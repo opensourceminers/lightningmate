@@ -32,7 +32,10 @@ export function App() {
   return (
     <div className="app">
       <header className="topbar">
-        <span className="brand">⚡ LightningMate</span>
+        <span className="brand">
+          ⚡ LightningMate
+          <span className="brand-sub">Lightning node manager</span>
+        </span>
         <button
           className="refresh"
           onClick={() => {
@@ -88,7 +91,7 @@ export function App() {
         {tab === "autopilot" ? <AutopilotPanel /> : null}
       </div>
 
-      <footer className="foot muted">Read-only by default · v0.2 · data refreshes automatically</footer>
+      <footer className="foot muted">Read-only by default · v0.4 · data refreshes automatically</footer>
     </div>
   );
 }
