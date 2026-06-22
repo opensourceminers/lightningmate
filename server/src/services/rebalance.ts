@@ -33,7 +33,7 @@ export const DEFAULT_REBALANCE_POLICY: RebalancePolicy = {
   econRatio: 0.8,
   maxLocalRatioTarget: 0.35,
   minLocalRatioSource: 0.65,
-  amountSats: 100_000,
+  amountSats: 1_000_000,
   minDemandSats: 1,
   flowWindowDays: 30,
   maxCandidates: 8,

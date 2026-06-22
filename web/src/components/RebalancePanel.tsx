@@ -16,7 +16,7 @@ type DraftKey =
   | "flowWindowDays";
 
 const DEFAULTS: Pick<RebalancePolicy, DraftKey> = {
-  amountSats: 100_000,
+  amountSats: 1_000_000,
   econRatio: 0.8,
   maxLocalRatioTarget: 0.35,
   minLocalRatioSource: 0.65,
@@ -32,7 +32,7 @@ const CONTROLS: { key: DraftKey; label: string; step: number; hint: string }[] =
 ];
 
 function Verdict({ c }: { c: RebalanceCandidate }) {
-  if (c.profitable) return <span className="ap-ok">✓ profitable</span>;
+  if (c.profitable) return <span className="pill-live">profitable</span>;
   if (!c.routeFound) return <span className="muted">no route</span>;
   return <span className="ap-fail">✗ too costly</span>;
 }
@@ -95,7 +95,9 @@ export function RebalancePanel() {
     <section className="panel">
       <div className="panel-head">
         <h2>Rebalancing <span className="muted">· profit-gated</span></h2>
-        {analysis ? <span className="change-badge">{profitable} profitable</span> : null}
+        {analysis ? (
+          <span className={profitable > 0 ? "pill-live" : "change-badge"}>{profitable} profitable</span>
+        ) : null}
       </div>
 
       <div className="dryrun-banner">
