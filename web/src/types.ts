@@ -255,3 +255,16 @@ export interface SuggestionsResponse {
   suggestions: ChannelSuggestion[];
   graphAgeSec: number;
 }
+
+export interface PnlSummary {
+  windowDays: number;
+  routingRevenueSats: number;
+  forwardCount: number;
+  rebalanceCostSats: number;
+  rebalanceCount: number;
+  channelOpenCostSats: number;
+  channelCloseCostSats: number;
+  otherChainFeesSats: number;
+  totalCostSats: number;
+  netProfitSats: number;
+}

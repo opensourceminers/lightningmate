@@ -11,6 +11,7 @@ import {
   type RebalancePolicy,
 } from "../services/rebalance.js";
 import { getChannelSuggestions, type SuggestionPolicy } from "../services/suggestions.js";
+import { getPnl } from "../services/pnl.js";
 import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 
@@ -212,6 +213,16 @@ export function createApiRouter(
   router.get("/rebalance/log", (_req, res) => {
     res.json({ summary: rebalanceLog.summary(), records: rebalanceLog.recent() });
   });
+
+  // Profit & loss over a window — routing revenue vs channel/rebalance costs.
+  router.get(
+    "/pnl",
+    wrap(async (req, res) => {
+      const days = Number(req.query.days ?? config.flowWindowDays);
+      const windowDays = Number.isFinite(days) && days > 0 ? days : config.flowWindowDays;
+      res.json(await getPnl(lnd, rebalanceLog, windowDays));
+    }),
+  );
 
   // Channel peer suggestions — read-only, computed from the network graph.
   router.get(
