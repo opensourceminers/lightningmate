@@ -15,5 +15,10 @@
   },
   "devDependencies": {
     "concurrently": "^9.1.0"
+  },
+  "comment:overrides": "Force patched transitive deps (DoS advisories) that lightning pins to vulnerable ranges.",
+  "overrides": {
+    "@grpc/grpc-js": "1.14.4",
+    "bn.js": "5.2.3"
   }
 }
