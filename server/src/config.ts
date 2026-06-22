@@ -7,7 +7,8 @@ import { config as loadDotenv } from "dotenv";
 // .env lives at the repo root. Load it explicitly from there, then also honor a
 // .env in the current working directory if one exists.
 const moduleDir = dirname(fileURLToPath(import.meta.url));
-loadDotenv({ path: resolve(moduleDir, "../../.env") });
+const repoRoot = resolve(moduleDir, "../../");
+loadDotenv({ path: resolve(repoRoot, ".env") });
 loadDotenv();
 
 function fileToBase64(path: string): string {
@@ -18,54 +19,67 @@ function fileToBase64(path: string): string {
  * On Umbrel we declare a dependency on the `lightning` app, which exports
  * APP_LIGHTNING_NODE_IP / _GRPC_PORT and lets us mount its data dir read-only.
  * When those are present we auto-discover everything — no manual config needed.
- * Standalone/dev users instead set LND_SOCKET + LND_CERT/_PATH + LND_MACAROON/_PATH.
  */
-function umbrelDefaults(): { socket: string; certPath: string; macaroonPath: string } | null {
+function umbrelDefaults(): {
+  socket: string;
+  certPath: string;
+  macaroonPath: string;
+  adminMacaroonPath: string;
+} | null {
   const ip = process.env.APP_LIGHTNING_NODE_IP?.trim();
   const grpcPort = process.env.APP_LIGHTNING_NODE_GRPC_PORT?.trim();
   if (!ip || !grpcPort) return null;
 
-  // We mount ${APP_LIGHTNING_NODE_DATA_DIR}:/lnd:ro in docker-compose; LND_DIR
-  // overrides the mount point. v1 reads the read-only macaroon on purpose.
   const lndDir = process.env.LND_DIR?.trim() || "/lnd";
+  const chainDir = `${lndDir}/data/chain/bitcoin/mainnet`;
   return {
     socket: `${ip}:${grpcPort}`,
     certPath: `${lndDir}/tls.cert`,
-    macaroonPath: `${lndDir}/data/chain/bitcoin/mainnet/readonly.macaroon`,
+    macaroonPath: `${chainDir}/readonly.macaroon`,
+    adminMacaroonPath: `${chainDir}/admin.macaroon`,
   };
 }
 
-/**
- * Resolve one credential as base64. Precedence:
- *   1. explicit base64 env (LND_CERT / LND_MACAROON)
- *   2. explicit file path env (LND_CERT_PATH / LND_MACAROON_PATH)
- *   3. Umbrel auto-discovered path (mounted /lnd)
- */
+/** Resolve a credential as base64. Throws if none of the sources are present. */
 function resolveCredential(
   name: string,
   base64Env: string | undefined,
   pathEnv: string | undefined,
   umbrelPath: string | undefined,
 ): string {
-  if (base64Env && base64Env.trim().length > 0) return base64Env.trim();
-
-  const path = pathEnv?.trim() || umbrelPath;
-  if (path && existsSync(path)) return fileToBase64(path);
-
+  const value = resolveOptional(base64Env, pathEnv, umbrelPath);
+  if (value) return value;
   throw new Error(
     `Missing LND credential "${name}". On Umbrel this comes from the mounted ` +
       `lightning data dir; standalone, set ${name} (base64) or ${name}_PATH.`,
   );
 }
 
+/** Like resolveCredential but returns undefined instead of throwing. */
+function resolveOptional(
+  base64Env: string | undefined,
+  pathEnv: string | undefined,
+  umbrelPath: string | undefined,
+): string | undefined {
+  if (base64Env && base64Env.trim().length > 0) return base64Env.trim();
+  const path = pathEnv?.trim() || umbrelPath;
+  if (path && existsSync(path)) return fileToBase64(path);
+  return undefined;
+}
+
 export interface Config {
   port: number;
   flowWindowDays: number;
   webDir: string | undefined;
+  dataDir: string;
+  /** True only when a write-capable macaroon is available AND opt-in is set. */
+  writeEnabled: boolean;
   lnd: {
     socket: string;
     cert: string;
     macaroon: string;
+    /** offchain:write-capable macaroon, present only when writeEnabled. */
+    writeMacaroon?: string;
   };
 }
 
@@ -80,25 +94,42 @@ export function loadConfig(): Config {
     );
   }
 
+  const cert = resolveCredential(
+    "LND_CERT",
+    process.env.LND_CERT,
+    process.env.LND_CERT_PATH,
+    umbrel?.certPath,
+  );
+  const macaroon = resolveCredential(
+    "LND_MACAROON",
+    process.env.LND_MACAROON,
+    process.env.LND_MACAROON_PATH,
+    umbrel?.macaroonPath,
+  );
+
+  // Writes are off unless explicitly enabled AND a write macaroon is resolvable.
+  const wantsWrite = process.env.LM_ENABLE_WRITE?.trim() === "true";
+  const writeMacaroon = wantsWrite
+    ? resolveOptional(
+        process.env.LND_WRITE_MACAROON,
+        process.env.LND_WRITE_MACAROON_PATH,
+        umbrel?.adminMacaroonPath,
+      )
+    : undefined;
+
+  if (wantsWrite && !writeMacaroon) {
+    console.warn(
+      "⚠ LM_ENABLE_WRITE=true but no write macaroon found — staying read-only. " +
+        "Set LND_WRITE_MACAROON (base64) or LND_WRITE_MACAROON_PATH (admin macaroon).",
+    );
+  }
+
   return {
     port: Number(process.env.PORT ?? 3001),
     flowWindowDays: Number(process.env.FLOW_WINDOW_DAYS ?? 30),
-    // When set (production/Docker), the server also serves the built web UI.
     webDir: process.env.WEB_DIR?.trim() || undefined,
-    lnd: {
-      socket,
-      cert: resolveCredential(
-        "LND_CERT",
-        process.env.LND_CERT,
-        process.env.LND_CERT_PATH,
-        umbrel?.certPath,
-      ),
-      macaroon: resolveCredential(
-        "LND_MACAROON",
-        process.env.LND_MACAROON,
-        process.env.LND_MACAROON_PATH,
-        umbrel?.macaroonPath,
-      ),
-    },
+    dataDir: process.env.DATA_DIR?.trim() || resolve(repoRoot, ".data"),
+    writeEnabled: Boolean(writeMacaroon),
+    lnd: { socket, cert, macaroon, writeMacaroon },
   };
 }

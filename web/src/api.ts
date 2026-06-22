@@ -1,7 +1,17 @@
-import type { ChannelView, FlowSummary, NodeSummary } from "./types";
+import type {
+  AutopilotConfig,
+  AutopilotRun,
+  AutopilotState,
+  ChannelView,
+  FeeApplyItem,
+  FeeApplyResult,
+  FeePolicy,
+  FeePreview,
+  FlowSummary,
+  NodeSummary,
+} from "./types";
 
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`/api${path}`);
+async function handle<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let detail = res.statusText;
     try {
@@ -15,8 +25,37 @@ async function get<T>(path: string): Promise<T> {
   return (await res.json()) as T;
 }
 
+async function get<T>(path: string): Promise<T> {
+  return handle<T>(await fetch(`/api${path}`));
+}
+
+async function post<T>(path: string, body: unknown): Promise<T> {
+  return handle<T>(
+    await fetch(`/api${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
 export const api = {
   node: () => get<NodeSummary>("/node"),
   channels: () => get<ChannelView[]>("/channels"),
   flows: (days?: number) => get<FlowSummary>(days ? `/flows?days=${days}` : "/flows"),
+  feesPreview: (policy?: Partial<FeePolicy>) => {
+    const qs = policy
+      ? "?" + new URLSearchParams(
+          Object.entries(policy).map(([k, v]) => [k, String(v)]),
+        ).toString()
+      : "";
+    return get<FeePreview>(`/fees/preview${qs}`);
+  },
+  feesApply: (items: FeeApplyItem[]) =>
+    post<{ results: FeeApplyResult[] }>("/fees/apply", { items }),
+  autopilotGet: () => get<AutopilotState>("/autopilot"),
+  autopilotSet: (partial: Partial<AutopilotConfig>) =>
+    post<AutopilotState>("/autopilot", partial),
+  autopilotRun: () =>
+    post<{ run: AutopilotRun; state: AutopilotState }>("/autopilot/run", {}),
 };
