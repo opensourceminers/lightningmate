@@ -1,8 +1,10 @@
 import type {
+  AppSettings,
   AutopilotConfig,
   AutopilotRun,
   AutopilotState,
   ChannelView,
+  PriceInfo,
   FeeApplyItem,
   FeeApplyResult,
   FeePolicy,
@@ -55,6 +57,9 @@ export const api = {
   flows: (days?: number) => get<FlowSummary>(days ? `/flows?days=${days}` : "/flows"),
   pnl: (days: number) => get<PnlSummary>(`/pnl?days=${days}`),
   score: () => get<NodeScore>("/score"),
+  getSettings: () => get<AppSettings>("/settings"),
+  setSettings: (s: Partial<AppSettings>) => post<AppSettings>("/settings", s),
+  price: () => get<PriceInfo>("/price"),
   forwardsReport: (days: number) => get<ForwardsReport>(`/forwards/report?days=${days}`),
   feesPreview: (policy?: Partial<FeePolicy>) => {
     const qs = policy

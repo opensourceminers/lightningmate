@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { PnlSummary } from "../types";
-import { sats } from "../format";
+import type { PnlSummary, PriceInfo } from "../types";
+import { fiat, sats } from "../format";
 import { useCountUp } from "../useCountUp";
 
 const WINDOWS: { label: string; days: number }[] = [
@@ -26,7 +26,7 @@ function Item({ label, value, kind }: { label: string; value: number; kind: "rev
   );
 }
 
-export function PnlOverview() {
+export function PnlOverview({ price }: { price?: PriceInfo | null }) {
   const [days, setDays] = useState(30);
   const [data, setData] = useState<PnlSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -71,6 +71,9 @@ export function PnlOverview() {
             <div className={`pnl-net ${net >= 0 ? "pos" : "neg"}`}>
               <div className="pnl-net-label">Net profit</div>
               <div className="pnl-net-value">{signed(Math.round(animatedNet))} sat</div>
+              {price && fiat(net, price.btcPrice, price.currency) ? (
+                <div className="pnl-net-fiat">≈ {fiat(net, price.btcPrice, price.currency)}</div>
+              ) : null}
               <div className="pnl-net-sub">
                 {data.forwardCount} forwards · {data.rebalanceCount} rebalances
               </div>

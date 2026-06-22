@@ -7,6 +7,7 @@ import { getLnd, getWriteLnd } from "./lnd.js";
 import { createApiRouter } from "./routes/api.js";
 import { Autopilot } from "./services/autopilot.js";
 import { RebalanceLog } from "./services/rebalanceLog.js";
+import { SettingsStore } from "./services/settings.js";
 
 // Never let a startup error vanish silently — print it so it's diagnosable.
 process.on("uncaughtException", (err) => {
@@ -36,13 +37,14 @@ function main(): void {
 
   const writeLnd = getWriteLnd(config);
   const rebalanceLog = new RebalanceLog(config.dataDir);
+  const settings = new SettingsStore(config.dataDir);
   const autopilot = new Autopilot(config.dataDir, lnd, writeLnd, rebalanceLog);
   autopilot.start();
 
   const app = express();
   app.use(cors());
   app.use(express.json());
-  app.use("/api", createApiRouter(lnd, writeLnd, config, autopilot, rebalanceLog));
+  app.use("/api", createApiRouter(lnd, writeLnd, config, autopilot, rebalanceLog, settings));
 
   // In production (Docker/Umbrel) we serve the built React app from the same
   // origin, so the whole tool is a single container behind Umbrel's app_proxy.
