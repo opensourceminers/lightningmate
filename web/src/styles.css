@@ -158,6 +158,17 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 }
 .pnl-win:hover { color: var(--text); }
 .pnl-win.active { background: var(--accent); color: #1a1205; }
+.pnl-net-fiat { font-size: 13px; color: var(--muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
+
+/* Segmented control (settings) */
+.seg { display: inline-flex; gap: 2px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 3px; }
+.seg-btn {
+  background: transparent; color: var(--muted); border: none; cursor: pointer;
+  padding: 6px 15px; font-size: 13px; font-weight: 600; border-radius: 999px; transition: all var(--t);
+}
+.seg-btn:hover:not(:disabled) { color: var(--text); }
+.seg-btn.active { background: var(--accent); color: #1a1205; }
+.seg-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 .pnl-grid { display: grid; grid-template-columns: 220px 1fr; gap: 22px; align-items: center; }
 .pnl-net-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }

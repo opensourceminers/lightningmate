@@ -304,6 +304,17 @@ export interface SuggestionsResponse {
   graphAgeSec: number;
 }
 
+export type FiatCurrency = "off" | "USD" | "EUR" | "GBP" | "CHF";
+
+export interface AppSettings {
+  fiatCurrency: FiatCurrency;
+}
+
+export interface PriceInfo {
+  currency: FiatCurrency;
+  btcPrice: number | null;
+}
+
 export interface NetworkRank {
   position: number;
   total: number;

@@ -1,5 +1,5 @@
-import type { NodeSummary } from "../types";
-import { sats } from "../format";
+import type { NodeSummary, PriceInfo } from "../types";
+import { fiat, sats } from "../format";
 
 function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
@@ -11,10 +11,12 @@ function Stat({ label, value, sub }: { label: string; value: string; sub?: strin
   );
 }
 
-export function SummaryBar({ node }: { node: NodeSummary }) {
+export function SummaryBar({ node, price }: { node: NodeSummary; price?: PriceInfo | null }) {
   const { balances } = node;
   const lnTotal = balances.localSats + balances.inboundSats;
   const outboundPct = lnTotal > 0 ? (balances.localSats / lnTotal) * 100 : 0;
+  const inFiat = (s: number) =>
+    price ? fiat(s, price.btcPrice, price.currency) ?? undefined : undefined;
 
   return (
     <section className="summary">
@@ -36,12 +38,16 @@ export function SummaryBar({ node }: { node: NodeSummary }) {
           sub={node.pendingChannelsCount ? `${node.pendingChannelsCount} pending` : "active"}
         />
         <Stat label="Peers" value={String(node.peersCount)} />
-        <Stat label="Local (outbound)" value={`${sats(balances.localSats)} sat`} />
-        <Stat label="Inbound" value={`${sats(balances.inboundSats)} sat`} />
+        <Stat label="Local (outbound)" value={`${sats(balances.localSats)} sat`} sub={inFiat(balances.localSats)} />
+        <Stat label="Inbound" value={`${sats(balances.inboundSats)} sat`} sub={inFiat(balances.inboundSats)} />
         <Stat
           label="On-chain"
           value={`${sats(balances.onchainConfirmedSats)} sat`}
-          sub={balances.onchainPendingSats ? `+${sats(balances.onchainPendingSats)} pending` : undefined}
+          sub={
+            balances.onchainPendingSats
+              ? `+${sats(balances.onchainPendingSats)} pending`
+              : inFiat(balances.onchainConfirmedSats)
+          }
         />
       </div>
 

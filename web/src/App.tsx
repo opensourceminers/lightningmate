@@ -11,11 +11,12 @@ import { HealthScore } from "./components/HealthScore";
 import { LiquidityMap } from "./components/LiquidityMap";
 import { LiveFeed } from "./components/LiveFeed";
 import { RebalancePanel } from "./components/RebalancePanel";
+import { SettingsPanel } from "./components/SettingsPanel";
 import { SuggestionsPanel } from "./components/SuggestionsPanel";
 import { SummaryBar } from "./components/SummaryBar";
 import { usePolledData } from "./usePolledData";
 
-type Tab = "channels" | "suggestions" | "forwards" | "fees" | "rebalance" | "autopilot";
+type Tab = "channels" | "suggestions" | "forwards" | "fees" | "rebalance" | "autopilot" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "channels", label: "Channels" },
@@ -24,11 +25,13 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "fees", label: "Fees" },
   { id: "rebalance", label: "Rebalancing" },
   { id: "autopilot", label: "Autopilot" },
+  { id: "settings", label: "Settings" },
 ];
 
 export function App() {
   const node = usePolledData(api.node, 15_000);
   const channels = usePolledData(api.channels, 30_000);
+  const price = usePolledData(api.price, 300_000);
   const [tab, setTab] = useState<Tab>("channels");
 
   const anyError = node.error ?? channels.error;
@@ -39,7 +42,7 @@ export function App() {
       <header className="topbar">
         <span className="brand">
           <BrandMark />
-          LightningMate
+          Lightning Mate
           <span className="brand-sub">Lightning node manager</span>
         </span>
         <button
@@ -65,14 +68,14 @@ export function App() {
 
       {initialLoading ? <div className="loading">Connecting to your node…</div> : null}
 
-      {node.data ? <SummaryBar node={node.data} /> : null}
+      {node.data ? <SummaryBar node={node.data} price={price.data} /> : null}
       {node.data ? (
         <div className="hero-row">
           <HealthScore />
           <LiveFeed />
         </div>
       ) : null}
-      {node.data ? <PnlOverview /> : null}
+      {node.data ? <PnlOverview price={price.data} /> : null}
 
       <nav className="tabs">
         {TABS.map((t) => (
@@ -102,6 +105,7 @@ export function App() {
         {tab === "fees" ? <FeesPanel /> : null}
         {tab === "rebalance" ? <RebalancePanel /> : null}
         {tab === "autopilot" ? <AutopilotPanel /> : null}
+        {tab === "settings" ? <SettingsPanel onChange={price.refresh} /> : null}
       </div>
 
       <Footer />

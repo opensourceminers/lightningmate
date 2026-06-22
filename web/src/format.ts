@@ -19,6 +19,17 @@ export function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
 
+const FIAT_SYMBOL: Record<string, string> = { USD: "$", EUR: "€", GBP: "£", CHF: "CHF " };
+
+/** Fiat value of a sat amount, or null when fiat is off / price unknown. */
+export function fiat(sats: number, btcPrice: number | null, currency: string): string | null {
+  if (!btcPrice || currency === "off") return null;
+  const value = (sats / 100_000_000) * btcPrice;
+  const symbol = FIAT_SYMBOL[currency] ?? "";
+  const digits = Math.abs(value) >= 1000 ? 0 : 2;
+  return `${symbol}${value.toLocaleString("en-US", { maximumFractionDigits: digits, minimumFractionDigits: digits })}`;
+}
+
 export function timeAgo(iso: string): string {
   const then = new Date(iso).getTime();
   const secs = Math.max(0, Math.round((Date.now() - then) / 1000));

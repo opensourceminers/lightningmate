@@ -14,6 +14,8 @@ import {
 import { getChannelSuggestions, type SuggestionPolicy } from "../services/suggestions.js";
 import { getPnl } from "../services/pnl.js";
 import { openChannelTo } from "../services/channelOps.js";
+import { getBtcPrice } from "../services/price.js";
+import type { SettingsStore } from "../services/settings.js";
 import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 
@@ -78,6 +80,7 @@ export function createApiRouter(
   config: Config,
   autopilot: Autopilot,
   rebalanceLog: RebalanceLog,
+  settings: SettingsStore,
 ): Router {
   const router = Router();
 
@@ -332,6 +335,23 @@ export function createApiRouter(
           isPrivate: Boolean(isPrivate),
         }),
       );
+    }),
+  );
+
+  // User settings (currency, …).
+  router.get("/settings", (_req, res) => {
+    res.json(settings.get());
+  });
+  router.post("/settings", (req, res) => {
+    res.json(settings.set(req.body ?? {}));
+  });
+
+  // Current BTC price in the chosen fiat currency (null when fiat is off).
+  router.get(
+    "/price",
+    wrap(async (_req, res) => {
+      const currency = settings.get().fiatCurrency;
+      res.json({ currency, btcPrice: await getBtcPrice(currency) });
     }),
   );
 
