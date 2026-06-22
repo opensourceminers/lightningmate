@@ -2,12 +2,13 @@
 #
 # - app_proxy provides Umbrel's authentication/SSO — we add no login of our own.
 # - The image MUST be pre-built, multi-arch (linux/amd64 + linux/arm64) and
-#   pinned by sha256 digest. Build & push with:
-#     docker buildx build --platform linux/amd64,linux/arm64 \
-#       -t <DOCKERHUB>/lightningmate:0.1.0 --push .
-#   then paste the resulting digest below.
+#   pinned by sha256 digest. The .github/workflows/build-image.yml Action builds
+#   and pushes it to GHCR on a version tag (git tag v0.4.0 && git push --tags)
+#   or via "Run workflow"; copy the digest from the run summary below.
 # - The lightning app's data dir is mounted read-only; the backend auto-reads
 #   tls.cert + readonly.macaroon from it (see server/src/config.ts).
+# - For Umbrel to pull it, make the GHCR package public (or configure a pull
+#   secret); writes (fee/rebalance autopilot) need LM_ENABLE_WRITE — see below.
 version: "3.7"
 
 services:
@@ -17,16 +18,19 @@ services:
       APP_PORT: 3001
 
   web:
-    image: <DOCKERHUB>/lightningmate:0.1.0@sha256:<REPLACE_WITH_IMAGE_DIGEST>
+    image: ghcr.io/othervice/lightningmate:0.4.0@sha256:REPLACE_WITH_IMAGE_DIGEST
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
     volumes:
-      # Read-only access to LND's tls.cert + macaroons.
+      # Read-only access to LND's tls.cert + macaroons (incl. admin if writes on).
       - ${APP_LIGHTNING_NODE_DATA_DIR}:/lnd:ro
-      # App's own writable data dir (used by future fee/rebalance accounting).
+      # App's own writable data dir (fee/rebalance autopilot config + accounting).
       - ${APP_DATA_DIR}/data:/data
     environment:
       LND_SOCKET: "$APP_LIGHTNING_NODE_IP:$APP_LIGHTNING_NODE_GRPC_PORT"
       LND_DIR: "/lnd"
+      DATA_DIR: "/data"
       PORT: "3001"
+      # Uncomment to allow fee/rebalance writes (admin macaroon auto-discovered):
+      # LM_ENABLE_WRITE: "true"

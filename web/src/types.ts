@@ -227,3 +227,31 @@ export interface RebalanceLogResponse {
   summary: RebalanceLogSummary;
   records: RebalanceRecord[];
 }
+
+export interface SuggestionPolicy {
+  count: number;
+  minChannels: number;
+  maxStaleDays: number;
+  minSizeSats: number;
+  maxSizeSats: number;
+  requireClearnet: boolean;
+}
+
+export interface ChannelSuggestion {
+  pubkey: string;
+  alias: string;
+  channels: number;
+  capacitySats: number;
+  avgFeePpm: number;
+  hasClearnet: boolean;
+  lastSeenDays: number;
+  score: number;
+  recommendedSizeSats: number;
+  reason: string;
+}
+
+export interface SuggestionsResponse {
+  policy: SuggestionPolicy;
+  suggestions: ChannelSuggestion[];
+  graphAgeSec: number;
+}

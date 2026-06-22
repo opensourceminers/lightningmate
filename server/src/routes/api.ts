@@ -10,6 +10,7 @@ import {
   getRebalanceCandidates,
   type RebalancePolicy,
 } from "../services/rebalance.js";
+import { getChannelSuggestions, type SuggestionPolicy } from "../services/suggestions.js";
 import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 
@@ -211,6 +212,24 @@ export function createApiRouter(
   router.get("/rebalance/log", (_req, res) => {
     res.json({ summary: rebalanceLog.summary(), records: rebalanceLog.recent() });
   });
+
+  // Channel peer suggestions — read-only, computed from the network graph.
+  router.get(
+    "/suggestions",
+    wrap(async (req, res) => {
+      const overrides: Partial<SuggestionPolicy> = numericOverrides<SuggestionPolicy>(req.query, [
+        "count",
+        "minChannels",
+        "maxStaleDays",
+        "minSizeSats",
+        "maxSizeSats",
+      ]);
+      if (req.query.requireClearnet !== undefined) {
+        overrides.requireClearnet = req.query.requireClearnet === "true";
+      }
+      res.json(await getChannelSuggestions(lnd, overrides));
+    }),
+  );
 
   // Error middleware — surface LND/connection failures as JSON, not a crash.
   router.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
