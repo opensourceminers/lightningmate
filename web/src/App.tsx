@@ -1,7 +1,9 @@
 import { useState } from "react";
 import { api } from "./api";
 import { AutopilotPanel } from "./components/AutopilotPanel";
+import { BrandMark } from "./components/BrandMark";
 import { ChannelTable } from "./components/ChannelTable";
+import { PnlOverview } from "./components/PnlOverview";
 import { FeesPanel } from "./components/FeesPanel";
 import { FlowsPanel } from "./components/FlowsPanel";
 import { RebalancePanel } from "./components/RebalancePanel";
@@ -33,7 +35,8 @@ export function App() {
     <div className="app">
       <header className="topbar">
         <span className="brand">
-          ⚡ LightningMate
+          <BrandMark />
+          LightningMate
           <span className="brand-sub">Lightning node manager</span>
         </span>
         <button
@@ -61,6 +64,7 @@ export function App() {
       {initialLoading ? <div className="loading">Connecting to your node…</div> : null}
 
       {node.data ? <SummaryBar node={node.data} /> : null}
+      {node.data ? <PnlOverview /> : null}
 
       <nav className="tabs">
         {TABS.map((t) => (
