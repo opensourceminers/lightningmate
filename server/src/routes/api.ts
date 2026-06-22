@@ -3,7 +3,7 @@ import type { AuthenticatedLnd } from "lightning";
 import type { Config } from "../config.js";
 import { getNodeSummary } from "../services/node.js";
 import { getChannelsView } from "../services/channels.js";
-import { getFlowSummary } from "../services/forwards.js";
+import { getFlowSummary, getForwardsReport } from "../services/forwards.js";
 import { applyFees, getFeePreview, type FeeApplyItem, type FeePolicy } from "../services/fees.js";
 import {
   executeRebalance,
@@ -103,6 +103,16 @@ export function createApiRouter(
       const days = Number(req.query.days ?? config.flowWindowDays);
       const windowDays = Number.isFinite(days) && days > 0 ? days : config.flowWindowDays;
       res.json(await getFlowSummary(lnd, windowDays));
+    }),
+  );
+
+  // Forwards report (Thunderhub-style) — daily series + per-channel + recent.
+  router.get(
+    "/forwards/report",
+    wrap(async (req, res) => {
+      const days = Number(req.query.days ?? 30);
+      const windowDays = Math.min(90, Math.max(1, Number.isFinite(days) ? days : 30));
+      res.json(await getForwardsReport(lnd, windowDays));
     }),
   );
 

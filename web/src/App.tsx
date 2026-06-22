@@ -5,18 +5,18 @@ import { BrandMark } from "./components/BrandMark";
 import { ChannelTable } from "./components/ChannelTable";
 import { PnlOverview } from "./components/PnlOverview";
 import { FeesPanel } from "./components/FeesPanel";
-import { FlowsPanel } from "./components/FlowsPanel";
+import { ForwardsPanel } from "./components/ForwardsPanel";
 import { RebalancePanel } from "./components/RebalancePanel";
 import { SuggestionsPanel } from "./components/SuggestionsPanel";
 import { SummaryBar } from "./components/SummaryBar";
 import { usePolledData } from "./usePolledData";
 
-type Tab = "channels" | "suggestions" | "flows" | "fees" | "rebalance" | "autopilot";
+type Tab = "channels" | "suggestions" | "forwards" | "fees" | "rebalance" | "autopilot";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "channels", label: "Channels" },
   { id: "suggestions", label: "Suggestions" },
-  { id: "flows", label: "Flows" },
+  { id: "forwards", label: "Forwards" },
   { id: "fees", label: "Fees" },
   { id: "rebalance", label: "Rebalancing" },
   { id: "autopilot", label: "Autopilot" },
@@ -25,10 +25,9 @@ const TABS: { id: Tab; label: string }[] = [
 export function App() {
   const node = usePolledData(api.node, 15_000);
   const channels = usePolledData(api.channels, 30_000);
-  const flows = usePolledData(() => api.flows(), 60_000);
   const [tab, setTab] = useState<Tab>("channels");
 
-  const anyError = node.error ?? channels.error ?? flows.error;
+  const anyError = node.error ?? channels.error;
   const initialLoading = node.loading && !node.data;
 
   return (
@@ -44,7 +43,6 @@ export function App() {
           onClick={() => {
             node.refresh();
             channels.refresh();
-            flows.refresh();
           }}
         >
           ↻ refresh
@@ -82,13 +80,7 @@ export function App() {
         {tab === "channels" ? (
           channels.data ? <ChannelTable channels={channels.data} /> : <Placeholder />
         ) : null}
-        {tab === "flows" ? (
-          flows.data && channels.data ? (
-            <FlowsPanel flows={flows.data} channels={channels.data} />
-          ) : (
-            <Placeholder />
-          )
-        ) : null}
+        {tab === "forwards" ? <ForwardsPanel /> : null}
         {tab === "suggestions" ? <SuggestionsPanel /> : null}
         {tab === "fees" ? <FeesPanel /> : null}
         {tab === "rebalance" ? <RebalancePanel /> : null}

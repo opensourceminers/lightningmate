@@ -282,6 +282,35 @@ table { width: 100%; border-collapse: collapse; }
 .flow-meta { font-size: 11px; }
 .forwards td { font-size: 12px; }
 
+/* ── Forwards report ─────────────────────────────────────── */
+.report-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 18px; }
+.chart-head { display: flex; align-items: center; justify-content: space-between; margin: 4px 0 10px; }
+.metric-toggle { display: flex; gap: 2px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 3px; }
+.metric-btn {
+  background: transparent; color: var(--muted); border: none; cursor: pointer;
+  padding: 4px 12px; font-size: 12px; font-weight: 600; border-radius: 999px; transition: all var(--t);
+}
+.metric-btn:hover { color: var(--text); }
+.metric-btn.active { background: var(--accent); color: #1a1205; }
+
+.chart {
+  display: flex; align-items: flex-end; gap: 2px; height: 150px;
+  padding: 8px 4px 0; background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.015));
+  border-bottom: 1px solid var(--line); border-radius: var(--radius-sm) var(--radius-sm) 0 0;
+}
+.chart-col { flex: 1 1 0; height: 100%; display: flex; align-items: flex-end; min-width: 2px; }
+.chart-bar {
+  width: 100%; min-height: 2px; border-radius: 3px 3px 0 0;
+  background: linear-gradient(180deg, var(--accent-2), var(--accent));
+  transition: filter var(--t), height 0.4s ease; opacity: 0.85;
+}
+.chart-col:hover .chart-bar { opacity: 1; filter: brightness(1.2); }
+.chart-axis { display: flex; justify-content: space-between; color: var(--faint); font-size: 11px; margin-top: 6px; }
+
+.share-col { width: 130px; }
+.share-bar { height: 7px; background: var(--panel-3); border-radius: 5px; overflow: hidden; }
+.share-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); border-radius: 5px; }
+
 /* ── Fees / policy controls ──────────────────────────────── */
 .change-badge {
   background: rgba(247, 147, 26, 0.14); color: var(--accent);
@@ -366,4 +395,5 @@ table { width: 100%; border-collapse: collapse; }
   .brand-sub { display: none; }
   .pnl-grid { grid-template-columns: 1fr; gap: 16px; }
   .pnl-items { grid-template-columns: 1fr; }
+  .report-stats { grid-template-columns: repeat(2, 1fr); }
 }

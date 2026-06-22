@@ -63,6 +63,43 @@ export interface FlowSummary {
   recent: ForwardEvent[];
 }
 
+export interface ChannelForwardStat {
+  channelId: string;
+  alias: string;
+  forwardCount: number;
+  routedOutSats: number;
+  routedInSats: number;
+  feesEarnedSats: number;
+}
+
+export interface DailyBucket {
+  date: string;
+  forwards: number;
+  routedSats: number;
+  feesSats: number;
+}
+
+export interface ResolvedForward {
+  createdAt: string;
+  incoming: string;
+  outgoing: string;
+  tokens: number;
+  fee: number;
+}
+
+export interface ForwardsReport {
+  windowDays: number;
+  totalForwards: number;
+  totalRoutedSats: number;
+  totalFeesEarnedSats: number;
+  avgFeePpm: number;
+  maxForwardSats: number;
+  busiestDay: string | null;
+  perChannel: ChannelForwardStat[];
+  daily: DailyBucket[];
+  recent: ResolvedForward[];
+}
+
 export interface FeePolicy {
   minPpm: number;
   maxPpm: number;
