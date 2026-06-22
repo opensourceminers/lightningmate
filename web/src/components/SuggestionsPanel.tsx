@@ -7,6 +7,7 @@ import type {
   SuggestionsResponse,
 } from "../types";
 import { sats, satsCompact } from "../format";
+import { Scanning } from "./Scanning";
 
 type NumKey = "count" | "minChannels" | "maxStaleDays";
 
@@ -126,9 +127,7 @@ export function SuggestionsPanel() {
         </button>
       </div>
 
-      {loading && !data ? (
-        <p className="muted empty">Analyzing the network graph — this can take a moment…</p>
-      ) : null}
+      {loading ? <Scanning label="SCANNING THE NETWORK GRAPH" /> : null}
       {error ? <p className="banner error">{error}</p> : null}
 
       <table className="fee-table">

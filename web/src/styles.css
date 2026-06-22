@@ -451,19 +451,54 @@ table { width: 100%; border-collapse: collapse; }
   padding: 14px 16px; margin-top: 8px; background: rgba(0, 0, 0, 0.15);
 }
 
+/* ── Scanning loader ─────────────────────────────────────── */
+.scanning { padding: 40px 0 36px; text-align: center; }
+.scan-bar {
+  max-width: 320px; height: 4px; margin: 0 auto 16px; border-radius: 4px;
+  background: var(--panel-3); overflow: hidden; position: relative;
+}
+.scan-sweep {
+  position: absolute; top: 0; left: -40%; width: 40%; height: 100%; border-radius: 4px;
+  background: linear-gradient(90deg, transparent, var(--accent), var(--accent-2), transparent);
+  animation: sweep 1.1s ease-in-out infinite;
+}
+@keyframes sweep { 0% { left: -40%; } 100% { left: 100%; } }
+.scan-label {
+  color: var(--accent); font-size: 13px; font-weight: 800; letter-spacing: 3px;
+  animation: scanpulse 1.3s ease-in-out infinite;
+}
+@keyframes scanpulse {
+  0%, 100% { opacity: 1; text-shadow: 0 0 10px var(--accent-glow); }
+  50% { opacity: 0.45; text-shadow: none; }
+}
+.scan-sub { color: var(--faint); font-size: 12px; margin-top: 6px; letter-spacing: 0.3px; }
+
 /* ── Footer ──────────────────────────────────────────────── */
-.foot { margin-top: 40px; padding-top: 22px; border-top: 1px solid var(--line); text-align: center; }
-.foot-links { display: flex; gap: 18px; justify-content: center; flex-wrap: wrap; margin-bottom: 12px; }
-.foot-links a { color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; transition: color var(--t); }
-.foot-links a:hover { color: var(--text); }
-.foot-links .donate-link { color: var(--accent); }
-.foot-links .donate-link:hover { color: var(--accent-2); }
+.foot { margin-top: 40px; padding-top: 24px; border-top: 1px solid var(--line); text-align: center; }
+.foot-pills { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-bottom: 14px; }
+.foot-pill {
+  display: inline-flex; align-items: center; gap: 8px; padding: 8px 15px;
+  border-radius: 999px; border: 1px solid var(--line); background: var(--panel-2);
+  color: var(--text); text-decoration: none; font-size: 13px; font-weight: 600;
+  transition: border-color var(--t), background var(--t), transform var(--t);
+}
+.foot-pill svg { width: 16px; height: 16px; }
+.foot-pill:hover { border-color: var(--accent); background: var(--panel-3); transform: translateY(-1px); }
+.foot-pill.donate { border-color: rgba(247, 147, 26, 0.45); color: var(--accent-2); }
+.foot-pill.donate:hover { background: rgba(247, 147, 26, 0.14); border-color: var(--accent); }
+
 .foot-donate {
   display: inline-flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: center;
   background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px;
-  padding: 6px 8px 6px 14px; font-size: 12px; margin-bottom: 12px;
+  padding: 6px 8px 6px 14px; font-size: 12px; margin-bottom: 14px;
 }
+.foot-donate svg { width: 14px; height: 14px; color: var(--accent); }
 .foot-donate code { color: var(--accent-2); font-size: 11px; word-break: break-all; }
+.foot-copy-btn {
+  background: var(--panel-3); color: var(--muted); border: 1px solid var(--line);
+  border-radius: 999px; padding: 4px 12px; font-size: 11px; cursor: pointer; transition: all var(--t);
+}
+.foot-copy-btn:hover { color: var(--text); border-color: var(--accent); }
 .foot-copy { font-size: 12px; color: var(--faint); }
 
 @media (max-width: 900px) {
