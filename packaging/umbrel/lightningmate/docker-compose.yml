@@ -18,7 +18,7 @@ services:
       APP_PORT: 3001
 
   web:
-    image: ghcr.io/othervice/lightningmate:0.4.0@sha256:REPLACE_WITH_IMAGE_DIGEST
+    image: ghcr.io/othervice/lightningmate:v0.4.0@sha256:d20462f828f7a0e8db069c95bc8a3c3041cefbdd9c1517de97354b28e791e9f2
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
