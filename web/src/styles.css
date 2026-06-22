@@ -606,7 +606,7 @@ table { width: 100%; border-collapse: collapse; }
 
 /* ── Footer ──────────────────────────────────────────────── */
 .foot { margin-top: 40px; padding-top: 24px; border-top: 1px solid var(--line); text-align: center; }
-.foot-pills { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; margin-bottom: 14px; }
+.foot-row { display: flex; gap: 10px; justify-content: center; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
 .foot-pill {
   display: inline-flex; align-items: center; gap: 8px; padding: 8px 15px;
   border-radius: 999px; border: 1px solid var(--line); background: var(--panel-2);
@@ -617,14 +617,10 @@ table { width: 100%; border-collapse: collapse; }
 .foot-pill:hover { border-color: var(--accent); background: var(--panel-3); transform: translateY(-1px); }
 .foot-pill.donate { border-color: rgba(247, 147, 26, 0.45); color: var(--accent-2); }
 .foot-pill.donate:hover { background: rgba(247, 147, 26, 0.14); border-color: var(--accent); }
-
-.foot-donate {
-  display: inline-flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: center;
-  background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px;
-  padding: 6px 8px 6px 14px; font-size: 12px; margin-bottom: 14px;
+.foot-addr {
+  color: var(--accent-2); font-size: 11px; word-break: break-all;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px;
 }
-.foot-donate svg { width: 14px; height: 14px; color: var(--accent); }
-.foot-donate code { color: var(--accent-2); font-size: 11px; word-break: break-all; }
 .foot-copy-btn {
   background: var(--panel-3); color: var(--muted); border: 1px solid var(--line);
   border-radius: 999px; padding: 4px 12px; font-size: 11px; cursor: pointer; transition: all var(--t);
