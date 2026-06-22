@@ -302,7 +302,7 @@ export function AutopilotPanel() {
                 <span>{timeAgo(run.at)}</span>
                 <span className="muted">{run.applied} applied{run.failed ? `, ${run.failed} failed` : ""}</span>
               </div>
-              {run.changes.length ? (
+              {run.changes?.length ? (
                 <div className="ap-changes">
                   {run.changes.map((c) => (
                     <span key={c.id} className={c.ok ? "ap-ok" : "ap-fail"} title={c.error ?? ""}>
@@ -311,7 +311,7 @@ export function AutopilotPanel() {
                   ))}
                 </div>
               ) : null}
-              {run.rebalances.length ? (
+              {run.rebalances?.length ? (
                 <div className="ap-changes">
                   {run.rebalances.map((r, j) => (
                     <span key={j} className={r.ok ? "ap-ok" : "ap-fail"} title={r.error ?? ""}>
@@ -320,7 +320,7 @@ export function AutopilotPanel() {
                   ))}
                 </div>
               ) : null}
-              {run.channels.length ? (
+              {run.channels?.length ? (
                 <div className="ap-changes">
                   {run.channels.map((c, j) => (
                     <span key={j} className={c.ok ? "ap-ok" : "ap-fail"} title={c.error ?? ""}>

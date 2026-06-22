@@ -143,7 +143,13 @@ export class Autopilot {
       canWrite: this.canWrite,
       config: this.state.config,
       lastRunAt: this.state.lastRunAt,
-      history: this.state.history.slice(0, 20),
+      // Normalise older persisted runs that predate newer arrays.
+      history: this.state.history.slice(0, 20).map((r) => ({
+        ...r,
+        changes: r.changes ?? [],
+        rebalances: r.rebalances ?? [],
+        channels: r.channels ?? [],
+      })),
     };
   }
 
