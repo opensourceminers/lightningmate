@@ -1,7 +1,7 @@
 import { useState } from "react";
 
 const DONATE = "bc1qje7dm783p86qu4xlvam6yrvy5mzx7qx76w72k8";
-const GITHUB = "https://github.com/othervice/lightningmate";
+const GITHUB = "https://github.com/opensourceminers/lightningmate";
 const X_URL = "https://x.com/opensource_de";
 const SITE = "https://opensourceminers.de";
 
