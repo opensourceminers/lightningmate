@@ -397,7 +397,74 @@ table { width: 100%; border-collapse: collapse; }
 .ap-ok { background: rgba(52, 211, 153, 0.15); color: #74e6b8; font-weight: 600; }
 .ap-fail { background: rgba(248, 113, 113, 0.15); color: #ffa3a3; font-weight: 600; }
 
-.foot { text-align: center; margin-top: 32px; font-size: 12px; color: var(--faint); }
+/* ── iOS-style switch + run state ────────────────────────── */
+.switch {
+  width: 48px; height: 28px; flex: none; border-radius: 999px; border: none;
+  background: var(--red); cursor: pointer; position: relative; padding: 0;
+  transition: background 0.2s ease; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+}
+.switch.on { background: var(--green); }
+.switch:disabled { opacity: 0.55; cursor: not-allowed; }
+.switch-knob {
+  position: absolute; top: 3px; left: 3px; width: 22px; height: 22px; border-radius: 50%;
+  background: #fff; transition: left 0.2s ease; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+}
+.switch.on .switch-knob { left: 23px; }
+
+.run-state {
+  font-weight: 800; font-size: 12px; letter-spacing: 1.5px; padding: 4px 12px;
+  border-radius: 7px; flex: none;
+}
+.run-state.off { color: var(--red); background: rgba(248, 113, 113, 0.12); }
+.run-state.on {
+  color: var(--green); background: rgba(52, 211, 153, 0.14);
+  animation: apulse 1.6s ease-in-out infinite;
+}
+@keyframes apulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.5); opacity: 1; }
+  50% { box-shadow: 0 0 14px 2px rgba(52, 211, 153, 0.55); opacity: 0.85; }
+}
+
+/* ── Autopilot master rows ───────────────────────────────── */
+.ap-master {
+  display: flex; align-items: center; gap: 14px;
+  background: linear-gradient(180deg, var(--panel-2), var(--panel));
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 14px 16px; margin-bottom: 12px;
+}
+.ap-master-text { flex: 1; min-width: 0; }
+.ap-master-title { font-size: 15px; font-weight: 600; }
+.ap-master-sub { font-size: 12px; color: var(--muted); margin-top: 1px; }
+
+.ap-settings-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 16px 0 6px; font-size: 13px; flex-wrap: wrap; gap: 10px;
+}
+.ap-settings-actions { display: flex; align-items: center; gap: 12px; }
+.link-btn {
+  background: none; border: none; color: var(--accent); cursor: pointer;
+  font-size: 13px; font-weight: 600; padding: 0; text-decoration: underline;
+}
+.link-btn:hover { color: var(--accent-2); }
+.ap-advanced {
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+  padding: 14px 16px; margin-top: 8px; background: rgba(0, 0, 0, 0.15);
+}
+
+/* ── Footer ──────────────────────────────────────────────── */
+.foot { margin-top: 40px; padding-top: 22px; border-top: 1px solid var(--line); text-align: center; }
+.foot-links { display: flex; gap: 18px; justify-content: center; flex-wrap: wrap; margin-bottom: 12px; }
+.foot-links a { color: var(--muted); text-decoration: none; font-size: 13px; font-weight: 500; transition: color var(--t); }
+.foot-links a:hover { color: var(--text); }
+.foot-links .donate-link { color: var(--accent); }
+.foot-links .donate-link:hover { color: var(--accent-2); }
+.foot-donate {
+  display: inline-flex; align-items: center; gap: 9px; flex-wrap: wrap; justify-content: center;
+  background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px;
+  padding: 6px 8px 6px 14px; font-size: 12px; margin-bottom: 12px;
+}
+.foot-donate code { color: var(--accent-2); font-size: 11px; word-break: break-all; }
+.foot-copy { font-size: 12px; color: var(--faint); }
 
 @media (max-width: 900px) {
   .app { padding: 18px 16px 48px; }

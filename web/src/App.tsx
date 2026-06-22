@@ -5,6 +5,7 @@ import { BrandMark } from "./components/BrandMark";
 import { ChannelTable } from "./components/ChannelTable";
 import { PnlOverview } from "./components/PnlOverview";
 import { FeesPanel } from "./components/FeesPanel";
+import { Footer } from "./components/Footer";
 import { ForwardsPanel } from "./components/ForwardsPanel";
 import { RebalancePanel } from "./components/RebalancePanel";
 import { SuggestionsPanel } from "./components/SuggestionsPanel";
@@ -87,7 +88,7 @@ export function App() {
         {tab === "autopilot" ? <AutopilotPanel /> : null}
       </div>
 
-      <footer className="foot muted">Read-only by default · v0.4 · data refreshes automatically</footer>
+      <Footer />
     </div>
   );
 }
