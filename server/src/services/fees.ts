@@ -1,11 +1,11 @@
 import {
   getChannel,
   getFeeRates,
-  getWalletInfo,
   updateRoutingFees,
   type AuthenticatedLnd,
 } from "lightning";
 import { getChannelsView } from "./channels.js";
+import { getOwnPubkey } from "./node.js";
 
 /**
  * A fee policy maps each channel's *current local balance ratio* to a target
@@ -140,13 +140,6 @@ export interface FeeApplyResult {
   error?: string;
 }
 
-let cachedPubkey: string | undefined;
-async function ownPubkey(lnd: AuthenticatedLnd): Promise<string> {
-  if (cachedPubkey) return cachedPubkey;
-  cachedPubkey = (await getWalletInfo({ lnd })).public_key;
-  return cachedPubkey;
-}
-
 /**
  * Apply fee updates to the node. `readLnd` reads each channel's current policy
  * (to preserve cltv_delta + HTLC limits, which LND would otherwise reset to
@@ -158,7 +151,7 @@ export async function applyFees(
   writeLnd: AuthenticatedLnd,
   items: FeeApplyItem[],
 ): Promise<FeeApplyResult[]> {
-  const mine = await ownPubkey(readLnd);
+  const mine = await getOwnPubkey(readLnd);
   const results: FeeApplyResult[] = [];
 
   for (const item of items) {

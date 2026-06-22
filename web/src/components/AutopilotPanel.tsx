@@ -3,12 +3,18 @@ import { api } from "../api";
 import type { AutopilotConfig, AutopilotRun, AutopilotState } from "../types";
 import { timeAgo } from "../format";
 
-type NumKey = "intervalMinutes" | "cooldownMinutes" | "maxChangesPerRun";
+type NumKey =
+  | "intervalMinutes"
+  | "cooldownMinutes"
+  | "maxChangesPerRun"
+  | "maxRebalancesPerRun"
+  | "rebalanceCooldownMinutes";
+type RebKey = "econRatio" | "amountSats" | "maxLocalRatioTarget" | "minLocalRatioSource";
 
 const NUMBER_FIELDS: { key: NumKey; label: string; hint: string }[] = [
   { key: "intervalMinutes", label: "Run every (min)", hint: "how often the autopilot runs" },
-  { key: "cooldownMinutes", label: "Per-channel cooldown (min)", hint: "min time between changes to the same channel" },
-  { key: "maxChangesPerRun", label: "Max changes / run", hint: "caps how many channels change at once" },
+  { key: "cooldownMinutes", label: "Fee cooldown (min)", hint: "min time between fee changes to the same channel" },
+  { key: "maxChangesPerRun", label: "Max fee changes / run", hint: "caps how many channels change at once" },
 ];
 
 const POLICY_FIELDS: { key: keyof AutopilotConfig["policy"]; label: string }[] = [
@@ -17,6 +23,18 @@ const POLICY_FIELDS: { key: keyof AutopilotConfig["policy"]; label: string }[] =
   { key: "baseFeeMsat", label: "Base fee (msat)" },
   { key: "step", label: "Round to" },
   { key: "minChangePpm", label: "Min change" },
+];
+
+const REBALANCE_NUM_FIELDS: { key: NumKey; label: string; hint: string }[] = [
+  { key: "maxRebalancesPerRun", label: "Max rebalances / run", hint: "caps how many rebalances per run" },
+  { key: "rebalanceCooldownMinutes", label: "Rebalance cooldown (min)", hint: "min time between rebalances to the same target" },
+];
+
+const REBALANCE_POLICY_FIELDS: { key: RebKey; label: string; step: number; hint: string }[] = [
+  { key: "econRatio", label: "Econ ratio", step: 0.05, hint: "budget = target fee × this (<1 = margin)" },
+  { key: "amountSats", label: "Amount (sat)", step: 10_000, hint: "amount per rebalance" },
+  { key: "maxLocalRatioTarget", label: "Target ≤ local", step: 0.05, hint: "only refill below this local ratio" },
+  { key: "minLocalRatioSource", label: "Source ≥ local", step: 0.05, hint: "only pull from above this local ratio" },
 ];
 
 export function AutopilotPanel() {
@@ -72,6 +90,10 @@ export function AutopilotPanel() {
     setDraft((d) => (d ? { ...d, [key]: Math.max(0, value || 0) } : d));
   const setPolicyNum = (key: keyof AutopilotConfig["policy"], value: number) =>
     setDraft((d) => (d ? { ...d, policy: { ...d.policy, [key]: Math.max(0, value || 0) } } : d));
+  const setRebPolicyNum = (key: RebKey, value: number) =>
+    setDraft((d) =>
+      d ? { ...d, rebalancePolicy: { ...d.rebalancePolicy, [key]: Math.max(0, value || 0) } } : d,
+    );
 
   const save = async (overrides: Partial<AutopilotConfig> = {}) => {
     setBusy(true);
@@ -156,6 +178,45 @@ export function AutopilotPanel() {
         ))}
       </div>
 
+      <h3 className="sub">Auto-rebalance</h3>
+      <label className="ap-toggle">
+        <input
+          type="checkbox"
+          checked={draft.rebalanceEnabled}
+          disabled={busy}
+          onChange={(e) => save({ rebalanceEnabled: e.target.checked })}
+        />
+        <span>
+          {draft.rebalanceEnabled ? "Auto-rebalance enabled" : "Auto-rebalance disabled"} —
+          only ever runs <strong>profitable</strong> rebalances (cost ≤ budget)
+        </span>
+      </label>
+      <div className="policy-controls">
+        {REBALANCE_NUM_FIELDS.map((f) => (
+          <label key={f.key} className="policy-field" title={f.hint}>
+            <span>{f.label}</span>
+            <input
+              type="number"
+              min={0}
+              value={draft[f.key] as number}
+              onChange={(e) => setNum(f.key, Number(e.target.value))}
+            />
+          </label>
+        ))}
+        {REBALANCE_POLICY_FIELDS.map((f) => (
+          <label key={f.key} className="policy-field" title={f.hint}>
+            <span>{f.label}</span>
+            <input
+              type="number"
+              min={0}
+              step={f.step}
+              value={draft.rebalancePolicy[f.key]}
+              onChange={(e) => setRebPolicyNum(f.key, Number(e.target.value))}
+            />
+          </label>
+        ))}
+      </div>
+
       {error ? <p className="banner error">{error}</p> : null}
 
       <div className="apply-row">
@@ -194,6 +255,15 @@ export function AutopilotPanel() {
                   {run.changes.map((c) => (
                     <span key={c.id} className={c.ok ? "ap-ok" : "ap-fail"} title={c.error ?? ""}>
                       {c.alias}: {c.fromPpm}→{c.toPpm}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+              {run.rebalances.length ? (
+                <div className="ap-changes">
+                  {run.rebalances.map((r, j) => (
+                    <span key={j} className={r.ok ? "ap-ok" : "ap-fail"} title={r.error ?? ""}>
+                      ⇄ {r.alias}: {r.ok ? `${r.feeSats} sat` : "fail"}
                     </span>
                   ))}
                 </div>

@@ -114,6 +114,10 @@ export interface AutopilotConfig {
   cooldownMinutes: number;
   maxChangesPerRun: number;
   policy: FeePolicy;
+  rebalanceEnabled: boolean;
+  rebalancePolicy: RebalancePolicy;
+  maxRebalancesPerRun: number;
+  rebalanceCooldownMinutes: number;
 }
 
 export interface AutopilotChange {
@@ -125,12 +129,22 @@ export interface AutopilotChange {
   error?: string;
 }
 
+export interface AutopilotRebalance {
+  alias: string;
+  amountSats: number;
+  feeSats: number | null;
+  costPpm: number | null;
+  ok: boolean;
+  error?: string;
+}
+
 export interface AutopilotRun {
   at: string;
   attempted: number;
   applied: number;
   failed: number;
   changes: AutopilotChange[];
+  rebalances: AutopilotRebalance[];
 }
 
 export interface AutopilotState {
@@ -138,4 +152,78 @@ export interface AutopilotState {
   config: AutopilotConfig;
   lastRunAt: string | null;
   history: AutopilotRun[];
+}
+
+export interface RebalancePolicy {
+  econRatio: number;
+  maxLocalRatioTarget: number;
+  minLocalRatioSource: number;
+  amountSats: number;
+  minDemandSats: number;
+  flowWindowDays: number;
+  maxCandidates: number;
+}
+
+export interface RebalanceCandidate {
+  targetId: string;
+  targetAlias: string;
+  targetLocalRatio: number;
+  targetOutboundPpm: number;
+  demandSats: number;
+  sourceId: string;
+  sourceAlias: string;
+  sourceLocalRatio: number;
+  amountSats: number;
+  maxFeePpm: number;
+  estCostPpm: number | null;
+  estFeeSats: number | null;
+  routeFound: boolean;
+  profitable: boolean;
+  verdict: string;
+}
+
+export interface RebalanceAnalysis {
+  policy: RebalancePolicy;
+  candidates: RebalanceCandidate[];
+}
+
+export interface RebalanceExecResult {
+  ok: boolean;
+  targetId: string;
+  targetAlias: string;
+  sourceId: string;
+  sourceAlias: string;
+  amountSats: number;
+  budgetPpm: number;
+  feeSats: number | null;
+  costPpm: number | null;
+  error?: string;
+}
+
+export interface RebalanceRecord {
+  at: string;
+  via: "manual" | "autopilot";
+  targetId: string;
+  targetAlias: string;
+  sourceId: string;
+  sourceAlias: string;
+  amountSats: number;
+  budgetPpm: number;
+  feeSats: number | null;
+  costPpm: number | null;
+  ok: boolean;
+  error?: string;
+}
+
+export interface RebalanceLogSummary {
+  count: number;
+  failed: number;
+  totalFeeSats: number;
+  totalAmountSats: number;
+  avgCostPpm: number;
+}
+
+export interface RebalanceLogResponse {
+  summary: RebalanceLogSummary;
+  records: RebalanceRecord[];
 }
