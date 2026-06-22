@@ -1,0 +1,19 @@
+{
+  "name": "lightningmate",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted management dashboard for an Umbrel LND Lightning node",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev": "concurrently -n server,web -c blue,magenta \"npm:dev -w server\" \"npm:dev -w web\"",
+    "build": "npm run build -w server && npm run build -w web",
+    "start": "npm run start -w server",
+    "typecheck": "npm run typecheck -w server && npm run typecheck -w web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}

@@ -1,0 +1,155 @@
+:root {
+  --bg: #0c0e14;
+  --panel: #151823;
+  --panel-2: #1c2030;
+  --line: #262b3d;
+  --text: #e6e9f2;
+  --muted: #8a91a8;
+  --accent: #f7931a;
+  --green: #2fbf71;
+  --blue: #3b82f6;
+  --red: #ef4444;
+  --radius: 12px;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+code { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; }
+.muted { color: var(--muted); }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.earned { color: var(--green); }
+
+.app { max-width: 1180px; margin: 0 auto; padding: 20px 24px 60px; }
+
+.topbar {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 20px;
+}
+.brand { font-size: 18px; font-weight: 700; letter-spacing: 0.3px; }
+.refresh {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 8px; padding: 7px 12px; cursor: pointer;
+}
+.refresh:hover { border-color: var(--accent); }
+
+.banner {
+  border-radius: var(--radius); padding: 12px 16px; margin-bottom: 18px;
+}
+.banner.error { background: rgba(239,68,68,0.12); border: 1px solid var(--red); }
+.banner-sub { color: var(--muted); margin-top: 4px; font-size: 13px; }
+.banner code { color: var(--text); }
+
+.loading { color: var(--muted); padding: 40px 0; text-align: center; }
+
+/* ── Summary ─────────────────────────────────────────────── */
+.summary {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 18px 20px; margin-bottom: 18px;
+}
+.summary-head { display: flex; align-items: center; gap: 12px; }
+.node-dot { width: 12px; height: 12px; border-radius: 50%; flex: none; }
+.summary-head h1 { font-size: 18px; margin: 0; }
+.pubkey { color: var(--muted); font-size: 11px; word-break: break-all; }
+.sync { margin-left: auto; font-size: 12px; }
+.sync.ok { color: var(--green); }
+.sync.warn { color: var(--accent); }
+
+.stats {
+  display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px;
+  margin: 18px 0 14px;
+}
+.stat { background: var(--panel-2); border-radius: 10px; padding: 10px 12px; }
+.stat-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+.stat-value { font-size: 16px; font-weight: 600; margin-top: 3px; }
+.stat-sub { color: var(--muted); font-size: 11px; }
+
+.liquidity-bar {
+  height: 10px; background: var(--blue); border-radius: 6px; overflow: hidden;
+}
+.liquidity-out { height: 100%; background: var(--accent); }
+.liquidity-legend {
+  display: flex; justify-content: space-between; color: var(--muted);
+  font-size: 12px; margin-top: 5px;
+}
+
+/* ── Grid / panels ───────────────────────────────────────── */
+.grid {
+  display: grid; grid-template-columns: 1.5fr 1fr; gap: 18px; align-items: start;
+}
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } .stats { grid-template-columns: repeat(2, 1fr); } }
+
+.panel {
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 16px 18px;
+}
+.panel-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.panel-head h2 { font-size: 15px; margin: 0; }
+.controls { display: flex; gap: 10px; align-items: center; }
+.controls select, .check {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 7px; padding: 5px 8px; font-size: 12px;
+}
+.check { display: inline-flex; gap: 5px; align-items: center; cursor: pointer; }
+.empty { padding: 20px 0; text-align: center; }
+.hint { color: var(--muted); font-size: 12px; margin: 12px 0 0; line-height: 1.5; }
+.hint code, .hint em { color: var(--text); font-style: normal; }
+
+/* ── Channels table ──────────────────────────────────────── */
+table { width: 100%; border-collapse: collapse; }
+.channels th, .channels td, .forwards td {
+  padding: 8px 8px; border-bottom: 1px solid var(--line); font-size: 13px;
+}
+.channels th { color: var(--muted); font-weight: 500; text-align: left; font-size: 11px; text-transform: uppercase; }
+.channels tr.inactive { opacity: 0.5; }
+.bal-col { width: 160px; }
+
+.status { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 7px; }
+.status.on { background: var(--green); }
+.status.off { background: var(--muted); }
+
+.tag {
+  margin-left: 6px; font-size: 10px; color: var(--muted);
+  border: 1px solid var(--line); border-radius: 4px; padding: 0 4px;
+}
+
+.role { font-size: 11px; padding: 2px 7px; border-radius: 999px; }
+.role-source { background: rgba(59,130,246,0.15); color: #7eb0ff; }
+.role-sink { background: rgba(239,68,68,0.15); color: #ff9b9b; }
+.role-router { background: rgba(47,191,113,0.15); color: #7fe0ac; }
+
+.bal-bar {
+  position: relative; height: 18px; background: var(--blue);
+  border-radius: 5px; overflow: hidden;
+}
+.bal-local { height: 100%; background: var(--accent); }
+.bal-pct {
+  position: absolute; top: 0; right: 6px; line-height: 18px;
+  font-size: 11px; color: #fff; text-shadow: 0 0 3px rgba(0,0,0,0.6);
+}
+
+/* ── Flows ───────────────────────────────────────────────── */
+.flow-totals {
+  display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 14px;
+  font-size: 13px; color: var(--muted);
+}
+.flow-totals strong { color: var(--text); font-size: 16px; }
+.sub { font-size: 12px; text-transform: uppercase; letter-spacing: 0.4px; color: var(--muted); margin: 16px 0 8px; }
+
+.flow-list { list-style: none; margin: 0; padding: 0; }
+.flow-list li { margin-bottom: 10px; }
+.flow-row { display: flex; justify-content: space-between; font-size: 13px; }
+.flow-fee { color: var(--green); }
+.flow-bar { height: 8px; background: var(--blue); border-radius: 5px; margin: 3px 0; min-width: 4px; }
+.flow-out { height: 100%; background: var(--accent); border-radius: 5px 0 0 5px; }
+.flow-meta { font-size: 11px; }
+
+.forwards td { font-size: 12px; }
+
+.foot { text-align: center; margin-top: 28px; font-size: 12px; }

@@ -1,0 +1,42 @@
+# Umbrel App Store manifest for LightningMate.
+# Copy this folder into a fork of github.com/getumbrel/umbrel-apps (as
+# `lightningmate/`) to submit, or into a community app store repo to test first.
+# Replace <YOU> / <DOCKERHUB> / the image digest before publishing.
+manifestVersion: 1
+id: lightningmate
+category: finance
+name: LightningMate
+version: "0.1.0"
+tagline: Profit-aware management for your Lightning node
+description: >-
+  LightningMate is a management dashboard for your Lightning node. It connects
+  automatically to your Umbrel Lightning (LND) node using a read-only macaroon,
+  so it can show everything but change nothing.
+
+
+  See your channels with live local/remote balance bars, a source / sink /
+  router classification per channel, total balances, and forwarding flows —
+  which channels route the most and what fees you earn. Built to replace
+  tedious manual fee tweaking with real visibility.
+
+
+  Roadmap: rule/flow-based fee automation and a profit-aware rebalancing engine
+  (circular + PeerSwap/Loop) that only rebalances when it pays off.
+releaseNotes: >-
+  First release: read-only dashboard (node summary, channels, forwarding flows).
+developer: <YOU>
+website: https://github.com/<YOU>/lightningmate
+dependencies:
+  - lightning
+repo: https://github.com/<YOU>/lightningmate
+support: https://github.com/<YOU>/lightningmate/issues
+port: 3001
+gallery:
+  - 1.jpg
+  - 2.jpg
+  - 3.jpg
+path: ""
+defaultUsername: ""
+defaultPassword: ""
+submitter: <YOU>
+submission: https://github.com/getumbrel/umbrel-apps/pull/XXXX
