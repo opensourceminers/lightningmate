@@ -173,6 +173,7 @@ export function SuggestionsPanel() {
           <tr>
             <th className="num">Score</th>
             <th>Peer</th>
+            <th className="num">New reach</th>
             <th className="num">Channels</th>
             <th className="num">Capacity</th>
             <th className="num">Avg fee</th>
@@ -189,6 +190,9 @@ export function SuggestionsPanel() {
                 <td>
                   {s.alias}
                   <div className="muted reason">{s.reason}</div>
+                </td>
+                <td className="num strong" title="new destinations reachable in 2 hops">
+                  {s.newReach > 0 ? `+${s.newReach}` : "—"}
                 </td>
                 <td className="num">{s.channels}</td>
                 <td className="num">{satsCompact(s.capacitySats)}</td>
@@ -211,7 +215,7 @@ export function SuggestionsPanel() {
               </tr>
               {openFor === s.pubkey ? (
                 <tr className="open-row">
-                  <td colSpan={8}>
+                  <td colSpan={9}>
                     <div className="open-form">
                       <span>Open channel to <strong>{s.alias}</strong></span>
                       <label className="policy-field inline">
@@ -242,7 +246,7 @@ export function SuggestionsPanel() {
               ) : null}
               {result && result.pubkey === s.pubkey ? (
                 <tr className="open-row">
-                  <td colSpan={8}>
+                  <td colSpan={9}>
                     {result.ok ? (
                       <span className="open-ok">✓ Channel opening — funding tx {result.transactionId?.slice(0, 16)}…</span>
                     ) : (
