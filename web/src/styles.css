@@ -152,4 +152,78 @@ table { width: 100%; border-collapse: collapse; }
 
 .forwards td { font-size: 12px; }
 
+/* ── Fee automation ──────────────────────────────────────── */
+.fees { margin-top: 18px; }
+.change-badge {
+  background: rgba(247,147,26,0.15); color: var(--accent);
+  border-radius: 999px; padding: 3px 10px; font-size: 12px; font-weight: 600;
+}
+.dryrun-banner {
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-left: 3px solid var(--accent); border-radius: 8px;
+  padding: 10px 14px; font-size: 13px; color: var(--muted); margin-bottom: 14px;
+}
+.dryrun-banner strong { color: var(--text); }
+
+.policy-controls {
+  display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end;
+  margin-bottom: 14px;
+}
+.policy-field { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--muted); }
+.policy-field input {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 7px; padding: 6px 8px; width: 110px; font-size: 13px;
+}
+.reset {
+  background: transparent; color: var(--muted); border: 1px solid var(--line);
+  border-radius: 7px; padding: 7px 12px; cursor: pointer; height: 33px;
+}
+.reset:hover { color: var(--text); border-color: var(--accent); }
+
+.fee-table { width: 100%; border-collapse: collapse; }
+.fee-table th, .fee-table td {
+  padding: 7px 8px; border-bottom: 1px solid var(--line); font-size: 13px; text-align: left;
+}
+.fee-table th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; }
+.fee-table tr.inactive { opacity: 0.45; }
+.fee-table tr.changing td { background: rgba(247,147,26,0.06); }
+.fee-table .strong { font-weight: 700; color: var(--text); }
+.fee-table .reason { font-size: 12px; }
+.delta-up { color: var(--red); font-variant-numeric: tabular-nums; }
+.delta-down { color: var(--green); font-variant-numeric: tabular-nums; }
+
+.apply-row { display: flex; align-items: center; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
+.primary-btn {
+  background: var(--accent); color: #1a1205; border: none; border-radius: 8px;
+  padding: 9px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+}
+.primary-btn:disabled { background: var(--panel-2); color: var(--muted); cursor: not-allowed; }
+.apply-result { color: var(--green); font-size: 13px; }
+.fail-list { margin: 8px 0 0; padding-left: 18px; font-size: 12px; }
+
+/* Tabs */
+.tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 18px 0 16px; }
+.tab {
+  background: transparent; color: var(--muted); border: none; cursor: pointer;
+  padding: 9px 16px; font-size: 14px; border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.tab:hover { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
+
+/* Autopilot */
+.ap-status { font-size: 12px; }
+.ap-status.on { color: var(--green); }
+.ap-status.off { color: var(--muted); }
+.ap-toggle { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; font-size: 14px; cursor: pointer; }
+.ap-toggle input { width: 16px; height: 16px; accent-color: var(--accent); }
+.enable-steps { margin: 8px 0 0; padding-left: 18px; }
+.enable-steps code { color: var(--text); }
+.ap-history { list-style: none; margin: 0; padding: 0; }
+.ap-history li { border-bottom: 1px solid var(--line); padding: 8px 0; }
+.ap-run-head { display: flex; justify-content: space-between; font-size: 13px; }
+.ap-changes { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.ap-changes span { font-size: 11px; padding: 2px 7px; border-radius: 5px; }
+.ap-ok { background: rgba(47,191,113,0.15); color: #7fe0ac; }
+.ap-fail { background: rgba(239,68,68,0.15); color: #ff9b9b; }
+
 .foot { text-align: center; margin-top: 28px; font-size: 12px; }

@@ -62,3 +62,80 @@ export interface FlowSummary {
   perChannel: ChannelFlow[];
   recent: ForwardEvent[];
 }
+
+export interface FeePolicy {
+  minPpm: number;
+  maxPpm: number;
+  baseFeeMsat: number;
+  step: number;
+  minChangePpm: number;
+}
+
+export interface FeeProposal {
+  id: string;
+  peerAlias: string;
+  active: boolean;
+  transactionId: string | null;
+  transactionVout: number | null;
+  localRatio: number;
+  currentPpm: number;
+  proposedPpm: number;
+  deltaPpm: number;
+  currentBaseMsat: number;
+  proposedBaseMsat: number;
+  willChange: boolean;
+  reason: string;
+}
+
+export interface FeePreview {
+  policy: FeePolicy;
+  proposals: FeeProposal[];
+  changeCount: number;
+}
+
+export interface FeeApplyItem {
+  id: string;
+  transactionId: string;
+  transactionVout: number;
+  feeRatePpm: number;
+  baseFeeMsat: number;
+}
+
+export interface FeeApplyResult {
+  id: string;
+  ok: boolean;
+  feeRatePpm: number;
+  error?: string;
+}
+
+export interface AutopilotConfig {
+  enabled: boolean;
+  intervalMinutes: number;
+  cooldownMinutes: number;
+  maxChangesPerRun: number;
+  policy: FeePolicy;
+}
+
+export interface AutopilotChange {
+  id: string;
+  alias: string;
+  fromPpm: number;
+  toPpm: number;
+  ok: boolean;
+  error?: string;
+}
+
+export interface AutopilotRun {
+  at: string;
+  attempted: number;
+  applied: number;
+  failed: number;
+  changes: AutopilotChange[];
+}
+
+export interface AutopilotState {
+  canWrite: boolean;
+  config: AutopilotConfig;
+  lastRunAt: string | null;
+  history: AutopilotRun[];
+}

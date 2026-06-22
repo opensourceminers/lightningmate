@@ -3,8 +3,9 @@ import { join } from "node:path";
 import cors from "cors";
 import express from "express";
 import { loadConfig } from "./config.js";
-import { getLnd } from "./lnd.js";
+import { getLnd, getWriteLnd } from "./lnd.js";
 import { createApiRouter } from "./routes/api.js";
+import { Autopilot } from "./services/autopilot.js";
 
 // Never let a startup error vanish silently — print it so it's diagnosable.
 process.on("uncaughtException", (err) => {
@@ -32,10 +33,14 @@ function main(): void {
     process.exit(1);
   }
 
+  const writeLnd = getWriteLnd(config);
+  const autopilot = new Autopilot(config.dataDir, lnd, writeLnd);
+  autopilot.start();
+
   const app = express();
   app.use(cors());
   app.use(express.json());
-  app.use("/api", createApiRouter(lnd, config));
+  app.use("/api", createApiRouter(lnd, writeLnd, config, autopilot));
 
   // In production (Docker/Umbrel) we serve the built React app from the same
   // origin, so the whole tool is a single container behind Umbrel's app_proxy.
@@ -49,7 +54,8 @@ function main(): void {
 
   app.listen(config.port, () => {
     console.log(`⚡ LightningMate listening on http://localhost:${config.port}`);
-    console.log(`   LND socket: ${config.lnd.socket}  (read-only)`);
+    const mode = config.writeEnabled ? "read + write" : "read-only";
+    console.log(`   LND socket: ${config.lnd.socket}  (${mode})`);
   });
 }
 
