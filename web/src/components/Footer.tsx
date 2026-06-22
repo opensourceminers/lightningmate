@@ -46,7 +46,7 @@ export function Footer() {
 
   return (
     <footer className="foot">
-      <div className="foot-pills">
+      <div className="foot-row">
         <a className="foot-pill" href={GITHUB} target="_blank" rel="noreferrer">
           <GithubIcon /> GitHub
         </a>
@@ -59,16 +59,12 @@ export function Footer() {
         <a className="foot-pill donate" href={`bitcoin:${DONATE}`}>
           <BoltIcon /> Donate
         </a>
-      </div>
-
-      <div className="foot-donate">
-        <BoltIcon />
-        <code>{DONATE}</code>
+        <code className="foot-addr">{DONATE}</code>
         <button className="foot-copy-btn" onClick={copy}>{copied ? "✓ copied" : "copy"}</button>
       </div>
 
       <div className="foot-copy muted">
-        © {new Date().getFullYear()} opensourceminers.de · MIT License · LightningMate
+        © {new Date().getFullYear()} opensourceminers.de · MIT License · Lightning Mate
       </div>
     </footer>
   );

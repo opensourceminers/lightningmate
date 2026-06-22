@@ -71,27 +71,6 @@ export function App() {
         </div>
       </header>
 
-      {anyError ? (
-        <div className="banner error">
-          Couldn’t reach the node: {anyError}
-          <div className="banner-sub">
-            Check <code>LND_SOCKET</code>, cert and read-only macaroon in your
-            <code> .env</code>, and that the backend is running.
-          </div>
-        </div>
-      ) : null}
-
-      {initialLoading ? <div className="loading">Connecting to your node…</div> : null}
-
-      {node.data ? <SummaryBar node={node.data} price={price.data} /> : null}
-      {node.data ? <AlertsBar /> : null}
-      {node.data ? (
-        <div className="hero-row">
-          <HealthScore />
-          <PnlOverview price={price.data} />
-        </div>
-      ) : null}
-
       <nav className="tabs">
         {TABS.map((t) => (
           <button
@@ -104,16 +83,38 @@ export function App() {
         ))}
       </nav>
 
+      {anyError ? (
+        <div className="banner error">
+          Couldn’t reach the node: {anyError}
+          <div className="banner-sub">
+            Check <code>LND_SOCKET</code>, cert and read-only macaroon in your
+            <code> .env</code>, and that the backend is running.
+          </div>
+        </div>
+      ) : null}
+
+      {initialLoading ? <div className="loading">Connecting to your node…</div> : null}
+      {node.data ? <AlertsBar /> : null}
+
       <div className="tab-body">
         {tab === "channels" ? (
-          channels.data ? (
-            <>
-              <LiquidityMap channels={channels.data} />
-              <ChannelTable channels={channels.data} />
-            </>
-          ) : (
-            <Placeholder />
-          )
+          <>
+            {node.data ? <SummaryBar node={node.data} price={price.data} /> : null}
+            {node.data ? (
+              <div className="hero-row">
+                <HealthScore />
+                <PnlOverview price={price.data} />
+              </div>
+            ) : null}
+            {channels.data ? (
+              <>
+                <LiquidityMap channels={channels.data} />
+                <ChannelTable channels={channels.data} />
+              </>
+            ) : (
+              <Placeholder />
+            )}
+          </>
         ) : null}
         {tab === "forwards" ? <ForwardsPanel /> : null}
         {tab === "suggestions" ? <SuggestionsPanel /> : null}
