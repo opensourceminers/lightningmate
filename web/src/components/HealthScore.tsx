@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { NodeScore } from "../types";
 import { useCountUp } from "../useCountUp";
+import { Skeleton } from "./Skeleton";
 
 const GRADE_CLASS: Record<string, string> = {
   A: "g-a",
@@ -63,8 +64,19 @@ export function HealthScore() {
             ))}
           </div>
         </div>
-      ) : (
-        <p className="muted empty">Scoring your node…</p>
+      ) : error ? null : (
+        <div className="score-body">
+          <Skeleton width={92} height={92} radius={16} />
+          <div className="score-components">
+            {Array.from({ length: 8 }).map((_, i) => (
+              <div className="score-row" key={i}>
+                <Skeleton width={90} height={10} />
+                <Skeleton height={8} />
+                <Skeleton width={20} height={10} />
+              </div>
+            ))}
+          </div>
+        </div>
       )}
     </section>
   );

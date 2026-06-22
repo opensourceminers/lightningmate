@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { ChannelOverride, ChannelRole, ChannelView, FeeMode, OverrideMap } from "../types";
 import { satsCompact } from "../format";
+import { useUi } from "./Overlay";
+import { EmptyState } from "./Skeleton";
 
 const ROLE_LABEL: Record<ChannelRole, string> = {
   source: "source",
@@ -61,6 +63,7 @@ type SortKey = "capacity" | "localRatio" | "totalSent" | "totalReceived";
 export function ChannelTable({ channels }: { channels: ChannelView[] }) {
   const [sort, setSort] = useState<SortKey>("capacity");
   const [onlyActive, setOnlyActive] = useState(false);
+  const { toast, confirm } = useUi();
   const [overrides, setOverrides] = useState<OverrideMap>({});
   const [canWrite, setCanWrite] = useState(false);
   const [closingId, setClosingId] = useState<string | null>(null);
@@ -75,14 +78,21 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
   };
 
   const closeChannel = async (c: ChannelView) => {
-    const how = c.active ? "cooperatively close" : "force-close (offline peer)";
-    if (!window.confirm(`${how} the channel with ${c.peerAlias}? This is an on-chain transaction.`)) return;
+    const how = c.active ? "Cooperatively close" : "Force-close (offline peer)";
+    const ok = await confirm({
+      title: "Close channel",
+      message: `${how} the channel with ${c.peerAlias}? This is an on-chain transaction.`,
+      confirmLabel: "Close channel",
+      danger: true,
+    });
+    if (!ok) return;
     setClosingId(c.id);
     try {
       const r = await api.channelClose(c.transactionId, c.transactionVout, !c.active);
-      window.alert(r.ok ? `Closing — funding ${r.transactionId?.slice(0, 16)}…` : `Close failed: ${r.error}`);
+      if (r.ok) toast(`Closing channel — funding ${r.transactionId?.slice(0, 12)}…`, "success");
+      else toast(`Close failed: ${r.error}`, "error");
     } catch (e) {
-      window.alert(`Close failed: ${e instanceof Error ? e.message : String(e)}`);
+      toast(`Close failed: ${e instanceof Error ? e.message : String(e)}`, "error");
     } finally {
       setClosingId(null);
     }
@@ -161,7 +171,7 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
           ))}
         </tbody>
       </table>
-      {rows.length === 0 ? <p className="muted empty">No channels to show.</p> : null}
+      {rows.length === 0 ? <EmptyState icon="⚡">No channels to show.</EmptyState> : null}
       <p className="hint">
         <strong>Roles</strong>: <em>source</em> mostly receives, <em>sink</em> mostly sends,
         <em> router</em> is balanced. <strong>Autopilot fee</strong>: <code>auto</code> follows the
