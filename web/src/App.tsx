@@ -12,8 +12,10 @@ import { HealthScore } from "./components/HealthScore";
 import { LiquidityMap } from "./components/LiquidityMap";
 import { RebalancePanel } from "./components/RebalancePanel";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { SkeletonPanel } from "./components/Skeleton";
 import { SuggestionsPanel } from "./components/SuggestionsPanel";
 import { SummaryBar } from "./components/SummaryBar";
+import { TabIcon } from "./components/TabIcon";
 import { usePolledData } from "./usePolledData";
 
 type Tab =
@@ -78,6 +80,7 @@ export function App() {
             className={`tab ${tab === t.id ? "active" : ""}`}
             onClick={() => setTab(t.id)}
           >
+            <TabIcon id={t.id} />
             {t.label}
           </button>
         ))}
@@ -112,7 +115,7 @@ export function App() {
                 <ChannelTable channels={channels.data} />
               </>
             ) : (
-              <Placeholder />
+              <SkeletonPanel rows={6} />
             )}
           </>
         ) : null}
@@ -127,8 +130,4 @@ export function App() {
       <Footer />
     </div>
   );
-}
-
-function Placeholder() {
-  return <div className="panel"><p className="muted empty">Loading…</p></div>;
 }

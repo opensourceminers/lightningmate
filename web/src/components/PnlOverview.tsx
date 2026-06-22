@@ -3,6 +3,7 @@ import { api } from "../api";
 import type { PnlSummary, PriceInfo } from "../types";
 import { fiat, sats } from "../format";
 import { useCountUp } from "../useCountUp";
+import { Skeleton } from "./Skeleton";
 
 const WINDOWS: { label: string; days: number }[] = [
   { label: "30d", days: 30 },
@@ -114,8 +115,23 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
             </p>
           ) : null}
         </>
-      ) : (
-        <p className="muted empty">Loading P&amp;L…</p>
+      ) : error ? null : (
+        <div className="pnl-grid">
+          <div className="pnl-net">
+            <Skeleton width={70} height={11} />
+            <div style={{ height: 10 }} />
+            <Skeleton width={150} height={30} />
+            <div style={{ height: 10 }} />
+            <Skeleton width={120} height={10} />
+          </div>
+          <div className="pnl-items">
+            {Array.from({ length: 4 }).map((_, i) => (
+              <div key={i} style={{ margin: "9px 0" }}>
+                <Skeleton height={12} />
+              </div>
+            ))}
+          </div>
+        </div>
       )}
     </section>
   );

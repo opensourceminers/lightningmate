@@ -9,6 +9,8 @@ import type {
 } from "../types";
 import { sats, satsCompact } from "../format";
 import { Scanning } from "./Scanning";
+import { useUi } from "./Overlay";
+import { EmptyState } from "./Skeleton";
 
 type NumKey = "count" | "minChannels" | "maxStaleDays";
 
@@ -40,6 +42,7 @@ function CopyButton({ pubkey }: { pubkey: string }) {
 }
 
 export function SuggestionsPanel() {
+  const { toast, confirm } = useUi();
   const [draft, setDraft] = useState(DEFAULTS);
   const [data, setData] = useState<SuggestionsResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -78,15 +81,25 @@ export function SuggestionsPanel() {
   }, []);
 
   const closeChannel = async (c: CloseCandidate) => {
-    const how = c.active ? "cooperatively close" : "force-close (offline peer)";
-    if (!window.confirm(`${how} the channel with ${c.alias}? This is an on-chain transaction.`)) return;
+    const how = c.active ? "Cooperatively close" : "Force-close (offline peer)";
+    const ok = await confirm({
+      title: "Close channel",
+      message: `${how} the channel with ${c.alias}? This is an on-chain transaction.`,
+      confirmLabel: "Close channel",
+      danger: true,
+    });
+    if (!ok) return;
     setClosingId(c.channelId);
     try {
       const r = await api.channelClose(c.transactionId, c.transactionVout, !c.active);
-      window.alert(r.ok ? `Closing — funding ${r.transactionId?.slice(0, 16)}…` : `Close failed: ${r.error}`);
-      if (r.ok) await loadClose();
+      if (r.ok) {
+        toast(`Closing channel — funding ${r.transactionId?.slice(0, 12)}…`, "success");
+        await loadClose();
+      } else {
+        toast(`Close failed: ${r.error}`, "error");
+      }
     } catch (e) {
-      window.alert(`Close failed: ${e instanceof Error ? e.message : String(e)}`);
+      toast(`Close failed: ${e instanceof Error ? e.message : String(e)}`, "error");
     } finally {
       setClosingId(null);
     }
@@ -243,7 +256,7 @@ export function SuggestionsPanel() {
         </tbody>
       </table>
       {rows.length === 0 && !loading && !error ? (
-        <p className="muted empty">No suggestions — try lowering “Min channels” or widening “Max stale”.</p>
+        <EmptyState icon="🔍">No suggestions — try lowering “Min channels” or widening “Max stale”.</EmptyState>
       ) : null}
       </section>
 
@@ -257,7 +270,7 @@ export function SuggestionsPanel() {
           {canWrite ? null : <> Closing is <strong>disabled</strong> (read-only).</>}
         </div>
         {closeData.length === 0 ? (
-          <p className="muted empty">No idle channels — every active channel has routed. 👍</p>
+          <EmptyState icon="✅">No idle channels — every active channel has routed.</EmptyState>
         ) : (
           <table className="fee-table">
             <thead>
