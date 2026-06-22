@@ -158,6 +158,10 @@ export interface AutopilotConfig {
   rebalancePolicy: RebalancePolicy;
   maxRebalancesPerRun: number;
   rebalanceCooldownMinutes: number;
+  channelEnabled: boolean;
+  channelReserveSats: number;
+  channelSizeSats: number;
+  channelCooldownMinutes: number;
 }
 
 export interface AutopilotChange {
@@ -178,6 +182,14 @@ export interface AutopilotRebalance {
   error?: string;
 }
 
+export interface AutopilotChannelOpen {
+  alias: string;
+  sizeSats: number;
+  ok: boolean;
+  transactionId?: string;
+  error?: string;
+}
+
 export interface AutopilotRun {
   at: string;
   attempted: number;
@@ -185,6 +197,7 @@ export interface AutopilotRun {
   failed: number;
   changes: AutopilotChange[];
   rebalances: AutopilotRebalance[];
+  channels: AutopilotChannelOpen[];
 }
 
 export interface AutopilotState {
@@ -316,21 +329,6 @@ export type OverrideMap = Record<string, ChannelOverride>;
 export interface Alert {
   level: "warn" | "info";
   message: string;
-}
-
-export interface WalletTx {
-  id: string;
-  createdAt: string;
-  tokens: number;
-  fee: number;
-  isOutgoing: boolean;
-  isConfirmed: boolean;
-}
-
-export interface WalletInfo {
-  confirmedSats: number;
-  pendingSats: number;
-  transactions: WalletTx[];
 }
 
 export interface CloseChannelResult {

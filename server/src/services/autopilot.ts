@@ -1,5 +1,7 @@
-import type { AuthenticatedLnd } from "lightning";
+import { getChainBalance, type AuthenticatedLnd } from "lightning";
 import { JsonStore } from "../store.js";
+import { openChannelTo } from "./channelOps.js";
+import { getChannelSuggestions } from "./suggestions.js";
 import {
   applyFees,
   DEFAULT_POLICY,
@@ -30,6 +32,14 @@ export interface AutopilotConfig {
   maxRebalancesPerRun: number;
   /** Per-target minimum time between rebalances. */
   rebalanceCooldownMinutes: number;
+  /** Channel autopilot: open a channel to the top suggestion when funds allow. */
+  channelEnabled: boolean;
+  /** Keep at least this much on-chain (sats) untouched. */
+  channelReserveSats: number;
+  /** Channel size to open; 0 = use the suggestion's recommended size. */
+  channelSizeSats: number;
+  /** Minimum time between auto-opens. */
+  channelCooldownMinutes: number;
 }
 
 export interface AutopilotChange {
@@ -50,6 +60,14 @@ export interface AutopilotRebalance {
   error?: string;
 }
 
+export interface AutopilotChannelOpen {
+  alias: string;
+  sizeSats: number;
+  ok: boolean;
+  transactionId?: string;
+  error?: string;
+}
+
 export interface AutopilotRun {
   at: string;
   attempted: number;
@@ -57,6 +75,7 @@ export interface AutopilotRun {
   failed: number;
   changes: AutopilotChange[];
   rebalances: AutopilotRebalance[];
+  channels: AutopilotChannelOpen[];
 }
 
 interface PersistedState {
@@ -64,6 +83,7 @@ interface PersistedState {
   lastRunAt: string | null;
   perChannelLastApplied: Record<string, string>;
   perTargetLastRebalanced: Record<string, string>;
+  lastChannelOpenAt: string | null;
   history: AutopilotRun[];
 }
 
@@ -77,6 +97,10 @@ const DEFAULT_CONFIG: AutopilotConfig = {
   rebalancePolicy: DEFAULT_REBALANCE_POLICY,
   maxRebalancesPerRun: 2,
   rebalanceCooldownMinutes: 720,
+  channelEnabled: false,
+  channelReserveSats: 50_000,
+  channelSizeSats: 0,
+  channelCooldownMinutes: 1_440,
 };
 
 const HISTORY_LIMIT = 50;
@@ -100,6 +124,7 @@ export class Autopilot {
       lastRunAt: null,
       perChannelLastApplied: {},
       perTargetLastRebalanced: {},
+      lastChannelOpenAt: null,
       history: [],
     });
     // Merge in any newly added config defaults from older persisted state.
@@ -141,6 +166,7 @@ export class Autopilot {
       // Refuse to "enable" anything when we have no write macaroon.
       this.state.config.enabled = false;
       this.state.config.rebalanceEnabled = false;
+      this.state.config.channelEnabled = false;
     }
     this.persist();
     this.reschedule();
@@ -148,8 +174,8 @@ export class Autopilot {
 
   private reschedule(): void {
     this.stop();
-    const { enabled, rebalanceEnabled } = this.state.config;
-    if ((!enabled && !rebalanceEnabled) || !this.canWrite) return;
+    const { enabled, rebalanceEnabled, channelEnabled } = this.state.config;
+    if ((!enabled && !rebalanceEnabled && !channelEnabled) || !this.canWrite) return;
     const ms = Math.max(1, this.state.config.intervalMinutes) * 60_000;
     this.timer = setInterval(() => void this.runOnce(), ms);
     // Kick off one run shortly after enabling, without blocking.
@@ -250,7 +276,46 @@ export class Autopilot {
     return out;
   }
 
-  /** Run the autopilot once: fee changes (if enabled) then rebalances (if enabled). */
+  /** Open a channel to the top suggestion when on-chain funds allow. */
+  private async runChannels(writeLnd: AuthenticatedLnd): Promise<AutopilotChannelOpen[]> {
+    const cfg = this.state.config;
+
+    // Respect the cooldown between auto-opens.
+    if (this.state.lastChannelOpenAt) {
+      const elapsedMin = (Date.now() - new Date(this.state.lastChannelOpenAt).getTime()) / 60_000;
+      if (elapsedMin < cfg.channelCooldownMinutes) return [];
+    }
+
+    const { chain_balance } = await getChainBalance({ lnd: this.readLnd });
+    const available = chain_balance - cfg.channelReserveSats;
+    if (available <= 0) return [];
+
+    const { suggestions } = await getChannelSuggestions(this.readLnd, {});
+    const top = suggestions[0];
+    if (!top) return [];
+
+    const size = cfg.channelSizeSats > 0 ? cfg.channelSizeSats : top.recommendedSizeSats;
+    if (available < size) return []; // not enough on-chain to fund it + keep the reserve
+
+    const res = await openChannelTo(writeLnd, {
+      pubkey: top.pubkey,
+      socket: top.socket || undefined,
+      localTokens: size,
+    });
+    if (res.ok) this.state.lastChannelOpenAt = new Date().toISOString();
+
+    return [
+      {
+        alias: top.alias,
+        sizeSats: size,
+        ok: res.ok,
+        transactionId: res.transactionId,
+        error: res.error,
+      },
+    ];
+  }
+
+  /** Run the autopilot once: fees, then rebalances, then channel opens (each if enabled). */
   async runOnce(): Promise<AutopilotRun> {
     const emptyRun: AutopilotRun = {
       at: new Date().toISOString(),
@@ -259,6 +324,7 @@ export class Autopilot {
       failed: 0,
       changes: [],
       rebalances: [],
+      channels: [],
     };
     if (this.running || !this.writeLnd) return emptyRun;
     this.running = true;
@@ -269,14 +335,22 @@ export class Autopilot {
       const rebalances = this.state.config.rebalanceEnabled
         ? await this.runRebalances(writeLnd)
         : [];
+      const channels = this.state.config.channelEnabled ? await this.runChannels(writeLnd) : [];
 
       const run: AutopilotRun = {
         at: new Date().toISOString(),
-        attempted: changes.length + rebalances.length,
-        applied: changes.filter((c) => c.ok).length + rebalances.filter((r) => r.ok).length,
-        failed: changes.filter((c) => !c.ok).length + rebalances.filter((r) => !r.ok).length,
+        attempted: changes.length + rebalances.length + channels.length,
+        applied:
+          changes.filter((c) => c.ok).length +
+          rebalances.filter((r) => r.ok).length +
+          channels.filter((c) => c.ok).length,
+        failed:
+          changes.filter((c) => !c.ok).length +
+          rebalances.filter((r) => !r.ok).length +
+          channels.filter((c) => !c.ok).length,
         changes,
         rebalances,
+        channels,
       };
 
       this.state.lastRunAt = run.at;

@@ -9,7 +9,10 @@ type NumKey =
   | "cooldownMinutes"
   | "maxChangesPerRun"
   | "maxRebalancesPerRun"
-  | "rebalanceCooldownMinutes";
+  | "rebalanceCooldownMinutes"
+  | "channelReserveSats"
+  | "channelSizeSats"
+  | "channelCooldownMinutes";
 type RebKey = "econRatio" | "amountSats" | "maxLocalRatioTarget" | "minLocalRatioSource";
 
 // The recommended (optimal) defaults — used as the baseline and for "reset".
@@ -20,6 +23,9 @@ const RECOMMENDED: Pick<
   | "maxChangesPerRun"
   | "maxRebalancesPerRun"
   | "rebalanceCooldownMinutes"
+  | "channelReserveSats"
+  | "channelSizeSats"
+  | "channelCooldownMinutes"
   | "policy"
   | "rebalancePolicy"
 > = {
@@ -28,6 +34,9 @@ const RECOMMENDED: Pick<
   maxChangesPerRun: 5,
   maxRebalancesPerRun: 2,
   rebalanceCooldownMinutes: 720,
+  channelReserveSats: 50_000,
+  channelSizeSats: 0,
+  channelCooldownMinutes: 1_440,
   policy: { minPpm: 50, maxPpm: 1000, baseFeeMsat: 1000, step: 10, minChangePpm: 25 },
   rebalancePolicy: {
     econRatio: 0.8,
@@ -39,6 +48,12 @@ const RECOMMENDED: Pick<
     maxCandidates: 8,
   },
 };
+
+const CHANNEL_NUM_FIELDS: { key: NumKey; label: string }[] = [
+  { key: "channelSizeSats", label: "Channel size (sat, 0=auto)" },
+  { key: "channelReserveSats", label: "Keep on-chain reserve (sat)" },
+  { key: "channelCooldownMinutes", label: "Open cooldown (min)" },
+];
 
 const FEE_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "intervalMinutes", label: "Run every (min)" },
@@ -154,6 +169,9 @@ export function AutopilotPanel() {
       maxChangesPerRun: draft.maxChangesPerRun,
       maxRebalancesPerRun: draft.maxRebalancesPerRun,
       rebalanceCooldownMinutes: draft.rebalanceCooldownMinutes,
+      channelReserveSats: draft.channelReserveSats,
+      channelSizeSats: draft.channelSizeSats,
+      channelCooldownMinutes: draft.channelCooldownMinutes,
       policy: draft.policy,
       rebalancePolicy: draft.rebalancePolicy,
     }) === JSON.stringify(RECOMMENDED);
@@ -183,6 +201,15 @@ export function AutopilotPanel() {
           <div className="ap-master-sub">Runs profitable rebalances only (cost ≤ budget)</div>
         </div>
         <RunState on={server.config.rebalanceEnabled} />
+      </div>
+
+      <div className="ap-master">
+        <Switch checked={draft.channelEnabled} disabled={busy} onChange={(v) => save({ channelEnabled: v })} label="Channel autopilot" />
+        <div className="ap-master-text">
+          <div className="ap-master-title">Channel autopilot</div>
+          <div className="ap-master-sub">Opens a channel to the top suggestion when on-chain funds allow</div>
+        </div>
+        <RunState on={server.config.channelEnabled} />
       </div>
 
       {/* Recommended / advanced */}
@@ -237,6 +264,15 @@ export function AutopilotPanel() {
               </label>
             ))}
           </div>
+          <h3 className="sub">Channel autopilot</h3>
+          <div className="policy-controls">
+            {CHANNEL_NUM_FIELDS.map((f) => (
+              <label key={f.key} className="policy-field">
+                <span>{f.label}</span>
+                <input type="number" min={0} value={draft[f.key] as number} onChange={(e) => setNum(f.key, Number(e.target.value))} />
+              </label>
+            ))}
+          </div>
           <div className="apply-row">
             <button className="primary-btn" disabled={busy} onClick={() => save()}>Save settings</button>
           </div>
@@ -280,6 +316,15 @@ export function AutopilotPanel() {
                   {run.rebalances.map((r, j) => (
                     <span key={j} className={r.ok ? "ap-ok" : "ap-fail"} title={r.error ?? ""}>
                       ⇄ {r.alias}: {r.ok ? `${r.feeSats} sat` : "fail"}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+              {run.channels.length ? (
+                <div className="ap-changes">
+                  {run.channels.map((c, j) => (
+                    <span key={j} className={c.ok ? "ap-ok" : "ap-fail"} title={c.error ?? ""}>
+                      ⊕ {c.alias}: {c.ok ? `${Math.round(c.sizeSats / 1000)}k sat` : "fail"}
                     </span>
                   ))}
                 </div>

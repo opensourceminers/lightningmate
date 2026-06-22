@@ -14,7 +14,6 @@ import {
 import { getChannelSuggestions, type SuggestionPolicy } from "../services/suggestions.js";
 import { getPnl } from "../services/pnl.js";
 import { closeChannelByOutpoint, openChannelTo } from "../services/channelOps.js";
-import { getWallet, newAddress } from "../services/wallet.js";
 import { getBtcPrice } from "../services/price.js";
 import type { SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
@@ -153,26 +152,6 @@ export function createApiRouter(
     "/alerts",
     wrap(async (_req, res) => {
       res.json(await getAlerts(lnd));
-    }),
-  );
-
-  // On-chain wallet: balance + recent transactions.
-  router.get(
-    "/wallet",
-    wrap(async (_req, res) => {
-      res.json(await getWallet(lnd));
-    }),
-  );
-
-  // Fresh receive address — requires write access.
-  router.post(
-    "/wallet/address",
-    wrap(async (_req, res) => {
-      if (!writeLnd) {
-        res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
-        return;
-      }
-      res.json({ address: await newAddress(writeLnd) });
     }),
   );
 
