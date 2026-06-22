@@ -16,6 +16,8 @@ import { getPnl } from "../services/pnl.js";
 import { openChannelTo } from "../services/channelOps.js";
 import { getBtcPrice } from "../services/price.js";
 import type { SettingsStore } from "../services/settings.js";
+import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
+import { getAlerts } from "../services/alerts.js";
 import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 
@@ -81,6 +83,7 @@ export function createApiRouter(
   autopilot: Autopilot,
   rebalanceLog: RebalanceLog,
   settings: SettingsStore,
+  overrides: OverridesStore,
 ): Router {
   const router = Router();
 
@@ -125,7 +128,30 @@ export function createApiRouter(
   router.get(
     "/fees/preview",
     wrap(async (req, res) => {
-      res.json(await getFeePreview(lnd, parsePolicyQuery(req.query)));
+      res.json(await getFeePreview(lnd, parsePolicyQuery(req.query), overrides.all()));
+    }),
+  );
+
+  // Per-channel manual fee overrides (auto / fixed / exclude).
+  router.get("/overrides", (_req, res) => {
+    res.json(overrides.all());
+  });
+  router.post("/overrides", (req, res) => {
+    const { channelId, mode, fixedPpm } = req.body ?? {};
+    if (!channelId || !["auto", "fixed", "exclude"].includes(mode)) {
+      res.status(400).json({ error: "bad_request", message: "channelId and a valid mode are required." });
+      return;
+    }
+    const override: ChannelOverride = { mode };
+    if (mode === "fixed" && Number.isFinite(Number(fixedPpm))) override.fixedPpm = Number(fixedPpm);
+    res.json(overrides.set(String(channelId), override));
+  });
+
+  // Derived alerts (offline channels, low balances, …).
+  router.get(
+    "/alerts",
+    wrap(async (_req, res) => {
+      res.json(await getAlerts(lnd));
     }),
   );
 

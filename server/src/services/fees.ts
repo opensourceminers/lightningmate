@@ -6,6 +6,7 @@ import {
 } from "lightning";
 import { getChannelsView } from "./channels.js";
 import { getOwnPubkey } from "./node.js";
+import type { OverrideMap } from "./overrides.js";
 
 /**
  * A fee policy maps each channel's *current local balance ratio* to a target
@@ -80,9 +81,10 @@ function reasonFor(localRatio: number, delta: number): string {
  */
 export async function getFeePreview(
   lnd: AuthenticatedLnd,
-  overrides: Partial<FeePolicy> = {},
+  policyOverrides: Partial<FeePolicy> = {},
+  channelOverrides: OverrideMap = {},
 ): Promise<FeePreview> {
-  const policy = { ...DEFAULT_POLICY, ...overrides };
+  const policy = { ...DEFAULT_POLICY, ...policyOverrides };
 
   const [channels, rates] = await Promise.all([
     getChannelsView(lnd),
@@ -94,8 +96,23 @@ export async function getFeePreview(
   const proposals: FeeProposal[] = channels.map((ch) => {
     const rate = rateById.get(ch.id);
     const currentPpm = rate?.fee_rate ?? 0;
-    const proposedPpm = targetPpm(ch.localRatio, policy);
+    const ov = channelOverrides[ch.id];
+
+    let proposedPpm: number;
+    let reason: string;
+    if (ov?.mode === "exclude") {
+      proposedPpm = currentPpm;
+      reason = "excluded (manual)";
+    } else if (ov?.mode === "fixed") {
+      proposedPpm = ov.fixedPpm ?? currentPpm;
+      reason = `pinned to ${proposedPpm} ppm (manual)`;
+    } else {
+      proposedPpm = targetPpm(ch.localRatio, policy);
+      reason = reasonFor(ch.localRatio, proposedPpm - currentPpm);
+    }
+
     const deltaPpm = proposedPpm - currentPpm;
+    const willChange = ov?.mode !== "exclude" && Math.abs(deltaPpm) >= policy.minChangePpm;
     return {
       id: ch.id,
       peerAlias: ch.peerAlias,
@@ -108,8 +125,8 @@ export async function getFeePreview(
       deltaPpm,
       currentBaseMsat: rate ? Number(rate.base_fee_mtokens) : 0,
       proposedBaseMsat: policy.baseFeeMsat,
-      willChange: Math.abs(deltaPpm) >= policy.minChangePpm,
-      reason: reasonFor(ch.localRatio, deltaPpm),
+      willChange,
+      reason,
     };
   });
 

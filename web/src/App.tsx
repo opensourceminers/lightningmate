@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { api } from "./api";
+import { AlertsBar } from "./components/AlertsBar";
 import { AutopilotPanel } from "./components/AutopilotPanel";
 import { BrandMark } from "./components/BrandMark";
 import { ChannelTable } from "./components/ChannelTable";
@@ -69,6 +70,7 @@ export function App() {
       {initialLoading ? <div className="loading">Connecting to your node…</div> : null}
 
       {node.data ? <SummaryBar node={node.data} price={price.data} /> : null}
+      {node.data ? <AlertsBar /> : null}
       {node.data ? (
         <div className="hero-row">
           <HealthScore />

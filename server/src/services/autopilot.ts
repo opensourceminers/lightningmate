@@ -14,6 +14,7 @@ import {
   type RebalancePolicy,
 } from "./rebalance.js";
 import type { RebalanceLog } from "./rebalanceLog.js";
+import type { OverridesStore } from "./overrides.js";
 
 export interface AutopilotConfig {
   enabled: boolean;
@@ -91,6 +92,7 @@ export class Autopilot {
     private readonly readLnd: AuthenticatedLnd,
     private readonly writeLnd: AuthenticatedLnd | undefined,
     private readonly rebalanceLog: RebalanceLog,
+    private readonly overrides: OverridesStore,
   ) {
     this.store = new JsonStore<PersistedState>(dataDir, "autopilot.json");
     this.state = this.store.read({
@@ -169,7 +171,7 @@ export class Autopilot {
 
   /** Compute and apply eligible fee changes. */
   private async runFees(writeLnd: AuthenticatedLnd): Promise<AutopilotChange[]> {
-    const preview = await getFeePreview(this.readLnd, this.state.config.policy);
+    const preview = await getFeePreview(this.readLnd, this.state.config.policy, this.overrides.all());
     const eligible = preview.proposals
       .filter(
         (p) =>

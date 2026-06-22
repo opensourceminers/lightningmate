@@ -304,6 +304,18 @@ export interface SuggestionsResponse {
   graphAgeSec: number;
 }
 
+export type FeeMode = "auto" | "fixed" | "exclude";
+export interface ChannelOverride {
+  mode: FeeMode;
+  fixedPpm?: number;
+}
+export type OverrideMap = Record<string, ChannelOverride>;
+
+export interface Alert {
+  level: "warn" | "info";
+  message: string;
+}
+
 export type FiatCurrency = "off" | "USD" | "EUR" | "GBP" | "CHF";
 
 export interface AppSettings {

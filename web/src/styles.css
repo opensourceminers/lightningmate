@@ -272,6 +272,26 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .liqmap-legend .sw.local { background: var(--accent); }
 .liqmap-legend .sw.remote { background: var(--blue); }
 
+/* ── Alerts ──────────────────────────────────────────────── */
+.alerts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+.alert {
+  font-size: 12.5px; font-weight: 500; padding: 7px 13px; border-radius: 999px;
+  border: 1px solid var(--line);
+}
+.alert.warn { color: #ffb4b4; background: rgba(248, 113, 113, 0.12); border-color: rgba(248, 113, 113, 0.35); }
+.alert.info { color: #9fc4ff; background: rgba(96, 165, 250, 0.1); border-color: rgba(96, 165, 250, 0.3); }
+
+/* ── Channel override control ────────────────────────────── */
+.ov { display: inline-flex; align-items: center; gap: 6px; }
+.ov select {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: var(--radius-xs); padding: 4px 7px; font-size: 12px;
+}
+.ov-ppm {
+  width: 64px; background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: var(--radius-xs); padding: 4px 6px; font-size: 12px;
+}
+
 /* ── Tabs ────────────────────────────────────────────────── */
 .tabs {
   display: flex; gap: 2px; border-bottom: 1px solid var(--line);
