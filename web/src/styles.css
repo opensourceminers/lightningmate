@@ -353,6 +353,8 @@ table { width: 100%; border-collapse: collapse; }
   color: var(--muted); font-weight: 600; text-align: left;
   font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.5px;
 }
+/* Numeric headers must right-align to sit over their right-aligned values. */
+.channels th.num, .fee-table th.num { text-align: right; }
 .channels tbody tr, .fee-table tbody tr { transition: background var(--t); }
 .channels tbody tr:hover, .fee-table tbody tr:hover { background: var(--line-soft); }
 .channels tr.inactive, .fee-table tr.inactive { opacity: 0.5; }
