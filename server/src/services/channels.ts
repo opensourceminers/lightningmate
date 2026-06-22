@@ -15,7 +15,7 @@ export interface ChannelView {
   transactionVout: number;
   localBalance: number;
   remoteBalance: number;
-  /** local / capacity, 0..1 — how full the outbound side is. */
+  /** local / (local + remote), 0..1 — the spendable outbound share. */
   localRatio: number;
   totalSent: number;
   totalReceived: number;
@@ -46,6 +46,9 @@ export async function getChannelsView(
   const views = await Promise.all(
     channels.map(async (c): Promise<ChannelView> => {
       const capacity = c.capacity;
+      // Split of *settled* funds, ignoring the commit-fee reserve which otherwise
+      // keeps the ratio from ever reaching 0/1.
+      const settled = c.local_balance + c.remote_balance;
       return {
         id: c.id,
         peerPubkey: c.partner_public_key,
@@ -58,7 +61,7 @@ export async function getChannelsView(
         transactionVout: c.transaction_vout,
         localBalance: c.local_balance,
         remoteBalance: c.remote_balance,
-        localRatio: capacity > 0 ? c.local_balance / capacity : 0,
+        localRatio: settled > 0 ? c.local_balance / settled : 0,
         totalSent: c.sent,
         totalReceived: c.received,
         unsettled: c.unsettled_balance,
