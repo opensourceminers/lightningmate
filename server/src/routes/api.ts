@@ -1,5 +1,5 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
-import { subscribeToForwards, type AuthenticatedLnd } from "lightning";
+import type { AuthenticatedLnd } from "lightning";
 import { getNodeScore } from "../services/score.js";
 import type { Config } from "../config.js";
 import { getNodeSummary } from "../services/node.js";
@@ -34,6 +34,28 @@ function numericOverrides<T>(query: Request["query"], keys: (keyof T)[]): Partia
 const WRITE_DISABLED_MSG =
   "Writing is disabled. Set LM_ENABLE_WRITE=true and provide a write macaroon " +
   "(LND_WRITE_MACAROON / LND_WRITE_MACAROON_PATH, or admin.macaroon on Umbrel).";
+
+// ── Input validation helpers (defense for fund-moving endpoints) ──────────────
+const isHex = (s: unknown, len: number): s is string =>
+  typeof s === "string" && new RegExp(`^[0-9a-f]{${len}}$`, "i").test(s);
+const isPubkey = (s: unknown): s is string => isHex(s, 66);
+const isTxid = (s: unknown): s is string => isHex(s, 64);
+const isChannelId = (s: unknown): s is string =>
+  typeof s === "string" && /^\d+x\d+x\d+$/.test(s);
+/** Finite integer within [min, max], else null. */
+function intIn(v: unknown, min: number, max: number): number | null {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= min && n <= max ? Math.floor(n) : null;
+}
+function numIn(v: unknown, min: number, max: number): number | null {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= min && n <= max ? n : null;
+}
+// Sane bounds.
+const MAX_CHANNEL_SATS = 1_000_000_000; // 10 BTC
+const MAX_FEE_PPM = 50_000; // 5%
+const MAX_BASE_MSAT = 10_000_000; // 10k sat
+const MAX_REBALANCE_SATS = 100_000_000; // 1 BTC
 
 // Read optional fee-policy overrides from the query string.
 function parsePolicyQuery(query: Request["query"]): Partial<FeePolicy> {
@@ -87,6 +109,21 @@ export function createApiRouter(
 ): Router {
   const router = Router();
 
+  // Simple global rate limit on state-changing requests — blocks runaway loops
+  // or a compromised client spamming fund-moving actions. Generous for a human.
+  const writeHits: number[] = [];
+  router.use((req, res, next) => {
+    if (req.method === "GET") return next();
+    const now = Date.now();
+    while (writeHits.length && now - writeHits[0] > 60_000) writeHits.shift();
+    if (writeHits.length >= 60) {
+      res.status(429).json({ error: "rate_limited", message: "Too many write requests; slow down." });
+      return;
+    }
+    writeHits.push(now);
+    next();
+  });
+
   router.get("/health", (_req, res) => {
     res.json({ ok: true, service: "lightningmate", version: "0.1.0" });
   });
@@ -138,13 +175,20 @@ export function createApiRouter(
   });
   router.post("/overrides", (req, res) => {
     const { channelId, mode, fixedPpm } = req.body ?? {};
-    if (!channelId || !["auto", "fixed", "exclude"].includes(mode)) {
-      res.status(400).json({ error: "bad_request", message: "channelId and a valid mode are required." });
+    if (!isChannelId(channelId) || !["auto", "fixed", "exclude"].includes(mode)) {
+      res.status(400).json({ error: "bad_request", message: "valid channelId and mode (auto/fixed/exclude) required." });
       return;
     }
     const override: ChannelOverride = { mode };
-    if (mode === "fixed" && Number.isFinite(Number(fixedPpm))) override.fixedPpm = Number(fixedPpm);
-    res.json(overrides.set(String(channelId), override));
+    if (mode === "fixed") {
+      const ppm = intIn(fixedPpm, 0, MAX_FEE_PPM);
+      if (ppm === null) {
+        res.status(400).json({ error: "bad_request", message: "fixedPpm out of range (0–50000)." });
+        return;
+      }
+      override.fixedPpm = ppm;
+    }
+    res.json(overrides.set(channelId, override));
   });
 
   // Derived alerts (offline channels, low balances, …).
@@ -164,13 +208,12 @@ export function createApiRouter(
         return;
       }
       const { transactionId, transactionVout, isForce } = req.body ?? {};
-      if (!transactionId || !Number.isFinite(Number(transactionVout))) {
-        res.status(400).json({ error: "bad_request", message: "transactionId and transactionVout are required." });
+      const vout = intIn(transactionVout, 0, 1_000_000);
+      if (!isTxid(transactionId) || vout === null) {
+        res.status(400).json({ error: "bad_request", message: "valid transactionId (64 hex) and transactionVout required." });
         return;
       }
-      res.json(
-        await closeChannelByOutpoint(writeLnd, String(transactionId), Number(transactionVout), Boolean(isForce)),
-      );
+      res.json(await closeChannelByOutpoint(writeLnd, transactionId, vout, Boolean(isForce)));
     }),
   );
 
@@ -182,10 +225,21 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const items = Array.isArray(req.body?.items) ? (req.body.items as FeeApplyItem[]) : [];
-      if (!items.length) {
-        res.status(400).json({ error: "no_items", message: "No fee changes provided." });
+      const raw = Array.isArray(req.body?.items) ? req.body.items : [];
+      if (raw.length === 0 || raw.length > 500) {
+        res.status(400).json({ error: "bad_request", message: "1–500 fee items required." });
         return;
+      }
+      const items: FeeApplyItem[] = [];
+      for (const it of raw) {
+        const vout = intIn(it?.transactionVout, 0, 1_000_000);
+        const feeRatePpm = intIn(it?.feeRatePpm, 0, MAX_FEE_PPM);
+        const baseFeeMsat = intIn(it?.baseFeeMsat, 0, MAX_BASE_MSAT);
+        if (typeof it?.id !== "string" || !isTxid(it?.transactionId) || vout === null || feeRatePpm === null || baseFeeMsat === null) {
+          res.status(400).json({ error: "bad_request", message: "invalid fee item." });
+          return;
+        }
+        items.push({ id: it.id, transactionId: it.transactionId, transactionVout: vout, feeRatePpm, baseFeeMsat });
       }
       res.json({ results: await applyFees(lnd, writeLnd, items) });
     }),
@@ -241,15 +295,20 @@ export function createApiRouter(
         return;
       }
       const { targetId, sourceId, amountSats, econRatio } = req.body ?? {};
-      if (!targetId || !sourceId || !Number.isFinite(Number(amountSats))) {
-        res.status(400).json({ error: "bad_request", message: "targetId, sourceId and amountSats are required." });
+      const amount = intIn(amountSats, 1000, MAX_REBALANCE_SATS);
+      const ratio = econRatio === undefined ? 0.8 : numIn(econRatio, 0.05, 1);
+      if (!isChannelId(targetId) || !isChannelId(sourceId) || amount === null || ratio === null) {
+        res.status(400).json({
+          error: "bad_request",
+          message: "valid targetId/sourceId, amountSats (1k–1 BTC) and econRatio (0.05–1) required.",
+        });
         return;
       }
       const result = await executeRebalance(lnd, writeLnd, {
-        targetId: String(targetId),
-        sourceId: String(sourceId),
-        amountSats: Number(amountSats),
-        econRatio: Number.isFinite(Number(econRatio)) ? Number(econRatio) : 0.8,
+        targetId,
+        sourceId,
+        amountSats: amount,
+        econRatio: ratio,
       });
       rebalanceLog.append({
         at: new Date().toISOString(),
@@ -282,53 +341,6 @@ export function createApiRouter(
     }),
   );
 
-  // Live forwarding events via Server-Sent Events.
-  router.get(
-    "/stream/forwards",
-    wrap(async (req, res) => {
-      const channels = await getChannelsView(lnd);
-      const aliasById = new Map(channels.map((c) => [c.id, c.peerAlias]));
-      const name = (id?: string) => (id ? aliasById.get(id) ?? `${id.slice(0, 10)}…` : "?");
-
-      res.setHeader("Content-Type", "text/event-stream");
-      res.setHeader("Cache-Control", "no-cache");
-      res.setHeader("Connection", "keep-alive");
-      res.flushHeaders?.();
-      res.write("retry: 5000\n\n");
-
-      const sub = subscribeToForwards({ lnd });
-      const onForward = (e: {
-        at: string;
-        is_confirmed: boolean;
-        is_receive: boolean;
-        is_send: boolean;
-        tokens?: number;
-        fee?: number;
-        in_channel?: string;
-        out_channel?: string;
-      }) => {
-        // Only settled routing forwards (not our own sends/receives).
-        if (!e.is_confirmed || e.is_receive || e.is_send || !e.tokens) return;
-        const payload = JSON.stringify({
-          at: e.at,
-          tokens: e.tokens,
-          fee: e.fee ?? 0,
-          incoming: name(e.in_channel),
-          outgoing: name(e.out_channel),
-        });
-        res.write(`data: ${payload}\n\n`);
-      };
-      sub.on("forward", onForward);
-      sub.on("error", () => {});
-
-      const heartbeat = setInterval(() => res.write(": ping\n\n"), 25_000);
-      req.on("close", () => {
-        clearInterval(heartbeat);
-        sub.removeAllListeners();
-        res.end();
-      });
-    }),
-  );
 
   // Profit & loss over a window — routing revenue vs channel/rebalance costs.
   router.get(
@@ -367,16 +379,26 @@ export function createApiRouter(
         return;
       }
       const { pubkey, socket, localTokens, feeRate, isPrivate } = req.body ?? {};
-      if (!pubkey || !Number.isFinite(Number(localTokens))) {
-        res.status(400).json({ error: "bad_request", message: "pubkey and localTokens are required." });
+      const amount = intIn(localTokens, 20_000, MAX_CHANNEL_SATS);
+      if (!isPubkey(pubkey) || amount === null) {
+        res.status(400).json({ error: "bad_request", message: "valid pubkey (66 hex) and localTokens (20k–10 BTC) required." });
+        return;
+      }
+      if (socket !== undefined && (typeof socket !== "string" || socket.length > 256)) {
+        res.status(400).json({ error: "bad_request", message: "invalid socket." });
+        return;
+      }
+      const fee = feeRate === undefined ? undefined : intIn(feeRate, 1, 10_000);
+      if (feeRate !== undefined && fee === null) {
+        res.status(400).json({ error: "bad_request", message: "feeRate out of range (1–10000 sat/vByte)." });
         return;
       }
       res.json(
         await openChannelTo(writeLnd, {
-          pubkey: String(pubkey),
+          pubkey,
           socket: socket ? String(socket) : undefined,
-          localTokens: Number(localTokens),
-          feeRate: Number.isFinite(Number(feeRate)) ? Number(feeRate) : undefined,
+          localTokens: amount,
+          feeRate: fee ?? undefined,
           isPrivate: Boolean(isPrivate),
         }),
       );
@@ -388,7 +410,12 @@ export function createApiRouter(
     res.json(settings.get());
   });
   router.post("/settings", (req, res) => {
-    res.json(settings.set(req.body ?? {}));
+    const fiatCurrency = req.body?.fiatCurrency;
+    if (!["off", "USD", "EUR", "GBP", "CHF"].includes(fiatCurrency)) {
+      res.status(400).json({ error: "bad_request", message: "invalid fiatCurrency" });
+      return;
+    }
+    res.json(settings.set({ fiatCurrency }));
   });
 
   // Current BTC price in the chosen fiat currency (null when fiat is off).

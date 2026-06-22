@@ -11,3 +11,4 @@ tls.cert
 *.tsbuildinfo
 *.log
 packaging
+.data
