@@ -269,6 +269,7 @@ export async function getChannelSuggestions(
   for (const [pk, stat] of graph.stats) {
     if (pk === ownKey || peers.has(pk)) continue;
     if (stat.degree < policy.minChannels) continue;
+    if (stat.enabledCount === 0) continue; // fully disabled — nothing routes through it
     const meta = graph.meta.get(pk);
     if (!meta) continue;
     if (now - meta.updatedAt > staleMs) continue;
@@ -282,38 +283,55 @@ export async function getChannelSuggestions(
 
   // New-reach: how many of each candidate's neighbours we can't already reach.
   const reachByPk = new Map<string, number>();
-  let maxNewReach = 1;
   for (const e of eligible) {
     let c = 0;
     for (const n of e.stat.neighbors) if (!reachable.has(n)) c += 1;
     reachByPk.set(e.pk, c);
-    if (c > maxNewReach) maxNewReach = c;
   }
 
-  // Normalisation bounds (log-scaled — these are heavy-tailed).
+  // Normalisation bound for liquidity depth (log-scaled — heavy-tailed).
   const avgChanOf = (s: NodeStat) => (s.degree ? s.totalCapacity / s.degree : 0);
-  const maxLogDeg = Math.max(...eligible.map((e) => Math.log(e.stat.degree + 1)));
   const maxLogDepth = Math.max(...eligible.map((e) => Math.log(avgChanOf(e.stat) + 1)));
-  const maxFee = Math.max(...eligible.map((e) => (e.stat.feeCount ? e.stat.feeSum / e.stat.feeCount : 0)), 1);
 
   const suggestions: ChannelSuggestion[] = eligible.map(({ pk, stat, meta }) => {
     const avgFee = stat.feeCount ? stat.feeSum / stat.feeCount : 0;
     const newReach = reachByPk.get(pk) ?? 0;
 
-    const reachScore = Math.log(1 + newReach) / Math.log(1 + maxNewReach); // new connectivity
-    const depthScore = Math.log(avgChanOf(stat) + 1) / maxLogDepth; // liquidity depth
-    const degScore = Math.log(stat.degree + 1) / maxLogDeg; // centrality
-    const activityScore = stat.degree ? Math.min(1, stat.recentUpdates / stat.degree) : 0;
-    const enabledScore = stat.degree ? Math.min(1, stat.enabledCount / stat.degree) : 0;
-    const feeScore = 1 - Math.min(1, avgFee / maxFee);
+    // Reach into NEW territory — rewards both non-redundancy (the share of the
+    // peer's neighbours that are new to us) and a meaningful absolute count, so a
+    // giant hub that mostly duplicates our existing reach can't win on size alone.
+    const novelty = stat.degree ? newReach / stat.degree : 0;
+    const magnitude = Math.min(1, newReach / 30);
+    const reachScore = Math.sqrt(novelty * magnitude);
+
+    // A live, maintained router: fresh policies + channels that are enabled.
+    const activityShare = stat.degree ? stat.recentUpdates / stat.degree : 0;
+    const enabledShare = stat.degree ? stat.enabledCount / stat.degree : 0;
+    const routerScore = 0.5 * Math.min(1, activityShare) + 0.5 * Math.min(1, enabledShare);
+
+    // Liquidity depth per channel — real routing capacity, not dust.
+    const depthScore = Math.log(avgChanOf(stat) + 1) / maxLogDepth;
+
+    // Connectivity sweet-spot: enough channels to route, but dampen the
+    // over-saturated mega-hubs everyone already connects to.
+    const enough = Math.min(1, Math.log(stat.degree) / Math.log(30));
+    const oversat = Math.max(
+      0,
+      (Math.log(stat.degree) - Math.log(250)) / (Math.log(4000) - Math.log(250)),
+    );
+    const centralityScore = enough * (1 - 0.6 * Math.min(1, oversat));
+
+    // Fee economics: moderate fees route and leave room to earn; 0 ppm is a hub
+    // dumping flow, and >2000 ppm barely routes.
+    const feeScore =
+      avgFee <= 0 ? 0.4 : avgFee < 10 ? 0.65 : avgFee <= 600 ? 1 : avgFee <= 2000 ? 0.6 : 0.2;
 
     const score =
       0.3 * reachScore +
-      0.2 * depthScore +
-      0.2 * degScore +
-      0.15 * activityScore +
-      0.1 * enabledScore +
-      0.05 * feeScore;
+      0.25 * routerScore +
+      0.15 * depthScore +
+      0.15 * centralityScore +
+      0.15 * feeScore;
 
     // Size: geometric mean of our typical channel and the candidate's average,
     // clamped to the configured bounds.
