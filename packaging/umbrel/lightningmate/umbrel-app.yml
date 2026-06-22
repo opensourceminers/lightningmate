@@ -33,7 +33,7 @@ dependencies:
   - lightning
 repo: https://github.com/opensourceminers/lightningmate
 support: https://github.com/opensourceminers/lightningmate/issues
-port: 3001
+port: 3742
 gallery: []
 path: ""
 defaultUsername: ""
