@@ -10,7 +10,6 @@ import { Footer } from "./components/Footer";
 import { ForwardsPanel } from "./components/ForwardsPanel";
 import { HealthScore } from "./components/HealthScore";
 import { LiquidityMap } from "./components/LiquidityMap";
-import { LiveFeed } from "./components/LiveFeed";
 import { RebalancePanel } from "./components/RebalancePanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SuggestionsPanel } from "./components/SuggestionsPanel";
@@ -89,10 +88,9 @@ export function App() {
       {node.data ? (
         <div className="hero-row">
           <HealthScore />
-          <LiveFeed />
+          <PnlOverview price={price.data} />
         </div>
       ) : null}
-      {node.data ? <PnlOverview price={price.data} /> : null}
 
       <nav className="tabs">
         {TABS.map((t) => (
