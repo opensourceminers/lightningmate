@@ -11,7 +11,7 @@ import {
   getRebalanceCandidates,
   type RebalancePolicy,
 } from "../services/rebalance.js";
-import { getChannelSuggestions, type SuggestionPolicy } from "../services/suggestions.js";
+import { getChannelSuggestions, getCloseCandidates, type SuggestionPolicy } from "../services/suggestions.js";
 import { getPnl } from "../services/pnl.js";
 import { closeChannelByOutpoint, openChannelTo } from "../services/channelOps.js";
 import { getBtcPrice } from "../services/price.js";
@@ -367,6 +367,16 @@ export function createApiRouter(
         overrides.requireClearnet = req.query.requireClearnet === "true";
       }
       res.json(await getChannelSuggestions(lnd, overrides));
+    }),
+  );
+
+  // Channels worth closing (offline / never routed / idle in the window).
+  router.get(
+    "/suggestions/close",
+    wrap(async (req, res) => {
+      const days = Number(req.query.days ?? 90);
+      const windowDays = Math.min(365, Math.max(7, Number.isFinite(days) ? days : 90));
+      res.json(await getCloseCandidates(lnd, windowDays));
     }),
   );
 

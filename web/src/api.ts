@@ -1,6 +1,7 @@
 import type {
   Alert,
   AppSettings,
+  CloseCandidatesResponse,
   CloseChannelResult,
   AutopilotConfig,
   AutopilotRun,
@@ -109,6 +110,8 @@ export const api = {
       : "";
     return get<SuggestionsResponse>(`/suggestions${qs}`);
   },
+  closeCandidates: (days?: number) =>
+    get<CloseCandidatesResponse>(days ? `/suggestions/close?days=${days}` : "/suggestions/close"),
   channelOpen: (params: {
     pubkey: string;
     socket?: string;

@@ -304,6 +304,26 @@ export interface ChannelSuggestion {
   socket: string;
 }
 
+export interface CloseCandidate {
+  channelId: string;
+  alias: string;
+  capacitySats: number;
+  localRatio: number;
+  active: boolean;
+  forwards: number;
+  routedSats: number;
+  feesEarnedSats: number;
+  lifetimeRoutedSats: number;
+  transactionId: string;
+  transactionVout: number;
+  reason: string;
+}
+
+export interface CloseCandidatesResponse {
+  windowDays: number;
+  candidates: CloseCandidate[];
+}
+
 export interface OpenChannelResult {
   ok: boolean;
   pubkey: string;
