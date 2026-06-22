@@ -2,7 +2,7 @@ import { useState } from "react";
 
 const DONATE = "bc1qje7dm783p86qu4xlvam6yrvy5mzx7qx76w72k8";
 const GITHUB = "https://github.com/othervice/lightningmate";
-const X_URL = "https://x.com/opensourceminers";
+const X_URL = "https://x.com/opensource_de";
 const SITE = "https://opensourceminers.de";
 
 function GithubIcon() {
@@ -51,7 +51,7 @@ export function Footer() {
           <GithubIcon /> GitHub
         </a>
         <a className="foot-pill" href={X_URL} target="_blank" rel="noreferrer">
-          <XIcon /> @opensourceminers
+          <XIcon /> @opensource_de
         </a>
         <a className="foot-pill" href={SITE} target="_blank" rel="noreferrer">
           <GlobeIcon /> opensourceminers.de
