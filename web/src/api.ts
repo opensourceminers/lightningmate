@@ -1,6 +1,7 @@
 import type {
   Alert,
   AppSettings,
+  CloseChannelResult,
   AutopilotConfig,
   AutopilotRun,
   AutopilotState,
@@ -24,6 +25,7 @@ import type {
   RebalancePolicy,
   SuggestionPolicy,
   SuggestionsResponse,
+  WalletInfo,
 } from "./types";
 
 async function handle<T>(res: Response): Promise<T> {
@@ -67,6 +69,10 @@ export const api = {
   setOverride: (channelId: string, mode: FeeMode, fixedPpm?: number) =>
     post<OverrideMap>("/overrides", { channelId, mode, fixedPpm }),
   alerts: () => get<Alert[]>("/alerts"),
+  wallet: () => get<WalletInfo>("/wallet"),
+  walletAddress: () => post<{ address: string }>("/wallet/address", {}),
+  channelClose: (transactionId: string, transactionVout: number, isForce: boolean) =>
+    post<CloseChannelResult>("/channels/close", { transactionId, transactionVout, isForce }),
   forwardsReport: (days: number) => get<ForwardsReport>(`/forwards/report?days=${days}`),
   feesPreview: (policy?: Partial<FeePolicy>) => {
     const qs = policy

@@ -62,13 +62,30 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
   const [sort, setSort] = useState<SortKey>("capacity");
   const [onlyActive, setOnlyActive] = useState(false);
   const [overrides, setOverrides] = useState<OverrideMap>({});
+  const [canWrite, setCanWrite] = useState(false);
+  const [closingId, setClosingId] = useState<string | null>(null);
 
   useEffect(() => {
     api.overrides().then(setOverrides).catch(() => {});
+    api.autopilotGet().then((s) => setCanWrite(s.canWrite)).catch(() => {});
   }, []);
 
   const applyOverride = (id: string, mode: FeeMode, fixedPpm?: number) => {
     api.setOverride(id, mode, fixedPpm).then(setOverrides).catch(() => {});
+  };
+
+  const closeChannel = async (c: ChannelView) => {
+    const how = c.active ? "cooperatively close" : "force-close (offline peer)";
+    if (!window.confirm(`${how} the channel with ${c.peerAlias}? This is an on-chain transaction.`)) return;
+    setClosingId(c.id);
+    try {
+      const r = await api.channelClose(c.transactionId, c.transactionVout, !c.active);
+      window.alert(r.ok ? `Closing — funding ${r.transactionId?.slice(0, 16)}…` : `Close failed: ${r.error}`);
+    } catch (e) {
+      window.alert(`Close failed: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setClosingId(null);
+    }
   };
 
   const rows = channels
@@ -104,6 +121,7 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
             <th className="num">Sent</th>
             <th className="num">Received</th>
             <th>Autopilot fee</th>
+            <th></th>
           </tr>
         </thead>
         <tbody>
@@ -126,6 +144,18 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
                   ov={overrides[c.id]}
                   onSet={(mode, ppm) => applyOverride(c.id, mode, ppm)}
                 />
+              </td>
+              <td>
+                {canWrite ? (
+                  <button
+                    className="row-btn ghost danger"
+                    disabled={closingId !== null}
+                    onClick={() => closeChannel(c)}
+                    title="Close this channel"
+                  >
+                    {closingId === c.id ? "…" : "close"}
+                  </button>
+                ) : null}
               </td>
             </tr>
           ))}

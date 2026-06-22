@@ -11,6 +11,8 @@ export interface ChannelView {
   private: boolean;
   initiator: "local" | "remote";
   capacity: number;
+  transactionId: string;
+  transactionVout: number;
   localBalance: number;
   remoteBalance: number;
   /** local / capacity, 0..1 — how full the outbound side is. */
@@ -52,6 +54,8 @@ export async function getChannelsView(
         private: c.is_private,
         initiator: c.is_partner_initiated ? "remote" : "local",
         capacity,
+        transactionId: c.transaction_id,
+        transactionVout: c.transaction_vout,
         localBalance: c.local_balance,
         remoteBalance: c.remote_balance,
         localRatio: capacity > 0 ? c.local_balance / capacity : 0,

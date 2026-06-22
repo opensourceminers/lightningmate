@@ -1,0 +1,13 @@
+{
+  "name": "Lightning Mate",
+  "short_name": "Lightning Mate",
+  "description": "Profit-aware management & autopilot for your Lightning node",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#090a0f",
+  "theme_color": "#f7931a",
+  "icons": [
+    { "src": "favicon.svg", "type": "image/svg+xml", "sizes": "any", "purpose": "any maskable" }
+  ]
+}
