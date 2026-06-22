@@ -23,3 +23,6 @@ npm-debug.log*
 .DS_Store
 .vscode/
 .idea/
+
+# Store gallery screenshots (contain node data — keep out of git)
+screenshots/
