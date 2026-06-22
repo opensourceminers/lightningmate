@@ -1,14 +1,3 @@
-# Umbrel runtime definition for LightningMate.
-#
-# - app_proxy provides Umbrel's authentication/SSO — we add no login of our own.
-# - The image MUST be pre-built, multi-arch (linux/amd64 + linux/arm64) and
-#   pinned by sha256 digest. The .github/workflows/build-image.yml Action builds
-#   and pushes it to GHCR on a version tag (git tag v0.4.0 && git push --tags)
-#   or via "Run workflow"; copy the digest from the run summary below.
-# - The lightning app's data dir is mounted read-only; the backend auto-reads
-#   tls.cert + readonly.macaroon from it (see server/src/config.ts).
-# - For Umbrel to pull it, make the GHCR package public (or configure a pull
-#   secret); writes (fee/rebalance autopilot) need LM_ENABLE_WRITE — see below.
 version: "3.7"
 
 services:
@@ -18,19 +7,28 @@ services:
       APP_PORT: 3001
 
   web:
-    image: ghcr.io/opensourceminers/lightningmate:v0.4.2@sha256:REPLACE_WITH_v0.4.2_DIGEST
+    image: ghcr.io/opensourceminers/lightningmate:v0.5.1@sha256:1145033e26d30e1af0a29ccbe4723ba4b75d67c3865a20282a6be1112460b258
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
     volumes:
-      # Read-only access to LND's tls.cert + macaroons (incl. admin if writes on).
+      # Read-only access to LND's tls.cert + macaroons.
       - ${APP_LIGHTNING_NODE_DATA_DIR}:/lnd:ro
-      # App's own writable data dir (fee/rebalance autopilot config + accounting).
+      # App's own writable data dir (autopilot config + rebalance accounting).
       - ${APP_DATA_DIR}/data:/data
     environment:
+      APP_LIGHTNING_NODE_IP: "$APP_LIGHTNING_NODE_IP"
+      APP_LIGHTNING_NODE_GRPC_PORT: "$APP_LIGHTNING_NODE_GRPC_PORT"
       LND_SOCKET: "$APP_LIGHTNING_NODE_IP:$APP_LIGHTNING_NODE_GRPC_PORT"
       LND_DIR: "/lnd"
+      LND_CERT_PATH: "/lnd/tls.cert"
+      LND_MACAROON_PATH: "/lnd/data/chain/bitcoin/mainnet/readonly.macaroon"
       DATA_DIR: "/data"
       PORT: "3001"
-      # Uncomment to allow fee/rebalance writes (admin macaroon auto-discovered):
+      # Bind all interfaces so app_proxy (which authenticates) can reach us.
+      LM_BIND: "0.0.0.0"
+      # Read-only by default. To enable fee/rebalance/open + autopilot, set
+      # LM_ENABLE_WRITE=true and point at a write macaroon. For a smaller blast
+      # radius, bake a least-privilege macaroon (see SECURITY.md) instead of admin.
       # LM_ENABLE_WRITE: "true"
+      # LND_WRITE_MACAROON_PATH: "/lnd/data/chain/bitcoin/mainnet/admin.macaroon"

@@ -1,44 +1,37 @@
-# Umbrel App Store manifest for LightningMate (official-store reference copy).
-# For the official store: copy this folder into a fork of
-# github.com/getumbrel/umbrel-apps as `lightningmate/`. The community-store copy
-# uses the store-prefixed id `opensourceminers-lightningmate`.
-# Add gallery screenshots (1.jpg–3.jpg) before public submission.
+# Official Umbrel App Store manifest (getumbrel/umbrel-apps).
+# Per the packaging guide: bare `lightningmate` id, gallery [], NO icon field —
+# the Umbrel team hosts the final icon + screenshots (provide them in the PR body).
 manifestVersion: 1
 id: lightningmate
 category: finance
-name: LightningMate
-version: "0.4.2"
+name: Lightning Mate
+version: "0.5.1"
 tagline: Profit-aware management & autopilot for your Lightning node
 description: >-
-  LightningMate manages your Lightning node so you don't have to babysit it.
-  Connects automatically to your Umbrel Lightning (LND) node.
+  Lightning Mate manages your Lightning node so you don't have to babysit it.
+  It connects automatically to your Umbrel Lightning (LND) node.
 
 
   See channels with live balance bars and source / sink / router roles, a full
   Forwards routing report, and a Profit & Loss overview (routing revenue vs
   channel-open and rebalancing costs). Get scored channel-peer suggestions from
-  the network graph and open channels in a click.
+  the network graph and open channels in a click, plus a node health score.
 
 
-  Flip on the Autopilot and the node tunes its own fees and runs only profitable
-  rebalances on recommended settings — with safe caps and per-channel cooldowns.
-  Read-only by default; writes are opt-in.
-releaseNotes: >-
-  Fee + rebalance autopilot, channel suggestions with one-click open, Forwards
-  report, and Profit & Loss overview.
-developer: Open Source Miners
+  Flip on the Autopilot and the node tunes its own fees, runs only profitable
+  rebalances, and opens channels to top peers — all on recommended settings with
+  safe caps and cooldowns. Read-only by default; writes are opt-in.
+releaseNotes: ""
+developer: opensourceminers.de
 website: https://opensourceminers.de
 dependencies:
   - lightning
 repo: https://github.com/opensourceminers/lightningmate
 support: https://github.com/opensourceminers/lightningmate/issues
 port: 3001
-gallery:
-  - 1.jpg
-  - 2.jpg
-  - 3.jpg
+gallery: []
 path: ""
 defaultUsername: ""
 defaultPassword: ""
 submitter: opensourceminers
-submission: https://github.com/getumbrel/umbrel-apps/pull/XXXX
+submission: ""
