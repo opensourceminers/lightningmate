@@ -1,0 +1,13 @@
+node_modules
+**/node_modules
+**/dist
+**/build
+.git
+.env
+.env.*
+!.env.example
+*.macaroon
+tls.cert
+*.tsbuildinfo
+*.log
+packaging

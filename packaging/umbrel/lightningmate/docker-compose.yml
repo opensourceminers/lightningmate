@@ -1,0 +1,32 @@
+# Umbrel runtime definition for LightningMate.
+#
+# - app_proxy provides Umbrel's authentication/SSO — we add no login of our own.
+# - The image MUST be pre-built, multi-arch (linux/amd64 + linux/arm64) and
+#   pinned by sha256 digest. Build & push with:
+#     docker buildx build --platform linux/amd64,linux/arm64 \
+#       -t <DOCKERHUB>/lightningmate:0.1.0 --push .
+#   then paste the resulting digest below.
+# - The lightning app's data dir is mounted read-only; the backend auto-reads
+#   tls.cert + readonly.macaroon from it (see server/src/config.ts).
+version: "3.7"
+
+services:
+  app_proxy:
+    environment:
+      APP_HOST: lightningmate_web_1
+      APP_PORT: 3001
+
+  web:
+    image: <DOCKERHUB>/lightningmate:0.1.0@sha256:<REPLACE_WITH_IMAGE_DIGEST>
+    user: "1000:1000"
+    restart: on-failure
+    stop_grace_period: 1m
+    volumes:
+      # Read-only access to LND's tls.cert + macaroons.
+      - ${APP_LIGHTNING_NODE_DATA_DIR}:/lnd:ro
+      # App's own writable data dir (used by future fee/rebalance accounting).
+      - ${APP_DATA_DIR}/data:/data
+    environment:
+      LND_SOCKET: "$APP_LIGHTNING_NODE_IP:$APP_LIGHTNING_NODE_GRPC_PORT"
+      LND_DIR: "/lnd"
+      PORT: "3001"
