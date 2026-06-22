@@ -5,13 +5,15 @@ import { ChannelTable } from "./components/ChannelTable";
 import { FeesPanel } from "./components/FeesPanel";
 import { FlowsPanel } from "./components/FlowsPanel";
 import { RebalancePanel } from "./components/RebalancePanel";
+import { SuggestionsPanel } from "./components/SuggestionsPanel";
 import { SummaryBar } from "./components/SummaryBar";
 import { usePolledData } from "./usePolledData";
 
-type Tab = "channels" | "flows" | "fees" | "rebalance" | "autopilot";
+type Tab = "channels" | "suggestions" | "flows" | "fees" | "rebalance" | "autopilot";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "channels", label: "Channels" },
+  { id: "suggestions", label: "Suggestions" },
   { id: "flows", label: "Flows" },
   { id: "fees", label: "Fees" },
   { id: "rebalance", label: "Rebalancing" },
@@ -80,6 +82,7 @@ export function App() {
             <Placeholder />
           )
         ) : null}
+        {tab === "suggestions" ? <SuggestionsPanel /> : null}
         {tab === "fees" ? <FeesPanel /> : null}
         {tab === "rebalance" ? <RebalancePanel /> : null}
         {tab === "autopilot" ? <AutopilotPanel /> : null}

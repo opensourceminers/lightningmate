@@ -13,6 +13,8 @@ import type {
   RebalanceExecResult,
   RebalanceLogResponse,
   RebalancePolicy,
+  SuggestionPolicy,
+  SuggestionsResponse,
 } from "./types";
 
 async function handle<T>(res: Response): Promise<T> {
@@ -77,4 +79,12 @@ export const api = {
     econRatio: number;
   }) => post<RebalanceExecResult>("/rebalance/execute", params),
   rebalanceLog: () => get<RebalanceLogResponse>("/rebalance/log"),
+  suggestions: (policy?: Partial<SuggestionPolicy>) => {
+    const qs = policy
+      ? "?" + new URLSearchParams(
+          Object.entries(policy).map(([k, v]) => [k, String(v)]),
+        ).toString()
+      : "";
+    return get<SuggestionsResponse>(`/suggestions${qs}`);
+  },
 };
