@@ -12,6 +12,9 @@ build/
 *.macaroon
 tls.cert
 
+# local runtime data (autopilot config, rebalance accounting, etc.)
+.data/
+
 # logs
 *.log
 npm-debug.log*
