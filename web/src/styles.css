@@ -187,7 +187,9 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 
 /* ── Hero row: health score + live feed ──────────────────── */
 .hero-row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-bottom: 20px; align-items: stretch; }
-.hero-row > .panel { margin: 0; height: 100%; display: flex; flex-direction: column; }
+/* higher specificity than the generic `.panel + .panel` spacing rule below,
+   so the second tile isn't pushed 18px down within the grid */
+.app .hero-row > .panel { margin: 0; height: 100%; display: flex; flex-direction: column; }
 /* HealthScore defines the height; the live list flexes to fill & scrolls within,
    so it never makes its tile taller than the sibling. */
 .hero-row .live-list { flex: 1 1 0; min-height: 0; max-height: none; overflow-y: auto; }
