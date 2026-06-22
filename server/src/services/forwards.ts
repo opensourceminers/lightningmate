@@ -1,4 +1,5 @@
 import { getForwards, type AuthenticatedLnd } from "lightning";
+import { getChannelsView } from "./channels.js";
 
 export interface ForwardEvent {
   createdAt: string;
@@ -111,6 +112,127 @@ export async function getFlowSummary(
     totalRoutedSats: totalRouted,
     totalFeesEarnedSats: totalFees,
     perChannel,
+    recent,
+  };
+}
+
+// ── Forwards report (Thunderhub-style overview) ───────────────────────────────
+
+export interface ChannelForwardStat {
+  channelId: string;
+  alias: string;
+  forwardCount: number;
+  routedOutSats: number;
+  routedInSats: number;
+  feesEarnedSats: number;
+}
+
+export interface DailyBucket {
+  date: string;
+  forwards: number;
+  routedSats: number;
+  feesSats: number;
+}
+
+export interface ResolvedForward {
+  createdAt: string;
+  incoming: string;
+  outgoing: string;
+  tokens: number;
+  fee: number;
+}
+
+export interface ForwardsReport {
+  windowDays: number;
+  totalForwards: number;
+  totalRoutedSats: number;
+  totalFeesEarnedSats: number;
+  avgFeePpm: number;
+  maxForwardSats: number;
+  busiestDay: string | null;
+  perChannel: ChannelForwardStat[];
+  daily: DailyBucket[];
+  recent: ResolvedForward[];
+}
+
+export async function getForwardsReport(
+  lnd: AuthenticatedLnd,
+  windowDays: number,
+): Promise<ForwardsReport> {
+  const [events, channels] = await Promise.all([
+    fetchForwards(lnd, windowDays),
+    getChannelsView(lnd),
+  ]);
+  const aliasById = new Map(channels.map((c) => [c.id, c.peerAlias]));
+  const name = (id: string): string => aliasById.get(id) ?? id;
+
+  const byChannel = new Map<string, ChannelForwardStat>();
+  const ensure = (id: string): ChannelForwardStat => {
+    let s = byChannel.get(id);
+    if (!s) {
+      s = { channelId: id, alias: name(id), forwardCount: 0, routedOutSats: 0, routedInSats: 0, feesEarnedSats: 0 };
+      byChannel.set(id, s);
+    }
+    return s;
+  };
+
+  const dayMap = new Map<string, DailyBucket>();
+  let totalRouted = 0;
+  let totalFees = 0;
+  let maxForward = 0;
+
+  for (const e of events) {
+    const out = ensure(e.outgoingChannel);
+    out.routedOutSats += e.tokens;
+    out.feesEarnedSats += e.fee;
+    out.forwardCount += 1;
+    ensure(e.incomingChannel).routedInSats += e.tokens;
+
+    totalRouted += e.tokens;
+    totalFees += e.fee;
+    if (e.tokens > maxForward) maxForward = e.tokens;
+
+    const date = e.createdAt.slice(0, 10);
+    const bucket = dayMap.get(date) ?? { date, forwards: 0, routedSats: 0, feesSats: 0 };
+    bucket.forwards += 1;
+    bucket.routedSats += e.tokens;
+    bucket.feesSats += e.fee;
+    dayMap.set(date, bucket);
+  }
+
+  // Continuous daily series (fill gaps with zeros) for the chart.
+  const daily: DailyBucket[] = [];
+  for (let i = windowDays - 1; i >= 0; i--) {
+    const date = new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10);
+    daily.push(dayMap.get(date) ?? { date, forwards: 0, routedSats: 0, feesSats: 0 });
+  }
+  const busiestDay =
+    daily.reduce<DailyBucket | null>((best, d) => (d.forwards > (best?.forwards ?? -1) ? d : best), null)
+      ?.date ?? null;
+
+  const perChannel = [...byChannel.values()].sort((a, b) => b.feesEarnedSats - a.feesEarnedSats);
+
+  const recent: ResolvedForward[] = [...events]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, 15)
+    .map((e) => ({
+      createdAt: e.createdAt,
+      incoming: name(e.incomingChannel),
+      outgoing: name(e.outgoingChannel),
+      tokens: e.tokens,
+      fee: e.fee,
+    }));
+
+  return {
+    windowDays,
+    totalForwards: events.length,
+    totalRoutedSats: totalRouted,
+    totalFeesEarnedSats: totalFees,
+    avgFeePpm: totalRouted > 0 ? Math.round((totalFees / totalRouted) * 1_000_000) : 0,
+    maxForwardSats: maxForward,
+    busiestDay,
+    perChannel,
+    daily,
     recent,
   };
 }
