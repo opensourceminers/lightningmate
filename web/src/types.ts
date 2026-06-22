@@ -285,6 +285,16 @@ export interface ChannelSuggestion {
   score: number;
   recommendedSizeSats: number;
   reason: string;
+  socket: string;
+}
+
+export interface OpenChannelResult {
+  ok: boolean;
+  pubkey: string;
+  localTokens: number;
+  transactionId?: string;
+  transactionVout?: number;
+  error?: string;
 }
 
 export interface SuggestionsResponse {

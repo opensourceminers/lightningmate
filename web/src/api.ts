@@ -10,6 +10,7 @@ import type {
   FlowSummary,
   ForwardsReport,
   NodeSummary,
+  OpenChannelResult,
   PnlSummary,
   RebalanceAnalysis,
   RebalanceExecResult,
@@ -91,4 +92,11 @@ export const api = {
       : "";
     return get<SuggestionsResponse>(`/suggestions${qs}`);
   },
+  channelOpen: (params: {
+    pubkey: string;
+    socket?: string;
+    localTokens: number;
+    feeRate?: number;
+    isPrivate?: boolean;
+  }) => post<OpenChannelResult>("/channels/open", params),
 };
