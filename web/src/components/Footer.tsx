@@ -1,4 +1,4 @@
-const DONATE_URL = "http://umbrel.local:3003/apps/3Vo4BjAK9GYCqQPqDKHAkQ9xHPZq/pos";
+const DONATE_URL = "https://btcpay.opensourceminers.de/apps/3Vo4BjAK9GYCqQPqDKHAkQ9xHPZq/pos";
 const GITHUB = "https://github.com/opensourceminers/lightningmate";
 const X_URL = "https://x.com/opensource_de";
 const SITE = "https://opensourceminers.de";
