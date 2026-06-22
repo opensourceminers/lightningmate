@@ -15,7 +15,6 @@ import { RebalancePanel } from "./components/RebalancePanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SuggestionsPanel } from "./components/SuggestionsPanel";
 import { SummaryBar } from "./components/SummaryBar";
-import { WalletPanel } from "./components/WalletPanel";
 import { usePolledData } from "./usePolledData";
 
 type Tab =
@@ -25,7 +24,6 @@ type Tab =
   | "fees"
   | "rebalance"
   | "autopilot"
-  | "wallet"
   | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
@@ -35,7 +33,6 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "fees", label: "Fees" },
   { id: "rebalance", label: "Rebalancing" },
   { id: "autopilot", label: "Autopilot" },
-  { id: "wallet", label: "Wallet" },
   { id: "settings", label: "Settings" },
 ];
 
@@ -125,7 +122,6 @@ export function App() {
         {tab === "fees" ? <FeesPanel /> : null}
         {tab === "rebalance" ? <RebalancePanel /> : null}
         {tab === "autopilot" ? <AutopilotPanel /> : null}
-        {tab === "wallet" ? <WalletPanel /> : null}
         {tab === "settings" ? <SettingsPanel onChange={price.refresh} /> : null}
       </div>
 
