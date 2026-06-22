@@ -261,9 +261,10 @@ export async function executeRebalance(
       return { ...base, budgetPpm, error: `no route within budget (${budgetPpm} ppm)` };
     }
 
-    await payViaRoutes({ lnd: writeLnd, id: invoice.id, routes: [route] });
+    const paid = await payViaRoutes({ lnd: writeLnd, id: invoice.id, routes: [route] });
 
-    const feeSats = route.safe_fee;
+    // Report the fee actually paid, not the pre-flight route estimate.
+    const feeSats = paid.safe_fee ?? route.safe_fee;
     return {
       ...base,
       ok: true,

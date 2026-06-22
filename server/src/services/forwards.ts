@@ -6,7 +6,10 @@ export interface ForwardEvent {
   incomingChannel: string;
   outgoingChannel: string;
   tokens: number;
+  /** Fee earned on this forward, in sats (rounded — display only). */
   fee: number;
+  /** Fee in millisatoshis — the precise value we accumulate on. */
+  feeMsat: number;
 }
 
 export interface ChannelFlow {
@@ -50,12 +53,16 @@ async function fetchForwards(
     const res = await getForwards(args);
 
     for (const f of res.forwards) {
+      // Sum on millisatoshis (fee_mtokens) — using the rounded `fee` (whole sats)
+      // drops sub-sat earnings and systematically understates routing revenue.
+      const feeMsat = f.fee_mtokens != null ? Number(f.fee_mtokens) : Math.round((f.fee ?? 0) * 1000);
       events.push({
         createdAt: f.created_at,
         incomingChannel: f.incoming_channel,
         outgoingChannel: f.outgoing_channel,
         tokens: f.tokens,
-        fee: f.fee,
+        fee: Math.round(feeMsat / 1000),
+        feeMsat,
       });
     }
 
@@ -83,18 +90,25 @@ export async function getFlowSummary(
   };
 
   let totalRouted = 0;
-  let totalFees = 0;
+  let totalFeeMsat = 0;
+  const feeMsatByChannel = new Map<string, number>();
 
   for (const e of events) {
     const out = ensure(e.outgoingChannel);
     out.routedOut += e.tokens;
-    out.feesEarned += e.fee;
     out.forwardCount += 1;
+    feeMsatByChannel.set(e.outgoingChannel, (feeMsatByChannel.get(e.outgoingChannel) ?? 0) + e.feeMsat);
 
     ensure(e.incomingChannel).routedIn += e.tokens;
 
     totalRouted += e.tokens;
-    totalFees += e.fee;
+    totalFeeMsat += e.feeMsat;
+  }
+
+  // Convert accumulated millisats → sats once, at the end.
+  for (const [id, msat] of feeMsatByChannel) {
+    const flow = byChannel.get(id);
+    if (flow) flow.feesEarned = Math.round(msat / 1000);
   }
 
   const perChannel = [...byChannel.values()].sort(
@@ -110,7 +124,7 @@ export async function getFlowSummary(
     windowDays,
     totalForwards: events.length,
     totalRoutedSats: totalRouted,
-    totalFeesEarnedSats: totalFees,
+    totalFeesEarnedSats: Math.round(totalFeeMsat / 1000),
     perChannel,
     recent,
   };
@@ -179,51 +193,64 @@ export async function getForwardsReport(
   };
 
   const dayMap = new Map<string, DailyBucket>();
-  const perChanDay = new Map<string, Map<string, number>>(); // channel -> date -> fees
+  const dayFeeMsat = new Map<string, number>(); // date -> fee msat
+  const chanFeeMsat = new Map<string, number>(); // channel -> fee msat
+  const perChanDayMsat = new Map<string, Map<string, number>>(); // channel -> date -> fee msat
   let totalRouted = 0;
-  let totalFees = 0;
+  let totalFeeMsat = 0;
   let maxForward = 0;
 
   for (const e of events) {
     const out = ensure(e.outgoingChannel);
     out.routedOutSats += e.tokens;
-    out.feesEarnedSats += e.fee;
     out.forwardCount += 1;
+    chanFeeMsat.set(e.outgoingChannel, (chanFeeMsat.get(e.outgoingChannel) ?? 0) + e.feeMsat);
     ensure(e.incomingChannel).routedInSats += e.tokens;
 
     totalRouted += e.tokens;
-    totalFees += e.fee;
+    totalFeeMsat += e.feeMsat;
     if (e.tokens > maxForward) maxForward = e.tokens;
 
     const date = e.createdAt.slice(0, 10);
     const bucket = dayMap.get(date) ?? { date, forwards: 0, routedSats: 0, feesSats: 0 };
     bucket.forwards += 1;
     bucket.routedSats += e.tokens;
-    bucket.feesSats += e.fee;
     dayMap.set(date, bucket);
+    dayFeeMsat.set(date, (dayFeeMsat.get(date) ?? 0) + e.feeMsat);
 
-    let chanDays = perChanDay.get(e.outgoingChannel);
+    let chanDays = perChanDayMsat.get(e.outgoingChannel);
     if (!chanDays) {
       chanDays = new Map();
-      perChanDay.set(e.outgoingChannel, chanDays);
+      perChanDayMsat.set(e.outgoingChannel, chanDays);
     }
-    chanDays.set(date, (chanDays.get(date) ?? 0) + e.fee);
+    chanDays.set(date, (chanDays.get(date) ?? 0) + e.feeMsat);
+  }
+
+  // Convert accumulated millisats → sats once.
+  for (const [id, msat] of chanFeeMsat) {
+    const s = byChannel.get(id);
+    if (s) s.feesEarnedSats = Math.round(msat / 1000);
   }
 
   // Continuous daily series (fill gaps with zeros) for the chart.
   const daily: DailyBucket[] = [];
   for (let i = windowDays - 1; i >= 0; i--) {
     const date = new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10);
-    daily.push(dayMap.get(date) ?? { date, forwards: 0, routedSats: 0, feesSats: 0 });
+    const b = dayMap.get(date);
+    daily.push(
+      b
+        ? { ...b, feesSats: Math.round((dayFeeMsat.get(date) ?? 0) / 1000) }
+        : { date, forwards: 0, routedSats: 0, feesSats: 0 },
+    );
   }
   const busiestDay =
     daily.reduce<DailyBucket | null>((best, d) => (d.forwards > (best?.forwards ?? -1) ? d : best), null)
       ?.date ?? null;
 
-  // Fill each channel's daily-fee sparkline, aligned to the `daily` dates.
+  // Fill each channel's daily-fee sparkline (sats), aligned to the `daily` dates.
   for (const stat of byChannel.values()) {
-    const days = perChanDay.get(stat.channelId);
-    stat.spark = daily.map((d) => days?.get(d.date) ?? 0);
+    const days = perChanDayMsat.get(stat.channelId);
+    stat.spark = daily.map((d) => Math.round((days?.get(d.date) ?? 0) / 1000));
   }
 
   const perChannel = [...byChannel.values()].sort((a, b) => b.feesEarnedSats - a.feesEarnedSats);
@@ -243,8 +270,8 @@ export async function getForwardsReport(
     windowDays,
     totalForwards: events.length,
     totalRoutedSats: totalRouted,
-    totalFeesEarnedSats: totalFees,
-    avgFeePpm: totalRouted > 0 ? Math.round((totalFees / totalRouted) * 1_000_000) : 0,
+    totalFeesEarnedSats: Math.round(totalFeeMsat / 1000),
+    avgFeePpm: totalRouted > 0 ? Math.round((totalFeeMsat / totalRouted) * 1000) : 0,
     maxForwardSats: maxForward,
     busiestDay,
     perChannel,
