@@ -12,6 +12,7 @@ import {
 } from "../services/rebalance.js";
 import { getChannelSuggestions, type SuggestionPolicy } from "../services/suggestions.js";
 import { getPnl } from "../services/pnl.js";
+import { openChannelTo } from "../services/channelOps.js";
 import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 
@@ -249,6 +250,31 @@ export function createApiRouter(
         overrides.requireClearnet = req.query.requireClearnet === "true";
       }
       res.json(await getChannelSuggestions(lnd, overrides));
+    }),
+  );
+
+  // Open a channel to a peer — real on-chain action, requires write access.
+  router.post(
+    "/channels/open",
+    wrap(async (req, res) => {
+      if (!writeLnd) {
+        res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
+        return;
+      }
+      const { pubkey, socket, localTokens, feeRate, isPrivate } = req.body ?? {};
+      if (!pubkey || !Number.isFinite(Number(localTokens))) {
+        res.status(400).json({ error: "bad_request", message: "pubkey and localTokens are required." });
+        return;
+      }
+      res.json(
+        await openChannelTo(writeLnd, {
+          pubkey: String(pubkey),
+          socket: socket ? String(socket) : undefined,
+          localTokens: Number(localTokens),
+          feeRate: Number.isFinite(Number(feeRate)) ? Number(feeRate) : undefined,
+          isPrivate: Boolean(isPrivate),
+        }),
+      );
     }),
   );
 

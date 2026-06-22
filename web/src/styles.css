@@ -369,6 +369,16 @@ table { width: 100%; border-collapse: collapse; }
 .row-btn:hover:not(:disabled) { background: rgba(247, 147, 26, 0.24); }
 .row-btn:active:not(:disabled) { transform: translateY(1px); }
 .row-btn:disabled { background: var(--panel-2); color: var(--faint); border-color: var(--line); cursor: not-allowed; }
+.row-btn.ghost { background: transparent; color: var(--muted); border-color: var(--line); }
+.row-btn.ghost:hover:not(:disabled) { background: var(--line-soft); color: var(--text); }
+.row-actions { display: flex; gap: 6px; justify-content: flex-end; }
+
+/* Open-channel inline form */
+.open-row td { background: rgba(247, 147, 26, 0.05); }
+.open-form { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; padding: 6px 0; font-size: 13px; }
+.policy-field.inline { flex-direction: column; }
+.open-warn { color: var(--accent); font-size: 12px; font-weight: 600; }
+.open-ok { color: var(--green); font-weight: 600; }
 
 /* ── Autopilot ───────────────────────────────────────────── */
 .ap-status { font-size: 12px; font-weight: 600; padding: 4px 11px; border-radius: 999px; border: 1px solid var(--line); }

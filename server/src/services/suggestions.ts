@@ -37,6 +37,8 @@ export interface ChannelSuggestion {
   score: number;
   recommendedSizeSats: number;
   reason: string;
+  /** Best known address to connect to (clearnet preferred), or "" if none. */
+  socket: string;
 }
 
 interface NodeStat {
@@ -49,6 +51,7 @@ interface NodeMeta {
   alias: string;
   hasClearnet: boolean;
   updatedAt: number;
+  socket: string;
 }
 
 interface GraphCache {
@@ -91,10 +94,12 @@ async function buildGraphCache(lnd: AuthenticatedLnd): Promise<GraphCache> {
 
   const meta = new Map<string, NodeMeta>();
   for (const n of graph.nodes) {
+    const clearnet = n.sockets.find(isClearnet);
     meta.set(n.public_key, {
       alias: n.alias?.trim() || `${n.public_key.slice(0, 12)}…`,
       hasClearnet: n.sockets.some(isClearnet),
       updatedAt: n.updated_at ? new Date(n.updated_at).getTime() : 0,
+      socket: clearnet ?? n.sockets[0] ?? "",
     });
   }
 
@@ -182,6 +187,7 @@ export async function getChannelSuggestions(
       score: Math.round(score * 100),
       recommendedSizeSats,
       reason: reasonFor(stat, meta, avgFee),
+      socket: meta.socket,
     };
   });
 
