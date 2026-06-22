@@ -1,5 +1,6 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
-import type { AuthenticatedLnd } from "lightning";
+import { subscribeToForwards, type AuthenticatedLnd } from "lightning";
+import { getNodeScore } from "../services/score.js";
 import type { Config } from "../config.js";
 import { getNodeSummary } from "../services/node.js";
 import { getChannelsView } from "../services/channels.js";
@@ -224,6 +225,62 @@ export function createApiRouter(
   router.get("/rebalance/log", (_req, res) => {
     res.json({ summary: rebalanceLog.summary(), records: rebalanceLog.recent() });
   });
+
+  // Node health score (A–F) + network rank.
+  router.get(
+    "/score",
+    wrap(async (_req, res) => {
+      res.json(await getNodeScore(lnd));
+    }),
+  );
+
+  // Live forwarding events via Server-Sent Events.
+  router.get(
+    "/stream/forwards",
+    wrap(async (req, res) => {
+      const channels = await getChannelsView(lnd);
+      const aliasById = new Map(channels.map((c) => [c.id, c.peerAlias]));
+      const name = (id?: string) => (id ? aliasById.get(id) ?? `${id.slice(0, 10)}…` : "?");
+
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders?.();
+      res.write("retry: 5000\n\n");
+
+      const sub = subscribeToForwards({ lnd });
+      const onForward = (e: {
+        at: string;
+        is_confirmed: boolean;
+        is_receive: boolean;
+        is_send: boolean;
+        tokens?: number;
+        fee?: number;
+        in_channel?: string;
+        out_channel?: string;
+      }) => {
+        // Only settled routing forwards (not our own sends/receives).
+        if (!e.is_confirmed || e.is_receive || e.is_send || !e.tokens) return;
+        const payload = JSON.stringify({
+          at: e.at,
+          tokens: e.tokens,
+          fee: e.fee ?? 0,
+          incoming: name(e.in_channel),
+          outgoing: name(e.out_channel),
+        });
+        res.write(`data: ${payload}\n\n`);
+      };
+      sub.on("forward", onForward);
+      sub.on("error", () => {});
+
+      const heartbeat = setInterval(() => res.write(": ping\n\n"), 25_000);
+      req.on("close", () => {
+        clearInterval(heartbeat);
+        sub.removeAllListeners();
+        res.end();
+      });
+    }),
+  );
 
   // Profit & loss over a window — routing revenue vs channel/rebalance costs.
   router.get(

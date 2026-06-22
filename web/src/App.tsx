@@ -7,6 +7,9 @@ import { PnlOverview } from "./components/PnlOverview";
 import { FeesPanel } from "./components/FeesPanel";
 import { Footer } from "./components/Footer";
 import { ForwardsPanel } from "./components/ForwardsPanel";
+import { HealthScore } from "./components/HealthScore";
+import { LiquidityMap } from "./components/LiquidityMap";
+import { LiveFeed } from "./components/LiveFeed";
 import { RebalancePanel } from "./components/RebalancePanel";
 import { SuggestionsPanel } from "./components/SuggestionsPanel";
 import { SummaryBar } from "./components/SummaryBar";
@@ -63,6 +66,12 @@ export function App() {
       {initialLoading ? <div className="loading">Connecting to your node…</div> : null}
 
       {node.data ? <SummaryBar node={node.data} /> : null}
+      {node.data ? (
+        <div className="hero-row">
+          <HealthScore />
+          <LiveFeed />
+        </div>
+      ) : null}
       {node.data ? <PnlOverview /> : null}
 
       <nav className="tabs">
@@ -79,7 +88,14 @@ export function App() {
 
       <div className="tab-body">
         {tab === "channels" ? (
-          channels.data ? <ChannelTable channels={channels.data} /> : <Placeholder />
+          channels.data ? (
+            <>
+              <LiquidityMap channels={channels.data} />
+              <ChannelTable channels={channels.data} />
+            </>
+          ) : (
+            <Placeholder />
+          )
         ) : null}
         {tab === "forwards" ? <ForwardsPanel /> : null}
         {tab === "suggestions" ? <SuggestionsPanel /> : null}

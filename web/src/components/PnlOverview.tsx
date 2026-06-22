@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { PnlSummary } from "../types";
 import { sats } from "../format";
+import { useCountUp } from "../useCountUp";
 
 const WINDOWS: { label: string; days: number }[] = [
   { label: "30d", days: 30 },
@@ -42,6 +43,7 @@ export function PnlOverview() {
   }, [days]);
 
   const net = data?.netProfitSats ?? 0;
+  const animatedNet = useCountUp(net);
   const max = data ? Math.max(1, data.routingRevenueSats, data.totalCostSats) : 1;
 
   return (
@@ -68,7 +70,7 @@ export function PnlOverview() {
           <div className="pnl-grid">
             <div className={`pnl-net ${net >= 0 ? "pos" : "neg"}`}>
               <div className="pnl-net-label">Net profit</div>
-              <div className="pnl-net-value">{signed(net)} sat</div>
+              <div className="pnl-net-value">{signed(Math.round(animatedNet))} sat</div>
               <div className="pnl-net-sub">
                 {data.forwardCount} forwards · {data.rebalanceCount} rebalances
               </div>

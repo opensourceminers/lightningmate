@@ -107,6 +107,36 @@ async function buildGraphCache(lnd: AuthenticatedLnd): Promise<GraphCache> {
   return cache;
 }
 
+export interface NetworkRank {
+  position: number;
+  total: number;
+  /** 0..1, share of nodes we rank above (by channel count). */
+  percentile: number;
+  degree: number;
+}
+
+/** Our node's rank among all graph nodes by channel count (connectivity). */
+export async function getNetworkRank(
+  lnd: AuthenticatedLnd,
+  ownPubkey: string,
+): Promise<NetworkRank | null> {
+  const graph = await buildGraphCache(lnd);
+  const mine = graph.stats.get(ownPubkey);
+  if (!mine) return null;
+
+  let higher = 0;
+  for (const [, s] of graph.stats) if (s.degree > mine.degree) higher += 1;
+
+  const total = graph.stats.size;
+  const position = higher + 1;
+  return {
+    position,
+    total,
+    percentile: total > 0 ? 1 - position / total : 0,
+    degree: mine.degree,
+  };
+}
+
 function median(values: number[]): number {
   if (values.length === 0) return 0;
   const sorted = [...values].sort((a, b) => a - b);

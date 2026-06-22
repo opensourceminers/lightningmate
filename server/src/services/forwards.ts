@@ -125,6 +125,8 @@ export interface ChannelForwardStat {
   routedOutSats: number;
   routedInSats: number;
   feesEarnedSats: number;
+  /** Daily fees earned, aligned to the report's `daily` dates (for sparklines). */
+  spark: number[];
 }
 
 export interface DailyBucket {
@@ -170,13 +172,14 @@ export async function getForwardsReport(
   const ensure = (id: string): ChannelForwardStat => {
     let s = byChannel.get(id);
     if (!s) {
-      s = { channelId: id, alias: name(id), forwardCount: 0, routedOutSats: 0, routedInSats: 0, feesEarnedSats: 0 };
+      s = { channelId: id, alias: name(id), forwardCount: 0, routedOutSats: 0, routedInSats: 0, feesEarnedSats: 0, spark: [] };
       byChannel.set(id, s);
     }
     return s;
   };
 
   const dayMap = new Map<string, DailyBucket>();
+  const perChanDay = new Map<string, Map<string, number>>(); // channel -> date -> fees
   let totalRouted = 0;
   let totalFees = 0;
   let maxForward = 0;
@@ -198,6 +201,13 @@ export async function getForwardsReport(
     bucket.routedSats += e.tokens;
     bucket.feesSats += e.fee;
     dayMap.set(date, bucket);
+
+    let chanDays = perChanDay.get(e.outgoingChannel);
+    if (!chanDays) {
+      chanDays = new Map();
+      perChanDay.set(e.outgoingChannel, chanDays);
+    }
+    chanDays.set(date, (chanDays.get(date) ?? 0) + e.fee);
   }
 
   // Continuous daily series (fill gaps with zeros) for the chart.
@@ -209,6 +219,12 @@ export async function getForwardsReport(
   const busiestDay =
     daily.reduce<DailyBucket | null>((best, d) => (d.forwards > (best?.forwards ?? -1) ? d : best), null)
       ?.date ?? null;
+
+  // Fill each channel's daily-fee sparkline, aligned to the `daily` dates.
+  for (const stat of byChannel.values()) {
+    const days = perChanDay.get(stat.channelId);
+    stat.spark = daily.map((d) => days?.get(d.date) ?? 0);
+  }
 
   const perChannel = [...byChannel.values()].sort((a, b) => b.feesEarnedSats - a.feesEarnedSats);
 
