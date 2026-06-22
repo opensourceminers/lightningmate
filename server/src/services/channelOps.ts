@@ -1,4 +1,4 @@
-import { addPeer, openChannel, type AuthenticatedLnd } from "lightning";
+import { addPeer, closeChannel, openChannel, type AuthenticatedLnd } from "lightning";
 
 export interface OpenChannelParams {
   pubkey: string;
@@ -72,5 +72,33 @@ export async function openChannelTo(
     };
   } catch (err) {
     return { ...base, error: describe(err) };
+  }
+}
+
+export interface CloseChannelResult {
+  ok: boolean;
+  transactionId?: string;
+  error?: string;
+}
+
+/**
+ * Close a channel by funding outpoint. Cooperative by default (needs the peer
+ * online); force-close when the peer is unreachable. Real on-chain action.
+ */
+export async function closeChannelByOutpoint(
+  writeLnd: AuthenticatedLnd,
+  transactionId: string,
+  transactionVout: number,
+  isForce: boolean,
+): Promise<CloseChannelResult> {
+  try {
+    const res = await closeChannel(
+      isForce
+        ? { lnd: writeLnd, transaction_id: transactionId, transaction_vout: transactionVout, is_force_close: true }
+        : { lnd: writeLnd, transaction_id: transactionId, transaction_vout: transactionVout },
+    );
+    return { ok: true, transactionId: res.transaction_id };
+  } catch (err) {
+    return { ok: false, error: describe(err) };
   }
 }

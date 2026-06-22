@@ -15,9 +15,18 @@ import { RebalancePanel } from "./components/RebalancePanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SuggestionsPanel } from "./components/SuggestionsPanel";
 import { SummaryBar } from "./components/SummaryBar";
+import { WalletPanel } from "./components/WalletPanel";
 import { usePolledData } from "./usePolledData";
 
-type Tab = "channels" | "suggestions" | "forwards" | "fees" | "rebalance" | "autopilot" | "settings";
+type Tab =
+  | "channels"
+  | "suggestions"
+  | "forwards"
+  | "fees"
+  | "rebalance"
+  | "autopilot"
+  | "wallet"
+  | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "channels", label: "Channels" },
@@ -26,6 +35,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "fees", label: "Fees" },
   { id: "rebalance", label: "Rebalancing" },
   { id: "autopilot", label: "Autopilot" },
+  { id: "wallet", label: "Wallet" },
   { id: "settings", label: "Settings" },
 ];
 
@@ -46,15 +56,23 @@ export function App() {
           Lightning Mate
           <span className="brand-sub">Lightning node manager</span>
         </span>
-        <button
-          className="refresh"
-          onClick={() => {
-            node.refresh();
-            channels.refresh();
-          }}
-        >
-          ↻ refresh
-        </button>
+        <div className="topbar-right">
+          <span
+            className={`conn ${node.error ? "down" : node.data ? "up" : "wait"}`}
+            title={node.error ? "Disconnected — retrying" : node.data ? "Connected" : "Connecting"}
+          >
+            <i /> {node.error ? "reconnecting" : node.data ? "connected" : "connecting"}
+          </span>
+          <button
+            className="refresh"
+            onClick={() => {
+              node.refresh();
+              channels.refresh();
+            }}
+          >
+            ↻ refresh
+          </button>
+        </div>
       </header>
 
       {anyError ? (
@@ -107,6 +125,7 @@ export function App() {
         {tab === "fees" ? <FeesPanel /> : null}
         {tab === "rebalance" ? <RebalancePanel /> : null}
         {tab === "autopilot" ? <AutopilotPanel /> : null}
+        {tab === "wallet" ? <WalletPanel /> : null}
         {tab === "settings" ? <SettingsPanel onChange={price.refresh} /> : null}
       </div>
 

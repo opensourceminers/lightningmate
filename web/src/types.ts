@@ -29,6 +29,8 @@ export interface ChannelView {
   private: boolean;
   initiator: "local" | "remote";
   capacity: number;
+  transactionId: string;
+  transactionVout: number;
   localBalance: number;
   remoteBalance: number;
   localRatio: number;
@@ -314,6 +316,27 @@ export type OverrideMap = Record<string, ChannelOverride>;
 export interface Alert {
   level: "warn" | "info";
   message: string;
+}
+
+export interface WalletTx {
+  id: string;
+  createdAt: string;
+  tokens: number;
+  fee: number;
+  isOutgoing: boolean;
+  isConfirmed: boolean;
+}
+
+export interface WalletInfo {
+  confirmedSats: number;
+  pendingSats: number;
+  transactions: WalletTx[];
+}
+
+export interface CloseChannelResult {
+  ok: boolean;
+  transactionId?: string;
+  error?: string;
 }
 
 export type FiatCurrency = "off" | "USD" | "EUR" | "GBP" | "CHF";

@@ -23,22 +23,6 @@ export async function getAlerts(lnd: AuthenticatedLnd): Promise<Alert[]> {
     alerts.push({ level: "warn", message: `${inactive} channel${inactive > 1 ? "s" : ""} offline` });
   }
 
-  const drained = channels.filter((c) => c.active && c.localRatio < 0.05).length;
-  if (drained > 0) {
-    alerts.push({
-      level: "info",
-      message: `${drained} channel${drained > 1 ? "s" : ""} nearly out of outbound liquidity`,
-    });
-  }
-
-  const full = channels.filter((c) => c.active && c.localRatio > 0.95).length;
-  if (full > 0) {
-    alerts.push({
-      level: "info",
-      message: `${full} channel${full > 1 ? "s" : ""} nearly out of inbound liquidity`,
-    });
-  }
-
   if (node.balances.onchainConfirmedSats < LOW_ONCHAIN_SATS) {
     alerts.push({ level: "info", message: "Low on-chain balance for fees / channel opens" });
   }
