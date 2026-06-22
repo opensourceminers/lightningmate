@@ -29,6 +29,15 @@ export interface NodeSummary {
   };
 }
 
+let cachedPubkey: string | undefined;
+
+/** Our node's own public key (cached for the process lifetime). */
+export async function getOwnPubkey(lnd: AuthenticatedLnd): Promise<string> {
+  if (cachedPubkey) return cachedPubkey;
+  cachedPubkey = (await getWalletInfo({ lnd })).public_key;
+  return cachedPubkey;
+}
+
 export async function getNodeSummary(lnd: AuthenticatedLnd): Promise<NodeSummary> {
   const [info, channelBalance, chainBalance, pendingChain] = await Promise.all([
     getWalletInfo({ lnd }),

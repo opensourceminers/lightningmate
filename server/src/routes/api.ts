@@ -5,7 +5,23 @@ import { getNodeSummary } from "../services/node.js";
 import { getChannelsView } from "../services/channels.js";
 import { getFlowSummary } from "../services/forwards.js";
 import { applyFees, getFeePreview, type FeeApplyItem, type FeePolicy } from "../services/fees.js";
+import {
+  executeRebalance,
+  getRebalanceCandidates,
+  type RebalancePolicy,
+} from "../services/rebalance.js";
 import type { Autopilot } from "../services/autopilot.js";
+import type { RebalanceLog } from "../services/rebalanceLog.js";
+
+// Pull the numeric keys of a policy object out of the query string.
+function numericOverrides<T>(query: Request["query"], keys: (keyof T)[]): Partial<T> {
+  const out: Partial<T> = {};
+  for (const key of keys) {
+    const n = Number(query[key as string]);
+    if (Number.isFinite(n)) out[key] = n as T[keyof T];
+  }
+  return out;
+}
 
 const WRITE_DISABLED_MSG =
   "Writing is disabled. Set LM_ENABLE_WRITE=true and provide a write macaroon " +
@@ -57,6 +73,7 @@ export function createApiRouter(
   writeLnd: AuthenticatedLnd | undefined,
   config: Config,
   autopilot: Autopilot,
+  rebalanceLog: RebalanceLog,
 ): Router {
   const router = Router();
 
@@ -134,6 +151,66 @@ export function createApiRouter(
       res.json({ run: await autopilot.runOnce(), state: autopilot.getState() });
     }),
   );
+
+  // Profit-aware rebalance candidates — read-only analysis, probes route costs
+  // without paying. Each candidate is gated on cost ppm ≤ profit budget.
+  router.get(
+    "/rebalance/candidates",
+    wrap(async (req, res) => {
+      const overrides = numericOverrides<RebalancePolicy>(req.query, [
+        "econRatio",
+        "maxLocalRatioTarget",
+        "minLocalRatioSource",
+        "amountSats",
+        "minDemandSats",
+        "flowWindowDays",
+        "maxCandidates",
+      ]);
+      res.json(await getRebalanceCandidates(lnd, overrides));
+    }),
+  );
+
+  // Execute one rebalance. Budget is enforced server-side; requires write access.
+  router.post(
+    "/rebalance/execute",
+    wrap(async (req, res) => {
+      if (!writeLnd) {
+        res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
+        return;
+      }
+      const { targetId, sourceId, amountSats, econRatio } = req.body ?? {};
+      if (!targetId || !sourceId || !Number.isFinite(Number(amountSats))) {
+        res.status(400).json({ error: "bad_request", message: "targetId, sourceId and amountSats are required." });
+        return;
+      }
+      const result = await executeRebalance(lnd, writeLnd, {
+        targetId: String(targetId),
+        sourceId: String(sourceId),
+        amountSats: Number(amountSats),
+        econRatio: Number.isFinite(Number(econRatio)) ? Number(econRatio) : 0.8,
+      });
+      rebalanceLog.append({
+        at: new Date().toISOString(),
+        via: "manual",
+        targetId: result.targetId,
+        targetAlias: result.targetAlias,
+        sourceId: result.sourceId,
+        sourceAlias: result.sourceAlias,
+        amountSats: result.amountSats,
+        budgetPpm: result.budgetPpm,
+        feeSats: result.feeSats,
+        costPpm: result.costPpm,
+        ok: result.ok,
+        error: result.error,
+      });
+      res.json(result);
+    }),
+  );
+
+  // Rebalance accounting log + totals.
+  router.get("/rebalance/log", (_req, res) => {
+    res.json({ summary: rebalanceLog.summary(), records: rebalanceLog.recent() });
+  });
 
   // Error middleware — surface LND/connection failures as JSON, not a crash.
   router.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

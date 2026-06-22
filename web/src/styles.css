@@ -199,6 +199,11 @@ table { width: 100%; border-collapse: collapse; }
 }
 .primary-btn:disabled { background: var(--panel-2); color: var(--muted); cursor: not-allowed; }
 .apply-result { color: var(--green); font-size: 13px; }
+.row-btn {
+  background: var(--accent); color: #1a1205; border: none; border-radius: 6px;
+  padding: 4px 10px; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.row-btn:disabled { background: var(--panel-2); color: var(--muted); cursor: not-allowed; }
 .fail-list { margin: 8px 0 0; padding-left: 18px; font-size: 12px; }
 
 /* Tabs */

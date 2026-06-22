@@ -9,6 +9,10 @@ import type {
   FeePreview,
   FlowSummary,
   NodeSummary,
+  RebalanceAnalysis,
+  RebalanceExecResult,
+  RebalanceLogResponse,
+  RebalancePolicy,
 } from "./types";
 
 async function handle<T>(res: Response): Promise<T> {
@@ -58,4 +62,19 @@ export const api = {
     post<AutopilotState>("/autopilot", partial),
   autopilotRun: () =>
     post<{ run: AutopilotRun; state: AutopilotState }>("/autopilot/run", {}),
+  rebalanceCandidates: (policy?: Partial<RebalancePolicy>) => {
+    const qs = policy
+      ? "?" + new URLSearchParams(
+          Object.entries(policy).map(([k, v]) => [k, String(v)]),
+        ).toString()
+      : "";
+    return get<RebalanceAnalysis>(`/rebalance/candidates${qs}`);
+  },
+  rebalanceExecute: (params: {
+    targetId: string;
+    sourceId: string;
+    amountSats: number;
+    econRatio: number;
+  }) => post<RebalanceExecResult>("/rebalance/execute", params),
+  rebalanceLog: () => get<RebalanceLogResponse>("/rebalance/log"),
 };
