@@ -9,6 +9,7 @@ import type {
   FeePreview,
   FlowSummary,
   ForwardsReport,
+  NodeScore,
   NodeSummary,
   OpenChannelResult,
   PnlSummary,
@@ -53,6 +54,7 @@ export const api = {
   channels: () => get<ChannelView[]>("/channels"),
   flows: (days?: number) => get<FlowSummary>(days ? `/flows?days=${days}` : "/flows"),
   pnl: (days: number) => get<PnlSummary>(`/pnl?days=${days}`),
+  score: () => get<NodeScore>("/score"),
   forwardsReport: (days: number) => get<ForwardsReport>(`/forwards/report?days=${days}`),
   feesPreview: (policy?: Partial<FeePolicy>) => {
     const qs = policy

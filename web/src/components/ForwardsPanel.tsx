@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { DailyBucket, ForwardsReport } from "../types";
 import { sats, satsCompact, timeAgo } from "../format";
+import { Sparkline } from "./Sparkline";
 
 const WINDOWS = [7, 30, 90];
 type Metric = "fees" | "volume" | "count";
@@ -112,6 +113,7 @@ export function ForwardsPanel() {
             <th className="num">Routed out</th>
             <th className="num">Routed in</th>
             <th className="num">Fees</th>
+            <th className="spark-col">Trend</th>
             <th className="share-col">Share</th>
           </tr>
         </thead>
@@ -123,6 +125,7 @@ export function ForwardsPanel() {
               <td className="num">{satsCompact(c.routedOutSats)}</td>
               <td className="num">{satsCompact(c.routedInSats)}</td>
               <td className="num earned">{sats(c.feesEarnedSats)}</td>
+              <td className="spark-col"><Sparkline data={c.spark} color="var(--green)" /></td>
               <td className="share-col">
                 <div className="share-bar">
                   <div className="share-fill" style={{ width: `${((c.routedOutSats + c.routedInSats) / maxRouted) * 100}%` }} />

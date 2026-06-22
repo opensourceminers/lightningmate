@@ -70,6 +70,7 @@ export interface ChannelForwardStat {
   routedOutSats: number;
   routedInSats: number;
   feesEarnedSats: number;
+  spark: number[];
 }
 
 export interface DailyBucket {
@@ -301,6 +302,36 @@ export interface SuggestionsResponse {
   policy: SuggestionPolicy;
   suggestions: ChannelSuggestion[];
   graphAgeSec: number;
+}
+
+export interface NetworkRank {
+  position: number;
+  total: number;
+  percentile: number;
+  degree: number;
+}
+
+export interface ScoreComponent {
+  key: string;
+  label: string;
+  score: number;
+  weight: number;
+  detail: string;
+}
+
+export interface NodeScore {
+  score: number;
+  grade: string;
+  components: ScoreComponent[];
+  rank: NetworkRank | null;
+}
+
+export interface LiveForward {
+  at: string;
+  tokens: number;
+  fee: number;
+  incoming: string;
+  outgoing: string;
 }
 
 export interface PnlSummary {
