@@ -1,6 +1,5 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import cors from "cors";
 import express from "express";
 import { loadConfig } from "./config.js";
 import { getLnd, getWriteLnd } from "./lnd.js";
@@ -44,8 +43,25 @@ function main(): void {
   autopilot.start();
 
   const app = express();
-  app.use(cors());
-  app.use(express.json());
+  app.disable("x-powered-by");
+
+  // Optional Host-header allowlist — defends against DNS-rebinding. Off unless
+  // LM_ALLOWED_HOSTS is set, so it never breaks default access.
+  if (config.allowedHosts.length > 0) {
+    app.use((req, res, next) => {
+      const host = (req.headers.host ?? "").split(":")[0].toLowerCase();
+      if (!config.allowedHosts.includes(host)) {
+        res.status(403).json({ error: "forbidden_host" });
+        return;
+      }
+      next();
+    });
+  }
+
+  // No CORS: the UI is served same-origin (Vite proxies /api in dev), so a
+  // cross-origin site can neither read responses nor make preflighted JSON
+  // POSTs — closing the cross-site / CSRF vector on the fund-moving API.
+  app.use(express.json({ limit: "256kb" }));
   app.use("/api", createApiRouter(lnd, writeLnd, config, autopilot, rebalanceLog, settings, overrides));
 
   // In production (Docker/Umbrel) we serve the built React app from the same
@@ -58,8 +74,8 @@ function main(): void {
     console.log(`   Serving web UI from ${webDir}`);
   }
 
-  app.listen(config.port, () => {
-    console.log(`⚡ LightningMate listening on http://localhost:${config.port}`);
+  app.listen(config.port, config.bindHost, () => {
+    console.log(`⚡ LightningMate listening on ${config.bindHost}:${config.port}`);
     const mode = config.writeEnabled ? "read + write" : "read-only";
     console.log(`   LND socket: ${config.lnd.socket}  (${mode})`);
   });
