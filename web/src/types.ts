@@ -298,6 +298,7 @@ export interface ChannelSuggestion {
   avgFeePpm: number;
   hasClearnet: boolean;
   lastSeenDays: number;
+  newReach: number;
   score: number;
   recommendedSizeSats: number;
   reason: string;

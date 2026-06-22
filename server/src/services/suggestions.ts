@@ -35,6 +35,8 @@ export interface ChannelSuggestion {
   avgFeePpm: number;
   hasClearnet: boolean;
   lastSeenDays: number;
+  /** New destinations this channel opens (peers not already within your 2 hops). */
+  newReach: number;
   score: number;
   recommendedSizeSats: number;
   reason: string;
@@ -47,6 +49,12 @@ interface NodeStat {
   totalCapacity: number;
   feeSum: number;
   feeCount: number;
+  /** Channels whose policy this node refreshed recently (active router). */
+  recentUpdates: number;
+  /** Channels where this node's policy is enabled (not disabled). */
+  enabledCount: number;
+  /** Pubkeys this node has a channel with (adjacency, for reach scoring). */
+  neighbors: Set<string>;
 }
 interface NodeMeta {
   alias: string;
@@ -75,21 +83,33 @@ async function buildGraphCache(lnd: AuthenticatedLnd): Promise<GraphCache> {
   const graph = await getNetworkGraph({ lnd });
 
   const stats = new Map<string, NodeStat>();
+  const freshAfter = Date.now() - 14 * 86_400_000; // "actively maintained" window
+  const ensureStat = (pk: string): NodeStat => {
+    let s = stats.get(pk);
+    if (!s) {
+      s = { degree: 0, totalCapacity: 0, feeSum: 0, feeCount: 0, recentUpdates: 0, enabledCount: 0, neighbors: new Set() };
+      stats.set(pk, s);
+    }
+    return s;
+  };
+
   for (const ch of graph.channels) {
-    const endpoints = new Set(ch.policies.map((p) => p.public_key));
+    const endpoints = [...new Set(ch.policies.map((p) => p.public_key))];
     for (const pk of endpoints) {
-      let s = stats.get(pk);
-      if (!s) {
-        s = { degree: 0, totalCapacity: 0, feeSum: 0, feeCount: 0 };
-        stats.set(pk, s);
-      }
+      const s = ensureStat(pk);
       s.degree += 1;
       s.totalCapacity += ch.capacity;
       const pol = ch.policies.find((p) => p.public_key === pk);
-      if (pol?.fee_rate !== undefined) {
-        s.feeSum += pol.fee_rate;
-        s.feeCount += 1;
+      if (pol) {
+        if (pol.fee_rate !== undefined) {
+          s.feeSum += pol.fee_rate;
+          s.feeCount += 1;
+        }
+        if (pol.is_disabled === false) s.enabledCount += 1;
+        if (pol.updated_at && new Date(pol.updated_at).getTime() >= freshAfter) s.recentUpdates += 1;
       }
+      // Adjacency: record the channel's other endpoint(s) as neighbors.
+      for (const other of endpoints) if (other !== pk) s.neighbors.add(other);
     }
   }
 
@@ -233,6 +253,14 @@ export async function getChannelSuggestions(
   const peers = new Set(channels.map((c) => c.peerPubkey));
   const ourMedianChan = median(channels.map((c) => c.capacity)) || 2_000_000;
 
+  // Everything we can already reach within two hops — a new channel only buys
+  // us connectivity to nodes OUTSIDE this set.
+  const reachable = new Set<string>([ownKey, ...peers]);
+  for (const peer of peers) {
+    const ps = graph.stats.get(peer);
+    if (ps) for (const n of ps.neighbors) reachable.add(n);
+  }
+
   const now = Date.now();
   const staleMs = policy.maxStaleDays * 86_400_000;
 
@@ -252,26 +280,44 @@ export async function getChannelSuggestions(
     return { policy, suggestions: [], graphAgeSec: Math.round((now - graph.at) / 1000) };
   }
 
-  // Normalisation bounds (log-scaled — degree & capacity are heavy-tailed).
+  // New-reach: how many of each candidate's neighbours we can't already reach.
+  const reachByPk = new Map<string, number>();
+  let maxNewReach = 1;
+  for (const e of eligible) {
+    let c = 0;
+    for (const n of e.stat.neighbors) if (!reachable.has(n)) c += 1;
+    reachByPk.set(e.pk, c);
+    if (c > maxNewReach) maxNewReach = c;
+  }
+
+  // Normalisation bounds (log-scaled — these are heavy-tailed).
+  const avgChanOf = (s: NodeStat) => (s.degree ? s.totalCapacity / s.degree : 0);
   const maxLogDeg = Math.max(...eligible.map((e) => Math.log(e.stat.degree + 1)));
-  const maxLogCap = Math.max(...eligible.map((e) => Math.log(e.stat.totalCapacity + 1)));
+  const maxLogDepth = Math.max(...eligible.map((e) => Math.log(avgChanOf(e.stat) + 1)));
   const maxFee = Math.max(...eligible.map((e) => (e.stat.feeCount ? e.stat.feeSum / e.stat.feeCount : 0)), 1);
 
   const suggestions: ChannelSuggestion[] = eligible.map(({ pk, stat, meta }) => {
     const avgFee = stat.feeCount ? stat.feeSum / stat.feeCount : 0;
-    const degScore = Math.log(stat.degree + 1) / maxLogDeg;
-    const capScore = Math.log(stat.totalCapacity + 1) / maxLogCap;
-    const ageDays = (now - meta.updatedAt) / 86_400_000;
-    const recencyScore = Math.max(0, 1 - ageDays / policy.maxStaleDays);
-    const reachScore = meta.hasClearnet ? 1 : 0.5;
+    const newReach = reachByPk.get(pk) ?? 0;
+
+    const reachScore = Math.log(1 + newReach) / Math.log(1 + maxNewReach); // new connectivity
+    const depthScore = Math.log(avgChanOf(stat) + 1) / maxLogDepth; // liquidity depth
+    const degScore = Math.log(stat.degree + 1) / maxLogDeg; // centrality
+    const activityScore = stat.degree ? Math.min(1, stat.recentUpdates / stat.degree) : 0;
+    const enabledScore = stat.degree ? Math.min(1, stat.enabledCount / stat.degree) : 0;
     const feeScore = 1 - Math.min(1, avgFee / maxFee);
 
     const score =
-      0.4 * degScore + 0.3 * capScore + 0.15 * recencyScore + 0.1 * reachScore + 0.05 * feeScore;
+      0.3 * reachScore +
+      0.2 * depthScore +
+      0.2 * degScore +
+      0.15 * activityScore +
+      0.1 * enabledScore +
+      0.05 * feeScore;
 
     // Size: geometric mean of our typical channel and the candidate's average,
     // clamped to the configured bounds.
-    const candidateAvgChan = stat.degree ? stat.totalCapacity / stat.degree : ourMedianChan;
+    const candidateAvgChan = avgChanOf(stat) || ourMedianChan;
     const size = roundTo100k(Math.sqrt(ourMedianChan * candidateAvgChan));
     const recommendedSizeSats = Math.min(policy.maxSizeSats, Math.max(policy.minSizeSats, size));
 
@@ -282,10 +328,11 @@ export async function getChannelSuggestions(
       capacitySats: stat.totalCapacity,
       avgFeePpm: Math.round(avgFee),
       hasClearnet: meta.hasClearnet,
-      lastSeenDays: Math.round(ageDays),
+      lastSeenDays: Math.round((now - meta.updatedAt) / 86_400_000),
+      newReach,
       score: Math.round(score * 100),
       recommendedSizeSats,
-      reason: reasonFor(stat, meta, avgFee),
+      reason: reasonFor(stat, meta, avgFee, newReach),
       socket: meta.socket,
     };
   });
@@ -299,10 +346,13 @@ export async function getChannelSuggestions(
   };
 }
 
-function reasonFor(stat: NodeStat, meta: NodeMeta, avgFee: number): string {
+function reasonFor(stat: NodeStat, meta: NodeMeta, avgFee: number, newReach: number): string {
   const btc = (stat.totalCapacity / 100_000_000).toFixed(1);
-  const parts = [`${stat.degree} channels`, `${btc} BTC capacity`];
+  const parts: string[] = [];
+  if (newReach > 0) parts.push(`opens ${newReach} new destination${newReach === 1 ? "" : "s"}`);
+  parts.push(`${stat.degree} channels`, `${btc} BTC`);
+  if (stat.degree && stat.recentUpdates / stat.degree >= 0.5) parts.push("actively routing");
   if (meta.hasClearnet) parts.push("clearnet");
   if (avgFee <= 100) parts.push("low fees");
-  return `well-connected hub — ${parts.join(", ")}`;
+  return parts.join(" · ");
 }
