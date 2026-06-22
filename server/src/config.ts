@@ -69,6 +69,10 @@ function resolveOptional(
 
 export interface Config {
   port: number;
+  /** Interface to bind. Default 127.0.0.1 (local only); Umbrel sets 0.0.0.0. */
+  bindHost: string;
+  /** Optional Host-header allowlist (DNS-rebinding defense). Empty = disabled. */
+  allowedHosts: string[];
   flowWindowDays: number;
   webDir: string | undefined;
   dataDir: string;
@@ -126,6 +130,11 @@ export function loadConfig(): Config {
 
   return {
     port: Number(process.env.PORT ?? 3001),
+    bindHost: process.env.LM_BIND?.trim() || "127.0.0.1",
+    allowedHosts: (process.env.LM_ALLOWED_HOSTS ?? "")
+      .split(",")
+      .map((h) => h.trim().toLowerCase())
+      .filter(Boolean),
     flowWindowDays: Number(process.env.FLOW_WINDOW_DAYS ?? 30),
     webDir: process.env.WEB_DIR?.trim() || undefined,
     dataDir: process.env.DATA_DIR?.trim() || resolve(repoRoot, ".data"),
