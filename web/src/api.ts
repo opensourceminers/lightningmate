@@ -1,9 +1,12 @@
 import type {
+  Alert,
   AppSettings,
   AutopilotConfig,
   AutopilotRun,
   AutopilotState,
   ChannelView,
+  FeeMode,
+  OverrideMap,
   PriceInfo,
   FeeApplyItem,
   FeeApplyResult,
@@ -60,6 +63,10 @@ export const api = {
   getSettings: () => get<AppSettings>("/settings"),
   setSettings: (s: Partial<AppSettings>) => post<AppSettings>("/settings", s),
   price: () => get<PriceInfo>("/price"),
+  overrides: () => get<OverrideMap>("/overrides"),
+  setOverride: (channelId: string, mode: FeeMode, fixedPpm?: number) =>
+    post<OverrideMap>("/overrides", { channelId, mode, fixedPpm }),
+  alerts: () => get<Alert[]>("/alerts"),
   forwardsReport: (days: number) => get<ForwardsReport>(`/forwards/report?days=${days}`),
   feesPreview: (policy?: Partial<FeePolicy>) => {
     const qs = policy

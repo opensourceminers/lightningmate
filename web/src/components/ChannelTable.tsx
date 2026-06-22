@@ -1,5 +1,6 @@
-import { useState } from "react";
-import type { ChannelRole, ChannelView } from "../types";
+import { useEffect, useState } from "react";
+import { api } from "../api";
+import type { ChannelOverride, ChannelRole, ChannelView, FeeMode, OverrideMap } from "../types";
 import { satsCompact } from "../format";
 
 const ROLE_LABEL: Record<ChannelRole, string> = {
@@ -9,7 +10,6 @@ const ROLE_LABEL: Record<ChannelRole, string> = {
 };
 
 function BalanceBar({ ratio }: { ratio: number }) {
-  // Color shifts from red (drained outbound) → green (balanced) → blue (full).
   const pct = Math.round(ratio * 100);
   return (
     <div className="bal-bar" title={`${pct}% local`}>
@@ -19,11 +19,57 @@ function BalanceBar({ ratio }: { ratio: number }) {
   );
 }
 
+function OverrideControl({
+  ov,
+  onSet,
+}: {
+  ov?: ChannelOverride;
+  onSet: (mode: FeeMode, fixedPpm?: number) => void;
+}) {
+  const mode = ov?.mode ?? "auto";
+  const [ppm, setPpm] = useState(ov?.fixedPpm ?? 100);
+  return (
+    <div className="ov">
+      <select
+        value={mode}
+        onChange={(e) => {
+          const m = e.target.value as FeeMode;
+          onSet(m, m === "fixed" ? ppm : undefined);
+        }}
+      >
+        <option value="auto">auto</option>
+        <option value="fixed">fixed</option>
+        <option value="exclude">exclude</option>
+      </select>
+      {mode === "fixed" ? (
+        <input
+          type="number"
+          className="ov-ppm"
+          min={0}
+          value={ppm}
+          onChange={(e) => setPpm(Math.max(0, Number(e.target.value) || 0))}
+          onBlur={() => onSet("fixed", ppm)}
+          title="fixed ppm"
+        />
+      ) : null}
+    </div>
+  );
+}
+
 type SortKey = "capacity" | "localRatio" | "totalSent" | "totalReceived";
 
 export function ChannelTable({ channels }: { channels: ChannelView[] }) {
   const [sort, setSort] = useState<SortKey>("capacity");
   const [onlyActive, setOnlyActive] = useState(false);
+  const [overrides, setOverrides] = useState<OverrideMap>({});
+
+  useEffect(() => {
+    api.overrides().then(setOverrides).catch(() => {});
+  }, []);
+
+  const applyOverride = (id: string, mode: FeeMode, fixedPpm?: number) => {
+    api.setOverride(id, mode, fixedPpm).then(setOverrides).catch(() => {});
+  };
 
   const rows = channels
     .filter((c) => (onlyActive ? c.active : true))
@@ -36,11 +82,7 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
         <h2>Channels <span className="muted">({rows.length})</span></h2>
         <div className="controls">
           <label className="check">
-            <input
-              type="checkbox"
-              checked={onlyActive}
-              onChange={(e) => setOnlyActive(e.target.checked)}
-            />
+            <input type="checkbox" checked={onlyActive} onChange={(e) => setOnlyActive(e.target.checked)} />
             active only
           </label>
           <select value={sort} onChange={(e) => setSort(e.target.value as SortKey)}>
@@ -61,6 +103,7 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
             <th className="bal-col">Local ⟷ Remote</th>
             <th className="num">Sent</th>
             <th className="num">Received</th>
+            <th>Autopilot fee</th>
           </tr>
         </thead>
         <tbody>
@@ -78,15 +121,21 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
               <td className="bal-col"><BalanceBar ratio={c.localRatio} /></td>
               <td className="num">{satsCompact(c.totalSent)}</td>
               <td className="num">{satsCompact(c.totalReceived)}</td>
+              <td>
+                <OverrideControl
+                  ov={overrides[c.id]}
+                  onSet={(mode, ppm) => applyOverride(c.id, mode, ppm)}
+                />
+              </td>
             </tr>
           ))}
         </tbody>
       </table>
       {rows.length === 0 ? <p className="muted empty">No channels to show.</p> : null}
       <p className="hint">
-        <strong>Roles</strong> are flow heuristics: <em>source</em> mostly receives
-        (keep fees low), <em>sink</em> mostly sends (raise fees), <em>router</em> is
-        balanced. Use <code>local %</code> to spot drained channels.
+        <strong>Roles</strong>: <em>source</em> mostly receives, <em>sink</em> mostly sends,
+        <em> router</em> is balanced. <strong>Autopilot fee</strong>: <code>auto</code> follows the
+        policy, <code>fixed</code> pins a ppm, <code>exclude</code> keeps the autopilot off this channel.
       </p>
     </section>
   );
