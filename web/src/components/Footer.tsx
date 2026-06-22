@@ -1,6 +1,4 @@
-import { useState } from "react";
-
-const DONATE = "bc1qje7dm783p86qu4xlvam6yrvy5mzx7qx76w72k8";
+const DONATE_URL = "http://umbrel.local:3003/apps/3Vo4BjAK9GYCqQPqDKHAkQ9xHPZq/pos";
 const GITHUB = "https://github.com/opensourceminers/lightningmate";
 const X_URL = "https://x.com/opensource_de";
 const SITE = "https://opensourceminers.de";
@@ -37,13 +35,6 @@ function BoltIcon() {
 }
 
 export function Footer() {
-  const [copied, setCopied] = useState(false);
-  const copy = () => {
-    void navigator.clipboard.writeText(DONATE);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  };
-
   return (
     <footer className="foot">
       <div className="foot-row">
@@ -56,11 +47,9 @@ export function Footer() {
         <a className="foot-pill" href={SITE} target="_blank" rel="noreferrer">
           <GlobeIcon /> opensourceminers.de
         </a>
-        <a className="foot-pill donate" href={`bitcoin:${DONATE}`}>
+        <a className="foot-pill donate" href={DONATE_URL} target="_blank" rel="noreferrer">
           <BoltIcon /> Donate
         </a>
-        <code className="foot-addr">{DONATE}</code>
-        <button className="foot-copy-btn" onClick={copy}>{copied ? "✓ copied" : "copy"}</button>
       </div>
 
       <div className="foot-copy muted">
