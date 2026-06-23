@@ -70,9 +70,12 @@ export interface FeePreview {
 
 function reasonFor(localRatio: number, delta: number): string {
   const pct = Math.round(localRatio * 100);
-  if (delta > 0) return `drained (${pct}% local) → raise to slow drain & earn more`;
-  if (delta < 0) return `full (${pct}% local) → lower to encourage outflow`;
-  return `balanced (${pct}% local) → keep`;
+  // Describe the channel by its actual balance, not the change direction — the
+  // fee can move either way just to align a channel back onto the policy curve.
+  const state = localRatio >= 0.55 ? "full" : localRatio <= 0.45 ? "drained" : "balanced";
+  if (delta > 0) return `${state} (${pct}% local) → raise toward target`;
+  if (delta < 0) return `${state} (${pct}% local) → lower toward target`;
+  return `${state} (${pct}% local) → on target`;
 }
 
 /**
