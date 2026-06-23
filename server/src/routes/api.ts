@@ -13,6 +13,7 @@ import {
 } from "../services/rebalance.js";
 import { getChannelSuggestions, getCloseCandidates, type SuggestionPolicy } from "../services/suggestions.js";
 import { getPnl } from "../services/pnl.js";
+import { buildDashboard } from "../services/dashboard.js";
 import {
   createInvoice,
   decodeRequest,
@@ -372,6 +373,20 @@ export function createApiRouter(
       const days = Number(req.query.days ?? config.flowWindowDays);
       const windowDays = Number.isFinite(days) && days > 0 ? days : config.flowWindowDays;
       res.json(await getPnl(lnd, rebalanceLog, windowDays));
+    }),
+  );
+
+  // Overview dashboard — KPI totals + sparklines, recent activity feed and an
+  // autopilot summary, assembled from a single forwards pull.
+  router.get(
+    "/dashboard",
+    wrap(async (_req, res) => {
+      const [report, ln, onchain] = await Promise.all([
+        getForwardsReport(lnd, 30),
+        getLnActivity(lnd, 10),
+        getOnchainTxs(lnd, 10),
+      ]);
+      res.json(buildDashboard(report, ln, onchain, rebalanceLog.summary(), autopilot.getState()));
     }),
   );
 

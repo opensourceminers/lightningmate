@@ -4,15 +4,12 @@ import { AlertsBar } from "./components/AlertsBar";
 import { AutopilotPanel } from "./components/AutopilotPanel";
 import { BrandMark } from "./components/BrandMark";
 import { ChannelTable } from "./components/ChannelTable";
-import { PnlOverview } from "./components/PnlOverview";
 import { Footer } from "./components/Footer";
-import { HealthScore } from "./components/HealthScore";
-import { LiquidityMap } from "./components/LiquidityMap";
+import { Overview } from "./components/Overview";
 import { RoutingPanel } from "./components/RoutingPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SkeletonPanel } from "./components/Skeleton";
 import { SuggestionsPanel } from "./components/SuggestionsPanel";
-import { SummaryBar } from "./components/SummaryBar";
 import { TabIcon } from "./components/TabIcon";
 import { WalletPanel } from "./components/WalletPanel";
 import { usePolledData } from "./usePolledData";
@@ -93,14 +90,7 @@ export function App() {
       <div className="tab-body">
         {tab === "overview" ? (
           node.data ? (
-            <>
-              <SummaryBar node={node.data} price={price.data} />
-              <div className="hero-row">
-                <HealthScore />
-                <PnlOverview price={price.data} />
-              </div>
-              {channels.data ? <LiquidityMap channels={channels.data} /> : null}
-            </>
+            <Overview node={node.data} channels={channels.data} price={price.data} />
           ) : (
             <SkeletonPanel rows={6} />
           )
