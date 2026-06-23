@@ -5,7 +5,7 @@ manifestVersion: 1
 id: lightningmate
 category: finance
 name: Lightning Mate
-version: "0.5.4"
+version: "0.6.0"
 tagline: Profit-aware management & autopilot for your Lightning node
 description: >-
   Lightning Mate manages your Lightning node so you don't have to babysit it.
@@ -22,9 +22,12 @@ description: >-
   rebalances, and opens channels to top peers — all on recommended settings with
   safe caps and cooldowns. Read-only by default; writes are opt-in.
 releaseNotes: >-
-  Fix: app settings (autopilot, currency) now persist across updates — the data
-  directory is made writable for the non-root app user. The tab bar no longer
-  shows a horizontal scroll control.
+  Big update. New Wallet: send & receive over Lightning (invoice + pay with QR)
+  and on-chain (receive address, send with sat/vByte fee, history). Reorganised
+  into a clean 6-tab layout (Overview, Channels, Wallet, Routing, Autopilot,
+  Settings) with a new Overview dashboard — KPI cards with sparklines, a recent
+  activity feed and an autopilot summary. Settings now persist across updates.
+  Plus smarter channel suggestions and many spacing / label fixes.
 developer: opensourceminers.de
 website: https://opensourceminers.de
 dependencies:
