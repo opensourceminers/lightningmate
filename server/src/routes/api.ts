@@ -13,6 +13,12 @@ import {
 } from "../services/rebalance.js";
 import { getChannelSuggestions, getCloseCandidates, type SuggestionPolicy } from "../services/suggestions.js";
 import { getPnl } from "../services/pnl.js";
+import {
+  createInvoice,
+  decodeRequest,
+  getLnActivity,
+  payRequest,
+} from "../services/payments.js";
 import { closeChannelByOutpoint, openChannelTo } from "../services/channelOps.js";
 import { getBtcPrice } from "../services/price.js";
 import type { SettingsStore } from "../services/settings.js";
@@ -42,6 +48,9 @@ const isPubkey = (s: unknown): s is string => isHex(s, 66);
 const isTxid = (s: unknown): s is string => isHex(s, 64);
 const isChannelId = (s: unknown): s is string =>
   typeof s === "string" && /^\d+x\d+x\d+$/.test(s);
+/** A BOLT11 payment request (bech32-ish, starts with "ln"). */
+const isPayRequest = (s: unknown): s is string =>
+  typeof s === "string" && s.length >= 20 && s.length <= 2000 && /^ln[a-z0-9]+$/i.test(s.trim());
 /** Finite integer within [min, max], else null. */
 function intIn(v: unknown, min: number, max: number): number | null {
   const n = Number(v);
@@ -56,6 +65,8 @@ const MAX_CHANNEL_SATS = 1_000_000_000; // 10 BTC
 const MAX_FEE_PPM = 50_000; // 5%
 const MAX_BASE_MSAT = 10_000_000; // 10k sat
 const MAX_REBALANCE_SATS = 100_000_000; // 1 BTC
+const MAX_RECEIVE_SATS = 100_000_000; // 1 BTC per invoice
+const MAX_PAY_FEE_SATS = 2_000_000; // routing-fee budget cap
 
 // Read optional fee-policy overrides from the query string.
 function parsePolicyQuery(query: Request["query"]): Partial<FeePolicy> {
@@ -434,6 +445,82 @@ export function createApiRouter(
     wrap(async (_req, res) => {
       const currency = settings.get().fiatCurrency;
       res.json({ currency, btcPrice: await getBtcPrice(currency) });
+    }),
+  );
+
+  // ── Lightning send / receive ───────────────────────────────────────────────
+
+  // Recent invoices + payments (read-only).
+  router.get(
+    "/ln/activity",
+    wrap(async (_req, res) => {
+      res.json(await getLnActivity(lnd));
+    }),
+  );
+
+  // Decode a BOLT11 request so the UI can show amount/destination before paying.
+  router.post(
+    "/ln/decode",
+    wrap(async (req, res) => {
+      const { request } = req.body ?? {};
+      if (!isPayRequest(request)) {
+        res.status(400).json({ error: "bad_request", message: "valid BOLT11 request required." });
+        return;
+      }
+      res.json(await decodeRequest(lnd, request.trim()));
+    }),
+  );
+
+  // Create a receive invoice. Requires a write (invoices:write) macaroon.
+  router.post(
+    "/ln/invoice",
+    wrap(async (req, res) => {
+      if (!writeLnd) {
+        res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
+        return;
+      }
+      const { tokens, description, expirySec } = req.body ?? {};
+      const amount = intIn(tokens ?? 0, 0, MAX_RECEIVE_SATS);
+      const expiry = intIn(expirySec ?? 3600, 60, 31_536_000);
+      if (amount === null || expiry === null) {
+        res.status(400).json({ error: "bad_request", message: "tokens (0–1 BTC) / expirySec out of range." });
+        return;
+      }
+      if (description !== undefined && (typeof description !== "string" || description.length > 640)) {
+        res.status(400).json({ error: "bad_request", message: "description too long (max 640)." });
+        return;
+      }
+      res.json(
+        await createInvoice(writeLnd, {
+          tokens: amount,
+          description: typeof description === "string" ? description : "",
+          expirySec: expiry,
+        }),
+      );
+    }),
+  );
+
+  // Pay a BOLT11 request. max_fee is enforced server-side; requires write access.
+  router.post(
+    "/ln/pay",
+    wrap(async (req, res) => {
+      if (!writeLnd) {
+        res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
+        return;
+      }
+      const { request, maxFeeSats, tokens } = req.body ?? {};
+      const maxFee = intIn(maxFeeSats ?? 0, 0, MAX_PAY_FEE_SATS);
+      const amount = tokens === undefined ? undefined : intIn(tokens, 1, MAX_RECEIVE_SATS);
+      if (!isPayRequest(request) || maxFee === null || (tokens !== undefined && amount === null)) {
+        res.status(400).json({ error: "bad_request", message: "valid request and maxFeeSats (0–2M) required." });
+        return;
+      }
+      try {
+        res.json(await payRequest(writeLnd, { request: request.trim(), maxFeeSats: maxFee, tokens: amount ?? undefined }));
+      } catch (err) {
+        // A failed payment (no route, rejected, …) is a normal result, not a 502.
+        res.json({ ok: false, id: "", tokens: 0, feeSats: 0, secret: "", error: describeError(err) });
+      }
     }),
   );
 

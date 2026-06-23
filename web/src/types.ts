@@ -369,6 +369,53 @@ export interface PriceInfo {
   btcPrice: number | null;
 }
 
+// ── Lightning send / receive ──────────────────────────────────────────────────
+export interface CreatedInvoice {
+  id: string;
+  request: string;
+  tokens: number;
+  description: string;
+  createdAt: string;
+  expiresAt: string;
+}
+
+export interface DecodedRequest {
+  id: string;
+  destination: string;
+  tokens: number;
+  description: string;
+  expiresAt: string;
+  expired: boolean;
+}
+
+export interface PayResult {
+  ok: boolean;
+  id: string;
+  tokens: number;
+  feeSats: number;
+  secret: string;
+  error?: string;
+}
+
+export interface LnActivity {
+  invoices: {
+    id: string;
+    tokens: number;
+    description: string;
+    isPaid: boolean;
+    receivedSats: number;
+    createdAt: string;
+  }[];
+  payments: {
+    id: string;
+    destination: string;
+    tokens: number;
+    feeSats: number;
+    isConfirmed: boolean;
+    createdAt: string;
+  }[];
+}
+
 export interface NetworkRank {
   position: number;
   total: number;

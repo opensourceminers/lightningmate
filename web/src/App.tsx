@@ -10,6 +10,7 @@ import { Footer } from "./components/Footer";
 import { ForwardsPanel } from "./components/ForwardsPanel";
 import { HealthScore } from "./components/HealthScore";
 import { LiquidityMap } from "./components/LiquidityMap";
+import { PaymentsPanel } from "./components/PaymentsPanel";
 import { RebalancePanel } from "./components/RebalancePanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SkeletonPanel } from "./components/Skeleton";
@@ -20,6 +21,7 @@ import { usePolledData } from "./usePolledData";
 
 type Tab =
   | "channels"
+  | "pay"
   | "suggestions"
   | "forwards"
   | "fees"
@@ -29,6 +31,7 @@ type Tab =
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "channels", label: "Channels" },
+  { id: "pay", label: "Pay" },
   { id: "suggestions", label: "Suggestions" },
   { id: "forwards", label: "Forwards" },
   { id: "fees", label: "Fees" },
@@ -119,6 +122,7 @@ export function App() {
             )}
           </>
         ) : null}
+        {tab === "pay" ? <PaymentsPanel price={price.data} /> : null}
         {tab === "forwards" ? <ForwardsPanel /> : null}
         {tab === "suggestions" ? <SuggestionsPanel /> : null}
         {tab === "fees" ? <FeesPanel /> : null}

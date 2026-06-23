@@ -19,6 +19,15 @@ export function TabIcon({ id }: { id: string }) {
           <rect x="14" y="3" width="7" height="18" rx="1.5" />
         </svg>
       );
+    case "pay":
+      return (
+        <svg {...C} aria-hidden>
+          <path d="M7 17 3 13l4-4" />
+          <path d="M3 13h12" />
+          <path d="m17 7 4 4-4 4" />
+          <path d="M21 11H9" />
+        </svg>
+      );
     case "suggestions":
       return (
         <svg {...C} aria-hidden>
