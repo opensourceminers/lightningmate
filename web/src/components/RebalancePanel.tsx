@@ -194,8 +194,8 @@ export function RebalancePanel() {
             <th className="num">Earns</th>
             <th className="num">Demand</th>
             <th>From (source)</th>
-            <th className="num">Budget</th>
             <th className="num">Est. cost</th>
+            <th className="num">Est. profit</th>
             <th>Verdict</th>
             <th></th>
           </tr>
@@ -208,8 +208,16 @@ export function RebalancePanel() {
               <td className="num">{c.targetOutboundPpm} ppm</td>
               <td className="num">{satsCompact(c.demandSats)}</td>
               <td className="muted">{c.sourceAlias} ({percent(c.sourceLocalRatio)})</td>
-              <td className="num">{c.maxFeePpm} ppm</td>
-              <td className="num strong">{c.estCostPpm === null ? "—" : `${c.estCostPpm} ppm`}</td>
+              <td className="num">{c.estCostPpm === null ? "—" : `${c.estCostPpm} ppm`}</td>
+              <td className="num strong">
+                {c.expectedProfitSats === null ? (
+                  "—"
+                ) : (
+                  <span className={c.expectedProfitSats >= 0 ? "earned" : "delta-up"}>
+                    {c.expectedProfitSats >= 0 ? "+" : "−"}{satsCompact(Math.abs(c.expectedProfitSats))}
+                  </span>
+                )}
+              </td>
               <td><Verdict c={c} /></td>
               <td>
                 <button

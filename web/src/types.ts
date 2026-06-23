@@ -158,6 +158,8 @@ export interface AutopilotConfig {
   rebalancePolicy: RebalancePolicy;
   maxRebalancesPerRun: number;
   rebalanceCooldownMinutes: number;
+  rebalanceHourStart: number;
+  rebalanceHourEnd: number;
   channelEnabled: boolean;
   channelReserveSats: number;
   channelSizeSats: number;
@@ -230,6 +232,8 @@ export interface RebalanceCandidate {
   maxFeePpm: number;
   estCostPpm: number | null;
   estFeeSats: number | null;
+  netMarginPpm: number | null;
+  expectedProfitSats: number | null;
   routeFound: boolean;
   profitable: boolean;
   verdict: string;
