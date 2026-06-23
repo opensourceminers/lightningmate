@@ -1,8 +1,9 @@
 import {
   createInvoice,
+  decodePaymentRequest,
   getFeeRates,
   getRouteToDestination,
-  payViaRoutes,
+  payViaPaymentDetails,
   type AuthenticatedLnd,
 } from "lightning";
 import { getChannelsView, type ChannelView } from "./channels.js";
@@ -197,6 +198,20 @@ export interface RebalanceExecResult {
   error?: string;
 }
 
+/** ln-service throws errors as [code, name, { ... }] arrays — surface the cause. */
+function describePayError(err: unknown, budgetPpm: number): string {
+  if (Array.isArray(err)) {
+    const name = String(err[1] ?? err[0] ?? "payment_failed");
+    if (/Route|Payable|Possible|Pathfinding/i.test(name)) {
+      return `no route within budget (${budgetPpm} ppm) — target may be too costly to refill`;
+    }
+    const extra = err[2] as { err?: { details?: string; message?: string } } | undefined;
+    const detail = extra?.err?.details ?? extra?.err?.message ?? "";
+    return detail ? `${name}: ${detail}` : name;
+  }
+  return err instanceof Error ? err.message : String(err);
+}
+
 /**
  * Execute one circular rebalance: pay a self-invoice out via the source channel
  * and back in via the target's peer. The profit budget is computed server-side
@@ -243,28 +258,28 @@ export async function executeRebalance(
   const ownKey = await getOwnPubkey(readLnd);
 
   try {
-    // Invoice first so we have the payment identifier for the final hop.
+    // Self-invoice, decoded to get the payment secret + mtokens for the route.
     const invoice = await createInvoice({ lnd: writeLnd, tokens: params.amountSats });
+    const decoded = await decodePaymentRequest({ lnd: readLnd, request: invoice.request });
 
-    const { route } = await getRouteToDestination({
-      lnd: readLnd,
+    // LND's own multi-path payment retries across many routes (skipping hops that
+    // fail), constrained to leave via the source channel and return via the
+    // target's peer, and never exceeds the fee budget. Far more reliable than
+    // building and paying a single route.
+    const paid = await payViaPaymentDetails({
+      lnd: writeLnd,
+      id: invoice.id,
       destination: ownKey,
       tokens: params.amountSats,
+      max_fee: maxFeeSats,
       outgoing_channel: source.id,
       incoming_peer: target.peerPubkey,
-      max_fee: maxFeeSats,
-      ...(invoice.payment ? { payment: invoice.payment } : {}),
-      total_mtokens: invoice.mtokens ?? String(params.amountSats * 1000),
+      payment: decoded.payment,
+      mtokens: decoded.mtokens,
+      pathfinding_timeout: 40_000,
     });
 
-    if (!route) {
-      return { ...base, budgetPpm, error: `no route within budget (${budgetPpm} ppm)` };
-    }
-
-    const paid = await payViaRoutes({ lnd: writeLnd, id: invoice.id, routes: [route] });
-
-    // Report the fee actually paid, not the pre-flight route estimate.
-    const feeSats = paid.safe_fee ?? route.safe_fee;
+    const feeSats = paid.safe_fee ?? paid.fee;
     return {
       ...base,
       ok: true,
@@ -273,10 +288,6 @@ export async function executeRebalance(
       costPpm: Math.round((feeSats / params.amountSats) * 1_000_000),
     };
   } catch (err) {
-    return {
-      ...base,
-      budgetPpm,
-      error: err instanceof Error ? err.message : String(err),
-    };
+    return { ...base, budgetPpm, error: describePayError(err, budgetPpm) };
   }
 }

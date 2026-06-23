@@ -186,15 +186,26 @@ export function RebalancePanel() {
             <div><strong>{satsCompact(log.summary.totalAmountSats)}</strong> sat moved</div>
             <div>avg <strong>{log.summary.avgCostPpm}</strong> ppm</div>
           </div>
-          <table className="forwards">
+          <table className="fee-table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Route (source → target)</th>
+                <th className="num">Amount</th>
+                <th className="num">Result</th>
+                <th>Via</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
             <tbody>
               {log.records.slice(0, 12).map((r, i) => (
                 <tr key={`${r.at}-${i}`}>
                   <td className="muted">{timeAgo(r.at)}</td>
                   <td>{r.sourceAlias} → {r.targetAlias}</td>
-                  <td className="num">{satsCompact(r.amountSats)}</td>
+                  <td className="num">{satsCompact(r.amountSats)} sat</td>
                   <td className="num">{r.ok ? <span className="earned">{r.feeSats} sat</span> : <span className="ap-fail">fail</span>}</td>
                   <td className="muted">{r.via}</td>
+                  <td className="muted reason" title={r.error ?? ""}>{r.ok ? "—" : r.error ?? "—"}</td>
                 </tr>
               ))}
             </tbody>
