@@ -255,7 +255,9 @@ export class Autopilot {
         amountSats: c.amountSats,
         econRatio: rebalancePolicy.econRatio,
       });
-      if (res.ok) this.state.perTargetLastRebalanced[c.targetId] = new Date().toISOString();
+      // Mark the target on every attempt (success or fail) so the cooldown also
+      // backs off failing targets — no more hammering the same dead route.
+      this.state.perTargetLastRebalanced[c.targetId] = new Date().toISOString();
       this.rebalanceLog.append({
         at: new Date().toISOString(),
         via: "autopilot",

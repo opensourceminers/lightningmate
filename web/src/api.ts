@@ -110,6 +110,7 @@ export const api = {
     sourceId: string;
     amountSats: number;
     econRatio: number;
+    maxFeePpm?: number;
   }) => post<RebalanceExecResult>("/rebalance/execute", params),
   rebalanceLog: () => get<RebalanceLogResponse>("/rebalance/log"),
   suggestions: (policy?: Partial<SuggestionPolicy>) => {

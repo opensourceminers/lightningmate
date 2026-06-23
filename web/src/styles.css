@@ -453,6 +453,12 @@ table { width: 100%; border-collapse: collapse; }
   transition: border-color var(--t), box-shadow var(--t);
 }
 .policy-field input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+.policy-field select {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: var(--radius-xs); padding: 7px 9px; min-width: 200px; font-size: 13px;
+  transition: border-color var(--t);
+}
+.policy-field select:focus { outline: none; border-color: var(--accent); }
 .reset {
   background: transparent; color: var(--muted); border: 1px solid var(--line);
   border-radius: var(--radius-xs); padding: 8px 13px; cursor: pointer; height: 34px;
