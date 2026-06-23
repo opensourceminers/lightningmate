@@ -318,13 +318,20 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { targetId, sourceId, amountSats, econRatio } = req.body ?? {};
+      const { targetId, sourceId, amountSats, econRatio, maxFeePpm } = req.body ?? {};
       const amount = intIn(amountSats, 1000, MAX_REBALANCE_SATS);
       const ratio = econRatio === undefined ? 0.8 : numIn(econRatio, 0.05, 1);
-      if (!isChannelId(targetId) || !isChannelId(sourceId) || amount === null || ratio === null) {
+      const maxFee = maxFeePpm === undefined ? undefined : intIn(maxFeePpm, 1, MAX_FEE_PPM);
+      if (
+        !isChannelId(targetId) ||
+        !isChannelId(sourceId) ||
+        amount === null ||
+        ratio === null ||
+        (maxFeePpm !== undefined && maxFee === null)
+      ) {
         res.status(400).json({
           error: "bad_request",
-          message: "valid targetId/sourceId, amountSats (1k–1 BTC) and econRatio (0.05–1) required.",
+          message: "valid targetId/sourceId, amountSats (1k–1 BTC), econRatio (0.05–1) and optional maxFeePpm required.",
         });
         return;
       }
@@ -333,6 +340,7 @@ export function createApiRouter(
         sourceId,
         amountSats: amount,
         econRatio: ratio,
+        ...(maxFee !== null && maxFee !== undefined ? { maxFeePpm: maxFee } : {}),
       });
       rebalanceLog.append({
         at: new Date().toISOString(),

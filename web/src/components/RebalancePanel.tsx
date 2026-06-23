@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import type {
+  ChannelView,
   RebalanceAnalysis,
   RebalanceCandidate,
   RebalanceLogResponse,
@@ -46,6 +47,14 @@ export function RebalancePanel() {
   const [runningId, setRunningId] = useState<string | null>(null);
   const [log, setLog] = useState<RebalanceLogResponse | null>(null);
 
+  // Manual rebalance: pick source + target + amount + max fee yourself.
+  const [channels, setChannels] = useState<ChannelView[]>([]);
+  const [mSource, setMSource] = useState("");
+  const [mTarget, setMTarget] = useState("");
+  const [mAmount, setMAmount] = useState("100000");
+  const [mMaxFee, setMMaxFee] = useState("1000");
+  const [mRunning, setMRunning] = useState(false);
+
   const analyze = async (policy: Pick<RebalancePolicy, DraftKey>) => {
     setLoading(true);
     setError(null);
@@ -63,8 +72,34 @@ export function RebalancePanel() {
   useEffect(() => {
     void analyze(DEFAULTS);
     api.autopilotGet().then((s) => setCanWrite(s.canWrite)).catch(() => setCanWrite(false));
+    api.channels().then(setChannels).catch(() => {});
     void loadLog();
   }, []);
+
+  const runManual = async () => {
+    if (!mSource || !mTarget) return;
+    if (mSource === mTarget) {
+      setError("Source and target must be different channels.");
+      return;
+    }
+    setMRunning(true);
+    setError(null);
+    try {
+      const res = await api.rebalanceExecute({
+        targetId: mTarget,
+        sourceId: mSource,
+        amountSats: Math.max(1000, Number(mAmount) || 0),
+        econRatio: draft.econRatio,
+        ...(Number(mMaxFee) > 0 ? { maxFeePpm: Number(mMaxFee) } : {}),
+      });
+      if (!res.ok) setError(`Manual rebalance: ${res.error}`);
+      await loadLog();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setMRunning(false);
+    }
+  };
 
   const setField = (key: DraftKey, value: number) =>
     setDraft((d) => ({ ...d, [key]: Math.max(0, value || 0) }));
@@ -92,6 +127,7 @@ export function RebalancePanel() {
   const profitable = rows.filter((c) => c.profitable).length;
 
   return (
+    <>
     <section className="panel">
       <div className="panel-head">
         <h2>Rebalancing <span className="muted">· profit-gated</span></h2>
@@ -213,5 +249,51 @@ export function RebalancePanel() {
         </>
       ) : null}
     </section>
+
+    <section className="panel">
+      <div className="panel-head"><h2>Manual rebalance</h2></div>
+      <div className="dryrun-banner">
+        Pick a <strong>source</strong> (pull liquidity from) and a <strong>target</strong> (refill),
+        an amount and a max fee. The engine tries that amount, then progressively smaller, and pays
+        the first route that actually works. Max fee is a hard cap and bypasses the profit gate.
+      </div>
+      <div className="policy-controls">
+        <label className="policy-field" title="channel to pull liquidity from">
+          <span>Source (pull from)</span>
+          <select value={mSource} onChange={(e) => setMSource(e.target.value)}>
+            <option value="">— select —</option>
+            {channels.filter((c) => c.active).map((c) => (
+              <option key={c.id} value={c.id}>{c.peerAlias} ({percent(c.localRatio)} local)</option>
+            ))}
+          </select>
+        </label>
+        <label className="policy-field" title="channel to refill">
+          <span>Target (refill)</span>
+          <select value={mTarget} onChange={(e) => setMTarget(e.target.value)}>
+            <option value="">— select —</option>
+            {channels.filter((c) => c.active).map((c) => (
+              <option key={c.id} value={c.id}>{c.peerAlias} ({percent(c.localRatio)} local)</option>
+            ))}
+          </select>
+        </label>
+        <label className="policy-field" title="how much to move">
+          <span>Amount (sat)</span>
+          <input type="number" min={1000} step={10000} value={mAmount} onChange={(e) => setMAmount(e.target.value)} />
+        </label>
+        <label className="policy-field" title="hard fee cap; bypasses the profit gate">
+          <span>Max fee (ppm)</span>
+          <input type="number" min={1} value={mMaxFee} onChange={(e) => setMMaxFee(e.target.value)} />
+        </label>
+        <button
+          className="primary-btn"
+          disabled={!canWrite || !mSource || !mTarget || mRunning}
+          onClick={runManual}
+          title={canWrite ? "" : "Enable writes to execute"}
+        >
+          {mRunning ? "Rebalancing…" : "Rebalance"}
+        </button>
+      </div>
+    </section>
+    </>
   );
 }

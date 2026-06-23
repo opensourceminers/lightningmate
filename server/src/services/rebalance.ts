@@ -2,8 +2,8 @@ import {
   createInvoice,
   decodePaymentRequest,
   getFeeRates,
-  getRouteToDestination,
   payViaPaymentDetails,
+  probeForRoute,
   type AuthenticatedLnd,
 } from "lightning";
 import { getChannelsView, type ChannelView } from "./channels.js";
@@ -70,24 +70,32 @@ export interface RebalanceAnalysis {
   candidates: RebalanceCandidate[];
 }
 
-async function probeCost(
+const PROBE_TIMEOUT_MS = 9_000;
+
+/**
+ * Real liquidity probe: LND sends a payment that fails at the destination, which
+ * confirms a route can ACTUALLY carry the amount (unlike pure graph pathfinding,
+ * which only proves a path exists on paper). Returns the probed route's cost, or
+ * null when no route with available liquidity exists within max ppm.
+ */
+async function probeRoute(
   lnd: AuthenticatedLnd,
   ownKey: string,
   source: ChannelView,
   target: ChannelView,
   amountSats: number,
+  maxPpm: number,
 ): Promise<{ costPpm: number | null; feeSats: number | null }> {
   try {
-    // Circular route: out via the (full) source channel, back in from the
-    // (depleted) target's peer — i.e. refilling the target. Cost only, no payment.
-    const maxFee = Math.ceil((amountSats * PROBE_CEILING_PPM) / 1_000_000);
-    const { route } = await getRouteToDestination({
+    const maxFee = Math.ceil((amountSats * maxPpm) / 1_000_000);
+    const { route } = await probeForRoute({
       lnd,
       destination: ownKey,
       tokens: amountSats,
       outgoing_channel: source.id,
       incoming_peer: target.peerPubkey,
       max_fee: maxFee,
+      probe_timeout_ms: PROBE_TIMEOUT_MS,
     });
     if (!route) return { costPpm: null, feeSats: null };
     const feeSats = route.safe_fee;
@@ -97,11 +105,18 @@ async function probeCost(
   }
 }
 
+/** Amounts to attempt, largest first, down to a floor — for adaptive rebalancing. */
+function adaptiveAmounts(target: number): number[] {
+  const floor = 50_000;
+  const raw = [target, Math.round(target / 2), Math.round(target / 4), Math.max(floor, Math.round(target / 10))];
+  return [...new Set(raw.filter((a) => a >= floor))];
+}
+
 function verdictFor(maxFeePpm: number, costPpm: number | null, profitable: boolean): string {
   if (maxFeePpm <= 0) return "target earns 0 ppm — set an outbound fee on it first";
-  if (costPpm === null) return `no route ≤ ${PROBE_CEILING_PPM} ppm found`;
-  if (profitable) return `profitable: cost ${costPpm} ≤ budget ${maxFeePpm} ppm`;
-  return `not worth it: cost ${costPpm} > budget ${maxFeePpm} ppm`;
+  if (costPpm === null) return "no route with available liquidity in budget";
+  if (profitable) return `routable @ ${costPpm} ppm (≤ budget ${maxFeePpm})`;
+  return `routable but ${costPpm} ppm > budget ${maxFeePpm} ppm`;
 }
 
 export async function getRebalanceCandidates(
@@ -138,35 +153,37 @@ export async function getRebalanceCandidates(
     .sort((a, b) => (demandById.get(b.id) ?? 0) - (demandById.get(a.id) ?? 0))
     .slice(0, policy.maxCandidates);
 
-  const candidates: RebalanceCandidate[] = [];
-  for (const target of targets) {
-    const source = sources.find((s) => s.id !== target.id);
-    if (!source) continue;
+  // Pair each target with the fullest available source, then probe them all in
+  // parallel — real probes are slow, so don't serialise.
+  const pairs = targets
+    .map((target) => ({ target, source: sources.find((s) => s.id !== target.id) }))
+    .filter((p): p is { target: ChannelView; source: ChannelView } => !!p.source);
 
-    const outboundPpm = ppmById.get(target.id) ?? 0;
-    const maxFeePpm = Math.floor(outboundPpm * policy.econRatio);
-    const probe = await probeCost(lnd, ownKey, source, target, policy.amountSats);
-    const profitable =
-      probe.costPpm !== null && maxFeePpm > 0 && probe.costPpm <= maxFeePpm;
-
-    candidates.push({
-      targetId: target.id,
-      targetAlias: target.peerAlias,
-      targetLocalRatio: target.localRatio,
-      targetOutboundPpm: outboundPpm,
-      demandSats: demandById.get(target.id) ?? 0,
-      sourceId: source.id,
-      sourceAlias: source.peerAlias,
-      sourceLocalRatio: source.localRatio,
-      amountSats: policy.amountSats,
-      maxFeePpm,
-      estCostPpm: probe.costPpm,
-      estFeeSats: probe.feeSats,
-      routeFound: probe.costPpm !== null,
-      profitable,
-      verdict: verdictFor(maxFeePpm, probe.costPpm, profitable),
-    });
-  }
+  const candidates: RebalanceCandidate[] = await Promise.all(
+    pairs.map(async ({ target, source }) => {
+      const outboundPpm = ppmById.get(target.id) ?? 0;
+      const maxFeePpm = Math.floor(outboundPpm * policy.econRatio);
+      const probe = await probeRoute(lnd, ownKey, source, target, policy.amountSats, PROBE_CEILING_PPM);
+      const profitable = probe.costPpm !== null && maxFeePpm > 0 && probe.costPpm <= maxFeePpm;
+      return {
+        targetId: target.id,
+        targetAlias: target.peerAlias,
+        targetLocalRatio: target.localRatio,
+        targetOutboundPpm: outboundPpm,
+        demandSats: demandById.get(target.id) ?? 0,
+        sourceId: source.id,
+        sourceAlias: source.peerAlias,
+        sourceLocalRatio: source.localRatio,
+        amountSats: policy.amountSats,
+        maxFeePpm,
+        estCostPpm: probe.costPpm,
+        estFeeSats: probe.feeSats,
+        routeFound: probe.costPpm !== null,
+        profitable,
+        verdict: verdictFor(maxFeePpm, probe.costPpm, profitable),
+      };
+    }),
+  );
 
   // Profitable first, then by demand.
   candidates.sort(
@@ -183,6 +200,8 @@ export interface RebalanceExecParams {
   amountSats: number;
   /** Safety margin; budget = target outbound fee ppm × econRatio. */
   econRatio: number;
+  /** Manual override: explicit fee budget (ppm). Bypasses the profit gate. */
+  maxFeePpm?: number;
 }
 
 export interface RebalanceExecResult {
@@ -249,45 +268,52 @@ export async function executeRebalance(
 
   const rates = await getFeeRates({ lnd: readLnd });
   const outboundPpm = rates.channels.find((c) => c.id === params.targetId)?.fee_rate ?? 0;
-  const budgetPpm = Math.floor(outboundPpm * params.econRatio);
+  // Manual runs may pass an explicit budget; otherwise it's the profit-gated
+  // fraction of what the target earns on outbound.
+  const budgetPpm =
+    params.maxFeePpm && params.maxFeePpm > 0
+      ? Math.floor(params.maxFeePpm)
+      : Math.floor(outboundPpm * params.econRatio);
   if (budgetPpm <= 0) {
-    return { ...base, error: "target earns 0 ppm — set an outbound fee on it first" };
+    return { ...base, error: "target earns 0 ppm — set an outbound fee or a max fee (ppm)" };
   }
 
-  const maxFeeSats = Math.max(1, Math.floor((params.amountSats * budgetPpm) / 1_000_000));
   const ownKey = await getOwnPubkey(readLnd);
 
-  try {
-    // Self-invoice, decoded to get the payment secret + mtokens for the route.
-    const invoice = await createInvoice({ lnd: writeLnd, tokens: params.amountSats });
-    const decoded = await decodePaymentRequest({ lnd: readLnd, request: invoice.request });
-
-    // LND's own multi-path payment retries across many routes (skipping hops that
-    // fail), constrained to leave via the source channel and return via the
-    // target's peer, and never exceeds the fee budget. Far more reliable than
-    // building and paying a single route.
-    const paid = await payViaPaymentDetails({
-      lnd: writeLnd,
-      id: invoice.id,
-      destination: ownKey,
-      tokens: params.amountSats,
-      max_fee: maxFeeSats,
-      outgoing_channel: source.id,
-      incoming_peer: target.peerPubkey,
-      payment: decoded.payment,
-      mtokens: decoded.mtokens,
-      pathfinding_timeout: 40_000,
-    });
-
-    const feeSats = paid.safe_fee ?? paid.fee;
-    return {
-      ...base,
-      ok: true,
-      budgetPpm,
-      feeSats,
-      costPpm: Math.round((feeSats / params.amountSats) * 1_000_000),
-    };
-  } catch (err) {
-    return { ...base, budgetPpm, error: describePayError(err, budgetPpm) };
+  // Adaptive: try the requested amount, then progressively smaller, paying the
+  // first that actually routes. LND's multi-path payment retries across many
+  // routes (skipping hops that fail), constrained to leave via the source and
+  // return via the target's peer, never exceeding the per-amount fee budget.
+  let lastErr: unknown = null;
+  for (const amount of adaptiveAmounts(params.amountSats)) {
+    const maxFeeSats = Math.max(1, Math.floor((amount * budgetPpm) / 1_000_000));
+    try {
+      const invoice = await createInvoice({ lnd: writeLnd, tokens: amount });
+      const decoded = await decodePaymentRequest({ lnd: readLnd, request: invoice.request });
+      const paid = await payViaPaymentDetails({
+        lnd: writeLnd,
+        id: invoice.id,
+        destination: ownKey,
+        tokens: amount,
+        max_fee: maxFeeSats,
+        outgoing_channel: source.id,
+        incoming_peer: target.peerPubkey,
+        payment: decoded.payment,
+        mtokens: decoded.mtokens,
+        pathfinding_timeout: 18_000,
+      });
+      const feeSats = paid.safe_fee ?? paid.fee;
+      return {
+        ...base,
+        ok: true,
+        amountSats: amount,
+        budgetPpm,
+        feeSats,
+        costPpm: Math.round((feeSats / amount) * 1_000_000),
+      };
+    } catch (err) {
+      lastErr = err;
+    }
   }
+  return { ...base, budgetPpm, error: describePayError(lastErr, budgetPpm) };
 }
