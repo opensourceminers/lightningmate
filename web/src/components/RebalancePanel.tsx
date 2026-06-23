@@ -8,6 +8,7 @@ import type {
   RebalancePolicy,
 } from "../types";
 import { percent, sats, satsCompact, timeAgo } from "../format";
+import { useUi } from "./Overlay";
 
 type DraftKey =
   | "amountSats"
@@ -33,12 +34,13 @@ const CONTROLS: { key: DraftKey; label: string; step: number; hint: string }[] =
 ];
 
 function Verdict({ c }: { c: RebalanceCandidate }) {
-  if (c.profitable) return <span className="pill-live">profitable</span>;
-  if (!c.routeFound) return <span className="muted">no route</span>;
-  return <span className="ap-fail">✗ too costly</span>;
+  if (!c.routeFound) return <span className="muted" title={c.verdict}>no cheap route</span>;
+  if (c.profitable) return <span className="pill-live" title={c.verdict}>profitable</span>;
+  return <span className="delta-up" title={c.verdict}>costs &gt; earn</span>;
 }
 
 export function RebalancePanel() {
+  const { confirm, toast } = useUi();
   const [draft, setDraft] = useState<Pick<RebalancePolicy, DraftKey>>(DEFAULTS);
   const [analysis, setAnalysis] = useState<RebalanceAnalysis | null>(null);
   const [loading, setLoading] = useState(false);
@@ -92,7 +94,8 @@ export function RebalancePanel() {
         econRatio: draft.econRatio,
         ...(Number(mMaxFee) > 0 ? { maxFeePpm: Number(mMaxFee) } : {}),
       });
-      if (!res.ok) setError(`Manual rebalance: ${res.error}`);
+      if (res.ok) toast(`Rebalanced ${satsCompact(res.amountSats)} sat · ${res.feeSats} sat fee`, "success");
+      else setError(`Manual rebalance: ${res.error}`);
       await loadLog();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -105,16 +108,32 @@ export function RebalancePanel() {
     setDraft((d) => ({ ...d, [key]: Math.max(0, value || 0) }));
 
   const rebalance = async (c: RebalanceCandidate) => {
+    const overBudget = c.estCostPpm !== null && c.estCostPpm > c.maxFeePpm;
+    const ok = await confirm({
+      title: "Run rebalance",
+      message: overBudget
+        ? `${c.targetAlias} looks unprofitable — est. ${c.estCostPpm} ppm is over your budget (${c.maxFeePpm} ppm). Rebalance anyway? Your call.`
+        : `Rebalance ${satsCompact(c.amountSats)} sat into ${c.targetAlias} from ${c.sourceAlias}? Est. cost ${c.estCostPpm ?? "?"} ppm, budget ${c.maxFeePpm} ppm.`,
+      confirmLabel: "Rebalance",
+      danger: overBudget,
+    });
+    if (!ok) return;
     setRunningId(c.targetId);
     setError(null);
     try {
+      // Allow the actual route up to the estimate (+20% headroom) or the budget,
+      // whichever is higher — so "your call" runs really attempt it.
+      const maxFeePpm =
+        Math.max(c.maxFeePpm, c.estCostPpm ? Math.ceil(c.estCostPpm * 1.2) : 0) || undefined;
       const res = await api.rebalanceExecute({
         targetId: c.targetId,
         sourceId: c.sourceId,
         amountSats: c.amountSats,
         econRatio: draft.econRatio,
+        ...(maxFeePpm ? { maxFeePpm } : {}),
       });
-      if (!res.ok) setError(`${res.targetAlias}: ${res.error}`);
+      if (res.ok) toast(`Rebalanced ${satsCompact(res.amountSats)} sat · ${res.feeSats} sat fee`, "success");
+      else setError(`${res.targetAlias}: ${res.error}`);
       await Promise.all([loadLog(), analyze(draft)]);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -137,11 +156,11 @@ export function RebalancePanel() {
       </div>
 
       <div className="dryrun-banner">
-        Finds depleted channels with <strong>proven outbound demand</strong> and checks
-        whether refilling them <strong>pays off</strong>: budget = target's outbound fee ×
-        econ ratio, vs. the probed route cost.
+        Depleted channels with <strong>proven outbound demand</strong>, with a quick cost
+        estimate vs. what each earns. Profitability is <strong>guidance</strong> — you decide:
+        run any of them, or use <strong>Manual rebalance</strong> below for full control.
         {canWrite ? (
-          <> Click <strong>Rebalance</strong> to run a profitable one — the budget caps the spend.</>
+          <> The estimate is optimistic; the real cost shows after running.</>
         ) : (
           <> Executing is <strong>disabled</strong> (read-only). Enable writes in the Autopilot tab.</>
         )}
@@ -195,7 +214,7 @@ export function RebalancePanel() {
               <td>
                 <button
                   className="row-btn"
-                  disabled={!canWrite || !c.profitable || runningId !== null}
+                  disabled={!canWrite || runningId !== null}
                   onClick={() => rebalance(c)}
                   title={canWrite ? "" : "Enable writes to execute"}
                 >

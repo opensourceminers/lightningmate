@@ -2,8 +2,8 @@ import {
   createInvoice,
   decodePaymentRequest,
   getFeeRates,
+  getRouteToDestination,
   payViaPaymentDetails,
-  probeForRoute,
   type AuthenticatedLnd,
 } from "lightning";
 import { getChannelsView, type ChannelView } from "./channels.js";
@@ -70,15 +70,12 @@ export interface RebalanceAnalysis {
   candidates: RebalanceCandidate[];
 }
 
-const PROBE_TIMEOUT_MS = 9_000;
-
 /**
- * Real liquidity probe: LND sends a payment that fails at the destination, which
- * confirms a route can ACTUALLY carry the amount (unlike pure graph pathfinding,
- * which only proves a path exists on paper). Returns the probed route's cost, or
- * null when no route with available liquidity exists within max ppm.
+ * Fast cost estimate from the graph (no payment, no probe HTLCs). Optimistic —
+ * the real cost and whether liquidity is actually there is only known when you
+ * run the rebalance. Shown as guidance; the user decides (Thunderhub-style).
  */
-async function probeRoute(
+async function estimateCost(
   lnd: AuthenticatedLnd,
   ownKey: string,
   source: ChannelView,
@@ -88,14 +85,13 @@ async function probeRoute(
 ): Promise<{ costPpm: number | null; feeSats: number | null }> {
   try {
     const maxFee = Math.ceil((amountSats * maxPpm) / 1_000_000);
-    const { route } = await probeForRoute({
+    const { route } = await getRouteToDestination({
       lnd,
       destination: ownKey,
       tokens: amountSats,
       outgoing_channel: source.id,
       incoming_peer: target.peerPubkey,
       max_fee: maxFee,
-      probe_timeout_ms: PROBE_TIMEOUT_MS,
     });
     if (!route) return { costPpm: null, feeSats: null };
     const feeSats = route.safe_fee;
@@ -113,10 +109,10 @@ function adaptiveAmounts(target: number): number[] {
 }
 
 function verdictFor(maxFeePpm: number, costPpm: number | null, profitable: boolean): string {
-  if (maxFeePpm <= 0) return "target earns 0 ppm — set an outbound fee on it first";
-  if (costPpm === null) return "no route with available liquidity in budget";
-  if (profitable) return `routable @ ${costPpm} ppm (≤ budget ${maxFeePpm})`;
-  return `routable but ${costPpm} ppm > budget ${maxFeePpm} ppm`;
+  if (costPpm === null) return "no cheap route — try a smaller amount or run it manually";
+  if (maxFeePpm <= 0) return `est. ${costPpm} ppm — target earns 0 ppm (set a fee or your call)`;
+  if (profitable) return `profitable: est. ${costPpm} ≤ budget ${maxFeePpm} ppm`;
+  return `est. ${costPpm} ppm > budget ${maxFeePpm} ppm — your call`;
 }
 
 export async function getRebalanceCandidates(
@@ -163,7 +159,7 @@ export async function getRebalanceCandidates(
     pairs.map(async ({ target, source }) => {
       const outboundPpm = ppmById.get(target.id) ?? 0;
       const maxFeePpm = Math.floor(outboundPpm * policy.econRatio);
-      const probe = await probeRoute(lnd, ownKey, source, target, policy.amountSats, PROBE_CEILING_PPM);
+      const probe = await estimateCost(lnd, ownKey, source, target, policy.amountSats, PROBE_CEILING_PPM);
       const profitable = probe.costPpm !== null && maxFeePpm > 0 && probe.costPpm <= maxFeePpm;
       return {
         targetId: target.id,
