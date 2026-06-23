@@ -151,7 +151,9 @@ export function FeesPanel() {
           ))}
         </tbody>
       </table>
-      {rows.length === 0 && !error ? <p className="muted empty">Loading proposals…</p> : null}
+      {rows.length === 0 && !error ? (
+        <p className="muted empty">{preview ? "No channels to set fees on yet." : "Loading proposals…"}</p>
+      ) : null}
 
       <div className="apply-row">
         <button
