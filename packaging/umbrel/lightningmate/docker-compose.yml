@@ -41,8 +41,9 @@ services:
       PORT: "3001"
       # Bind all interfaces so app_proxy (which authenticates) can reach us.
       LM_BIND: "0.0.0.0"
-      # Read-only by default. To enable fee/rebalance/open + autopilot, set
-      # LM_ENABLE_WRITE=true and point at a write macaroon. For a smaller blast
-      # radius, bake a least-privilege macaroon (see SECURITY.md) instead of admin.
-      # LM_ENABLE_WRITE: "true"
-      # LND_WRITE_MACAROON_PATH: "/lnd/data/chain/bitcoin/mainnet/admin.macaroon"
+      # Node management needs write access (like RTL / Thunderhub / Lightning
+      # Terminal). The autopilot itself stays OFF until the user turns it on, and
+      # every fund-moving action asks for confirmation. To run read-only instead,
+      # comment these two lines out.
+      LM_ENABLE_WRITE: "true"
+      LND_WRITE_MACAROON_PATH: "/lnd/data/chain/bitcoin/mainnet/admin.macaroon"
