@@ -142,14 +142,22 @@ export function ForwardsPanel() {
       {data && data.recent.length > 0 ? (
         <>
           <h3 className="sub">Recent forwards</h3>
-          <table className="forwards">
+          <table className="fee-table">
+            <thead>
+              <tr>
+                <th>When</th>
+                <th>Route (in → out)</th>
+                <th className="num">Routed</th>
+                <th className="num">Fee earned</th>
+              </tr>
+            </thead>
             <tbody>
               {data.recent.map((e, i) => (
                 <tr key={`${e.createdAt}-${i}`}>
                   <td className="muted">{timeAgo(e.createdAt)}</td>
                   <td>{e.incoming} → {e.outgoing}</td>
-                  <td className="num">{satsCompact(e.tokens)}</td>
-                  <td className="num earned">+{e.fee}</td>
+                  <td className="num">{satsCompact(e.tokens)} sat</td>
+                  <td className="num earned">+{e.fee} sat</td>
                 </tr>
               ))}
             </tbody>

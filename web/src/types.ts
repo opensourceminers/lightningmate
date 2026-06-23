@@ -451,6 +451,39 @@ export interface OnchainSendResult {
   error?: string;
 }
 
+// ── Overview dashboard ────────────────────────────────────────────────────────
+export type ActivityKind = "forward" | "received" | "sent" | "onchain_in" | "onchain_out";
+
+export interface ActivityItem {
+  at: string;
+  kind: ActivityKind;
+  title: string;
+  amountSats: number;
+  routedSats?: number;
+  feeSats?: number;
+}
+
+export interface DashboardData {
+  windowDays: number;
+  earnedSats: number;
+  forwardCount: number;
+  routedSats: number;
+  feesSpark: number[];
+  forwardsSpark: number[];
+  routedSpark: number[];
+  rebalancedCount: number;
+  rebalancedSats: number;
+  activity: ActivityItem[];
+  autopilot: {
+    fees: boolean;
+    rebalance: boolean;
+    channel: boolean;
+    lastRunAt: string | null;
+    lastApplied: number;
+    lastAttempted: number;
+  };
+}
+
 export interface NetworkRank {
   position: number;
   total: number;

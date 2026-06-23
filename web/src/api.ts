@@ -24,6 +24,7 @@ import type {
   OnchainTx,
   NewAddress,
   OnchainSendResult,
+  DashboardData,
   NodeScore,
   NodeSummary,
   OpenChannelResult,
@@ -66,6 +67,7 @@ async function post<T>(path: string, body: unknown): Promise<T> {
 
 export const api = {
   node: () => get<NodeSummary>("/node"),
+  dashboard: () => get<DashboardData>("/dashboard"),
   channels: () => get<ChannelView[]>("/channels"),
   flows: (days?: number) => get<FlowSummary>(days ? `/flows?days=${days}` : "/flows"),
   pnl: (days: number) => get<PnlSummary>(`/pnl?days=${days}`),
