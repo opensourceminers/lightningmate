@@ -32,6 +32,10 @@ export interface AutopilotConfig {
   maxRebalancesPerRun: number;
   /** Per-target minimum time between rebalances. */
   rebalanceCooldownMinutes: number;
+  /** Only auto-rebalance within this hour window (node local time, 0–24). Equal
+   *  start/end = any time. e.g. 0→6 = only overnight, when routes are cheaper. */
+  rebalanceHourStart: number;
+  rebalanceHourEnd: number;
   /** Channel autopilot: open a channel to the top suggestion when funds allow. */
   channelEnabled: boolean;
   /** Keep at least this much on-chain (sats) untouched. */
@@ -97,6 +101,8 @@ const DEFAULT_CONFIG: AutopilotConfig = {
   rebalancePolicy: DEFAULT_REBALANCE_POLICY,
   maxRebalancesPerRun: 2,
   rebalanceCooldownMinutes: 720,
+  rebalanceHourStart: 0,
+  rebalanceHourEnd: 24,
   channelEnabled: false,
   channelReserveSats: 50_000,
   channelSizeSats: 0,
@@ -239,8 +245,17 @@ export class Autopilot {
     });
   }
 
+  /** Within the configured rebalance hour window (node local time)? */
+  private inRebalanceWindow(): boolean {
+    const { rebalanceHourStart: s, rebalanceHourEnd: e } = this.state.config;
+    if (s === e) return true; // any time
+    const h = new Date().getHours();
+    return s < e ? h >= s && h < e : h >= s || h < e; // handles midnight wrap
+  }
+
   /** Execute eligible (profitable, off-cooldown) rebalances. */
   private async runRebalances(writeLnd: AuthenticatedLnd): Promise<AutopilotRebalance[]> {
+    if (!this.inRebalanceWindow()) return [];
     const { rebalancePolicy, maxRebalancesPerRun, rebalanceCooldownMinutes } = this.state.config;
     const analysis = await getRebalanceCandidates(this.readLnd, rebalancePolicy);
     const eligible = analysis.candidates

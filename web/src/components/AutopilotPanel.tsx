@@ -10,6 +10,8 @@ type NumKey =
   | "maxChangesPerRun"
   | "maxRebalancesPerRun"
   | "rebalanceCooldownMinutes"
+  | "rebalanceHourStart"
+  | "rebalanceHourEnd"
   | "channelReserveSats"
   | "channelSizeSats"
   | "channelCooldownMinutes";
@@ -23,6 +25,8 @@ const RECOMMENDED: Pick<
   | "maxChangesPerRun"
   | "maxRebalancesPerRun"
   | "rebalanceCooldownMinutes"
+  | "rebalanceHourStart"
+  | "rebalanceHourEnd"
   | "channelReserveSats"
   | "channelSizeSats"
   | "channelCooldownMinutes"
@@ -34,6 +38,8 @@ const RECOMMENDED: Pick<
   maxChangesPerRun: 5,
   maxRebalancesPerRun: 2,
   rebalanceCooldownMinutes: 720,
+  rebalanceHourStart: 0,
+  rebalanceHourEnd: 24,
   channelReserveSats: 50_000,
   channelSizeSats: 0,
   channelCooldownMinutes: 1_440,
@@ -70,6 +76,8 @@ const POLICY_FIELDS: { key: keyof AutopilotConfig["policy"]; label: string }[] =
 const REB_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "maxRebalancesPerRun", label: "Max rebalances / run" },
   { key: "rebalanceCooldownMinutes", label: "Rebalance cooldown (min)" },
+  { key: "rebalanceHourStart", label: "Run from hour (0–24)" },
+  { key: "rebalanceHourEnd", label: "Run to hour (0–24)" },
 ];
 const REB_POLICY_FIELDS: { key: RebKey; label: string; step: number }[] = [
   { key: "econRatio", label: "Econ ratio", step: 0.05 },
@@ -169,6 +177,8 @@ export function AutopilotPanel() {
       maxChangesPerRun: draft.maxChangesPerRun,
       maxRebalancesPerRun: draft.maxRebalancesPerRun,
       rebalanceCooldownMinutes: draft.rebalanceCooldownMinutes,
+      rebalanceHourStart: draft.rebalanceHourStart,
+      rebalanceHourEnd: draft.rebalanceHourEnd,
       channelReserveSats: draft.channelReserveSats,
       channelSizeSats: draft.channelSizeSats,
       channelCooldownMinutes: draft.channelCooldownMinutes,

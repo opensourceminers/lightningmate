@@ -60,6 +60,11 @@ export interface RebalanceCandidate {
   /** Cheapest route cost found (ppm), or null if none. */
   estCostPpm: number | null;
   estFeeSats: number | null;
+  /** What you net per sat once refilled liquidity routes out: earn − cost (ppm). */
+  netMarginPpm: number | null;
+  /** Rough net profit (sats) of this refill, accounting for demand (the channel
+   *  only earns on what it can actually route out). Negative = over-refilling. */
+  expectedProfitSats: number | null;
   routeFound: boolean;
   profitable: boolean;
   verdict: string;
@@ -112,11 +117,13 @@ function adaptiveAmounts(target: number): number[] {
 // route attempt is a slow round-trip; on Umbrel (direct) it resolves far quicker.
 const PATHFINDING_TIMEOUT_MS = 45_000;
 
-function verdictFor(maxFeePpm: number, costPpm: number | null, profitable: boolean): string {
+function verdictFor(outboundPpm: number, costPpm: number | null, profitable: boolean): string {
   if (costPpm === null) return "no cheap route — try a smaller amount or run it manually";
-  if (maxFeePpm <= 0) return `est. ${costPpm} ppm — target earns 0 ppm (set a fee or your call)`;
-  if (profitable) return `profitable: est. ${costPpm} ≤ budget ${maxFeePpm} ppm`;
-  return `est. ${costPpm} ppm > budget ${maxFeePpm} ppm — your call`;
+  if (outboundPpm <= 0) return `est. ${costPpm} ppm cost — target earns 0 ppm (set a fee or your call)`;
+  const margin = outboundPpm - costPpm;
+  if (profitable) return `profitable: earns ${outboundPpm} − costs ${costPpm} = +${margin} ppm margin`;
+  if (margin > 0) return `thin margin: earns ${outboundPpm} − costs ${costPpm} = +${margin} ppm (under target)`;
+  return `unprofitable: costs ${costPpm} ≥ earns ${outboundPpm} ppm`;
 }
 
 export async function getRebalanceCandidates(
@@ -162,15 +169,28 @@ export async function getRebalanceCandidates(
   const candidates: RebalanceCandidate[] = await Promise.all(
     pairs.map(async ({ target, source }) => {
       const outboundPpm = ppmById.get(target.id) ?? 0;
+      const demand = demandById.get(target.id) ?? 0;
       const maxFeePpm = Math.floor(outboundPpm * policy.econRatio);
       const probe = await estimateCost(lnd, ownKey, source, target, policy.amountSats, PROBE_CEILING_PPM);
       const profitable = probe.costPpm !== null && maxFeePpm > 0 && probe.costPpm <= maxFeePpm;
+
+      // Profit view: you pay the rebalance cost on the full amount, but only earn
+      // on what the channel can actually route out (capped by recent demand).
+      const netMarginPpm = probe.costPpm === null ? null : outboundPpm - probe.costPpm;
+      const expectedProfitSats =
+        probe.costPpm === null
+          ? null
+          : Math.round(
+              (Math.min(policy.amountSats, demand) * outboundPpm - policy.amountSats * probe.costPpm) /
+                1_000_000,
+            );
+
       return {
         targetId: target.id,
         targetAlias: target.peerAlias,
         targetLocalRatio: target.localRatio,
         targetOutboundPpm: outboundPpm,
-        demandSats: demandById.get(target.id) ?? 0,
+        demandSats: demand,
         sourceId: source.id,
         sourceAlias: source.peerAlias,
         sourceLocalRatio: source.localRatio,
@@ -178,16 +198,22 @@ export async function getRebalanceCandidates(
         maxFeePpm,
         estCostPpm: probe.costPpm,
         estFeeSats: probe.feeSats,
+        netMarginPpm,
+        expectedProfitSats,
         routeFound: probe.costPpm !== null,
         profitable,
-        verdict: verdictFor(maxFeePpm, probe.costPpm, profitable),
+        verdict: verdictFor(outboundPpm, probe.costPpm, profitable),
       };
     }),
   );
 
-  // Profitable first, then by demand.
+  // Rank by what actually matters: profitable first, then by expected net
+  // profit (sats), then demand as a tiebreaker.
   candidates.sort(
-    (a, b) => Number(b.profitable) - Number(a.profitable) || b.demandSats - a.demandSats,
+    (a, b) =>
+      Number(b.profitable) - Number(a.profitable) ||
+      (b.expectedProfitSats ?? -Infinity) - (a.expectedProfitSats ?? -Infinity) ||
+      b.demandSats - a.demandSats,
   );
   return { policy, candidates };
 }
