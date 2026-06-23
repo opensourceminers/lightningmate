@@ -752,7 +752,11 @@ table { width: 100%; border-collapse: collapse; }
 .oc-bal-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; font-size: 13px; }
 
 /* ── Overview dashboard widgets ──────────────────────────── */
-.kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin: 18px 0; }
+/* Uniform vertical rhythm — flex gap controls all spacing so a `.panel`
+   followed by a `.hero-row` div still gets the right gap. */
+.overview { display: flex; flex-direction: column; gap: 20px; }
+.overview > * { margin: 0; }
+.kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
 .kpi {
   background: linear-gradient(180deg, var(--panel-3), var(--panel-2));
   border: 1px solid var(--line-soft); border-radius: var(--radius-sm); padding: 14px 16px;

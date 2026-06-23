@@ -129,7 +129,7 @@ export function Overview({
   }, []);
 
   return (
-    <>
+    <div className="overview">
       <SummaryBar node={node} price={price} />
       {dash ? <KpiRow d={dash} price={price} /> : null}
       <div className="hero-row">
@@ -143,6 +143,6 @@ export function Overview({
           <AutopilotStatus a={dash.autopilot} />
         </div>
       ) : null}
-    </>
+    </div>
   );
 }
