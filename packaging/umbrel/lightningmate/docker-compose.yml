@@ -18,7 +18,7 @@ services:
       - ${APP_DATA_DIR}/data:/data
 
   web:
-    image: ghcr.io/opensourceminers/lightningmate:v0.6.0@sha256:5bd60f946d84eb620677b1425b8a8e183a79c03e636e6b2b81d8aa31dac1059c
+    image: ghcr.io/opensourceminers/lightningmate:v0.6.1@sha256:a1fc9f52c043f14b7b55ce29497ac6874085079abd527c3b9749c9d711100d62
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
