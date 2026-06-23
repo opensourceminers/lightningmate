@@ -5,37 +5,25 @@ import { AutopilotPanel } from "./components/AutopilotPanel";
 import { BrandMark } from "./components/BrandMark";
 import { ChannelTable } from "./components/ChannelTable";
 import { PnlOverview } from "./components/PnlOverview";
-import { FeesPanel } from "./components/FeesPanel";
 import { Footer } from "./components/Footer";
-import { ForwardsPanel } from "./components/ForwardsPanel";
 import { HealthScore } from "./components/HealthScore";
 import { LiquidityMap } from "./components/LiquidityMap";
-import { PaymentsPanel } from "./components/PaymentsPanel";
-import { RebalancePanel } from "./components/RebalancePanel";
+import { RoutingPanel } from "./components/RoutingPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SkeletonPanel } from "./components/Skeleton";
 import { SuggestionsPanel } from "./components/SuggestionsPanel";
 import { SummaryBar } from "./components/SummaryBar";
 import { TabIcon } from "./components/TabIcon";
+import { WalletPanel } from "./components/WalletPanel";
 import { usePolledData } from "./usePolledData";
 
-type Tab =
-  | "channels"
-  | "pay"
-  | "suggestions"
-  | "forwards"
-  | "fees"
-  | "rebalance"
-  | "autopilot"
-  | "settings";
+type Tab = "overview" | "channels" | "wallet" | "routing" | "autopilot" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
+  { id: "overview", label: "Overview" },
   { id: "channels", label: "Channels" },
-  { id: "pay", label: "Pay" },
-  { id: "suggestions", label: "Suggestions" },
-  { id: "forwards", label: "Forwards" },
-  { id: "fees", label: "Fees" },
-  { id: "rebalance", label: "Rebalancing" },
+  { id: "wallet", label: "Wallet" },
+  { id: "routing", label: "Routing" },
   { id: "autopilot", label: "Autopilot" },
   { id: "settings", label: "Settings" },
 ];
@@ -44,7 +32,7 @@ export function App() {
   const node = usePolledData(api.node, 15_000);
   const channels = usePolledData(api.channels, 30_000);
   const price = usePolledData(api.price, 300_000);
-  const [tab, setTab] = useState<Tab>("channels");
+  const [tab, setTab] = useState<Tab>("overview");
 
   const anyError = node.error ?? channels.error;
   const initialLoading = node.loading && !node.data;
@@ -103,30 +91,34 @@ export function App() {
       {node.data ? <AlertsBar /> : null}
 
       <div className="tab-body">
-        {tab === "channels" ? (
-          <>
-            {node.data ? <SummaryBar node={node.data} price={price.data} /> : null}
-            {node.data ? (
+        {tab === "overview" ? (
+          node.data ? (
+            <>
+              <SummaryBar node={node.data} price={price.data} />
               <div className="hero-row">
                 <HealthScore />
                 <PnlOverview price={price.data} />
               </div>
-            ) : null}
-            {channels.data ? (
-              <>
-                <LiquidityMap channels={channels.data} />
-                <ChannelTable channels={channels.data} />
-              </>
-            ) : (
-              <SkeletonPanel rows={6} />
-            )}
-          </>
+              {channels.data ? <LiquidityMap channels={channels.data} /> : null}
+            </>
+          ) : (
+            <SkeletonPanel rows={6} />
+          )
         ) : null}
-        {tab === "pay" ? <PaymentsPanel price={price.data} /> : null}
-        {tab === "forwards" ? <ForwardsPanel /> : null}
-        {tab === "suggestions" ? <SuggestionsPanel /> : null}
-        {tab === "fees" ? <FeesPanel /> : null}
-        {tab === "rebalance" ? <RebalancePanel /> : null}
+
+        {tab === "channels" ? (
+          channels.data ? (
+            <>
+              <ChannelTable channels={channels.data} />
+              <SuggestionsPanel />
+            </>
+          ) : (
+            <SkeletonPanel rows={6} />
+          )
+        ) : null}
+
+        {tab === "wallet" ? <WalletPanel price={price.data} /> : null}
+        {tab === "routing" ? <RoutingPanel /> : null}
         {tab === "autopilot" ? <AutopilotPanel /> : null}
         {tab === "settings" ? <SettingsPanel onChange={price.refresh} /> : null}
       </div>

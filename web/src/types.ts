@@ -416,6 +416,41 @@ export interface LnActivity {
   }[];
 }
 
+// ── On-chain wallet ───────────────────────────────────────────────────────────
+export interface OnchainUtxo {
+  outpoint: string;
+  address: string;
+  tokens: number;
+  confirmations: number;
+}
+
+export interface OnchainState {
+  confirmedSats: number;
+  pendingSats: number;
+  utxos: OnchainUtxo[];
+  suggestedFeeRate: number | null;
+}
+
+export interface OnchainTx {
+  id: string;
+  amountSats: number;
+  feeSats: number;
+  confirmations: number;
+  isConfirmed: boolean;
+  isOutgoing: boolean;
+  createdAt: string;
+}
+
+export interface NewAddress {
+  address: string;
+}
+
+export interface OnchainSendResult {
+  ok: boolean;
+  transactionId: string;
+  error?: string;
+}
+
 export interface NetworkRank {
   position: number;
   total: number;

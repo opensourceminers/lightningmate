@@ -19,6 +19,12 @@ import {
   getLnActivity,
   payRequest,
 } from "../services/payments.js";
+import {
+  getOnchainState,
+  getOnchainTxs,
+  newAddress,
+  sendOnchain,
+} from "../services/onchain.js";
 import { closeChannelByOutpoint, openChannelTo } from "../services/channelOps.js";
 import { getBtcPrice } from "../services/price.js";
 import type { SettingsStore } from "../services/settings.js";
@@ -51,6 +57,10 @@ const isChannelId = (s: unknown): s is string =>
 /** A BOLT11 payment request (bech32-ish, starts with "ln"). */
 const isPayRequest = (s: unknown): s is string =>
   typeof s === "string" && s.length >= 20 && s.length <= 2000 && /^ln[a-z0-9]+$/i.test(s.trim());
+/** A mainnet on-chain address (bech32 bc1… or base58 1…/3…). LND validates fully. */
+const isBtcAddress = (s: unknown): s is string =>
+  typeof s === "string" &&
+  (/^bc1[a-z0-9]{8,87}$/i.test(s.trim()) || /^[13][a-km-zA-HJ-NP-Z1-9]{20,40}$/.test(s.trim()));
 /** Finite integer within [min, max], else null. */
 function intIn(v: unknown, min: number, max: number): number | null {
   const n = Number(v);
@@ -67,6 +77,8 @@ const MAX_BASE_MSAT = 10_000_000; // 10k sat
 const MAX_REBALANCE_SATS = 100_000_000; // 1 BTC
 const MAX_RECEIVE_SATS = 100_000_000; // 1 BTC per invoice
 const MAX_PAY_FEE_SATS = 2_000_000; // routing-fee budget cap
+const MAX_ONCHAIN_SEND_SATS = 1_000_000_000; // 10 BTC per send
+const MAX_FEE_RATE = 2_000; // sat/vByte
 
 // Read optional fee-policy overrides from the query string.
 function parsePolicyQuery(query: Request["query"]): Partial<FeePolicy> {
@@ -520,6 +532,62 @@ export function createApiRouter(
       } catch (err) {
         // A failed payment (no route, rejected, …) is a normal result, not a 502.
         res.json({ ok: false, id: "", tokens: 0, feeSats: 0, secret: "", error: describeError(err) });
+      }
+    }),
+  );
+
+  // ── On-chain wallet ────────────────────────────────────────────────────────
+
+  // Balance + UTXOs + suggested fee rate (read-only).
+  router.get(
+    "/onchain",
+    wrap(async (_req, res) => {
+      res.json(await getOnchainState(lnd));
+    }),
+  );
+
+  // On-chain transaction history (read-only).
+  router.get(
+    "/onchain/txs",
+    wrap(async (_req, res) => {
+      res.json(await getOnchainTxs(lnd));
+    }),
+  );
+
+  // Generate a fresh receive address. Requires a write macaroon.
+  router.post(
+    "/onchain/address",
+    wrap(async (_req, res) => {
+      if (!writeLnd) {
+        res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
+        return;
+      }
+      res.json(await newAddress(writeLnd));
+    }),
+  );
+
+  // Send on-chain. Requires write access; amount + fee rate validated.
+  router.post(
+    "/onchain/send",
+    wrap(async (req, res) => {
+      if (!writeLnd) {
+        res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
+        return;
+      }
+      const { address, tokens, feeRate } = req.body ?? {};
+      const amount = intIn(tokens, 546, MAX_ONCHAIN_SEND_SATS); // ≥ dust
+      const rate = intIn(feeRate, 1, MAX_FEE_RATE);
+      if (!isBtcAddress(address) || amount === null || rate === null) {
+        res.status(400).json({
+          error: "bad_request",
+          message: "valid address, tokens (≥546 sat) and feeRate (1–2000 sat/vB) required.",
+        });
+        return;
+      }
+      try {
+        res.json(await sendOnchain(writeLnd, { address: address.trim(), tokens: amount, feeRate: rate }));
+      } catch (err) {
+        res.json({ ok: false, transactionId: "", error: describeError(err) });
       }
     }),
   );
