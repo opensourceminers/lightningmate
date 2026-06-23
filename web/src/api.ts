@@ -16,6 +16,10 @@ import type {
   FeePreview,
   FlowSummary,
   ForwardsReport,
+  CreatedInvoice,
+  DecodedRequest,
+  LnActivity,
+  PayResult,
   NodeScore,
   NodeSummary,
   OpenChannelResult,
@@ -119,4 +123,10 @@ export const api = {
     feeRate?: number;
     isPrivate?: boolean;
   }) => post<OpenChannelResult>("/channels/open", params),
+  lnActivity: () => get<LnActivity>("/ln/activity"),
+  lnDecode: (request: string) => post<DecodedRequest>("/ln/decode", { request }),
+  lnInvoice: (params: { tokens: number; description: string; expirySec?: number }) =>
+    post<CreatedInvoice>("/ln/invoice", params),
+  lnPay: (params: { request: string; maxFeeSats: number; tokens?: number }) =>
+    post<PayResult>("/ln/pay", params),
 };
