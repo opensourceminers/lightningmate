@@ -104,9 +104,13 @@ async function estimateCost(
 /** Amounts to attempt, largest first, down to a floor — for adaptive rebalancing. */
 function adaptiveAmounts(target: number): number[] {
   const floor = 50_000;
-  const raw = [target, Math.round(target / 2), Math.round(target / 4), Math.max(floor, Math.round(target / 10))];
+  const raw = [target, Math.round(target / 2), Math.round(target / 4)];
   return [...new Set(raw.filter((a) => a >= floor))];
 }
+
+// Pathfinding budget per attempt. Generous because over a dev SSH tunnel each
+// route attempt is a slow round-trip; on Umbrel (direct) it resolves far quicker.
+const PATHFINDING_TIMEOUT_MS = 45_000;
 
 function verdictFor(maxFeePpm: number, costPpm: number | null, profitable: boolean): string {
   if (costPpm === null) return "no cheap route — try a smaller amount or run it manually";
@@ -296,7 +300,7 @@ export async function executeRebalance(
         incoming_peer: target.peerPubkey,
         payment: decoded.payment,
         mtokens: decoded.mtokens,
-        pathfinding_timeout: 18_000,
+        pathfinding_timeout: PATHFINDING_TIMEOUT_MS,
       });
       const feeSats = paid.safe_fee ?? paid.fee;
       return {
