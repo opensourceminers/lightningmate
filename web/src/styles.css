@@ -300,8 +300,8 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 
 /* ── Tabs ────────────────────────────────────────────────── */
 .tabs {
-  display: flex; gap: 2px; border-bottom: 1px solid var(--line);
-  margin: 22px 0 18px; overflow-x: auto;
+  display: flex; flex-wrap: wrap; gap: 2px; border-bottom: 1px solid var(--line);
+  margin: 22px 0 18px;
 }
 .tab {
   display: inline-flex; align-items: center; gap: 7px;

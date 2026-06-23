@@ -5,7 +5,7 @@ manifestVersion: 1
 id: lightningmate
 category: finance
 name: Lightning Mate
-version: "0.5.3"
+version: "0.5.4"
 tagline: Profit-aware management & autopilot for your Lightning node
 description: >-
   Lightning Mate manages your Lightning node so you don't have to babysit it.
@@ -22,10 +22,9 @@ description: >-
   rebalances, and opens channels to top peers — all on recommended settings with
   safe caps and cooldowns. Read-only by default; writes are opt-in.
 releaseNotes: >-
-  Smarter channel suggestions tuned for routing income — a new-reach metric
-  rewards peers that open genuinely new destinations, mid-tier active routers are
-  favoured and over-saturated mega-hubs are dampened. Donate now opens a public
-  BTCPay page.
+  Fix: app settings (autopilot, currency) now persist across updates — the data
+  directory is made writable for the non-root app user. The tab bar no longer
+  shows a horizontal scroll control.
 developer: opensourceminers.de
 website: https://opensourceminers.de
 dependencies:
