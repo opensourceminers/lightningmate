@@ -705,7 +705,11 @@ table { width: 100%; border-collapse: collapse; }
 @keyframes modalIn { from { opacity: 0; transform: translateY(10px) scale(0.98); } to { opacity: 1; transform: none; } }
 
 /* ── Pay (send / receive) ─────────────────────────────────── */
-.pay-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+.pay { display: flex; flex-direction: column; gap: 18px; }
+.pay-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; align-items: stretch; }
+/* Cancel the generic `.panel + .panel` top-margin inside the grid so both tiles
+   align at the top and stretch to equal height. */
+.pay .pay-grid > .panel { margin: 0; height: 100%; }
 .pay-form { display: flex; flex-direction: column; gap: 12px; }
 .pay-form .policy-field { display: flex; flex-direction: column; gap: 5px; }
 .pay-form .policy-field > span { font-size: 12px; color: var(--muted); }
