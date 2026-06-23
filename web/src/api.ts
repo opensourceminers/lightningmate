@@ -20,6 +20,10 @@ import type {
   DecodedRequest,
   LnActivity,
   PayResult,
+  OnchainState,
+  OnchainTx,
+  NewAddress,
+  OnchainSendResult,
   NodeScore,
   NodeSummary,
   OpenChannelResult,
@@ -129,4 +133,9 @@ export const api = {
     post<CreatedInvoice>("/ln/invoice", params),
   lnPay: (params: { request: string; maxFeeSats: number; tokens?: number }) =>
     post<PayResult>("/ln/pay", params),
+  onchainState: () => get<OnchainState>("/onchain"),
+  onchainTxs: () => get<OnchainTx[]>("/onchain/txs"),
+  onchainAddress: () => post<NewAddress>("/onchain/address", {}),
+  onchainSend: (params: { address: string; tokens: number; feeRate: number }) =>
+    post<OnchainSendResult>("/onchain/send", params),
 };

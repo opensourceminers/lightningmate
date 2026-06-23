@@ -12,11 +12,37 @@ const C = {
 /** Small line icon for each tab. */
 export function TabIcon({ id }: { id: string }) {
   switch (id) {
+    case "overview":
+      return (
+        <svg {...C} aria-hidden>
+          <rect x="3" y="3" width="7" height="9" rx="1.5" />
+          <rect x="14" y="3" width="7" height="5" rx="1.5" />
+          <rect x="14" y="12" width="7" height="9" rx="1.5" />
+          <rect x="3" y="16" width="7" height="5" rx="1.5" />
+        </svg>
+      );
     case "channels":
       return (
         <svg {...C} aria-hidden>
           <rect x="3" y="3" width="7" height="18" rx="1.5" />
           <rect x="14" y="3" width="7" height="18" rx="1.5" />
+        </svg>
+      );
+    case "wallet":
+      return (
+        <svg {...C} aria-hidden>
+          <path d="M3 7a2 2 0 0 1 2-2h13a1 1 0 0 1 1 1v2" />
+          <path d="M3 7v10a2 2 0 0 0 2 2h14a1 1 0 0 0 1-1v-3" />
+          <path d="M21 11h-5a2 2 0 0 0 0 4h5a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1z" />
+        </svg>
+      );
+    case "routing":
+      return (
+        <svg {...C} aria-hidden>
+          <path d="m16 3 4 4-4 4" />
+          <path d="M20 7H4" />
+          <path d="m8 21-4-4 4-4" />
+          <path d="M4 17h16" />
         </svg>
       );
     case "pay":

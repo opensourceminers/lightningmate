@@ -736,3 +736,17 @@ table { width: 100%; border-collapse: collapse; }
 .pay-decoded .kv { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
 .mono-sm { font-family: ui-monospace, monospace; font-size: 12px; }
 @media (max-width: 760px) { .pay-grid { grid-template-columns: 1fr; } }
+
+/* Sub-navigation (Wallet / Routing inner tabs) */
+.subnav { display: flex; gap: 5px; margin-bottom: 18px; flex-wrap: wrap; }
+.subtab {
+  background: var(--panel-2); color: var(--muted); border: 1px solid var(--line);
+  border-radius: 999px; padding: 7px 16px; font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: color var(--t), background var(--t), border-color var(--t);
+}
+.subtab:hover { color: var(--text); border-color: var(--line-soft); }
+.subtab.active { background: var(--accent); color: #1a1205; border-color: var(--accent); }
+
+/* On-chain balance strip */
+.oc-bal { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.oc-bal-meta { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; font-size: 13px; }
