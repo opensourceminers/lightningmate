@@ -37,22 +37,25 @@ import type {
   SuggestionsResponse,
 } from "./types";
 
-// ── Write-mode unlock token ───────────────────────────────────────────────────
+// ── Session token ─────────────────────────────────────────────────────────────
 let token = localStorage.getItem("lm_token") ?? "";
-let unlockHandler: (() => Promise<boolean>) | null = null;
+let onUnauthorized: (() => void) | null = null;
 
 function setToken(t: string): void {
   token = t;
   if (t) localStorage.setItem("lm_token", t);
   else localStorage.removeItem("lm_token");
 }
-/** App registers this so a locked write can prompt for the password + retry. */
-export function setUnlockHandler(fn: () => Promise<boolean>): void {
-  unlockHandler = fn;
+/** App registers this so an expired/invalid session bounces back to the login screen. */
+export function setUnauthorizedHandler(fn: () => void): void {
+  onUnauthorized = fn;
 }
+const authHeaders = (): Record<string, string> =>
+  token ? { Authorization: `Bearer ${token}` } : {};
 
 async function handle<T>(res: Response): Promise<T> {
   if (!res.ok) {
+    if (res.status === 401) onUnauthorized?.();
     let detail = res.statusText;
     try {
       const body = (await res.json()) as { message?: string };
@@ -66,26 +69,17 @@ async function handle<T>(res: Response): Promise<T> {
 }
 
 async function get<T>(path: string): Promise<T> {
-  return handle<T>(await fetch(`/api${path}`));
+  return handle<T>(await fetch(`/api${path}`, { headers: authHeaders() }));
 }
 
-async function post<T>(path: string, body: unknown, retry = true): Promise<T> {
-  const res = await fetch(`/api${path}`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    body: JSON.stringify(body),
-  });
-  // Locked write → prompt for the Umbrel password, then retry once.
-  if (res.status === 401 && retry && unlockHandler) {
-    const err = (await res.clone().json().catch(() => ({}))) as { error?: string };
-    if (err.error === "locked" && (await unlockHandler())) {
-      return post<T>(path, body, false);
-    }
-  }
-  return handle<T>(res);
+async function post<T>(path: string, body: unknown): Promise<T> {
+  return handle<T>(
+    await fetch(`/api${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify(body),
+    }),
+  );
 }
 
 export const api = {
@@ -165,7 +159,7 @@ export const api = {
   onchainSend: (params: { address: string; tokens: number; feeRate: number }) =>
     post<OnchainSendResult>("/onchain/send", params),
   authStatus: () => get<{ authRequired: boolean; unlocked: boolean }>("/auth/status"),
-  unlock: async (password: string): Promise<boolean> => {
+  login: async (password: string): Promise<boolean> => {
     const res = await fetch("/api/auth/unlock", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -176,5 +170,8 @@ export const api = {
     setToken(t);
     return true;
   },
-  lock: () => setToken(""),
+  logout: () => {
+    setToken("");
+    onUnauthorized?.();
+  },
 };
