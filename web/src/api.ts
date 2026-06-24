@@ -181,21 +181,6 @@ export const api = {
     setToken("");
     onUnauthorized?.();
   },
-  authChallenge: () => get<{ challenge: string }>("/auth/challenge"),
-  nodeLogin: async (challenge: string, signature: string): Promise<{ ok: boolean; error?: string }> => {
-    const res = await fetch("/api/auth/node-login", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ challenge, signature }),
-    });
-    if (res.ok) {
-      const { token: t } = (await res.json()) as { token: string };
-      setToken(t);
-      return { ok: true };
-    }
-    const b = (await res.json().catch(() => ({}))) as { message?: string };
-    return { ok: false, error: b.message ?? "Login failed." };
-  },
   ambossStatus: () => get<{ connected: boolean }>("/amboss/status"),
   ambossMarket: () => get<MarketView>("/amboss/market"),
   ambossConnect: (apiKey: string) =>

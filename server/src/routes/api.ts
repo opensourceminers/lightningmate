@@ -1,6 +1,5 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
-import { randomBytes } from "node:crypto";
-import { getWalletInfo, signMessage, verifyMessage, type AuthenticatedLnd } from "lightning";
+import { getWalletInfo, signMessage, type AuthenticatedLnd } from "lightning";
 import { getNodeScore } from "../services/score.js";
 import type { Config } from "../config.js";
 import { getNodeSummary } from "../services/node.js";
@@ -159,13 +158,7 @@ export function createApiRouter(
   // containers share the Docker network, so without this they could read node
   // data or move funds directly. No-op when auth isn't required (standalone on
   // 127.0.0.1, where there is no cross-container threat).
-  const OPEN_PATHS = new Set([
-    "/auth/status",
-    "/auth/unlock",
-    "/auth/challenge",
-    "/auth/node-login",
-    "/health",
-  ]);
+  const OPEN_PATHS = new Set(["/auth/status", "/auth/unlock", "/health"]);
   router.use((req, res, next) => {
     if (OPEN_PATHS.has(req.path)) return next();
     if (verifyToken(bearer(req))) return next();
@@ -193,55 +186,6 @@ export function createApiRouter(
     }
     res.json({ token: issueToken() });
   });
-
-  // ── Login with Node (sign a challenge) ──────────────────────────────────────
-  // The app shows a one-time challenge; the operator signs it with their node
-  // (e.g. `lncli signmessage`) and pastes the signature. We verify it was signed
-  // by THIS node's pubkey, then issue a session. Single-use, short-lived.
-  const challenges = new Map<string, number>(); // challenge -> expiry (ms)
-  let cachedPubkey = "";
-  const nodePubkey = async (): Promise<string> => {
-    if (!cachedPubkey) cachedPubkey = (await getWalletInfo({ lnd })).public_key;
-    return cachedPubkey;
-  };
-
-  router.get("/auth/challenge", (_req, res) => {
-    const now = Date.now();
-    for (const [k, exp] of challenges) if (exp < now) challenges.delete(k);
-    const challenge = `lightningmate-${randomBytes(16).toString("hex")}`;
-    challenges.set(challenge, now + 5 * 60_000);
-    res.json({ challenge });
-  });
-
-  router.post(
-    "/auth/node-login",
-    wrap(async (req, res) => {
-      const challenge = typeof req.body?.challenge === "string" ? req.body.challenge : "";
-      const signature = typeof req.body?.signature === "string" ? req.body.signature.trim() : "";
-      const exp = challenges.get(challenge);
-      if (!challenge || !exp || exp < Date.now()) {
-        res.status(400).json({ error: "bad_challenge", message: "Challenge expired — refresh and retry." });
-        return;
-      }
-      if (!signature) {
-        res.status(400).json({ error: "bad_request", message: "Paste the signature first." });
-        return;
-      }
-      let signedBy = "";
-      try {
-        signedBy = (await verifyMessage({ lnd, message: challenge, signature })).signed_by;
-      } catch {
-        res.status(401).json({ error: "bad_signature", message: "Couldn't verify that signature." });
-        return;
-      }
-      if (signedBy !== (await nodePubkey())) {
-        res.status(401).json({ error: "wrong_node", message: "That signature isn't from this node." });
-        return;
-      }
-      challenges.delete(challenge); // single use
-      res.json({ token: issueToken() });
-    }),
-  );
 
   router.get("/health", (_req, res) => {
     res.json({ ok: true, service: "lightningmate", version: "0.1.0" });

@@ -729,21 +729,15 @@ table { width: 100%; border-collapse: collapse; }
 }
 .login-msg { margin: 0 0 18px; color: var(--muted); font-size: 14px; line-height: 1.5; }
 .login-btn { width: 100%; justify-content: center; }
-.login-label { display: block; font-size: 12px; color: var(--muted); margin: 0 0 6px; }
+
+/* Signature display (Sign message tool) */
 .challenge-row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
 .challenge {
   flex: 1; overflow-x: auto; white-space: nowrap; font-size: 12px;
   padding: 8px 10px; background: var(--panel-3); border: 1px solid var(--line);
   border-radius: 8px; color: var(--text);
 }
-.login-hint { margin: 0 0 12px; font-size: 12px; color: var(--muted); }
 .sig-input { resize: vertical; font-family: inherit; }
-.link-btn {
-  display: block; width: 100%; margin-top: 12px; padding: 6px;
-  background: none; border: none; color: var(--muted); font-size: 13px;
-  cursor: pointer; text-align: center;
-}
-.link-btn:hover { color: var(--accent); text-decoration: underline; }
 
 /* Amboss connect row (Settings) */
 .amboss-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
