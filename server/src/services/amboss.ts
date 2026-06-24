@@ -247,10 +247,11 @@ export interface MyOrdersView {
 /** Create a SELL channel offer on the marketplace. */
 export async function createOffer(apiKey: string, p: CreateOfferParams): Promise<boolean> {
   const mutation = `mutation Create($input: CreateOffer!) { createOffer(input: $input) }`;
+  // Amboss wants either (onchain_priority + onchain_multiplier) OR a base_fee.
+  // We price with base_fee + fee_rate, so omit the on-chain fields entirely.
   const input = {
     offer_side: "SELL",
     offer_type: "CHANNEL",
-    onchain_priority: "MEDIUM",
     total_size: p.totalSizeSats,
     min_size: p.minSizeSats,
     max_size: p.maxSizeSats,

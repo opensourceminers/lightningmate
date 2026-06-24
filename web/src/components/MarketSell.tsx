@@ -16,6 +16,13 @@ const DEFAULTS = {
 
 type Draft = typeof DEFAULTS;
 
+const median = (arr: number[]): number => {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  const mid = Math.floor(s.length / 2);
+  return s.length % 2 ? s[mid] : Math.round((s[mid - 1] + s[mid]) / 2);
+};
+
 const FIELDS: { key: keyof Draft; label: string; hint: string }[] = [
   { key: "totalSizeSats", label: "Total (sat)", hint: "total liquidity you'll sell across orders" },
   { key: "minSizeSats", label: "Min channel (sat)", hint: "smallest channel a buyer can order" },
@@ -33,8 +40,18 @@ export function MarketSell() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [ref, setRef] = useState<{ feeMin: number; feeMed: number; baseMed: number } | null>(null);
 
   const load = async () => {
+    // Live market reference (no key needed) — orientation for your pricing.
+    try {
+      const m = await api.ambossMarket();
+      const fees = m.offers.map((o) => o.feeRatePpm).filter((n) => n > 0);
+      const bases = m.offers.map((o) => o.baseFeeSats).filter((n) => n > 0);
+      if (fees.length) setRef({ feeMin: Math.min(...fees), feeMed: median(fees), baseMed: median(bases) });
+    } catch {
+      // reference is best-effort
+    }
     try {
       const s = await api.ambossStatus();
       setConnected(s.connected);
@@ -116,6 +133,21 @@ export function MarketSell() {
         must open a channel to them within the time window, or your seller score drops. (The Autopilot
         will be able to handle this automatically — coming next.)
       </div>
+
+      {ref ? (
+        <div className="market-ref">
+          <span>
+            Market — fee rate <strong>{ref.feeMin} ppm</strong> lowest · <strong>{ref.feeMed} ppm</strong>{" "}
+            median · base fee <strong>{ref.baseMed} sat</strong> median
+          </span>
+          <button
+            className="row-btn ghost"
+            onClick={() => setDraft((d) => ({ ...d, feeRatePpm: ref.feeMed, baseFeeSats: ref.baseMed }))}
+          >
+            match median
+          </button>
+        </div>
+      ) : null}
 
       <div className="policy-controls">
         {FIELDS.map((f) => (

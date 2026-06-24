@@ -855,6 +855,13 @@ export function createApiRouter(
         res.status(400).json({ error: "bad_sizes", message: "Sizes must satisfy 0 < min ≤ max ≤ total." });
         return;
       }
+      if (baseFeeSats <= 0) {
+        res.status(400).json({
+          error: "bad_fee",
+          message: "Set a base fee above 0 — offers are priced with a base fee + fee rate.",
+        });
+        return;
+      }
       const ok = await createOffer(amboss.getKey(), {
         totalSizeSats,
         minSizeSats,
