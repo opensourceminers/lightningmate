@@ -1,6 +1,6 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { randomBytes } from "node:crypto";
-import { getWalletInfo, verifyMessage, type AuthenticatedLnd } from "lightning";
+import { getWalletInfo, signMessage, verifyMessage, type AuthenticatedLnd } from "lightning";
 import { getNodeScore } from "../services/score.js";
 import type { Config } from "../config.js";
 import { getNodeSummary } from "../services/node.js";
@@ -707,6 +707,25 @@ export function createApiRouter(
       } catch (err) {
         res.json({ ok: false, transactionId: "", error: describeError(err) });
       }
+    }),
+  );
+
+  // Sign a message with the node (admin macaroon) — e.g. to prove node ownership
+  // to Amboss when connecting your account, or any "Login with Node" challenge.
+  router.post(
+    "/sign",
+    wrap(async (req, res) => {
+      if (!writeLnd) {
+        res.status(403).json({ error: "read_only", message: "Enable write mode to sign (needs the admin macaroon)." });
+        return;
+      }
+      const message = typeof req.body?.message === "string" ? req.body.message : "";
+      if (!message.trim()) {
+        res.status(400).json({ error: "bad_request", message: "Enter a message to sign." });
+        return;
+      }
+      const { signature } = await signMessage({ lnd: writeLnd, message });
+      res.json({ signature });
     }),
   );
 

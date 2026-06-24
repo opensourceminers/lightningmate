@@ -206,4 +206,5 @@ export const api = {
   ambossBuyPay: (orderId: string, paymentRequest: string, maxSats: number) =>
     post<{ ok: boolean; sats: number }>("/amboss/buy/pay", { orderId, paymentRequest, maxSats }),
   ambossOrder: (id: string) => get<OrderState>(`/amboss/order?id=${encodeURIComponent(id)}`),
+  signMessage: (message: string) => post<{ signature: string }>("/sign", { message }),
 };
