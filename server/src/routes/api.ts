@@ -33,12 +33,15 @@ import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
 import { getAlerts } from "../services/alerts.js";
 import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
 import {
+  acceptOrder,
+  addOrderTransaction,
   buyLiquidity,
   createOffer,
   getMarket,
   getMyOffers,
   getMyOrders,
   getOrder,
+  getSellerOrder,
   toggleOffer,
   validateKey,
 } from "../services/amboss.js";
@@ -874,6 +877,87 @@ export function createApiRouter(
         return;
       }
       res.json({ status: await toggleOffer(amboss.getKey(), id) });
+    }),
+  );
+
+  // Seller fulfillment — step 1: accept the order (creates the fee invoice).
+  router.post(
+    "/amboss/order/accept",
+    wrap(async (req, res) => {
+      if (!needKey(res)) return;
+      if (!writeLnd) {
+        res.status(403).json({ error: "read_only", message: "Enable write mode to fulfill orders." });
+        return;
+      }
+      const id = typeof req.body?.id === "string" ? req.body.id : "";
+      if (!id) {
+        res.status(400).json({ error: "bad_request", message: "Missing order id." });
+        return;
+      }
+      const order = await getSellerOrder(amboss.getKey(), id);
+      if (!order) {
+        res.status(404).json({ error: "not_found", message: "Order not found." });
+        return;
+      }
+      if (order.status !== "WAITING_FOR_SELLER_APPROVAL") {
+        res.status(400).json({ error: "bad_status", message: `Order is ${order.status}, not awaiting approval.` });
+        return;
+      }
+      if (!(order.feeSats > 0)) {
+        res.status(400).json({ error: "bad_amount", message: "Order has no fee amount yet." });
+        return;
+      }
+      // The invoice must outlive Amboss' 48h fulfillment window.
+      const inv = await createInvoice(writeLnd, {
+        tokens: order.feeSats,
+        description: `Magma order ${id}`,
+        expirySec: 49 * 3600,
+      });
+      const ok = await acceptOrder(amboss.getKey(), id, inv.request);
+      res.json({ ok });
+    }),
+  );
+
+  // Seller fulfillment — step 2: open the channel to the buyer + report the tx.
+  router.post(
+    "/amboss/order/open",
+    wrap(async (req, res) => {
+      if (!needKey(res)) return;
+      if (!writeLnd) {
+        res.status(403).json({ error: "read_only", message: "Enable write mode to fulfill orders." });
+        return;
+      }
+      const id = typeof req.body?.id === "string" ? req.body.id : "";
+      if (!id) {
+        res.status(400).json({ error: "bad_request", message: "Missing order id." });
+        return;
+      }
+      const order = await getSellerOrder(amboss.getKey(), id);
+      if (!order) {
+        res.status(404).json({ error: "not_found", message: "Order not found." });
+        return;
+      }
+      if (order.status !== "WAITING_FOR_CHANNEL_OPEN") {
+        res.status(400).json({ error: "bad_status", message: `Order is ${order.status}, not ready for channel open.` });
+        return;
+      }
+      const [pubkey, socket] = order.destination.split("@");
+      if (!pubkey) {
+        res.status(400).json({ error: "bad_destination", message: "Order has no buyer endpoint." });
+        return;
+      }
+      const opened = await openChannelTo(writeLnd, {
+        pubkey,
+        socket: socket || undefined,
+        localTokens: order.sizeSats,
+      });
+      if (!opened.ok || !opened.transactionId) {
+        res.status(502).json({ error: "open_failed", message: opened.error ?? "Channel open failed." });
+        return;
+      }
+      const outpoint = `${opened.transactionId}:${opened.transactionVout}`;
+      const added = await addOrderTransaction(amboss.getKey(), id, outpoint);
+      res.json({ ok: added, transactionId: opened.transactionId, outpoint });
     }),
   );
 

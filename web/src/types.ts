@@ -580,6 +580,8 @@ export interface MyOrder {
   status: string;
   side: string;
   sizeSats: number;
+  feeSats: number;
+  destination: string;
   paymentStatus: string | null;
   channelId: string | null;
   createdAt: string;

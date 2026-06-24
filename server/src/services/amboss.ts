@@ -232,6 +232,8 @@ export interface MyOrder {
   status: string;
   side: string; // offer_side: SELL = you're the seller
   sizeSats: number;
+  feeSats: number; // seller_invoice_amount — what you earn for fulfilling
+  destination: string; // buyer endpoint to open the channel to (pubkey[@socket])
   paymentStatus: string | null;
   channelId: string | null;
   createdAt: string;
@@ -293,7 +295,10 @@ export async function getMyOffers(apiKey: string): Promise<MyOffer[]> {
 export async function getMyOrders(apiKey: string): Promise<MyOrdersView> {
   const query = `query { getUser { market {
     pending_seller_orders
-    offer_orders { list { id status size offer_side payment_status channel_id created_at } }
+    offer_orders { list {
+      id status size offer_side seller_invoice_amount payment_status channel_id created_at
+      endpoints { destination }
+    } }
   } } }`;
   const data = await gql<{
     getUser: {
@@ -305,9 +310,11 @@ export async function getMyOrders(apiKey: string): Promise<MyOrdersView> {
             status: string;
             size: string;
             offer_side: string;
+            seller_invoice_amount: string | null;
             payment_status: string | null;
             channel_id: string | null;
             created_at: string;
+            endpoints: { destination: string } | null;
           }[];
         };
       };
@@ -321,11 +328,45 @@ export async function getMyOrders(apiKey: string): Promise<MyOrdersView> {
       status: o.status,
       side: o.offer_side,
       sizeSats: Number(o.size),
+      feeSats: Number(o.seller_invoice_amount ?? 0),
+      destination: o.endpoints?.destination ?? "",
       paymentStatus: o.payment_status ?? null,
       channelId: o.channel_id ?? null,
       createdAt: o.created_at,
     })),
   };
+}
+
+// ── Seller fulfillment ────────────────────────────────────────────────────────
+
+/** Accept an order by providing a BOLT11 invoice (expiry > 48h) for the fee. */
+export async function acceptOrder(apiKey: string, id: string, request: string): Promise<boolean> {
+  const mutation = `mutation Accept($id: String!, $request: String!) { sellerAcceptOrder(id: $id, request: $request) }`;
+  const data = await gql<{ sellerAcceptOrder: boolean }>(AMBOSS_URL, mutation, apiKey, { id, request });
+  return data.sellerAcceptOrder;
+}
+
+/** Tell Amboss the channel funding outpoint ("txid:vout") after opening it. */
+export async function addOrderTransaction(apiKey: string, id: string, outpoint: string): Promise<boolean> {
+  const mutation = `mutation AddTx($id: String!, $transaction: String!) { sellerAddTransaction(id: $id, transaction: $transaction) }`;
+  const data = await gql<{ sellerAddTransaction: boolean }>(AMBOSS_URL, mutation, apiKey, { id, transaction: outpoint });
+  return data.sellerAddTransaction;
+}
+
+export interface SellerOrderDetail {
+  id: string;
+  status: string;
+  sizeSats: number;
+  feeSats: number;
+  destination: string;
+}
+
+/** Fetch one of your seller orders by id (fields needed to fulfill it). */
+export async function getSellerOrder(apiKey: string, id: string): Promise<SellerOrderDetail | null> {
+  const view = await getMyOrders(apiKey);
+  const o = view.orders.find((x) => x.id === id);
+  if (!o) return null;
+  return { id: o.id, status: o.status, sizeSats: o.sizeSats, feeSats: o.feeSats, destination: o.destination };
 }
 
 /** True if the key authenticates against Amboss (getUser requires auth). */

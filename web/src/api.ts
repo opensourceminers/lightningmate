@@ -205,4 +205,7 @@ export const api = {
     minBlockLength: number;
   }) => post<{ ok: boolean }>("/amboss/offer", p),
   ambossToggleOffer: (id: string) => post<{ status: string }>("/amboss/offer/toggle", { id }),
+  ambossAcceptOrder: (id: string) => post<{ ok: boolean }>("/amboss/order/accept", { id }),
+  ambossOpenOrder: (id: string) =>
+    post<{ ok: boolean; transactionId: string; outpoint: string }>("/amboss/order/open", { id }),
 };
