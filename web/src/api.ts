@@ -28,7 +28,9 @@ import type {
   NodeScore,
   NodeSummary,
   OpenChannelResult,
+  BuyQuote,
   MarketView,
+  OrderState,
   PnlSummary,
   RebalanceAnalysis,
   RebalanceExecResult,
@@ -184,4 +186,9 @@ export const api = {
   ambossConnect: (apiKey: string) =>
     post<{ ok: boolean; connected: boolean; error?: string }>("/amboss/key", { apiKey }),
   ambossDisconnect: () => del<{ ok: boolean; connected: boolean }>("/amboss/key"),
+  ambossBuyQuote: (usdCents: number, isPrivate: boolean) =>
+    post<BuyQuote>("/amboss/buy/quote", { usdCents, private: isPrivate }),
+  ambossBuyPay: (orderId: string, paymentRequest: string, maxSats: number) =>
+    post<{ ok: boolean; sats: number }>("/amboss/buy/pay", { orderId, paymentRequest, maxSats }),
+  ambossOrder: (id: string) => get<OrderState>(`/amboss/order?id=${encodeURIComponent(id)}`),
 };

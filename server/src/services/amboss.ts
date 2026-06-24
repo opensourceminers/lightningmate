@@ -38,7 +38,12 @@ interface RawOffer {
   total_size: string;
 }
 
-async function gql<T>(url: string, query: string, apiKey?: string): Promise<T> {
+async function gql<T>(
+  url: string,
+  query: string,
+  apiKey?: string,
+  variables?: Record<string, unknown>,
+): Promise<T> {
   let res: Response;
   try {
     res = await fetch(url, {
@@ -47,7 +52,7 @@ async function gql<T>(url: string, query: string, apiKey?: string): Promise<T> {
         "Content-Type": "application/json",
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
       },
-      body: JSON.stringify({ query }),
+      body: JSON.stringify(variables ? { query, variables } : { query }),
     });
   } catch (e) {
     throw new Error(`Amboss unreachable: ${e instanceof Error ? e.message : String(e)}`);
@@ -100,6 +105,104 @@ export async function satsPerUsd(): Promise<number | null> {
 export async function getMarket(): Promise<MarketView> {
   const [offers, perUsd] = await Promise.all([getOffers(), satsPerUsd()]);
   return { offers, satsPerUsd: perUsd };
+}
+
+export interface BuyQuote {
+  orderId: string;
+  paymentRequest: string;
+  sats: number;
+  channelSizeSats: number;
+}
+
+const TERMINAL_FAIL = new Set([
+  "BUYER_FAILED_TO_PAY",
+  "BUYER_REJECTED",
+  "SELLER_REJECTED",
+  "SELLER_FAILED_TO_OPEN_CHANNEL",
+  "SELLER_FAILED_TO_REACT",
+  "SELLER_FAILED_TO_SEND_SWAP",
+  "INVALID_CHANNEL_OPENING",
+  "ADMIN_CLOSED",
+]);
+
+export interface OrderState {
+  status: string;
+  paymentStatus: string | null;
+  channelId: string | null;
+  channelSizeSats: number;
+  done: boolean;
+  failed: boolean;
+}
+
+/**
+ * Create a Magma buy order. Returns the HODL invoice to pay — does NOT pay it.
+ * Amboss matches a seller for the requested USD amount; the seller opens an
+ * inbound channel to connectionUri once the invoice is paid.
+ */
+export async function buyLiquidity(
+  apiKey: string,
+  connectionUri: string,
+  usdCents: number,
+  isPrivate: boolean,
+): Promise<BuyQuote> {
+  const query = `mutation Buy($input: LiquidityOrderInput!) {
+    liquidity { buy(input: $input) {
+      order { transaction_id amount }
+      payment { lightning_invoice amount { sats } }
+    } }
+  }`;
+  const input = {
+    connection_uri: connectionUri,
+    usd_cents: String(usdCents),
+    options: { private: isPrivate },
+  };
+  const data = await gql<{
+    liquidity: {
+      buy: {
+        order: { transaction_id: string; amount: string };
+        payment: { lightning_invoice: string; amount: { sats: string } };
+      };
+    };
+  }>(MAGMA_URL, query, apiKey, { input });
+  const buy = data.liquidity.buy;
+  return {
+    orderId: buy.order.transaction_id,
+    paymentRequest: buy.payment.lightning_invoice,
+    sats: Number(buy.payment.amount.sats),
+    channelSizeSats: Number(buy.order.amount),
+  };
+}
+
+/** Poll a Magma order's status. */
+export async function getOrder(apiKey: string, orderId: string): Promise<OrderState> {
+  const query = `query GetOrder($id: String!) {
+    user { market { orders { get_order(order_id: $id) {
+      status payment_status channel_id amount
+    } } } }
+  }`;
+  const data = await gql<{
+    user: {
+      market: {
+        orders: {
+          get_order: {
+            status: string;
+            payment_status: string | null;
+            channel_id: string | null;
+            amount: string | null;
+          };
+        };
+      };
+    };
+  }>(MAGMA_URL, query, apiKey, { id: orderId });
+  const o = data.user.market.orders.get_order;
+  return {
+    status: o.status,
+    paymentStatus: o.payment_status ?? null,
+    channelId: o.channel_id ?? null,
+    channelSizeSats: Number(o.amount ?? 0),
+    done: o.status === "VALID_CHANNEL_OPENING",
+    failed: TERMINAL_FAIL.has(o.status),
+  };
 }
 
 /** True if the key authenticates against Amboss (getUser requires auth). */
