@@ -149,13 +149,17 @@ export class Autopilot {
       canWrite: this.canWrite,
       config: this.state.config,
       lastRunAt: this.state.lastRunAt,
+      // Only surface runs that did something; hide any older "0 applied" no-ops.
       // Normalise older persisted runs that predate newer arrays.
-      history: this.state.history.slice(0, 20).map((r) => ({
-        ...r,
-        changes: r.changes ?? [],
-        rebalances: r.rebalances ?? [],
-        channels: r.channels ?? [],
-      })),
+      history: this.state.history
+        .filter((r) => (r.attempted ?? 0) > 0)
+        .slice(0, 20)
+        .map((r) => ({
+          ...r,
+          changes: r.changes ?? [],
+          rebalances: r.rebalances ?? [],
+          channels: r.channels ?? [],
+        })),
     };
   }
 
@@ -377,8 +381,12 @@ export class Autopilot {
       };
 
       this.state.lastRunAt = run.at;
-      this.state.history.unshift(run);
-      this.state.history = this.state.history.slice(0, HISTORY_LIMIT);
+      // Only record runs that actually did something (applied or failed) — skip the
+      // hourly no-op runs so the history shows changes, not "0 applied" every hour.
+      if (run.attempted > 0) {
+        this.state.history.unshift(run);
+        this.state.history = this.state.history.slice(0, HISTORY_LIMIT);
+      }
       this.persist();
       return run;
     } catch (err) {
