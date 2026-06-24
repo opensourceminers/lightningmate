@@ -530,3 +530,19 @@ export interface PnlSummary {
   totalCostSats: number;
   netProfitSats: number;
 }
+
+export interface MagmaOffer {
+  id: string;
+  sellerPubkey: string;
+  minSizeSats: number;
+  maxSizeSats: number;
+  baseFeeSats: number;
+  feeRatePpm: number;
+  sellerScore: number;
+  availableSats: number;
+}
+
+export interface MarketView {
+  offers: MagmaOffer[];
+  satsPerUsd: number | null;
+}

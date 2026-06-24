@@ -32,6 +32,8 @@ import type { SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
 import { getAlerts } from "../services/alerts.js";
 import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
+import { getMarket, validateKey } from "../services/amboss.js";
+import type { AmbossStore } from "../services/ambossStore.js";
 import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 
@@ -131,6 +133,7 @@ export function createApiRouter(
   rebalanceLog: RebalanceLog,
   settings: SettingsStore,
   overrides: OverridesStore,
+  amboss: AmbossStore,
 ): Router {
   const router = Router();
 
@@ -650,6 +653,40 @@ export function createApiRouter(
       }
     }),
   );
+
+  // ── Amboss Magma (liquidity marketplace) ────────────────────────────────────
+  // Reads (the marketplace + price) need no key. The key is stored per-install
+  // and used later for buying/selling. All behind the app login gate already.
+  router.get("/amboss/status", (_req, res) => {
+    res.json({ connected: amboss.hasKey() });
+  });
+
+  router.get(
+    "/amboss/market",
+    wrap(async (_req, res) => {
+      res.json(await getMarket());
+    }),
+  );
+
+  router.post("/amboss/key", async (req, res) => {
+    const apiKey = typeof req.body?.apiKey === "string" ? req.body.apiKey.trim() : "";
+    if (!apiKey) {
+      res.status(400).json({ error: "missing_key", message: "Missing API key." });
+      return;
+    }
+    const valid = await validateKey(apiKey);
+    if (!valid) {
+      res.status(400).json({ error: "invalid_key", message: "Amboss rejected this API key." });
+      return;
+    }
+    amboss.setKey(apiKey);
+    res.json({ ok: true, connected: true });
+  });
+
+  router.delete("/amboss/key", (_req, res) => {
+    amboss.clear();
+    res.json({ ok: true, connected: false });
+  });
 
   // Error middleware — surface LND/connection failures as JSON, not a crash.
   router.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
