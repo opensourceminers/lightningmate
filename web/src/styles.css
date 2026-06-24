@@ -704,6 +704,24 @@ table { width: 100%; border-collapse: collapse; }
 .modal-title { margin: 0 0 8px; font-size: 17px; }
 .modal-msg { margin: 0 0 20px; color: var(--muted); font-size: 14px; line-height: 1.5; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
+.unlock-input {
+  width: 100%; box-sizing: border-box; margin: 0 0 12px;
+  padding: 10px 12px; font-size: 14px;
+  background: var(--panel-3); color: var(--text);
+  border: 1px solid var(--line); border-radius: 10px;
+}
+.unlock-input:focus { outline: none; border-color: var(--accent); }
+.unlock-err { margin: -4px 0 14px; color: var(--red); font-size: 13px; }
+
+/* Topbar write-mode lock indicator */
+.writelock {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 12px; padding: 5px 10px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--panel-3);
+  color: var(--muted); cursor: pointer; transition: border-color 0.15s, color 0.15s;
+}
+.writelock:hover { border-color: var(--accent); color: var(--text); }
+.writelock.unlocked { color: var(--green); border-color: rgba(52, 211, 153, 0.4); }
 .btn-danger {
   background: linear-gradient(180deg, #e25b54, var(--red)) !important;
   color: #2a0c0a !important;
