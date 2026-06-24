@@ -713,15 +713,22 @@ table { width: 100%; border-collapse: collapse; }
 .unlock-input:focus { outline: none; border-color: var(--accent); }
 .unlock-err { margin: -4px 0 14px; color: var(--red); font-size: 13px; }
 
-/* Topbar write-mode lock indicator */
-.writelock {
-  display: inline-flex; align-items: center; gap: 6px;
-  font-size: 12px; padding: 5px 10px; border-radius: 999px;
-  border: 1px solid var(--line); background: var(--panel-3);
-  color: var(--muted); cursor: pointer; transition: border-color 0.15s, color 0.15s;
+/* Sign-in screen (shown before the app on Umbrel) */
+.login-screen {
+  min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px;
 }
-.writelock:hover { border-color: var(--accent); color: var(--text); }
-.writelock.unlocked { color: var(--green); border-color: rgba(52, 211, 153, 0.4); }
+.login-card {
+  width: 100%; max-width: 380px;
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: var(--radius); padding: 28px 26px 24px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.5);
+}
+.login-brand {
+  display: flex; align-items: center; gap: 10px;
+  font-size: 18px; font-weight: 600; margin-bottom: 16px;
+}
+.login-msg { margin: 0 0 18px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+.login-btn { width: 100%; justify-content: center; }
 .btn-danger {
   background: linear-gradient(180deg, #e25b54, var(--red)) !important;
   color: #2a0c0a !important;

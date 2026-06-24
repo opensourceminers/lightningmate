@@ -5,6 +5,7 @@ import { AutopilotPanel } from "./components/AutopilotPanel";
 import { BrandMark } from "./components/BrandMark";
 import { ChannelTable } from "./components/ChannelTable";
 import { Footer } from "./components/Footer";
+import { LogoutButton } from "./components/LogoutButton";
 import { Overview } from "./components/Overview";
 import { RoutingPanel } from "./components/RoutingPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
@@ -12,7 +13,6 @@ import { SkeletonPanel } from "./components/Skeleton";
 import { SuggestionsPanel } from "./components/SuggestionsPanel";
 import { TabIcon } from "./components/TabIcon";
 import { WalletPanel } from "./components/WalletPanel";
-import { WriteLock } from "./components/WriteLock";
 import { usePolledData } from "./usePolledData";
 
 type Tab = "overview" | "channels" | "wallet" | "routing" | "autopilot" | "settings";
@@ -44,7 +44,7 @@ export function App() {
           <span className="brand-sub">Lightning node manager</span>
         </span>
         <div className="topbar-right">
-          <WriteLock />
+          <LogoutButton />
           <span
             className={`conn ${node.error ? "down" : node.data ? "up" : "wait"}`}
             title={node.error ? "Disconnected — retrying" : node.data ? "Connected" : "Connecting"}

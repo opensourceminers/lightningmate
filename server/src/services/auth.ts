@@ -1,12 +1,12 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 /**
- * Write-mode auth. Umbrel's app_proxy only authenticates the browser session; it
- * does not pass a credential the app can verify, and other app containers share
- * the Docker network — so they could call our write endpoints directly. To stop
- * that, fund-moving endpoints require a token the caller can only get by proving
- * the per-install secret: the user's Umbrel password, exposed to the container as
- * $APP_PASSWORD (same pattern as Torq). Reads stay open; writes need an unlock.
+ * App auth. Umbrel's app_proxy only authenticates the browser session; it does
+ * not pass a credential the app can verify, and other app containers share the
+ * Docker network — so they could call our API directly to read node data or move
+ * funds. The whole API therefore requires a session token, obtained by proving
+ * the per-install app password Umbrel derives and shows the user (deterministic-
+ * Password), exposed to the container as $APP_PASSWORD. $APP_SEED signs tokens.
  *
  * Standalone (no $APP_PASSWORD) binds to 127.0.0.1, so there is no cross-container
  * threat and auth is disabled.

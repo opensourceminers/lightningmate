@@ -149,37 +149,25 @@ export function createApiRouter(
     next();
   });
 
-  // ── Write-mode auth ─────────────────────────────────────────────────────────
-  // Fund-moving / node-writing endpoints require an unlock token (proves the
-  // user's Umbrel password). Reads and local-only writes (settings, overrides)
-  // stay open. No-op when auth isn't required (standalone on 127.0.0.1).
-  const WRITE_AUTH_PATHS = new Set([
-    "/fees/apply",
-    "/rebalance/execute",
-    "/channels/open",
-    "/channels/close",
-    "/ln/invoice",
-    "/ln/pay",
-    "/onchain/address",
-    "/onchain/send",
-    "/autopilot",
-    "/autopilot/run",
-  ]);
+  // ── Auth gate ───────────────────────────────────────────────────────────────
+  // The whole API requires a session token (proves the per-install app password
+  // Umbrel shows the user) — EXCEPT the auth + health endpoints. Other app
+  // containers share the Docker network, so without this they could read node
+  // data or move funds directly. No-op when auth isn't required (standalone on
+  // 127.0.0.1, where there is no cross-container threat).
+  const OPEN_PATHS = new Set(["/auth/status", "/auth/unlock", "/health"]);
   router.use((req, res, next) => {
-    if (req.method === "GET" || !WRITE_AUTH_PATHS.has(req.path)) return next();
+    if (OPEN_PATHS.has(req.path)) return next();
     if (verifyToken(bearer(req))) return next();
-    res.status(401).json({
-      error: "locked",
-      message: "Write mode is locked. Unlock with your Umbrel password.",
-    });
+    res.status(401).json({ error: "unauthorized", message: "Sign in to continue." });
   });
 
-  // Whether writes need unlocking, and whether this request is already unlocked.
+  // Whether a login is required, and whether this request is already signed in.
   router.get("/auth/status", (req, res) => {
     res.json({ authRequired: authRequired(), unlocked: verifyToken(bearer(req)) });
   });
 
-  // Exchange the Umbrel password for a session token. Brute-force guarded.
+  // Exchange the app password for a session token. Brute-force guarded.
   const unlockHits: number[] = [];
   router.post("/auth/unlock", (req, res) => {
     const now = Date.now();
