@@ -205,6 +205,129 @@ export async function getOrder(apiKey: string, orderId: string): Promise<OrderSt
   };
 }
 
+// ── Selling (offers) ──────────────────────────────────────────────────────────
+
+export interface MyOffer {
+  id: string;
+  status: string;
+  minSizeSats: number;
+  maxSizeSats: number;
+  totalSizeSats: number;
+  baseFeeSats: number;
+  feeRatePpm: number;
+  minBlockLength: number;
+}
+
+export interface CreateOfferParams {
+  totalSizeSats: number;
+  minSizeSats: number;
+  maxSizeSats: number;
+  feeRatePpm: number;
+  baseFeeSats: number;
+  minBlockLength: number;
+}
+
+export interface MyOrder {
+  id: string;
+  status: string;
+  side: string; // offer_side: SELL = you're the seller
+  sizeSats: number;
+  paymentStatus: string | null;
+  channelId: string | null;
+  createdAt: string;
+}
+
+export interface MyOrdersView {
+  orders: MyOrder[];
+  pendingSeller: number;
+}
+
+/** Create a SELL channel offer on the marketplace. */
+export async function createOffer(apiKey: string, p: CreateOfferParams): Promise<boolean> {
+  const mutation = `mutation Create($input: CreateOffer!) { createOffer(input: $input) }`;
+  const input = {
+    offer_side: "SELL",
+    offer_type: "CHANNEL",
+    onchain_priority: "MEDIUM",
+    total_size: p.totalSizeSats,
+    min_size: p.minSizeSats,
+    max_size: p.maxSizeSats,
+    fee_rate: p.feeRatePpm,
+    base_fee: p.baseFeeSats,
+    min_block_length: p.minBlockLength,
+  };
+  const data = await gql<{ createOffer: boolean }>(AMBOSS_URL, mutation, apiKey, { input });
+  return data.createOffer;
+}
+
+/** Enable/disable one of your offers; returns the new status. */
+export async function toggleOffer(apiKey: string, id: string): Promise<string> {
+  const mutation = `mutation Toggle($id: String!) { toggleOffer(id: $id) }`;
+  const data = await gql<{ toggleOffer: string }>(AMBOSS_URL, mutation, apiKey, { id });
+  return data.toggleOffer;
+}
+
+/** Your own SELL offers. */
+export async function getMyOffers(apiKey: string): Promise<MyOffer[]> {
+  const query = `query { getUser { market { offers { list {
+    id side status min_size max_size total_size base_fee fee_rate min_block_length
+  } } } } }`;
+  const data = await gql<{
+    getUser: { market: { offers: { list: (RawOffer & { min_block_length: string })[] } } };
+  }>(AMBOSS_URL, query, apiKey);
+  return (data.getUser?.market?.offers?.list ?? [])
+    .filter((o) => o.side === "SELL")
+    .map((o) => ({
+      id: o.id,
+      status: o.status,
+      minSizeSats: Number(o.min_size),
+      maxSizeSats: Number(o.max_size),
+      totalSizeSats: Number(o.total_size),
+      baseFeeSats: Number(o.base_fee),
+      feeRatePpm: Number(o.fee_rate),
+      minBlockLength: Number(o.min_block_length),
+    }));
+}
+
+/** Orders placed against your offers (you as the seller), + pending count. */
+export async function getMyOrders(apiKey: string): Promise<MyOrdersView> {
+  const query = `query { getUser { market {
+    pending_seller_orders
+    offer_orders { list { id status size offer_side payment_status channel_id created_at } }
+  } } }`;
+  const data = await gql<{
+    getUser: {
+      market: {
+        pending_seller_orders: number;
+        offer_orders: {
+          list: {
+            id: string;
+            status: string;
+            size: string;
+            offer_side: string;
+            payment_status: string | null;
+            channel_id: string | null;
+            created_at: string;
+          }[];
+        };
+      };
+    };
+  }>(AMBOSS_URL, query, apiKey);
+  const m = data.getUser?.market;
+  return {
+    pendingSeller: Number(m?.pending_seller_orders ?? 0),
+    orders: (m?.offer_orders?.list ?? []).map((o) => ({
+      id: o.id,
+      status: o.status,
+      side: o.offer_side,
+      sizeSats: Number(o.size),
+      paymentStatus: o.payment_status ?? null,
+      channelId: o.channel_id ?? null,
+      createdAt: o.created_at,
+    })),
+  };
+}
+
 /** True if the key authenticates against Amboss (getUser requires auth). */
 export async function validateKey(apiKey: string): Promise<boolean> {
   if (!apiKey.trim()) return false;

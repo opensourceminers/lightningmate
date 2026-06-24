@@ -32,7 +32,16 @@ import type { SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
 import { getAlerts } from "../services/alerts.js";
 import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
-import { buyLiquidity, getMarket, getOrder, validateKey } from "../services/amboss.js";
+import {
+  buyLiquidity,
+  createOffer,
+  getMarket,
+  getMyOffers,
+  getMyOrders,
+  getOrder,
+  toggleOffer,
+  validateKey,
+} from "../services/amboss.js";
 import type { AmbossStore } from "../services/ambossStore.js";
 import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
@@ -797,6 +806,74 @@ export function createApiRouter(
       }
       const order = await getOrder(amboss.getKey(), id);
       res.json({ ...order, payment: magmaPays.get(id) ?? null });
+    }),
+  );
+
+  // ── Magma selling (offers) ──────────────────────────────────────────────────
+  const needKey = (res: Response): boolean => {
+    if (amboss.hasKey()) return true;
+    res.status(400).json({ error: "no_key", message: "Connect Amboss in Settings first." });
+    return false;
+  };
+
+  router.get(
+    "/amboss/my-offers",
+    wrap(async (_req, res) => {
+      if (!needKey(res)) return;
+      res.json({ offers: await getMyOffers(amboss.getKey()) });
+    }),
+  );
+
+  router.get(
+    "/amboss/my-orders",
+    wrap(async (_req, res) => {
+      if (!needKey(res)) return;
+      res.json(await getMyOrders(amboss.getKey()));
+    }),
+  );
+
+  router.post(
+    "/amboss/offer",
+    wrap(async (req, res) => {
+      if (!needKey(res)) return;
+      const b = req.body ?? {};
+      const totalSizeSats = Math.floor(Number(b.totalSizeSats));
+      const minSizeSats = Math.floor(Number(b.minSizeSats));
+      const maxSizeSats = Math.floor(Number(b.maxSizeSats));
+      const feeRatePpm = Math.floor(Number(b.feeRatePpm));
+      const baseFeeSats = Math.floor(Number(b.baseFeeSats));
+      const minBlockLength = Math.floor(Number(b.minBlockLength));
+      const nums = [totalSizeSats, minSizeSats, maxSizeSats, feeRatePpm, baseFeeSats, minBlockLength];
+      if (!nums.every((n) => Number.isFinite(n) && n >= 0)) {
+        res.status(400).json({ error: "bad_request", message: "Fill in all fields with valid numbers." });
+        return;
+      }
+      if (minSizeSats <= 0 || maxSizeSats < minSizeSats || totalSizeSats < maxSizeSats) {
+        res.status(400).json({ error: "bad_sizes", message: "Sizes must satisfy 0 < min ≤ max ≤ total." });
+        return;
+      }
+      const ok = await createOffer(amboss.getKey(), {
+        totalSizeSats,
+        minSizeSats,
+        maxSizeSats,
+        feeRatePpm,
+        baseFeeSats,
+        minBlockLength,
+      });
+      res.json({ ok });
+    }),
+  );
+
+  router.post(
+    "/amboss/offer/toggle",
+    wrap(async (req, res) => {
+      if (!needKey(res)) return;
+      const id = typeof req.body?.id === "string" ? req.body.id : "";
+      if (!id) {
+        res.status(400).json({ error: "bad_request", message: "Missing offer id." });
+        return;
+      }
+      res.json({ status: await toggleOffer(amboss.getKey(), id) });
     }),
   );
 
