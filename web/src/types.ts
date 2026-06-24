@@ -563,3 +563,29 @@ export interface OrderState {
   failed: boolean;
   payment: { state: "paying" | "paid" | "failed"; error?: string; feeSats?: number } | null;
 }
+
+export interface MyOffer {
+  id: string;
+  status: string;
+  minSizeSats: number;
+  maxSizeSats: number;
+  totalSizeSats: number;
+  baseFeeSats: number;
+  feeRatePpm: number;
+  minBlockLength: number;
+}
+
+export interface MyOrder {
+  id: string;
+  status: string;
+  side: string;
+  sizeSats: number;
+  paymentStatus: string | null;
+  channelId: string | null;
+  createdAt: string;
+}
+
+export interface MyOrdersView {
+  orders: MyOrder[];
+  pendingSeller: number;
+}

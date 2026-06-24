@@ -30,6 +30,8 @@ import type {
   OpenChannelResult,
   BuyQuote,
   MarketView,
+  MyOffer,
+  MyOrdersView,
   OrderState,
   PnlSummary,
   RebalanceAnalysis,
@@ -192,4 +194,15 @@ export const api = {
     post<{ ok: boolean; sats: number }>("/amboss/buy/pay", { orderId, paymentRequest, maxSats }),
   ambossOrder: (id: string) => get<OrderState>(`/amboss/order?id=${encodeURIComponent(id)}`),
   signMessage: (message: string) => post<{ signature: string }>("/sign", { message }),
+  ambossMyOffers: () => get<{ offers: MyOffer[] }>("/amboss/my-offers"),
+  ambossMyOrders: () => get<MyOrdersView>("/amboss/my-orders"),
+  ambossCreateOffer: (p: {
+    totalSizeSats: number;
+    minSizeSats: number;
+    maxSizeSats: number;
+    feeRatePpm: number;
+    baseFeeSats: number;
+    minBlockLength: number;
+  }) => post<{ ok: boolean }>("/amboss/offer", p),
+  ambossToggleOffer: (id: string) => post<{ status: string }>("/amboss/offer/toggle", { id }),
 };
