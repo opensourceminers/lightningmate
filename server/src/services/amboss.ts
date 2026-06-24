@@ -263,6 +263,22 @@ export async function createOffer(apiKey: string, p: CreateOfferParams): Promise
   return data.createOffer;
 }
 
+/** Update an existing offer's pricing / sizes (free tier allows one offer). */
+export async function updateOffer(apiKey: string, id: string, p: CreateOfferParams): Promise<boolean> {
+  const mutation = `mutation Update($input: UpdateOffer!) { updateOffer(input: $input) }`;
+  const input = {
+    offer: id,
+    total_size: p.totalSizeSats,
+    min_size: p.minSizeSats,
+    max_size: p.maxSizeSats,
+    fee_rate: p.feeRatePpm,
+    base_fee: p.baseFeeSats,
+    min_block_length: p.minBlockLength,
+  };
+  const data = await gql<{ updateOffer: boolean }>(AMBOSS_URL, mutation, apiKey, { input });
+  return data.updateOffer;
+}
+
 /** Enable/disable one of your offers; returns the new status. */
 export async function toggleOffer(apiKey: string, id: string): Promise<string> {
   const mutation = `mutation Toggle($id: String!) { toggleOffer(id: $id) }`;

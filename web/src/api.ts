@@ -204,6 +204,17 @@ export const api = {
     baseFeeSats: number;
     minBlockLength: number;
   }) => post<{ ok: boolean }>("/amboss/offer", p),
+  ambossUpdateOffer: (
+    id: string,
+    p: {
+      totalSizeSats: number;
+      minSizeSats: number;
+      maxSizeSats: number;
+      feeRatePpm: number;
+      baseFeeSats: number;
+      minBlockLength: number;
+    },
+  ) => post<{ ok: boolean }>("/amboss/offer/update", { id, ...p }),
   ambossToggleOffer: (id: string) => post<{ status: string }>("/amboss/offer/toggle", { id }),
   ambossAcceptOrder: (id: string) => post<{ ok: boolean }>("/amboss/order/accept", { id }),
   ambossOpenOrder: (id: string) =>
