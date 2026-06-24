@@ -43,6 +43,7 @@ import {
   getOrder,
   getSellerOrder,
   toggleOffer,
+  updateOffer,
   validateKey,
 } from "../services/amboss.js";
 import type { AmbossStore } from "../services/ambossStore.js";
@@ -863,6 +864,47 @@ export function createApiRouter(
         return;
       }
       const ok = await createOffer(amboss.getKey(), {
+        totalSizeSats,
+        minSizeSats,
+        maxSizeSats,
+        feeRatePpm,
+        baseFeeSats,
+        minBlockLength,
+      });
+      res.json({ ok });
+    }),
+  );
+
+  router.post(
+    "/amboss/offer/update",
+    wrap(async (req, res) => {
+      if (!needKey(res)) return;
+      const b = req.body ?? {};
+      const id = typeof b.id === "string" ? b.id : "";
+      if (!id) {
+        res.status(400).json({ error: "bad_request", message: "Missing offer id." });
+        return;
+      }
+      const totalSizeSats = Math.floor(Number(b.totalSizeSats));
+      const minSizeSats = Math.floor(Number(b.minSizeSats));
+      const maxSizeSats = Math.floor(Number(b.maxSizeSats));
+      const feeRatePpm = Math.floor(Number(b.feeRatePpm));
+      const baseFeeSats = Math.floor(Number(b.baseFeeSats));
+      const minBlockLength = Math.floor(Number(b.minBlockLength));
+      const nums = [totalSizeSats, minSizeSats, maxSizeSats, feeRatePpm, baseFeeSats, minBlockLength];
+      if (!nums.every((n) => Number.isFinite(n) && n >= 0)) {
+        res.status(400).json({ error: "bad_request", message: "Fill in all fields with valid numbers." });
+        return;
+      }
+      if (minSizeSats <= 0 || maxSizeSats < minSizeSats || totalSizeSats < maxSizeSats) {
+        res.status(400).json({ error: "bad_sizes", message: "Sizes must satisfy 0 < min ≤ max ≤ total." });
+        return;
+      }
+      if (baseFeeSats <= 0) {
+        res.status(400).json({ error: "bad_fee", message: "Set a base fee above 0." });
+        return;
+      }
+      const ok = await updateOffer(amboss.getKey(), id, {
         totalSizeSats,
         minSizeSats,
         maxSizeSats,

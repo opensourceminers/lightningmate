@@ -40,6 +40,7 @@ export function MarketSell() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [ref, setRef] = useState<{ feeMin: number; feeMed: number; baseMed: number } | null>(null);
 
   const load = async () => {
@@ -69,25 +70,54 @@ export function MarketSell() {
   const setNum = (k: keyof Draft, v: number) =>
     setDraft((d) => ({ ...d, [k]: Math.max(0, Math.floor(v) || 0) }));
 
-  const create = async () => {
+  const startEdit = (o: MyOffer) => {
+    setEditingId(o.id);
+    setError(null);
+    setDraft({
+      totalSizeSats: o.totalSizeSats,
+      minSizeSats: o.minSizeSats,
+      maxSizeSats: o.maxSizeSats,
+      feeRatePpm: o.feeRatePpm,
+      baseFeeSats: o.baseFeeSats,
+      minBlockLength: o.minBlockLength,
+    });
+  };
+
+  const cancelEdit = () => {
+    setEditingId(null);
+    setDraft(DEFAULTS);
+    setError(null);
+  };
+
+  const submit = async () => {
     setError(null);
     if (!(draft.minSizeSats > 0 && draft.maxSizeSats >= draft.minSizeSats && draft.totalSizeSats >= draft.maxSizeSats)) {
       setError("Sizes must satisfy 0 < min ≤ max ≤ total.");
       return;
     }
+    if (draft.baseFeeSats <= 0) {
+      setError("Set a base fee above 0.");
+      return;
+    }
+    const editing = editingId;
     const ok = await ui.confirm({
-      title: "Create sell offer",
-      message:
-        `List ${satsCompact(draft.totalSizeSats)} of liquidity (channels ${satsCompact(draft.minSizeSats)}–` +
-        `${satsCompact(draft.maxSizeSats)} at ${draft.feeRatePpm} ppm)? When someone buys, you must open ` +
-        `a channel to them in time or your seller score drops.`,
-      confirmLabel: "Create offer",
+      title: editing ? "Update offer" : "Create sell offer",
+      message: editing
+        ? `Update your offer to channels ${satsCompact(draft.minSizeSats)}–${satsCompact(draft.maxSizeSats)} ` +
+          `at ${draft.feeRatePpm} ppm + ${draft.baseFeeSats} sat base?`
+        : `List ${satsCompact(draft.totalSizeSats)} of liquidity (channels ${satsCompact(draft.minSizeSats)}–` +
+          `${satsCompact(draft.maxSizeSats)} at ${draft.feeRatePpm} ppm)? When someone buys, you must open ` +
+          `a channel to them in time or your seller score drops.`,
+      confirmLabel: editing ? "Save changes" : "Create offer",
     });
     if (!ok) return;
     setBusy(true);
     try {
-      await api.ambossCreateOffer(draft);
-      ui.toast("Offer created.", "success");
+      if (editing) await api.ambossUpdateOffer(editing, draft);
+      else await api.ambossCreateOffer(draft);
+      ui.toast(editing ? "Offer updated." : "Offer created.", "success");
+      setEditingId(null);
+      setDraft(DEFAULTS);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -161,9 +191,14 @@ export function MarketSell() {
             />
           </label>
         ))}
-        <button className="primary-btn" disabled={busy} onClick={() => void create()}>
-          {busy ? "Creating…" : "Create offer"}
+        <button className="primary-btn" disabled={busy} onClick={() => void submit()}>
+          {busy ? (editingId ? "Saving…" : "Creating…") : editingId ? "Save changes" : "Create offer"}
         </button>
+        {editingId ? (
+          <button className="reset" disabled={busy} onClick={cancelEdit}>
+            Cancel
+          </button>
+        ) : null}
       </div>
       {error ? <p className="banner error">{error}</p> : null}
 
@@ -198,9 +233,14 @@ export function MarketSell() {
                   <td className="num">{o.baseFeeSats}</td>
                   <td className="num">{Math.round(o.minBlockLength / 144)}d</td>
                   <td>
-                    <button className="row-btn ghost" disabled={togglingId !== null} onClick={() => void toggle(o.id)}>
-                      {togglingId === o.id ? "…" : active ? "disable" : "enable"}
-                    </button>
+                    <div className="row-actions">
+                      <button className="row-btn ghost" disabled={busy} onClick={() => startEdit(o)}>
+                        edit
+                      </button>
+                      <button className="row-btn ghost" disabled={togglingId !== null} onClick={() => void toggle(o.id)}>
+                        {togglingId === o.id ? "…" : active ? "disable" : "enable"}
+                      </button>
+                    </div>
                   </td>
                 </tr>
               );
