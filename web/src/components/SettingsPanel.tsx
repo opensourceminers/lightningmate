@@ -67,6 +67,33 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
     }
   };
 
+  // Sign a message with the node (e.g. Amboss's "Login with Node" challenge)
+  const [signInput, setSignInput] = useState("");
+  const [signature, setSignature] = useState("");
+  const [signing, setSigning] = useState(false);
+  const [signError, setSignError] = useState<string | null>(null);
+  const [sigCopied, setSigCopied] = useState(false);
+
+  const doSign = async () => {
+    if (!signInput.trim() || signing) return;
+    setSigning(true);
+    setSignError(null);
+    setSignature("");
+    try {
+      setSignature((await api.signMessage(signInput.trim())).signature);
+    } catch (e) {
+      setSignError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSigning(false);
+    }
+  };
+
+  const copySig = () => {
+    void navigator.clipboard.writeText(signature);
+    setSigCopied(true);
+    setTimeout(() => setSigCopied(false), 1500);
+  };
+
   return (
     <section className="panel">
       <div className="panel-head"><h2>Settings</h2></div>
@@ -131,6 +158,32 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
         </div>
       )}
       {ambossError ? <p className="banner error">{ambossError}</p> : null}
+
+      <h3 className="sub">Sign a message</h3>
+      <div className="dryrun-banner">
+        Sign any message with your node’s key. Use this for Amboss’ <strong>“Login with Node”</strong>{" "}
+        challenge (e.g. <code>amboss-…</code>) to get your API key above — paste the message,
+        sign, and copy the signature back to Amboss. Needs write mode (admin macaroon).
+      </div>
+      <textarea
+        className="unlock-input sig-input"
+        rows={2}
+        value={signInput}
+        placeholder="Message to sign (e.g. the amboss-… challenge)"
+        onChange={(e) => setSignInput(e.target.value)}
+      />
+      <div className="amboss-row">
+        <button className="primary-btn" disabled={!signInput.trim() || signing} onClick={() => void doSign()}>
+          {signing ? "Signing…" : "Sign with node"}
+        </button>
+      </div>
+      {signature ? (
+        <div className="challenge-row" style={{ marginTop: 10 }}>
+          <code className="challenge">{signature}</code>
+          <button className="reset" onClick={copySig}>{sigCopied ? "copied" : "copy"}</button>
+        </div>
+      ) : null}
+      {signError ? <p className="banner error">{signError}</p> : null}
 
       <p className="hint">
         More settings (autopilot safety caps, refresh intervals, alerts) live in their own
