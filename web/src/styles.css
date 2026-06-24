@@ -503,7 +503,7 @@ table { width: 100%; border-collapse: collapse; }
 /* Open-channel inline form */
 .open-row td { background: rgba(247, 147, 26, 0.05); }
 .open-form { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; padding: 6px 0; font-size: 13px; }
-.policy-field.inline { flex-direction: column; }
+.policy-field.inline { flex-direction: row; align-items: center; gap: 8px; }
 .open-warn { color: var(--accent); font-size: 12px; font-weight: 600; }
 .open-ok { color: var(--green); font-weight: 600; }
 
