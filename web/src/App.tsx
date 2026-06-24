@@ -6,6 +6,7 @@ import { BrandMark } from "./components/BrandMark";
 import { ChannelsPanel } from "./components/ChannelsPanel";
 import { Footer } from "./components/Footer";
 import { LogoutButton } from "./components/LogoutButton";
+import { MarketPanel } from "./components/MarketPanel";
 import { Overview } from "./components/Overview";
 import { RoutingPanel } from "./components/RoutingPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
@@ -14,11 +15,12 @@ import { TabIcon } from "./components/TabIcon";
 import { WalletPanel } from "./components/WalletPanel";
 import { usePolledData } from "./usePolledData";
 
-type Tab = "overview" | "channels" | "wallet" | "routing" | "autopilot" | "settings";
+type Tab = "overview" | "channels" | "market" | "wallet" | "routing" | "autopilot" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "channels", label: "Channels" },
+  { id: "market", label: "Market" },
   { id: "wallet", label: "Wallet" },
   { id: "routing", label: "Routing" },
   { id: "autopilot", label: "Autopilot" },
@@ -105,6 +107,7 @@ export function App() {
           )
         ) : null}
 
+        {tab === "market" ? <MarketPanel /> : null}
         {tab === "wallet" ? <WalletPanel price={price.data} /> : null}
         {tab === "routing" ? <RoutingPanel /> : null}
         {tab === "autopilot" ? <AutopilotPanel /> : null}
