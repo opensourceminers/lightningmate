@@ -41,7 +41,7 @@ function main(): void {
   const settings = new SettingsStore(config.dataDir);
   const overrides = new OverridesStore(config.dataDir);
   const ambossStore = new AmbossStore(config.dataDir);
-  const autopilot = new Autopilot(config.dataDir, lnd, writeLnd, rebalanceLog, overrides);
+  const autopilot = new Autopilot(config.dataDir, lnd, writeLnd, rebalanceLog, overrides, ambossStore);
   autopilot.start();
 
   const app = express();

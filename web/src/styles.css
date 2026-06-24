@@ -747,6 +747,7 @@ table { width: 100%; border-collapse: collapse; }
 .buy-box { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
 .buy-status { margin: 0 0 14px; font-size: 14px; }
 .market-ref { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; color: var(--muted); margin-bottom: 12px; }
+.ap-check { margin-top: 8px; }
 .btn-danger {
   background: linear-gradient(180deg, #e25b54, var(--red)) !important;
   color: #2a0c0a !important;

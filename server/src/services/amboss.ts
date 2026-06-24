@@ -236,6 +236,8 @@ export interface MyOrder {
   destination: string; // buyer endpoint to open the channel to (pubkey[@socket])
   paymentStatus: string | null;
   channelId: string | null;
+  transactionId: string | null; // funding txid of the opened channel
+  blocksUntilClosable: number; // 0 = lease over, channel can be closed
   createdAt: string;
 }
 
@@ -314,6 +316,7 @@ export async function getMyOrders(apiKey: string): Promise<MyOrdersView> {
     pending_seller_orders
     offer_orders { list {
       id status size offer_side seller_invoice_amount payment_status channel_id created_at
+      transaction_id blocks_until_can_be_closed
       endpoints { destination }
     } }
   } } }`;
@@ -331,6 +334,8 @@ export async function getMyOrders(apiKey: string): Promise<MyOrdersView> {
             payment_status: string | null;
             channel_id: string | null;
             created_at: string;
+            transaction_id: string | null;
+            blocks_until_can_be_closed: number | null;
             endpoints: { destination: string } | null;
           }[];
         };
@@ -349,6 +354,8 @@ export async function getMyOrders(apiKey: string): Promise<MyOrdersView> {
       destination: o.endpoints?.destination ?? "",
       paymentStatus: o.payment_status ?? null,
       channelId: o.channel_id ?? null,
+      transactionId: o.transaction_id ?? null,
+      blocksUntilClosable: Number(o.blocks_until_can_be_closed ?? Number.POSITIVE_INFINITY),
       createdAt: o.created_at,
     })),
   };

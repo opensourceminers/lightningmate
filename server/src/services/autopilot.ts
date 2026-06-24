@@ -1,6 +1,9 @@
-import { getChainBalance, type AuthenticatedLnd } from "lightning";
+import { getChannels, getChainBalance, type AuthenticatedLnd } from "lightning";
 import { JsonStore } from "../store.js";
-import { openChannelTo } from "./channelOps.js";
+import { closeChannelByOutpoint, openChannelTo } from "./channelOps.js";
+import { createInvoice } from "./payments.js";
+import { acceptOrder, addOrderTransaction, getMyOrders } from "./amboss.js";
+import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestions } from "./suggestions.js";
 import {
   applyFees,
@@ -44,6 +47,16 @@ export interface AutopilotConfig {
   channelSizeSats: number;
   /** Minimum time between auto-opens. */
   channelCooldownMinutes: number;
+  /** Magma liquidity provision: auto-fulfill sell orders (accept + open channel). */
+  sellEnabled: boolean;
+  /** Max total capital deployed into sold channels (sats). */
+  sellMaxDeploySats: number;
+  /** On-chain balance to always keep when fulfilling (sats). */
+  sellReserveSats: number;
+  /** Max channel size to fulfill per order (sats). */
+  sellMaxChannelSats: number;
+  /** Auto-close sold channels once the lease is over, to reclaim capital. */
+  sellAutoClose: boolean;
 }
 
 export interface AutopilotChange {
@@ -72,6 +85,15 @@ export interface AutopilotChannelOpen {
   error?: string;
 }
 
+export interface AutopilotSell {
+  orderId: string;
+  action: "accept" | "open" | "close" | "skip";
+  sizeSats: number;
+  ok: boolean;
+  transactionId?: string;
+  error?: string;
+}
+
 export interface AutopilotRun {
   at: string;
   attempted: number;
@@ -80,6 +102,7 @@ export interface AutopilotRun {
   changes: AutopilotChange[];
   rebalances: AutopilotRebalance[];
   channels: AutopilotChannelOpen[];
+  sells: AutopilotSell[];
 }
 
 interface PersistedState {
@@ -107,6 +130,11 @@ const DEFAULT_CONFIG: AutopilotConfig = {
   channelReserveSats: 50_000,
   channelSizeSats: 0,
   channelCooldownMinutes: 1_440,
+  sellEnabled: false,
+  sellMaxDeploySats: 2_000_000,
+  sellReserveSats: 50_000,
+  sellMaxChannelSats: 5_000_000,
+  sellAutoClose: false,
 };
 
 const HISTORY_LIMIT = 50;
@@ -123,6 +151,7 @@ export class Autopilot {
     private readonly writeLnd: AuthenticatedLnd | undefined,
     private readonly rebalanceLog: RebalanceLog,
     private readonly overrides: OverridesStore,
+    private readonly amboss: AmbossStore,
   ) {
     this.store = new JsonStore<PersistedState>(dataDir, "autopilot.json");
     this.state = this.store.read({
@@ -159,6 +188,7 @@ export class Autopilot {
           changes: r.changes ?? [],
           rebalances: r.rebalances ?? [],
           channels: r.channels ?? [],
+          sells: r.sells ?? [],
         })),
     };
   }
@@ -342,6 +372,101 @@ export class Autopilot {
     ];
   }
 
+  /**
+   * Magma liquidity provision: auto-fulfill incoming sell orders within caps.
+   * Accept (creates the fee invoice) → open the channel to the buyer → after the
+   * lease, optionally close it to reclaim the capital. Every action is gated by
+   * the deploy cap, max channel size and on-chain reserve.
+   */
+  private async runSell(writeLnd: AuthenticatedLnd): Promise<AutopilotSell[]> {
+    const cfg = this.state.config;
+    if (!cfg.sellEnabled || !this.amboss.hasKey()) return [];
+
+    let orders;
+    try {
+      orders = (await getMyOrders(this.amboss.getKey())).orders.filter((o) => o.side === "SELL");
+    } catch {
+      return []; // Amboss unreachable — retry next run
+    }
+    if (orders.length === 0) return [];
+
+    const key = this.amboss.getKey();
+    const out: AutopilotSell[] = [];
+    const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+    const { chain_balance } = await getChainBalance({ lnd: this.readLnd });
+    const skip = (o: { id: string; sizeSats: number }, error: string) =>
+      out.push({ orderId: o.id, action: "skip" as const, sizeSats: o.sizeSats, ok: false, error });
+
+    // Capital already committed to currently-open sold channels.
+    let deployed = orders
+      .filter((o) => o.channelId && o.blocksUntilClosable > 0)
+      .reduce((s, o) => s + o.sizeSats, 0);
+
+    let myChannels: { transaction_id: string; transaction_vout: number }[] | null = null;
+
+    for (const o of orders) {
+      if (o.status === "WAITING_FOR_SELLER_APPROVAL") {
+        if (o.sizeSats > cfg.sellMaxChannelSats) {
+          skip(o, "above max channel size");
+        } else if (deployed + o.sizeSats > cfg.sellMaxDeploySats) {
+          skip(o, "deploy cap reached");
+        } else if (chain_balance - o.sizeSats < cfg.sellReserveSats) {
+          skip(o, "would breach on-chain reserve");
+        } else {
+          try {
+            const inv = await createInvoice(writeLnd, {
+              tokens: o.feeSats,
+              description: `Magma order ${o.id}`,
+              expirySec: 49 * 3600,
+            });
+            await acceptOrder(key, o.id, inv.request);
+            out.push({ orderId: o.id, action: "accept", sizeSats: o.sizeSats, ok: true });
+          } catch (e) {
+            out.push({ orderId: o.id, action: "accept", sizeSats: o.sizeSats, ok: false, error: msg(e) });
+          }
+        }
+      } else if (o.status === "WAITING_FOR_CHANNEL_OPEN") {
+        if (chain_balance - o.sizeSats < cfg.sellReserveSats) {
+          skip(o, "would breach on-chain reserve");
+          continue;
+        }
+        const [pubkey, socket] = o.destination.split("@");
+        if (!pubkey) {
+          out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: false, error: "no buyer endpoint" });
+          continue;
+        }
+        const res = await openChannelTo(writeLnd, { pubkey, socket: socket || undefined, localTokens: o.sizeSats });
+        if (res.ok && res.transactionId) {
+          try {
+            await addOrderTransaction(key, o.id, `${res.transactionId}:${res.transactionVout}`);
+            deployed += o.sizeSats;
+            out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: true, transactionId: res.transactionId });
+          } catch (e) {
+            out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: false, error: `channel opened but Amboss update failed: ${msg(e)}` });
+          }
+        } else {
+          out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: false, error: res.error });
+        }
+      } else if (cfg.sellAutoClose && o.channelId && o.transactionId && o.blocksUntilClosable <= 0) {
+        if (!myChannels) {
+          try {
+            myChannels = (await getChannels({ lnd: this.readLnd })).channels.map((c) => ({
+              transaction_id: c.transaction_id,
+              transaction_vout: c.transaction_vout,
+            }));
+          } catch {
+            myChannels = [];
+          }
+        }
+        const ch = myChannels.find((c) => c.transaction_id === o.transactionId);
+        if (!ch) continue; // already closed or not ours
+        const res = await closeChannelByOutpoint(writeLnd, ch.transaction_id, ch.transaction_vout, false);
+        out.push({ orderId: o.id, action: "close", sizeSats: o.sizeSats, ok: res.ok, transactionId: res.transactionId, error: res.error });
+      }
+    }
+    return out;
+  }
+
   /** Run the autopilot once: fees, then rebalances, then channel opens (each if enabled). */
   async runOnce(): Promise<AutopilotRun> {
     const emptyRun: AutopilotRun = {
@@ -352,6 +477,7 @@ export class Autopilot {
       changes: [],
       rebalances: [],
       channels: [],
+      sells: [],
     };
     if (this.running || !this.writeLnd) return emptyRun;
     this.running = true;
@@ -363,21 +489,27 @@ export class Autopilot {
         ? await this.runRebalances(writeLnd)
         : [];
       const channels = this.state.config.channelEnabled ? await this.runChannels(writeLnd) : [];
+      const sells = await this.runSell(writeLnd);
+      // "skip" entries are non-actions (cap/reserve) — don't count them as attempts.
+      const acted = sells.filter((s) => s.action !== "skip");
 
       const run: AutopilotRun = {
         at: new Date().toISOString(),
-        attempted: changes.length + rebalances.length + channels.length,
+        attempted: changes.length + rebalances.length + channels.length + acted.length,
         applied:
           changes.filter((c) => c.ok).length +
           rebalances.filter((r) => r.ok).length +
-          channels.filter((c) => c.ok).length,
+          channels.filter((c) => c.ok).length +
+          acted.filter((s) => s.ok).length,
         failed:
           changes.filter((c) => !c.ok).length +
           rebalances.filter((r) => !r.ok).length +
-          channels.filter((c) => !c.ok).length,
+          channels.filter((c) => !c.ok).length +
+          acted.filter((s) => !s.ok).length,
         changes,
         rebalances,
         channels,
+        sells,
       };
 
       this.state.lastRunAt = run.at;
