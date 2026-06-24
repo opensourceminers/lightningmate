@@ -3,14 +3,13 @@ import { api } from "./api";
 import { AlertsBar } from "./components/AlertsBar";
 import { AutopilotPanel } from "./components/AutopilotPanel";
 import { BrandMark } from "./components/BrandMark";
-import { ChannelTable } from "./components/ChannelTable";
+import { ChannelsPanel } from "./components/ChannelsPanel";
 import { Footer } from "./components/Footer";
 import { LogoutButton } from "./components/LogoutButton";
 import { Overview } from "./components/Overview";
 import { RoutingPanel } from "./components/RoutingPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SkeletonPanel } from "./components/Skeleton";
-import { SuggestionsPanel } from "./components/SuggestionsPanel";
 import { TabIcon } from "./components/TabIcon";
 import { WalletPanel } from "./components/WalletPanel";
 import { usePolledData } from "./usePolledData";
@@ -100,10 +99,7 @@ export function App() {
 
         {tab === "channels" ? (
           channels.data ? (
-            <>
-              <ChannelTable channels={channels.data} />
-              <SuggestionsPanel />
-            </>
+            <ChannelsPanel channels={channels.data} />
           ) : (
             <SkeletonPanel rows={6} />
           )
