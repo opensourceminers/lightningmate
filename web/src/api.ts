@@ -37,6 +37,20 @@ import type {
   SuggestionsResponse,
 } from "./types";
 
+// ── Write-mode unlock token ───────────────────────────────────────────────────
+let token = localStorage.getItem("lm_token") ?? "";
+let unlockHandler: (() => Promise<boolean>) | null = null;
+
+function setToken(t: string): void {
+  token = t;
+  if (t) localStorage.setItem("lm_token", t);
+  else localStorage.removeItem("lm_token");
+}
+/** App registers this so a locked write can prompt for the password + retry. */
+export function setUnlockHandler(fn: () => Promise<boolean>): void {
+  unlockHandler = fn;
+}
+
 async function handle<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let detail = res.statusText;
@@ -55,14 +69,23 @@ async function get<T>(path: string): Promise<T> {
   return handle<T>(await fetch(`/api${path}`));
 }
 
-async function post<T>(path: string, body: unknown): Promise<T> {
-  return handle<T>(
-    await fetch(`/api${path}`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
-  );
+async function post<T>(path: string, body: unknown, retry = true): Promise<T> {
+  const res = await fetch(`/api${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  // Locked write → prompt for the Umbrel password, then retry once.
+  if (res.status === 401 && retry && unlockHandler) {
+    const err = (await res.clone().json().catch(() => ({}))) as { error?: string };
+    if (err.error === "locked" && (await unlockHandler())) {
+      return post<T>(path, body, false);
+    }
+  }
+  return handle<T>(res);
 }
 
 export const api = {
@@ -141,4 +164,17 @@ export const api = {
   onchainAddress: () => post<NewAddress>("/onchain/address", {}),
   onchainSend: (params: { address: string; tokens: number; feeRate: number }) =>
     post<OnchainSendResult>("/onchain/send", params),
+  authStatus: () => get<{ authRequired: boolean; unlocked: boolean }>("/auth/status"),
+  unlock: async (password: string): Promise<boolean> => {
+    const res = await fetch("/api/auth/unlock", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ password }),
+    });
+    if (!res.ok) return false;
+    const { token: t } = (await res.json()) as { token: string };
+    setToken(t);
+    return true;
+  },
+  lock: () => setToken(""),
 };

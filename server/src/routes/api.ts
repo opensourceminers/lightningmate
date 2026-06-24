@@ -31,6 +31,7 @@ import { getBtcPrice } from "../services/price.js";
 import type { SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
 import { getAlerts } from "../services/alerts.js";
+import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
 import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 
@@ -146,6 +147,53 @@ export function createApiRouter(
     }
     writeHits.push(now);
     next();
+  });
+
+  // ── Write-mode auth ─────────────────────────────────────────────────────────
+  // Fund-moving / node-writing endpoints require an unlock token (proves the
+  // user's Umbrel password). Reads and local-only writes (settings, overrides)
+  // stay open. No-op when auth isn't required (standalone on 127.0.0.1).
+  const WRITE_AUTH_PATHS = new Set([
+    "/fees/apply",
+    "/rebalance/execute",
+    "/channels/open",
+    "/channels/close",
+    "/ln/invoice",
+    "/ln/pay",
+    "/onchain/address",
+    "/onchain/send",
+    "/autopilot",
+    "/autopilot/run",
+  ]);
+  router.use((req, res, next) => {
+    if (req.method === "GET" || !WRITE_AUTH_PATHS.has(req.path)) return next();
+    if (verifyToken(bearer(req))) return next();
+    res.status(401).json({
+      error: "locked",
+      message: "Write mode is locked. Unlock with your Umbrel password.",
+    });
+  });
+
+  // Whether writes need unlocking, and whether this request is already unlocked.
+  router.get("/auth/status", (req, res) => {
+    res.json({ authRequired: authRequired(), unlocked: verifyToken(bearer(req)) });
+  });
+
+  // Exchange the Umbrel password for a session token. Brute-force guarded.
+  const unlockHits: number[] = [];
+  router.post("/auth/unlock", (req, res) => {
+    const now = Date.now();
+    while (unlockHits.length && now - unlockHits[0] > 60_000) unlockHits.shift();
+    if (unlockHits.length >= 8) {
+      res.status(429).json({ error: "rate_limited", message: "Too many attempts; wait a minute." });
+      return;
+    }
+    unlockHits.push(now);
+    if (!verifyPassword(req.body?.password)) {
+      res.status(401).json({ error: "bad_password", message: "Wrong password." });
+      return;
+    }
+    res.json({ token: issueToken() });
   });
 
   router.get("/health", (_req, res) => {
