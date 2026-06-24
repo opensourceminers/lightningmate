@@ -28,6 +28,15 @@ export function TabIcon({ id }: { id: string }) {
           <rect x="14" y="3" width="7" height="18" rx="1.5" />
         </svg>
       );
+    case "market":
+      return (
+        <svg {...C} aria-hidden>
+          <path d="M3 9 4.5 4h15L21 9" />
+          <path d="M4 9v10a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1V9" />
+          <path d="M3 9h18" />
+          <path d="M9 20v-6h6v6" />
+        </svg>
+      );
     case "wallet":
       return (
         <svg {...C} aria-hidden>
