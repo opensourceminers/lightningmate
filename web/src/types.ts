@@ -164,6 +164,11 @@ export interface AutopilotConfig {
   channelReserveSats: number;
   channelSizeSats: number;
   channelCooldownMinutes: number;
+  sellEnabled: boolean;
+  sellMaxDeploySats: number;
+  sellReserveSats: number;
+  sellMaxChannelSats: number;
+  sellAutoClose: boolean;
 }
 
 export interface AutopilotChange {
@@ -192,6 +197,15 @@ export interface AutopilotChannelOpen {
   error?: string;
 }
 
+export interface AutopilotSell {
+  orderId: string;
+  action: "accept" | "open" | "close" | "skip";
+  sizeSats: number;
+  ok: boolean;
+  transactionId?: string;
+  error?: string;
+}
+
 export interface AutopilotRun {
   at: string;
   attempted: number;
@@ -200,6 +214,7 @@ export interface AutopilotRun {
   changes: AutopilotChange[];
   rebalances: AutopilotRebalance[];
   channels: AutopilotChannelOpen[];
+  sells: AutopilotSell[];
 }
 
 export interface AutopilotState {

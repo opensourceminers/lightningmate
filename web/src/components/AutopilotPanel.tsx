@@ -14,7 +14,10 @@ type NumKey =
   | "rebalanceHourEnd"
   | "channelReserveSats"
   | "channelSizeSats"
-  | "channelCooldownMinutes";
+  | "channelCooldownMinutes"
+  | "sellMaxDeploySats"
+  | "sellReserveSats"
+  | "sellMaxChannelSats";
 type RebKey = "econRatio" | "amountSats" | "maxLocalRatioTarget" | "minLocalRatioSource";
 
 // The recommended (optimal) defaults — used as the baseline and for "reset".
@@ -59,6 +62,12 @@ const CHANNEL_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "channelSizeSats", label: "Channel size (sat, 0=auto)" },
   { key: "channelReserveSats", label: "Keep on-chain reserve (sat)" },
   { key: "channelCooldownMinutes", label: "Open cooldown (min)" },
+];
+
+const SELL_NUM_FIELDS: { key: NumKey; label: string }[] = [
+  { key: "sellMaxDeploySats", label: "Max capital deployed (sat)" },
+  { key: "sellMaxChannelSats", label: "Max channel size / order (sat)" },
+  { key: "sellReserveSats", label: "Keep on-chain reserve (sat)" },
 ];
 
 const FEE_NUM_FIELDS: { key: NumKey; label: string }[] = [
@@ -141,6 +150,8 @@ export function AutopilotPanel() {
     setDraft((d) => (d ? { ...d, policy: { ...d.policy, [key]: Math.max(0, value || 0) } } : d));
   const setRebPolicyNum = (key: RebKey, value: number) =>
     setDraft((d) => (d ? { ...d, rebalancePolicy: { ...d.rebalancePolicy, [key]: Math.max(0, value || 0) } } : d));
+  const setBool = (key: keyof AutopilotConfig, value: boolean) =>
+    setDraft((d) => (d ? { ...d, [key]: value } : d));
 
   const save = async (overrides: Partial<AutopilotConfig> = {}) => {
     setBusy(true);
@@ -222,6 +233,15 @@ export function AutopilotPanel() {
         <RunState on={server.config.channelEnabled} />
       </div>
 
+      <div className="ap-master">
+        <Switch checked={draft.sellEnabled} disabled={busy} onChange={(v) => save({ sellEnabled: v })} label="Liquidity provision" />
+        <div className="ap-master-text">
+          <div className="ap-master-title">Liquidity provision (Magma)</div>
+          <div className="ap-master-sub">Auto-fulfills your sell orders — opens channels to buyers, earns lease fees, within caps</div>
+        </div>
+        <RunState on={server.config.sellEnabled} />
+      </div>
+
       {/* Recommended / advanced */}
       <div className="ap-settings-bar">
         <span className="muted">
@@ -283,6 +303,19 @@ export function AutopilotPanel() {
               </label>
             ))}
           </div>
+          <h3 className="sub">Liquidity provision (Magma)</h3>
+          <div className="policy-controls">
+            {SELL_NUM_FIELDS.map((f) => (
+              <label key={f.key} className="policy-field">
+                <span>{f.label}</span>
+                <input type="number" min={0} value={draft[f.key] as number} onChange={(e) => setNum(f.key, Number(e.target.value))} />
+              </label>
+            ))}
+          </div>
+          <label className="check ap-check">
+            <input type="checkbox" checked={draft.sellAutoClose} onChange={(e) => setBool("sellAutoClose", e.target.checked)} />
+            Auto-close channels after the lease ends (reclaim the capital on-chain)
+          </label>
           <div className="apply-row">
             <button className="primary-btn" disabled={busy} onClick={() => save()}>Save settings</button>
           </div>
