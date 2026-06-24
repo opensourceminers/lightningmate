@@ -28,6 +28,7 @@ import type {
   NodeScore,
   NodeSummary,
   OpenChannelResult,
+  MarketView,
   PnlSummary,
   RebalanceAnalysis,
   RebalanceExecResult,
@@ -80,6 +81,10 @@ async function post<T>(path: string, body: unknown): Promise<T> {
       body: JSON.stringify(body),
     }),
   );
+}
+
+async function del<T>(path: string): Promise<T> {
+  return handle<T>(await fetch(`/api${path}`, { method: "DELETE", headers: authHeaders() }));
 }
 
 export const api = {
@@ -174,4 +179,9 @@ export const api = {
     setToken("");
     onUnauthorized?.();
   },
+  ambossStatus: () => get<{ connected: boolean }>("/amboss/status"),
+  ambossMarket: () => get<MarketView>("/amboss/market"),
+  ambossConnect: (apiKey: string) =>
+    post<{ ok: boolean; connected: boolean; error?: string }>("/amboss/key", { apiKey }),
+  ambossDisconnect: () => del<{ ok: boolean; connected: boolean }>("/amboss/key"),
 };

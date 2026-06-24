@@ -8,6 +8,7 @@ import { Autopilot } from "./services/autopilot.js";
 import { RebalanceLog } from "./services/rebalanceLog.js";
 import { SettingsStore } from "./services/settings.js";
 import { OverridesStore } from "./services/overrides.js";
+import { AmbossStore } from "./services/ambossStore.js";
 
 // Never let a startup error vanish silently — print it so it's diagnosable.
 process.on("uncaughtException", (err) => {
@@ -39,6 +40,7 @@ function main(): void {
   const rebalanceLog = new RebalanceLog(config.dataDir);
   const settings = new SettingsStore(config.dataDir);
   const overrides = new OverridesStore(config.dataDir);
+  const ambossStore = new AmbossStore(config.dataDir);
   const autopilot = new Autopilot(config.dataDir, lnd, writeLnd, rebalanceLog, overrides);
   autopilot.start();
 
@@ -62,7 +64,10 @@ function main(): void {
   // cross-origin site can neither read responses nor make preflighted JSON
   // POSTs — closing the cross-site / CSRF vector on the fund-moving API.
   app.use(express.json({ limit: "256kb" }));
-  app.use("/api", createApiRouter(lnd, writeLnd, config, autopilot, rebalanceLog, settings, overrides));
+  app.use(
+    "/api",
+    createApiRouter(lnd, writeLnd, config, autopilot, rebalanceLog, settings, overrides, ambossStore),
+  );
 
   // In production (Docker/Umbrel) we serve the built React app from the same
   // origin, so the whole tool is a single container behind Umbrel's app_proxy.
