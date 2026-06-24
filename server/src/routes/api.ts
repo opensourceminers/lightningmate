@@ -1,5 +1,5 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
-import type { AuthenticatedLnd } from "lightning";
+import { getWalletInfo, type AuthenticatedLnd } from "lightning";
 import { getNodeScore } from "../services/score.js";
 import type { Config } from "../config.js";
 import { getNodeSummary } from "../services/node.js";
@@ -32,7 +32,7 @@ import type { SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
 import { getAlerts } from "../services/alerts.js";
 import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
-import { getMarket, validateKey } from "../services/amboss.js";
+import { buyLiquidity, getMarket, getOrder, validateKey } from "../services/amboss.js";
 import type { AmbossStore } from "../services/ambossStore.js";
 import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
@@ -687,6 +687,99 @@ export function createApiRouter(
     amboss.clear();
     res.json({ ok: true, connected: false });
   });
+
+  // In-flight Magma payments (HODL invoices settle only once the seller opens the
+  // channel — minutes later — so we pay in the background and never await it in the
+  // request). Amboss' get_order is the source of truth for status; this is a hint.
+  const magmaPays = new Map<string, { state: "paying" | "paid" | "failed"; error?: string; feeSats?: number }>();
+
+  // Step 1 — create an order and return the HODL invoice + EXACT sats. No payment.
+  router.post(
+    "/amboss/buy/quote",
+    wrap(async (req, res) => {
+      if (!amboss.hasKey()) {
+        res.status(400).json({ error: "no_key", message: "Connect Amboss in Settings first." });
+        return;
+      }
+      const usdCents = Math.floor(Number(req.body?.usdCents));
+      if (!Number.isFinite(usdCents) || usdCents < 500) {
+        res.status(400).json({ error: "bad_amount", message: "Minimum is $5 (500 cents)." });
+        return;
+      }
+      const isPrivate = req.body?.private === true;
+      const info = await getWalletInfo({ lnd });
+      const uri = info.uris?.[0];
+      if (!uri) {
+        res.status(400).json({
+          error: "no_uri",
+          message: "Your node has no public address, so a seller can't open a channel to it.",
+        });
+        return;
+      }
+      const quote = await buyLiquidity(amboss.getKey(), uri, usdCents, isPrivate);
+      // Decode the invoice ourselves — authoritative amount for the confirm + cap.
+      const decoded = await decodeRequest(lnd, quote.paymentRequest);
+      res.json({
+        orderId: quote.orderId,
+        paymentRequest: quote.paymentRequest,
+        sats: decoded.tokens,
+        channelSizeSats: quote.channelSizeSats,
+      });
+    }),
+  );
+
+  // Step 2 — pay the quoted invoice from our node (background; capped at maxSats).
+  router.post(
+    "/amboss/buy/pay",
+    wrap(async (req, res) => {
+      if (!writeLnd) {
+        res.status(403).json({ error: "read_only", message: "Write mode is off." });
+        return;
+      }
+      const orderId = typeof req.body?.orderId === "string" ? req.body.orderId : "";
+      const request = typeof req.body?.paymentRequest === "string" ? req.body.paymentRequest.trim() : "";
+      const maxSats = Math.floor(Number(req.body?.maxSats));
+      if (!orderId || !request || !Number.isFinite(maxSats) || maxSats <= 0) {
+        res.status(400).json({ error: "bad_request", message: "Missing order, invoice or cap." });
+        return;
+      }
+      const decoded = await decodeRequest(lnd, request);
+      if (decoded.tokens > maxSats) {
+        res.status(400).json({
+          error: "amount_mismatch",
+          message: `Invoice is ${decoded.tokens} sat, above the confirmed ${maxSats} sat. Aborted.`,
+        });
+        return;
+      }
+      // Routing-fee cap for paying the (small) fee invoice: 1% + 25 sat floor.
+      const maxFeeSats = Math.max(25, Math.ceil(decoded.tokens * 0.01));
+      magmaPays.set(orderId, { state: "paying" });
+      void payRequest(writeLnd, { request, maxFeeSats })
+        .then((r) => magmaPays.set(orderId, { state: r.ok ? "paid" : "failed", feeSats: r.feeSats }))
+        .catch((e) =>
+          magmaPays.set(orderId, { state: "failed", error: e instanceof Error ? e.message : String(e) }),
+        );
+      res.json({ ok: true, sats: decoded.tokens });
+    }),
+  );
+
+  // Poll order status (Amboss truth) + our local payment hint.
+  router.get(
+    "/amboss/order",
+    wrap(async (req, res) => {
+      if (!amboss.hasKey()) {
+        res.status(400).json({ error: "no_key", message: "Connect Amboss in Settings first." });
+        return;
+      }
+      const id = typeof req.query.id === "string" ? req.query.id : "";
+      if (!id) {
+        res.status(400).json({ error: "bad_request", message: "Missing order id." });
+        return;
+      }
+      const order = await getOrder(amboss.getKey(), id);
+      res.json({ ...order, payment: magmaPays.get(id) ?? null });
+    }),
+  );
 
   // Error middleware — surface LND/connection failures as JSON, not a crash.
   router.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {

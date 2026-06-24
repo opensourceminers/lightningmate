@@ -546,3 +546,20 @@ export interface MarketView {
   offers: MagmaOffer[];
   satsPerUsd: number | null;
 }
+
+export interface BuyQuote {
+  orderId: string;
+  paymentRequest: string;
+  sats: number;
+  channelSizeSats: number;
+}
+
+export interface OrderState {
+  status: string;
+  paymentStatus: string | null;
+  channelId: string | null;
+  channelSizeSats: number;
+  done: boolean;
+  failed: boolean;
+  payment: { state: "paying" | "paid" | "failed"; error?: string; feeSats?: number } | null;
+}
