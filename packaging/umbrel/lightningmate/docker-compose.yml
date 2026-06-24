@@ -27,9 +27,10 @@ services:
       PORT: "3001"
       # Bind all interfaces so app_proxy (which authenticates) can reach us.
       LM_BIND: "0.0.0.0"
-      # Per-install secrets for server-side write-mode auth. Other app containers
-      # share the Docker network, so fund-moving endpoints require an unlock token
-      # proving the user's Umbrel password ($APP_PASSWORD); $APP_SEED signs tokens.
+      # Per-install secrets for server-side auth. Other app containers share the
+      # Docker network, so the whole API requires a session token proving the
+      # per-app password Umbrel shows the user ($APP_PASSWORD, from
+      # deterministicPassword); $APP_SEED signs the tokens.
       APP_PASSWORD: "$APP_PASSWORD"
       APP_SEED: "$APP_SEED"
       # Node management needs write access (like RTL / Thunderhub / Lightning
