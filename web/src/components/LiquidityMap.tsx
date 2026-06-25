@@ -2,14 +2,13 @@ import type { ChannelView } from "../types";
 import { percent, satsCompact } from "../format";
 
 /** One glance at where your liquidity sits — every active channel as a column,
- *  width = capacity, orange (local/outbound) filling up from the bottom against a
- *  blue (remote/inbound) track. Sorted by balance so the shape reads as a slope
- *  from outbound-heavy to inbound-heavy, with a dashed 50% reference line. */
+ *  width = capacity (biggest first), orange (local/outbound) filling up from the
+ *  bottom against a blue (remote/inbound) track, with a dashed 50% reference line. */
 export function LiquidityMap({ channels }: { channels: ChannelView[] }) {
   const active = channels.filter((c) => c.active);
   if (active.length === 0) return null;
 
-  const sorted = [...active].sort((a, b) => b.localRatio - a.localRatio);
+  const sorted = [...active].sort((a, b) => b.capacity - a.capacity);
   const totalLocal = active.reduce((s, c) => s + c.localBalance, 0);
   const settled = active.reduce((s, c) => s + c.localBalance + c.remoteBalance, 0);
   const outPct = settled > 0 ? Math.round((totalLocal / settled) * 100) : 0;
