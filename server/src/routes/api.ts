@@ -785,6 +785,8 @@ export function createApiRouter(
       }
       // Routing-fee cap for paying the (small) fee invoice: 1% + 25 sat floor.
       const maxFeeSats = Math.max(25, Math.ceil(decoded.tokens * 0.01));
+      // Bound the in-memory hint map over a long-running process.
+      if (magmaPays.size > 200) magmaPays.delete(magmaPays.keys().next().value as string);
       magmaPays.set(orderId, { state: "paying" });
       void payRequest(writeLnd, { request, maxFeeSats })
         .then((r) => magmaPays.set(orderId, { state: r.ok ? "paid" : "failed", feeSats: r.feeSats }))
