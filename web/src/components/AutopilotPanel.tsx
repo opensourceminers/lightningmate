@@ -325,6 +325,10 @@ export function AutopilotPanel() {
             <input type="checkbox" checked={draft.sellAutoClose} onChange={(e) => setBool("sellAutoClose", e.target.checked)} />
             Auto-close channels after the lease ends (reclaim the capital on-chain)
           </label>
+          <label className="check ap-check">
+            <input type="checkbox" checked={draft.sellAutoRelist} onChange={(e) => setBool("sellAutoRelist", e.target.checked)} />
+            Auto-relist a depleted offer (top it back up within your caps so it keeps selling)
+          </label>
           <div className="apply-row">
             <button className="primary-btn" disabled={busy} onClick={() => save()}>Save settings</button>
           </div>
