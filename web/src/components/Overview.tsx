@@ -69,7 +69,7 @@ function RecentActivity({ items }: { items: ActivityItem[] }) {
         <p className="muted empty">Nothing yet — forwards and payments will show here.</p>
       ) : (
         <div className="feed">
-          {items.map((a, i) => (
+          {items.slice(0, 11).map((a, i) => (
             <div className="feed-row" key={`${a.at}-${i}`}>
               <span className={`feed-dot k-${a.kind}`} />
               <div className="feed-main">
@@ -92,12 +92,13 @@ function ApBadge({ on }: { on: boolean }) {
 
 function AutopilotStatus({ a }: { a: DashboardData["autopilot"] }) {
   return (
-    <section className="panel">
+    <section className="panel mini">
       <div className="panel-head"><h2>Autopilot</h2></div>
       <div className="ap-rows">
         <div className="ap-row"><span>Fee automation</span><ApBadge on={a.fees} /></div>
         <div className="ap-row"><span>Auto-rebalance</span><ApBadge on={a.rebalance} /></div>
         <div className="ap-row"><span>Channel autopilot</span><ApBadge on={a.channel} /></div>
+        <div className="ap-row"><span>Liquidity provision</span><ApBadge on={a.sell} /></div>
       </div>
       <div className="ap-foot">
         {a.lastRunAt

@@ -18,7 +18,7 @@ export function TopChannelsTile() {
             [...r.perChannel]
               .filter((c) => c.feesEarnedSats > 0)
               .sort((a, b) => b.feesEarnedSats - a.feesEarnedSats)
-              .slice(0, 4),
+              .slice(0, 5),
           );
         })
         .catch(() => !cancelled && setRows((cur) => cur ?? []));

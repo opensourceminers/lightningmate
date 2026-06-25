@@ -12,7 +12,7 @@ export function SuggestedPeersTile() {
     let cancelled = false;
     api
       .suggestions()
-      .then((r) => !cancelled && setRows(r.suggestions.slice(0, 4)))
+      .then((r) => !cancelled && setRows(r.suggestions.slice(0, 5)))
       .catch(() => !cancelled && setRows([]));
     return () => {
       cancelled = true;
