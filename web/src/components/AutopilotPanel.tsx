@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { AutopilotConfig, AutopilotRun, AutopilotState } from "../types";
-import { timeAgo } from "../format";
+import { satsCompact, timeAgo } from "../format";
 import { RunState, Switch } from "./Switch";
 
 type NumKey =
@@ -102,6 +102,15 @@ export function AutopilotPanel() {
   const [advanced, setAdvanced] = useState(false);
   const [lastRun, setLastRun] = useState<AutopilotRun | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Expanded history runs, keyed by timestamp (stable across the 15s refresh).
+  const [openRuns, setOpenRuns] = useState<Set<string>>(new Set());
+  const toggleRun = (at: string) =>
+    setOpenRuns((s) => {
+      const n = new Set(s);
+      if (n.has(at)) n.delete(at);
+      else n.add(at);
+      return n;
+    });
 
   useEffect(() => {
     let cancelled = false;
@@ -339,41 +348,61 @@ export function AutopilotPanel() {
         <p className="muted empty">No runs yet.</p>
       ) : (
         <ul className="ap-history">
-          {server.history.map((run, i) => (
-            <li key={`${run.at}-${i}`}>
-              <div className="ap-run-head">
-                <span>{timeAgo(run.at)}</span>
-                <span className="muted">{run.applied} applied{run.failed ? `, ${run.failed} failed` : ""}</span>
-              </div>
-              {run.changes?.length ? (
-                <div className="ap-changes">
-                  {run.changes.map((c) => (
-                    <span key={c.id} className={c.ok ? "ap-ok" : "ap-fail"} title={c.error ?? ""}>
-                      {c.alias}: {c.fromPpm}→{c.toPpm}
-                    </span>
-                  ))}
-                </div>
-              ) : null}
-              {run.rebalances?.length ? (
-                <div className="ap-changes">
-                  {run.rebalances.map((r, j) => (
-                    <span key={j} className={r.ok ? "ap-ok" : "ap-fail"} title={r.error ?? ""}>
-                      ⇄ {r.alias}: {r.ok ? `${r.feeSats} sat` : "fail"}
-                    </span>
-                  ))}
-                </div>
-              ) : null}
-              {run.channels?.length ? (
-                <div className="ap-changes">
-                  {run.channels.map((c, j) => (
-                    <span key={j} className={c.ok ? "ap-ok" : "ap-fail"} title={c.error ?? ""}>
-                      ⊕ {c.alias}: {c.ok ? `${Math.round(c.sizeSats / 1000)}k sat` : "fail"}
-                    </span>
-                  ))}
-                </div>
-              ) : null}
-            </li>
-          ))}
+          {server.history.map((run, i) => {
+            const open = openRuns.has(run.at);
+            const items: { ok: boolean; label: string; error?: string }[] = [
+              ...(run.changes ?? []).map((c) => ({
+                ok: c.ok,
+                label: `Fee · ${c.alias}: ${c.fromPpm}→${c.toPpm} ppm`,
+                error: c.error,
+              })),
+              ...(run.rebalances ?? []).map((r) => ({
+                ok: r.ok,
+                label: `Rebalance · ${r.alias}${r.ok ? ` — ${r.feeSats} sat` : ""}`,
+                error: r.error,
+              })),
+              ...(run.channels ?? []).map((c) => ({
+                ok: c.ok,
+                label: `Open · ${c.alias}${c.ok ? ` — ${satsCompact(c.sizeSats)}` : ""}`,
+                error: c.error,
+              })),
+              ...(run.sells ?? []).map((s) => ({
+                ok: s.ok,
+                label: `Magma ${s.action} · ${satsCompact(s.sizeSats)}`,
+                error: s.error,
+              })),
+            ];
+            return (
+              <li key={`${run.at}-${i}`}>
+                <button className="ap-run-head" onClick={() => toggleRun(run.at)}>
+                  <span className="ap-run-when">
+                    <span className="ap-caret">{open ? "▾" : "▸"}</span>
+                    {timeAgo(run.at)}
+                  </span>
+                  <span className="muted">
+                    {run.applied} applied
+                    {run.failed ? <span className="ap-fail-count"> · {run.failed} failed</span> : null}
+                  </span>
+                </button>
+                {open ? (
+                  <div className="ap-run-detail">
+                    {items.length === 0 ? (
+                      <span className="muted">No actions in this run.</span>
+                    ) : (
+                      items.map((it, j) => (
+                        <div key={j} className={`ap-item ${it.ok ? "" : "fail"}`}>
+                          <span>
+                            {it.ok ? "✓" : "✗"} {it.label}
+                          </span>
+                          {!it.ok && it.error ? <span className="ap-err-msg">{it.error}</span> : null}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                ) : null}
+              </li>
+            );
+          })}
         </ul>
       )}
     </section>
