@@ -3,6 +3,7 @@ import { JsonStore } from "../store.js";
 import { closeChannelByOutpoint, openChannelTo } from "./channelOps.js";
 import { createInvoice } from "./payments.js";
 import { acceptOrder, addOrderTransaction, getMyOrders } from "./amboss.js";
+import { paySaleServiceFee } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestions } from "./suggestions.js";
 import {
@@ -449,6 +450,9 @@ export class Autopilot {
           try {
             await addOrderTransaction(key, o.id, `${res.transactionId}:${res.transactionVout}`);
             extra += o.sizeSats;
+            // Disclosed service fee on a completed sale — best-effort, never throws.
+            const fee = await paySaleServiceFee(writeLnd, o.feeSats);
+            if (fee.paid) console.log(`[fee] order ${o.id}: paid ${fee.sats} sat service fee`);
             out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: true, transactionId: res.transactionId });
           } catch (e) {
             out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: false, error: `channel opened but Amboss update failed: ${msg(e)}` });

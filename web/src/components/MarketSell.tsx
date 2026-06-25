@@ -35,6 +35,7 @@ const FIELDS: { key: keyof Draft; label: string; hint: string }[] = [
 export function MarketSell() {
   const ui = useUi();
   const [connected, setConnected] = useState<boolean | null>(null);
+  const [feeBps, setFeeBps] = useState(0);
   const [offers, setOffers] = useState<MyOffer[]>([]);
   const [draft, setDraft] = useState<Draft>(DEFAULTS);
   const [busy, setBusy] = useState(false);
@@ -56,6 +57,7 @@ export function MarketSell() {
     try {
       const s = await api.ambossStatus();
       setConnected(s.connected);
+      setFeeBps(s.saleFeeBps ?? 0);
       if (s.connected) setOffers((await api.ambossMyOffers()).offers);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -160,9 +162,14 @@ export function MarketSell() {
       </div>
       <div className="dryrun-banner">
         List channel liquidity for sale on Magma. <strong>Important:</strong> when a buyer orders you
-        must open a channel to them within the time window, or your seller score drops. (The Autopilot
-        will be able to handle this automatically — coming next.)
+        must open a channel to them within the time window, or your seller score drops — the Autopilot
+        can handle this for you automatically (enable <strong>Liquidity provision</strong>).
       </div>
+      {feeBps > 0 ? (
+        <p className="fee-note">
+          A {feeBps / 100}% service fee on completed sales supports Lightning Mate’s development.
+        </p>
+      ) : null}
 
       {ref ? (
         <div className="market-ref">
