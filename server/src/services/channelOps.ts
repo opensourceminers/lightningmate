@@ -1,4 +1,6 @@
-import { addPeer, closeChannel, openChannel, type AuthenticatedLnd } from "lightning";
+import { addPeer, closeChannel, getPeers, openChannel, type AuthenticatedLnd } from "lightning";
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export interface OpenChannelParams {
   pubkey: string;
@@ -31,10 +33,44 @@ function describe(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+async function isConnected(lnd: AuthenticatedLnd, pubkey: string): Promise<boolean> {
+  try {
+    const { peers } = await getPeers({ lnd });
+    return peers.some((p) => p.public_key === pubkey);
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Open a channel to a peer. Connects first (best-effort), then funds the channel
- * on-chain. This spends real funds and is irreversible — callers must gate it
- * behind write access and explicit user confirmation.
+ * Make sure there's a live connection to the peer before funding a channel —
+ * otherwise openChannel fails with RemotePeerDisconnected. Dials the socket and
+ * verifies the peer actually shows up as connected, retrying a few times since
+ * the handshake can take a moment.
+ */
+async function ensureConnected(
+  lnd: AuthenticatedLnd,
+  pubkey: string,
+  socket?: string,
+): Promise<boolean> {
+  if (await isConnected(lnd, pubkey)) return true;
+  if (!socket) return false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await addPeer({ lnd, public_key: pubkey, socket });
+    } catch {
+      // "already connected" or a transient dial error — verify below either way
+    }
+    if (await isConnected(lnd, pubkey)) return true;
+    await sleep(1200);
+  }
+  return isConnected(lnd, pubkey);
+}
+
+/**
+ * Open a channel to a peer. Connects first (and confirms the peer is online),
+ * then funds the channel on-chain. This spends real funds and is irreversible —
+ * callers must gate it behind write access and explicit user confirmation.
  */
 export async function openChannelTo(
   writeLnd: AuthenticatedLnd,
@@ -46,13 +82,14 @@ export async function openChannelTo(
     return { ...base, error: `channel size must be at least ${MIN_CHANNEL_SATS} sat` };
   }
 
-  // Connect to the peer first; ignore "already connected" style errors.
-  if (params.socket) {
-    try {
-      await addPeer({ lnd: writeLnd, public_key: params.pubkey, socket: params.socket });
-    } catch {
-      // proceed — openChannel will also try via partner_socket
-    }
+  // Connect to (and confirm) the peer first — openChannel otherwise fails with
+  // RemotePeerDisconnected when the peer isn't already a live connection.
+  const connected = await ensureConnected(writeLnd, params.pubkey, params.socket);
+  if (!connected) {
+    return {
+      ...base,
+      error: `couldn't connect to ${params.pubkey.slice(0, 12)}… — the peer looks offline. Try again later.`,
+    };
   }
 
   try {
