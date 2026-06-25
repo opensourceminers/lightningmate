@@ -63,14 +63,12 @@ export function SummaryBar({ node, price }: { node: NodeSummary; price?: PriceIn
             <span className="liq-amt">{sats(balances.localSats)} <span className="liq-unit">sat</span></span>
             {outFiat ? <span className="liq-fiat">{outFiat}</span> : null}
           </div>
+          <span className={`liq-balance s-${skew <= 10 ? "good" : skew <= 25 ? "ok" : "warn"}`}>{balanceLabel}</span>
           <div className="liq-side in">
             <span className="liq-cap">Inbound · can receive<span className="liq-dot" /></span>
             <span className="liq-amt">{sats(balances.inboundSats)} <span className="liq-unit">sat</span></span>
             {inbFiat ? <span className="liq-fiat">{inbFiat}</span> : null}
           </div>
-        </div>
-        <div className="liq-balance-row">
-          <span className={`liq-balance s-${skew <= 10 ? "good" : skew <= 25 ? "ok" : "warn"}`}>{balanceLabel}</span>
         </div>
         <div className="liq-bar" title={`${outboundPct.toFixed(0)}% outbound · ${inboundPct.toFixed(0)}% inbound`}>
           <div className="liq-out" style={{ width: `${outboundPct}%` }}>
