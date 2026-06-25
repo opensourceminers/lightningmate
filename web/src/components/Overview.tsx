@@ -90,10 +90,17 @@ function ApBadge({ on }: { on: boolean }) {
   return <span className={`ap-badge ${on ? "on" : "off"}`}>{on ? "ON" : "OFF"}</span>;
 }
 
-function AutopilotStatus({ a }: { a: DashboardData["autopilot"] }) {
+function AutopilotStatus({ a, onOpen }: { a: DashboardData["autopilot"]; onOpen?: () => void }) {
   return (
-    <section className="panel mini">
-      <div className="panel-head"><h2>Autopilot</h2></div>
+    <section
+      className="panel mini clickable"
+      onClick={onOpen}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onOpen?.()}
+      title="Open Autopilot"
+    >
+      <div className="panel-head"><h2>Autopilot</h2><span className="tile-go" aria-hidden>↗</span></div>
       <div className="ap-rows">
         <div className="ap-row"><span>Fee automation</span><ApBadge on={a.fees} /></div>
         <div className="ap-row"><span>Auto-rebalance</span><ApBadge on={a.rebalance} /></div>
@@ -113,10 +120,12 @@ export function Overview({
   node,
   channels,
   price,
+  onNavigate,
 }: {
   node: NodeSummary;
   channels?: ChannelView[] | null;
   price?: PriceInfo | null;
+  onNavigate?: (tab: string, sub?: string) => void;
 }) {
   const [dash, setDash] = useState<DashboardData | null>(null);
 
@@ -144,9 +153,9 @@ export function Overview({
         <div className="hero-row">
           <RecentActivity items={dash.activity} />
           <div className="stack-col">
-            <TopChannelsTile />
-            <SuggestedPeersTile />
-            <AutopilotStatus a={dash.autopilot} />
+            <TopChannelsTile onOpen={() => onNavigate?.("routing")} />
+            <SuggestedPeersTile onOpen={() => onNavigate?.("channels", "suggestions")} />
+            <AutopilotStatus a={dash.autopilot} onOpen={() => onNavigate?.("autopilot")} />
           </div>
         </div>
       ) : null}

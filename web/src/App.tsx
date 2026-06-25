@@ -32,6 +32,12 @@ export function App() {
   const channels = usePolledData(api.channels, 30_000);
   const price = usePolledData(api.price, 300_000);
   const [tab, setTab] = useState<Tab>("overview");
+  // Sub-tab to open when navigating from an Overview tile (e.g. Channels → suggestions).
+  const [pendingSub, setPendingSub] = useState<string | undefined>(undefined);
+  const navigate = (t: string, sub?: string) => {
+    setTab(t as Tab);
+    setPendingSub(sub);
+  };
 
   const anyError = node.error ?? channels.error;
   const initialLoading = node.loading && !node.data;
@@ -69,7 +75,10 @@ export function App() {
           <button
             key={t.id}
             className={`tab ${tab === t.id ? "active" : ""}`}
-            onClick={() => setTab(t.id)}
+            onClick={() => {
+              setTab(t.id);
+              setPendingSub(undefined);
+            }}
           >
             <TabIcon id={t.id} />
             {t.label}
@@ -93,7 +102,7 @@ export function App() {
       <div className="tab-body">
         {tab === "overview" ? (
           node.data ? (
-            <Overview node={node.data} channels={channels.data} price={price.data} />
+            <Overview node={node.data} channels={channels.data} price={price.data} onNavigate={navigate} />
           ) : (
             <SkeletonPanel rows={6} />
           )
@@ -101,7 +110,7 @@ export function App() {
 
         {tab === "channels" ? (
           channels.data ? (
-            <ChannelsPanel channels={channels.data} />
+            <ChannelsPanel channels={channels.data} initialSub={pendingSub} />
           ) : (
             <SkeletonPanel rows={6} />
           )

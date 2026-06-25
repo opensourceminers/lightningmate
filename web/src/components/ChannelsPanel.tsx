@@ -6,8 +6,16 @@ import { SuggestionsPanel } from "./SuggestionsPanel";
 
 type Sub = "channels" | "suggestions" | "close";
 
-export function ChannelsPanel({ channels }: { channels: ChannelView[] }) {
-  const [sub, setSub] = useState<Sub>("channels");
+export function ChannelsPanel({
+  channels,
+  initialSub,
+}: {
+  channels: ChannelView[];
+  initialSub?: string;
+}) {
+  const [sub, setSub] = useState<Sub>(
+    initialSub === "suggestions" || initialSub === "close" ? initialSub : "channels",
+  );
   return (
     <div>
       <div className="subnav">
