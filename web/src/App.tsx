@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { api } from "./api";
 import { AlertsBar } from "./components/AlertsBar";
+import { AnalyticsPanel } from "./components/AnalyticsPanel";
 import { AutopilotPanel } from "./components/AutopilotPanel";
 import { BrandMark } from "./components/BrandMark";
 import { ChannelsPanel } from "./components/ChannelsPanel";
@@ -15,7 +16,7 @@ import { TabIcon } from "./components/TabIcon";
 import { WalletPanel } from "./components/WalletPanel";
 import { usePolledData } from "./usePolledData";
 
-type Tab = "overview" | "channels" | "market" | "wallet" | "routing" | "autopilot" | "settings";
+type Tab = "overview" | "channels" | "market" | "wallet" | "routing" | "analytics" | "autopilot" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
@@ -23,6 +24,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "market", label: "Market" },
   { id: "wallet", label: "Wallet" },
   { id: "routing", label: "Routing" },
+  { id: "analytics", label: "Analytics" },
   { id: "autopilot", label: "Autopilot" },
   { id: "settings", label: "Settings" },
 ];
@@ -119,6 +121,7 @@ export function App() {
         {tab === "market" ? <MarketPanel /> : null}
         {tab === "wallet" ? <WalletPanel price={price.data} /> : null}
         {tab === "routing" ? <RoutingPanel /> : null}
+        {tab === "analytics" ? <AnalyticsPanel /> : null}
         {tab === "autopilot" ? <AutopilotPanel /> : null}
         {tab === "settings" ? <SettingsPanel onChange={price.refresh} /> : null}
       </div>
