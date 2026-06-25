@@ -7,6 +7,8 @@ import { HealthScore } from "./HealthScore";
 import { PnlOverview } from "./PnlOverview";
 import { LiquidityMap } from "./LiquidityMap";
 import { Sparkline } from "./Sparkline";
+import { TopChannelsTile } from "./TopChannelsTile";
+import { SuggestedPeersTile } from "./SuggestedPeersTile";
 
 const KIND_LABEL: Record<ActivityItem["kind"], string> = {
   forward: "Routed",
@@ -140,7 +142,11 @@ export function Overview({
       {dash ? (
         <div className="hero-row">
           <RecentActivity items={dash.activity} />
-          <AutopilotStatus a={dash.autopilot} />
+          <div className="stack-col">
+            <TopChannelsTile />
+            <SuggestedPeersTile />
+            <AutopilotStatus a={dash.autopilot} />
+          </div>
         </div>
       ) : null}
     </div>
