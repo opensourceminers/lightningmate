@@ -137,9 +137,9 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .stat-value { font-size: 17px; font-weight: 700; margin-top: 4px; }
 .stat-sub { color: var(--faint); font-size: 11px; margin-top: 1px; }
 
-.liquidity { margin-top: 18px; }
-.liq-labels { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 10px; }
-.liq-side { display: flex; flex-direction: column; gap: 3px; }
+.liquidity { margin-top: 14px; }
+.liq-labels { display: flex; align-items: center; gap: 14px; margin-bottom: 9px; }
+.liq-side { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
 .liq-side.in { text-align: right; align-items: flex-end; }
 .liq-cap {
   display: inline-flex; align-items: center; gap: 7px;
@@ -170,8 +170,7 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
   position: absolute; left: 50%; top: -1px; bottom: -1px; width: 0;
   border-left: 2px dashed rgba(255, 255, 255, 0.35); transform: translateX(-1px);
 }
-.liq-balance-row { display: flex; justify-content: center; margin-bottom: 8px; }
-.liq-balance {
+.liq-balance { white-space: nowrap; flex: none;
   text-transform: uppercase; letter-spacing: 0.4px; font-size: 10.5px; font-weight: 700;
   padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line-soft);
 }
