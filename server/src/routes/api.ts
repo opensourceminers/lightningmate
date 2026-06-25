@@ -172,7 +172,9 @@ export function createApiRouter(
   // containers share the Docker network, so without this they could read node
   // data or move funds directly. No-op when auth isn't required (standalone on
   // 127.0.0.1, where there is no cross-container threat).
-  const OPEN_PATHS = new Set(["/auth/status", "/auth/unlock", "/health"]);
+  // /widget/* is polled by umbreld directly (bypassing app_proxy), so it can't
+  // carry a session token — it serves only non-sensitive summary stats.
+  const OPEN_PATHS = new Set(["/auth/status", "/auth/unlock", "/health", "/widget/stats"]);
   router.use((req, res, next) => {
     if (OPEN_PATHS.has(req.path)) return next();
     if (verifyToken(bearer(req))) return next();
@@ -203,6 +205,35 @@ export function createApiRouter(
 
   router.get("/health", (_req, res) => {
     res.json({ ok: true, service: "lightningmate", version: process.env.APP_VERSION ?? "dev" });
+  });
+
+  // Umbrel home-screen widget (four-stats). Polled by umbreld; cached briefly so
+  // continuous polling doesn't keep re-scanning forwarding history.
+  let widgetCache: { at: number; body: unknown } | null = null;
+  router.get("/widget/stats", async (_req, res) => {
+    if (widgetCache && Date.now() - widgetCache.at < 30_000) {
+      res.json(widgetCache.body);
+      return;
+    }
+    const compact = (n: number) =>
+      n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1_000 ? `${(n / 1_000).toFixed(1)}k` : String(n);
+    try {
+      const [node, flow] = await Promise.all([getNodeSummary(lnd), getFlowSummary(lnd, 30)]);
+      const body = {
+        type: "four-stats",
+        link: "",
+        items: [
+          { title: "Channels", text: String(node.activeChannelsCount), subtext: "active" },
+          { title: "Outbound", text: compact(node.balances.localSats), subtext: "can send" },
+          { title: "Earned", text: compact(flow.totalFeesEarnedSats), subtext: "sat · 30d" },
+          { title: "Forwards", text: String(flow.totalForwards), subtext: "30d" },
+        ],
+      };
+      widgetCache = { at: Date.now(), body };
+      res.json(body);
+    } catch {
+      res.json({ type: "four-stats", link: "", items: [] });
+    }
   });
 
   router.get(
