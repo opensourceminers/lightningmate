@@ -2,7 +2,7 @@ import { getChannels, getChainBalance, type AuthenticatedLnd } from "lightning";
 import { JsonStore } from "../store.js";
 import { closeChannelByOutpoint, openChannelTo } from "./channelOps.js";
 import { createInvoice } from "./payments.js";
-import { acceptOrder, addOrderTransaction, getMyOrders } from "./amboss.js";
+import { acceptOrder, addOrderTransaction, getMyOffers, getMyOrders, updateOffer } from "./amboss.js";
 import { paySaleServiceFee } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestions } from "./suggestions.js";
@@ -58,6 +58,8 @@ export interface AutopilotConfig {
   sellMaxChannelSats: number;
   /** Auto-close sold channels once the lease is over, to reclaim capital. */
   sellAutoClose: boolean;
+  /** Top a depleted offer back up (within the caps) so it keeps taking orders. */
+  sellAutoRelist: boolean;
 }
 
 export interface AutopilotChange {
@@ -88,7 +90,7 @@ export interface AutopilotChannelOpen {
 
 export interface AutopilotSell {
   orderId: string;
-  action: "accept" | "open" | "close" | "skip";
+  action: "accept" | "open" | "close" | "skip" | "relist";
   sizeSats: number;
   ok: boolean;
   transactionId?: string;
@@ -136,6 +138,7 @@ const DEFAULT_CONFIG: AutopilotConfig = {
   sellReserveSats: 50_000,
   sellMaxChannelSats: 5_000_000,
   sellAutoClose: false,
+  sellAutoRelist: false,
 };
 
 const HISTORY_LIMIT = 50;
@@ -389,7 +392,6 @@ export class Autopilot {
     } catch {
       return []; // Amboss unreachable — retry next run
     }
-    if (orders.length === 0) return [];
 
     const key = this.amboss.getKey();
     const out: AutopilotSell[] = [];
@@ -406,6 +408,34 @@ export class Autopilot {
     // one run can't each pass against the same starting balance and collectively
     // blow past the deploy cap or the on-chain reserve.
     let extra = 0;
+
+    // Auto-relist: top a depleted offer back up so it keeps taking orders. Only
+    // acts when an offer has dropped below one max-order, and only within the
+    // on-chain reserve + deploy cap — listing commits no funds, and order
+    // fulfillment re-checks the caps before any channel is actually opened.
+    if (cfg.sellAutoRelist) {
+      try {
+        const offers = await getMyOffers(key);
+        for (const off of offers) {
+          if (off.status !== "ENABLED" || off.totalSizeSats >= off.maxSizeSats) continue;
+          if (off.maxSizeSats > chain_balance - cfg.sellReserveSats) continue;
+          if (off.maxSizeSats > cfg.sellMaxDeploySats - deployed) continue;
+          await updateOffer(key, off.id, {
+            totalSizeSats: off.maxSizeSats,
+            minSizeSats: off.minSizeSats,
+            maxSizeSats: off.maxSizeSats,
+            feeRatePpm: off.feeRatePpm,
+            baseFeeSats: off.baseFeeSats,
+            minBlockLength: off.minBlockLength,
+          });
+          out.push({ orderId: off.id, action: "relist", sizeSats: off.maxSizeSats, ok: true });
+        }
+      } catch {
+        // best-effort — relisting never blocks order fulfillment
+      }
+    }
+
+    if (orders.length === 0) return out;
 
     let myChannels: { transaction_id: string; transaction_vout: number }[] | null = null;
 

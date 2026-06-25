@@ -23,6 +23,13 @@ const median = (arr: number[]): number => {
   return s.length % 2 ? s[mid] : Math.round((s[mid - 1] + s[mid]) / 2);
 };
 
+// q-th percentile (0..1) — used for a competitive "price to sell" suggestion.
+const percentile = (arr: number[], q: number): number => {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.max(0, Math.round(q * (s.length - 1))))];
+};
+
 const FIELDS: { key: keyof Draft; label: string; hint: string }[] = [
   { key: "totalSizeSats", label: "Total (sat)", hint: "total liquidity you'll sell across orders" },
   { key: "minSizeSats", label: "Min channel (sat)", hint: "smallest channel a buyer can order" },
@@ -42,7 +49,7 @@ export function MarketSell() {
   const [error, setError] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [ref, setRef] = useState<{ feeMin: number; feeMed: number; baseMed: number } | null>(null);
+  const [ref, setRef] = useState<{ feeMin: number; feeComp: number; feeMed: number; baseMed: number } | null>(null);
 
   const load = async () => {
     // Live market reference (no key needed) — orientation for your pricing.
@@ -50,7 +57,13 @@ export function MarketSell() {
       const m = await api.ambossMarket();
       const fees = m.offers.map((o) => o.feeRatePpm).filter((n) => n > 0);
       const bases = m.offers.map((o) => o.baseFeeSats).filter((n) => n > 0);
-      if (fees.length) setRef({ feeMin: Math.min(...fees), feeMed: median(fees), baseMed: median(bases) });
+      if (fees.length)
+        setRef({
+          feeMin: Math.min(...fees),
+          feeComp: percentile(fees, 0.25),
+          feeMed: median(fees),
+          baseMed: median(bases),
+        });
     } catch {
       // reference is best-effort
     }
@@ -174,15 +187,25 @@ export function MarketSell() {
       {ref ? (
         <div className="market-ref">
           <span>
-            Market — fee rate <strong>{ref.feeMin} ppm</strong> lowest · <strong>{ref.feeMed} ppm</strong>{" "}
-            median · base fee <strong>{ref.baseMed} sat</strong> median
+            Market — <strong>{ref.feeMin} ppm</strong> lowest · <strong>{ref.feeComp} ppm</strong>{" "}
+            competitive (p25) · <strong>{ref.feeMed} ppm</strong> median · base{" "}
+            <strong>{ref.baseMed} sat</strong>
           </span>
-          <button
-            className="row-btn ghost"
-            onClick={() => setDraft((d) => ({ ...d, feeRatePpm: ref.feeMed, baseFeeSats: ref.baseMed }))}
-          >
-            match median
-          </button>
+          <div className="row-actions">
+            <button
+              className="row-btn"
+              title="Undercut ~75% of the market to win orders"
+              onClick={() => setDraft((d) => ({ ...d, feeRatePpm: ref.feeComp, baseFeeSats: ref.baseMed }))}
+            >
+              price to sell
+            </button>
+            <button
+              className="row-btn ghost"
+              onClick={() => setDraft((d) => ({ ...d, feeRatePpm: ref.feeMed, baseFeeSats: ref.baseMed }))}
+            >
+              match median
+            </button>
+          </div>
         </div>
       ) : null}
 
