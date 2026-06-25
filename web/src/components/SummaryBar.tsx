@@ -15,8 +15,13 @@ export function SummaryBar({ node, price }: { node: NodeSummary; price?: PriceIn
   const { balances } = node;
   const lnTotal = balances.localSats + balances.inboundSats;
   const outboundPct = lnTotal > 0 ? (balances.localSats / lnTotal) * 100 : 0;
+  const inboundPct = 100 - outboundPct;
   const inFiat = (s: number) =>
     price ? fiat(s, price.btcPrice, price.currency) ?? undefined : undefined;
+  const outFiat = inFiat(balances.localSats);
+  const inbFiat = inFiat(balances.inboundSats);
+  const skew = Math.abs(outboundPct - 50);
+  const balanceLabel = lnTotal === 0 ? "no liquidity" : skew <= 10 ? "well balanced" : skew <= 25 ? "slightly skewed" : outboundPct > 50 ? "outbound-heavy" : "inbound-heavy";
 
   return (
     <section className="summary">
@@ -51,12 +56,33 @@ export function SummaryBar({ node, price }: { node: NodeSummary; price?: PriceIn
         />
       </div>
 
-      <div className="liquidity-bar" title={`${outboundPct.toFixed(0)}% outbound`}>
-        <div className="liquidity-out" style={{ width: `${outboundPct}%` }} />
-      </div>
-      <div className="liquidity-legend">
-        <span>◀ outbound {sats(balances.localSats)}</span>
-        <span>inbound {sats(balances.inboundSats)} ▶</span>
+      <div className="liquidity">
+        <div className="liq-labels">
+          <div className="liq-side out">
+            <span className="liq-cap"><span className="liq-dot" />Outbound · can send</span>
+            <span className="liq-amt">{sats(balances.localSats)} <span className="liq-unit">sat</span></span>
+            {outFiat ? <span className="liq-fiat">{outFiat}</span> : null}
+          </div>
+          <div className="liq-side in">
+            <span className="liq-cap">Inbound · can receive<span className="liq-dot" /></span>
+            <span className="liq-amt">{sats(balances.inboundSats)} <span className="liq-unit">sat</span></span>
+            {inbFiat ? <span className="liq-fiat">{inbFiat}</span> : null}
+          </div>
+        </div>
+        <div className="liq-bar" title={`${outboundPct.toFixed(0)}% outbound · ${inboundPct.toFixed(0)}% inbound`}>
+          <div className="liq-out" style={{ width: `${outboundPct}%` }}>
+            {outboundPct >= 12 ? <span>{Math.round(outboundPct)}%</span> : null}
+          </div>
+          <div className="liq-in">
+            {inboundPct >= 12 ? <span>{Math.round(inboundPct)}%</span> : null}
+          </div>
+          <span className="liq-mid" />
+        </div>
+        <div className="liq-foot">
+          <span className="liq-tick">0%</span>
+          <span className={`liq-balance s-${skew <= 10 ? "good" : skew <= 25 ? "ok" : "warn"}`}>{balanceLabel}</span>
+          <span className="liq-tick">100%</span>
+        </div>
       </div>
     </section>
   );
