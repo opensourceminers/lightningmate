@@ -12,20 +12,7 @@ const WINDOWS: { label: string; days: number }[] = [
   { label: "All", days: 36_500 },
 ];
 
-function signed(value: number): string {
-  const s = sats(Math.abs(value));
-  return value < 0 ? `−${s}` : `+${s}`;
-}
-
-function Item({ label, value, kind }: { label: string; value: number; kind: "rev" | "cost" }) {
-  return (
-    <div className="pnl-item">
-      <span className="pnl-item-dot" data-kind={kind} />
-      <span className="pnl-item-label">{label}</span>
-      <span className={`pnl-item-val ${kind}`}>{signed(value)} sat</span>
-    </div>
-  );
-}
+const signed = (v: number): string => (v < 0 ? `−${sats(Math.abs(v))}` : `+${sats(v)}`);
 
 export function PnlOverview({ price }: { price?: PriceInfo | null }) {
   const [days, setDays] = useState(30);
@@ -45,7 +32,17 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
 
   const net = data?.netProfitSats ?? 0;
   const animatedNet = useCountUp(net);
-  const max = data ? Math.max(1, data.routingRevenueSats, data.totalCostSats) : 1;
+
+  const revenue = data?.routingRevenueSats ?? 0;
+  const opens = data?.channelOpenCostSats ?? 0;
+  const rebal = data?.rebalanceCostSats ?? 0;
+  const closes = data?.channelCloseCostSats ?? 0;
+  const totalCost = data?.totalCostSats ?? 0;
+  const max = Math.max(1, revenue, totalCost);
+  const pct = (v: number) => `${(v / max) * 100}%`;
+  const margin = revenue > 0 ? Math.round((net / revenue) * 100) : null;
+  const winLabel = data ? (data.windowDays >= 36_500 ? "all time" : `${data.windowDays}d`) : "";
+  const netFiat = data && price ? fiat(net, price.btcPrice, price.currency) : null;
 
   return (
     <section className="pnl">
@@ -68,45 +65,50 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
 
       {data ? (
         <>
-          <div className="pnl-grid">
-            <div className={`pnl-net ${net >= 0 ? "pos" : "neg"}`}>
-              <div className="pnl-net-label">Net profit</div>
-              <div className="pnl-net-value">{signed(Math.round(animatedNet))} sat</div>
-              {price && fiat(net, price.btcPrice, price.currency) ? (
-                <div className="pnl-net-fiat">≈ {fiat(net, price.btcPrice, price.currency)}</div>
-              ) : null}
-              <div className="pnl-net-sub">
-                {data.forwardCount} forwards · {data.rebalanceCount} rebalances
+          <div className="pnl-hero">
+            <div className="pnl-hero-left">
+              <div className="pnl-net-label">Net profit · {winLabel}</div>
+              <div className={`pnl-net-value ${net >= 0 ? "pos" : "neg"}`}>
+                {signed(Math.round(animatedNet))} <span className="pnl-unit">sat</span>
               </div>
+              {netFiat ? <div className="pnl-net-fiat">≈ {netFiat}</div> : null}
             </div>
-
-            <div className="pnl-items">
-              <Item label="Routing revenue" value={data.routingRevenueSats} kind="rev" />
-              <Item label="Channel opens" value={-data.channelOpenCostSats} kind="cost" />
-              <Item label="Rebalancing" value={-data.rebalanceCostSats} kind="cost" />
-              <Item label="Channel closes" value={-data.channelCloseCostSats} kind="cost" />
+            <div className="pnl-hero-right">
+              {margin !== null ? (
+                <span className={`pnl-margin ${net >= 0 ? "pos" : "neg"}`}>
+                  {margin >= 0 ? "+" : "−"}
+                  {Math.abs(margin)}% margin
+                </span>
+              ) : null}
+              <span className="pnl-meta">{data.forwardCount} forwards</span>
+              <span className="pnl-meta">{data.rebalanceCount} rebalances</span>
             </div>
           </div>
 
           <div className="pnl-bars">
             <div className="pnl-bar-row">
-              <span className="pnl-bar-tag">revenue</span>
+              <span className="pnl-bar-tag">Revenue</span>
               <div className="pnl-track">
-                <div
-                  className="pnl-fill rev"
-                  style={{ width: `${(data.routingRevenueSats / max) * 100}%` }}
-                />
+                <div className="pnl-seg rev" style={{ width: pct(revenue) }} />
               </div>
+              <span className="pnl-bar-val rev">{signed(revenue)}</span>
             </div>
             <div className="pnl-bar-row">
-              <span className="pnl-bar-tag">costs</span>
+              <span className="pnl-bar-tag">Costs</span>
               <div className="pnl-track">
-                <div
-                  className="pnl-fill cost"
-                  style={{ width: `${(data.totalCostSats / max) * 100}%` }}
-                />
+                <div className="pnl-seg c-open" style={{ width: pct(opens) }} title={`Channel opens · ${sats(opens)} sat`} />
+                <div className="pnl-seg c-rebal" style={{ width: pct(rebal) }} title={`Rebalancing · ${sats(rebal)} sat`} />
+                <div className="pnl-seg c-close" style={{ width: pct(closes) }} title={`Channel closes · ${sats(closes)} sat`} />
               </div>
+              <span className="pnl-bar-val cost">{totalCost > 0 ? `−${sats(totalCost)}` : "0"}</span>
             </div>
+          </div>
+
+          <div className="pnl-legend">
+            <span className="pnl-leg"><i className="pnl-d rev" />Revenue<b>{sats(revenue)}</b></span>
+            <span className="pnl-leg"><i className="pnl-d c-open" />Opens<b>{sats(opens)}</b></span>
+            <span className="pnl-leg"><i className="pnl-d c-rebal" />Rebalance<b>{sats(rebal)}</b></span>
+            <span className="pnl-leg"><i className="pnl-d c-close" />Closes<b>{sats(closes)}</b></span>
           </div>
 
           {data.otherChainFeesSats > 0 ? (
@@ -116,22 +118,28 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
           ) : null}
         </>
       ) : error ? null : (
-        <div className="pnl-grid">
-          <div className="pnl-net">
-            <Skeleton width={70} height={11} />
-            <div style={{ height: 10 }} />
-            <Skeleton width={150} height={30} />
-            <div style={{ height: 10 }} />
-            <Skeleton width={120} height={10} />
+        <>
+          <div className="pnl-hero">
+            <div className="pnl-hero-left">
+              <Skeleton width={90} height={11} />
+              <div style={{ height: 8 }} />
+              <Skeleton width={170} height={32} />
+              <div style={{ height: 8 }} />
+              <Skeleton width={110} height={11} />
+            </div>
           </div>
-          <div className="pnl-items">
-            {Array.from({ length: 4 }).map((_, i) => (
-              <div key={i} style={{ margin: "9px 0" }}>
-                <Skeleton height={12} />
+          <div className="pnl-bars">
+            {Array.from({ length: 2 }).map((_, i) => (
+              <div className="pnl-bar-row" key={i}>
+                <Skeleton width={56} height={11} />
+                <div style={{ flex: 1 }}>
+                  <Skeleton height={9} radius={6} />
+                </div>
+                <Skeleton width={60} height={11} />
               </div>
             ))}
           </div>
-        </div>
+        </>
       )}
     </section>
   );
