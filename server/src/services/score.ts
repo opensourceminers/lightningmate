@@ -1,4 +1,4 @@
-import { getFeeRates, type AuthenticatedLnd } from "lightning";
+import { getChainBalance, getFeeRates, type AuthenticatedLnd } from "lightning";
 import { getChannelsView } from "./channels.js";
 import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
@@ -21,8 +21,6 @@ export interface NodeScore {
   score: number; // 0..100
   grade: string; // A–F
   categories: ScoreCategory[];
-  /** The category with the most points to gain — what to fix first. */
-  biggestWin: { label: string; hint: string } | null;
   rank: NetworkRank | null;
 }
 
@@ -44,10 +42,11 @@ const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
  * and dead capacity in offline channels, so the score reflects real resilience.
  */
 export async function getNodeScore(lnd: AuthenticatedLnd): Promise<NodeScore> {
-  const [channels, rates, flows, ownKey] = await Promise.all([
+  const [channels, rates, flows, chain, ownKey] = await Promise.all([
     getChannelsView(lnd),
     getFeeRates({ lnd }),
     getFlowSummary(lnd, 30),
+    getChainBalance({ lnd }).catch(() => ({ chain_balance: 0 })),
     getOwnPubkey(lnd),
   ]);
   const rank = await getNetworkRank(lnd, ownKey).catch(() => null);
@@ -112,12 +111,19 @@ export async function getNodeScore(lnd: AuthenticatedLnd): Promise<NodeScore> {
   const activeCapRatio = totalCapacity > 0 ? activeCapacity / totalCapacity : 0;
   const hygiene = clamp01(0.6 * feeHealth + 0.4 * activeCapRatio);
 
+  // ── Reserve ── on-chain sats to fee-bump force-closes and fund new channels.
+  const onchain = chain.chain_balance ?? 0;
+  const reserveTarget = Math.max(250_000, active.length * 50_000);
+  const reserveScore = clamp01(onchain / reserveTarget);
+  const onchainStr =
+    onchain >= 1_000_000 ? `${(onchain / 1_000_000).toFixed(1)}M` : `${Math.round(onchain / 1000)}k`;
+
   const categories: ScoreCategory[] = [
     {
       key: "liquidity",
       label: "Liquidity",
       score: liquidity,
-      weight: 0.22,
+      weight: 0.2,
       detail: `${Math.round(routable * 100)}% of channels route both ways`,
       hint: lopsided
         ? `Rebalance ${lopsided} lopsided channel${lopsided === 1 ? "" : "s"} so they can route both directions.`
@@ -127,7 +133,7 @@ export async function getNodeScore(lnd: AuthenticatedLnd): Promise<NodeScore> {
       key: "connectivity",
       label: "Connectivity",
       score: connectivity,
-      weight: 0.22,
+      weight: 0.2,
       detail: rank
         ? `top ${Math.max(1, Math.round((1 - rank.percentile) * 100))}% · ${effectivePeers.toFixed(1)} effective peers`
         : `${effectivePeers.toFixed(1)} effective peers`,
@@ -137,7 +143,7 @@ export async function getNodeScore(lnd: AuthenticatedLnd): Promise<NodeScore> {
       key: "scale",
       label: "Scale",
       score: scale,
-      weight: 0.18,
+      weight: 0.15,
       detail: `${active.length} channel${active.length === 1 ? "" : "s"} · ${btc} BTC`,
       hint: `Open a few more well-connected channels (target 8+) to grow reach.`,
     },
@@ -145,7 +151,7 @@ export async function getNodeScore(lnd: AuthenticatedLnd): Promise<NodeScore> {
       key: "earnings",
       label: "Earnings",
       score: earnings,
-      weight: 0.22,
+      weight: 0.2,
       detail: `${flows.totalForwards} forwards · ~${Math.round(monthlyPpm)} ppm/mo`,
       hint: `Lower fees on idle channels or add inbound so they start routing.`,
     },
@@ -153,19 +159,21 @@ export async function getNodeScore(lnd: AuthenticatedLnd): Promise<NodeScore> {
       key: "hygiene",
       label: "Hygiene",
       score: hygiene,
-      weight: 0.16,
+      weight: 0.13,
       detail: `${sane}/${active.length} sane fees · ${Math.round(activeCapRatio * 100)}% capacity online`,
       hint: `Set sensible outbound fees on the rest and clear out dead channels.`,
+    },
+    {
+      key: "reserve",
+      label: "Reserve",
+      score: reserveScore,
+      weight: 0.12,
+      detail: `${onchainStr} sat on-chain`,
+      hint: `Keep on-chain sats to fee-bump force-closes and fund new channels.`,
     },
   ];
 
   const score = Math.round(categories.reduce((s, c) => s + c.score * c.weight, 0) * 100);
 
-  // Biggest win: the category with the most weighted points still on the table.
-  const weak = [...categories]
-    .filter((c) => c.score < 0.7)
-    .sort((a, b) => b.weight * (1 - b.score) - a.weight * (1 - a.score))[0];
-  const biggestWin = weak ? { label: weak.label, hint: weak.hint } : null;
-
-  return { score, grade: grade(score), categories, biggestWin, rank };
+  return { score, grade: grade(score), categories, rank };
 }

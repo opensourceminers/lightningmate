@@ -83,7 +83,7 @@ export function HealthScore() {
 
             <div className="score-cats">
               {data.categories.map((c) => (
-                <div className="cat-row" key={c.key}>
+                <div className="cat-row" key={c.key} title={c.hint}>
                   <div className="cat-head">
                     <span className="cat-label">{c.label}</span>
                     <span className="cat-detail">{c.detail}</span>
@@ -98,21 +98,12 @@ export function HealthScore() {
               ))}
             </div>
           </div>
-
-          {data.biggestWin ? (
-            <div className="biggest-win">
-              <span className="bw-icon">▲</span>
-              <span>
-                <strong>Biggest win — {data.biggestWin.label}:</strong> {data.biggestWin.hint}
-              </span>
-            </div>
-          ) : null}
         </>
       ) : error ? null : (
         <div className="score-body">
           <Skeleton width={120} height={120} radius={60} />
           <div className="score-cats">
-            {Array.from({ length: 5 }).map((_, i) => (
+            {Array.from({ length: 6 }).map((_, i) => (
               <div className="cat-row" key={i}>
                 <div className="cat-head">
                   <Skeleton width={80} height={11} />

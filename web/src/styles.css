@@ -207,31 +207,41 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .seg-btn.active { background: var(--accent); color: #1a1205; }
 .seg-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.pnl-grid { display: grid; grid-template-columns: 220px 1fr; gap: 22px; align-items: center; }
+.pnl-hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
 .pnl-net-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
-.pnl-net-value { font-size: 30px; font-weight: 800; letter-spacing: -0.5px; margin: 3px 0; font-variant-numeric: tabular-nums; }
-.pnl-net.pos .pnl-net-value { color: var(--green); }
-.pnl-net.neg .pnl-net-value { color: var(--red); }
-.pnl-net-sub { font-size: 12px; color: var(--faint); }
+.pnl-net-value { font-size: 32px; font-weight: 800; letter-spacing: -0.5px; margin: 3px 0; font-variant-numeric: tabular-nums; }
+.pnl-net-value.pos { color: var(--green); }
+.pnl-net-value.neg { color: var(--red); }
+.pnl-unit { font-size: 15px; font-weight: 600; color: var(--muted); }
+.pnl-net-fiat { font-size: 13px; color: var(--muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
+.pnl-hero-right { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+.pnl-margin { font-size: 12px; font-weight: 700; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line-soft); }
+.pnl-margin.pos { color: var(--green); background: rgba(52, 211, 153, 0.1); border-color: rgba(52, 211, 153, 0.3); }
+.pnl-margin.neg { color: #ff9b9b; background: rgba(248, 113, 113, 0.1); border-color: rgba(248, 113, 113, 0.3); }
+.pnl-meta { font-size: 11.5px; color: var(--faint); }
 
-.pnl-items { display: grid; grid-template-columns: 1fr 1fr; gap: 9px 24px; }
-.pnl-item { display: flex; align-items: center; gap: 9px; font-size: 13px; }
-.pnl-item-dot { width: 9px; height: 9px; border-radius: 3px; flex: none; }
-.pnl-item-dot[data-kind="rev"] { background: var(--green); }
-.pnl-item-dot[data-kind="cost"] { background: var(--red); }
-.pnl-item-label { color: var(--muted); }
-.pnl-item-val { margin-left: auto; font-variant-numeric: tabular-nums; font-weight: 600; }
-.pnl-item-val.rev { color: var(--green); }
-.pnl-item-val.cost { color: #ffa3a3; }
+.pnl-bars { margin-top: 16px; display: flex; flex-direction: column; gap: 9px; }
+.pnl-bar-row { display: flex; align-items: center; gap: 11px; }
+.pnl-bar-tag { width: 56px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; flex: none; }
+.pnl-track { flex: 1; display: flex; height: 9px; background: var(--panel-3); border-radius: 6px; overflow: hidden; }
+.pnl-seg { height: 100%; transition: width 0.5s ease; }
+.pnl-seg.rev { background: linear-gradient(90deg, #1f9d6b, var(--green)); border-radius: 6px; }
+.pnl-seg.c-open { background: var(--accent); }
+.pnl-seg.c-rebal { background: #fbbf24; }
+.pnl-seg.c-close { background: #ff7a7a; }
+.pnl-bar-val { width: 84px; text-align: right; font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; flex: none; }
+.pnl-bar-val.rev { color: var(--green); }
+.pnl-bar-val.cost { color: #ffa3a3; }
 
-.pnl-bars { margin-top: 16px; display: flex; flex-direction: column; gap: 7px; }
-.pnl-bar-row { display: flex; align-items: center; gap: 10px; }
-.pnl-bar-tag { width: 56px; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
-.pnl-track { flex: 1; height: 9px; background: var(--panel-3); border-radius: 6px; overflow: hidden; }
-.pnl-fill { height: 100%; border-radius: 6px; transition: width 0.5s ease; }
-.pnl-fill.rev { background: linear-gradient(90deg, #1f9d6b, var(--green)); }
-.pnl-fill.cost { background: linear-gradient(90deg, #c2453f, var(--red)); }
-.pnl-foot { font-size: 12px; margin: 12px 0 0; }
+.pnl-legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 13px; }
+.pnl-leg { display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); }
+.pnl-leg b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.pnl-d { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+.pnl-d.rev { background: var(--green); }
+.pnl-d.c-open { background: var(--accent); }
+.pnl-d.c-rebal { background: #fbbf24; }
+.pnl-d.c-close { background: #ff7a7a; }
+.pnl-foot { font-size: 12px; margin: 13px 0 0; }
 
 /* ── Hero row: health score + live feed ──────────────────── */
 .hero-row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-bottom: 20px; align-items: stretch; }
@@ -239,8 +249,6 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
    so the second tile isn't pushed 18px down within the grid */
 .app .hero-row > .panel,
 .app .hero-row > .pnl { margin: 0; height: 100%; display: flex; flex-direction: column; }
-/* P&L sits in a half-width tile here, so stack net over the breakdown. */
-.hero-row .pnl-grid { display: flex; flex-direction: column; gap: 14px; }
 
 /* Health score */
 .rank-badge {
@@ -274,13 +282,6 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 }
 .cat-track { height: 7px; background: var(--panel-3); border-radius: 5px; overflow: hidden; }
 .cat-fill { height: 100%; border-radius: 5px; transition: width 0.6s ease, background 0.4s ease; }
-.biggest-win {
-  display: flex; gap: 9px; align-items: flex-start; margin-top: 16px; padding: 10px 13px;
-  background: rgba(247, 147, 26, 0.08); border: 1px solid rgba(247, 147, 26, 0.22);
-  border-radius: 10px; font-size: 12px; line-height: 1.45;
-}
-.bw-icon { color: var(--accent); font-size: 10px; margin-top: 2px; flex: none; }
-.biggest-win strong { color: var(--text); font-weight: 700; }
 
 /* Live feed */
 .live-state { font-size: 11px; font-weight: 700; letter-spacing: 1px; padding: 2px 10px; border-radius: 999px; vertical-align: middle; }
@@ -702,8 +703,6 @@ table { width: 100%; border-collapse: collapse; }
   .app { padding: 18px 16px 48px; }
   .stats { grid-template-columns: repeat(2, 1fr); }
   .brand-sub { display: none; }
-  .pnl-grid { grid-template-columns: 1fr; gap: 16px; }
-  .pnl-items { grid-template-columns: 1fr; }
   .report-stats { grid-template-columns: repeat(2, 1fr); }
   .hero-row { grid-template-columns: 1fr; }
 }

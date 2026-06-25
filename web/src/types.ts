@@ -523,7 +523,6 @@ export interface NodeScore {
   score: number;
   grade: string;
   categories: ScoreCategory[];
-  biggestWin: { label: string; hint: string } | null;
   rank: NetworkRank | null;
 }
 
