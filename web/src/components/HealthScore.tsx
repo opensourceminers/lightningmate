@@ -4,13 +4,19 @@ import type { NodeScore } from "../types";
 import { useCountUp } from "../useCountUp";
 import { Skeleton } from "./Skeleton";
 
-const GRADE_CLASS: Record<string, string> = {
-  A: "g-a",
-  B: "g-b",
-  C: "g-c",
-  D: "g-d",
-  F: "g-f",
+const GRADE_COLOR: Record<string, string> = {
+  A: "#34d399",
+  B: "#5eead4",
+  C: "#f7931a",
+  D: "#fdba74",
+  F: "#ff7a7a",
 };
+
+// Colour each category bar by its own score so weak spots stand out.
+const barColor = (s: number) => (s >= 0.7 ? "#34d399" : s >= 0.4 ? "#f7931a" : "#ff7a7a");
+
+const R = 52;
+const CIRC = 2 * Math.PI * R;
 
 export function HealthScore() {
   const [data, setData] = useState<NodeScore | null>(null);
@@ -32,6 +38,7 @@ export function HealthScore() {
   }, []);
 
   const animated = useCountUp(data?.score ?? 0);
+  const color = data ? GRADE_COLOR[data.grade] ?? "#f7931a" : "#f7931a";
 
   return (
     <section className="panel score">
@@ -47,32 +54,71 @@ export function HealthScore() {
       {error ? <p className="banner error">{error}</p> : null}
 
       {data ? (
-        <div className="score-body">
-          <div className={`grade ${GRADE_CLASS[data.grade] ?? "g-c"}`}>
-            <span className="grade-letter">{data.grade}</span>
-            <span className="grade-num">{Math.round(animated)}</span>
-          </div>
-          <div className="score-components">
-            {data.components.map((c) => (
-              <div className="score-row" key={c.key} title={c.detail}>
-                <span className="score-label">{c.label}</span>
-                <div className="score-track">
-                  <div className="score-fill" style={{ width: `${Math.round(c.score * 100)}%` }} />
-                </div>
-                <span className="score-pct">{Math.round(c.score * 100)}</span>
+        <>
+          <div className="score-body">
+            <div className="score-ring-wrap">
+              <svg viewBox="0 0 120 120" className="score-ring">
+                <circle cx="60" cy="60" r={R} className="ring-track" />
+                <circle
+                  cx="60"
+                  cy="60"
+                  r={R}
+                  className="ring-fill"
+                  style={{
+                    stroke: color,
+                    strokeDasharray: CIRC,
+                    strokeDashoffset: CIRC * (1 - animated / 100),
+                  }}
+                />
+              </svg>
+              <div className="ring-center">
+                <span className="ring-num" style={{ color }}>
+                  {Math.round(animated)}
+                </span>
+                <span className="ring-grade" style={{ color }}>
+                  Grade {data.grade}
+                </span>
               </div>
-            ))}
+            </div>
+
+            <div className="score-cats">
+              {data.categories.map((c) => (
+                <div className="cat-row" key={c.key}>
+                  <div className="cat-head">
+                    <span className="cat-label">{c.label}</span>
+                    <span className="cat-detail">{c.detail}</span>
+                  </div>
+                  <div className="cat-track">
+                    <div
+                      className="cat-fill"
+                      style={{ width: `${Math.round(c.score * 100)}%`, background: barColor(c.score) }}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
+
+          {data.biggestWin ? (
+            <div className="biggest-win">
+              <span className="bw-icon">▲</span>
+              <span>
+                <strong>Biggest win — {data.biggestWin.label}:</strong> {data.biggestWin.hint}
+              </span>
+            </div>
+          ) : null}
+        </>
       ) : error ? null : (
         <div className="score-body">
-          <Skeleton width={92} height={92} radius={16} />
-          <div className="score-components">
-            {Array.from({ length: 8 }).map((_, i) => (
-              <div className="score-row" key={i}>
-                <Skeleton width={90} height={10} />
-                <Skeleton height={8} />
-                <Skeleton width={20} height={10} />
+          <Skeleton width={120} height={120} radius={60} />
+          <div className="score-cats">
+            {Array.from({ length: 5 }).map((_, i) => (
+              <div className="cat-row" key={i}>
+                <div className="cat-head">
+                  <Skeleton width={80} height={11} />
+                  <Skeleton width={120} height={10} />
+                </div>
+                <Skeleton height={7} radius={5} />
               </div>
             ))}
           </div>
