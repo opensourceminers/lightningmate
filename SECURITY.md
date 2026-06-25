@@ -11,10 +11,9 @@ security@opensourceminers.de (please don't open a public issue first).
   a write-capable macaroon.
 - **Minimal outbound traffic.** Beyond LND, outbound calls happen only for
   features you use: the optional fiat price lookup (mempool.space) when a
-  currency is set; the Amboss Magma marketplace (api.amboss.space /
-  magma.amboss.tech) when you add an Amboss API key; and — on the community
-  build — resolving the service-fee Lightning Address (LNURL) when a Magma sale
-  completes. Nothing else leaves your node.
+  currency is set, and the Amboss Magma marketplace (api.amboss.space /
+  magma.amboss.tech) when you add an Amboss API key. Nothing else leaves your
+  node.
 - **Secrets** (`tls.cert`, macaroons) are read from the mounted LND data dir at
   runtime — never baked into the image, committed to git, or logged.
 - **Dependencies** are pinned and `npm audit` is kept at 0 known vulnerabilities
