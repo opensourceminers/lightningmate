@@ -252,7 +252,7 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 
 /* Right column: three stacked tiles, spread to match the tall left tile. */
 .app .hero-row > .stack-col { height: 100%; }
-.stack-col { display: flex; flex-direction: column; gap: 18px; justify-content: space-between; }
+.stack-col { display: flex; flex-direction: column; gap: 18px; }
 .app .hero-row .stack-col > .panel { margin: 0; }
 .panel.mini { padding: 15px 18px; }
 .panel.mini .panel-head { margin-bottom: 11px; }

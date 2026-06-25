@@ -35,6 +35,7 @@ export interface DashboardData {
     fees: boolean;
     rebalance: boolean;
     channel: boolean;
+    sell: boolean;
     lastRunAt: string | null;
     lastApplied: number;
     lastAttempted: number;
@@ -47,7 +48,7 @@ interface RebalanceSummary {
 }
 
 interface AutopilotState {
-  config: { enabled: boolean; rebalanceEnabled: boolean; channelEnabled: boolean };
+  config: { enabled: boolean; rebalanceEnabled: boolean; channelEnabled: boolean; sellEnabled: boolean };
   lastRunAt: string | null;
   history: { applied: number; attempted: number }[];
 }
@@ -116,6 +117,7 @@ export function buildDashboard(
       fees: autopilot.config.enabled,
       rebalance: autopilot.config.rebalanceEnabled,
       channel: autopilot.config.channelEnabled,
+      sell: autopilot.config.sellEnabled,
       lastRunAt: autopilot.lastRunAt,
       lastApplied: last?.applied ?? 0,
       lastAttempted: last?.attempted ?? 0,

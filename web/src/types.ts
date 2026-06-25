@@ -497,6 +497,7 @@ export interface DashboardData {
     fees: boolean;
     rebalance: boolean;
     channel: boolean;
+    sell: boolean;
     lastRunAt: string | null;
     lastApplied: number;
     lastAttempted: number;
