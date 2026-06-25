@@ -14,9 +14,12 @@ RUN npm run build
 # ── runtime stage: production deps + built artifacts only ─────────────────────
 FROM node:22-alpine AS runtime
 WORKDIR /app
+# Stamped from the git tag by CI (see build-image.yml); surfaced at /health.
+ARG APP_VERSION=dev
 ENV NODE_ENV=production \
     PORT=3001 \
-    WEB_DIR=/app/web/dist
+    WEB_DIR=/app/web/dist \
+    APP_VERSION=$APP_VERSION
 
 # Production dependencies only (drops tsx/typescript/vite). Hoisted to /app.
 COPY package.json package-lock.json ./

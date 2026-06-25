@@ -202,7 +202,7 @@ export function createApiRouter(
   });
 
   router.get("/health", (_req, res) => {
-    res.json({ ok: true, service: "lightningmate", version: "0.1.0" });
+    res.json({ ok: true, service: "lightningmate", version: process.env.APP_VERSION ?? "dev" });
   });
 
   router.get(
