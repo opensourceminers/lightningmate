@@ -102,13 +102,13 @@ export function AutopilotPanel() {
   const [advanced, setAdvanced] = useState(false);
   const [lastRun, setLastRun] = useState<AutopilotRun | null>(null);
   const [error, setError] = useState<string | null>(null);
-  // Expanded history runs, keyed by timestamp (stable across the 15s refresh).
-  const [openRuns, setOpenRuns] = useState<Set<string>>(new Set());
-  const toggleRun = (at: string) =>
-    setOpenRuns((s) => {
+  // Expanded failed actions, keyed by `runAt:index` (stable across the 15s refresh).
+  const [openItems, setOpenItems] = useState<Set<string>>(new Set());
+  const toggleItem = (key: string) =>
+    setOpenItems((s) => {
       const n = new Set(s);
-      if (n.has(at)) n.delete(at);
-      else n.add(at);
+      if (n.has(key)) n.delete(key);
+      else n.add(key);
       return n;
     });
 
@@ -349,7 +349,6 @@ export function AutopilotPanel() {
       ) : (
         <ul className="ap-history">
           {server.history.map((run, i) => {
-            const open = openRuns.has(run.at);
             const items: { ok: boolean; label: string; error?: string }[] = [
               ...(run.changes ?? []).map((c) => ({
                 ok: c.ok,
@@ -374,30 +373,34 @@ export function AutopilotPanel() {
             ];
             return (
               <li key={`${run.at}-${i}`}>
-                <button className="ap-run-head" onClick={() => toggleRun(run.at)}>
-                  <span className="ap-run-when">
-                    <span className="ap-caret">{open ? "▾" : "▸"}</span>
-                    {timeAgo(run.at)}
-                  </span>
+                <div className="ap-run-head">
+                  <span>{timeAgo(run.at)}</span>
                   <span className="muted">
                     {run.applied} applied
                     {run.failed ? <span className="ap-fail-count"> · {run.failed} failed</span> : null}
                   </span>
-                </button>
-                {open ? (
-                  <div className="ap-run-detail">
-                    {items.length === 0 ? (
-                      <span className="muted">No actions in this run.</span>
-                    ) : (
-                      items.map((it, j) => (
-                        <div key={j} className={`ap-item ${it.ok ? "" : "fail"}`}>
-                          <span>
-                            {it.ok ? "✓" : "✗"} {it.label}
-                          </span>
-                          {!it.ok && it.error ? <span className="ap-err-msg">{it.error}</span> : null}
+                </div>
+                {items.length ? (
+                  <div className="ap-run-items">
+                    {items.map((it, j) => {
+                      const key = `${run.at}:${j}`;
+                      const expandable = !it.ok && !!it.error;
+                      const isOpen = openItems.has(key);
+                      return (
+                        <div key={j} className="ap-line">
+                          {expandable ? (
+                            <button className="ap-line-btn" onClick={() => toggleItem(key)}>
+                              <span className="ap-caret">{isOpen ? "▾" : "▸"}</span>✗ {it.label}
+                            </button>
+                          ) : (
+                            <span className={it.ok ? "ap-line-ok" : "ap-line-fail"}>
+                              {it.ok ? "✓" : "✗"} {it.label}
+                            </span>
+                          )}
+                          {expandable && isOpen ? <div className="ap-err-msg">{it.error}</div> : null}
                         </div>
-                      ))
-                    )}
+                      );
+                    })}
                   </div>
                 ) : null}
               </li>
