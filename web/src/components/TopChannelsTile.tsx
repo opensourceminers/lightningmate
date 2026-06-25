@@ -4,7 +4,7 @@ import type { ChannelForwardStat } from "../types";
 import { sats } from "../format";
 import { Sparkline } from "./Sparkline";
 
-export function TopChannelsTile() {
+export function TopChannelsTile({ onOpen }: { onOpen?: () => void }) {
   const [rows, setRows] = useState<ChannelForwardStat[] | null>(null);
 
   useEffect(() => {
@@ -31,10 +31,18 @@ export function TopChannelsTile() {
   }, []);
 
   return (
-    <section className="panel mini">
+    <section
+      className="panel mini clickable"
+      onClick={onOpen}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onOpen?.()}
+      title="Open routing report"
+    >
       <div className="panel-head">
         <h2>Top channels</h2>
         <span className="mini-tag">30d · earned</span>
+        <span className="tile-go" aria-hidden>↗</span>
       </div>
       {rows === null ? (
         <p className="muted empty">Loading…</p>

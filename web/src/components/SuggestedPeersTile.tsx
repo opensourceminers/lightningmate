@@ -5,7 +5,7 @@ import { satsCompact } from "../format";
 
 const scoreClass = (s: number) => (s >= 75 ? "good" : s >= 50 ? "ok" : "low");
 
-export function SuggestedPeersTile() {
+export function SuggestedPeersTile({ onOpen }: { onOpen?: () => void }) {
   const [rows, setRows] = useState<ChannelSuggestion[] | null>(null);
 
   useEffect(() => {
@@ -20,10 +20,18 @@ export function SuggestedPeersTile() {
   }, []);
 
   return (
-    <section className="panel mini">
+    <section
+      className="panel mini clickable"
+      onClick={onOpen}
+      role="button"
+      tabIndex={0}
+      onKeyDown={(e) => (e.key === "Enter" || e.key === " ") && onOpen?.()}
+      title="Open channel suggestions"
+    >
       <div className="panel-head">
         <h2>Suggested peers</h2>
         <span className="mini-tag">to grow reach</span>
+        <span className="tile-go" aria-hidden>↗</span>
       </div>
       {rows === null ? (
         <p className="muted empty">Loading…</p>
