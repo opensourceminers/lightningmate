@@ -9,23 +9,28 @@ security@opensourceminers.de (please don't open a public issue first).
 - **Read-only by default.** Writes (fee changes, rebalancing, opening/closing
   channels, autopilot) are off unless you opt in with `LM_ENABLE_WRITE=true` and
   a write-capable macaroon.
-- **Runs locally.** The only outbound network call is the optional fiat price
-  lookup (mempool.space), and only when you enable a currency. Nothing else
-  leaves your node.
+- **Minimal outbound traffic.** Beyond LND, outbound calls happen only for
+  features you use: the optional fiat price lookup (mempool.space) when a
+  currency is set; the Amboss Magma marketplace (api.amboss.space /
+  magma.amboss.tech) when you add an Amboss API key; and — on the community
+  build — resolving the service-fee Lightning Address (LNURL) when a Magma sale
+  completes. Nothing else leaves your node.
 - **Secrets** (`tls.cert`, macaroons) are read from the mounted LND data dir at
   runtime — never baked into the image, committed to git, or logged.
 - **Dependencies** are pinned and `npm audit` is kept at 0 known vulnerabilities
   (transitive DoS advisories patched via `overrides`).
 
-## Network exposure
+## Network exposure & auth
 
-The API has no built-in login; it relies on its network boundary:
-
-- **Umbrel:** runs behind Umbrel's `app_proxy`, which authenticates the user.
-  The container binds `0.0.0.0` (so app_proxy can reach it) — set via `LM_BIND`.
-- **Standalone/dev:** binds **`127.0.0.1`** by default, so the API is reachable
-  only from the same machine. Don't expose it to a LAN/WAN without putting an
-  authenticating reverse proxy in front.
+- **Umbrel:** the API requires a session token proving the **per-app password**
+  Umbrel generates for the app (`deterministicPassword`, shown when you open it).
+  Other containers share the Docker network, so this stops them from using the
+  API; it also runs behind Umbrel's `app_proxy`. The container binds `0.0.0.0`
+  (so app_proxy can reach it) — set via `LM_BIND`. `$APP_PASSWORD` / `$APP_SEED`
+  are injected by Umbrel and used to verify and sign the session token.
+- **Standalone/dev:** with no `APP_PASSWORD` set it binds **`127.0.0.1`** and
+  runs without a login, so the API is reachable only from the same machine.
+  Don't expose it to a LAN/WAN without an authenticating reverse proxy.
 - **No CORS** is sent, so a malicious web page can't read responses or make
   cross-site JSON requests to the API.
 - `LM_ALLOWED_HOSTS` (comma-separated) optionally pins accepted `Host` headers
@@ -58,6 +63,10 @@ LND_WRITE_MACAROON_PATH: "/lnd/lightningmate.macaroon"
 This still permits rebalancing (which sends payments) and opening/closing
 channels, but excludes admin-only powers like baking further macaroons, message
 signing, and wallet/seed access.
+
+> Note: the optional Amboss sign-in helper (Settings → Sign message) uses LND's
+> message signing, which the macaroon above omits. Add the message-signing
+> permission if you want to use that helper; nothing else in the app needs it.
 
 ## Reducing risk further
 
