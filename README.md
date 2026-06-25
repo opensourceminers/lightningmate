@@ -114,13 +114,6 @@ macaroon is auto-discovered for write mode.
   [`getumbrel/umbrel-apps`](https://github.com/getumbrel/umbrel-apps). See
   [`packaging/umbrel/SUBMISSION.md`](packaging/umbrel/SUBMISSION.md).
 
-## Monetization
-
-The community-store build charges a small, **clearly disclosed 0.5% service fee
-on completed Magma liquidity sales** (a share of the lease fee you earn — never
-added to buyers). It's shown in the Sell tab and configurable via
-`LM_SELL_FEE_BPS` / `LM_SELL_FEE_ADDRESS` (set `LM_SELL_FEE_BPS=0` to disable).
-
 ## License
 
 MIT
