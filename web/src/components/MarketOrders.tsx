@@ -100,8 +100,8 @@ export function MarketOrders() {
       </div>
       <div className="dryrun-banner">
         Orders buyers placed on your offers. <strong>Accept</strong> creates the fee invoice, then{" "}
-        <strong>Open channel</strong> funds the channel to the buyer — you verify each step. (The
-        Autopilot will be able to do this automatically — coming next.)
+        <strong>Open channel</strong> funds the channel to the buyer — you verify each step. The
+        Autopilot can do this automatically (enable <strong>Liquidity provision</strong>).
       </div>
       {error ? <p className="banner error">{error}</p> : null}
 

@@ -2,7 +2,7 @@
   "name": "lightningmate",
   "version": "0.1.0",
   "private": true,
-  "description": "Self-hosted management dashboard for an Umbrel LND Lightning node",
+  "description": "Self-hosted management dashboard & autopilot for an Umbrel LND Lightning node (fees, rebalancing, channels, Amboss Magma liquidity)",
   "workspaces": [
     "server",
     "web"
