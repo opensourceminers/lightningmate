@@ -510,18 +510,20 @@ export interface NetworkRank {
   degree: number;
 }
 
-export interface ScoreComponent {
+export interface ScoreCategory {
   key: string;
   label: string;
   score: number;
   weight: number;
   detail: string;
+  hint: string;
 }
 
 export interface NodeScore {
   score: number;
   grade: string;
-  components: ScoreComponent[];
+  categories: ScoreCategory[];
+  biggestWin: { label: string; hint: string } | null;
   rank: NetworkRank | null;
 }
 
