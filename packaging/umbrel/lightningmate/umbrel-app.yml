@@ -47,3 +47,25 @@ defaultPassword: ""
 deterministicPassword: true
 submitter: opensourceminers
 submission: "https://github.com/getumbrel/umbrel-apps/pull/5783"
+widgets:
+  - id: "stats"
+    type: "four-stats"
+    refresh: "60s"
+    endpoint: "web:3001/api/widget/stats"
+    link: ""
+    example:
+      type: "four-stats"
+      link: ""
+      items:
+        - title: "Channels"
+          text: "25"
+          subtext: "active"
+        - title: "Outbound"
+          text: "55.7M"
+          subtext: "can send"
+        - title: "Earned"
+          text: "1.3k"
+          subtext: "sat · 30d"
+        - title: "Forwards"
+          text: "234"
+          subtext: "30d"
