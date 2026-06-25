@@ -398,9 +398,13 @@ export class Autopilot {
       out.push({ orderId: o.id, action: "skip" as const, sizeSats: o.sizeSats, ok: false, error });
 
     // Capital already committed to currently-open sold channels.
-    let deployed = orders
+    const deployed = orders
       .filter((o) => o.channelId && o.blocksUntilClosable > 0)
       .reduce((s, o) => s + o.sizeSats, 0);
+    // Capital committed during THIS run (accepts + opens) — so multiple orders in
+    // one run can't each pass against the same starting balance and collectively
+    // blow past the deploy cap or the on-chain reserve.
+    let extra = 0;
 
     let myChannels: { transaction_id: string; transaction_vout: number }[] | null = null;
 
@@ -408,9 +412,9 @@ export class Autopilot {
       if (o.status === "WAITING_FOR_SELLER_APPROVAL") {
         if (o.sizeSats > cfg.sellMaxChannelSats) {
           skip(o, "above max channel size");
-        } else if (deployed + o.sizeSats > cfg.sellMaxDeploySats) {
+        } else if (deployed + extra + o.sizeSats > cfg.sellMaxDeploySats) {
           skip(o, "deploy cap reached");
-        } else if (chain_balance - o.sizeSats < cfg.sellReserveSats) {
+        } else if (chain_balance - extra - o.sizeSats < cfg.sellReserveSats) {
           skip(o, "would breach on-chain reserve");
         } else {
           try {
@@ -420,13 +424,18 @@ export class Autopilot {
               expirySec: 49 * 3600,
             });
             await acceptOrder(key, o.id, inv.request);
+            extra += o.sizeSats; // committed — it will need funding when it opens
             out.push({ orderId: o.id, action: "accept", sizeSats: o.sizeSats, ok: true });
           } catch (e) {
             out.push({ orderId: o.id, action: "accept", sizeSats: o.sizeSats, ok: false, error: msg(e) });
           }
         }
       } else if (o.status === "WAITING_FOR_CHANNEL_OPEN") {
-        if (chain_balance - o.sizeSats < cfg.sellReserveSats) {
+        if (deployed + extra + o.sizeSats > cfg.sellMaxDeploySats) {
+          skip(o, "deploy cap reached");
+          continue;
+        }
+        if (chain_balance - extra - o.sizeSats < cfg.sellReserveSats) {
           skip(o, "would breach on-chain reserve");
           continue;
         }
@@ -439,7 +448,7 @@ export class Autopilot {
         if (res.ok && res.transactionId) {
           try {
             await addOrderTransaction(key, o.id, `${res.transactionId}:${res.transactionVout}`);
-            deployed += o.sizeSats;
+            extra += o.sizeSats;
             out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: true, transactionId: res.transactionId });
           } catch (e) {
             out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: false, error: `channel opened but Amboss update failed: ${msg(e)}` });
