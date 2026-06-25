@@ -69,6 +69,9 @@ export function SummaryBar({ node, price }: { node: NodeSummary; price?: PriceIn
             {inbFiat ? <span className="liq-fiat">{inbFiat}</span> : null}
           </div>
         </div>
+        <div className="liq-balance-row">
+          <span className={`liq-balance s-${skew <= 10 ? "good" : skew <= 25 ? "ok" : "warn"}`}>{balanceLabel}</span>
+        </div>
         <div className="liq-bar" title={`${outboundPct.toFixed(0)}% outbound · ${inboundPct.toFixed(0)}% inbound`}>
           <div className="liq-out" style={{ width: `${outboundPct}%` }}>
             {outboundPct >= 12 ? <span>{Math.round(outboundPct)}%</span> : null}
@@ -77,11 +80,6 @@ export function SummaryBar({ node, price }: { node: NodeSummary; price?: PriceIn
             {inboundPct >= 12 ? <span>{Math.round(inboundPct)}%</span> : null}
           </div>
           <span className="liq-mid" />
-        </div>
-        <div className="liq-foot">
-          <span className="liq-tick">0%</span>
-          <span className={`liq-balance s-${skew <= 10 ? "good" : skew <= 25 ? "ok" : "warn"}`}>{balanceLabel}</span>
-          <span className="liq-tick">100%</span>
         </div>
       </div>
     </section>
