@@ -27,6 +27,7 @@ import {
   sendOnchain,
 } from "../services/onchain.js";
 import { closeChannelByOutpoint, openChannelTo } from "../services/channelOps.js";
+import { paySaleServiceFee, saleFeeConfig } from "../services/serviceFee.js";
 import { getBtcPrice } from "../services/price.js";
 import type { SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
@@ -690,7 +691,7 @@ export function createApiRouter(
   // Reads (the marketplace + price) need no key. The key is stored per-install
   // and used later for buying/selling. All behind the app login gate already.
   router.get("/amboss/status", (_req, res) => {
-    res.json({ connected: amboss.hasKey() });
+    res.json({ connected: amboss.hasKey(), saleFeeBps: saleFeeConfig().bps });
   });
 
   router.get(
@@ -1008,6 +1009,13 @@ export function createApiRouter(
       }
       const outpoint = `${opened.transactionId}:${opened.transactionVout}`;
       const added = await addOrderTransaction(amboss.getKey(), id, outpoint);
+      if (added) {
+        // Disclosed service fee on a completed sale — best-effort, never blocks.
+        const fee = await paySaleServiceFee(writeLnd, order.feeSats);
+        if (fee.paid) console.log(`[fee] order ${id}: paid ${fee.sats} sat service fee`);
+        else if (fee.reason && fee.reason !== "disabled" && fee.reason !== "self")
+          console.warn(`[fee] order ${id}: skipped ${fee.sats} sat (${fee.reason})`);
+      }
       res.json({ ok: added, transactionId: opened.transactionId, outpoint });
     }),
   );
