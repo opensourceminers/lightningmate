@@ -528,6 +528,67 @@ export interface NodeScore {
   rank: NetworkRank | null;
 }
 
+export type FeeRecState =
+  | "normal"
+  | "exploring_lower_fee"
+  | "protecting_liquidity"
+  | "recovering_cost"
+  | "close_candidate";
+
+export interface FeeRecMetrics {
+  localRatio: number;
+  targetLocalRatio: number;
+  channelAgeDays: number | null;
+  routedOut14d: number;
+  routedIn14d: number;
+  routedOut30d: number;
+  routedIn30d: number;
+  grossFlow14d: number;
+  netDrain14d: number;
+  grossFlow30d: number;
+  netDrain30d: number;
+  revenue14d: number;
+  revenue30d: number;
+  revenuePpm14d: number | null;
+  revenuePpm30d: number | null;
+  costBasisPpm: number | null;
+  costBasisSource: "rebalance_avg" | "unknown";
+  profitFloorPpm: number | null;
+  peerGate: "ok" | "weak";
+  role: string;
+  isTopEarner: boolean;
+  benchmarkComparison: "above" | "median" | "below";
+}
+
+export interface FeeRecommendation {
+  channelId: string;
+  alias: string;
+  capacity: number;
+  currentPpm: number;
+  targetPpm: number;
+  wouldApply: boolean;
+  blockedByGuards: string[];
+  state: FeeRecState;
+  reasons: string[];
+  metrics: FeeRecMetrics;
+}
+
+export interface NodeBenchmarks {
+  activeChannelCount: number;
+  topGrossFlow14d: number;
+  medianGrossFlow14d: number;
+  topRevenue30d: number;
+  medianRevenue30d: number;
+  topRevenuePpm30d: number;
+  medianRevenuePpm30d: number;
+}
+
+export interface FeeRecReport {
+  generatedAt: string;
+  nodeBenchmarks: NodeBenchmarks;
+  recommendations: FeeRecommendation[];
+}
+
 export interface LiveForward {
   at: string;
   tokens: number;

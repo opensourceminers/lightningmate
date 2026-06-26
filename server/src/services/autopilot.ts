@@ -176,6 +176,14 @@ export class Autopilot {
     return !!this.writeLnd;
   }
 
+  /** Cooldown view for the fee-recommendation dry-run (read-only). */
+  feeCooldown(): { lastApplied: Record<string, string>; cooldownHours: number } {
+    return {
+      lastApplied: this.state.perChannelLastApplied,
+      cooldownHours: this.state.config.cooldownMinutes / 60,
+    };
+  }
+
   /** Public, serializable view for the API. */
   getState() {
     return {

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ForwardsPanel } from "./ForwardsPanel";
+import { FeeRecommendations } from "./FeeRecommendations";
 import { FeesPanel } from "./FeesPanel";
 import { RebalancePanel } from "./RebalancePanel";
 
@@ -20,7 +21,16 @@ export function RoutingPanel() {
           Rebalancing
         </button>
       </div>
-      {sub === "forwards" ? <ForwardsPanel /> : sub === "fees" ? <FeesPanel /> : <RebalancePanel />}
+      {sub === "forwards" ? (
+        <ForwardsPanel />
+      ) : sub === "fees" ? (
+        <>
+          <FeeRecommendations />
+          <FeesPanel />
+        </>
+      ) : (
+        <RebalancePanel />
+      )}
     </div>
   );
 }
