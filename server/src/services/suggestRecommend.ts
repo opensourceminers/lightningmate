@@ -2,6 +2,9 @@ import { type AuthenticatedLnd } from "lightning";
 import { getChannelsView } from "./channels.js";
 import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
+import { getFeeRecommendations, type FeeRecConfig, type FeeRecState } from "./feeRecommend.js";
+import type { RebalanceRecord } from "./rebalanceLog.js";
+import type { OverrideMap } from "./overrides.js";
 import {
   buildGraphCache,
   DEFAULT_SUGGESTION_POLICY,
@@ -97,6 +100,7 @@ export interface SuggestV2Report {
 }
 
 const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
+const k = (n: number) => `${Math.round(n / 1000)}k`;
 function median(values: number[]): number {
   if (values.length === 0) return 0;
   const s = [...values].sort((a, b) => a - b);
@@ -548,4 +552,227 @@ export async function getChannelSuggestionsV2(
       demandCoveragePct,
     },
   };
+}
+
+// ── Close Suggestions v2 ──────────────────────────────────────────────────────
+// Which channels are dead weight worth closing — but honest about whether a close
+// actually frees YOUR capital. You only ever reclaim your *local* balance on close;
+// a channel the peer opened to you frees little (their capital, your small local)
+// and gives up free inbound, so it's judged very differently from one you funded.
+
+export interface CloseSuggestion {
+  channelId: string;
+  alias: string;
+  peerPubkey: string;
+  transactionId: string;
+  transactionVout: number;
+  active: boolean;
+  /** We funded the channel (initiator) — closing returns our committed capital. */
+  weOpened: boolean;
+  capacitySats: number;
+  localSats: number;
+  /** What you'd actually reclaim on-chain on close = your current local balance. */
+  capitalFreedSats: number;
+  /** Inbound liquidity you'd give up (the remote side), free if the peer opened it. */
+  inboundLiquidityLostSats: number;
+  closeScore: number;
+  pnl30dSats: number;
+  pnl60dSats: number;
+  flow60dSats: number;
+  forwards60d: number;
+  ageDays: number | null;
+  reachContribution: number;
+  uniqueReachLost: number;
+  feeV2State: FeeRecState;
+  opportunityCandidates: { alias: string; score: number; sizeSats: number }[];
+  reasons: string[];
+  warnings: string[];
+}
+
+export interface CloseV2Report {
+  windowDays: number;
+  candidates: CloseSuggestion[];
+  protectedCount: number;
+  totalCapitalFreedSats: number;
+}
+
+export async function getCloseSuggestionsV2(
+  lnd: AuthenticatedLnd,
+  rebalanceRecords: RebalanceRecord[],
+  feeConfig: Partial<FeeRecConfig> = {},
+  channelOverrides: OverrideMap = {},
+): Promise<CloseV2Report> {
+  const [channels, ownKey, graph, flow60, feeRep, sugRep] = await Promise.all([
+    getChannelsView(lnd),
+    getOwnPubkey(lnd),
+    buildGraphCache(lnd),
+    getFlowSummary(lnd, 60).catch(() => null),
+    getFeeRecommendations(lnd, rebalanceRecords, null, feeConfig, channelOverrides),
+    getChannelSuggestionsV2(lnd).catch(() => null),
+  ]);
+
+  const now = Date.now();
+  const feeById = new Map(feeRep.recommendations.map((r) => [r.channelId, r]));
+  const flow60ById = new Map((flow60?.perChannel ?? []).map((f) => [f.channelId, f]));
+  const peersSet = new Set(channels.map((c) => c.peerPubkey));
+
+  // 60d revenue percentile is not needed once fee-v2 gives us isTopEarner; we keep
+  // the rebalance-cost lookups window-aware for the P&L.
+  const within = (at: string, days: number) => now - new Date(at).getTime() <= days * 86_400_000;
+  const rebalCost = (channelId: string, days: number) =>
+    rebalanceRecords
+      .filter((r) => r.ok && r.targetId === channelId && within(r.at, days))
+      .reduce((s, r) => s + (r.feeSats ?? 0), 0);
+
+  // Reach cover: how many of our peers reach each 2-hop node. uniqueReach for a
+  // channel = nodes only its peer reaches → what we'd actually lose by closing it.
+  const cover = new Map<string, number>();
+  for (const c of channels) {
+    const ps = graph.stats.get(c.peerPubkey);
+    if (ps) for (const n of ps.neighbors) cover.set(n, (cover.get(n) ?? 0) + 1);
+  }
+  const uniqueReachOf = (peerPubkey: string): number => {
+    const ps = graph.stats.get(peerPubkey);
+    if (!ps) return 0;
+    let u = 0;
+    for (const n of ps.neighbors) if (cover.get(n) === 1 && !peersSet.has(n) && n !== ownKey) u += 1;
+    return u;
+  };
+  const uniqueReachByChan = new Map(channels.map((c) => [c.id, uniqueReachOf(c.peerPubkey)]));
+  const maxUniqueReach = Math.max(1, ...[...uniqueReachByChan.values()]);
+
+  const opportunity = (sugRep?.suggestions ?? []).slice(0, 3).map((s) => ({
+    alias: s.alias,
+    score: s.score,
+    sizeSats: s.recommendedSizeSats,
+  }));
+
+  let protectedCount = 0;
+  const candidates: CloseSuggestion[] = [];
+
+  for (const c of channels) {
+    const fee = feeById.get(c.id);
+    const f60 = flow60ById.get(c.id);
+    const m = fee?.metrics;
+    const routed30 = (m?.routedOut30d ?? 0) + (m?.routedIn30d ?? 0);
+    const routed60 = (f60?.routedOut ?? 0) + (f60?.routedIn ?? 0);
+    const forwards60 = f60?.forwardCount ?? 0;
+    const lifetime = c.totalSent + c.totalReceived;
+    const rev30 = m?.revenue30d ?? 0;
+    const rev60 = f60?.feesEarned ?? 0;
+    const pnl30 = rev30 - rebalCost(c.id, 30);
+    const pnl60 = rev60 - rebalCost(c.id, 60);
+    const ageDays = m?.channelAgeDays ?? null;
+    const uniqueReach = uniqueReachByChan.get(c.id) ?? 0;
+    const reachContribution = uniqueReach / maxUniqueReach;
+    const feeState = fee?.state ?? "normal";
+    const weOpened = c.initiator === "local";
+
+    // ── Protections: never suggest closing these ──
+    let protectedReason: string | null = null;
+    if (channelOverrides[c.id]?.mode === "exclude") protectedReason = "manually protected";
+    else if (ageDays != null && ageDays < 30) protectedReason = "new channel — still in its test period";
+    else if (c.active && routed30 > 0) protectedReason = "routed recently";
+    else if (m?.isTopEarner) protectedReason = "top earner";
+    else if (c.active && reachContribution >= 0.5) protectedReason = "provides significant unique reach";
+    if (protectedReason) {
+      protectedCount += 1;
+      continue;
+    }
+
+    // ── Must have at least one real close signal ──
+    const offline = !c.active;
+    const idle60 = routed60 === 0;
+    const losing = pnl60 < 0;
+    const weak = feeState === "close_candidate" || m?.peerGate === "weak";
+    if (!offline && !idle60 && !losing && !weak) continue;
+
+    // ── Score ──
+    const idleScore = offline ? 1 : idle60 ? 0.8 : routed30 === 0 ? 0.4 : 0;
+    const negPnlScore = pnl60 < 0 ? clamp01(-pnl60 / 5000) : 0;
+    const weakPeerScore = feeState === "close_candidate" ? 1 : offline ? 0.6 : m?.peerGate === "weak" ? 0.5 : 0;
+    const lowReachScore = 1 - reachContribution;
+    // What closing actually returns on-chain to redeploy = our current local balance,
+    // regardless of who opened the channel.
+    const capitalFreed = Math.max(0, c.localBalance);
+    const opportunityScore = clamp01(capitalFreed / 2_000_000);
+    const staleScore = feeState === "close_candidate" || offline ? 0.7 : 0.3;
+    let closeScore = Math.round(
+      100 *
+        (0.28 * idleScore +
+          0.24 * negPnlScore +
+          0.16 * weakPeerScore +
+          0.12 * lowReachScore +
+          0.12 * opportunityScore +
+          0.08 * staleScore),
+    );
+    // Sacrificing far more free inbound than the capital it frees is a poor trade —
+    // demote those (e.g. a peer-opened channel with big inbound but little local).
+    const inboundLossRatio = capitalFreed > 0 ? c.remoteBalance / capitalFreed : c.remoteBalance > 0 ? 10 : 0;
+    if (inboundLossRatio > 3) closeScore = Math.round(closeScore * 0.7);
+
+    // ── Reasons ──
+    const reasons: string[] = [];
+    if (offline) reasons.push("Offline — peer unreachable.");
+    if (idle60 && lifetime === 0) reasons.push("Never routed.");
+    else if (idle60) reasons.push("No forwards in 60d.");
+    if (losing)
+      reasons.push(
+        `Negative P&L: -${Math.round(-pnl60)} sat over 60d (earned ${Math.round(rev60)} - rebalancing ${Math.round(rebalCost(c.id, 60))}).`,
+      );
+    if (feeState === "close_candidate") reasons.push("Fee autopilot flags this peer as a close candidate.");
+    if (reachContribution < 0.15) reasons.push("Adds little unique reach — other channels already cover the same nodes.");
+    if (capitalFreed >= 500_000 && opportunity.length) {
+      reasons.push(
+        `Frees ${k(capitalFreed)} you could redeploy into ${opportunity[0].alias}${opportunity.length > 1 ? ` +${opportunity.length - 1} more` : ""}.`,
+      );
+    }
+    if (reasons.length === 0) reasons.push("Weak, low-value channel.");
+
+    // ── Warnings: be honest about what a close really costs ──
+    const warnings: string[] = [];
+    if (capitalFreed < 0.2 * c.capacity) {
+      warnings.push(`Mostly drained — only ${k(capitalFreed)} returns on-chain (the rest already routed out).`);
+    }
+    if (c.remoteBalance >= 0.3 * c.capacity) {
+      warnings.push(
+        weOpened
+          ? `Closing gives up ${k(c.remoteBalance)} of inbound liquidity.`
+          : `Peer opened this channel — closing gives up ${k(c.remoteBalance)} of free inbound liquidity it provided.`,
+      );
+    }
+
+    candidates.push({
+      channelId: c.id,
+      alias: c.peerAlias,
+      peerPubkey: c.peerPubkey,
+      transactionId: c.transactionId,
+      transactionVout: c.transactionVout,
+      active: c.active,
+      weOpened,
+      capacitySats: c.capacity,
+      localSats: c.localBalance,
+      capitalFreedSats: capitalFreed,
+      inboundLiquidityLostSats: c.remoteBalance,
+      closeScore,
+      pnl30dSats: Math.round(pnl30),
+      pnl60dSats: Math.round(pnl60),
+      flow60dSats: routed60,
+      forwards60d: forwards60,
+      ageDays,
+      reachContribution: Math.round(reachContribution * 100) / 100,
+      uniqueReachLost: uniqueReach,
+      feeV2State: feeState,
+      // Only dangle redeploy candidates when a close actually frees usable capital.
+      opportunityCandidates: capitalFreed >= 500_000 ? opportunity : [],
+      reasons,
+      warnings,
+    });
+  }
+
+  // Offline first, then highest close score.
+  candidates.sort((a, b) => Number(a.active) - Number(b.active) || b.closeScore - a.closeScore);
+  const totalCapitalFreedSats = candidates.reduce((s, c) => s + c.capitalFreedSats, 0);
+
+  return { windowDays: 60, candidates, protectedCount, totalCapitalFreedSats };
 }
