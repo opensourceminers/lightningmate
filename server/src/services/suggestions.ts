@@ -1,6 +1,5 @@
 import { getNetworkGraph, type AuthenticatedLnd } from "lightning";
 import { getChannelsView } from "./channels.js";
-import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
 
 /**
@@ -126,74 +125,6 @@ export async function buildGraphCache(lnd: AuthenticatedLnd): Promise<GraphCache
 
   cache = { at: Date.now(), stats, meta };
   return cache;
-}
-
-// ── Close candidates (channels that aren't pulling their weight) ──────────────
-
-export interface CloseCandidate {
-  channelId: string;
-  alias: string;
-  capacitySats: number;
-  localRatio: number;
-  active: boolean;
-  /** Window stats. */
-  forwards: number;
-  routedSats: number;
-  feesEarnedSats: number;
-  lifetimeRoutedSats: number;
-  transactionId: string;
-  transactionVout: number;
-  reason: string;
-}
-
-/**
- * Channels worth considering for closing: offline peers, channels that never
- * routed, or ones idle for the whole window. Uses routed in+out (not just fees)
- * so inbound "source" channels aren't wrongly flagged. Ranked by idle capital.
- */
-export async function getCloseCandidates(
-  lnd: AuthenticatedLnd,
-  windowDays = 90,
-): Promise<{ windowDays: number; candidates: CloseCandidate[] }> {
-  const [channels, flows] = await Promise.all([
-    getChannelsView(lnd),
-    getFlowSummary(lnd, windowDays),
-  ]);
-  const flowById = new Map(flows.perChannel.map((f) => [f.channelId, f]));
-
-  const candidates: CloseCandidate[] = [];
-  for (const c of channels) {
-    const f = flowById.get(c.id);
-    const routed = (f?.routedOut ?? 0) + (f?.routedIn ?? 0);
-    const lifetime = c.totalSent + c.totalReceived;
-
-    let reason: string | null = null;
-    if (!c.active) reason = "offline — peer unreachable";
-    else if (routed === 0 && lifetime === 0) reason = `never routed · idle ${windowDays}d`;
-    else if (routed === 0) reason = `no routing in ${windowDays}d`;
-    if (!reason) continue;
-
-    candidates.push({
-      channelId: c.id,
-      alias: c.peerAlias,
-      capacitySats: c.capacity,
-      localRatio: c.localRatio,
-      active: c.active,
-      forwards: f?.forwardCount ?? 0,
-      routedSats: routed,
-      feesEarnedSats: f?.feesEarned ?? 0,
-      lifetimeRoutedSats: lifetime,
-      transactionId: c.transactionId,
-      transactionVout: c.transactionVout,
-      reason,
-    });
-  }
-
-  // Offline first, then the most idle capital.
-  candidates.sort(
-    (a, b) => Number(a.active) - Number(b.active) || b.capacitySats - a.capacitySats,
-  );
-  return { windowDays, candidates };
 }
 
 export interface NetworkRank {

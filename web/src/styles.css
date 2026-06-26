@@ -496,6 +496,8 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .sug-bar i { display: block; height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); }
 .sug-bar-val { font-size: 11px; color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
 .sug-warn { color: #e0b341; }
+.sug-badge.warn { color: var(--red); background: rgba(248, 113, 113, 0.1); border-color: rgba(248, 113, 113, 0.25); }
+.close-redeploy { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 8px; }
 
 /* ── Alerts ──────────────────────────────────────────────── */
 .alerts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }

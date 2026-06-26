@@ -11,8 +11,8 @@ import {
   getRebalanceCandidates,
   type RebalancePolicy,
 } from "../services/rebalance.js";
-import { getCloseCandidates, type SuggestionPolicy } from "../services/suggestions.js";
-import { getChannelSuggestionsV2 } from "../services/suggestRecommend.js";
+import { type SuggestionPolicy } from "../services/suggestions.js";
+import { getChannelSuggestionsV2, getCloseSuggestionsV2 } from "../services/suggestRecommend.js";
 import { getPnl } from "../services/pnl.js";
 import { buildDashboard } from "../services/dashboard.js";
 import {
@@ -537,13 +537,18 @@ export function createApiRouter(
     }),
   );
 
-  // Channels worth closing (offline / never routed / idle in the window).
+  // Channels worth closing — demand/P&L/reach-aware, honest about freed capital.
   router.get(
     "/suggestions/close",
-    wrap(async (req, res) => {
-      const days = Number(req.query.days ?? 90);
-      const windowDays = Math.min(365, Math.max(7, Number.isFinite(days) ? days : 90));
-      res.json(await getCloseCandidates(lnd, windowDays));
+    wrap(async (_req, res) => {
+      res.json(
+        await getCloseSuggestionsV2(
+          lnd,
+          rebalanceLog.recent(200),
+          autopilot.feeV2Overrides(),
+          overrides.all(),
+        ),
+      );
     }),
   );
 

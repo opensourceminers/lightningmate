@@ -356,21 +356,34 @@ export interface ChannelSuggestion {
 export interface CloseCandidate {
   channelId: string;
   alias: string;
-  capacitySats: number;
-  localRatio: number;
-  active: boolean;
-  forwards: number;
-  routedSats: number;
-  feesEarnedSats: number;
-  lifetimeRoutedSats: number;
+  peerPubkey: string;
   transactionId: string;
   transactionVout: number;
-  reason: string;
+  active: boolean;
+  weOpened: boolean;
+  capacitySats: number;
+  localSats: number;
+  capitalFreedSats: number;
+  inboundLiquidityLostSats: number;
+  closeScore: number;
+  pnl30dSats: number;
+  pnl60dSats: number;
+  flow60dSats: number;
+  forwards60d: number;
+  ageDays: number | null;
+  reachContribution: number;
+  uniqueReachLost: number;
+  feeV2State: string;
+  opportunityCandidates: { alias: string; score: number; sizeSats: number }[];
+  reasons: string[];
+  warnings: string[];
 }
 
 export interface CloseCandidatesResponse {
   windowDays: number;
   candidates: CloseCandidate[];
+  protectedCount: number;
+  totalCapitalFreedSats: number;
 }
 
 export interface OpenChannelResult {
