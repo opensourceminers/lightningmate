@@ -80,7 +80,7 @@ export interface RebalanceAnalysis {
  * the real cost and whether liquidity is actually there is only known when you
  * run the rebalance. Shown as guidance; the user decides (Thunderhub-style).
  */
-async function estimateCost(
+export async function estimateCost(
   lnd: AuthenticatedLnd,
   ownKey: string,
   source: ChannelView,
