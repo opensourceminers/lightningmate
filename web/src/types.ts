@@ -170,6 +170,7 @@ export interface AutopilotConfig {
   sellMaxChannelSats: number;
   sellAutoClose: boolean;
   sellAutoRelist: boolean;
+  sellAutoReprice: boolean;
 }
 
 export interface AutopilotChange {

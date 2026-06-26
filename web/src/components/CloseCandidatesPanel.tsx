@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
-import type { CloseCandidate, CloseCandidatesResponse } from "../types";
+import type { CloseCandidate, CloseCandidatesResponse, MagmaV2Report } from "../types";
 import { satsCompact } from "../format";
 import { useUi } from "./Overlay";
 import { EmptyState } from "./Skeleton";
@@ -12,6 +12,7 @@ export function CloseCandidatesPanel() {
   const [data, setData] = useState<CloseCandidatesResponse | null>(null);
   const [closingId, setClosingId] = useState<string | null>(null);
   const [canWrite, setCanWrite] = useState(false);
+  const [magma, setMagma] = useState<MagmaV2Report | null>(null);
   const [open, setOpen] = useState<Set<string>>(new Set());
   const toggle = (id: string) =>
     setOpen((s) => {
@@ -26,6 +27,7 @@ export function CloseCandidatesPanel() {
   useEffect(() => {
     void load();
     api.autopilotGet().then((s) => setCanWrite(s.canWrite)).catch(() => setCanWrite(false));
+    api.magmaRecommendations().then(setMagma).catch(() => {});
   }, []);
 
   const closeChannel = async (c: CloseCandidate) => {
@@ -75,6 +77,15 @@ export function CloseCandidatesPanel() {
         and a channel the peer opened to you gives up free inbound.
         {canWrite ? null : <> Closing is <strong>disabled</strong> (read-only).</>}
       </div>
+
+      {data && data.totalCapitalFreedSats > 0 && magma?.sell.recommendations[0]?.economics.beatsRouting && magma.sell.state !== "not_recommended_node_needs_inbound" ? (
+        <div className="magma-crosslink">
+          💡 Closing these frees ~{satsCompact(data.totalCapitalFreedSats)} — Magma leasing currently yields ~
+          {magma.sell.recommendations[0].economics.leaseApy}% APY vs ~
+          {(magma.sell.adjustedRoutingPpmPerYear / 10000).toFixed(2)}% routing. Consider listing freed capital on Magma
+          (Market → Sell).
+        </div>
+      ) : null}
 
       {rows.length === 0 ? (
         <EmptyState icon="✅">Nothing to close — every channel is earning, reachable or strategic.</EmptyState>

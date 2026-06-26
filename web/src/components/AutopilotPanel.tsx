@@ -250,6 +250,10 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
           <h3 className="sub">Caps</h3>
           <div className="policy-controls">{numFields(SELL_NUM_FIELDS)}</div>
           <label className="check ap-check">
+            <input type="checkbox" checked={draft.sellAutoReprice} onChange={(e) => setBool("sellAutoReprice", e.target.checked)} />
+            Auto-price the offer competitively (Magma v2 — only when leasing beats routing, max once/day)
+          </label>
+          <label className="check ap-check">
             <input type="checkbox" checked={draft.sellAutoClose} onChange={(e) => setBool("sellAutoClose", e.target.checked)} />
             Auto-close channels after the lease ends (reclaim the capital on-chain)
           </label>

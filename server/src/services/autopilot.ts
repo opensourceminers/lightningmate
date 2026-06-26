@@ -6,6 +6,7 @@ import { acceptOrder, addOrderTransaction, getMyOffers, getMyOrders, updateOffer
 import { paySaleServiceFee } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
+import { getMagmaRecommendations, type MagmaSellRecommendation } from "./magmaRecommend.js";
 import {
   applyFees,
   DEFAULT_POLICY,
@@ -56,6 +57,9 @@ export interface AutopilotConfig {
   sellAutoClose: boolean;
   /** Top a depleted offer back up (within the caps) so it keeps taking orders. */
   sellAutoRelist: boolean;
+  /** Auto-tune the offer price to the Magma v2 recommendation (competitive +
+   *  profit-aware), instead of leaving it static. Respects a daily cooldown. */
+  sellAutoReprice: boolean;
 }
 
 export interface AutopilotChange {
@@ -86,7 +90,7 @@ export interface AutopilotChannelOpen {
 
 export interface AutopilotSell {
   orderId: string;
-  action: "accept" | "open" | "close" | "skip" | "relist";
+  action: "accept" | "open" | "close" | "skip" | "relist" | "reprice";
   sizeSats: number;
   ok: boolean;
   transactionId?: string;
@@ -110,6 +114,7 @@ interface PersistedState {
   perChannelLastApplied: Record<string, string>;
   perTargetLastRebalanced: Record<string, string>;
   lastChannelOpenAt: string | null;
+  lastSellRepriceAt: string | null;
   history: AutopilotRun[];
 }
 
@@ -135,6 +140,7 @@ const DEFAULT_CONFIG: AutopilotConfig = {
   sellMaxChannelSats: 5_000_000,
   sellAutoClose: false,
   sellAutoRelist: false,
+  sellAutoReprice: true,
 };
 
 const HISTORY_LIMIT = 50;
@@ -160,6 +166,7 @@ export class Autopilot {
       perChannelLastApplied: {},
       perTargetLastRebalanced: {},
       lastChannelOpenAt: null,
+      lastSellRepriceAt: null,
       history: [],
     });
     // Merge in any newly added config defaults from older persisted state.
@@ -435,29 +442,76 @@ export class Autopilot {
     // blow past the deploy cap or the on-chain reserve.
     let extra = 0;
 
-    // Auto-relist: top a depleted offer back up so it keeps taking orders. Only
-    // acts when an offer has dropped below one max-order, and only within the
-    // on-chain reserve + deploy cap — listing commits no funds, and order
-    // fulfillment re-checks the caps before any channel is actually opened.
-    if (cfg.sellAutoRelist) {
+    // Manage live offers: keep the price competitive (Magma v2 reprice) and top up
+    // depleted offers so they keep taking orders. Repricing uses the profit-aware
+    // recommendation (only when it beats routing and is competitive), is capped to
+    // once per 24h, and never sells when the node itself needs inbound. Relisting
+    // commits no funds; order fulfillment re-checks the caps before any open.
+    if (cfg.sellAutoRelist || cfg.sellAutoReprice) {
       try {
         const offers = await getMyOffers(key);
+        let recByOffer = new Map<string, MagmaSellRecommendation>();
+        let canReprice = false;
+        if (cfg.sellAutoReprice) {
+          canReprice =
+            !this.state.lastSellRepriceAt ||
+            Date.now() - new Date(this.state.lastSellRepriceAt).getTime() >= 24 * 3_600_000;
+          try {
+            const rec = await getMagmaRecommendations(this.readLnd, key);
+            if (rec.sell.state !== "not_recommended_node_needs_inbound")
+              recByOffer = new Map(
+                rec.sell.recommendations.filter((r) => r.offerId).map((r) => [r.offerId as string, r]),
+              );
+          } catch {
+            // no recommendation — fall back to the offer's current price
+          }
+        }
+        // Recommended price for an offer, when a reprice is actually warranted + allowed.
+        const priceFor = (off: { id: string; feeRatePpm: number; baseFeeSats: number }) => {
+          const r = recByOffer.get(off.id);
+          const should =
+            !!r &&
+            r.shouldReprice &&
+            r.economics.beatsRouting &&
+            r.state !== "do_not_list_unprofitable" &&
+            r.state !== "do_not_list_uncompetitive";
+          if (should && canReprice && r) return { fee: r.recommended.feeRatePpm, base: r.recommended.baseFeeSat, repriced: true };
+          return { fee: off.feeRatePpm, base: off.baseFeeSats, repriced: false };
+        };
+
         for (const off of offers) {
-          if (off.status !== "ENABLED" || off.totalSizeSats >= off.maxSizeSats) continue;
-          if (off.maxSizeSats > chain_balance - cfg.sellReserveSats) continue;
-          if (off.maxSizeSats > cfg.sellMaxDeploySats - deployed) continue;
-          await updateOffer(key, off.id, {
-            totalSizeSats: off.maxSizeSats,
-            minSizeSats: off.minSizeSats,
-            maxSizeSats: off.maxSizeSats,
-            feeRatePpm: off.feeRatePpm,
-            baseFeeSats: off.baseFeeSats,
-            minBlockLength: off.minBlockLength,
-          });
-          out.push({ orderId: off.id, action: "relist", sizeSats: off.maxSizeSats, ok: true });
+          if (off.status !== "ENABLED") continue;
+          const depleted = off.totalSizeSats < off.maxSizeSats;
+          const price = priceFor(off);
+
+          if (depleted && cfg.sellAutoRelist) {
+            if (off.maxSizeSats > chain_balance - cfg.sellReserveSats) continue;
+            if (off.maxSizeSats > cfg.sellMaxDeploySats - deployed) continue;
+            await updateOffer(key, off.id, {
+              totalSizeSats: off.maxSizeSats,
+              minSizeSats: off.minSizeSats,
+              maxSizeSats: off.maxSizeSats,
+              feeRatePpm: price.fee,
+              baseFeeSats: price.base,
+              minBlockLength: off.minBlockLength,
+            });
+            out.push({ orderId: off.id, action: "relist", sizeSats: off.maxSizeSats, ok: true });
+            if (price.repriced) this.state.lastSellRepriceAt = new Date().toISOString();
+          } else if (!depleted && price.repriced) {
+            await updateOffer(key, off.id, {
+              totalSizeSats: off.totalSizeSats,
+              minSizeSats: off.minSizeSats,
+              maxSizeSats: off.maxSizeSats,
+              feeRatePpm: price.fee,
+              baseFeeSats: price.base,
+              minBlockLength: off.minBlockLength,
+            });
+            out.push({ orderId: off.id, action: "reprice", sizeSats: off.totalSizeSats, ok: true });
+            this.state.lastSellRepriceAt = new Date().toISOString();
+          }
         }
       } catch {
-        // best-effort — relisting never blocks order fulfillment
+        // best-effort — managing offers never blocks order fulfillment
       }
     }
 

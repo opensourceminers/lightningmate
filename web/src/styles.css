@@ -548,6 +548,10 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
   margin-left: 8px; font-size: 10px; font-weight: 700; padding: 1px 8px; border-radius: 999px;
   color: #1a1205; background: var(--accent); vertical-align: middle;
 }
+.magma-crosslink {
+  margin: 4px 0 14px; padding: 11px 15px; font-size: 12.5px; border-radius: var(--radius-sm);
+  background: rgba(52, 211, 153, 0.07); border: 1px solid rgba(52, 211, 153, 0.25); color: var(--text);
+}
 
 /* ── Alerts ──────────────────────────────────────────────── */
 .alerts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
