@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { MarketView, OrderState } from "../types";
+import type { MagmaBuyRecommendation, MarketView, OrderState } from "../types";
 import { satsCompact } from "../format";
 import { Scanning } from "./Scanning";
 import { EmptyState } from "./Skeleton";
@@ -12,6 +12,7 @@ export function MarketBuy() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  const [buyRank, setBuyRank] = useState<Map<string, MagmaBuyRecommendation>>(new Map());
 
   // Buy flow
   const [usd, setUsd] = useState(10);
@@ -28,6 +29,11 @@ export function MarketBuy() {
       const [market, status] = await Promise.all([api.ambossMarket(), api.ambossStatus()]);
       setData(market);
       setConnected(status.connected);
+      // True-cost value ranking (needs the Amboss key) — best-effort.
+      if (status.connected)
+        api.magmaRecommendations()
+          .then((r) => setBuyRank(new Map(r.buy.ranked.map((b) => [b.offerId, b]))))
+          .catch(() => {});
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -98,7 +104,9 @@ export function MarketBuy() {
     }
   };
 
-  const offers = data?.offers ?? [];
+  const offers = [...(data?.offers ?? [])].sort(
+    (a, b) => (buyRank.get(b.id)?.valueScore ?? -1) - (buyRank.get(a.id)?.valueScore ?? -1),
+  );
   const estInbound = data?.satsPerUsd ? Math.round(usd * data.satsPerUsd) : null;
 
   return (
@@ -184,21 +192,39 @@ export function MarketBuy() {
           <table className="fee-table">
             <thead>
               <tr>
+                {buyRank.size ? <th className="num">Value</th> : null}
+                <th className="num">True cost</th>
                 <th className="num">Score</th>
                 <th>Seller</th>
                 <th className="num">Size range</th>
                 <th className="num">Available</th>
-                <th className="num">Fee rate</th>
-                <th className="num">Base fee</th>
                 <th className="num">From*</th>
               </tr>
             </thead>
             <tbody>
               {offers.map((o) => {
                 const cost = o.baseFeeSats + Math.round((o.minSizeSats * o.feeRatePpm) / 1_000_000);
+                const br = buyRank.get(o.id);
                 return (
                   <tr key={o.id}>
-                    <td className="num strong">{o.sellerScore.toFixed(1)}</td>
+                    {buyRank.size ? (
+                      <td className="num">
+                        {br ? (
+                          <>
+                            <span className={`sug-score ${br.valueScore >= 70 ? "u-high" : br.valueScore >= 45 ? "u-medium" : "u-low"}`}>
+                              {br.valueScore}
+                            </span>
+                            {br.state === "best_value" ? <span className="sug-badge"> best</span> : null}
+                          </>
+                        ) : (
+                          "—"
+                        )}
+                      </td>
+                    ) : null}
+                    <td className="num strong" title="effective ppm at a 2M channel (rate + amortized base)">
+                      {br ? `${br.effectiveCostPpm}` : "—"}
+                    </td>
+                    <td className="num">{o.sellerScore.toFixed(1)}</td>
                     <td title={o.sellerPubkey}>
                       <code>{o.sellerPubkey.slice(0, 14)}…</code>
                     </td>
@@ -206,8 +232,6 @@ export function MarketBuy() {
                       {satsCompact(o.minSizeSats)}–{satsCompact(o.maxSizeSats)}
                     </td>
                     <td className="num">{satsCompact(o.availableSats)}</td>
-                    <td className="num">{o.feeRatePpm} ppm</td>
-                    <td className="num">{o.baseFeeSats}</td>
                     <td className="num strong">{satsCompact(cost)}</td>
                   </tr>
                 );
@@ -215,8 +239,8 @@ export function MarketBuy() {
             </tbody>
           </table>
           <p className="muted reason">
-            * one-time lease fee for the smallest channel (base + size × rate). The seller sets
-            routing fees on the channel afterwards. Score is Amboss’ seller-reliability rating.
+            Ranked by <strong>value</strong> — true cost (effective ppm: rate + base amortized over size) weighed
+            against seller reliability and size fit, not score alone. * one-time lease fee for the smallest channel.
           </p>
         </>
       ) : null}

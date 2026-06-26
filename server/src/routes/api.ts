@@ -13,6 +13,7 @@ import {
 } from "../services/rebalance.js";
 import { type SuggestionPolicy } from "../services/suggestions.js";
 import { getChannelSuggestionsV2, getCloseSuggestionsV2 } from "../services/suggestRecommend.js";
+import { getMagmaRecommendations } from "../services/magmaRecommend.js";
 import { getPnl } from "../services/pnl.js";
 import { buildDashboard } from "../services/dashboard.js";
 import {
@@ -895,6 +896,15 @@ export function createApiRouter(
     res.status(400).json({ error: "no_key", message: "Connect Amboss in Settings first." });
     return false;
   };
+
+  // Magma v2 — profit-aware recommendations (dry-run; no execution).
+  router.get(
+    "/amboss/recommendations",
+    wrap(async (_req, res) => {
+      if (!needKey(res)) return;
+      res.json(await getMagmaRecommendations(lnd, amboss.getKey()));
+    }),
+  );
 
   router.get(
     "/amboss/my-offers",

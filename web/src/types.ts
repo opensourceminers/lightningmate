@@ -799,3 +799,126 @@ export interface MyOrdersView {
   orders: MyOrder[];
   pendingSeller: number;
 }
+
+// ── Magma v2 (profit-aware recommendations) ──
+export type MagmaSellOfferState =
+  | "well_priced"
+  | "underpriced"
+  | "overpriced"
+  | "below_profit_floor"
+  | "do_not_list_unprofitable"
+  | "do_not_list_uncompetitive"
+  | "exhausted"
+  | "inactive";
+
+export interface PricePoint {
+  feeRatePpm: number;
+  baseFeeSat: number;
+  effectiveFeePpm: number;
+  leaseApy: number;
+}
+
+export interface MagmaSellRecommendation {
+  offerId: string | null;
+  mode: "create" | "update" | "hold";
+  state: MagmaSellOfferState;
+  shouldReprice: boolean;
+  repriceDirection: "up" | "down" | "none";
+  current: { feeRatePpm: number; baseFeeSat: number; effectiveFeePpm: number } | null;
+  recommended: PricePoint & { minBlockLength: number; sizeSat: number };
+  market: {
+    sizeBand: string;
+    segmentCount: number;
+    fallbackLevel: "size_band" | "all_offers";
+    p10: number;
+    p25: number;
+    median: number;
+    p75: number;
+    mySellerScore: number | null;
+    segmentMedianScore: number;
+    scorePremium: number;
+    myRank: number | null;
+  };
+  economics: {
+    sizeSat: number;
+    leaseYears: number;
+    leaseFeeSat: number;
+    serviceFeeSat: number;
+    openCostSat: number;
+    closeCostSat: number;
+    netLeaseProfitSat: number;
+    leasePpmPerYear: number;
+    leaseApy: number;
+    routingOpportunityPpmPerYear: number | null;
+    adjustedRoutingPpmPerYear: number;
+    profitFloorEffectivePpm: number;
+    beatsRouting: boolean;
+  };
+  pricing: { fast: PricePoint; balanced: PricePoint; premium: PricePoint; profitFloor: PricePoint };
+  reasons: string[];
+  warnings: string[];
+}
+
+export interface MagmaBuyRecommendation {
+  offerId: string;
+  sellerPubkey: string;
+  state: "best_value" | "cheap_but_low_score" | "reliable_but_expensive" | "good_fit" | "size_mismatch";
+  valueScore: number;
+  effectiveCostPpm: number;
+  sellerScore: number;
+  minSizeSat: number;
+  maxSizeSat: number;
+  availableSat: number;
+  reasons: string[];
+}
+
+export interface MagmaSellAnalytics {
+  mySellerScore: number | null;
+  offersActive: number;
+  offersInactive: number;
+  offersExhausted: number;
+  totalListedSat: number;
+  availableSat: number;
+  deployedSat: number;
+  filledOrders30d: number;
+  filledOrdersAllTime: number;
+  grossEarningsSat: number;
+  serviceFeesSat: number;
+  onchainCostsSat: number;
+  netProfitSat: number;
+  avgLeaseFeePpm: number | null;
+  fillRate: number | null;
+  closableSoon: number;
+}
+
+export interface MagmaV2Report {
+  nodeNeed: NodeNeed;
+  nodeNeedReason: string;
+  hasRoutingData: boolean;
+  satsPerUsd: number | null;
+  sell: {
+    state:
+      | "good_to_sell"
+      | "sell_only_above_profit_floor"
+      | "market_too_cheap"
+      | "insufficient_capital"
+      | "not_recommended_node_needs_inbound";
+    deployableCapitalSat: number;
+    recommendedSellSizeSat: number | null;
+    routingOpportunityPpmPerYear: number | null;
+    adjustedRoutingPpmPerYear: number;
+    recommendedMinLeasePpmPerYear: number;
+    reasons: string[];
+    warnings: string[];
+    recommendations: MagmaSellRecommendation[];
+  };
+  buy: {
+    state: "recommended" | "optional" | "not_needed" | "no_good_offers";
+    recommendedBuySizeSat: number | null;
+    bestOfferId: string | null;
+    reasons: string[];
+    warnings: string[];
+    ranked: MagmaBuyRecommendation[];
+  };
+  analytics: MagmaSellAnalytics;
+}

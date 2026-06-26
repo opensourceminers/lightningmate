@@ -30,6 +30,7 @@ import type {
   NodeSummary,
   OpenChannelResult,
   BuyQuote,
+  MagmaV2Report,
   MarketView,
   MyOffer,
   MyOrdersView,
@@ -200,6 +201,7 @@ export const api = {
   signMessage: (message: string) => post<{ signature: string }>("/sign", { message }),
   ambossMyOffers: () => get<{ offers: MyOffer[] }>("/amboss/my-offers"),
   ambossMyOrders: () => get<MyOrdersView>("/amboss/my-orders"),
+  magmaRecommendations: () => get<MagmaV2Report>("/amboss/recommendations"),
   ambossCreateOffer: (p: {
     totalSizeSats: number;
     minSizeSats: number;

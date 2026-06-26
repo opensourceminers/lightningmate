@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { MyOrder, MyOrdersView } from "../types";
-import { satsCompact } from "../format";
+import type { MagmaV2Report, MyOrder, MyOrdersView } from "../types";
+import { sats, satsCompact } from "../format";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
 
@@ -11,16 +11,22 @@ export function MarketOrders() {
   const [connected, setConnected] = useState<boolean | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [rec, setRec] = useState<MagmaV2Report | null>(null);
 
   const load = async () => {
+    let conn = false;
     try {
       const s = await api.ambossStatus();
+      conn = s.connected;
       setConnected(s.connected);
-      if (s.connected) setData(await api.ambossMyOrders());
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setConnected(false);
+      return;
     }
+    if (!conn) return;
+    api.ambossMyOrders().then(setData).catch(() => {});
+    api.magmaRecommendations().then(setRec).catch(() => {});
   };
 
   useEffect(() => {
@@ -104,6 +110,20 @@ export function MarketOrders() {
         Autopilot can do this automatically (enable <strong>Liquidity provision</strong>).
       </div>
       {error ? <p className="banner error">{error}</p> : null}
+
+      {rec ? (
+        <div className="magma-analytics">
+          <div className="magma-an"><span>{rec.analytics.filledOrdersAllTime}</span><label>sold all-time</label></div>
+          <div className="magma-an"><span>{rec.analytics.filledOrders30d}</span><label>sold 30d</label></div>
+          <div className="magma-an green"><span>{sats(rec.analytics.grossEarningsSat)}</span><label>gross earned (sat)</label></div>
+          <div className="magma-an green"><span>{sats(rec.analytics.netProfitSat)}</span><label>net after costs</label></div>
+          <div className="magma-an"><span>{satsCompact(rec.analytics.deployedSat)}</span><label>capital deployed</label></div>
+          <div className="magma-an"><span>{rec.analytics.avgLeaseFeePpm != null ? `${rec.analytics.avgLeaseFeePpm}` : "—"}</span><label>avg lease ppm</label></div>
+          {rec.analytics.closableSoon > 0 ? (
+            <div className="magma-an"><span>{rec.analytics.closableSoon}</span><label>closable soon</label></div>
+          ) : null}
+        </div>
+      ) : null}
 
       {connected === null ? (
         <p className="muted">Loading…</p>

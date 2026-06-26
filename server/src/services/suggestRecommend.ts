@@ -1,5 +1,5 @@
 import { type AuthenticatedLnd } from "lightning";
-import { getChannelsView } from "./channels.js";
+import { getChannelsView, type ChannelView } from "./channels.js";
 import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
 import { getFeeRecommendations, type FeeRecConfig, type FeeRecState } from "./feeRecommend.js";
@@ -46,6 +46,27 @@ export type NodeNeed =
   | "need_routing_diversity"
   | "need_revenue"
   | "balanced";
+
+/** Our node's current need, inferred honestly from our own balance + revenue. */
+export function computeNodeNeed(
+  channels: ChannelView[],
+  revenueWindowSats: number,
+  windowDays: number,
+): { nodeNeed: NodeNeed; reason: string } {
+  const totalCap = channels.reduce((s, c) => s + c.capacity, 0) || 1;
+  const localSats = channels.reduce((s, c) => s + c.localRatio * c.capacity, 0);
+  const myLocalRatio = localSats / totalCap;
+  const revenuePerChannel = channels.length ? revenueWindowSats / channels.length : 0;
+  if (channels.length < 5)
+    return { nodeNeed: "need_routing_diversity", reason: `only ${channels.length} channel${channels.length === 1 ? "" : "s"} — broaden into new clusters first` };
+  if (myLocalRatio >= 0.7)
+    return { nodeNeed: "need_outbound", reason: `${Math.round(myLocalRatio * 100)}% of your liquidity is local — deploy it toward peers that pull flow` };
+  if (myLocalRatio <= 0.3)
+    return { nodeNeed: "need_inbound", reason: `only ${Math.round(myLocalRatio * 100)}% local — you need inbound; new opens give outbound, so prefer peers likely to send back` };
+  if (revenuePerChannel < 50)
+    return { nodeNeed: "need_revenue", reason: `low earnings per channel (${Math.round(revenuePerChannel)} sat/${windowDays}d) — chase real demand` };
+  return { nodeNeed: "balanced", reason: "well balanced — grow where you already see demand and into fresh clusters" };
+}
 
 export interface SuggestionV2 {
   pubkey: string;
@@ -145,30 +166,8 @@ export async function getChannelSuggestionsV2(
   }
 
   // ── Our node's current need (honest, from our own data) ─────────────────────
-  const totalCap = channels.reduce((s, c) => s + c.capacity, 0) || 1;
-  const localSats = channels.reduce((s, c) => s + c.localRatio * c.capacity, 0);
-  const myLocalRatio = localSats / totalCap;
   const revenue = flow?.totalFeesEarnedSats ?? 0;
-  const revenuePerChannel = channels.length ? revenue / channels.length : 0;
-
-  let nodeNeed: NodeNeed;
-  let nodeNeedReason: string;
-  if (channels.length < 5) {
-    nodeNeed = "need_routing_diversity";
-    nodeNeedReason = `only ${channels.length} channel${channels.length === 1 ? "" : "s"} — broaden into new clusters first`;
-  } else if (myLocalRatio >= 0.7) {
-    nodeNeed = "need_outbound";
-    nodeNeedReason = `${Math.round(myLocalRatio * 100)}% of your liquidity is local — deploy it toward peers that pull flow`;
-  } else if (myLocalRatio <= 0.3) {
-    nodeNeed = "need_inbound";
-    nodeNeedReason = `only ${Math.round(myLocalRatio * 100)}% local — you need inbound; new opens give outbound, so prefer peers likely to send back`;
-  } else if (revenuePerChannel < 50) {
-    nodeNeed = "need_revenue";
-    nodeNeedReason = `low earnings per channel (${Math.round(revenuePerChannel)} sat/${policy.demandWindowDays}d) — chase real demand`;
-  } else {
-    nodeNeed = "balanced";
-    nodeNeedReason = "well balanced — grow where you already see demand and into fresh clusters";
-  }
+  const { nodeNeed, reason: nodeNeedReason } = computeNodeNeed(channels, revenue, policy.demandWindowDays);
 
   // ── Demand map: where does our own outbound flow actually go? ────────────────
   // We can only see which of OUR channels a forward left through (LND gives the
