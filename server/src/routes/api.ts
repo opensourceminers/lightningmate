@@ -283,7 +283,15 @@ export function createApiRouter(
   router.get(
     "/fees/recommendations",
     wrap(async (_req, res) => {
-      res.json(await getFeeRecommendations(lnd, rebalanceLog.recent(200), autopilot.feeCooldown()));
+      res.json(
+        await getFeeRecommendations(
+          lnd,
+          rebalanceLog.recent(200),
+          autopilot.feeCooldown(),
+          autopilot.feeV2Overrides(),
+          overrides.all(),
+        ),
+      );
     }),
   );
 
