@@ -193,41 +193,42 @@ export function MarketBuy() {
             <thead>
               <tr>
                 {buyRank.size ? <th className="num">Value</th> : null}
-                <th className="num">True cost</th>
-                <th className="num">Score</th>
                 <th>Seller</th>
+                {buyRank.size ? <th className="num">Eff. cost</th> : null}
+                <th className="num">Score</th>
                 <th className="num">Size range</th>
                 <th className="num">Available</th>
-                <th className="num">From*</th>
+                <th className="num">Fee*</th>
               </tr>
             </thead>
             <tbody>
               {offers.map((o) => {
                 const cost = o.baseFeeSats + Math.round((o.minSizeSats * o.feeRatePpm) / 1_000_000);
                 const br = buyRank.get(o.id);
+                const isBest = br?.state === "best_value";
                 return (
-                  <tr key={o.id}>
+                  <tr key={o.id} className={isBest ? "row-best" : ""}>
                     {buyRank.size ? (
                       <td className="num">
                         {br ? (
-                          <>
-                            <span className={`sug-score ${br.valueScore >= 70 ? "u-high" : br.valueScore >= 45 ? "u-medium" : "u-low"}`}>
-                              {br.valueScore}
-                            </span>
-                            {br.state === "best_value" ? <span className="sug-badge"> best</span> : null}
-                          </>
+                          <span className={`sug-score ${br.valueScore >= 70 ? "u-high" : br.valueScore >= 45 ? "u-medium" : "u-low"}`}>
+                            {br.valueScore}
+                          </span>
                         ) : (
-                          "—"
+                          <span className="muted">—</span>
                         )}
                       </td>
                     ) : null}
-                    <td className="num strong" title="effective ppm at a 2M channel (rate + amortized base)">
-                      {br ? `${br.effectiveCostPpm}` : "—"}
-                    </td>
-                    <td className="num">{o.sellerScore.toFixed(1)}</td>
                     <td title={o.sellerPubkey}>
                       <code>{o.sellerPubkey.slice(0, 14)}…</code>
+                      {isBest ? <span className="best-pill">best value</span> : null}
                     </td>
+                    {buyRank.size ? (
+                      <td className="num strong" title="effective ppm at a 2M channel (rate + amortized base)">
+                        {br ? `${br.effectiveCostPpm} ppm` : "—"}
+                      </td>
+                    ) : null}
+                    <td className="num">{o.sellerScore.toFixed(1)}</td>
                     <td className="num">
                       {satsCompact(o.minSizeSats)}–{satsCompact(o.maxSizeSats)}
                     </td>
@@ -239,8 +240,13 @@ export function MarketBuy() {
             </tbody>
           </table>
           <p className="muted reason">
-            Ranked by <strong>value</strong> — true cost (effective ppm: rate + base amortized over size) weighed
-            against seller reliability and size fit, not score alone. * one-time lease fee for the smallest channel.
+            {buyRank.size ? (
+              <>
+                Ranked by <strong>value</strong> — effective cost (rate + base amortized over size) weighed against
+                seller reliability and size fit, not score alone.{" "}
+              </>
+            ) : null}
+            * one-time lease fee for the smallest channel. When you buy, Amboss matches you to a top-scored seller.
           </p>
         </>
       ) : null}

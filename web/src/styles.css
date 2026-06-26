@@ -389,6 +389,18 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .an-kpi-val { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .an-kpi-val.green { color: var(--green); }
 .an-unit { font-size: 12px; font-weight: 500; color: var(--muted); }
+.an-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.an-card {
+  display: flex; flex-direction: column; gap: 4px; padding: 14px 16px;
+  background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
+}
+.an-card-label { font-size: 10.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+.an-card-val { font-size: 22px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.an-card-val.green { color: var(--green); }
+.an-card-val.cost { color: var(--red); }
+.an-card-sub { font-size: 11px; color: var(--faint); }
+.spark { display: inline-flex; align-items: flex-end; gap: 1px; height: 22px; width: 84px; }
+.spark i { flex: 1; min-height: 1px; background: var(--green); border-radius: 1px; opacity: 0.65; }
 .an-chart { display: flex; align-items: flex-end; gap: 2px; height: 120px; padding: 6px 0; }
 .an-bar-wrap { flex: 1; height: 100%; display: flex; align-items: flex-end; min-width: 0; }
 .an-bar { width: 100%; background: linear-gradient(180deg, #5eead4, var(--green)); border-radius: 2px 2px 0 0; transition: height 0.4s ease; }
@@ -530,6 +542,12 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .magma-an span { font-size: 17px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .magma-an.green span { color: var(--green); }
 .magma-an label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+.row-best { background: rgba(247, 147, 26, 0.06); }
+.row-best td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+.best-pill {
+  margin-left: 8px; font-size: 10px; font-weight: 700; padding: 1px 8px; border-radius: 999px;
+  color: #1a1205; background: var(--accent); vertical-align: middle;
+}
 
 /* ── Alerts ──────────────────────────────────────────────── */
 .alerts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
