@@ -3,6 +3,7 @@ import { getChannelsView } from "./channels.js";
 import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
 import { computeNodeNeed, type NodeNeed } from "./suggestRecommend.js";
+import { saleFeeConfig } from "./serviceFee.js";
 import { getMarket, getMyOffers, getMyOrders, type MagmaOffer, type MyOffer, type MyOrder } from "./amboss.js";
 
 /**
@@ -47,7 +48,7 @@ export interface MagmaV2Config {
 
 export const MAGMA_V2_DEFAULTS: MagmaV2Config = {
   blocksPerYear: 52_560,
-  serviceFeeRate: 0.005,
+  serviceFeeRate: 0.01, // fallback; overridden by the live LM_SELL_FEE_BPS config
   defaultOpenCostSat: 1_000,
   defaultCloseCostSat: 500,
   includeCloseCost: true,
@@ -224,6 +225,9 @@ export async function getMagmaRecommendations(
   overrides: Partial<MagmaV2Config> = {},
 ): Promise<MagmaV2Report> {
   const cfg = { ...MAGMA_V2_DEFAULTS, ...overrides };
+  // Keep the lease economics honest: use whatever service fee is actually charged
+  // (LM_SELL_FEE_BPS), so the APY / profit-floor math never drifts from reality.
+  if (overrides.serviceFeeRate === undefined) cfg.serviceFeeRate = saleFeeConfig().bps / 10_000;
 
   const [market, myOffers, myOrdersView, channels, chain, ownKey, flow] = await Promise.all([
     getMarket(),

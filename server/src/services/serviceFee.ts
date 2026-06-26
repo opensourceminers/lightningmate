@@ -2,7 +2,7 @@ import { decodePaymentRequest, getWalletInfo, type AuthenticatedLnd } from "ligh
 import { payRequest } from "./payments.js";
 
 export interface SaleFeeConfig {
-  /** Basis points of the earned lease fee, e.g. 50 = 0.5%. 0 disables the fee. */
+  /** Basis points of the earned lease fee, e.g. 100 = 1%. 0 disables the fee. */
   bps: number;
   /** Lightning Address the fee is paid to, e.g. name@domain. */
   address: string;
