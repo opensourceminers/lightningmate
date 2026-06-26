@@ -40,7 +40,7 @@ export function SuggestedPeersTile({ onOpen }: { onOpen?: () => void }) {
       ) : (
         <div className="sug-list">
           {rows.map((s) => (
-            <div className="sug-row" key={s.pubkey} title={s.reason}>
+            <div className="sug-row" key={s.pubkey} title={s.reasons[0]}>
               <span className={`sug-score ${scoreClass(s.score)}`}>{Math.round(s.score)}</span>
               <span className="sug-alias">{s.alias || `${s.pubkey.slice(0, 12)}…`}</span>
               <span className="sug-size">~{satsCompact(s.recommendedSizeSats)}</span>

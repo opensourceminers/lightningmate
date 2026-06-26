@@ -153,8 +153,8 @@ export function Overview({
         <div className="hero-row">
           <RecentActivity items={dash.activity} />
           <div className="stack-col">
-            <TopChannelsTile onOpen={() => onNavigate?.("routing")} />
-            <SuggestedPeersTile onOpen={() => onNavigate?.("channels", "suggestions")} />
+            <TopChannelsTile onOpen={() => onNavigate?.("analytics", "pnl")} />
+            <SuggestedPeersTile onOpen={() => onNavigate?.("autopilot", "channels")} />
             <AutopilotStatus a={dash.autopilot} onOpen={() => onNavigate?.("autopilot")} />
           </div>
         </div>

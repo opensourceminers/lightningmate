@@ -5,7 +5,7 @@ import { createInvoice } from "./payments.js";
 import { acceptOrder, addOrderTransaction, getMyOffers, getMyOrders, updateOffer } from "./amboss.js";
 import { paySaleServiceFee } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
-import { getChannelSuggestions } from "./suggestions.js";
+import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
 import {
   applyFees,
   DEFAULT_POLICY,
@@ -377,7 +377,7 @@ export class Autopilot {
     const available = chain_balance - cfg.channelReserveSats;
     if (available <= 0) return [];
 
-    const { suggestions } = await getChannelSuggestions(this.readLnd, {});
+    const { suggestions } = await getChannelSuggestionsV2(this.readLnd, {});
     const top = suggestions[0];
     if (!top) return [];
 

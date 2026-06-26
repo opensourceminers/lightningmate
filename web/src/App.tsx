@@ -134,8 +134,8 @@ export function App() {
 
         {tab === "market" ? <MarketPanel /> : null}
         {tab === "wallet" ? <WalletPanel price={price.data} /> : null}
-        {tab === "analytics" ? <AnalyticsPanel /> : null}
-        {tab === "autopilot" ? <AutopilotPanel /> : null}
+        {tab === "analytics" ? <AnalyticsPanel initialSub={pendingSub} /> : null}
+        {tab === "autopilot" ? <AutopilotPanel initialSub={pendingSub} /> : null}
         {tab === "settings" ? <SettingsPanel onChange={price.refresh} /> : null}
       </div>
 
