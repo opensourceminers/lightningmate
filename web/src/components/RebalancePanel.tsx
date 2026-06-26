@@ -8,6 +8,7 @@ import type {
   RebalancePolicy,
 } from "../types";
 import { percent, sats, satsCompact, timeAgo } from "../format";
+import { RebalanceRecommendations } from "./RebalanceRecommendations";
 import { useUi } from "./Overlay";
 
 type DraftKey =
@@ -147,6 +148,7 @@ export function RebalancePanel() {
 
   return (
     <>
+    <RebalanceRecommendations />
     <section className="panel">
       <div className="panel-head">
         <h2>Rebalancing <span className="muted">· profit-gated</span></h2>

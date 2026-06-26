@@ -589,6 +589,82 @@ export interface FeeRecReport {
   recommendations: FeeRecommendation[];
 }
 
+export type RebalanceRecState =
+  | "not_needed"
+  | "watching"
+  | "fee_adjust_first"
+  | "profitable_rebalance_candidate"
+  | "route_found_profitable"
+  | "route_found_too_expensive"
+  | "unprofitable_skip"
+  | "close_candidate";
+
+export interface RebalanceSourceCandidate {
+  channelId: string;
+  alias: string;
+  localRatio: number;
+  reason: string;
+  rejected?: boolean;
+  rejectedReason?: string;
+}
+
+export interface RebalanceRecommendation {
+  channelId: string;
+  alias: string;
+  role: string;
+  state: RebalanceRecState;
+  wouldRebalance: boolean;
+  blockedBy: string[];
+  reasons: string[];
+  localRatio: number;
+  targetLocalRatio: number;
+  capacity: number;
+  currentPpm: number;
+  feeV2TargetPpm: number | null;
+  feeV2State: string | null;
+  profitFloorPpm: number | null;
+  routedOut14d: number;
+  routedIn14d: number;
+  routedOut30d: number;
+  routedIn30d: number;
+  netDrain14d: number;
+  grossFlow14d: number;
+  revenue14d: number;
+  revenue30d: number;
+  revenuePpm14d: number | null;
+  revenuePpm30d: number | null;
+  expectedRevenuePpm: number | null;
+  avgDailyRevenueSats: number;
+  maxCostPpm: number | null;
+  maxCostSatsByPayback: number | null;
+  maxPaybackDays: number;
+  recommendedAmount: number | null;
+  amountToReachTargetLocalRatio: number;
+  demandSizedAmount: number;
+  sourceCandidates: RebalanceSourceCandidate[];
+  selectedSourceChannel: string | null;
+  estimatedRouteFeeSats: number | null;
+  estimatedRouteCostPpm: number | null;
+  expectedPaybackDays: number | null;
+  expectedNetProfitSats: number | null;
+}
+
+export interface RebalanceRecSummary {
+  totalCandidates: number;
+  profitableRecommendations: number;
+  feeAdjustFirstCount: number;
+  tooExpensiveCount: number;
+  closeCandidateCount: number;
+  expectedTotalCostSats: number;
+  expectedTotalNetProfitSats: number;
+}
+
+export interface RebalanceRecReport {
+  generatedAt: string;
+  summary: RebalanceRecSummary;
+  recommendations: RebalanceRecommendation[];
+}
+
 export interface LiveForward {
   at: string;
   tokens: number;

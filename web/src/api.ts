@@ -39,6 +39,7 @@ import type {
   RebalanceExecResult,
   RebalanceLogResponse,
   RebalancePolicy,
+  RebalanceRecReport,
   SuggestionPolicy,
   SuggestionsResponse,
 } from "./types";
@@ -141,6 +142,7 @@ export const api = {
     maxFeePpm?: number;
   }) => post<RebalanceExecResult>("/rebalance/execute", params),
   rebalanceLog: () => get<RebalanceLogResponse>("/rebalance/log"),
+  rebalanceRecommendations: () => get<RebalanceRecReport>("/rebalance/recommendations"),
   suggestions: (policy?: Partial<SuggestionPolicy>) => {
     const qs = policy
       ? "?" + new URLSearchParams(

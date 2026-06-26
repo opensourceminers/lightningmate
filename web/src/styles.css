@@ -415,6 +415,7 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .feerec-chip.s-cost, .feerec-state.s-cost { color: var(--accent-2); background: rgba(247, 147, 26, 0.12); border-color: rgba(247, 147, 26, 0.3); }
 .feerec-chip.s-explore, .feerec-state.s-explore { color: #93c0ff; background: rgba(96, 165, 250, 0.12); border-color: rgba(96, 165, 250, 0.3); }
 .feerec-chip.s-close, .feerec-state.s-close { color: var(--muted); background: var(--panel-3); border-color: var(--line-soft); }
+.feerec-chip.s-good, .feerec-state.s-good { color: #74e6b8; background: rgba(52, 211, 153, 0.14); border-color: rgba(52, 211, 153, 0.35); }
 .feerec-row { cursor: pointer; }
 .feerec-row:hover { background: var(--panel-2); }
 .feerec-caret { color: var(--muted); width: 18px; }

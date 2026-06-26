@@ -29,6 +29,7 @@ import {
 import { closeChannelByOutpoint, openChannelTo } from "../services/channelOps.js";
 import { paySaleServiceFee, saleFeeConfig } from "../services/serviceFee.js";
 import { getFeeRecommendations } from "../services/feeRecommend.js";
+import { getRebalanceRecommendations } from "../services/rebalanceRecommend.js";
 import { getBtcPrice } from "../services/price.js";
 import type { SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
@@ -409,6 +410,23 @@ export function createApiRouter(
         "maxCandidates",
       ]);
       res.json(await getRebalanceCandidates(lnd, overrides));
+    }),
+  );
+
+  // Rebalance Autopilot v1 — recommendation engine (dry-run only, no payments).
+  // Consumes Fee v2 per channel; fee-adjust-first + payback/profit gating.
+  router.get(
+    "/rebalance/recommendations",
+    wrap(async (_req, res) => {
+      res.json(
+        await getRebalanceRecommendations(
+          lnd,
+          rebalanceLog.recent(200),
+          autopilot.feeCooldown(),
+          autopilot.feeV2Overrides(),
+          overrides.all(),
+        ),
+      );
     }),
   );
 
