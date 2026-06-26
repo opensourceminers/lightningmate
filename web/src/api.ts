@@ -14,6 +14,7 @@ import type {
   FeeApplyResult,
   FeePolicy,
   FeePreview,
+  FeeRecReport,
   FlowSummary,
   ForwardsReport,
   CreatedInvoice,
@@ -118,6 +119,7 @@ export const api = {
   },
   feesApply: (items: FeeApplyItem[]) =>
     post<{ results: FeeApplyResult[] }>("/fees/apply", { items }),
+  feesRecommendations: () => get<FeeRecReport>("/fees/recommendations"),
   autopilotGet: () => get<AutopilotState>("/autopilot"),
   autopilotSet: (partial: Partial<AutopilotConfig>) =>
     post<AutopilotState>("/autopilot", partial),

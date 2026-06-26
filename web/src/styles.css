@@ -400,6 +400,35 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .fee-table td.cost { color: #ffa3a3; }
 .fee-table td.net { font-weight: 700; }
 
+/* ── Fee Autopilot v2 recommendations ────────────────────── */
+.v2-badge {
+  font-size: 10.5px; font-weight: 700; color: var(--accent); background: rgba(247, 147, 26, 0.12);
+  border: 1px solid rgba(247, 147, 26, 0.3); border-radius: 999px; padding: 2px 8px; margin-left: 8px;
+  vertical-align: middle; text-transform: uppercase; letter-spacing: 0.4px;
+}
+.feerec-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 4px 0 14px; }
+.feerec-chip { font-size: 11px; font-weight: 700; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line-soft); }
+.feerec-bench { font-size: 11.5px; margin-left: auto; }
+.feerec-state { font-size: 10.5px; font-weight: 700; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.feerec-state.s-normal { color: var(--muted); }
+.feerec-chip.s-protect, .feerec-state.s-protect { color: #ff9b9b; background: rgba(248, 113, 113, 0.12); border-color: rgba(248, 113, 113, 0.3); }
+.feerec-chip.s-cost, .feerec-state.s-cost { color: var(--accent-2); background: rgba(247, 147, 26, 0.12); border-color: rgba(247, 147, 26, 0.3); }
+.feerec-chip.s-explore, .feerec-state.s-explore { color: #93c0ff; background: rgba(96, 165, 250, 0.12); border-color: rgba(96, 165, 250, 0.3); }
+.feerec-chip.s-close, .feerec-state.s-close { color: var(--muted); background: var(--panel-3); border-color: var(--line-soft); }
+.feerec-row { cursor: pointer; }
+.feerec-row:hover { background: var(--panel-2); }
+.feerec-caret { color: var(--muted); width: 18px; }
+.apply-yes { color: var(--green); font-weight: 700; }
+.apply-no { color: var(--faint); }
+.top-earner { color: var(--accent); }
+.feerec-detail-row td { background: var(--panel-2); }
+.feerec-detail { display: flex; flex-direction: column; gap: 10px; padding: 4px 0 10px; }
+.feerec-reasons { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.feerec-metrics { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 11.5px; color: var(--muted); }
+.feerec-metrics b { color: var(--text); font-variant-numeric: tabular-nums; }
+.feerec-metrics b.ok { color: var(--green); }
+.feerec-metrics b.warn { color: #ff9b9b; }
+
 /* ── Alerts ──────────────────────────────────────────────── */
 .alerts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
 .alert {

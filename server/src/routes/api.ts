@@ -28,6 +28,7 @@ import {
 } from "../services/onchain.js";
 import { closeChannelByOutpoint, openChannelTo } from "../services/channelOps.js";
 import { paySaleServiceFee, saleFeeConfig } from "../services/serviceFee.js";
+import { getFeeRecommendations } from "../services/feeRecommend.js";
 import { getBtcPrice } from "../services/price.js";
 import type { SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
@@ -275,6 +276,14 @@ export function createApiRouter(
     "/fees/preview",
     wrap(async (req, res) => {
       res.json(await getFeePreview(lnd, parsePolicyQuery(req.query), overrides.all()));
+    }),
+  );
+
+  // Fee Autopilot v2 — recommendation engine (dry-run only, never writes fees).
+  router.get(
+    "/fees/recommendations",
+    wrap(async (_req, res) => {
+      res.json(await getFeeRecommendations(lnd, rebalanceLog.recent(200), autopilot.feeCooldown()));
     }),
   );
 
