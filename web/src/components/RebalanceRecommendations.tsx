@@ -1,7 +1,8 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
-import type { RebalanceRecReport, RebalanceRecState } from "../types";
-import { sats, satsCompact } from "../format";
+import type { RebalanceLogResponse, RebalanceRecReport, RebalanceRecState } from "../types";
+import { sats, satsCompact, timeAgo } from "../format";
+import { useUi } from "./Overlay";
 
 const STATE_LABEL: Record<RebalanceRecState, string> = {
   not_needed: "ok",
@@ -26,8 +27,12 @@ const STATE_CLASS: Record<RebalanceRecState, string> = {
 const pct = (n: number) => `${Math.round(n * 100)}%`;
 
 export function RebalanceRecommendations() {
+  const ui = useUi();
   const [data, setData] = useState<RebalanceRecReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [canWrite, setCanWrite] = useState(false);
+  const [log, setLog] = useState<RebalanceLogResponse | null>(null);
+  const [running, setRunning] = useState<string | null>(null);
   const [open, setOpen] = useState<Set<string>>(new Set());
   const toggle = (id: string) =>
     setOpen((s) => {
@@ -37,16 +42,48 @@ export function RebalanceRecommendations() {
       return n;
     });
 
-  useEffect(() => {
-    let cancelled = false;
+  const load = () =>
     api
       .rebalanceRecommendations()
-      .then((r) => !cancelled && (setData(r), setError(null)))
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)));
-    return () => {
-      cancelled = true;
-    };
+      .then((r) => (setData(r), setError(null)))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+
+  useEffect(() => {
+    void load();
+    api.autopilotGet().then((s) => setCanWrite(s.canWrite)).catch(() => setCanWrite(false));
+    api.rebalanceLog().then(setLog).catch(() => {});
   }, []);
+
+  const execute = async (r: RebalanceRecReport["recommendations"][number]) => {
+    if (!r.selectedSourceChannel || !r.recommendedAmount) return;
+    const ok = await ui.confirm({
+      title: "Run rebalance",
+      message:
+        `Move ${satsCompact(r.recommendedAmount)} into ${r.alias} from ${r.sourceCandidates[0]?.alias ?? "a source channel"}, ` +
+        `paying at most ${r.maxCostPpm} ppm (~${sats(r.maxCostSatsByPayback ?? 0)} sat)? This sends a real payment.`,
+      confirmLabel: "Run it",
+    });
+    if (!ok) return;
+    setRunning(r.channelId);
+    try {
+      const res = await api.rebalanceExecute({
+        targetId: r.channelId,
+        sourceId: r.selectedSourceChannel,
+        amountSats: r.recommendedAmount,
+        econRatio: 0.8,
+        maxFeePpm: r.maxCostPpm ?? undefined,
+      });
+      ui.toast(
+        res.ok ? `Rebalanced ${satsCompact(res.amountSats)} for ${res.feeSats} sat` : `Failed: ${res.error}`,
+        res.ok ? "success" : "error",
+      );
+      await Promise.all([load(), api.rebalanceLog().then(setLog).catch(() => {})]);
+    } catch (e) {
+      ui.toast(e instanceof Error ? e.message : String(e), "error");
+    } finally {
+      setRunning(null);
+    }
+  };
 
   const rows = (data?.recommendations ?? [])
     .filter((r) => r.state !== "not_needed")
@@ -57,14 +94,15 @@ export function RebalanceRecommendations() {
     <section className="panel feerec">
       <div className="panel-head">
         <h2>
-          Smart rebalance <span className="v2-badge">v1 · dry-run</span>
+          Smart rebalance <span className="v2-badge">v1</span>
         </h2>
         {s ? <span className="change-badge">{s.profitableRecommendations} worth doing</span> : null}
       </div>
 
       <div className="dryrun-banner">
-        <strong>Dry-run only — no payments.</strong> Rebalance only when it pays back — and never refill liquidity
-        that Fee Autopilot says is being sold too cheaply (raise the fee first).
+        Rebalance only when it pays back — and never refill liquidity Fee Autopilot says is being sold too cheaply
+        (raise the fee first). The autopilot runs the profitable ones when <strong>Auto-rebalance</strong> is on;
+        you can also run one now.{canWrite ? null : <> Running is disabled (read-only macaroon).</>}
       </div>
 
       {error ? <p className="banner error">{error}</p> : null}
@@ -152,6 +190,22 @@ export function RebalanceRecommendations() {
                               ) : null}
                               <span>max cost <b>{r.maxCostPpm != null ? `${r.maxCostPpm} ppm` : "—"}</b> · payback limit {r.maxPaybackDays}d</span>
                             </div>
+                            {r.wouldRebalance && canWrite ? (
+                              <div className="apply-row">
+                                <button
+                                  className="primary-btn"
+                                  disabled={running === r.channelId}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    void execute(r);
+                                  }}
+                                >
+                                  {running === r.channelId
+                                    ? "Running…"
+                                    : `Run rebalance — move ${satsCompact(r.recommendedAmount ?? 0)}`}
+                                </button>
+                              </div>
+                            ) : null}
                           </div>
                         </td>
                       </tr>
@@ -162,6 +216,33 @@ export function RebalanceRecommendations() {
             )}
           </tbody>
         </table>
+      ) : null}
+
+      {log && log.records.length ? (
+        <div className="rbr-log">
+          <div className="panel-head">
+            <h2>Recent rebalances</h2>
+            <span className="muted">
+              {log.summary.count} done · {sats(log.summary.totalFeeSats)} sat fees · avg {log.summary.avgCostPpm} ppm
+            </span>
+          </div>
+          <div className="feed">
+            {log.records.slice(0, 8).map((r, i) => (
+              <div className="feed-row" key={`${r.at}-${i}`}>
+                <span className={`feed-dot ${r.ok ? "k-forward" : "k-sent"}`} />
+                <div className="feed-main">
+                  <span className="feed-title">
+                    {r.sourceAlias} → {r.targetAlias} · {satsCompact(r.amountSats)} sat
+                  </span>
+                  <span className="feed-sub">
+                    {r.ok ? `${r.feeSats} sat · ${r.costPpm} ppm` : r.error ?? "failed"} · {r.via}
+                  </span>
+                </div>
+                <span className="feed-time">{timeAgo(r.at)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
       ) : null}
     </section>
   );

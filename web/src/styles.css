@@ -429,6 +429,8 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .feerec-metrics b { color: var(--text); font-variant-numeric: tabular-nums; }
 .feerec-metrics b.ok { color: var(--green); }
 .feerec-metrics b.warn { color: #ff9b9b; }
+.head-actions { display: flex; align-items: center; gap: 10px; }
+.rbr-log { margin-top: 24px; padding-top: 6px; border-top: 1px solid var(--line-soft); }
 
 /* ── Alerts ──────────────────────────────────────────────── */
 .alerts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }

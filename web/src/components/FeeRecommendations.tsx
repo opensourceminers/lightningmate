@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
-import type { FeeRecReport, FeeRecState } from "../types";
+import type { FeeApplyItem, FeeRecReport, FeeRecState } from "../types";
 import { satsCompact } from "../format";
 
 const STATE_LABEL: Record<FeeRecState, string> = {
@@ -23,6 +23,9 @@ const pct = (n: number) => `${Math.round(n * 100)}%`;
 export function FeeRecommendations() {
   const [data, setData] = useState<FeeRecReport | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [canWrite, setCanWrite] = useState(false);
+  const [applying, setApplying] = useState(false);
+  const [applied, setApplied] = useState<number | null>(null);
   const [open, setOpen] = useState<Set<string>>(new Set());
   const toggle = (id: string) =>
     setOpen((s) => {
@@ -32,29 +35,63 @@ export function FeeRecommendations() {
       return n;
     });
 
-  useEffect(() => {
-    let cancelled = false;
+  const load = () =>
     api
       .feesRecommendations()
-      .then((r) => !cancelled && (setData(r), setError(null)))
-      .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)));
-    return () => {
-      cancelled = true;
-    };
+      .then((r) => (setData(r), setError(null)))
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+
+  useEffect(() => {
+    void load();
+    api.autopilotGet().then((s) => setCanWrite(s.canWrite)).catch(() => setCanWrite(false));
   }, []);
+
+  const wouldApply = data?.recommendations.filter((r) => r.wouldApply) ?? [];
+  const apply = async () => {
+    const items: FeeApplyItem[] = wouldApply
+      .filter((r) => r.transactionId !== null && r.transactionVout !== null)
+      .map((r) => ({
+        id: r.channelId,
+        transactionId: r.transactionId as string,
+        transactionVout: r.transactionVout as number,
+        feeRatePpm: r.targetPpm,
+        baseFeeMsat: r.currentBaseMsat,
+      }));
+    if (!items.length) return;
+    setApplying(true);
+    setApplied(null);
+    try {
+      const res = await api.feesApply(items);
+      setApplied(res.results.filter((r) => r.ok).length);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setApplying(false);
+    }
+  };
 
   return (
     <section className="panel feerec">
       <div className="panel-head">
         <h2>
-          Smart fee recommendations <span className="v2-badge">v2 · dry-run</span>
+          Smart fees <span className="v2-badge">v2</span>
         </h2>
-        {data ? <span className="change-badge">{data.recommendations.filter((r) => r.wouldApply).length} would change</span> : null}
+        <div className="head-actions">
+          {data ? <span className="change-badge">{wouldApply.length} to change</span> : null}
+          {canWrite && wouldApply.length > 0 ? (
+            <button className="primary-btn" disabled={applying} onClick={() => void apply()}>
+              {applying ? "Applying…" : `Apply ${wouldApply.length}`}
+            </button>
+          ) : null}
+          {applied != null ? <span className="apply-result">✓ {applied} applied</span> : null}
+        </div>
       </div>
 
       <div className="dryrun-banner">
-        <strong>Dry-run only — no fees are changed.</strong> What the v2 autopilot would recommend: protect
-        nearly-drained channels, never route below your refill cost, react to real demand, and explain every move.
+        The fees the autopilot applies when <strong>Fee automation</strong> is on — protect nearly-drained
+        channels, never route below your refill cost, react to real demand. Apply them now, or let the autopilot
+        manage them.{canWrite ? null : <> Applying is disabled (read-only macaroon).</>}
       </div>
 
       {error ? <p className="banner error">{error}</p> : null}

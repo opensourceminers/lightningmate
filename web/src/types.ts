@@ -566,6 +566,9 @@ export interface FeeRecommendation {
   capacity: number;
   currentPpm: number;
   targetPpm: number;
+  transactionId: string | null;
+  transactionVout: number | null;
+  currentBaseMsat: number;
   wouldApply: boolean;
   blockedByGuards: string[];
   state: FeeRecState;
