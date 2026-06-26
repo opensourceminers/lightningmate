@@ -9,21 +9,19 @@ import { Footer } from "./components/Footer";
 import { LogoutButton } from "./components/LogoutButton";
 import { MarketPanel } from "./components/MarketPanel";
 import { Overview } from "./components/Overview";
-import { RoutingPanel } from "./components/RoutingPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SkeletonPanel } from "./components/Skeleton";
 import { TabIcon } from "./components/TabIcon";
 import { WalletPanel } from "./components/WalletPanel";
 import { usePolledData } from "./usePolledData";
 
-type Tab = "overview" | "channels" | "market" | "wallet" | "routing" | "analytics" | "autopilot" | "settings";
+type Tab = "overview" | "channels" | "market" | "wallet" | "analytics" | "autopilot" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "channels", label: "Channels" },
   { id: "market", label: "Market" },
   { id: "wallet", label: "Wallet" },
-  { id: "routing", label: "Routing" },
   { id: "analytics", label: "Analytics" },
   { id: "autopilot", label: "Autopilot" },
   { id: "settings", label: "Settings" },
@@ -33,7 +31,13 @@ export function App() {
   const node = usePolledData(api.node, 15_000);
   const channels = usePolledData(api.channels, 30_000);
   const price = usePolledData(api.price, 300_000);
+  const autopilot = usePolledData(api.autopilotGet, 30_000);
   const [tab, setTab] = useState<Tab>("overview");
+  const apOn = !!autopilot.data?.config &&
+    (autopilot.data.config.enabled ||
+      autopilot.data.config.rebalanceEnabled ||
+      autopilot.data.config.channelEnabled ||
+      autopilot.data.config.sellEnabled);
   // Sub-tab to open when navigating from an Overview tile (e.g. Channels → suggestions).
   const [pendingSub, setPendingSub] = useState<string | undefined>(undefined);
   const navigate = (t: string, sub?: string) => {
@@ -53,6 +57,16 @@ export function App() {
           <span className="brand-sub">Lightning node manager</span>
         </span>
         <div className="topbar-right">
+          <button
+            className={`ap-status ${apOn ? "on" : "off"}`}
+            onClick={() => {
+              setTab("autopilot");
+              setPendingSub(undefined);
+            }}
+            title={apOn ? "Autopilot is active" : "Autopilot is off"}
+          >
+            <i /> Autopilot {apOn ? "ON" : "OFF"}
+          </button>
           <LogoutButton />
           <span
             className={`conn ${node.error ? "down" : node.data ? "up" : "wait"}`}
@@ -120,7 +134,6 @@ export function App() {
 
         {tab === "market" ? <MarketPanel /> : null}
         {tab === "wallet" ? <WalletPanel price={price.data} /> : null}
-        {tab === "routing" ? <RoutingPanel /> : null}
         {tab === "analytics" ? <AnalyticsPanel /> : null}
         {tab === "autopilot" ? <AutopilotPanel /> : null}
         {tab === "settings" ? <SettingsPanel onChange={price.refresh} /> : null}

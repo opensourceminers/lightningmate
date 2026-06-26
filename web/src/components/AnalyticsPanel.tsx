@@ -3,6 +3,9 @@ import { api } from "../api";
 import type { ForwardsReport, RebalanceRecord } from "../types";
 import { sats, satsCompact } from "../format";
 import { SkeletonPanel } from "./Skeleton";
+import { ForwardsPanel } from "./ForwardsPanel";
+
+type Sub = "trends" | "pnl" | "forwards";
 
 const WINDOWS = [
   { label: "30d", days: 30 },
@@ -99,6 +102,7 @@ function TrendChart({ fr }: { fr: ForwardsReport }) {
 }
 
 export function AnalyticsPanel() {
+  const [sub, setSub] = useState<Sub>("trends");
   const [days, setDays] = useState(30);
   const [fr, setFr] = useState<ForwardsReport | null>(null);
   const [records, setRecords] = useState<RebalanceRecord[]>([]);
@@ -125,23 +129,34 @@ export function AnalyticsPanel() {
   return (
     <div>
       <div className="subnav an-head">
-        <h2 className="an-title">Analytics</h2>
-        <div className="pnl-windows">
-          {WINDOWS.map((w) => (
-            <button key={w.days} className={`pnl-win ${days === w.days ? "active" : ""}`} onClick={() => setDays(w.days)}>
-              {w.label}
+        <div className="an-subnav">
+          {([["trends", "Trends"], ["pnl", "Channel P&L"], ["forwards", "Forwards"]] as [Sub, string][]).map(([id, label]) => (
+            <button key={id} className={`subtab ${sub === id ? "active" : ""}`} onClick={() => setSub(id)}>
+              {label}
             </button>
           ))}
         </div>
+        {sub !== "forwards" ? (
+          <div className="pnl-windows">
+            {WINDOWS.map((w) => (
+              <button key={w.days} className={`pnl-win ${days === w.days ? "active" : ""}`} onClick={() => setDays(w.days)}>
+                {w.label}
+              </button>
+            ))}
+          </div>
+        ) : null}
       </div>
 
-      {error ? <p className="banner error">{error}</p> : null}
-      {!fr ? (
+      {sub === "forwards" ? (
+        <ForwardsPanel />
+      ) : error ? (
+        <p className="banner error">{error}</p>
+      ) : !fr ? (
         <SkeletonPanel rows={6} />
+      ) : sub === "trends" ? (
+        <TrendChart fr={fr} />
       ) : (
         <>
-          <TrendChart fr={fr} />
-
           <section className="panel">
             <div className="panel-head">
               <h2>Channel profitability <span className="muted">· fees earned − rebalancing cost</span></h2>
