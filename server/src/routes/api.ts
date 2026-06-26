@@ -221,6 +221,7 @@ export function createApiRouter(
       const [node, flow] = await Promise.all([getNodeSummary(lnd), getFlowSummary(lnd, 30)]);
       const body = {
         type: "four-stats",
+        refresh: "60s",
         link: "",
         items: [
           { title: "Channels", text: String(node.activeChannelsCount), subtext: "active" },
@@ -232,7 +233,7 @@ export function createApiRouter(
       widgetCache = { at: Date.now(), body };
       res.json(body);
     } catch {
-      res.json({ type: "four-stats", link: "", items: [] });
+      res.json({ type: "four-stats", refresh: "60s", link: "", items: [] });
     }
   });
 
