@@ -317,7 +317,10 @@ function buildRecommendation(
   const isTopEarner = enoughChannels && f30.revenue > 0 && f30.revenue >= earnerCutoff;
 
   // §6 peer gate — has it routed out (or seen flow) in the gate window?
-  const peerGate: "ok" | "weak" = f30.out > 0 || f30.forwards > 0 ? "ok" : "weak";
+  // On active routing paths in either direction? A fully-drained channel can't
+  // route out, so also count inbound flow (it's being naturally refilled) — else
+  // we'd wrongly flag a busy, just-drained channel as a dead peer.
+  const peerGate: "ok" | "weak" = f30.out > 0 || f30.inn > 0 || f30.forwards > 0 ? "ok" : "weak";
 
   // §2 target ratio + §1 balance base
   const targetLocalRatio = targetLocalRatioFor(ch.role, cfg);

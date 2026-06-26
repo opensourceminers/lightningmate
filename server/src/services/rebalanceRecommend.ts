@@ -390,7 +390,10 @@ async function probe(
   }
 
   rec.expectedPaybackDays = rec.avgDailyRevenueSats > 0 ? Math.round((feeSats / rec.avgDailyRevenueSats) * 10) / 10 : null;
-  const earnings = Math.round((Math.min(amount, Math.max(0, rec.routedOut14d - rec.routedIn14d) || amount) * (rec.expectedRevenuePpm ?? 0)) / 1_000_000);
+  // Refilled liquidity earns on what the channel actually routes out (its demand,
+  // proxied by 14d outbound), not on the whole amount.
+  const demandCap = rec.routedOut14d > 0 ? rec.routedOut14d : amount;
+  const earnings = Math.round((Math.min(amount, demandCap) * (rec.expectedRevenuePpm ?? 0)) / 1_000_000);
   rec.expectedNetProfitSats = earnings - feeSats;
 
   const tooPricey = (rec.maxCostPpm != null && costPpm > rec.maxCostPpm) || (rec.maxCostSatsByPayback != null && feeSats > rec.maxCostSatsByPayback);
