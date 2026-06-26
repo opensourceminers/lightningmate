@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
-import type { FeeApplyItem, FeeRecReport, FeeRecState } from "../types";
+import type { FeeApplyItem, FeeMode, FeeRecReport, FeeRecState, OverrideMap } from "../types";
 import { satsCompact } from "../format";
 
 const STATE_LABEL: Record<FeeRecState, string> = {
@@ -26,6 +26,8 @@ export function FeeRecommendations() {
   const [canWrite, setCanWrite] = useState(false);
   const [applying, setApplying] = useState(false);
   const [applied, setApplied] = useState<number | null>(null);
+  const [overrides, setOverrides] = useState<OverrideMap>({});
+  const [showAll, setShowAll] = useState(false);
   const [open, setOpen] = useState<Set<string>>(new Set());
   const toggle = (id: string) =>
     setOpen((s) => {
@@ -44,7 +46,18 @@ export function FeeRecommendations() {
   useEffect(() => {
     void load();
     api.autopilotGet().then((s) => setCanWrite(s.canWrite)).catch(() => setCanWrite(false));
+    api.overrides().then(setOverrides).catch(() => {});
   }, []);
+
+  const setOv = async (id: string, mode: FeeMode, fixedPpm?: number) => {
+    try {
+      await api.setOverride(id, mode, fixedPpm);
+      setOverrides(await api.overrides());
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const wouldApply = data?.recommendations.filter((r) => r.wouldApply) ?? [];
   const apply = async () => {
@@ -85,6 +98,9 @@ export function FeeRecommendations() {
             </button>
           ) : null}
           {applied != null ? <span className="apply-result">✓ {applied} applied</span> : null}
+          <button className="reset" onClick={() => setShowAll((v) => !v)}>
+            {showAll ? "only changes" : "show all"}
+          </button>
         </div>
       </div>
 
@@ -122,12 +138,13 @@ export function FeeRecommendations() {
                 <th className="num">Local</th>
                 <th className="num">Current → Target</th>
                 <th>State</th>
-                <th>Apply</th>
+                <th>Manage</th>
                 <th>Why</th>
               </tr>
             </thead>
             <tbody>
               {[...data.recommendations]
+                .filter((r) => showAll || r.state !== "normal" || r.wouldApply || overrides[r.channelId])
                 .sort(
                   (a, b) =>
                     Number(b.wouldApply) - Number(a.wouldApply) ||
@@ -151,13 +168,36 @@ export function FeeRecommendations() {
                         </td>
                         <td>
                           <span className={`feerec-state ${STATE_CLASS[r.state]}`}>{STATE_LABEL[r.state]}</span>
+                          {r.wouldApply ? <span className="apply-yes" title="would change"> ✓</span> : null}
                         </td>
-                        <td>
-                          {r.wouldApply ? (
-                            <span className="apply-yes">✓</span>
-                          ) : (
-                            <span className="apply-no" title={r.blockedByGuards.join(", ")}>—</span>
-                          )}
+                        <td className="ov-cell" onClick={(e) => e.stopPropagation()}>
+                          <div className="ov-control">
+                            {(["auto", "fixed", "exclude"] as FeeMode[]).map((mode) => (
+                              <button
+                                key={mode}
+                                className={`ov-btn ${(overrides[r.channelId]?.mode ?? "auto") === mode ? "active" : ""}`}
+                                title={mode === "fixed" ? "pin a fixed fee" : mode === "exclude" ? "autopilot won't touch this channel" : "autopilot manages"}
+                                onClick={() =>
+                                  void setOv(
+                                    r.channelId,
+                                    mode,
+                                    mode === "fixed" ? overrides[r.channelId]?.fixedPpm ?? r.currentPpm : undefined,
+                                  )
+                                }
+                              >
+                                {mode === "auto" ? "auto" : mode === "fixed" ? "fix" : "off"}
+                              </button>
+                            ))}
+                            {overrides[r.channelId]?.mode === "fixed" ? (
+                              <input
+                                className="ov-input"
+                                type="number"
+                                min={0}
+                                defaultValue={overrides[r.channelId]?.fixedPpm ?? r.currentPpm}
+                                onBlur={(e) => void setOv(r.channelId, "fixed", Math.max(0, Number(e.target.value) || 0))}
+                              />
+                            ) : null}
+                          </div>
                         </td>
                         <td className="muted reason">{r.reasons[0]}</td>
                       </tr>

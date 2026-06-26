@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
-import type { RebalanceLogResponse, RebalanceRecReport, RebalanceRecState } from "../types";
+import type { FeeMode, OverrideMap, RebalanceLogResponse, RebalanceRecReport, RebalanceRecState } from "../types";
 import { sats, satsCompact, timeAgo } from "../format";
 import { useUi } from "./Overlay";
 
@@ -33,6 +33,7 @@ export function RebalanceRecommendations() {
   const [canWrite, setCanWrite] = useState(false);
   const [log, setLog] = useState<RebalanceLogResponse | null>(null);
   const [running, setRunning] = useState<string | null>(null);
+  const [overrides, setOverrides] = useState<OverrideMap>({});
   const [open, setOpen] = useState<Set<string>>(new Set());
   const toggle = (id: string) =>
     setOpen((s) => {
@@ -52,7 +53,18 @@ export function RebalanceRecommendations() {
     void load();
     api.autopilotGet().then((s) => setCanWrite(s.canWrite)).catch(() => setCanWrite(false));
     api.rebalanceLog().then(setLog).catch(() => {});
+    api.overrides().then(setOverrides).catch(() => {});
   }, []);
+
+  const setOv = async (id: string, mode: FeeMode) => {
+    try {
+      await api.setOverride(id, mode);
+      setOverrides(await api.overrides());
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   const execute = async (r: RebalanceRecReport["recommendations"][number]) => {
     if (!r.selectedSourceChannel || !r.recommendedAmount) return;
@@ -189,6 +201,21 @@ export function RebalanceRecommendations() {
                                 <span>source <b>{r.sourceCandidates[0]?.alias ?? r.selectedSourceChannel}</b>{r.estimatedRouteFeeSats != null ? ` · route ${sats(r.estimatedRouteFeeSats)} sat` : ""}</span>
                               ) : null}
                               <span>max cost <b>{r.maxCostPpm != null ? `${r.maxCostPpm} ppm` : "—"}</b> · payback limit {r.maxPaybackDays}d</span>
+                            </div>
+                            <div className="ov-control">
+                              <span className="ov-label">Autopilot:</span>
+                              <button
+                                className={`ov-btn ${(overrides[r.channelId]?.mode ?? "auto") !== "exclude" ? "active" : ""}`}
+                                onClick={() => void setOv(r.channelId, "auto")}
+                              >
+                                auto
+                              </button>
+                              <button
+                                className={`ov-btn ${overrides[r.channelId]?.mode === "exclude" ? "active" : ""}`}
+                                onClick={() => void setOv(r.channelId, "exclude")}
+                              >
+                                exclude
+                              </button>
                             </div>
                             {r.wouldRebalance && canWrite ? (
                               <div className="apply-row">

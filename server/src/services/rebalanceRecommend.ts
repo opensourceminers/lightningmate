@@ -284,6 +284,14 @@ function classify(
     return rec;
   }
 
+  // excluded from the autopilot (manual) → visible but never auto-rebalanced
+  if (overrides[ch.id]?.mode === "exclude") {
+    rec.state = "watching";
+    rec.blockedBy.push("excluded (manual)");
+    rec.reasons.push("excluded from the autopilot — not auto-rebalancing this channel");
+    return rec;
+  }
+
   // §6 dead / weak-peer target → close candidate, never rebalance
   if (fee?.state === "close_candidate" || m?.peerGate === "weak") {
     rec.state = "close_candidate";
@@ -374,49 +382,65 @@ async function probe(
 ): Promise<void> {
   const source = rec.selectedSourceChannel ? chById.get(rec.selectedSourceChannel) : undefined;
   const target = chById.get(rec.channelId);
-  const amount = rec.recommendedAmount;
-  if (!source || !target || !amount) return;
+  const base = rec.recommendedAmount;
+  if (!source || !target || !base) return;
 
-  // probe at a generous ceiling so we report an honest cost even when too pricey
-  const { costPpm, feeSats } = await estimateCost(lnd, ownKey, source, target, amount, cfg.probeCeilingPpm);
-  rec.estimatedRouteCostPpm = costPpm;
-  rec.estimatedRouteFeeSats = feeSats;
-
-  if (costPpm == null || feeSats == null) {
+  // Try the desired amount and adaptive fallbacks — a target that's too pricey at
+  // the full size can be profitable at a smaller one (matches what execution does).
+  const amounts = [...new Set([base, Math.round(base / 2), Math.round(base / 4)].filter((a) => a >= cfg.minRebalanceAmount))];
+  const demand = rec.routedOut14d > 0 ? rec.routedOut14d : base;
+  const probes = await Promise.all(
+    amounts.map(async (amount) => {
+      const { costPpm, feeSats } = await estimateCost(lnd, ownKey, source, target, amount, cfg.probeCeilingPpm);
+      if (costPpm == null || feeSats == null) return null;
+      const earnings = Math.round((Math.min(amount, demand) * (rec.expectedRevenuePpm ?? 0)) / 1_000_000);
+      const netProfit = earnings - feeSats;
+      const paybackDays = rec.avgDailyRevenueSats > 0 ? Math.round((feeSats / rec.avgDailyRevenueSats) * 10) / 10 : null;
+      const passes =
+        (rec.maxCostPpm == null || costPpm <= rec.maxCostPpm) &&
+        (rec.maxCostSatsByPayback == null || feeSats <= rec.maxCostSatsByPayback) &&
+        netProfit >= cfg.minExpectedNetProfitSats;
+      return { amount, costPpm, feeSats, netProfit, paybackDays, passes };
+    }),
+  );
+  const found = probes.filter((p): p is NonNullable<typeof p> => p != null);
+  if (found.length === 0) {
     rec.state = "route_found_too_expensive";
     rec.blockedBy.push("no route within budget");
-    rec.reasons.push("no route found within the probe ceiling — try a smaller amount or run it manually");
+    rec.reasons.push("no route found at any size within the probe ceiling — try running it manually");
     return;
   }
+  // best passing route by net profit; otherwise the cheapest, for transparency
+  const passing = found.filter((p) => p.passes).sort((a, b) => b.netProfit - a.netProfit);
+  const best = passing[0] ?? [...found].sort((a, b) => a.costPpm - b.costPpm)[0];
+  rec.recommendedAmount = best.amount;
+  rec.estimatedRouteCostPpm = best.costPpm;
+  rec.estimatedRouteFeeSats = best.feeSats;
+  rec.expectedPaybackDays = best.paybackDays;
+  rec.expectedNetProfitSats = best.netProfit;
+  const k = (n: number) => `${Math.round(n / 1000)}k`;
 
-  rec.expectedPaybackDays = rec.avgDailyRevenueSats > 0 ? Math.round((feeSats / rec.avgDailyRevenueSats) * 10) / 10 : null;
-  // Refilled liquidity earns on what the channel actually routes out (its demand,
-  // proxied by 14d outbound), not on the whole amount.
-  const demandCap = rec.routedOut14d > 0 ? rec.routedOut14d : amount;
-  const earnings = Math.round((Math.min(amount, demandCap) * (rec.expectedRevenuePpm ?? 0)) / 1_000_000);
-  rec.expectedNetProfitSats = earnings - feeSats;
-
-  const tooPricey = (rec.maxCostPpm != null && costPpm > rec.maxCostPpm) || (rec.maxCostSatsByPayback != null && feeSats > rec.maxCostSatsByPayback);
+  if (best.passes) {
+    rec.state = "route_found_profitable";
+    rec.wouldRebalance = true;
+    rec.reasons.push(
+      `profitable: move ${k(best.amount)} at ${best.costPpm} ppm ≤ max ${rec.maxCostPpm}, payback ~${best.paybackDays}d, net +${best.netProfit} sat`,
+    );
+    return;
+  }
+  const tooPricey =
+    (rec.maxCostPpm != null && best.costPpm > rec.maxCostPpm) || (rec.maxCostSatsByPayback != null && best.feeSats > rec.maxCostSatsByPayback);
   if (tooPricey) {
     rec.state = "route_found_too_expensive";
     rec.blockedBy.push("route above max cost / payback limit");
     rec.reasons.push(
-      `route costs ${costPpm} ppm (max ${rec.maxCostPpm})` +
-        (rec.expectedPaybackDays != null ? `, payback ~${rec.expectedPaybackDays}d (limit ${cfg.maxPaybackDays}d)` : "") +
-        " — too expensive to be worth it",
+      `cheapest route ${best.costPpm} ppm (max ${rec.maxCostPpm})` +
+        (best.paybackDays != null ? `, payback ~${best.paybackDays}d (limit ${cfg.maxPaybackDays}d)` : "") +
+        " — too expensive even at smaller sizes",
     );
-    return;
-  }
-  if ((rec.expectedNetProfitSats ?? 0) < cfg.minExpectedNetProfitSats) {
+  } else {
     rec.state = "unprofitable_skip";
     rec.blockedBy.push("net profit below minimum");
-    rec.reasons.push(`expected net profit ${rec.expectedNetProfitSats} sat is below the ${cfg.minExpectedNetProfitSats} sat minimum`);
-    return;
+    rec.reasons.push(`best net profit ${best.netProfit} sat is below the ${cfg.minExpectedNetProfitSats} sat minimum`);
   }
-
-  rec.state = "route_found_profitable";
-  rec.wouldRebalance = true;
-  rec.reasons.push(
-    `profitable: route ${costPpm} ppm ≤ max ${rec.maxCostPpm}, payback ~${rec.expectedPaybackDays}d, expected net +${rec.expectedNetProfitSats} sat`,
-  );
 }
