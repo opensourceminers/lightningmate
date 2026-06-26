@@ -371,28 +371,34 @@ function buildRecommendation(
   let target = base * combinedMod;
 
   // §10 hard floors (always win). The binding floor's reason is unshifted to the
-  // front so the *dominant* reason is always shown first.
+  // front so the *dominant* reason is shown first. Floors are safety/economics
+  // limits, so they may exceed maxPpm — otherwise a low maxPpm would defeat
+  // protect mode and let the node route below its own refill cost.
   let floored: FeeRecState | null = null;
+  let hardFloor = 0;
   if (ageDays != null && ageDays < cfg.newChannelProtectionDays && f30.forwards < 3) {
     if (cfg.newChannelMinPpm > target) {
       target = cfg.newChannelMinPpm;
+      hardFloor = Math.max(hardFloor, cfg.newChannelMinPpm);
       reasons.unshift(`new channel: only ${ageDays}d old with little history — keeping a protected fee`);
     }
     exploring = false; // never explore-lower a brand-new channel
   }
   if (profitFloorPpm != null && profitFloorPpm > target) {
     target = profitFloorPpm;
+    hardFloor = Math.max(hardFloor, profitFloorPpm);
     floored = "recovering_cost";
     reasons.unshift(`profit floor: raised above refill cost (basis ${costBasisPpm} ppm × ${cfg.safetyMargin})`);
   }
   if (ch.localRatio < 0.1) {
     if (cfg.protectPpm > target) target = cfg.protectPpm;
+    hardFloor = Math.max(hardFloor, cfg.protectPpm);
     floored = "protecting_liquidity";
     reasons.unshift(`protect mode: channel nearly drained (${Math.round(ch.localRatio * 100)}% local) — raising fee`);
   }
 
-  // §10 clamp + round
-  target = clamp(target, cfg.minPpm, cfg.maxPpm);
+  // §10 clamp + round — floors may push the ceiling above maxPpm
+  target = clamp(target, cfg.minPpm, Math.max(cfg.maxPpm, hardFloor));
   let targetPpm = Math.round(target / cfg.stepPpm) * cfg.stepPpm;
 
   // manual per-channel overrides win over the algorithm
