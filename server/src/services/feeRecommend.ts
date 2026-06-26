@@ -2,6 +2,7 @@ import { getFeeRates, getWalletInfo, type AuthenticatedLnd } from "lightning";
 import { getChannelsView, type ChannelRole } from "./channels.js";
 import { getForwardsReport } from "./forwards.js";
 import type { RebalanceRecord } from "./rebalanceLog.js";
+import type { ChannelOverride, OverrideMap } from "./overrides.js";
 
 /**
  * Fee Autopilot v2 — recommendation engine (dry-run only; never writes fees).
@@ -99,6 +100,10 @@ export interface FeeRecommendation {
   capacity: number;
   currentPpm: number;
   targetPpm: number;
+  /** Funding outpoint + current base fee — needed to apply without clobbering base. */
+  transactionId: string | null;
+  transactionVout: number | null;
+  currentBaseMsat: number;
   wouldApply: boolean;
   blockedByGuards: string[];
   state: FeeRecState;
@@ -201,9 +206,10 @@ export async function getFeeRecommendations(
   lnd: AuthenticatedLnd,
   rebalanceRecords: RebalanceRecord[],
   cooldown: CooldownInput | null,
-  overrides: Partial<FeeRecConfig> = {},
+  configOverrides: Partial<FeeRecConfig> = {},
+  channelOverrides: OverrideMap = {},
 ): Promise<FeeRecReport> {
-  const cfg = { ...FEE_REC_DEFAULTS, ...overrides };
+  const cfg = { ...FEE_REC_DEFAULTS, ...configOverrides };
   const [channels, rates, fw14, fw30, wallet] = await Promise.all([
     getChannelsView(lnd),
     getFeeRates({ lnd }),
@@ -211,7 +217,7 @@ export async function getFeeRecommendations(
     getForwardsReport(lnd, cfg.benchmarkWindowDays),
     getWalletInfo({ lnd }),
   ]);
-  const rateById = new Map(rates.channels.map((c) => [c.id, c.fee_rate]));
+  const rateById = new Map(rates.channels.map((c) => [c.id, c]));
   const f14 = flowMap(fw14.perChannel);
   const f30 = flowMap(fw30.perChannel);
   const currentBlock = wallet.current_block_height ?? 0;
@@ -243,7 +249,8 @@ export async function getFeeRecommendations(
   const recommendations = channels.map((ch) =>
     buildRecommendation(ch, {
       cfg,
-      currentPpm: rateById.get(ch.id) ?? 0,
+      rate: rateById.get(ch.id),
+      override: channelOverrides[ch.id],
       f14: flowOf(f14, ch.id),
       f30: flowOf(f30, ch.id),
       currentBlock,
@@ -267,9 +274,17 @@ export async function getFeeRecommendations(
   return { generatedAt: new Date().toISOString(), config: cfg, nodeBenchmarks, recommendations };
 }
 
+interface RateInfo {
+  fee_rate: number;
+  base_fee_mtokens: string;
+  transaction_id: string;
+  transaction_vout: number;
+}
+
 interface BuildCtx {
   cfg: FeeRecConfig;
-  currentPpm: number;
+  rate: RateInfo | undefined;
+  override: ChannelOverride | undefined;
   f14: Flow;
   f30: Flow;
   currentBlock: number;
@@ -284,7 +299,8 @@ function buildRecommendation(
   ch: Awaited<ReturnType<typeof getChannelsView>>[number],
   ctx: BuildCtx,
 ): FeeRecommendation {
-  const { cfg, currentPpm, f14, f30, records, bench, enoughChannels, earnerCutoff } = ctx;
+  const { cfg, rate, f14, f30, records, bench, enoughChannels, earnerCutoff } = ctx;
+  const currentPpm = rate?.fee_rate ?? 0;
   const cap = Math.max(1, ch.capacity);
   const reasons: string[] = [];
 
@@ -351,29 +367,40 @@ function buildRecommendation(
   const combinedMod = clamp(velocityMod * benchMod, 0.8, 1.4);
   let target = base * combinedMod;
 
-  // §10 hard floors (always win)
+  // §10 hard floors (always win). The binding floor's reason is unshifted to the
+  // front so the *dominant* reason is always shown first.
   let floored: FeeRecState | null = null;
   if (ageDays != null && ageDays < cfg.newChannelProtectionDays && f30.forwards < 3) {
     if (cfg.newChannelMinPpm > target) {
       target = cfg.newChannelMinPpm;
-      reasons.push(`new channel: only ${ageDays}d old with little history — keeping a protected fee`);
+      reasons.unshift(`new channel: only ${ageDays}d old with little history — keeping a protected fee`);
     }
     exploring = false; // never explore-lower a brand-new channel
   }
   if (profitFloorPpm != null && profitFloorPpm > target) {
     target = profitFloorPpm;
     floored = "recovering_cost";
-    reasons.push(`profit floor: raised above refill cost (basis ${costBasisPpm} ppm × ${cfg.safetyMargin})`);
+    reasons.unshift(`profit floor: raised above refill cost (basis ${costBasisPpm} ppm × ${cfg.safetyMargin})`);
   }
-  if (ch.localRatio < 0.1 && cfg.protectPpm > target) {
-    target = cfg.protectPpm;
+  if (ch.localRatio < 0.1) {
+    if (cfg.protectPpm > target) target = cfg.protectPpm;
     floored = "protecting_liquidity";
-    reasons.push(`protect mode: channel nearly drained (${Math.round(ch.localRatio * 100)}% local)`);
+    reasons.unshift(`protect mode: channel nearly drained (${Math.round(ch.localRatio * 100)}% local) — raising fee`);
   }
 
   // §10 clamp + round
   target = clamp(target, cfg.minPpm, cfg.maxPpm);
-  const targetPpm = Math.round(target / cfg.stepPpm) * cfg.stepPpm;
+  let targetPpm = Math.round(target / cfg.stepPpm) * cfg.stepPpm;
+
+  // manual per-channel overrides win over the algorithm
+  const { override } = ctx;
+  if (override?.mode === "exclude") {
+    targetPpm = currentPpm;
+    reasons.unshift("excluded (manual) — not managed by the autopilot");
+  } else if (override?.mode === "fixed" && override.fixedPpm != null) {
+    targetPpm = clamp(Math.round(override.fixedPpm / cfg.stepPpm) * cfg.stepPpm, cfg.minPpm, cfg.maxPpm);
+    reasons.unshift(`pinned to ${targetPpm} ppm (manual)`);
+  }
 
   // §1/§8 base balance reason if nothing more specific fired
   if (reasons.length === 0) {
@@ -394,6 +421,7 @@ function buildRecommendation(
   // §11 apply guards (decide wouldApply only — never the target)
   const blockedByGuards: string[] = [];
   const minDelta = Math.max(cfg.minChangePpm, Math.round(currentPpm * cfg.relativeChangeThreshold));
+  if (override?.mode === "exclude") blockedByGuards.push("excluded (manual)");
   if (!ch.active) blockedByGuards.push("channel inactive");
   if (Math.abs(targetPpm - currentPpm) < minDelta) blockedByGuards.push("change below threshold");
   if (ctx.cooldown) {
@@ -411,6 +439,9 @@ function buildRecommendation(
     capacity: ch.capacity,
     currentPpm,
     targetPpm,
+    transactionId: rate?.transaction_id ?? null,
+    transactionVout: rate?.transaction_vout ?? null,
+    currentBaseMsat: rate ? Number(rate.base_fee_mtokens) : 0,
     wouldApply,
     blockedByGuards,
     state,

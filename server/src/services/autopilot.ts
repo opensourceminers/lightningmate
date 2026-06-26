@@ -9,10 +9,10 @@ import { getChannelSuggestions } from "./suggestions.js";
 import {
   applyFees,
   DEFAULT_POLICY,
-  getFeePreview,
   type FeeApplyItem,
   type FeePolicy,
 } from "./fees.js";
+import { getFeeRecommendations, type FeeRecConfig } from "./feeRecommend.js";
 import {
   DEFAULT_REBALANCE_POLICY,
   executeRebalance,
@@ -184,6 +184,19 @@ export class Autopilot {
     };
   }
 
+  /** Map the autopilot's existing policy onto the v2 engine, so v2 honours the
+   *  user's own min/max/step/anti-churn caps instead of its wider defaults. */
+  feeV2Overrides(): Partial<FeeRecConfig> {
+    const p = this.state.config.policy;
+    return {
+      minPpm: p.minPpm,
+      maxPpm: p.maxPpm,
+      stepPpm: p.step,
+      minChangePpm: p.minChangePpm,
+      maxChangesPerRun: this.state.config.maxChangesPerRun,
+    };
+  }
+
   /** Public, serializable view for the API. */
   getState() {
     return {
@@ -240,13 +253,6 @@ export class Autopilot {
     setTimeout(() => void this.runOnce(), 2_000);
   }
 
-  private cooldownOk(channelId: string): boolean {
-    const last = this.state.perChannelLastApplied[channelId];
-    if (!last) return true;
-    const elapsedMin = (Date.now() - new Date(last).getTime()) / 60_000;
-    return elapsedMin >= this.state.config.cooldownMinutes;
-  }
-
   private rebalanceCooldownOk(targetId: string, cooldownMin: number): boolean {
     const last = this.state.perTargetLastRebalanced[targetId];
     if (!last) return true;
@@ -255,38 +261,39 @@ export class Autopilot {
 
   /** Compute and apply eligible fee changes. */
   private async runFees(writeLnd: AuthenticatedLnd): Promise<AutopilotChange[]> {
-    const preview = await getFeePreview(this.readLnd, this.state.config.policy, this.overrides.all());
-    const eligible = preview.proposals
-      .filter(
-        (p) =>
-          p.active &&
-          p.willChange &&
-          p.transactionId !== null &&
-          p.transactionVout !== null &&
-          this.cooldownOk(p.id),
-      )
-      .slice(0, this.state.config.maxChangesPerRun);
+    // v2 engine — wouldApply already folds in the relative/absolute threshold,
+    // cooldown and max-changes-per-run, so we just apply the eligible ones.
+    const report = await getFeeRecommendations(
+      this.readLnd,
+      this.rebalanceLog.recent(200),
+      this.feeCooldown(),
+      this.feeV2Overrides(),
+      this.overrides.all(),
+    );
+    const eligible = report.recommendations.filter(
+      (r) => r.wouldApply && r.transactionId !== null && r.transactionVout !== null,
+    );
 
-    const items: FeeApplyItem[] = eligible.map((p) => ({
-      id: p.id,
-      transactionId: p.transactionId as string,
-      transactionVout: p.transactionVout as number,
-      feeRatePpm: p.proposedPpm,
-      baseFeeMsat: p.proposedBaseMsat,
+    const items: FeeApplyItem[] = eligible.map((r) => ({
+      id: r.channelId,
+      transactionId: r.transactionId as string,
+      transactionVout: r.transactionVout as number,
+      feeRatePpm: r.targetPpm,
+      baseFeeMsat: r.currentBaseMsat, // preserve the channel's base fee
     }));
 
     const results = items.length ? await applyFees(this.readLnd, writeLnd, items) : [];
-    const byId = new Map(eligible.map((p) => [p.id, p]));
-    return results.map((r) => {
-      const p = byId.get(r.id);
-      if (r.ok) this.state.perChannelLastApplied[r.id] = new Date().toISOString();
+    const byId = new Map(eligible.map((r) => [r.channelId, r]));
+    return results.map((res) => {
+      const r = byId.get(res.id);
+      if (res.ok) this.state.perChannelLastApplied[res.id] = new Date().toISOString();
       return {
-        id: r.id,
-        alias: p?.peerAlias ?? r.id,
-        fromPpm: p?.currentPpm ?? 0,
-        toPpm: r.feeRatePpm,
-        ok: r.ok,
-        error: r.error,
+        id: res.id,
+        alias: r?.alias ?? res.id,
+        fromPpm: r?.currentPpm ?? 0,
+        toPpm: res.feeRatePpm,
+        ok: res.ok,
+        error: res.error,
       };
     });
   }
