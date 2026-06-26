@@ -44,7 +44,7 @@ export interface ChannelSuggestion {
   socket: string;
 }
 
-interface NodeStat {
+export interface NodeStat {
   degree: number;
   totalCapacity: number;
   feeSum: number;
@@ -56,14 +56,14 @@ interface NodeStat {
   /** Pubkeys this node has a channel with (adjacency, for reach scoring). */
   neighbors: Set<string>;
 }
-interface NodeMeta {
+export interface NodeMeta {
   alias: string;
   hasClearnet: boolean;
   updatedAt: number;
   socket: string;
 }
 
-interface GraphCache {
+export interface GraphCache {
   at: number;
   stats: Map<string, NodeStat>;
   meta: Map<string, NodeMeta>;
@@ -77,7 +77,7 @@ function isClearnet(socket: string): boolean {
 }
 
 /** Pull + aggregate the network graph (cached — it's a heavy call). */
-async function buildGraphCache(lnd: AuthenticatedLnd): Promise<GraphCache> {
+export async function buildGraphCache(lnd: AuthenticatedLnd): Promise<GraphCache> {
   if (cache && Date.now() - cache.at < GRAPH_TTL_MS) return cache;
 
   const graph = await getNetworkGraph({ lnd });

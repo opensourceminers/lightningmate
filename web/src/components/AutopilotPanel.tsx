@@ -5,8 +5,9 @@ import { satsCompact, timeAgo } from "../format";
 import { RunState, Switch } from "./Switch";
 import { FeeRecommendations } from "./FeeRecommendations";
 import { RebalanceRecommendations } from "./RebalanceRecommendations";
+import { SuggestionsPanel } from "./SuggestionsPanel";
 
-type Sub = "fees" | "rebalancing" | "channels" | "history";
+type Sub = "fees" | "rebalancing" | "channels" | "magma" | "history";
 type NumKey =
   | "intervalMinutes"
   | "cooldownMinutes"
@@ -58,11 +59,15 @@ const SELL_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "sellReserveSats", label: "Keep on-chain reserve (sat)" },
 ];
 
-export function AutopilotPanel() {
+const SUBS: Sub[] = ["fees", "rebalancing", "channels", "magma", "history"];
+
+export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   const [server, setServer] = useState<AutopilotState | null>(null);
   const [draft, setDraft] = useState<AutopilotConfig | null>(null);
   const [busy, setBusy] = useState(false);
-  const [sub, setSub] = useState<Sub>("fees");
+  const [sub, setSub] = useState<Sub>(
+    initialSub && (SUBS as string[]).includes(initialSub) ? (initialSub as Sub) : "fees",
+  );
   const [lastRun, setLastRun] = useState<AutopilotRun | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [openItems, setOpenItems] = useState<Set<string>>(new Set());
@@ -164,6 +169,7 @@ export function AutopilotPanel() {
     { id: "fees", label: "Fees" },
     { id: "rebalancing", label: "Rebalancing" },
     { id: "channels", label: "Channels" },
+    { id: "magma", label: "Magma" },
     { id: "history", label: "History" },
   ];
 
@@ -227,12 +233,21 @@ export function AutopilotPanel() {
           <RebalanceRecommendations />
         </>
       ) : sub === "channels" ? (
+        <>
+          {toggleRow("channelEnabled", "Channel autopilot", "Opens a channel to the top suggestion below when on-chain funds allow")}
+          <details className="ap-customize">
+            <summary>Customize channel policy</summary>
+            <div className="policy-controls">{numFields(CHANNEL_NUM_FIELDS)}</div>
+            <div className="apply-row">
+              <button className="primary-btn" disabled={busy} onClick={() => save()}>Save settings</button>
+            </div>
+          </details>
+          <SuggestionsPanel />
+        </>
+      ) : sub === "magma" ? (
         <section className="panel">
-          {toggleRow("channelEnabled", "Channel autopilot", "Opens a channel to the top suggestion when on-chain funds allow")}
-          {toggleRow("sellEnabled", "Liquidity provision (Magma)", "Auto-fulfils your sell orders — opens channels to buyers, within caps")}
-          <h3 className="sub">Channel opening</h3>
-          <div className="policy-controls">{numFields(CHANNEL_NUM_FIELDS)}</div>
-          <h3 className="sub">Liquidity provision (Magma)</h3>
+          {toggleRow("sellEnabled", "Liquidity provision (Magma)", "Auto-fulfils your sell orders — opens channels to buyers, earns lease fees, within caps")}
+          <h3 className="sub">Caps</h3>
           <div className="policy-controls">{numFields(SELL_NUM_FIELDS)}</div>
           <label className="check ap-check">
             <input type="checkbox" checked={draft.sellAutoClose} onChange={(e) => setBool("sellAutoClose", e.target.checked)} />

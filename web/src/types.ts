@@ -310,19 +310,47 @@ export interface SuggestionPolicy {
   requireClearnet: boolean;
 }
 
+export type NodeNeed =
+  | "need_inbound"
+  | "need_outbound"
+  | "need_routing_diversity"
+  | "need_revenue"
+  | "balanced";
+
 export interface ChannelSuggestion {
   pubkey: string;
   alias: string;
+  socket: string;
+  hasClearnet: boolean;
   channels: number;
   capacitySats: number;
+  avgChannelSats: number;
   avgFeePpm: number;
-  hasClearnet: boolean;
   lastSeenDays: number;
-  newReach: number;
+
   score: number;
+  graphScore: number;
+  demandScore: number;
+  weightedReachScore: number;
+  roleFitScore: number;
+  economicsScore: number;
+
+  newReach: number;
+  weightedNewReach: number;
+  qualityReachCount: number;
+
+  demandOverlapCount: number;
+  demandFlowSharePct: number;
+
+  portfolioOverlap: number;
+
   recommendedSizeSats: number;
-  reason: string;
-  socket: string;
+  sizeReason: string;
+
+  usefulness: "high" | "medium" | "low";
+  badges: string[];
+  reasons: string[];
+  warnings: string[];
 }
 
 export interface CloseCandidate {
@@ -356,8 +384,17 @@ export interface OpenChannelResult {
 
 export interface SuggestionsResponse {
   policy: SuggestionPolicy;
+  nodeNeed: NodeNeed;
+  nodeNeedReason: string;
+  hasDemandData: boolean;
   suggestions: ChannelSuggestion[];
   graphAgeSec: number;
+  portfolioSummary: {
+    selectedCount: number;
+    estimatedNewReach: number;
+    estimatedWeightedNewReach: number;
+    demandCoveragePct: number;
+  };
 }
 
 export type FeeMode = "auto" | "fixed" | "exclude";

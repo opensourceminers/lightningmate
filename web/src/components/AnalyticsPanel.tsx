@@ -101,8 +101,10 @@ function TrendChart({ fr }: { fr: ForwardsReport }) {
   );
 }
 
-export function AnalyticsPanel() {
-  const [sub, setSub] = useState<Sub>("trends");
+export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
+  const [sub, setSub] = useState<Sub>(
+    initialSub === "pnl" || initialSub === "forwards" ? initialSub : "trends",
+  );
   const [days, setDays] = useState(30);
   const [fr, setFr] = useState<ForwardsReport | null>(null);
   const [records, setRecords] = useState<RebalanceRecord[]>([]);

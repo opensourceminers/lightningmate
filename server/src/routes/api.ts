@@ -11,7 +11,8 @@ import {
   getRebalanceCandidates,
   type RebalancePolicy,
 } from "../services/rebalance.js";
-import { getChannelSuggestions, getCloseCandidates, type SuggestionPolicy } from "../services/suggestions.js";
+import { getCloseCandidates, type SuggestionPolicy } from "../services/suggestions.js";
+import { getChannelSuggestionsV2 } from "../services/suggestRecommend.js";
 import { getPnl } from "../services/pnl.js";
 import { buildDashboard } from "../services/dashboard.js";
 import {
@@ -532,7 +533,7 @@ export function createApiRouter(
       if (req.query.requireClearnet !== undefined) {
         overrides.requireClearnet = req.query.requireClearnet === "true";
       }
-      res.json(await getChannelSuggestions(lnd, overrides));
+      res.json(await getChannelSuggestionsV2(lnd, overrides));
     }),
   );
 
