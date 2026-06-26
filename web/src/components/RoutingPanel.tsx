@@ -1,8 +1,7 @@
 import { useState } from "react";
 import { ForwardsPanel } from "./ForwardsPanel";
 import { FeeRecommendations } from "./FeeRecommendations";
-import { FeesPanel } from "./FeesPanel";
-import { RebalancePanel } from "./RebalancePanel";
+import { RebalanceRecommendations } from "./RebalanceRecommendations";
 
 type Sub = "forwards" | "fees" | "rebalance";
 
@@ -24,12 +23,9 @@ export function RoutingPanel() {
       {sub === "forwards" ? (
         <ForwardsPanel />
       ) : sub === "fees" ? (
-        <>
-          <FeeRecommendations />
-          <FeesPanel />
-        </>
+        <FeeRecommendations />
       ) : (
-        <RebalancePanel />
+        <RebalanceRecommendations />
       )}
     </div>
   );

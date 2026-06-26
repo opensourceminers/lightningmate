@@ -13,12 +13,8 @@ import {
   type FeePolicy,
 } from "./fees.js";
 import { getFeeRecommendations, type FeeRecConfig } from "./feeRecommend.js";
-import {
-  DEFAULT_REBALANCE_POLICY,
-  executeRebalance,
-  getRebalanceCandidates,
-  type RebalancePolicy,
-} from "./rebalance.js";
+import { DEFAULT_REBALANCE_POLICY, executeRebalance, type RebalancePolicy } from "./rebalance.js";
+import { getRebalanceRecommendations } from "./rebalanceRecommend.js";
 import type { RebalanceLog } from "./rebalanceLog.js";
 import type { OverridesStore } from "./overrides.js";
 
@@ -310,22 +306,37 @@ export class Autopilot {
   private async runRebalances(writeLnd: AuthenticatedLnd): Promise<AutopilotRebalance[]> {
     if (!this.inRebalanceWindow()) return [];
     const { rebalancePolicy, maxRebalancesPerRun, rebalanceCooldownMinutes } = this.state.config;
-    const analysis = await getRebalanceCandidates(this.readLnd, rebalancePolicy);
-    const eligible = analysis.candidates
-      .filter((c) => c.profitable && this.rebalanceCooldownOk(c.targetId, rebalanceCooldownMinutes))
+    // v1 recommender — only acts on route_found_profitable (wouldRebalance), with
+    // the fee-adjust-first / payback / profit gating already applied.
+    const report = await getRebalanceRecommendations(
+      this.readLnd,
+      this.rebalanceLog.recent(200),
+      this.feeCooldown(),
+      this.feeV2Overrides(),
+      this.overrides.all(),
+    );
+    const eligible = report.recommendations
+      .filter(
+        (r) =>
+          r.wouldRebalance &&
+          r.selectedSourceChannel &&
+          r.recommendedAmount &&
+          this.rebalanceCooldownOk(r.channelId, rebalanceCooldownMinutes),
+      )
       .slice(0, maxRebalancesPerRun);
 
     const out: AutopilotRebalance[] = [];
-    for (const c of eligible) {
+    for (const r of eligible) {
       const res = await executeRebalance(this.readLnd, writeLnd, {
-        targetId: c.targetId,
-        sourceId: c.sourceId,
-        amountSats: c.amountSats,
+        targetId: r.channelId,
+        sourceId: r.selectedSourceChannel as string,
+        amountSats: r.recommendedAmount as number,
         econRatio: rebalancePolicy.econRatio,
+        maxFeePpm: r.maxCostPpm ?? undefined, // the v1 economic ceiling
       });
       // Mark the target on every attempt (success or fail) so the cooldown also
       // backs off failing targets — no more hammering the same dead route.
-      this.state.perTargetLastRebalanced[c.targetId] = new Date().toISOString();
+      this.state.perTargetLastRebalanced[r.channelId] = new Date().toISOString();
       this.rebalanceLog.append({
         at: new Date().toISOString(),
         via: "autopilot",
