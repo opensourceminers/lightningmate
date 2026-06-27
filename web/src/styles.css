@@ -559,12 +559,12 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .mode-opt {
   flex: 1; min-width: 140px; display: flex; flex-direction: column; gap: 3px; align-items: flex-start;
   padding: 11px 14px; background: var(--panel-2); border: 1px solid var(--line); border-radius: var(--radius-sm);
-  cursor: pointer; text-align: left; transition: border-color var(--t), background var(--t);
+  cursor: pointer; text-align: left; color: var(--text); transition: border-color var(--t), background var(--t);
 }
 .mode-opt:hover:not(.active):not(:disabled) { border-color: var(--line-soft); }
 .mode-opt.active { border-color: var(--accent); background: rgba(247, 147, 26, 0.08); }
 .mode-opt:disabled { opacity: 0.5; cursor: default; }
-.mode-opt-label { font-weight: 700; font-size: 14px; }
+.mode-opt-label { font-weight: 700; font-size: 14px; color: var(--text); }
 .mode-opt.active .mode-opt-label { color: var(--accent); }
 .mode-opt-desc { font-size: 11px; color: var(--muted); }
 
