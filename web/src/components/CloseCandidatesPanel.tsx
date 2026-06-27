@@ -118,6 +118,7 @@ export function CloseCandidatesPanel() {
                       </div>
                       <div className="sug-badges">
                         <span className="sug-badge">{c.weOpened ? "you funded" : "peer-opened"}</span>
+                        {c.opportunityCandidates.length ? <span className="sug-badge swap">⇄ swap</span> : null}
                         {c.warnings.length ? <span className="sug-badge warn">⚠ {c.warnings.length}</span> : null}
                       </div>
                       <div className="muted reason">{c.reasons[0]}</div>
@@ -172,7 +173,10 @@ export function CloseCandidatesPanel() {
                           </div>
                           {c.opportunityCandidates.length ? (
                             <div className="close-redeploy">
-                              <span className="muted">Redeploy {satsCompact(c.capitalFreedSats)} into:</span>
+                              <span className="muted">
+                                ⇄ Swap — close this, open <strong>{c.opportunityCandidates[0].alias}</strong> with the
+                                freed {satsCompact(c.capitalFreedSats)}:
+                              </span>
                               {c.opportunityCandidates.map((o) => (
                                 <span key={o.alias} className="sug-badge">
                                   {o.alias} ({o.score}) · ~{satsCompact(o.sizeSats)}
