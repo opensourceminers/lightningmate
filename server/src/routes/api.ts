@@ -14,6 +14,7 @@ import {
 import { type SuggestionPolicy } from "../services/suggestions.js";
 import { getChannelSuggestionsV2, getCloseSuggestionsV2 } from "../services/suggestRecommend.js";
 import { getMagmaRecommendations } from "../services/magmaRecommend.js";
+import { getAutopilotOutcomes } from "../services/outcomes.js";
 import { getPnl } from "../services/pnl.js";
 import { buildDashboard } from "../services/dashboard.js";
 import {
@@ -503,6 +504,14 @@ export function createApiRouter(
       const days = Number(req.query.days ?? config.flowWindowDays);
       const windowDays = Number.isFinite(days) && days > 0 ? days : config.flowWindowDays;
       res.json(await getPnl(lnd, rebalanceLog, windowDays));
+    }),
+  );
+
+  // Autopilot outcomes — did the fee changes / rebalances actually pay off?
+  router.get(
+    "/autopilot/outcomes",
+    wrap(async (_req, res) => {
+      res.json(await getAutopilotOutcomes(lnd, autopilot.getState().history, rebalanceLog.recent(200)));
     }),
   );
 

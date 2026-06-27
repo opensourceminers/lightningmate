@@ -32,6 +32,7 @@ import type {
   BuyQuote,
   MagmaV2Report,
   MarketView,
+  OutcomesReport,
   MyOffer,
   MyOrdersView,
   OrderState,
@@ -202,6 +203,7 @@ export const api = {
   ambossMyOffers: () => get<{ offers: MyOffer[] }>("/amboss/my-offers"),
   ambossMyOrders: () => get<MyOrdersView>("/amboss/my-orders"),
   magmaRecommendations: () => get<MagmaV2Report>("/amboss/recommendations"),
+  autopilotOutcomes: () => get<OutcomesReport>("/autopilot/outcomes"),
   ambossCreateOffer: (p: {
     totalSizeSats: number;
     minSizeSats: number;
