@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
-import type { ChannelView, ForwardsReport, MagmaV2Report, RebalanceRecord } from "../types";
+import type { ChannelView, ForwardsReport, MagmaV2Report, OutcomesReport, RebalanceRecord } from "../types";
 import { sats, satsCompact } from "../format";
 import { SkeletonPanel } from "./Skeleton";
 import { ForwardsPanel } from "./ForwardsPanel";
@@ -119,6 +119,7 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
   const [records, setRecords] = useState<RebalanceRecord[]>([]);
   const [channels, setChannels] = useState<ChannelView[]>([]);
   const [magma, setMagma] = useState<MagmaV2Report | null>(null);
+  const [outcomes, setOutcomes] = useState<OutcomesReport | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -140,6 +141,7 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
   useEffect(() => {
     api.channels().then((c) => setChannels(c)).catch(() => {});
     api.magmaRecommendations().then(setMagma).catch(() => {});
+    api.autopilotOutcomes().then(setOutcomes).catch(() => {});
   }, []);
 
   const pnl = useMemo(() => (fr ? buildPnl(fr, records, days) : []), [fr, records, days]);
@@ -261,6 +263,58 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
               </table>
             )}
           </section>
+
+          {outcomes && (outcomes.fees.measured > 0 || outcomes.rebalances.measured > 0) ? (
+            <section className="panel">
+              <div className="panel-head">
+                <h2>Did the autopilot pay off? <span className="muted">· measured outcomes</span></h2>
+              </div>
+              <div className="an-card-grid">
+                <Kpi
+                  label="Fee changes"
+                  value={outcomes.fees.avgRevenueDeltaPct != null ? `${outcomes.fees.avgRevenueDeltaPct >= 0 ? "+" : ""}${Math.round(outcomes.fees.avgRevenueDeltaPct * 100)}` : "—"}
+                  unit="% rev"
+                  tone={outcomes.fees.avgRevenueDeltaPct != null && outcomes.fees.avgRevenueDeltaPct >= 0 ? "green" : outcomes.fees.avgRevenueDeltaPct != null ? "cost" : undefined}
+                  sub={`${outcomes.fees.measured} change${outcomes.fees.measured === 1 ? "" : "s"} · ${outcomes.fees.raises}↑ ${outcomes.fees.cuts}↓ · revenue vs prior week`}
+                />
+                <Kpi
+                  label="Rebalance ROI"
+                  value={outcomes.rebalances.avgEarnedBackPct != null ? `${outcomes.rebalances.avgEarnedBackPct}` : "—"}
+                  unit="% earned back"
+                  tone={outcomes.rebalances.avgEarnedBackPct != null && outcomes.rebalances.avgEarnedBackPct >= 100 ? "green" : outcomes.rebalances.avgEarnedBackPct != null ? "cost" : undefined}
+                  sub={`${outcomes.rebalances.paidBackCount}/${outcomes.rebalances.measured} paid back · ${outcomes.rebalances.netSats >= 0 ? "+" : "−"}${sats(Math.abs(outcomes.rebalances.netSats))} sat net (${outcomes.measureWindowDays}d)`}
+                />
+              </div>
+              {outcomes.fees.items.length ? (
+                <table className="fee-table">
+                  <thead>
+                    <tr>
+                      <th>Channel</th>
+                      <th className="num">Fee</th>
+                      <th className="num">Daily rev before → after</th>
+                      <th className="num">Δ</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {outcomes.fees.items.slice(0, 12).map((f, i) => (
+                      <tr key={`${f.channelId}-${i}`}>
+                        <td className="an-alias">{f.alias}</td>
+                        <td className="num">
+                          {f.fromPpm} <span className={f.raised ? "delta-up" : "delta-down"}>→ {f.toPpm}</span>
+                        </td>
+                        <td className="num muted">
+                          {f.beforeDailyAvgSat} → {f.afterDailyAvgSat} sat
+                        </td>
+                        <td className={`num net ${f.deltaPct == null ? "" : f.deltaPct >= 0 ? "green" : "cost"}`}>
+                          {f.deltaPct == null ? "—" : `${f.deltaPct >= 0 ? "+" : ""}${Math.round(f.deltaPct * 100)}%`}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : null}
+            </section>
+          ) : null}
         </>
       )}
     </div>

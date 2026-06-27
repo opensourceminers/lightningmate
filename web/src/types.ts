@@ -893,6 +893,41 @@ export interface MagmaSellAnalytics {
   closableSoon: number;
 }
 
+export interface FeeOutcome {
+  channelId: string;
+  alias: string;
+  at: string;
+  fromPpm: number;
+  toPpm: number;
+  raised: boolean;
+  beforeDailyAvgSat: number;
+  afterDailyAvgSat: number;
+  deltaPct: number | null;
+}
+export interface RebalanceOutcome {
+  targetId: string;
+  alias: string;
+  at: string;
+  costSats: number;
+  revenueAfterSats: number;
+  earnedBackPct: number;
+  netSats: number;
+  paidBack: boolean;
+}
+export interface OutcomesReport {
+  measureWindowDays: number;
+  fees: { measured: number; raises: number; cuts: number; avgRevenueDeltaPct: number | null; items: FeeOutcome[] };
+  rebalances: {
+    measured: number;
+    totalCostSats: number;
+    totalEarnedBackSats: number;
+    avgEarnedBackPct: number | null;
+    paidBackCount: number;
+    netSats: number;
+    items: RebalanceOutcome[];
+  };
+}
+
 export interface MagmaV2Report {
   nodeNeed: NodeNeed;
   nodeNeedReason: string;
