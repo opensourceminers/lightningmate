@@ -2,11 +2,11 @@ import { getChannels, getChainBalance, type AuthenticatedLnd } from "lightning";
 import { JsonStore } from "../store.js";
 import { closeChannelByOutpoint, openChannelTo } from "./channelOps.js";
 import { createInvoice } from "./payments.js";
-import { acceptOrder, addOrderTransaction, getMyOffers, getMyOrders, updateOffer } from "./amboss.js";
+import { acceptOrder, addOrderTransaction, createOffer, getMyOffers, getMyOrders, updateOffer } from "./amboss.js";
 import { paySaleServiceFee } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
-import { getMagmaRecommendations, type MagmaSellRecommendation } from "./magmaRecommend.js";
+import { getMagmaRecommendations, type MagmaSellRecommendation, type MagmaV2Report } from "./magmaRecommend.js";
 import {
   applyFees,
   DEFAULT_POLICY,
@@ -61,8 +61,8 @@ export interface AutopilotConfig {
    *  the profit floor), instead of leaving it static. */
   sellAutoReprice: boolean;
   /** Pricing level when auto-pricing: fast (undercut to sell quickly), balanced
-   *  (market median), or premium (top of the market). */
-  sellPricingMode: "fast" | "balanced" | "premium";
+   *  (market median), premium (top of the market), or auto (adapt to fill speed). */
+  sellPricingMode: "fast" | "balanced" | "premium" | "auto";
 }
 
 export interface AutopilotChange {
@@ -118,6 +118,12 @@ interface PersistedState {
   perTargetLastRebalanced: Record<string, string>;
   lastChannelOpenAt: string | null;
   lastSellRepriceAt: string | null;
+  /** Adaptive Magma pricing state (mode "auto"): the current 0..1 price level and
+   *  the fill bookkeeping that ratchets it up (sells fast) or down (sits unsold). */
+  sellAdaptiveLevel: number;
+  lastSellFilledCount: number;
+  lastSellFillAt: string | null;
+  lastSellAdaptiveAdjustAt: string | null;
   history: AutopilotRun[];
 }
 
@@ -171,11 +177,19 @@ export class Autopilot {
       perTargetLastRebalanced: {},
       lastChannelOpenAt: null,
       lastSellRepriceAt: null,
+      sellAdaptiveLevel: 0.5,
+      lastSellFilledCount: 0,
+      lastSellFillAt: null,
+      lastSellAdaptiveAdjustAt: null,
       history: [],
     });
     // Merge in any newly added config defaults from older persisted state.
     this.state.config = { ...DEFAULT_CONFIG, ...this.state.config };
     this.state.perTargetLastRebalanced ??= {};
+    this.state.sellAdaptiveLevel ??= 0.5;
+    this.state.lastSellFilledCount ??= 0;
+    this.state.lastSellFillAt ??= null;
+    this.state.lastSellAdaptiveAdjustAt ??= null;
   }
 
   /** Whether writing to the node is possible at all. */
@@ -202,6 +216,12 @@ export class Autopilot {
       minChangePpm: p.minChangePpm,
       maxChangesPerRun: this.state.config.maxChangesPerRun,
     };
+  }
+
+  /** Magma pricing the recommendations should reflect — the configured mode + the
+   *  live adaptive level — so the UI shows what the autopilot is actually doing. */
+  magmaOverrides(): { sellPricingMode: "fast" | "balanced" | "premium" | "auto"; adaptiveLevel: number } {
+    return { sellPricingMode: this.state.config.sellPricingMode, adaptiveLevel: this.state.sellAdaptiveLevel };
   }
 
   /** Public, serializable view for the API. */
@@ -446,6 +466,29 @@ export class Autopilot {
     // blow past the deploy cap or the on-chain reserve.
     let extra = 0;
 
+    // Adaptive pricing (mode "auto"): ratchet the price level UP when an order
+    // fills (you could be charging more) and DOWN when the offer sits unsold —
+    // converging on the price that just clears. Floor still applies downstream.
+    if (cfg.sellPricingMode === "auto" && cfg.sellAutoReprice) {
+      const filledNow = orders.filter((o) => o.transactionId).length;
+      const now = Date.now();
+      if (filledNow > this.state.lastSellFilledCount) {
+        this.state.sellAdaptiveLevel = Math.min(1, this.state.sellAdaptiveLevel + 0.15);
+        this.state.lastSellFillAt = new Date().toISOString();
+        this.state.lastSellAdaptiveAdjustAt = new Date().toISOString();
+      } else {
+        const staleFor = this.state.lastSellFillAt ? now - new Date(this.state.lastSellFillAt).getTime() : Infinity;
+        const sinceAdjust = this.state.lastSellAdaptiveAdjustAt
+          ? now - new Date(this.state.lastSellAdaptiveAdjustAt).getTime()
+          : Infinity;
+        if (staleFor > 3 * 86_400_000 && sinceAdjust > 86_400_000) {
+          this.state.sellAdaptiveLevel = Math.max(0, this.state.sellAdaptiveLevel - 0.1);
+          this.state.lastSellAdaptiveAdjustAt = new Date().toISOString();
+        }
+      }
+      this.state.lastSellFilledCount = filledNow;
+    }
+
     // Manage live offers: an ENABLED offer is kept continuously priced to the
     // CURRENT market at the configured level (Low / Median / Premium) — never below
     // the profit floor (the engine clamps that). This is the heart of the Magma
@@ -455,10 +498,14 @@ export class Autopilot {
     if (cfg.sellAutoRelist || cfg.sellAutoReprice) {
       try {
         const offers = await getMyOffers(key);
+        let rec: MagmaV2Report | null = null;
         let recByOffer = new Map<string, MagmaSellRecommendation>();
         if (cfg.sellAutoReprice) {
           try {
-            const rec = await getMagmaRecommendations(this.readLnd, key, { sellPricingMode: cfg.sellPricingMode });
+            rec = await getMagmaRecommendations(this.readLnd, key, {
+              sellPricingMode: cfg.sellPricingMode,
+              adaptiveLevel: this.state.sellAdaptiveLevel,
+            });
             recByOffer = new Map(
               rec.sell.recommendations.filter((r) => r.offerId).map((r) => [r.offerId as string, r]),
             );
@@ -507,6 +554,28 @@ export class Autopilot {
               minBlockLength: off.minBlockLength,
             });
             out.push({ orderId: off.id, action: "reprice", sizeSats: off.totalSizeSats, ok: true });
+          }
+        }
+
+        // Auto-list idle/freed capital: when there's NO offer at all and leasing
+        // currently beats routing, list your deployable on-chain capital at the
+        // recommended price. (Only when no offer exists — a disabled offer is
+        // treated as a deliberate choice and left alone.)
+        const createRec = rec?.sell.recommendations.find((r) => r.mode === "create");
+        if (offers.length === 0 && rec?.sell.state === "good_to_sell" && createRec) {
+          const total = Math.min(chain_balance - cfg.sellReserveSats - deployed, cfg.sellMaxDeploySats - deployed);
+          const maxCh = Math.min(cfg.sellMaxChannelSats, total);
+          const minCh = Math.min(1_000_000, maxCh);
+          if (total >= 1_000_000 && maxCh >= minCh) {
+            await createOffer(key, {
+              totalSizeSats: total,
+              minSizeSats: minCh,
+              maxSizeSats: maxCh,
+              feeRatePpm: createRec.recommended.feeRatePpm,
+              baseFeeSats: createRec.recommended.baseFeeSat,
+              minBlockLength: createRec.recommended.minBlockLength,
+            });
+            out.push({ orderId: "new-offer", action: "relist", sizeSats: total, ok: true });
           }
         }
       } catch {

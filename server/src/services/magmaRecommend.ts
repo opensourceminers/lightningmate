@@ -1,4 +1,4 @@
-import { getChainBalance, type AuthenticatedLnd } from "lightning";
+import { getChainBalance, getChainFeeRate, type AuthenticatedLnd } from "lightning";
 import { getChannelsView } from "./channels.js";
 import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
@@ -28,6 +28,9 @@ export interface MagmaV2Config {
   defaultOpenCostSat: number;
   defaultCloseCostSat: number;
   includeCloseCost: boolean;
+  /** Approx on-chain tx size to cost the open/close from the live fee rate. */
+  openTxVbytes: number;
+  closeTxVbytes: number;
   /** Lease must out-yield routing by at least this ratio to be worth selling. */
   minLeaseVsRoutingRatio: number;
   defaultRoutingOpportunityPpmPerYear: number;
@@ -36,7 +39,9 @@ export interface MagmaV2Config {
   maxSellSizeSat: number;
   onchainReserveSat: number;
   defaultMinBlockLength: number;
-  sellPricingMode: "fast" | "balanced" | "premium";
+  sellPricingMode: "fast" | "balanced" | "premium" | "auto";
+  /** For "auto": 0 = aggressive (undercut/low), 0.5 = median, 1 = premium. */
+  adaptiveLevel: number;
   minFeeRatePpm: number;
   maxFeeRatePpm: number;
   minRepriceDeltaPpm: number;
@@ -52,6 +57,8 @@ export const MAGMA_V2_DEFAULTS: MagmaV2Config = {
   defaultOpenCostSat: 1_000,
   defaultCloseCostSat: 500,
   includeCloseCost: true,
+  openTxVbytes: 175,
+  closeTxVbytes: 150,
   minLeaseVsRoutingRatio: 1.2,
   defaultRoutingOpportunityPpmPerYear: 10_000,
   minNetLeaseProfitSat: 500,
@@ -60,6 +67,7 @@ export const MAGMA_V2_DEFAULTS: MagmaV2Config = {
   onchainReserveSat: 250_000,
   defaultMinBlockLength: 4032,
   sellPricingMode: "balanced",
+  adaptiveLevel: 0.5,
   minFeeRatePpm: 1,
   maxFeeRatePpm: 50_000,
   minRepriceDeltaPpm: 25,
@@ -184,6 +192,15 @@ export interface MagmaV2Report {
     routingOpportunityPpmPerYear: number | null;
     adjustedRoutingPpmPerYear: number;
     recommendedMinLeasePpmPerYear: number;
+    pricingMode: "fast" | "balanced" | "premium" | "auto";
+    adaptiveLevel: number;
+    optimalSizeSat: number;
+    optimalLeaseBlocks: number;
+    projectedMonthlySat: number;
+    onchainOpenCostSat: number;
+    onchainCloseCostSat: number;
+    onchainFeePerVbyte: number | null;
+    pendingSellerOrders: number;
     reasons: string[];
     warnings: string[];
     recommendations: MagmaSellRecommendation[];
@@ -229,7 +246,7 @@ export async function getMagmaRecommendations(
   // (LM_SELL_FEE_BPS), so the APY / profit-floor math never drifts from reality.
   if (overrides.serviceFeeRate === undefined) cfg.serviceFeeRate = saleFeeConfig().bps / 10_000;
 
-  const [market, myOffers, myOrdersView, channels, chain, ownKey, flow] = await Promise.all([
+  const [market, myOffers, myOrdersView, channels, chain, ownKey, flow, feeRate] = await Promise.all([
     getMarket(),
     getMyOffers(apiKey).catch(() => [] as MyOffer[]),
     getMyOrders(apiKey).catch(() => ({ orders: [] as MyOrder[], pendingSeller: 0 })),
@@ -237,10 +254,20 @@ export async function getMagmaRecommendations(
     getChainBalance({ lnd }).catch(() => ({ chain_balance: 0 })),
     getOwnPubkey(lnd),
     getFlowSummary(lnd, 30).catch(() => null),
+    getChainFeeRate({ lnd }).catch(() => null),
   ]);
 
   const offers = market.offers;
   const myOrders = myOrdersView.orders.filter((o) => o.side === "SELL");
+
+  // Live on-chain cost: a fee spike can make opening a channel cost more than the
+  // lease earns, so the profit floor must react to it. Fall back to the static
+  // defaults when the estimate is unavailable.
+  const onchainFeePerVbyte = feeRate?.tokens_per_vbyte ?? null;
+  if (onchainFeePerVbyte != null) {
+    cfg.defaultOpenCostSat = Math.ceil(onchainFeePerVbyte * cfg.openTxVbytes);
+    cfg.defaultCloseCostSat = Math.ceil(onchainFeePerVbyte * cfg.closeTxVbytes);
+  }
 
   // ── Routing opportunity cost — yield ON CAPITAL, annualised. This is the honest
   // bar Magma leasing must clear: how many ppm/year your sats earn just routing.
@@ -305,6 +332,10 @@ export async function getMagmaRecommendations(
     }
     const effs = pool.map((o) => effectiveAt(o.feeRatePpm, o.baseFeeSats, repSize)).sort((a, b) => a - b);
     const scores = pool.map((o) => o.sellerScore);
+    const competitorEffs = pool
+      .filter((o) => o.sellerPubkey !== ownKey)
+      .map((o) => effectiveAt(o.feeRatePpm, o.baseFeeSats, repSize))
+      .sort((a, b) => a - b);
     return {
       count: pool.length,
       fallbackLevel,
@@ -312,11 +343,13 @@ export async function getMagmaRecommendations(
       p25: Math.round(pct(effs, 0.25)),
       median: Math.round(pct(effs, 0.5)),
       p75: Math.round(pct(effs, 0.75)),
+      minCompetitor: competitorEffs.length ? Math.round(competitorEffs[0]) : 0,
       segmentMedianScore: median(scores),
       baseMed: Math.round(median(pool.map((o) => o.baseFeeSats))),
       effs,
     };
   };
+  const interp = (a: number, b: number, t: number) => a + (b - a) * clamp(t, 0, 1);
 
   const scorePremium = (segMedScore: number): number => {
     if (mySellerScore == null) return 0;
@@ -352,14 +385,26 @@ export async function getMagmaRecommendations(
     const premium = scorePremium(seg.segmentMedianScore);
     const floorEff = Math.round(profitFloorEffectivePpm(repSize, minBlock));
 
-    const modeKey = cfg.sellPricingMode === "fast" ? seg.p10 : cfg.sellPricingMode === "premium" ? seg.p75 : seg.median;
-    const targetEff = Math.max(floorEff, Math.round(modeKey * (1 + premium)));
+    // Target effective price for the configured mode. "fast" undercuts the cheapest
+    // competitor by 1 ppm (no score premium — the point is to win the next order);
+    // "auto" interpolates p10→p75 by the adaptive level the autopilot maintains.
+    const undercut = seg.minCompetitor > 0 ? seg.minCompetitor - 1 : seg.p10;
+    const targetEff = Math.max(
+      floorEff,
+      cfg.sellPricingMode === "fast"
+        ? undercut
+        : cfg.sellPricingMode === "premium"
+          ? Math.round(seg.p75 * (1 + premium))
+          : cfg.sellPricingMode === "auto"
+            ? Math.round(interp(seg.p10, seg.p75, cfg.adaptiveLevel) * (1 + premium))
+            : Math.round(seg.median * (1 + premium)),
+    );
     const recommended = pricePointFrom(targetEff, repSize, baseFee, minBlock);
     const recEcon = economics(repSize, minBlock, recommended.effectiveFeePpm);
     const beatsRouting = recEcon.leasePpmPerYear >= recommendedMinLeasePpmPerYear;
 
     const pricing = {
-      fast: pricePointFrom(Math.max(floorEff, Math.round(seg.p10 * (1 + premium))), repSize, baseFee, minBlock),
+      fast: pricePointFrom(Math.max(floorEff, undercut), repSize, baseFee, minBlock),
       balanced: pricePointFrom(Math.max(floorEff, Math.round(seg.median * (1 + premium))), repSize, baseFee, minBlock),
       premium: pricePointFrom(Math.max(floorEff, Math.round(seg.p75 * (1 + premium))), repSize, baseFee, minBlock),
       profitFloor: pricePointFrom(floorEff, repSize, baseFee, minBlock),
@@ -594,6 +639,31 @@ export async function getMagmaRecommendations(
     closableSoon: myOrders.filter((o) => o.channelId && o.blocksUntilClosable > 0 && o.blocksUntilClosable <= 288).length,
   };
 
+  // ── On-chain cost surfaced + spike warning (#4) ──
+  const onchainOpenCostSat = cfg.defaultOpenCostSat;
+  const onchainCloseCostSat = cfg.includeCloseCost ? cfg.defaultCloseCostSat : 0;
+  if (onchainFeePerVbyte != null && onchainOpenCostSat + onchainCloseCostSat > 2500)
+    sellWarnings.push(
+      `on-chain fees are elevated (~${onchainOpenCostSat + onchainCloseCostSat} sat to open+close) — the profit floor is raised so you won't lease at a loss`,
+    );
+
+  // ── Seller-score / pending-order risk (#5) ──
+  if (myOrdersView.pendingSeller > 0)
+    sellWarnings.push(
+      `${myOrdersView.pendingSeller} order${myOrdersView.pendingSeller === 1 ? "" : "s"} waiting on you — open the channel${myOrdersView.pendingSeller === 1 ? "" : "s"} in time or your seller score drops`,
+    );
+
+  // ── Optimal size from the market (#3) ──
+  const marketMins = offers.map((o) => o.minSizeSats).filter((n) => n > 0);
+  const optimalSizeSat = marketMins.length
+    ? clamp(Math.round(median(marketMins) / 500_000) * 500_000, cfg.minSellSizeSat, cfg.maxSellSizeSat)
+    : cfg.minSellSizeSat;
+  const optimalLeaseBlocks = myOffers[0]?.minBlockLength ?? cfg.defaultMinBlockLength;
+
+  // ── Projected monthly earnings from your own fill history (#7) ──
+  const avgFeePerFill = filled.length ? grossEarningsSat / filled.length : 0;
+  const projectedMonthlySat = Math.round(filled30.length * avgFeePerFill);
+
   return {
     nodeNeed,
     nodeNeedReason,
@@ -606,6 +676,15 @@ export async function getMagmaRecommendations(
       routingOpportunityPpmPerYear,
       adjustedRoutingPpmPerYear: adjustedRouting,
       recommendedMinLeasePpmPerYear,
+      pricingMode: cfg.sellPricingMode,
+      adaptiveLevel: cfg.adaptiveLevel,
+      optimalSizeSat,
+      optimalLeaseBlocks,
+      projectedMonthlySat,
+      onchainOpenCostSat,
+      onchainCloseCostSat,
+      onchainFeePerVbyte,
+      pendingSellerOrders: myOrdersView.pendingSeller,
       reasons: sellReasons,
       warnings: sellWarnings,
       recommendations,

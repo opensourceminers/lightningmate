@@ -256,10 +256,11 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
           <div className="mode-select">
             {(
               [
+                ["auto", "Auto", "adapts to demand — raises when it sells, lowers when it doesn't"],
                 ["fast", "Low", "undercut — sell fast"],
                 ["balanced", "Median", "match the market middle"],
                 ["premium", "Premium", "top of the market — earn more"],
-              ] as ["fast" | "balanced" | "premium", string, string][]
+              ] as ["auto" | "fast" | "balanced" | "premium", string, string][]
             ).map(([id, label, desc]) => (
               <button
                 key={id}

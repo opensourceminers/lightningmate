@@ -171,7 +171,7 @@ export interface AutopilotConfig {
   sellAutoClose: boolean;
   sellAutoRelist: boolean;
   sellAutoReprice: boolean;
-  sellPricingMode: "fast" | "balanced" | "premium";
+  sellPricingMode: "fast" | "balanced" | "premium" | "auto";
 }
 
 export interface AutopilotChange {
@@ -910,6 +910,15 @@ export interface MagmaV2Report {
     routingOpportunityPpmPerYear: number | null;
     adjustedRoutingPpmPerYear: number;
     recommendedMinLeasePpmPerYear: number;
+    pricingMode: "fast" | "balanced" | "premium" | "auto";
+    adaptiveLevel: number;
+    optimalSizeSat: number;
+    optimalLeaseBlocks: number;
+    projectedMonthlySat: number;
+    onchainOpenCostSat: number;
+    onchainCloseCostSat: number;
+    onchainFeePerVbyte: number | null;
+    pendingSellerOrders: number;
     reasons: string[];
     warnings: string[];
     recommendations: MagmaSellRecommendation[];
