@@ -902,7 +902,7 @@ export function createApiRouter(
     "/amboss/recommendations",
     wrap(async (_req, res) => {
       if (!needKey(res)) return;
-      res.json(await getMagmaRecommendations(lnd, amboss.getKey()));
+      res.json(await getMagmaRecommendations(lnd, amboss.getKey(), autopilot.magmaOverrides()));
     }),
   );
 

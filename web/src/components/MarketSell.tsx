@@ -206,7 +206,34 @@ export function MarketSell() {
             >
               {SUMMARY_LABEL[rec.sell.state]}
             </span>
-            <span className="muted">{rec.sell.reasons[0] ?? rec.sell.warnings[0] ?? rec.nodeNeedReason}</span>
+            <span className="muted">{rec.sell.reasons[0] ?? rec.nodeNeedReason}</span>
+          </div>
+
+          {rec.sell.pendingSellerOrders > 0 ? (
+            <div className="magma-warn-banner">
+              ⚠ {rec.sell.pendingSellerOrders} order{rec.sell.pendingSellerOrders === 1 ? "" : "s"} waiting on you — open the
+              channel{rec.sell.pendingSellerOrders === 1 ? "" : "s"} in time or your seller score drops.
+            </div>
+          ) : null}
+
+          <div className="magma-substats muted">
+            {a?.mySellerScore != null ? (
+              <>
+                seller score <b>{a.mySellerScore.toFixed(1)}</b> ·{" "}
+              </>
+            ) : null}
+            {rec.sell.projectedMonthlySat > 0 ? (
+              <>
+                ≈ <b>{sats(rec.sell.projectedMonthlySat)}</b> sat/mo projected ·{" "}
+              </>
+            ) : null}
+            optimal size <b>~{satsCompact(rec.sell.optimalSizeSat)}</b> · ~{rec.sell.onchainOpenCostSat} sat to open on-chain
+            {rec.sell.pricingMode === "auto" ? (
+              <>
+                {" "}
+                · auto level <b>{Math.round(rec.sell.adaptiveLevel * 100)}%</b>
+              </>
+            ) : null}
           </div>
 
           {r0 ? (
@@ -251,6 +278,21 @@ export function MarketSell() {
                   {r0.economics.profitFloorEffectivePpm}
                   {r0.market.scorePremium ? ` · ${r0.market.scorePremium > 0 ? "+" : ""}${Math.round(r0.market.scorePremium * 100)}% score ${r0.market.scorePremium > 0 ? "premium" : "discount"}` : ""}
                 </div>
+                {(() => {
+                  const lo = r0.market.p10;
+                  const hi = Math.max(r0.market.p75, lo + 1);
+                  const pos = (v: number) => Math.min(100, Math.max(0, ((v - lo) / (hi - lo)) * 100));
+                  return (
+                    <div className="magma-depth" title="where your price sits across the market (p10 → p75)">
+                      <span>cheap</span>
+                      <div className="magma-depth-bar">
+                        <i className="magma-depth-floor" style={{ left: `${pos(r0.economics.profitFloorEffectivePpm)}%` }} title="profit floor" />
+                        <i className="magma-depth-you" style={{ left: `${pos(r0.recommended.effectiveFeePpm)}%` }} title="your price" />
+                      </div>
+                      <span>dear</span>
+                    </div>
+                  );
+                })()}
                 <div className="magma-price-buttons">
                   <button className="row-btn" title="undercut the market to fill fast" onClick={() => applyPrice(r0.pricing.fast)}>
                     Sell fast
