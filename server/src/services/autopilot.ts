@@ -126,6 +126,8 @@ interface PersistedState {
   lastSellFilledCount: number;
   lastSellFillAt: string | null;
   lastSellAdaptiveAdjustAt: string | null;
+  /** One-time flag: bumped installs from the old 60-min default to 30 min. */
+  intervalMigrated?: boolean;
   history: AutopilotRun[];
 }
 
@@ -265,6 +267,13 @@ export class Autopilot {
 
   /** Begin scheduling if enabled and writing is possible. */
   start(): void {
+    // One-time: move installs still on the old 60-min default onto the new 30-min
+    // default. Deliberate non-default intervals are left untouched.
+    if (!this.state.intervalMigrated) {
+      if (this.state.config.intervalMinutes === 60) this.state.config.intervalMinutes = 30;
+      this.state.intervalMigrated = true;
+      this.persist();
+    }
     this.reschedule();
   }
 
