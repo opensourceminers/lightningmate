@@ -3,6 +3,7 @@ import { getChannelsView, type ChannelView } from "./channels.js";
 import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
 import { getFeeRecommendations, type FeeRecConfig, type FeeRecState } from "./feeRecommend.js";
+import { onchainCosts } from "./nodeEconomics.js";
 import type { RebalanceRecord } from "./rebalanceLog.js";
 import type { OverrideMap } from "./overrides.js";
 import {
@@ -572,6 +573,8 @@ export interface CloseSuggestion {
   localSats: number;
   /** What you'd actually reclaim on-chain on close = your current local balance. */
   capitalFreedSats: number;
+  /** Live on-chain cost to close this channel. */
+  closeCostSat: number;
   /** Inbound liquidity you'd give up (the remote side), free if the peer opened it. */
   inboundLiquidityLostSats: number;
   closeScore: number;
@@ -601,14 +604,16 @@ export async function getCloseSuggestionsV2(
   feeConfig: Partial<FeeRecConfig> = {},
   channelOverrides: OverrideMap = {},
 ): Promise<CloseV2Report> {
-  const [channels, ownKey, graph, flow60, feeRep, sugRep] = await Promise.all([
+  const [channels, ownKey, graph, flow60, feeRep, sugRep, oc] = await Promise.all([
     getChannelsView(lnd),
     getOwnPubkey(lnd),
     buildGraphCache(lnd),
     getFlowSummary(lnd, 60).catch(() => null),
     getFeeRecommendations(lnd, rebalanceRecords, null, feeConfig, channelOverrides),
     getChannelSuggestionsV2(lnd).catch(() => null),
+    onchainCosts(lnd),
   ]);
+  const closeCostSat = oc.closeCostSat;
 
   const now = Date.now();
   const feeById = new Map(feeRep.recommendations.map((r) => [r.channelId, r]));
@@ -691,10 +696,11 @@ export async function getCloseSuggestionsV2(
     const negPnlScore = pnl60 < 0 ? clamp01(-pnl60 / 5000) : 0;
     const weakPeerScore = feeState === "close_candidate" ? 1 : offline ? 0.6 : m?.peerGate === "weak" ? 0.5 : 0;
     const lowReachScore = 1 - reachContribution;
-    // What closing actually returns on-chain to redeploy = our current local balance,
-    // regardless of who opened the channel.
+    // What closing actually returns on-chain to redeploy = our current local balance
+    // minus the on-chain cost to close, regardless of who opened the channel.
     const capitalFreed = Math.max(0, c.localBalance);
-    const opportunityScore = clamp01(capitalFreed / 2_000_000);
+    const netFreed = Math.max(0, capitalFreed - closeCostSat);
+    const opportunityScore = clamp01(netFreed / 2_000_000);
     const staleScore = feeState === "close_candidate" || offline ? 0.7 : 0.3;
     let closeScore = Math.round(
       100 *
@@ -740,6 +746,11 @@ export async function getCloseSuggestionsV2(
           : `Peer opened this channel — closing gives up ${k(c.remoteBalance)} of free inbound liquidity it provided.`,
       );
     }
+    if (closeCostSat > 0.3 * Math.max(capitalFreed, 1)) {
+      warnings.push(
+        `On-chain fees are high right now — closing costs ~${closeCostSat} sat, ${Math.round((closeCostSat / Math.max(capitalFreed, 1)) * 100)}% of what you'd reclaim. Wait for cheaper fees.`,
+      );
+    }
 
     candidates.push({
       channelId: c.id,
@@ -752,6 +763,7 @@ export async function getCloseSuggestionsV2(
       capacitySats: c.capacity,
       localSats: c.localBalance,
       capitalFreedSats: capitalFreed,
+      closeCostSat,
       inboundLiquidityLostSats: c.remoteBalance,
       closeScore,
       pnl30dSats: Math.round(pnl30),

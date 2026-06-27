@@ -7,6 +7,7 @@ import { paySaleServiceFee } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
 import { getMagmaRecommendations, type MagmaSellRecommendation, type MagmaV2Report } from "./magmaRecommend.js";
+import { onchainCosts } from "./nodeEconomics.js";
 import {
   applyFees,
   DEFAULT_POLICY,
@@ -414,6 +415,15 @@ export class Autopilot {
 
     const size = cfg.channelSizeSats > 0 ? cfg.channelSizeSats : top.recommendedSizeSats;
     if (available < size) return []; // not enough on-chain to fund it + keep the reserve
+
+    // On-chain fee awareness: don't open when the funding fee eats >1% of the
+    // channel — opening into a mempool spike is throwing money away; wait it out.
+    const oc = await onchainCosts(this.readLnd);
+    if (oc.feePerVbyte != null && oc.openCostSat > size * 0.01) {
+      return [
+        { alias: top.alias, sizeSats: size, ok: false, error: `on-chain fees too high (~${oc.openCostSat} sat to open) — deferred` },
+      ];
+    }
 
     const res = await openChannelTo(writeLnd, {
       pubkey: top.pubkey,

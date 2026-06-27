@@ -366,6 +366,7 @@ export interface CloseCandidate {
   capacitySats: number;
   localSats: number;
   capitalFreedSats: number;
+  closeCostSat: number;
   inboundLiquidityLostSats: number;
   closeScore: number;
   pnl30dSats: number;
