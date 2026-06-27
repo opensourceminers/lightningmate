@@ -120,6 +120,18 @@ export function RebalanceRecommendations() {
       {error ? <p className="banner error">{error}</p> : null}
       {!data && !error ? <p className="muted">Probing routes…</p> : null}
 
+      {data?.inbound && data.inbound.cheapest !== "none" ? (
+        <div className={`magma-crosslink ${data.inbound.cheapest === "magma" ? "" : ""}`}>
+          💡 <strong>Cheapest inbound:</strong> {data.inbound.note}
+          {data.inbound.rebalanceTypicalPpm != null || data.inbound.magmaCheapestPpm != null ? (
+            <span className="muted">
+              {" "}
+              · raising the fee + waiting is always free (just slower).
+            </span>
+          ) : null}
+        </div>
+      ) : null}
+
       {s ? (
         <div className="feerec-chips">
           {s.profitableRecommendations ? <span className="feerec-chip s-good">{s.profitableRecommendations} profitable</span> : null}
