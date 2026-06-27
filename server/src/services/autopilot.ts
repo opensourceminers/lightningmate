@@ -288,8 +288,8 @@ export class Autopilot {
 
   private reschedule(): void {
     this.stop();
-    const { enabled, rebalanceEnabled, channelEnabled } = this.state.config;
-    if ((!enabled && !rebalanceEnabled && !channelEnabled) || !this.canWrite) return;
+    const { enabled, rebalanceEnabled, channelEnabled, sellEnabled } = this.state.config;
+    if ((!enabled && !rebalanceEnabled && !channelEnabled && !sellEnabled) || !this.canWrite) return;
     const ms = Math.max(1, this.state.config.intervalMinutes) * 60_000;
     this.timer = setInterval(() => void this.runOnce(), ms);
     // Kick off one run shortly after enabling, without blocking.
