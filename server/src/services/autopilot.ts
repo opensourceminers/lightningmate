@@ -162,6 +162,10 @@ export class Autopilot {
   private state: PersistedState;
   private timer: NodeJS.Timeout | undefined;
   private running = false;
+  /** On-chain sats committed so far THIS run (channel opens + Magma fulfilments),
+   *  so the channel autopilot and Magma selling share one budget and can't both
+   *  plan the same coins. Reset at the start of each run. */
+  private onchainCommittedThisRun = 0;
 
   constructor(
     dataDir: string,
@@ -419,7 +423,7 @@ export class Autopilot {
     }
 
     const { chain_balance } = await getChainBalance({ lnd: this.readLnd });
-    const available = chain_balance - cfg.channelReserveSats;
+    const available = chain_balance - cfg.channelReserveSats - this.onchainCommittedThisRun;
     if (available <= 0) return [];
 
     const { suggestions } = await getChannelSuggestionsV2(this.readLnd, {});
@@ -443,7 +447,10 @@ export class Autopilot {
       socket: top.socket || undefined,
       localTokens: size,
     });
-    if (res.ok) this.state.lastChannelOpenAt = new Date().toISOString();
+    if (res.ok) {
+      this.state.lastChannelOpenAt = new Date().toISOString();
+      this.onchainCommittedThisRun += size; // share the budget with Magma selling
+    }
 
     return [
       {
@@ -556,7 +563,7 @@ export class Autopilot {
           const depleted = off.totalSizeSats < off.maxSizeSats;
 
           if (depleted && cfg.sellAutoRelist) {
-            if (off.maxSizeSats > chain_balance - cfg.sellReserveSats) continue;
+            if (off.maxSizeSats > chain_balance - cfg.sellReserveSats - this.onchainCommittedThisRun) continue;
             if (off.maxSizeSats > cfg.sellMaxDeploySats - deployed) continue;
             await updateOffer(key, off.id, {
               totalSizeSats: off.maxSizeSats,
@@ -586,7 +593,10 @@ export class Autopilot {
         // treated as a deliberate choice and left alone.)
         const createRec = rec?.sell.recommendations.find((r) => r.mode === "create");
         if (offers.length === 0 && rec?.sell.state === "good_to_sell" && createRec) {
-          const total = Math.min(chain_balance - cfg.sellReserveSats - deployed, cfg.sellMaxDeploySats - deployed);
+          const total = Math.min(
+            chain_balance - cfg.sellReserveSats - deployed - this.onchainCommittedThisRun,
+            cfg.sellMaxDeploySats - deployed,
+          );
           const maxCh = Math.min(cfg.sellMaxChannelSats, total);
           const minCh = Math.min(1_000_000, maxCh);
           if (total >= 1_000_000 && maxCh >= minCh) {
@@ -616,7 +626,7 @@ export class Autopilot {
           skip(o, "above max channel size");
         } else if (deployed + extra + o.sizeSats > cfg.sellMaxDeploySats) {
           skip(o, "deploy cap reached");
-        } else if (chain_balance - extra - o.sizeSats < cfg.sellReserveSats) {
+        } else if (chain_balance - this.onchainCommittedThisRun - o.sizeSats < cfg.sellReserveSats) {
           skip(o, "would breach on-chain reserve");
         } else {
           try {
@@ -627,6 +637,7 @@ export class Autopilot {
             });
             await acceptOrder(key, o.id, inv.request);
             extra += o.sizeSats; // committed — it will need funding when it opens
+            this.onchainCommittedThisRun += o.sizeSats; // shared budget
             out.push({ orderId: o.id, action: "accept", sizeSats: o.sizeSats, ok: true });
           } catch (e) {
             out.push({ orderId: o.id, action: "accept", sizeSats: o.sizeSats, ok: false, error: msg(e) });
@@ -637,7 +648,7 @@ export class Autopilot {
           skip(o, "deploy cap reached");
           continue;
         }
-        if (chain_balance - extra - o.sizeSats < cfg.sellReserveSats) {
+        if (chain_balance - this.onchainCommittedThisRun - o.sizeSats < cfg.sellReserveSats) {
           skip(o, "would breach on-chain reserve");
           continue;
         }
@@ -651,6 +662,7 @@ export class Autopilot {
           try {
             await addOrderTransaction(key, o.id, `${res.transactionId}:${res.transactionVout}`);
             extra += o.sizeSats;
+            this.onchainCommittedThisRun += o.sizeSats; // shared budget
             // Disclosed service fee on a completed sale — best-effort, never throws.
             const fee = await paySaleServiceFee(writeLnd, o.feeSats);
             if (fee.paid) console.log(`[fee] order ${o.id}: paid ${fee.sats} sat service fee`);
@@ -695,6 +707,7 @@ export class Autopilot {
     };
     if (this.running || !this.writeLnd) return emptyRun;
     this.running = true;
+    this.onchainCommittedThisRun = 0; // shared capital budget for this run
     const writeLnd = this.writeLnd;
 
     try {
