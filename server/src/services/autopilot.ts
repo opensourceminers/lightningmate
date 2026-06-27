@@ -2,7 +2,7 @@ import { getChannels, getChainBalance, type AuthenticatedLnd } from "lightning";
 import { JsonStore } from "../store.js";
 import { closeChannelByOutpoint, openChannelTo } from "./channelOps.js";
 import { createInvoice } from "./payments.js";
-import { acceptOrder, addOrderTransaction, createOffer, getMyOffers, getMyOrders, updateOffer } from "./amboss.js";
+import { acceptOrder, addOrderTransaction, createOffer, getMyOffers, getMyOrders, updateOffer, type MyOrder } from "./amboss.js";
 import { paySaleServiceFee } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
@@ -161,6 +161,8 @@ export class Autopilot {
   private readonly store: JsonStore<PersistedState>;
   private state: PersistedState;
   private timer: NodeJS.Timeout | undefined;
+  /** Fast, separate loop just for time-critical Magma order fulfilment. */
+  private fastTimer: NodeJS.Timeout | undefined;
   private running = false;
   /** On-chain sats committed so far THIS run (channel opens + Magma fulfilments),
    *  so the channel autopilot and Magma selling share one budget and can't both
@@ -268,7 +270,9 @@ export class Autopilot {
 
   stop(): void {
     if (this.timer) clearInterval(this.timer);
+    if (this.fastTimer) clearInterval(this.fastTimer);
     this.timer = undefined;
+    this.fastTimer = undefined;
   }
 
   setConfig(partial: Partial<AutopilotConfig>): void {
@@ -294,6 +298,13 @@ export class Autopilot {
     this.timer = setInterval(() => void this.runOnce(), ms);
     // Kick off one run shortly after enabling, without blocking.
     setTimeout(() => void this.runOnce(), 2_000);
+    // Fast lane: poll Magma orders every 3 min so a buyer's order is accepted +
+    // opened within minutes (protects the seller score), independent of the heavy
+    // optimisation cadence above.
+    if (sellEnabled) {
+      this.fastTimer = setInterval(() => void this.pollSellOrders(), 3 * 60_000);
+      setTimeout(() => void this.pollSellOrders(), 5_000);
+    }
   }
 
   private rebalanceCooldownOk(targetId: string, cooldownMin: number): boolean {
@@ -482,19 +493,12 @@ export class Autopilot {
 
     const key = this.amboss.getKey();
     const out: AutopilotSell[] = [];
-    const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
     const { chain_balance } = await getChainBalance({ lnd: this.readLnd });
-    const skip = (o: { id: string; sizeSats: number }, error: string) =>
-      out.push({ orderId: o.id, action: "skip" as const, sizeSats: o.sizeSats, ok: false, error });
 
-    // Capital already committed to currently-open sold channels.
+    // Capital already committed to currently-open sold channels (for the deploy cap).
     const deployed = orders
       .filter((o) => o.channelId && o.blocksUntilClosable > 0)
       .reduce((s, o) => s + o.sizeSats, 0);
-    // Capital committed during THIS run (accepts + opens) — so multiple orders in
-    // one run can't each pass against the same starting balance and collectively
-    // blow past the deploy cap or the on-chain reserve.
-    let extra = 0;
 
     // Adaptive pricing (mode "auto"): ratchet the price level UP when an order
     // fills (you could be charging more) and DOWN when the offer sits unsold —
@@ -616,8 +620,28 @@ export class Autopilot {
       }
     }
 
-    if (orders.length === 0) return out;
+    out.push(...(await this.fulfillOrders(writeLnd, orders, chain_balance)));
+    return out;
+  }
 
+  /** Accept + open (and optionally close) Magma sell orders — the time-critical
+   *  part, shared by the main pass and the fast fulfilment poll. The on-chain
+   *  reserve uses the shared per-run counter; the deploy cap is Magma-only. */
+  private async fulfillOrders(
+    writeLnd: AuthenticatedLnd,
+    orders: MyOrder[],
+    chain_balance: number,
+  ): Promise<AutopilotSell[]> {
+    const cfg = this.state.config;
+    const key = this.amboss.getKey();
+    const out: AutopilotSell[] = [];
+    const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
+    const skip = (o: { id: string; sizeSats: number }, error: string) =>
+      out.push({ orderId: o.id, action: "skip" as const, sizeSats: o.sizeSats, ok: false, error });
+    const deployed = orders
+      .filter((o) => o.channelId && o.blocksUntilClosable > 0)
+      .reduce((s, o) => s + o.sizeSats, 0);
+    let extra = 0;
     let myChannels: { transaction_id: string; transaction_vout: number }[] | null = null;
 
     for (const o of orders) {
@@ -691,6 +715,47 @@ export class Autopilot {
       }
     }
     return out;
+  }
+
+  /** Fast, lightweight Magma fulfilment poll (every few minutes): accept + open
+   *  pending orders so a buyer is served within minutes — protecting the seller
+   *  score — without the heavy hourly optimisation. Mutually exclusive with the
+   *  main run via the shared `running` lock. */
+  async pollSellOrders(): Promise<void> {
+    const cfg = this.state.config;
+    if (!cfg.sellEnabled || !this.amboss.hasKey() || !this.writeLnd || this.running) return;
+    this.running = true;
+    this.onchainCommittedThisRun = 0;
+    try {
+      const orders = (await getMyOrders(this.amboss.getKey())).orders.filter((o) => o.side === "SELL");
+      const pending = orders.some(
+        (o) => o.status === "WAITING_FOR_SELLER_APPROVAL" || o.status === "WAITING_FOR_CHANNEL_OPEN",
+      );
+      if (!pending) return; // nothing time-critical — let the main run handle the rest
+      const { chain_balance } = await getChainBalance({ lnd: this.readLnd });
+      const sells = await this.fulfillOrders(this.writeLnd, orders, chain_balance);
+      const acted = sells.filter((s) => s.action !== "skip");
+      if (acted.length) {
+        const run: AutopilotRun = {
+          at: new Date().toISOString(),
+          attempted: acted.length,
+          applied: acted.filter((s) => s.ok).length,
+          failed: acted.filter((s) => !s.ok).length,
+          changes: [],
+          rebalances: [],
+          channels: [],
+          sells,
+        };
+        this.state.lastRunAt = run.at;
+        this.state.history.unshift(run);
+        this.state.history = this.state.history.slice(0, HISTORY_LIMIT);
+        this.persist();
+      }
+    } catch (err) {
+      console.error("[autopilot] fulfilment poll failed:", err);
+    } finally {
+      this.running = false;
+    }
   }
 
   /** Run the autopilot once: fees, then rebalances, then channel opens (each if enabled). */
