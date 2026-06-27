@@ -173,24 +173,28 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     { id: "history", label: "History" },
   ];
 
+  // Every preset is profit-first; they differ only in WHERE the capital earns.
+  // Selling presets use "auto" pricing (adapts to find the income-maximising lease
+  // price). Rebalancing is off-chain and only ever runs profitable moves, so it
+  // stays on wherever it adds revenue without competing for on-chain capital.
   const PRESETS: { id: string; label: string; desc: string; cfg: Partial<AutopilotConfig> }[] = [
     {
       id: "routing",
       label: "Maximize routing",
-      desc: "fees + rebalancing + channels on, Magma off",
+      desc: "earn from forwarding — fees, profitable rebalances + channel growth on, Magma off",
       cfg: { enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: false },
     },
     {
       id: "magma",
       label: "Magma leasing",
-      desc: "lease idle capital, auto-priced; rebalancing off",
-      cfg: { enabled: true, sellEnabled: true, sellAutoReprice: true, sellPricingMode: "auto", rebalanceEnabled: false, channelEnabled: false },
+      desc: "lease idle capital at the income-max price; fees + profitable rebalances stay on, no new routing channels",
+      cfg: { enabled: true, sellEnabled: true, sellAutoReprice: true, sellPricingMode: "auto", rebalanceEnabled: true, channelEnabled: false },
     },
     {
       id: "balanced",
       label: "Balanced",
-      desc: "everything on, moderate",
-      cfg: { enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: true, sellAutoReprice: true, sellPricingMode: "balanced" },
+      desc: "everything on, all profit-maximising — route, lease + grow",
+      cfg: { enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: true, sellAutoReprice: true, sellPricingMode: "auto" },
     },
   ];
   const matchesPreset = (p: Partial<AutopilotConfig>) =>
