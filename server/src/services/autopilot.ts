@@ -8,6 +8,7 @@ import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
 import { getMagmaRecommendations, type MagmaSellRecommendation, type MagmaV2Report } from "./magmaRecommend.js";
 import { onchainCosts } from "./nodeEconomics.js";
+import { getFeeElasticity } from "./outcomes.js";
 import {
   applyFees,
   DEFAULT_POLICY,
@@ -225,6 +226,16 @@ export class Autopilot {
     return { sellPricingMode: this.state.config.sellPricingMode, adaptiveLevel: this.state.sellAdaptiveLevel };
   }
 
+  /** Per-channel learned fee elasticity modifiers (from measured outcomes). */
+  async feeElasticityModifiers(): Promise<Map<string, number>> {
+    try {
+      const el = await getFeeElasticity(this.readLnd, this.state.history);
+      return new Map([...el].map(([id, e]) => [id, e.modifier]));
+    } catch {
+      return new Map();
+    }
+  }
+
   /** Public, serializable view for the API. */
   getState() {
     return {
@@ -291,12 +302,14 @@ export class Autopilot {
   private async runFees(writeLnd: AuthenticatedLnd): Promise<AutopilotChange[]> {
     // v2 engine — wouldApply already folds in the relative/absolute threshold,
     // cooldown and max-changes-per-run, so we just apply the eligible ones.
+    const elasticity = await this.feeElasticityModifiers();
     const report = await getFeeRecommendations(
       this.readLnd,
       this.rebalanceLog.recent(200),
       this.feeCooldown(),
       this.feeV2Overrides(),
       this.overrides.all(),
+      elasticity,
     );
     const eligible = report.recommendations.filter(
       (r) => r.wouldApply && r.transactionId !== null && r.transactionVout !== null,

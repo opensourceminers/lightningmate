@@ -294,6 +294,7 @@ export function createApiRouter(
           autopilot.feeCooldown(),
           autopilot.feeV2Overrides(),
           overrides.all(),
+          await autopilot.feeElasticityModifiers(),
         ),
       );
     }),

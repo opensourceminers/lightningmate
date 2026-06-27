@@ -208,6 +208,8 @@ export async function getFeeRecommendations(
   cooldown: CooldownInput | null,
   configOverrides: Partial<FeeRecConfig> = {},
   channelOverrides: OverrideMap = {},
+  /** Per-channel learned fee elasticity modifier (channelId → ~0.85..1.2). */
+  elasticity: Map<string, number> = new Map(),
 ): Promise<FeeRecReport> {
   const cfg = { ...FEE_REC_DEFAULTS, ...configOverrides };
   const [channels, rates, fw14, fw30, wallet] = await Promise.all([
@@ -259,6 +261,7 @@ export async function getFeeRecommendations(
       enoughChannels,
       earnerCutoff,
       cooldown,
+      elasticityMod: elasticity.get(ch.id) ?? 1,
     }),
   );
 
@@ -293,6 +296,7 @@ interface BuildCtx {
   enoughChannels: boolean;
   earnerCutoff: number;
   cooldown: CooldownInput | null;
+  elasticityMod: number;
 }
 
 function buildRecommendation(
@@ -369,6 +373,16 @@ function buildRecommendation(
   // §10 precedence: base × modifiers (combined modifier clamped so forces don't explode)
   const combinedMod = clamp(velocityMod * benchMod, 0.8, 1.4);
   let target = base * combinedMod;
+  // Learned elasticity: nudge by how this channel's revenue responded to past fee
+  // changes (neutral 1.0 when there's no measured history).
+  if (ctx.elasticityMod !== 1) {
+    target *= ctx.elasticityMod;
+    reasons.push(
+      ctx.elasticityMod > 1
+        ? `elasticity: raising fees lifted revenue here before — charging ~${Math.round((ctx.elasticityMod - 1) * 100)}% more`
+        : `elasticity: higher fees cost flow here before — easing ~${Math.round((1 - ctx.elasticityMod) * 100)}% lower`,
+    );
+  }
 
   // §10 hard floors (always win). The binding floor's reason is unshifted to the
   // front so the *dominant* reason is shown first. Floors are safety/economics
