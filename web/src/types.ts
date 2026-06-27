@@ -715,9 +715,17 @@ export interface RebalanceRecSummary {
   expectedTotalNetProfitSats: number;
 }
 
+export interface InboundOptions {
+  magmaCheapestPpm: number | null;
+  rebalanceTypicalPpm: number | null;
+  cheapest: "rebalance" | "magma" | "fee_first" | "none";
+  note: string;
+}
+
 export interface RebalanceRecReport {
   generatedAt: string;
   summary: RebalanceRecSummary;
+  inbound: InboundOptions;
   recommendations: RebalanceRecommendation[];
 }
 

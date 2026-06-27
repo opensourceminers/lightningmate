@@ -2,6 +2,7 @@ import { type AuthenticatedLnd } from "lightning";
 import { getChannelsView, type ChannelRole, type ChannelView } from "./channels.js";
 import { getOwnPubkey } from "./node.js";
 import { estimateCost } from "./rebalance.js";
+import { getMarket } from "./amboss.js";
 import {
   getFeeRecommendations,
   type CooldownInput,
@@ -136,10 +137,19 @@ export interface RebalanceRecSummary {
   expectedTotalNetProfitSats: number;
 }
 
+export interface InboundOptions {
+  /** Cheapest one-off cost per sat of inbound right now, by source (ppm). */
+  magmaCheapestPpm: number | null;
+  rebalanceTypicalPpm: number | null;
+  cheapest: "rebalance" | "magma" | "fee_first" | "none";
+  note: string;
+}
+
 export interface RebalanceRecReport {
   generatedAt: string;
   config: RebalanceRecConfig;
   summary: RebalanceRecSummary;
+  inbound: InboundOptions;
   recommendations: RebalanceRecommendation[];
 }
 
@@ -180,10 +190,11 @@ export async function getRebalanceRecommendations(
   recOverrides: Partial<RebalanceRecConfig> = {},
 ): Promise<RebalanceRecReport> {
   const cfg = { ...REBAL_REC_DEFAULTS, ...recOverrides };
-  const [feeRep, channels, ownKey] = await Promise.all([
+  const [feeRep, channels, ownKey, market] = await Promise.all([
     getFeeRecommendations(lnd, rebalanceRecords, cooldown, feeConfigOverrides, channelOverrides),
     getChannelsView(lnd),
     getOwnPubkey(lnd),
+    getMarket().catch(() => null),
   ]);
   const feeById = new Map(feeRep.recommendations.map((r) => [r.channelId, r]));
   const chById = new Map(channels.map((c) => [c.id, c]));
@@ -208,7 +219,32 @@ export async function getRebalanceRecommendations(
     expectedTotalNetProfitSats: recs.reduce((s, r) => s + (r.wouldRebalance ? r.expectedNetProfitSats ?? 0 : 0), 0),
   };
 
-  return { generatedAt: new Date().toISOString(), config: cfg, summary, recommendations: recs };
+  // ── Cheapest way to get inbound right now: rebalance vs Magma vs raise-fee ──
+  const REP = 2_000_000; // representative channel size for an apples-to-apples ppm
+  const magmaEffs = (market?.offers ?? [])
+    .filter((o) => REP >= o.minSizeSats && REP <= o.maxSizeSats)
+    .map((o) => o.feeRatePpm + (o.baseFeeSats / REP) * 1_000_000);
+  const magmaCheapestPpm = magmaEffs.length ? Math.round(Math.min(...magmaEffs)) : null;
+  const routeCosts = recs
+    .map((r) => r.estimatedRouteCostPpm)
+    .filter((n): n is number => n != null)
+    .sort((a, b) => a - b);
+  const rebalanceTypicalPpm = routeCosts.length ? routeCosts[Math.floor(routeCosts.length / 2)] : null;
+  let cheapest: InboundOptions["cheapest"] = "none";
+  if (rebalanceTypicalPpm != null && (magmaCheapestPpm == null || rebalanceTypicalPpm <= magmaCheapestPpm)) cheapest = "rebalance";
+  else if (magmaCheapestPpm != null) cheapest = "magma";
+  else if (summary.feeAdjustFirstCount > 0) cheapest = "fee_first";
+  const note =
+    cheapest === "rebalance"
+      ? `Rebalancing (~${rebalanceTypicalPpm} ppm) is currently your cheapest inbound${magmaCheapestPpm != null ? ` — Magma is ~${magmaCheapestPpm} ppm` : ""}.`
+      : cheapest === "magma"
+        ? `Buying inbound on Magma (~${magmaCheapestPpm} ppm) is cheaper than rebalancing${rebalanceTypicalPpm != null ? ` (~${rebalanceTypicalPpm} ppm)` : " right now"}.`
+        : cheapest === "fee_first"
+          ? "No cheap route or Magma offer — raise fees and let inbound refill for free."
+          : "Nothing needs inbound right now.";
+  const inbound: InboundOptions = { magmaCheapestPpm, rebalanceTypicalPpm, cheapest, note };
+
+  return { generatedAt: new Date().toISOString(), config: cfg, summary, inbound, recommendations: recs };
 }
 
 function classify(
