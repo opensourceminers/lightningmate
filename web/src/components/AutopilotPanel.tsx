@@ -247,20 +247,50 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       ) : sub === "magma" ? (
         <section className="panel">
           {toggleRow("sellEnabled", "Liquidity provision (Magma)", "Auto-fulfils your sell orders — opens channels to buyers, earns lease fees, within caps")}
+
+          <h3 className="sub">Offer pricing</h3>
+          <p className="muted ap-hint">
+            With auto-pricing on, your enabled offer is kept continuously priced to the live market at this level —
+            never below your profit floor.
+          </p>
+          <div className="mode-select">
+            {(
+              [
+                ["fast", "Low", "undercut — sell fast"],
+                ["balanced", "Median", "match the market middle"],
+                ["premium", "Premium", "top of the market — earn more"],
+              ] as ["fast" | "balanced" | "premium", string, string][]
+            ).map(([id, label, desc]) => (
+              <button
+                key={id}
+                className={`mode-opt ${draft.sellPricingMode === id ? "active" : ""}`}
+                disabled={busy || writeOff}
+                onClick={() => save({ sellPricingMode: id })}
+              >
+                <span className="mode-opt-label">{label}</span>
+                <span className="mode-opt-desc">{desc}</span>
+              </button>
+            ))}
+          </div>
+
+          <h3 className="sub">Automation</h3>
+          <div className="ap-checks">
+            <label className="check ap-check">
+              <input type="checkbox" checked={draft.sellAutoReprice} onChange={(e) => setBool("sellAutoReprice", e.target.checked)} />
+              Auto-price the enabled offer to the live market (at the level above, floor-protected)
+            </label>
+            <label className="check ap-check">
+              <input type="checkbox" checked={draft.sellAutoRelist} onChange={(e) => setBool("sellAutoRelist", e.target.checked)} />
+              Auto-relist a depleted offer (top it back up within your caps so it keeps selling)
+            </label>
+            <label className="check ap-check">
+              <input type="checkbox" checked={draft.sellAutoClose} onChange={(e) => setBool("sellAutoClose", e.target.checked)} />
+              Auto-close channels after the lease ends (reclaim the capital on-chain)
+            </label>
+          </div>
+
           <h3 className="sub">Caps</h3>
           <div className="policy-controls">{numFields(SELL_NUM_FIELDS)}</div>
-          <label className="check ap-check">
-            <input type="checkbox" checked={draft.sellAutoReprice} onChange={(e) => setBool("sellAutoReprice", e.target.checked)} />
-            Auto-price the offer competitively (Magma v2 — only when leasing beats routing, max once/day)
-          </label>
-          <label className="check ap-check">
-            <input type="checkbox" checked={draft.sellAutoClose} onChange={(e) => setBool("sellAutoClose", e.target.checked)} />
-            Auto-close channels after the lease ends (reclaim the capital on-chain)
-          </label>
-          <label className="check ap-check">
-            <input type="checkbox" checked={draft.sellAutoRelist} onChange={(e) => setBool("sellAutoRelist", e.target.checked)} />
-            Auto-relist a depleted offer (top it back up within your caps so it keeps selling)
-          </label>
           <div className="apply-row">
             <button className="primary-btn" disabled={busy} onClick={() => save()}>Save settings</button>
           </div>
