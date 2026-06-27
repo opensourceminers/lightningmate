@@ -2,7 +2,7 @@ import { getChannels, getChainBalance, type AuthenticatedLnd } from "lightning";
 import { JsonStore } from "../store.js";
 import { closeChannelByOutpoint, openChannelTo } from "./channelOps.js";
 import { createInvoice } from "./payments.js";
-import { acceptOrder, addOrderTransaction, createOffer, getMyOffers, getMyOrders, updateOffer, type MyOrder } from "./amboss.js";
+import { acceptOrder, addOrderTransaction, createOffer, getMyOffers, getMyOrders, toggleOffer, updateOffer, type MyOrder } from "./amboss.js";
 import { paySaleServiceFee } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
@@ -95,7 +95,7 @@ export interface AutopilotChannelOpen {
 
 export interface AutopilotSell {
   orderId: string;
-  action: "accept" | "open" | "close" | "skip" | "relist" | "reprice";
+  action: "accept" | "open" | "close" | "skip" | "relist" | "reprice" | "enable";
   sizeSats: number;
   ok: boolean;
   transactionId?: string;
@@ -571,7 +571,18 @@ export class Autopilot {
         };
 
         for (const off of offers) {
-          if (off.status !== "ENABLED") continue;
+          // Magma autopilot is on → activate a disabled offer so it actually sells
+          // (turning on Liquidity provision means "I want to sell"). Then price it.
+          if (off.status === "DISABLED") {
+            try {
+              await toggleOffer(key, off.id);
+              out.push({ orderId: off.id, action: "enable", sizeSats: off.totalSizeSats, ok: true });
+            } catch {
+              continue;
+            }
+          } else if (off.status !== "ENABLED") {
+            continue;
+          }
           const t = target(off);
           const depleted = off.totalSizeSats < off.maxSizeSats;
 
