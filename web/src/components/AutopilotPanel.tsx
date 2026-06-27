@@ -173,8 +173,47 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     { id: "history", label: "History" },
   ];
 
+  const PRESETS: { id: string; label: string; desc: string; cfg: Partial<AutopilotConfig> }[] = [
+    {
+      id: "routing",
+      label: "Maximize routing",
+      desc: "fees + rebalancing + channels on, Magma off",
+      cfg: { enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: false },
+    },
+    {
+      id: "magma",
+      label: "Magma leasing",
+      desc: "lease idle capital, auto-priced; rebalancing off",
+      cfg: { enabled: true, sellEnabled: true, sellAutoReprice: true, sellPricingMode: "auto", rebalanceEnabled: false, channelEnabled: false },
+    },
+    {
+      id: "balanced",
+      label: "Balanced",
+      desc: "everything on, moderate",
+      cfg: { enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: true, sellAutoReprice: true, sellPricingMode: "balanced" },
+    },
+  ];
+  const matchesPreset = (p: Partial<AutopilotConfig>) =>
+    (Object.keys(p) as (keyof AutopilotConfig)[]).every((k) => draft[k] === p[k]);
+
   return (
     <div>
+      <div className="ap-presets">
+        <span className="ap-presets-label">Strategy</span>
+        {PRESETS.map((p) => (
+          <button
+            key={p.id}
+            className={`preset-opt ${matchesPreset(p.cfg) ? "active" : ""}`}
+            disabled={busy || writeOff}
+            title={p.desc}
+            onClick={() => save(p.cfg)}
+          >
+            <span className="preset-opt-label">{p.label}</span>
+            <span className="preset-opt-desc">{p.desc}</span>
+          </button>
+        ))}
+      </div>
+
       <div className="subnav">
         {TABS.map((t) => (
           <button key={t.id} className={`subtab ${sub === t.id ? "active" : ""}`} onClick={() => setSub(t.id)}>
