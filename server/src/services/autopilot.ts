@@ -131,7 +131,7 @@ interface PersistedState {
 
 const DEFAULT_CONFIG: AutopilotConfig = {
   enabled: false,
-  intervalMinutes: 60,
+  intervalMinutes: 30,
   cooldownMinutes: 360,
   maxChangesPerRun: 5,
   policy: DEFAULT_POLICY,
