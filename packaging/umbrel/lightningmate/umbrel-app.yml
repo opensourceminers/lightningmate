@@ -3,7 +3,7 @@
 # the Umbrel team hosts the final icon + screenshots (provide them in the PR body).
 manifestVersion: 1
 id: lightningmate
-category: finance
+category: bitcoin
 name: Lightning Mate
 version: "0.6.10"
 tagline: Profit-aware management & autopilot for your Lightning node
