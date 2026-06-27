@@ -181,19 +181,19 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     {
       id: "routing",
       label: "Maximize routing",
-      desc: "earn from forwarding — fees, profitable rebalances + channel growth on, Magma off",
+      desc: "Earn from forwarding. Magma off.",
       cfg: { enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: false },
     },
     {
       id: "magma",
       label: "Magma leasing",
-      desc: "lease idle capital at the income-max price; fees + profitable rebalances stay on, no new routing channels",
+      desc: "Lease capital at the best price. No new routing channels.",
       cfg: { enabled: true, sellEnabled: true, sellAutoReprice: true, sellPricingMode: "auto", rebalanceEnabled: true, channelEnabled: false },
     },
     {
       id: "balanced",
       label: "Balanced",
-      desc: "everything on, all profit-maximising — route, lease + grow",
+      desc: "Route, lease & grow — all profit-max.",
       cfg: { enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: true, sellAutoReprice: true, sellPricingMode: "auto" },
     },
   ];
@@ -202,20 +202,24 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
 
   return (
     <div>
-      <div className="ap-presets">
-        <span className="ap-presets-label">Strategy</span>
-        {PRESETS.map((p) => (
-          <button
-            key={p.id}
-            className={`preset-opt ${matchesPreset(p.cfg) ? "active" : ""}`}
-            disabled={busy || writeOff}
-            title={p.desc}
-            onClick={() => save(p.cfg)}
-          >
-            <span className="preset-opt-label">{p.label}</span>
-            <span className="preset-opt-desc">{p.desc}</span>
-          </button>
-        ))}
+      <div className="ap-strategy">
+        <div className="ap-strategy-head">
+          <span className="ap-strategy-title">Strategy</span>
+          <span className="muted">one click — each maximises profit its own way</span>
+        </div>
+        <div className="ap-preset-grid">
+          {PRESETS.map((p) => (
+            <button
+              key={p.id}
+              className={`preset-opt ${matchesPreset(p.cfg) ? "active" : ""}`}
+              disabled={busy || writeOff}
+              onClick={() => save(p.cfg)}
+            >
+              <span className="preset-opt-label">{p.label}</span>
+              <span className="preset-opt-desc">{p.desc}</span>
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="subnav">
