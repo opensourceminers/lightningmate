@@ -171,6 +171,7 @@ export interface AutopilotConfig {
   sellAutoClose: boolean;
   sellAutoRelist: boolean;
   sellAutoReprice: boolean;
+  sellPricingMode: "fast" | "balanced" | "premium";
 }
 
 export interface AutopilotChange {
