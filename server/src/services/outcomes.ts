@@ -154,3 +154,51 @@ export async function getAutopilotOutcomes(
 
   return { measureWindowDays: rebWin, fees, rebalances };
 }
+
+export interface ChannelElasticity {
+  /** Multiplier to nudge the fee target — >1 = inelastic (charge more), <1 = elastic. */
+  modifier: number;
+  /** -1..1: did charging more help revenue? */
+  signal: number;
+  samples: number;
+}
+
+const clampEl = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
+
+/**
+ * Per-channel fee elasticity from measured outcomes: did raising the fee actually
+ * raise revenue (inelastic → can charge more) or kill the flow (elastic → back
+ * off)? Returns a modifier the fee algo applies. Empty for channels with no
+ * measured history → the fee algo behaves exactly as before.
+ */
+export function feeElasticityFromOutcomes(items: FeeOutcome[]): Map<string, ChannelElasticity> {
+  const byChan = new Map<string, FeeOutcome[]>();
+  for (const f of items) {
+    if (f.deltaPct == null) continue;
+    const list = byChan.get(f.channelId);
+    if (list) list.push(f);
+    else byChan.set(f.channelId, [f]);
+  }
+  const out = new Map<string, ChannelElasticity>();
+  for (const [id, list] of byChan) {
+    // "Did charging more help?" raise+rev↑ = +1, raise+rev↓ = −1; a cut that
+    // raised revenue means we were too high (elastic) = −1, and vice-versa.
+    const signals = list.map((f) => (f.raised ? Math.sign(f.deltaPct as number) : -Math.sign(f.deltaPct as number)));
+    const signal = signals.reduce((a, b) => a + b, 0) / signals.length;
+    out.set(id, {
+      modifier: Math.round(clampEl(1 + signal * 0.2, 0.85, 1.2) * 100) / 100,
+      signal: Math.round(signal * 100) / 100,
+      samples: list.length,
+    });
+  }
+  return out;
+}
+
+/** Convenience: compute per-channel fee elasticity directly from the node + history. */
+export async function getFeeElasticity(
+  lnd: AuthenticatedLnd,
+  history: AutopilotRun[],
+): Promise<Map<string, ChannelElasticity>> {
+  const report = await getAutopilotOutcomes(lnd, history, []);
+  return feeElasticityFromOutcomes(report.fees.items);
+}
