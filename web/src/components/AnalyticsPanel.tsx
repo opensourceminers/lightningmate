@@ -4,6 +4,7 @@ import type { ChannelView, ForwardsReport, MagmaV2Report, RebalanceRecord } from
 import { sats, satsCompact } from "../format";
 import { SkeletonPanel } from "./Skeleton";
 import { ForwardsPanel } from "./ForwardsPanel";
+import { Sparkline } from "./Sparkline";
 
 type Sub = "performance" | "forwards";
 
@@ -21,18 +22,6 @@ interface ChannelPnl {
   rebalanceCostSats: number;
   netSats: number;
   spark: number[];
-}
-
-function Sparkline({ data }: { data: number[] }) {
-  if (!data?.length || data.every((v) => v === 0)) return <span className="muted">—</span>;
-  const max = Math.max(1, ...data);
-  return (
-    <span className="spark" aria-hidden>
-      {data.map((v, i) => (
-        <i key={i} style={{ height: `${Math.max(6, (v / max) * 100)}%` }} />
-      ))}
-    </span>
-  );
 }
 
 function buildPnl(fr: ForwardsReport, records: RebalanceRecord[], days: number): ChannelPnl[] {
@@ -251,7 +240,13 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
                   {pnl.map((r) => (
                     <tr key={r.channelId} className={r.netSats < 0 ? "pnl-loser" : ""}>
                       <td className="an-alias">{r.alias}</td>
-                      <td><Sparkline data={r.spark} /></td>
+                      <td>
+                        {r.spark.length >= 2 && r.spark.some((v) => v > 0) ? (
+                          <Sparkline data={r.spark} width={84} height={22} color="var(--green)" />
+                        ) : (
+                          <span className="muted">—</span>
+                        )}
+                      </td>
                       <td className="num">{r.forwardCount}</td>
                       <td className="num">{r.routedOutSats ? satsCompact(r.routedOutSats) : "—"}</td>
                       <td className="num green">{r.feesEarnedSats ? sats(r.feesEarnedSats) : "—"}</td>

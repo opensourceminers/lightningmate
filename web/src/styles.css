@@ -399,8 +399,6 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .an-card-val.green { color: var(--green); }
 .an-card-val.cost { color: var(--red); }
 .an-card-sub { font-size: 11px; color: var(--faint); }
-.spark { display: inline-flex; align-items: flex-end; gap: 1px; height: 22px; width: 84px; }
-.spark i { flex: 1; min-height: 1px; background: var(--green); border-radius: 1px; opacity: 0.65; }
 .an-chart { display: flex; align-items: flex-end; gap: 2px; height: 120px; padding: 6px 0; }
 .an-bar-wrap { flex: 1; height: 100%; display: flex; align-items: flex-end; min-width: 0; }
 .an-bar { width: 100%; background: linear-gradient(180deg, #5eead4, var(--green)); border-radius: 2px 2px 0 0; transition: height 0.4s ease; }
