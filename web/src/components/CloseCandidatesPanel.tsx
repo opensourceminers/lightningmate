@@ -158,7 +158,7 @@ export function CloseCandidatesPanel() {
                           <div className="feerec-metrics">
                             <span>
                               capacity <b>{satsCompact(c.capacitySats)}</b> · local <b>{satsCompact(c.localSats)}</b> · frees{" "}
-                              <b>{satsCompact(c.capitalFreedSats)}</b>
+                              <b>{satsCompact(c.capitalFreedSats)}</b> · close cost <b>~{c.closeCostSat} sat</b>
                             </span>
                             <span>
                               {c.forwards60d} forwards / 60d · {satsCompact(c.flow60dSats)} routed · P&amp;L 30d{" "}

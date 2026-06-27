@@ -1,5 +1,6 @@
-import { getChainBalance, getChainFeeRate, type AuthenticatedLnd } from "lightning";
+import { getChainBalance, type AuthenticatedLnd } from "lightning";
 import { getChannelsView } from "./channels.js";
+import { nodeCapitalYield, onchainCosts } from "./nodeEconomics.js";
 import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
 import { computeNodeNeed, type NodeNeed } from "./suggestRecommend.js";
@@ -246,7 +247,7 @@ export async function getMagmaRecommendations(
   // (LM_SELL_FEE_BPS), so the APY / profit-floor math never drifts from reality.
   if (overrides.serviceFeeRate === undefined) cfg.serviceFeeRate = saleFeeConfig().bps / 10_000;
 
-  const [market, myOffers, myOrdersView, channels, chain, ownKey, flow, feeRate] = await Promise.all([
+  const [market, myOffers, myOrdersView, channels, chain, ownKey, flow, oc] = await Promise.all([
     getMarket(),
     getMyOffers(apiKey).catch(() => [] as MyOffer[]),
     getMyOrders(apiKey).catch(() => ({ orders: [] as MyOrder[], pendingSeller: 0 })),
@@ -254,29 +255,23 @@ export async function getMagmaRecommendations(
     getChainBalance({ lnd }).catch(() => ({ chain_balance: 0 })),
     getOwnPubkey(lnd),
     getFlowSummary(lnd, 30).catch(() => null),
-    getChainFeeRate({ lnd }).catch(() => null),
+    onchainCosts(lnd, cfg.openTxVbytes, cfg.closeTxVbytes),
   ]);
 
   const offers = market.offers;
   const myOrders = myOrdersView.orders.filter((o) => o.side === "SELL");
 
   // Live on-chain cost: a fee spike can make opening a channel cost more than the
-  // lease earns, so the profit floor must react to it. Fall back to the static
-  // defaults when the estimate is unavailable.
-  const onchainFeePerVbyte = feeRate?.tokens_per_vbyte ?? null;
-  if (onchainFeePerVbyte != null) {
-    cfg.defaultOpenCostSat = Math.ceil(onchainFeePerVbyte * cfg.openTxVbytes);
-    cfg.defaultCloseCostSat = Math.ceil(onchainFeePerVbyte * cfg.closeTxVbytes);
-  }
+  // lease earns, so the profit floor must react to it (shared node-economics model).
+  const onchainFeePerVbyte = oc.feePerVbyte;
+  cfg.defaultOpenCostSat = oc.openCostSat;
+  cfg.defaultCloseCostSat = oc.closeCostSat;
 
-  // ── Routing opportunity cost — yield ON CAPITAL, annualised. This is the honest
-  // bar Magma leasing must clear: how many ppm/year your sats earn just routing.
-  const totalCap = channels.reduce((s, c) => s + c.capacity, 0);
+  // ── Routing opportunity cost — yield ON CAPITAL (shared node-economics model).
   const fees30 = flow?.totalFeesEarnedSats ?? 0;
-  const hasRoutingData = totalCap > 0 && fees30 > 0;
-  const routingOpportunityPpmPerYear = hasRoutingData
-    ? Math.round((fees30 / totalCap) * (365 / 30) * 1_000_000)
-    : null;
+  const cy = nodeCapitalYield(channels, fees30, 30);
+  const routingOpportunityPpmPerYear = cy.routingYieldPpmPerYear;
+  const hasRoutingData = routingOpportunityPpmPerYear != null;
   const baseRouting = routingOpportunityPpmPerYear ?? cfg.defaultRoutingOpportunityPpmPerYear;
 
   const { nodeNeed, reason: nodeNeedReason } = computeNodeNeed(channels, fees30, 30);
