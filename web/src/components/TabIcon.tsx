@@ -118,6 +118,13 @@ export function TabIcon({ id }: { id: string }) {
           <line x1="17" y1="16" x2="23" y2="16" />
         </svg>
       );
+    case "security":
+      return (
+        <svg {...C} aria-hidden>
+          <path d="M12 2 4 5v6c0 5 3.4 8.5 8 11 4.6-2.5 8-6 8-11V5l-8-3z" />
+          <path d="M9 12l2 2 4-4" />
+        </svg>
+      );
     case "settings":
       return (
         <svg {...C} aria-hidden>

@@ -42,6 +42,7 @@ import type {
   RebalanceLogResponse,
   RebalancePolicy,
   RebalanceRecReport,
+  SecuritySummary,
   SuggestionPolicy,
   SuggestionsResponse,
 } from "./types";
@@ -227,4 +228,5 @@ export const api = {
   ambossAcceptOrder: (id: string) => post<{ ok: boolean }>("/amboss/order/accept", { id }),
   ambossOpenOrder: (id: string) =>
     post<{ ok: boolean; transactionId: string; outpoint: string }>("/amboss/order/open", { id }),
+  securitySummary: () => get<SecuritySummary>("/security/summary"),
 };

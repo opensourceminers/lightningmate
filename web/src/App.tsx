@@ -9,13 +9,14 @@ import { Footer } from "./components/Footer";
 import { LogoutButton } from "./components/LogoutButton";
 import { MarketPanel } from "./components/MarketPanel";
 import { Overview } from "./components/Overview";
+import { SecurityPanel } from "./components/SecurityPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SkeletonPanel } from "./components/Skeleton";
 import { TabIcon } from "./components/TabIcon";
 import { WalletPanel } from "./components/WalletPanel";
 import { usePolledData } from "./usePolledData";
 
-type Tab = "overview" | "channels" | "market" | "wallet" | "analytics" | "autopilot" | "settings";
+type Tab = "overview" | "channels" | "market" | "wallet" | "analytics" | "autopilot" | "security" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
@@ -24,6 +25,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "wallet", label: "Wallet" },
   { id: "analytics", label: "Analytics" },
   { id: "autopilot", label: "Autopilot" },
+  { id: "security", label: "Security" },
   { id: "settings", label: "Settings" },
 ];
 
@@ -136,6 +138,7 @@ export function App() {
         {tab === "wallet" ? <WalletPanel price={price.data} /> : null}
         {tab === "analytics" ? <AnalyticsPanel initialSub={pendingSub} /> : null}
         {tab === "autopilot" ? <AutopilotPanel initialSub={pendingSub} /> : null}
+        {tab === "security" ? <SecurityPanel /> : null}
         {tab === "settings" ? <SettingsPanel onChange={price.refresh} /> : null}
       </div>
 
