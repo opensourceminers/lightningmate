@@ -426,8 +426,6 @@ const RISK_LABEL: Record<ChannelRiskType, string> = {
   pending_htlc: "Stuck HTLC",
   pending_close: "Closing",
   force_close: "Force close",
-  severe_imbalance: "Imbalanced",
-  low_liquidity: "Low liquidity",
   dead_capital: "Dead capital",
   negative_pnl: "Negative P&L",
   close_candidate: "Close candidate",
