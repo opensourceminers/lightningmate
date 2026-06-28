@@ -55,6 +55,8 @@ import {
 import type { AmbossStore } from "../services/ambossStore.js";
 import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
+import type { SecurityStore } from "../services/security/securityStore.js";
+import { buildSecuritySummary, exportSecurityBackup } from "../services/security/run.js";
 
 // Pull the numeric keys of a policy object out of the query string.
 function numericOverrides<T>(query: Request["query"], keys: (keyof T)[]): Partial<T> {
@@ -153,6 +155,7 @@ export function createApiRouter(
   settings: SettingsStore,
   overrides: OverridesStore,
   amboss: AmbossStore,
+  security: SecurityStore,
 ): Router {
   const router = Router();
 
@@ -297,6 +300,39 @@ export function createApiRouter(
           await autopilot.feeElasticityModifiers(),
         ),
       );
+    }),
+  );
+
+  // ── Security (read-only node-safety checks) ───────────────────────────────────
+  // A live read-only safety assessment: node health, channel backup watchdog,
+  // channel risk, on-chain reserve, payment readiness and liquidity. Uses only
+  // read LND calls — it can never move funds or change channels.
+  router.get(
+    "/security/summary",
+    wrap(async (_req, res) => {
+      res.json(await buildSecuritySummary(lnd, security));
+    }),
+  );
+
+  // Export the all-channels static channel backup (read-only LND call,
+  // offchain:read). The hex blob streams straight to the browser for download
+  // and is never written to disk or uploaded. Only the timestamp + channel count
+  // metadata is persisted, so the backup watchdog can detect staleness.
+  router.post(
+    "/security/backup/export",
+    wrap(async (_req, res) => {
+      const result = await exportSecurityBackup(lnd, security);
+      if (!result.ok || !result.backupHex) {
+        res.status(400).json({ error: "backup_export_failed", message: result.error ?? "Backup export failed." });
+        return;
+      }
+      const buf = Buffer.from(result.backupHex, "hex");
+      res.setHeader("Content-Type", "application/octet-stream");
+      res.setHeader("Content-Disposition", `attachment; filename="channel.backup"`);
+      if (result.channelCount !== undefined) {
+        res.setHeader("X-Channel-Count", String(result.channelCount));
+      }
+      res.send(buf);
     }),
   );
 
