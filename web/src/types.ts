@@ -741,11 +741,14 @@ export interface PnlSummary {
   windowDays: number;
   routingRevenueSats: number;
   forwardCount: number;
+  magmaRevenueSats: number;
+  magmaSaleCount: number;
   rebalanceCostSats: number;
   rebalanceCount: number;
   channelOpenCostSats: number;
   channelCloseCostSats: number;
   otherChainFeesSats: number;
+  serviceFeePaidSats: number;
   totalCostSats: number;
   netProfitSats: number;
 }

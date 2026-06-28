@@ -33,10 +33,13 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
   const net = data?.netProfitSats ?? 0;
   const animatedNet = useCountUp(net);
 
-  const revenue = data?.routingRevenueSats ?? 0;
+  const routing = data?.routingRevenueSats ?? 0;
+  const magma = data?.magmaRevenueSats ?? 0;
+  const revenue = routing + magma;
   const opens = data?.channelOpenCostSats ?? 0;
   const rebal = data?.rebalanceCostSats ?? 0;
   const closes = data?.channelCloseCostSats ?? 0;
+  const svcFee = data?.serviceFeePaidSats ?? 0;
   const totalCost = data?.totalCostSats ?? 0;
   const max = Math.max(1, revenue, totalCost);
   const pct = (v: number) => `${(v / max) * 100}%`;
@@ -89,7 +92,8 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
             <div className="pnl-bar-row">
               <span className="pnl-bar-tag">Revenue</span>
               <div className="pnl-track">
-                <div className="pnl-seg rev" style={{ width: pct(revenue) }} />
+                <div className="pnl-seg rev" style={{ width: pct(routing) }} title={`Routing · ${sats(routing)} sat`} />
+                <div className="pnl-seg rev-magma" style={{ width: pct(magma) }} title={`Magma leases · ${sats(magma)} sat`} />
               </div>
               <span className="pnl-bar-val rev">{signed(revenue)}</span>
             </div>
@@ -99,16 +103,19 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
                 <div className="pnl-seg c-open" style={{ width: pct(opens) }} title={`Channel opens · ${sats(opens)} sat`} />
                 <div className="pnl-seg c-rebal" style={{ width: pct(rebal) }} title={`Rebalancing · ${sats(rebal)} sat`} />
                 <div className="pnl-seg c-close" style={{ width: pct(closes) }} title={`Channel closes · ${sats(closes)} sat`} />
+                <div className="pnl-seg c-fee" style={{ width: pct(svcFee) }} title={`Magma service fee · ${sats(svcFee)} sat`} />
               </div>
               <span className="pnl-bar-val cost">{totalCost > 0 ? `−${sats(totalCost)}` : "0"}</span>
             </div>
           </div>
 
           <div className="pnl-legend">
-            <span className="pnl-leg"><i className="pnl-d rev" />Revenue<b>{sats(revenue)}</b></span>
+            <span className="pnl-leg"><i className="pnl-d rev" />Routing<b>{sats(routing)}</b></span>
+            {magma > 0 ? <span className="pnl-leg"><i className="pnl-d rev-magma" />Magma<b>{sats(magma)}</b></span> : null}
             <span className="pnl-leg"><i className="pnl-d c-open" />Opens<b>{sats(opens)}</b></span>
             <span className="pnl-leg"><i className="pnl-d c-rebal" />Rebalance<b>{sats(rebal)}</b></span>
             <span className="pnl-leg"><i className="pnl-d c-close" />Closes<b>{sats(closes)}</b></span>
+            {svcFee > 0 ? <span className="pnl-leg"><i className="pnl-d c-fee" />Fee<b>{sats(svcFee)}</b></span> : null}
           </div>
 
           {data.otherChainFeesSats > 0 ? (

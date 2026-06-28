@@ -226,9 +226,11 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .pnl-track { flex: 1; display: flex; height: 9px; background: var(--panel-3); border-radius: 6px; overflow: hidden; }
 .pnl-seg { height: 100%; transition: width 0.5s ease; }
 .pnl-seg.rev { background: linear-gradient(90deg, #1f9d6b, var(--green)); border-radius: 6px; }
+.pnl-seg.rev-magma { background: #38bdf8; }
 .pnl-seg.c-open { background: var(--accent); }
 .pnl-seg.c-rebal { background: #fbbf24; }
 .pnl-seg.c-close { background: #ff7a7a; }
+.pnl-seg.c-fee { background: #c084fc; }
 .pnl-bar-val { width: 84px; text-align: right; font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; flex: none; }
 .pnl-bar-val.rev { color: var(--green); }
 .pnl-bar-val.cost { color: #ffa3a3; }
@@ -238,9 +240,11 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .pnl-leg b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
 .pnl-d { width: 9px; height: 9px; border-radius: 3px; flex: none; }
 .pnl-d.rev { background: var(--green); }
+.pnl-d.rev-magma { background: #38bdf8; }
 .pnl-d.c-open { background: var(--accent); }
 .pnl-d.c-rebal { background: #fbbf24; }
 .pnl-d.c-close { background: #ff7a7a; }
+.pnl-d.c-fee { background: #c084fc; }
 .pnl-foot { font-size: 12px; margin: 13px 0 0; }
 
 /* ── Hero row: health score + live feed ──────────────────── */

@@ -20,6 +20,7 @@ import { DEFAULT_REBALANCE_POLICY, executeRebalance, type RebalancePolicy } from
 import { getRebalanceRecommendations } from "./rebalanceRecommend.js";
 import type { RebalanceLog } from "./rebalanceLog.js";
 import type { OverridesStore } from "./overrides.js";
+import type { EarningsLog } from "./earningsLog.js";
 
 export interface AutopilotConfig {
   enabled: boolean;
@@ -178,6 +179,7 @@ export class Autopilot {
     private readonly rebalanceLog: RebalanceLog,
     private readonly overrides: OverridesStore,
     private readonly amboss: AmbossStore,
+    private readonly earnings: EarningsLog,
   ) {
     this.store = new JsonStore<PersistedState>(dataDir, "autopilot.json");
     this.state = this.store.read({
@@ -710,6 +712,14 @@ export class Autopilot {
             // Disclosed service fee on a completed sale — best-effort, never throws.
             const fee = await paySaleServiceFee(writeLnd, o.feeSats);
             if (fee.paid) console.log(`[fee] order ${o.id}: paid ${fee.sats} sat service fee`);
+            // Record the sale for P&L: gross lease income + the fee we paid out.
+            this.earnings.append({
+              at: new Date().toISOString(),
+              via: "autopilot",
+              orderId: o.id,
+              leaseSats: o.feeSats,
+              feePaidSats: fee.paid ? fee.sats : 0,
+            });
             out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: true, transactionId: res.transactionId });
           } catch (e) {
             out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: false, error: `channel opened but Amboss update failed: ${msg(e)}` });

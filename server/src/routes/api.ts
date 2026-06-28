@@ -56,6 +56,7 @@ import type { AmbossStore } from "../services/ambossStore.js";
 import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 import { BackupStore, exportScb, getBackupStatus } from "../services/backup.js";
+import type { EarningsLog } from "../services/earningsLog.js";
 
 // Pull the numeric keys of a policy object out of the query string.
 function numericOverrides<T>(query: Request["query"], keys: (keyof T)[]): Partial<T> {
@@ -155,6 +156,7 @@ export function createApiRouter(
   overrides: OverridesStore,
   amboss: AmbossStore,
   backup: BackupStore,
+  earnings: EarningsLog,
 ): Router {
   const router = Router();
 
@@ -539,7 +541,7 @@ export function createApiRouter(
     wrap(async (req, res) => {
       const days = Number(req.query.days ?? config.flowWindowDays);
       const windowDays = Number.isFinite(days) && days > 0 ? days : config.flowWindowDays;
-      res.json(await getPnl(lnd, rebalanceLog, windowDays));
+      res.json(await getPnl(lnd, rebalanceLog, earnings, windowDays));
     }),
   );
 
@@ -1143,6 +1145,14 @@ export function createApiRouter(
         if (fee.paid) console.log(`[fee] order ${id}: paid ${fee.sats} sat service fee`);
         else if (fee.reason && fee.reason !== "disabled" && fee.reason !== "self")
           console.warn(`[fee] order ${id}: skipped ${fee.sats} sat (${fee.reason})`);
+        // Record the sale for P&L: gross lease income + the fee we paid out.
+        earnings.append({
+          at: new Date().toISOString(),
+          via: "manual",
+          orderId: id,
+          leaseSats: order.feeSats,
+          feePaidSats: fee.paid ? fee.sats : 0,
+        });
       }
       res.json({ ok: added, transactionId: opened.transactionId, outpoint });
     }),

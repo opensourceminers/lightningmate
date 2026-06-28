@@ -68,22 +68,27 @@ export async function getAutopilotOutcomes(
 ): Promise<OutcomesReport> {
   const feeWin = opts.feeWindowDays ?? 7;
   const rebWin = opts.rebalanceWindowDays ?? 14;
-  const gap = (opts.measureGapDays ?? 5) * DAY; // need a few days after the action to judge it
   const lookback = (opts.lookbackDays ?? 60) * DAY;
 
   const report = await getForwardsReport(lnd, 90);
   const dayTs = report.daily.map((d) => new Date(`${d.date}T00:00:00Z`).getTime());
   const sparkById = new Map(report.perChannel.map((c) => [c.channelId, c.spark]));
   const aliasById = new Map(report.perChannel.map((c) => [c.channelId, c.alias]));
+  // Node-wide daily fee total (sum of every channel's spark per day) — the
+  // baseline used to difference out market-wide swings from one channel's move.
+  const nodeSpark: number[] = dayTs.map((_, i) =>
+    report.perChannel.reduce((s, c) => s + (c.spark[i] ?? 0), 0),
+  );
 
-  // Sum a channel's fees earned over [fromTs, toTs) from its daily sparkline.
-  const sumWindow = (channelId: string, fromTs: number, toTs: number): number => {
-    const spark = sparkById.get(channelId);
+  // Sum a sparkline over [fromTs, toTs).
+  const sumSpark = (spark: number[] | undefined, fromTs: number, toTs: number): number => {
     if (!spark) return 0;
     let s = 0;
     for (let i = 0; i < dayTs.length; i++) if (dayTs[i] >= fromTs && dayTs[i] < toTs) s += spark[i] ?? 0;
     return s;
   };
+  const sumWindow = (channelId: string, fromTs: number, toTs: number): number =>
+    sumSpark(sparkById.get(channelId), fromTs, toTs);
 
   const now = Date.now();
 
@@ -91,11 +96,22 @@ export async function getAutopilotOutcomes(
   const feeItems: FeeOutcome[] = [];
   for (const run of history) {
     const at = new Date(run.at).getTime();
-    if (now - at < gap || now - at > lookback) continue;
+    // Only measure once a FULL after-window exists (was `gap` < feeWin, which
+    // truncated the after-window for recent changes and biased them negative).
+    if (now - at < feeWin * DAY || now - at > lookback) continue;
     for (const c of run.changes ?? []) {
       if (!c.ok || c.fromPpm === c.toPpm) continue;
-      const before = sumWindow(c.id, at - feeWin * DAY, at) / feeWin;
-      const after = sumWindow(c.id, at, at + feeWin * DAY) / feeWin;
+      const from = at - feeWin * DAY;
+      const to = at + feeWin * DAY;
+      const cBefore = sumWindow(c.id, from, at);
+      const cAfter = sumWindow(c.id, at, to);
+      // Difference-in-differences: subtract the node-wide (ex-this-channel)
+      // revenue change over the same windows, so a market-wide swing isn't
+      // mistaken for this channel's response to the fee change.
+      const exBefore = sumSpark(nodeSpark, from, at) - cBefore;
+      const exAfter = sumSpark(nodeSpark, at, to) - cAfter;
+      const chanDelta = cBefore > 0 ? (cAfter - cBefore) / cBefore : null;
+      const marketDelta = exBefore > 0 ? (exAfter - exBefore) / exBefore : 0;
       feeItems.push({
         channelId: c.id,
         alias: c.alias || aliasById.get(c.id) || c.id,
@@ -103,9 +119,9 @@ export async function getAutopilotOutcomes(
         fromPpm: c.fromPpm,
         toPpm: c.toPpm,
         raised: c.toPpm > c.fromPpm,
-        beforeDailyAvgSat: Math.round(before),
-        afterDailyAvgSat: Math.round(after),
-        deltaPct: before > 0 ? Math.round(((after - before) / before) * 100) / 100 : null,
+        beforeDailyAvgSat: Math.round(cBefore / feeWin),
+        afterDailyAvgSat: Math.round(cAfter / feeWin),
+        deltaPct: chanDelta == null ? null : Math.round((chanDelta - marketDelta) * 100) / 100,
       });
     }
   }
@@ -126,7 +142,8 @@ export async function getAutopilotOutcomes(
   for (const r of rebalanceRecords) {
     if (!r.ok || !r.feeSats || r.feeSats <= 0) continue;
     const at = new Date(r.at).getTime();
-    if (now - at < gap || now - at > lookback) continue;
+    // Require a full after-window before judging (same truncation fix as fees).
+    if (now - at < rebWin * DAY || now - at > lookback) continue;
     const revenueAfter = sumWindow(r.targetId, at, at + rebWin * DAY);
     rebItems.push({
       targetId: r.targetId,
@@ -165,31 +182,42 @@ export interface ChannelElasticity {
 
 const clampEl = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
 
+/** Need at least this many measured changes before trusting an elasticity nudge. */
+const MIN_SAMPLES = 2;
+/** Sample count at which the nudge reaches full strength (confidence shrink). */
+const CONF_FULL = 4;
+
 /**
- * Per-channel fee elasticity from measured outcomes: did raising the fee actually
- * raise revenue (inelastic → can charge more) or kill the flow (elastic → back
- * off)? Returns a modifier the fee algo applies. Empty for channels with no
- * measured history → the fee algo behaves exactly as before.
+ * Per-channel fee elasticity from measured outcomes — a demand-curve-lite move
+ * toward the revenue peak. For each measured change we ask "did charging more
+ * lift revenue here?" using the MAGNITUDE of the (difference-in-differences-
+ * adjusted) revenue response, not just its sign. A consistent positive response
+ * means the channel is inelastic → price up toward the peak; negative means we
+ * went past it → ease down. The nudge is sample-gated and confidence-weighted, so
+ * one noisy week can't swing a fee, and channels with too little history are left
+ * out of the map entirely → the fee algo behaves exactly as before.
  */
 export function feeElasticityFromOutcomes(items: FeeOutcome[]): Map<string, ChannelElasticity> {
   const byChan = new Map<string, FeeOutcome[]>();
   for (const f of items) {
-    if (f.deltaPct == null) continue;
+    if (f.deltaPct == null || f.deltaPct === 0) continue; // skip no-flow / no-effect
     const list = byChan.get(f.channelId);
     if (list) list.push(f);
     else byChan.set(f.channelId, [f]);
   }
   const out = new Map<string, ChannelElasticity>();
   for (const [id, list] of byChan) {
-    // "Did charging more help?" raise+rev↑ = +1, raise+rev↓ = −1; a cut that
-    // raised revenue means we were too high (elastic) = −1, and vice-versa.
-    const signals = list.map((f) => (f.raised ? Math.sign(f.deltaPct as number) : -Math.sign(f.deltaPct as number)));
-    const signal = signals.reduce((a, b) => a + b, 0) / signals.length;
-    out.set(id, {
-      modifier: Math.round(clampEl(1 + signal * 0.2, 0.85, 1.2) * 100) / 100,
-      signal: Math.round(signal * 100) / 100,
-      samples: list.length,
-    });
+    if (list.length < MIN_SAMPLES) continue; // not enough evidence — don't nudge
+    // raiseScore > 0 ⇒ "charging more lifted revenue" (inelastic, price up);
+    // < 0 ⇒ raising cost flow (elastic, ease down). A revenue-raising cut means
+    // we were too high ⇒ negative score, and vice-versa.
+    const raiseScores = list.map((f) => (f.raised ? (f.deltaPct as number) : -(f.deltaPct as number)));
+    const avg = raiseScores.reduce((a, b) => a + b, 0) / raiseScores.length;
+    const confidence = Math.min(1, list.length / CONF_FULL);
+    const signal = clampEl(avg, -0.5, 0.5);
+    // Bounded, confidence-weighted step toward the revenue peak.
+    const modifier = Math.round(clampEl(1 + signal * 0.5 * confidence, 0.75, 1.3) * 100) / 100;
+    out.set(id, { modifier, signal: Math.round(signal * 100) / 100, samples: list.length });
   }
   return out;
 }

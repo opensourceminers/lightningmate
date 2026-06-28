@@ -370,16 +370,23 @@ function buildRecommendation(
     }
   }
 
-  // §10 precedence: base × modifiers (combined modifier clamped so forces don't explode)
-  const combinedMod = clamp(velocityMod * benchMod, 0.8, 1.4);
+  // §3.5 elasticity gate: don't raise on drain if raising measurably lost flow
+  // here before. Only bites when there's real evidence (elasticityMod < 1);
+  // neutral history (1.0) leaves the drain reflex untouched.
+  if (velocityMod > 1 && ctx.elasticityMod < 1) {
+    velocityMod = 1;
+    reasons.push("elasticity: raising lost revenue here before — not raising on drain");
+  }
+
+  // §10 precedence: base × modifiers. Elasticity is folded INTO the clamp so a
+  // learned signal can steer the price toward the revenue peak but never blow
+  // past the combined envelope.
+  const combinedMod = clamp(velocityMod * benchMod * ctx.elasticityMod, 0.7, 1.5);
   let target = base * combinedMod;
-  // Learned elasticity: nudge by how this channel's revenue responded to past fee
-  // changes (neutral 1.0 when there's no measured history).
   if (ctx.elasticityMod !== 1) {
-    target *= ctx.elasticityMod;
     reasons.push(
       ctx.elasticityMod > 1
-        ? `elasticity: raising fees lifted revenue here before — charging ~${Math.round((ctx.elasticityMod - 1) * 100)}% more`
+        ? `elasticity: raising fees lifted revenue here before — pricing ~${Math.round((ctx.elasticityMod - 1) * 100)}% higher`
         : `elasticity: higher fees cost flow here before — easing ~${Math.round((1 - ctx.elasticityMod) * 100)}% lower`,
     );
   }

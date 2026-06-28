@@ -10,6 +10,7 @@ import { SettingsStore } from "./services/settings.js";
 import { OverridesStore } from "./services/overrides.js";
 import { AmbossStore } from "./services/ambossStore.js";
 import { BackupStore } from "./services/backup.js";
+import { EarningsLog } from "./services/earningsLog.js";
 
 // Never let a startup error vanish silently — print it so it's diagnosable.
 process.on("uncaughtException", (err) => {
@@ -43,7 +44,8 @@ function main(): void {
   const overrides = new OverridesStore(config.dataDir);
   const ambossStore = new AmbossStore(config.dataDir);
   const backupStore = new BackupStore(config.dataDir);
-  const autopilot = new Autopilot(config.dataDir, lnd, writeLnd, rebalanceLog, overrides, ambossStore);
+  const earningsLog = new EarningsLog(config.dataDir);
+  const autopilot = new Autopilot(config.dataDir, lnd, writeLnd, rebalanceLog, overrides, ambossStore, earningsLog);
   autopilot.start();
 
   const app = express();
@@ -68,7 +70,7 @@ function main(): void {
   app.use(express.json({ limit: "256kb" }));
   app.use(
     "/api",
-    createApiRouter(lnd, writeLnd, config, autopilot, rebalanceLog, settings, overrides, ambossStore, backupStore),
+    createApiRouter(lnd, writeLnd, config, autopilot, rebalanceLog, settings, overrides, ambossStore, backupStore, earningsLog),
   );
 
   // In production (Docker/Umbrel) we serve the built React app from the same
