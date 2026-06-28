@@ -42,7 +42,7 @@ import type {
   RebalanceLogResponse,
   RebalancePolicy,
   RebalanceRecReport,
-  SecuritySummary,
+  BackupStatus,
   SuggestionPolicy,
   SuggestionsResponse,
 } from "./types";
@@ -228,5 +228,30 @@ export const api = {
   ambossAcceptOrder: (id: string) => post<{ ok: boolean }>("/amboss/order/accept", { id }),
   ambossOpenOrder: (id: string) =>
     post<{ ok: boolean; transactionId: string; outpoint: string }>("/amboss/order/open", { id }),
-  securitySummary: () => get<SecuritySummary>("/security/summary"),
+  backupStatus: () => get<BackupStatus>("/backup/status"),
+  // Download the channel backup with the auth header, then trigger a browser
+  // download of a `channel.backup` file from the response blob.
+  backupExport: async (): Promise<void> => {
+    const res = await fetch("/api/backup/export", { method: "POST", headers: authHeaders() });
+    if (!res.ok) {
+      if (res.status === 401) onUnauthorized?.();
+      let detail = `Export failed (${res.status}).`;
+      try {
+        const body = (await res.json()) as { message?: string };
+        if (body.message) detail = body.message;
+      } catch {
+        // binary or empty body — keep the default detail
+      }
+      throw new Error(detail);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "channel.backup";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
 };
