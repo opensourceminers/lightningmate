@@ -55,8 +55,7 @@ import {
 import type { AmbossStore } from "../services/ambossStore.js";
 import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
-import type { SecurityStore } from "../services/security/securityStore.js";
-import { buildSecuritySummary, exportSecurityBackup } from "../services/security/run.js";
+import { BackupStore, exportScb, getBackupStatus } from "../services/backup.js";
 
 // Pull the numeric keys of a policy object out of the query string.
 function numericOverrides<T>(query: Request["query"], keys: (keyof T)[]): Partial<T> {
@@ -155,7 +154,7 @@ export function createApiRouter(
   settings: SettingsStore,
   overrides: OverridesStore,
   amboss: AmbossStore,
-  security: SecurityStore,
+  backup: BackupStore,
 ): Router {
   const router = Router();
 
@@ -303,14 +302,14 @@ export function createApiRouter(
     }),
   );
 
-  // ── Security (read-only node-safety checks) ───────────────────────────────────
-  // A live read-only safety assessment: node health, channel backup watchdog,
-  // channel risk, on-chain reserve, payment readiness and liquidity. Uses only
-  // read LND calls — it can never move funds or change channels.
+  // ── Channel backup (SCB) watchdog ─────────────────────────────────────────────
+  // Read-only backup status: current channel count + last-export metadata and a
+  // staleness verdict. Uses only read LND calls — it can never move funds or
+  // change channels.
   router.get(
-    "/security/summary",
+    "/backup/status",
     wrap(async (_req, res) => {
-      res.json(await buildSecuritySummary(lnd, security));
+      res.json(await getBackupStatus(lnd, backup));
     }),
   );
 
@@ -319,9 +318,9 @@ export function createApiRouter(
   // and is never written to disk or uploaded. Only the timestamp + channel count
   // metadata is persisted, so the backup watchdog can detect staleness.
   router.post(
-    "/security/backup/export",
+    "/backup/export",
     wrap(async (_req, res) => {
-      const result = await exportSecurityBackup(lnd, security);
+      const result = await exportScb(lnd, backup);
       if (!result.ok || !result.backupHex) {
         res.status(400).json({ error: "backup_export_failed", message: result.error ?? "Backup export failed." });
         return;

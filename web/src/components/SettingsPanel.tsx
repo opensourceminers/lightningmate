@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { AppSettings, FiatCurrency } from "../types";
+import { BackupCard } from "./BackupCard";
 
 const CURRENCIES: { value: FiatCurrency; label: string }[] = [
   { value: "off", label: "Off" },
@@ -95,6 +96,7 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
   };
 
   return (
+    <>
     <section className="panel">
       <div className="panel-head"><h2>Settings</h2></div>
 
@@ -190,5 +192,8 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
         tabs — this page will grow.
       </p>
     </section>
+
+    <BackupCard />
+    </>
   );
 }
