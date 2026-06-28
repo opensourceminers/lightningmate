@@ -1098,8 +1098,6 @@ export type ChannelRiskType =
   | "pending_htlc"
   | "pending_close"
   | "force_close"
-  | "severe_imbalance"
-  | "low_liquidity"
   | "dead_capital"
   | "negative_pnl"
   | "close_candidate";

@@ -12,8 +12,13 @@ import { formatSat, makeRecommendation, safeRatio, severityRank, shortPubkey, wo
 /** Inactive channels holding at least this much local balance count as dead capital. */
 const DEAD_CAPITAL_MIN_SAT = 100_000;
 
-function assessOpenChannel(c: NormalizedChannel, config: SecurityConfig): ChannelRisk | null {
-  const cfg = config.channelRisk;
+// Channel imbalance is deliberately NOT treated as a risk here: a channel with
+// liquidity on only one side (freshly opened, just leased, or a routing sink/
+// source) is normal and not a safety concern. Balance distribution is a
+// routing/liquidity matter — handled by the rebalance + liquidity features —
+// not security. Security channel risk is strictly about funds at risk:
+// inactive/dead-capital channels, stuck HTLCs, and force/pending closes.
+function assessOpenChannel(c: NormalizedChannel): ChannelRisk | null {
   const riskTypes: ChannelRiskType[] = [];
   const reasons: string[] = [];
   let level: SecuritySeverity = "healthy";
@@ -35,18 +40,6 @@ function assessOpenChannel(c: NormalizedChannel, config: SecurityConfig): Channe
       riskTypes.push("pending_htlc");
       level = worstSeverity([level, "critical"]);
       reasons.push(`${c.pendingHtlcCount} in-flight HTLC(s) on an inactive channel — funds may be stuck.`);
-    }
-  } else {
-    const ratio = c.localRatio;
-    if (ratio >= cfg.severeImbalanceRatio) {
-      riskTypes.push("severe_imbalance");
-      level = worstSeverity([level, "warning"]);
-      reasons.push(`Severely imbalanced toward local (${(ratio * 100).toFixed(0)}% local). Little inbound on this channel.`);
-    } else if (ratio <= 1 - cfg.severeImbalanceRatio) {
-      riskTypes.push("severe_imbalance");
-      riskTypes.push("low_liquidity");
-      level = worstSeverity([level, "warning"]);
-      reasons.push(`Severely imbalanced toward remote (${(ratio * 100).toFixed(0)}% local). Little outbound on this channel.`);
     }
   }
 
@@ -80,8 +73,10 @@ function assessOpenChannel(c: NormalizedChannel, config: SecurityConfig): Channe
 }
 
 /**
- * Channel risk monitor — flags inactive, force-closing, imbalanced and
- * dead-capital channels.
+ * Channel risk monitor — flags inactive, force-closing and dead-capital
+ * channels (channels with funds at risk). Balance imbalance is intentionally
+ * excluded: one-sided liquidity is normal and a routing/liquidity matter, not
+ * a security concern.
  */
 export function evaluateChannelRisk(
   snapshot: SecuritySnapshot,
@@ -113,7 +108,7 @@ export function evaluateChannelRisk(
   const inactiveCapacity = inactive.reduce((a, c) => a + c.capacitySat, 0);
 
   for (const c of channels) {
-    const risk = assessOpenChannel(c, config);
+    const risk = assessOpenChannel(c);
     if (risk) riskyChannels.push(risk);
   }
 
@@ -181,12 +176,6 @@ export function evaluateChannelRisk(
       severities.push("warning");
       warnings.push(`${(inactiveCapacityRatio * 100).toFixed(0)}% of channel capacity is locked in inactive channels.`);
     }
-  }
-
-  const imbalanced = riskyChannels.filter((r) => r.riskTypes.includes("severe_imbalance"));
-  if (imbalanced.length > 0) {
-    severities.push("warning");
-    warnings.push(`${imbalanced.length} channel(s) are severely imbalanced.`);
   }
 
   if (severities.every((s) => s === "healthy") && channels.length > 0) {

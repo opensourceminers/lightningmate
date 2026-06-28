@@ -43,7 +43,6 @@ export const securityDefaults = {
   channelRisk: {
     inactiveChannelWarningRatio: 0.2,
     inactiveCapacityWarningRatio: 0.25,
-    severeImbalanceRatio: 0.9,
     deadCapitalDays: 60,
   },
 
