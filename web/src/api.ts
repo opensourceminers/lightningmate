@@ -43,7 +43,6 @@ import type {
   RebalancePolicy,
   RebalanceRecReport,
   BackupStatus,
-  CapitalPlan,
   SuggestionPolicy,
   SuggestionsResponse,
 } from "./types";
@@ -103,7 +102,6 @@ export const api = {
   channels: () => get<ChannelView[]>("/channels"),
   flows: (days?: number) => get<FlowSummary>(days ? `/flows?days=${days}` : "/flows"),
   pnl: (days: number) => get<PnlSummary>(`/pnl?days=${days}`),
-  capitalPlan: () => get<CapitalPlan>("/capital/plan"),
   score: () => get<NodeScore>("/score"),
   getSettings: () => get<AppSettings>("/settings"),
   setSettings: (s: Partial<AppSettings>) => post<AppSettings>("/settings", s),

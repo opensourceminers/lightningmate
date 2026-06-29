@@ -737,33 +737,6 @@ export interface LiveForward {
   outgoing: string;
 }
 
-export type CapitalActionKind = "reserve" | "close" | "open" | "lease" | "hold" | "keep";
-
-export interface CapitalAction {
-  kind: CapitalActionKind;
-  title: string;
-  sats: number;
-  expectedYieldPpmYear: number | null;
-  confidence: "high" | "medium" | "low";
-  rationale: string;
-  ref?: string;
-}
-
-export interface CapitalPlan {
-  generatedAt: string;
-  totalCapacitySats: number;
-  onchainConfirmedSats: number;
-  reserveSats: number;
-  deployableSats: number;
-  freedByClosesSats: number;
-  medianRoutingYieldPpmYear: number;
-  marginalRoutingYieldPpmYear: number;
-  leaseThresholdPpmYear: number;
-  actions: CapitalAction[];
-  summary: string;
-  notes: string[];
-}
-
 export interface PnlSummary {
   windowDays: number;
   routingRevenueSats: number;
