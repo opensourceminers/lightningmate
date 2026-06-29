@@ -16,6 +16,7 @@ import { getChannelSuggestionsV2, getCloseSuggestionsV2 } from "../services/sugg
 import { getMagmaRecommendations } from "../services/magmaRecommend.js";
 import { getAutopilotOutcomes } from "../services/outcomes.js";
 import { getPnl } from "../services/pnl.js";
+import { getCapitalPlan } from "../services/capitalAllocator.js";
 import { buildDashboard } from "../services/dashboard.js";
 import {
   createInvoice,
@@ -542,6 +543,16 @@ export function createApiRouter(
       const days = Number(req.query.days ?? config.flowWindowDays);
       const windowDays = Number.isFinite(days) && days > 0 ? days : config.flowWindowDays;
       res.json(await getPnl(lnd, rebalanceLog, earnings, windowDays));
+    }),
+  );
+
+  // Capital Allocation Engine — ADVISORY plan ("where should my sats go?").
+  // Read-only: scores every use of capital (keep/close/open/lease/reserve) in a
+  // common ppm/year currency and proposes a coordinated plan. Executes nothing.
+  router.get(
+    "/capital/plan",
+    wrap(async (_req, res) => {
+      res.json(await getCapitalPlan(lnd));
     }),
   );
 

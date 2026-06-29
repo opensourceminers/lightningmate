@@ -97,6 +97,14 @@ export function TabIcon({ id }: { id: string }) {
           <path d="M3 21v-5h5" />
         </svg>
       );
+    case "capital":
+      return (
+        <svg {...C} aria-hidden>
+          <ellipse cx="12" cy="6" rx="7" ry="3" />
+          <path d="M5 6v6c0 1.7 3.1 3 7 3s7-1.3 7-3V6" />
+          <path d="M5 12v6c0 1.7 3.1 3 7 3s7-1.3 7-3v-6" />
+        </svg>
+      );
     case "analytics":
       return (
         <svg {...C} aria-hidden>

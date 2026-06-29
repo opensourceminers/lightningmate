@@ -4,6 +4,7 @@ import { AlertsBar } from "./components/AlertsBar";
 import { AnalyticsPanel } from "./components/AnalyticsPanel";
 import { AutopilotPanel } from "./components/AutopilotPanel";
 import { BrandMark } from "./components/BrandMark";
+import { CapitalPanel } from "./components/CapitalPanel";
 import { ChannelsPanel } from "./components/ChannelsPanel";
 import { Footer } from "./components/Footer";
 import { LogoutButton } from "./components/LogoutButton";
@@ -15,13 +16,14 @@ import { TabIcon } from "./components/TabIcon";
 import { WalletPanel } from "./components/WalletPanel";
 import { usePolledData } from "./usePolledData";
 
-type Tab = "overview" | "channels" | "market" | "wallet" | "analytics" | "autopilot" | "settings";
+type Tab = "overview" | "channels" | "market" | "wallet" | "capital" | "analytics" | "autopilot" | "settings";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "channels", label: "Channels" },
   { id: "market", label: "Market" },
   { id: "wallet", label: "Wallet" },
+  { id: "capital", label: "Capital" },
   { id: "analytics", label: "Analytics" },
   { id: "autopilot", label: "Autopilot" },
   { id: "settings", label: "Settings" },
@@ -134,6 +136,7 @@ export function App() {
 
         {tab === "market" ? <MarketPanel /> : null}
         {tab === "wallet" ? <WalletPanel price={price.data} /> : null}
+        {tab === "capital" ? <CapitalPanel /> : null}
         {tab === "analytics" ? <AnalyticsPanel initialSub={pendingSub} /> : null}
         {tab === "autopilot" ? <AutopilotPanel initialSub={pendingSub} /> : null}
         {tab === "settings" ? <SettingsPanel onChange={price.refresh} /> : null}
