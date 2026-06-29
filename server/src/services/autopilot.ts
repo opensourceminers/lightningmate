@@ -21,6 +21,9 @@ import { getRebalanceRecommendations } from "./rebalanceRecommend.js";
 import type { RebalanceLog } from "./rebalanceLog.js";
 import type { OverridesStore } from "./overrides.js";
 import type { EarningsLog } from "./earningsLog.js";
+import { getChannelsView } from "./channels.js";
+import { getForwardsReport } from "./forwards.js";
+import { routingYieldStats } from "./capitalAllocator.js";
 
 export interface AutopilotConfig {
   enabled: boolean;
@@ -454,6 +457,33 @@ export class Autopilot {
 
     const size = cfg.channelSizeSats > 0 ? cfg.channelSizeSats : top.recommendedSizeSats;
     if (available < size) return []; // not enough on-chain to fund it + keep the reserve
+
+    // Capital engine: when Magma selling is also on, only open a routing channel
+    // if a new channel is expected to out-earn leasing this capital (routing
+    // median yield vs the lease floor). Otherwise leave the sats for Magma. This
+    // is the unified capital decision driving the autopilot — not just a panel.
+    if (cfg.sellEnabled) {
+      try {
+        const [chans, report] = await Promise.all([
+          getChannelsView(this.readLnd),
+          getForwardsReport(this.readLnd, 30),
+        ]);
+        const revByChan = new Map(report.perChannel.map((c) => [c.channelId, c.feesEarnedSats]));
+        const stats = routingYieldStats(chans.filter((c) => c.active), revByChan);
+        if (stats.medianPpmYear < stats.leaseThresholdPpmYear) {
+          return [
+            {
+              alias: top.alias,
+              sizeSats: size,
+              ok: false,
+              error: `deferred: leasing beats routing for this capital (routing ~${stats.medianPpmYear} vs lease floor ${stats.leaseThresholdPpmYear} ppm/yr) — left for Magma`,
+            },
+          ];
+        }
+      } catch {
+        // couldn't compute the capital decision — fall through and open as before
+      }
+    }
 
     // On-chain fee awareness: don't open when the funding fee eats >1% of the
     // channel — opening into a mempool spike is throwing money away; wait it out.

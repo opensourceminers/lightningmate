@@ -48,9 +48,10 @@ export function CapitalPanel() {
       </div>
 
       <div className="dryrun-banner">
-        <strong>Advisory — “where should my sats go?”</strong> One coordinated plan across keeping,
-        closing, opening, leasing and reserve, ranked by expected yield (ppm/year). This is a
-        recommendation only — <strong>nothing is executed automatically</strong>.
+        <strong>“Where should my sats go?”</strong> One coordinated plan across keeping, closing,
+        opening, leasing and reserve, ranked by expected yield (ppm/year). The Autopilot already
+        uses this engine's <strong>routing-vs-lease</strong> decision to place on-chain capital; the
+        close and specific open suggestions below are <strong>advisory</strong> — review before acting.
       </div>
 
       {error ? <p className="banner error">{error}</p> : null}

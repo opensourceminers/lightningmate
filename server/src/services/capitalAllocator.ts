@@ -1,5 +1,5 @@
 import { getChainBalance, type AuthenticatedLnd } from "lightning";
-import { getChannelsView } from "./channels.js";
+import { getChannelsView, type ChannelView } from "./channels.js";
 import { getForwardsReport } from "./forwards.js";
 import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
 
@@ -68,6 +68,34 @@ function percentile(sortedAsc: number[], p: number): number {
 const compact = (n: number): string =>
   n >= 1_000_000 ? `${(n / 1_000_000).toFixed(n >= 10_000_000 ? 0 : 1)}M` : n >= 1_000 ? `${Math.round(n / 1_000)}k` : String(n);
 
+export interface RoutingYieldStats {
+  /** Median per-channel routing yield (ppm/year) — the expected yield of a new channel. */
+  medianPpmYear: number;
+  /** Lower-quartile yield — the opportunity cost of the capital you'd redeploy. */
+  marginalPpmYear: number;
+  /** Lease only above this; below it, routing the capital earns more. */
+  leaseThresholdPpmYear: number;
+}
+
+/**
+ * The shared capital-decision primitive: per-channel routing yield stats, used
+ * BOTH by the advisory plan and by the autopilot to choose open-vs-lease. This is
+ * the engine's core — one definition of "what does a sat earn routing here?".
+ */
+export function routingYieldStats(active: ChannelView[], revByChan: Map<string, number>): RoutingYieldStats {
+  const yieldOf = (id: string, capacity: number): number => {
+    const rev = revByChan.get(id) ?? 0;
+    return capacity > 0 ? Math.round((rev / capacity) * YEAR_OVER_30D * 1_000_000) : 0;
+  };
+  const yields = active.map((c) => yieldOf(c.id, c.capacity)).sort((a, b) => a - b);
+  const marginalPpmYear = percentile(yields, 25);
+  return {
+    medianPpmYear: percentile(yields, 50),
+    marginalPpmYear,
+    leaseThresholdPpmYear: Math.round(Math.max(marginalPpmYear, 1) * LEASE_VS_ROUTE_RATIO),
+  };
+}
+
 export async function getCapitalPlan(lnd: AuthenticatedLnd): Promise<CapitalPlan> {
   const [channels, report, chain] = await Promise.all([
     getChannelsView(lnd),
@@ -88,10 +116,10 @@ export async function getCapitalPlan(lnd: AuthenticatedLnd): Promise<CapitalPlan
     return capacity > 0 ? Math.round((rev / capacity) * YEAR_OVER_30D * 1_000_000) : 0;
   };
 
-  const yields = active.map((c) => yieldOf(c.id, c.capacity)).sort((a, b) => a - b);
-  const medianRoutingYieldPpmYear = percentile(yields, 50);
-  const marginalRoutingYieldPpmYear = percentile(yields, 25);
-  const leaseThresholdPpmYear = Math.round(Math.max(marginalRoutingYieldPpmYear, 1) * LEASE_VS_ROUTE_RATIO);
+  const stats = routingYieldStats(active, revByChan);
+  const medianRoutingYieldPpmYear = stats.medianPpmYear;
+  const marginalRoutingYieldPpmYear = stats.marginalPpmYear;
+  const leaseThresholdPpmYear = stats.leaseThresholdPpmYear;
 
   const actions: CapitalAction[] = [];
   const notes: string[] = [];
@@ -211,7 +239,7 @@ export async function getCapitalPlan(lnd: AuthenticatedLnd): Promise<CapitalPlan
 
   notes.push("Advisory only — review before acting. Closing channels is irreversible and costs on-chain fees.");
   notes.push("Yields are annualised from the last 30 days; new-channel yields are estimates, not measured.");
-  if (yields.length === 0 || yields.every((y) => y === 0)) {
+  if (active.length === 0 || !report.perChannel.some((c) => c.feesEarnedSats > 0)) {
     notes.push("No routing revenue in the last 30 days yet — estimates are weak until data accumulates.");
   }
 
