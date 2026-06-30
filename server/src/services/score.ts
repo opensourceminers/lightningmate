@@ -41,7 +41,14 @@ const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
  * liquidity and penalises peer concentration (capital stuck with a single peer)
  * and dead capacity in offline channels, so the score reflects real resilience.
  */
+// The score barely changes minute-to-minute and the network-rank lookup is heavy
+// (pulls the graph), so cache the whole result briefly — the tile then loads
+// instantly on auto-refresh; only the first request per window recomputes.
+let scoreCache: { at: number; value: NodeScore } | null = null;
+const SCORE_TTL_MS = 5 * 60_000;
+
 export async function getNodeScore(lnd: AuthenticatedLnd): Promise<NodeScore> {
+  if (scoreCache && Date.now() - scoreCache.at < SCORE_TTL_MS) return scoreCache.value;
   const [channels, rates, flows, chain, ownKey] = await Promise.all([
     getChannelsView(lnd),
     getFeeRates({ lnd }),
@@ -180,5 +187,7 @@ export async function getNodeScore(lnd: AuthenticatedLnd): Promise<NodeScore> {
 
   const score = Math.round(categories.reduce((s, c) => s + c.score * c.weight, 0) * 100);
 
-  return { score, grade: grade(score), categories, rank };
+  const value: NodeScore = { score, grade: grade(score), categories, rank };
+  scoreCache = { at: Date.now(), value };
+  return value;
 }
