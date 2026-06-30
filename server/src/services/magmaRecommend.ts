@@ -546,7 +546,11 @@ export async function getMagmaRecommendations(
       sellReasons.push("only list above your profit floor — the market median is below what makes leasing worthwhile");
     } else {
       sellState = "good_to_sell";
-      sellReasons.push(`leasing beats routing here — list around ${seg.median} ppm effective`);
+      // Use the SAME number the price card + slider show (the actual per-offer or
+      // create recommendation), not a separate refSize-segment median — so the
+      // banner never contradicts the card.
+      const recEff = recommendations[0]?.recommended.effectiveFeePpm ?? seg.median;
+      sellReasons.push(`leasing beats routing here — list around ${recEff} ppm effective`);
     }
   }
 
