@@ -15,9 +15,9 @@ export interface CloseTarget {
 
 /**
  * Close dialog with a free fee choice for cooperative closes: shows the current
- * mempool fee rates, lets the user type a sat/vByte (or pick Fast / Economy),
- * and offers a separate force-close. Force-closes can't set a fee (the
- * commitment tx fee was fixed at open time) and time-lock the funds.
+ * mempool fee rates as pickable speed cards, lets the user fine-tune a sat/vByte,
+ * and offers a separate force-close. Force-closes can't set a fee (the commitment
+ * tx fee was fixed at open time) and time-lock the funds.
  */
 export function CloseChannelDialog({
   channel,
@@ -65,78 +65,86 @@ export function CloseChannelDialog({
     setBusy(null);
   };
 
+  const presets = [
+    { key: "fast", label: "Fast", hint: "next block", rate: fees?.fast ?? null },
+    { key: "normal", label: "Normal", hint: "~30 min", rate: fees?.normal ?? null },
+    { key: "economy", label: "Economy", hint: "~hours", rate: fees?.economy ?? null },
+  ];
+
   return (
     <div className="modal-overlay" onClick={onCancel}>
       <div className="modal close-dialog" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
-        <h3 className="modal-title">Close channel with {channel.peerAlias}</h3>
+        <h3 className="modal-title">Close channel</h3>
         <p className="modal-msg">
-          {satsCompact(channel.capacity)} sat capacity — this broadcasts an on-chain transaction.
+          with <strong>{channel.peerAlias}</strong> · {satsCompact(channel.capacity)} sat — broadcasts an
+          on-chain transaction.
         </p>
 
-        <div className="fee-now">
-          Network fee now:{" "}
-          {fees ? (
-            <>
-              fast <strong>~{fees.fast ?? "–"}</strong> · normal <strong>~{fees.normal ?? "–"}</strong> ·{" "}
-              economy <strong>~{fees.economy ?? "–"}</strong> sat/vB
-            </>
-          ) : (
-            "loading…"
-          )}
-        </div>
-
-        {!offline ? (
+        {offline ? (
           <>
-            <label className="fee-input-row">
-              <span>Fee rate</span>
-              <input
-                type="number"
-                min={1}
-                value={rate || ""}
-                onChange={(e) => setRate(Math.max(1, Math.round(Number(e.target.value) || 0)))}
-              />
-              <span className="unit">sat/vByte</span>
-            </label>
-            <div className="fee-presets">
-              <button
-                type="button"
-                className="chip"
-                disabled={!fees?.fast}
-                onClick={() => fees?.fast && setRate(fees.fast)}
-              >
-                Fast · next block{fees?.fast ? ` · ${fees.fast}` : ""}
+            <p className="modal-msg warn">
+              The peer is offline, so a cooperative close isn’t possible. A force-close works, but your
+              funds stay time-locked for a while before they return on-chain — and you can’t set the fee
+              (it was fixed when the channel opened).
+            </p>
+            <div className="modal-actions">
+              <button className="reset" onClick={onCancel} disabled={busy !== null}>
+                Cancel
               </button>
-              <button
-                type="button"
-                className="chip"
-                disabled={!fees?.economy}
-                onClick={() => fees?.economy && setRate(fees.economy)}
-              >
-                Economy{fees?.economy ? ` · ${fees.economy}` : ""}
+              <button className="primary-btn btn-danger" disabled={busy !== null} onClick={() => doClose(true)}>
+                {busy === "force" ? "Force-closing…" : "Force-close"}
               </button>
             </div>
           </>
         ) : (
-          <p className="modal-msg warn">
-            The peer is offline, so a cooperative close isn’t possible. A force-close works, but your
-            funds stay time-locked for a while before they return on-chain — and you can’t set the fee
-            (it was fixed when the channel opened).
-          </p>
-        )}
+          <>
+            <span className="field-label">Fee rate — pick a speed</span>
+            <div className="fee-grid">
+              {presets.map((p) => (
+                <button
+                  key={p.key}
+                  type="button"
+                  className={`fee-card ${p.rate !== null && rate === p.rate ? "selected" : ""}`}
+                  disabled={p.rate === null}
+                  onClick={() => p.rate !== null && setRate(p.rate)}
+                >
+                  <span className="fee-card-label">{p.label}</span>
+                  <span className="fee-card-rate">{p.rate ?? "–"}</span>
+                  <span className="fee-card-hint">{p.hint}</span>
+                </button>
+              ))}
+            </div>
 
-        <div className="modal-actions close-actions">
-          <button className="reset" onClick={onCancel} disabled={busy !== null}>
-            Cancel
-          </button>
-          {!offline ? (
-            <button className="primary-btn" disabled={busy !== null || !rate} onClick={() => doClose(false)}>
-              {busy === "coop" ? "Closing…" : `Close at ${rate || "?"} sat/vB`}
-            </button>
-          ) : null}
-          <button className="primary-btn btn-danger" disabled={busy !== null} onClick={() => doClose(true)}>
-            {busy === "force" ? "Force-closing…" : "Force-close"}
-          </button>
-        </div>
+            <label className="fee-field">
+              <span className="field-label">Custom</span>
+              <span className="fee-field-input">
+                <input
+                  type="number"
+                  min={1}
+                  value={rate || ""}
+                  onChange={(e) => setRate(Math.max(1, Math.round(Number(e.target.value) || 0)))}
+                />
+                <span className="suffix">sat/vByte</span>
+              </span>
+            </label>
+
+            <div className="modal-actions">
+              <button className="reset" onClick={onCancel} disabled={busy !== null}>
+                Cancel
+              </button>
+              <button className="primary-btn" disabled={busy !== null || !rate} onClick={() => doClose(false)}>
+                {busy === "coop" ? "Closing…" : `Close · ${rate || "?"} sat/vB`}
+              </button>
+            </div>
+
+            <div className="force-row">
+              <span className="muted small">Peer unreachable or stuck?</span>
+              <button className="row-btn ghost danger" disabled={busy !== null} onClick={() => doClose(true)}>
+                {busy === "force" ? "Force-closing…" : "Force-close"}
+              </button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
