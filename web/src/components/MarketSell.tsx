@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { goTo } from "../nav";
 import { api } from "../api";
 import type { MagmaSellOfferState, MagmaV2Report, MyOffer, PricePoint } from "../types";
 import { sats, satsCompact } from "../format";
@@ -332,8 +333,11 @@ export function MarketSell() {
                 </div>
                 {apManaged ? (
                   <p className="magma-ap-note muted">
-                    Autopilot is managing your Magma pricing automatically. Turn off
-                    <strong> Liquidity provision</strong> in the Autopilot tab to set prices manually.
+                    Autopilot is managing your Magma pricing automatically.{" "}
+                    <button className="linklike" onClick={() => goTo("autopilot", "magma")}>
+                      Open Autopilot
+                    </button>{" "}
+                    to turn off Liquidity provision and price manually.
                   </p>
                 ) : null}
                 {r0.warnings.length ? (

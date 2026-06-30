@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "./api";
+import { setNavHandler } from "./nav";
 import { AlertsBar } from "./components/AlertsBar";
 import { AnalyticsPanel } from "./components/AnalyticsPanel";
 import { AutopilotPanel } from "./components/AutopilotPanel";
@@ -44,6 +45,12 @@ export function App() {
     setTab(t as Tab);
     setPendingSub(sub);
   };
+
+  // Let any component request a tab jump (e.g. "go to Autopilot" links).
+  useEffect(() => {
+    setNavHandler(navigate);
+    return () => setNavHandler(null);
+  }, []);
 
   const anyError = node.error ?? channels.error;
   const initialLoading = node.loading && !node.data;
