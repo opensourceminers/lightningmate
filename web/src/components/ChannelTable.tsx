@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { ChannelOverride, ChannelRole, ChannelView, FeeMode, OverrideMap } from "../types";
 import { satsCompact } from "../format";
-import { useUi } from "./Overlay";
+import { CloseChannelDialog } from "./CloseChannelDialog";
 import { EmptyState } from "./Skeleton";
 
 const ROLE_LABEL: Record<ChannelRole, string> = {
@@ -63,10 +63,9 @@ type SortKey = "capacity" | "localRatio" | "totalSent" | "totalReceived";
 export function ChannelTable({ channels }: { channels: ChannelView[] }) {
   const [sort, setSort] = useState<SortKey>("capacity");
   const [onlyActive, setOnlyActive] = useState(false);
-  const { toast, confirm } = useUi();
   const [overrides, setOverrides] = useState<OverrideMap>({});
   const [canWrite, setCanWrite] = useState(false);
-  const [closingId, setClosingId] = useState<string | null>(null);
+  const [closeTarget, setCloseTarget] = useState<ChannelView | null>(null);
 
   useEffect(() => {
     api.overrides().then(setOverrides).catch(() => {});
@@ -75,27 +74,6 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
 
   const applyOverride = (id: string, mode: FeeMode, fixedPpm?: number) => {
     api.setOverride(id, mode, fixedPpm).then(setOverrides).catch(() => {});
-  };
-
-  const closeChannel = async (c: ChannelView) => {
-    const how = c.active ? "Cooperatively close" : "Force-close (offline peer)";
-    const ok = await confirm({
-      title: "Close channel",
-      message: `${how} the channel with ${c.peerAlias}? This is an on-chain transaction.`,
-      confirmLabel: "Close channel",
-      danger: true,
-    });
-    if (!ok) return;
-    setClosingId(c.id);
-    try {
-      const r = await api.channelClose(c.transactionId, c.transactionVout, !c.active);
-      if (r.ok) toast(`Closing channel — funding ${r.transactionId?.slice(0, 12)}…`, "success");
-      else toast(`Close failed: ${r.error}`, "error");
-    } catch (e) {
-      toast(`Close failed: ${e instanceof Error ? e.message : String(e)}`, "error");
-    } finally {
-      setClosingId(null);
-    }
   };
 
   const rows = channels
@@ -135,12 +113,18 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
           </tr>
         </thead>
         <tbody>
-          {rows.map((c) => (
-            <tr key={c.id} className={c.active ? "" : "inactive"}>
+          {rows.map((c) => {
+            const pending = c.status === "pending_close";
+            return (
+            <tr key={c.id} className={pending ? "pending" : c.active ? "" : "inactive"}>
               <td>
-                <span className={`status ${c.active ? "on" : "off"}`} />
+                <span className={`status ${pending ? "pending" : c.active ? "on" : "off"}`} />
                 {c.peerAlias}
-                {c.private ? <span className="tag">priv</span> : null}
+                {pending ? (
+                  <span className="tag tag-pending">pending close</span>
+                ) : c.private ? (
+                  <span className="tag">priv</span>
+                ) : null}
               </td>
               <td>
                 <span className={`role role-${c.role}`}>{ROLE_LABEL[c.role]}</span>
@@ -150,25 +134,33 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
               <td className="num">{satsCompact(c.totalSent)}</td>
               <td className="num">{satsCompact(c.totalReceived)}</td>
               <td>
-                <OverrideControl
-                  ov={overrides[c.id]}
-                  onSet={(mode, ppm) => applyOverride(c.id, mode, ppm)}
-                />
+                {pending ? (
+                  <span className="muted">—</span>
+                ) : (
+                  <OverrideControl
+                    ov={overrides[c.id]}
+                    onSet={(mode, ppm) => applyOverride(c.id, mode, ppm)}
+                  />
+                )}
               </td>
               <td>
-                {canWrite ? (
+                {pending ? (
+                  <span className="muted small" title="Waiting for the closing transaction to confirm">
+                    {c.timelockBlocks ? `~${c.timelockBlocks} blks` : "closing…"}
+                  </span>
+                ) : canWrite ? (
                   <button
                     className="row-btn ghost danger"
-                    disabled={closingId !== null}
-                    onClick={() => closeChannel(c)}
+                    onClick={() => setCloseTarget(c)}
                     title="Close this channel"
                   >
-                    {closingId === c.id ? "…" : "close"}
+                    close
                   </button>
                 ) : null}
               </td>
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
       {rows.length === 0 ? <EmptyState icon="⚡">No channels to show.</EmptyState> : null}
@@ -177,6 +169,14 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
         <em> router</em> is balanced. <strong>Autopilot fee</strong>: <code>auto</code> follows the
         policy, <code>fixed</code> pins a ppm, <code>exclude</code> keeps the autopilot off this channel.
       </p>
+
+      {closeTarget ? (
+        <CloseChannelDialog
+          channel={closeTarget}
+          onCancel={() => setCloseTarget(null)}
+          onClosed={() => setCloseTarget(null)}
+        />
+      ) : null}
     </section>
   );
 }

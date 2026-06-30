@@ -703,11 +703,15 @@ table { width: 100%; border-collapse: collapse; }
 .status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 8px; }
 .status.on { background: var(--green); box-shadow: 0 0 8px rgba(52, 211, 153, 0.6); }
 .status.off { background: var(--faint); }
+.status.pending { background: var(--accent); box-shadow: 0 0 8px var(--accent-glow); }
 
 .tag {
   margin-left: 6px; font-size: 10px; color: var(--muted);
   border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px;
 }
+.tag-pending { color: var(--accent); border-color: rgba(247, 147, 26, 0.4); background: rgba(247, 147, 26, 0.1); }
+tr.pending td { opacity: 0.9; }
+.muted.small { font-size: 11px; }
 
 .role { font-size: 11px; padding: 2px 9px; border-radius: 999px; font-weight: 600; }
 .role-source { background: rgba(96, 165, 250, 0.16); color: #93c0ff; }
@@ -1053,6 +1057,26 @@ table { width: 100%; border-collapse: collapse; }
 .modal-title { margin: 0 0 8px; font-size: 17px; }
 .modal-msg { margin: 0 0 20px; color: var(--muted); font-size: 14px; line-height: 1.5; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
+
+/* Close-channel dialog */
+.close-dialog { width: min(460px, 100%); }
+.fee-now { font-size: 13px; color: var(--muted); margin: -8px 0 16px; }
+.fee-now strong { color: var(--text); font-variant-numeric: tabular-nums; }
+.fee-input-row { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; font-size: 14px; }
+.fee-input-row input { width: 120px; }
+.fee-input-row .unit { color: var(--muted); font-size: 13px; }
+.fee-presets { display: flex; gap: 8px; margin-bottom: 18px; flex-wrap: wrap; }
+.chip {
+  font-size: 12px; padding: 6px 12px; border-radius: 999px; cursor: pointer;
+  background: var(--panel-3); color: var(--text); border: 1px solid var(--line);
+}
+.chip:hover:not(:disabled) { border-color: var(--accent); }
+.chip:disabled { color: var(--faint); cursor: not-allowed; }
+.modal-msg.warn {
+  color: #ffcf9b; background: rgba(247, 147, 26, 0.08);
+  border: 1px solid rgba(247, 147, 26, 0.25); border-radius: 8px; padding: 10px 12px;
+}
+.close-actions { flex-wrap: wrap; }
 .unlock-input {
   width: 100%; box-sizing: border-box; margin: 0 0 12px;
   padding: 10px 12px; font-size: 14px;

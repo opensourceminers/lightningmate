@@ -1,7 +1,10 @@
-import { getChannels, type AuthenticatedLnd } from "lightning";
+import { getChannels, getPendingChannels, type AuthenticatedLnd } from "lightning";
 import { getAlias } from "./aliases.js";
 
 export type ChannelRole = "source" | "sink" | "router";
+
+/** "open" = live channel; "pending_close" = a close that hasn't confirmed yet. */
+export type ChannelStatus = "open" | "pending_close";
 
 export interface ChannelView {
   id: string;
@@ -20,6 +23,9 @@ export interface ChannelView {
   totalSent: number;
   totalReceived: number;
   unsettled: number;
+  status: ChannelStatus;
+  /** Force-close in progress: blocks until time-locked funds are spendable. */
+  timelockBlocks?: number;
   /**
    * Heuristic classification from lifetime flow:
    *  - source: mostly receives (drains inbound) → keep fees low
@@ -41,7 +47,10 @@ function classify(sent: number, received: number): ChannelRole {
 export async function getChannelsView(
   lnd: AuthenticatedLnd,
 ): Promise<ChannelView[]> {
-  const { channels } = await getChannels({ lnd });
+  const [{ channels }, pending] = await Promise.all([
+    getChannels({ lnd }),
+    getPendingChannels({ lnd }).catch(() => ({ pending_channels: [] })),
+  ]);
 
   const views = await Promise.all(
     channels.map(async (c): Promise<ChannelView> => {
@@ -65,12 +74,43 @@ export async function getChannelsView(
         totalSent: c.sent,
         totalReceived: c.received,
         unsettled: c.unsettled_balance,
+        status: "open",
         role: classify(c.sent, c.received),
       };
     }),
   );
 
+  // Channels mid-close stay visible as "pending close" until the close confirms.
+  const closing = await Promise.all(
+    pending.pending_channels
+      .filter((p) => p.is_closing)
+      .map(async (p): Promise<ChannelView> => {
+        const settled = p.local_balance + p.remote_balance;
+        return {
+          id: `${p.transaction_id}:${p.transaction_vout}`,
+          peerPubkey: p.partner_public_key,
+          peerAlias: await getAlias(lnd, p.partner_public_key),
+          active: false,
+          private: false,
+          initiator: p.is_partner_initiated ? "remote" : "local",
+          capacity: p.capacity,
+          transactionId: p.transaction_id,
+          transactionVout: p.transaction_vout,
+          localBalance: p.local_balance,
+          remoteBalance: p.remote_balance,
+          localRatio: settled > 0 ? p.local_balance / settled : 0,
+          totalSent: p.sent,
+          totalReceived: p.received,
+          unsettled: 0,
+          status: "pending_close",
+          timelockBlocks: p.timelock_blocks,
+          role: classify(p.sent, p.received),
+        };
+      }),
+  );
+
+  const all = [...views, ...closing];
   // Biggest channels first — that's usually where the action is.
-  views.sort((a, b) => b.capacity - a.capacity);
-  return views;
+  all.sort((a, b) => b.capacity - a.capacity);
+  return all;
 }

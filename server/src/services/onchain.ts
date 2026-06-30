@@ -50,6 +50,27 @@ export async function getOnchainState(lnd: AuthenticatedLnd): Promise<OnchainSta
   };
 }
 
+export interface FeeEstimates {
+  /** ~next block (sat/vByte). */
+  fast: number | null;
+  /** ~30 min. */
+  normal: number | null;
+  /** ~hours — cheapest sensible. */
+  economy: number | null;
+}
+
+/** Current mempool fee rates for a few confirmation targets (for the close dialog). */
+export async function getFeeEstimates(lnd: AuthenticatedLnd): Promise<FeeEstimates> {
+  const [fast, normal, economy] = await Promise.all([
+    getChainFeeRate({ lnd, confirmation_target: 1 }).catch(() => null),
+    getChainFeeRate({ lnd, confirmation_target: 3 }).catch(() => null),
+    getChainFeeRate({ lnd, confirmation_target: 36 }).catch(() => null),
+  ]);
+  const r = (f: { tokens_per_vbyte: number } | null) =>
+    f ? Math.max(1, Math.round(f.tokens_per_vbyte)) : null;
+  return { fast: r(fast), normal: r(normal), economy: r(economy) };
+}
+
 export interface OnchainTx {
   id: string;
   amountSats: number; // signed: negative for sends

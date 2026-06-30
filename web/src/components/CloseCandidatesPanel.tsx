@@ -2,15 +2,14 @@ import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
 import type { CloseCandidate, CloseCandidatesResponse, MagmaV2Report } from "../types";
 import { satsCompact } from "../format";
-import { useUi } from "./Overlay";
+import { CloseChannelDialog, type CloseTarget } from "./CloseChannelDialog";
 import { EmptyState } from "./Skeleton";
 
 const scoreClass = (s: number) => (s >= 55 ? "u-high" : s >= 35 ? "u-medium" : "u-low");
 
 export function CloseCandidatesPanel() {
-  const { toast, confirm } = useUi();
   const [data, setData] = useState<CloseCandidatesResponse | null>(null);
-  const [closingId, setClosingId] = useState<string | null>(null);
+  const [closeTarget, setCloseTarget] = useState<CloseTarget | null>(null);
   const [canWrite, setCanWrite] = useState(false);
   const [magma, setMagma] = useState<MagmaV2Report | null>(null);
   const [open, setOpen] = useState<Set<string>>(new Set());
@@ -30,31 +29,14 @@ export function CloseCandidatesPanel() {
     api.magmaRecommendations().then(setMagma).catch(() => {});
   }, []);
 
-  const closeChannel = async (c: CloseCandidate) => {
-    const how = c.active ? "Cooperatively close" : "Force-close (offline peer)";
-    const inbound = c.inboundLiquidityLostSats > 0 ? ` You'd give up ${satsCompact(c.inboundLiquidityLostSats)} of inbound.` : "";
-    const ok = await confirm({
-      title: "Close channel",
-      message: `${how} the channel with ${c.alias}? Frees ~${satsCompact(c.capitalFreedSats)} on-chain.${inbound} This is an on-chain transaction.`,
-      confirmLabel: "Close channel",
-      danger: true,
+  const openClose = (c: CloseCandidate) =>
+    setCloseTarget({
+      peerAlias: c.alias,
+      capacity: c.capacitySats,
+      active: c.active,
+      transactionId: c.transactionId,
+      transactionVout: c.transactionVout,
     });
-    if (!ok) return;
-    setClosingId(c.channelId);
-    try {
-      const r = await api.channelClose(c.transactionId, c.transactionVout, !c.active);
-      if (r.ok) {
-        toast(`Closing channel — funding ${r.transactionId?.slice(0, 12)}…`, "success");
-        await load();
-      } else {
-        toast(`Close failed: ${r.error}`, "error");
-      }
-    } catch (e) {
-      toast(`Close failed: ${e instanceof Error ? e.message : String(e)}`, "error");
-    } finally {
-      setClosingId(null);
-    }
-  };
 
   const rows = data?.candidates ?? [];
 
@@ -131,14 +113,14 @@ export function CloseCandidatesPanel() {
                     <td>
                       <button
                         className="row-btn ghost danger"
-                        disabled={!canWrite || closingId !== null}
+                        disabled={!canWrite}
                         onClick={(e) => {
                           e.stopPropagation();
-                          void closeChannel(c);
+                          openClose(c);
                         }}
                         title={canWrite ? "Close this channel" : "Enable writes to close"}
                       >
-                        {closingId === c.channelId ? "…" : "close"}
+                        close
                       </button>
                     </td>
                   </tr>
@@ -194,6 +176,17 @@ export function CloseCandidatesPanel() {
           </tbody>
         </table>
       )}
+
+      {closeTarget ? (
+        <CloseChannelDialog
+          channel={closeTarget}
+          onCancel={() => setCloseTarget(null)}
+          onClosed={() => {
+            setCloseTarget(null);
+            void load();
+          }}
+        />
+      ) : null}
     </section>
   );
 }

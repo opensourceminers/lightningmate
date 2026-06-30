@@ -24,6 +24,7 @@ import {
   payRequest,
 } from "../services/payments.js";
 import {
+  getFeeEstimates,
   getOnchainState,
   getOnchainTxs,
   newAddress,
@@ -375,13 +376,23 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { transactionId, transactionVout, isForce } = req.body ?? {};
+      const { transactionId, transactionVout, isForce, feeRate } = req.body ?? {};
       const vout = intIn(transactionVout, 0, 1_000_000);
       if (!isTxid(transactionId) || vout === null) {
         res.status(400).json({ error: "bad_request", message: "valid transactionId (64 hex) and transactionVout required." });
         return;
       }
-      res.json(await closeChannelByOutpoint(writeLnd, transactionId, vout, Boolean(isForce)));
+      // Optional sat/vByte for cooperative closes; ignored for force-closes.
+      const rate = feeRate === undefined ? undefined : (intIn(feeRate, 1, 5000) ?? undefined);
+      res.json(await closeChannelByOutpoint(writeLnd, transactionId, vout, Boolean(isForce), rate));
+    }),
+  );
+
+  // Current on-chain fee estimates (sat/vByte) for the close dialog. Read-only.
+  router.get(
+    "/chain/fee-estimates",
+    wrap(async (_req, res) => {
+      res.json(await getFeeEstimates(lnd));
     }),
   );
 

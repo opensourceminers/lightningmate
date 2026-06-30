@@ -37,7 +37,16 @@ export interface ChannelView {
   totalSent: number;
   totalReceived: number;
   unsettled: number;
+  status: "open" | "pending_close";
+  /** Force-close in progress: blocks until time-locked funds are spendable. */
+  timelockBlocks?: number;
   role: ChannelRole;
+}
+
+export interface FeeEstimates {
+  fast: number | null;
+  normal: number | null;
+  economy: number | null;
 }
 
 export interface ChannelFlow {

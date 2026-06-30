@@ -7,6 +7,7 @@ import type {
   AutopilotRun,
   AutopilotState,
   ChannelView,
+  FeeEstimates,
   FeeMode,
   OverrideMap,
   PriceInfo,
@@ -110,8 +111,9 @@ export const api = {
   setOverride: (channelId: string, mode: FeeMode, fixedPpm?: number) =>
     post<OverrideMap>("/overrides", { channelId, mode, fixedPpm }),
   alerts: () => get<Alert[]>("/alerts"),
-  channelClose: (transactionId: string, transactionVout: number, isForce: boolean) =>
-    post<CloseChannelResult>("/channels/close", { transactionId, transactionVout, isForce }),
+  channelClose: (transactionId: string, transactionVout: number, isForce: boolean, feeRate?: number) =>
+    post<CloseChannelResult>("/channels/close", { transactionId, transactionVout, isForce, feeRate }),
+  feeEstimates: () => get<FeeEstimates>("/chain/fee-estimates"),
   forwardsReport: (days: number) => get<ForwardsReport>(`/forwards/report?days=${days}`),
   feesPreview: (policy?: Partial<FeePolicy>) => {
     const qs = policy

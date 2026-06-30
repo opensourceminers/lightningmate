@@ -121,18 +121,27 @@ export interface CloseChannelResult {
 /**
  * Close a channel by funding outpoint. Cooperative by default (needs the peer
  * online); force-close when the peer is unreachable. Real on-chain action.
+ *
+ * `feeRate` (sat/vByte) only applies to a cooperative close — a force-close
+ * broadcasts the pre-signed commitment tx whose fee was fixed at open time.
  */
 export async function closeChannelByOutpoint(
   writeLnd: AuthenticatedLnd,
   transactionId: string,
   transactionVout: number,
   isForce: boolean,
+  feeRate?: number,
 ): Promise<CloseChannelResult> {
   try {
     const res = await closeChannel(
       isForce
         ? { lnd: writeLnd, transaction_id: transactionId, transaction_vout: transactionVout, is_force_close: true }
-        : { lnd: writeLnd, transaction_id: transactionId, transaction_vout: transactionVout },
+        : {
+            lnd: writeLnd,
+            transaction_id: transactionId,
+            transaction_vout: transactionVout,
+            ...(feeRate && feeRate > 0 ? { tokens_per_vbyte: Math.round(feeRate) } : {}),
+          },
     );
     return { ok: true, transactionId: res.transaction_id };
   } catch (err) {
