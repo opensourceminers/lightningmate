@@ -65,6 +65,9 @@ export function MarketSell() {
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [rec, setRec] = useState<MagmaV2Report | null>(null);
+  // True when the Autopilot is auto-repricing Magma offers — manual pricing would
+  // just be overwritten, so we disable the manual buttons to avoid the conflict.
+  const [apManaged, setApManaged] = useState(false);
 
   const load = async () => {
     let conn = false;
@@ -82,6 +85,10 @@ export function MarketSell() {
     // Best-effort — a flaky offers call (e.g. an expired key) shouldn't blank the tab.
     api.ambossMyOffers().then((r) => setOffers(r.offers)).catch(() => {});
     api.magmaRecommendations().then(setRec).catch(() => setRec(null));
+    api
+      .autopilotGet()
+      .then((s) => setApManaged(!!(s.config?.sellEnabled && s.config?.sellAutoReprice)))
+      .catch(() => setApManaged(false));
   };
 
   useEffect(() => {
@@ -311,18 +318,24 @@ export function MarketSell() {
                   );
                 })()}
                 <div className="magma-price-buttons">
-                  <button className="row-btn" title="undercut the market to fill fast" onClick={() => applyPrice(r0.pricing.fast)}>
+                  <button className="row-btn" disabled={apManaged} title="undercut the market to fill fast" onClick={() => applyPrice(r0.pricing.fast)}>
                     Sell fast
                   </button>
-                  <button className="row-btn" onClick={() => applyPrice(r0.pricing.balanced)}>Balanced</button>
-                  <button className="row-btn" title="charge a premium (needs a strong score)" onClick={() => applyPrice(r0.pricing.premium)}>
+                  <button className="row-btn" disabled={apManaged} onClick={() => applyPrice(r0.pricing.balanced)}>Balanced</button>
+                  <button className="row-btn" disabled={apManaged} title="charge a premium (needs a strong score)" onClick={() => applyPrice(r0.pricing.premium)}>
                     Premium
                   </button>
-                  <button className="row-btn ghost" title="lowest price that still beats routing" onClick={() => applyPrice(r0.pricing.profitFloor)}>
+                  <button className="row-btn ghost" disabled={apManaged} title="lowest price that still beats routing" onClick={() => applyPrice(r0.pricing.profitFloor)}>
                     Profit floor
                   </button>
-                  <button className="row-btn primary" onClick={() => applyPrice(r0.recommended)}>Apply recommended</button>
+                  <button className="row-btn primary" disabled={apManaged} onClick={() => applyPrice(r0.recommended)}>Apply recommended</button>
                 </div>
+                {apManaged ? (
+                  <p className="magma-ap-note muted">
+                    Autopilot is managing your Magma pricing automatically. Turn off
+                    <strong> Liquidity provision</strong> in the Autopilot tab to set prices manually.
+                  </p>
+                ) : null}
                 {r0.warnings.length ? (
                   <div className="magma-warns">
                     {r0.warnings.slice(0, 2).map((w, i) => (

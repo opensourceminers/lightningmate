@@ -560,6 +560,7 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .magma-dot.median { width: 2px; height: 11px; border-radius: 1px; background: var(--text); }
 .magma-dot.cur { background: #38bdf8; }
 .magma-dot.rec { background: var(--accent); }
+.magma-ap-note { font-size: 12px; margin: 9px 0 0; line-height: 1.45; }
 .magma-analytics {
   display: flex; flex-wrap: wrap; gap: 20px; padding: 13px 16px; margin-bottom: 14px;
   background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
