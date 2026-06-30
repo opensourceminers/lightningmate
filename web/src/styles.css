@@ -543,11 +543,23 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 }
 .magma-substats { font-size: 12px; margin: 2px 0 10px; }
 .magma-substats b { color: var(--text); }
-.magma-depth { display: flex; align-items: center; gap: 9px; margin-top: 10px; font-size: 10.5px; color: var(--faint); }
-.magma-depth-bar { position: relative; flex: 1; height: 6px; border-radius: 3px; background: linear-gradient(90deg, rgba(52,211,153,0.25), rgba(247,147,26,0.25), rgba(248,113,113,0.25)); }
-.magma-depth-bar i { position: absolute; top: 50%; width: 3px; height: 14px; transform: translate(-50%, -50%); border-radius: 2px; }
-.magma-depth-you { background: var(--accent); box-shadow: 0 0 6px var(--accent-glow); }
-.magma-depth-floor { background: var(--muted); height: 10px; }
+/* Magma price slider — market band + median + your price + recommendation */
+.magma-slider { margin: 12px 0 4px; }
+.magma-slider-track { position: relative; height: 10px; border-radius: 6px; background: var(--panel-3); }
+.magma-slider-band { position: absolute; top: 0; height: 100%; background: rgba(247, 147, 26, 0.18); border-radius: 6px; }
+.magma-tick { position: absolute; top: -3px; width: 2px; height: 16px; transform: translateX(-1px); border-radius: 1px; }
+.magma-tick.median { background: var(--text); }
+.magma-tick.floor { background: #ff7a7a; }
+.magma-pin { position: absolute; top: 50%; width: 12px; height: 12px; border-radius: 999px; transform: translate(-50%, -50%); box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.4); }
+.magma-pin.cur { background: #38bdf8; }
+.magma-pin.rec { background: var(--accent); box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.4), 0 0 7px var(--accent-glow); }
+.magma-slider-legend { display: flex; align-items: center; gap: 11px; flex-wrap: wrap; margin-top: 9px; font-size: 11px; color: var(--muted); }
+.magma-leg { display: inline-flex; align-items: center; gap: 5px; }
+.magma-dot { width: 9px; height: 9px; border-radius: 999px; flex: none; }
+.magma-dot.band { background: rgba(247, 147, 26, 0.4); border-radius: 2px; }
+.magma-dot.median { width: 2px; height: 11px; border-radius: 1px; background: var(--text); }
+.magma-dot.cur { background: #38bdf8; }
+.magma-dot.rec { background: var(--accent); }
 .magma-analytics {
   display: flex; flex-wrap: wrap; gap: 20px; padding: 13px 16px; margin-bottom: 14px;
   background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: var(--radius-sm);

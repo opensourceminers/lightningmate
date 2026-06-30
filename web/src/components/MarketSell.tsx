@@ -279,17 +279,34 @@ export function MarketSell() {
                   {r0.market.scorePremium ? ` · ${r0.market.scorePremium > 0 ? "+" : ""}${Math.round(r0.market.scorePremium * 100)}% score ${r0.market.scorePremium > 0 ? "premium" : "discount"}` : ""}
                 </div>
                 {(() => {
-                  const lo = r0.market.p10;
-                  const hi = Math.max(r0.market.p75, lo + 1);
-                  const pos = (v: number) => Math.min(100, Math.max(0, ((v - lo) / (hi - lo)) * 100));
+                  const m = r0.market;
+                  const cur = r0.current?.effectiveFeePpm ?? null;
+                  const recv = r0.recommended.effectiveFeePpm;
+                  const floor = r0.economics.profitFloorEffectivePpm;
+                  const lo = Math.min(m.p10, floor, cur ?? recv) * 0.95;
+                  const hi = Math.max(m.p75, recv, cur ?? 0) * 1.05;
+                  const span = Math.max(1, hi - lo);
+                  const pos = (v: number) => Math.min(100, Math.max(0, ((v - lo) / span) * 100));
                   return (
-                    <div className="magma-depth" title="where your price sits across the market (p10 → p75)">
-                      <span>cheap</span>
-                      <div className="magma-depth-bar">
-                        <i className="magma-depth-floor" style={{ left: `${pos(r0.economics.profitFloorEffectivePpm)}%` }} title="profit floor" />
-                        <i className="magma-depth-you" style={{ left: `${pos(r0.recommended.effectiveFeePpm)}%` }} title="your price" />
+                    <div className="magma-slider">
+                      <div className="magma-slider-track" title={`market p25–p75: ${m.p25}–${m.p75} ppm · median ${m.median}`}>
+                        <div
+                          className="magma-slider-band"
+                          style={{ left: `${pos(m.p25)}%`, width: `${Math.max(1, pos(m.p75) - pos(m.p25))}%` }}
+                        />
+                        <i className="magma-tick floor" style={{ left: `${pos(floor)}%` }} title={`profit floor ${floor} ppm`} />
+                        <i className="magma-tick median" style={{ left: `${pos(m.median)}%` }} title={`market median ${m.median} ppm`} />
+                        {cur != null ? <i className="magma-pin cur" style={{ left: `${pos(cur)}%` }} title={`your current ${cur} ppm`} /> : null}
+                        <i className="magma-pin rec" style={{ left: `${pos(recv)}%` }} title={`recommended ${recv} ppm`} />
                       </div>
-                      <span>dear</span>
+                      <div className="magma-slider-legend">
+                        <span className="muted">cheap</span>
+                        <span className="magma-leg"><i className="magma-dot band" />market</span>
+                        <span className="magma-leg"><i className="magma-dot median" />median {m.median}</span>
+                        {cur != null ? <span className="magma-leg"><i className="magma-dot cur" />you {cur}</span> : null}
+                        <span className="magma-leg"><i className="magma-dot rec" />rec {recv}</span>
+                        <span className="muted">dear</span>
+                      </div>
                     </div>
                   );
                 })()}
