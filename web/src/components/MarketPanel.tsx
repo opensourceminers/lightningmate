@@ -21,17 +21,6 @@ export function MarketPanel() {
 
   return (
     <div>
-      {a ? (
-        <div className="market-score">
-          <span className="market-score-main">
-            Seller score <b>{a.mySellerScore != null ? a.mySellerScore.toFixed(1) : "—"}</b>
-          </span>
-          <span className="muted">
-            {a.filledOrdersAllTime} sold · {sats(a.netProfitSat)} sat net
-          </span>
-        </div>
-      ) : null}
-
       <div className="subnav">
         <button className={`subtab ${sub === "buy" ? "active" : ""}`} onClick={() => setSub("buy")}>
           Buy
@@ -43,6 +32,18 @@ export function MarketPanel() {
           Orders
         </button>
       </div>
+
+      {a ? (
+        <div className="market-score">
+          <span className="market-score-main">
+            Seller score <b>{a.mySellerScore != null ? a.mySellerScore.toFixed(1) : "—"}</b>
+          </span>
+          <span className="muted">
+            {a.filledOrdersAllTime} sold · {sats(a.netProfitSat)} sat net
+          </span>
+        </div>
+      ) : null}
+
       {sub === "buy" ? <MarketBuy /> : sub === "sell" ? <MarketSell /> : <MarketOrders />}
     </div>
   );
