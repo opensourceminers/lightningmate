@@ -55,15 +55,17 @@ export async function getNodeScore(lnd: AuthenticatedLnd): Promise<NodeScore> {
   const totalCapacity = channels.reduce((s, c) => s + c.capacity, 0);
   const activeCapacity = active.reduce((s, c) => s + c.capacity, 0);
 
-  // ── Liquidity ── two-sided liquidity routes; lopsided channels are dead weight.
-  const routable = active.length
-    ? active.filter((c) => c.localRatio >= 0.1 && c.localRatio <= 0.9).length / active.length
-    : 0;
-  const balance = active.length
-    ? 1 - active.reduce((s, c) => s + Math.abs(c.localRatio - 0.5) * 2, 0) / active.length
-    : 0;
-  const lopsided = active.filter((c) => c.localRatio < 0.1 || c.localRatio > 0.9).length;
-  const liquidity = clamp01(0.6 * routable + 0.4 * balance);
+  // ── Liquidity ── a routing node is healthy when it has BOTH outbound and
+  // inbound liquidity available ACROSS THE NODE — not when every channel is
+  // individually balanced. Dedicated source (outbound) and sink (inbound)
+  // channels are normal and fine; what matters is the node can route both ways.
+  const totalLocal = active.reduce((s, c) => s + c.localBalance, 0);
+  const totalRemote = active.reduce((s, c) => s + c.remoteBalance, 0);
+  const sideTotal = totalLocal + totalRemote;
+  const outShare = sideTotal > 0 ? totalLocal / sideTotal : 0;
+  const inShare = sideTotal > 0 ? totalRemote / sideTotal : 0;
+  // 50/50 across the node = best routing flexibility; heavily one-sided = limited.
+  const liquidity = clamp01(2 * Math.min(outShare, inShare));
 
   // ── Connectivity ── online + peer diversity (HHI) + network rank.
   const onlineShare = channels.length ? active.length / channels.length : 0;
@@ -124,10 +126,13 @@ export async function getNodeScore(lnd: AuthenticatedLnd): Promise<NodeScore> {
       label: "Liquidity",
       score: liquidity,
       weight: 0.2,
-      detail: `${Math.round(routable * 100)}% of channels route both ways`,
-      hint: lopsided
-        ? `Rebalance ${lopsided} lopsided channel${lopsided === 1 ? "" : "s"} so they can route both directions.`
-        : `Keep channels two-sided so they can route in both directions.`,
+      detail: `${Math.round(outShare * 100)}% outbound · ${Math.round(inShare * 100)}% inbound`,
+      hint:
+        outShare < 0.2
+          ? "Low outbound — you can receive but barely forward out. Refill outbound (rebalance or open a channel)."
+          : inShare < 0.2
+            ? "Low inbound — you can forward out but barely receive. Get inbound (sell on Magma, spend, or loop out)."
+            : "Healthy two-sided liquidity — the node can route in both directions.",
     },
     {
       key: "connectivity",
