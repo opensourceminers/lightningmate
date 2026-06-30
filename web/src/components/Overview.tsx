@@ -48,12 +48,10 @@ function KpiRow({ d, price }: { d: DashboardData; price?: PriceInfo | null }) {
         <div className="kpi-spark"><Sparkline data={d.routedSpark} width={150} height={30} /></div>
       </div>
       <div className="kpi">
-        <div className="kpi-label">Rebalanced</div>
-        <div className="kpi-value">{d.rebalancedCount}<span className="kpi-unit"> runs</span></div>
-        <div className="kpi-sub">{satsCompact(d.rebalancedSats)} sat moved</div>
-        <div className="kpi-sub kpi-yield" title="Routing fees earned vs total channel capacity, annualised">
-          yield ≈ {d.yieldPpmYear.toLocaleString()} ppm/yr on capital
-        </div>
+        <div className="kpi-label">Yield · {d.windowDays}d</div>
+        <div className="kpi-value">{d.yieldPpmYear.toLocaleString()} <span className="kpi-unit">ppm/yr</span></div>
+        <div className="kpi-sub">on capital</div>
+        <div className="kpi-spark"><Sparkline data={d.feesSpark} width={150} height={30} color="var(--accent)" /></div>
       </div>
     </div>
   );
