@@ -41,10 +41,10 @@ export interface FeeRecConfig {
 
 export const FEE_REC_DEFAULTS: FeeRecConfig = {
   minPpm: 50,
-  maxPpm: 2500,
-  neutralPpm: 250,
-  protectPpm: 1500,
-  newChannelMinPpm: 250,
+  maxPpm: 1000,
+  neutralPpm: 120,
+  protectPpm: 350,
+  newChannelMinPpm: 120,
   minChangePpm: 25,
   relativeChangeThreshold: 0.2,
   stepPpm: 25,
@@ -330,24 +330,23 @@ function buildRecommendation(
   const targetLocalRatio = targetLocalRatioFor(ch.role, cfg);
   const base = balanceTargetPpm(ch.localRatio, targetLocalRatio, cfg);
 
-  // §3 velocity modifier
+  // §3 velocity modifier — volume-first: gentle on raises (never slam a working
+  // channel up), and lower idle outbound liquidity to win flow.
   let velocityMod = 1;
   let exploring = false;
   if (grossFlow14d >= 0.2 && netDrain14d >= 0.1) {
-    velocityMod = 1.25;
-    reasons.push(`velocity: draining fast (${Math.round(netDrain14d * 100)}% net in ${cfg.flowWindowDays}d) — raising fee`);
-  } else if (grossFlow14d >= 0.05 && netDrain14d >= 0.03) {
     velocityMod = 1.1;
-    reasons.push("velocity: steady outbound demand — nudging fee up");
-  } else if (grossFlow14d >= 0.2 && Math.abs(netDrain14d) < 0.05) {
+    reasons.push(`velocity: draining fast (${Math.round(netDrain14d * 100)}% net in ${cfg.flowWindowDays}d) — small nudge up`);
+  } else if (grossFlow14d >= 0.05 && netDrain14d >= 0.03) {
     velocityMod = 1.05;
-    reasons.push("velocity: active and balanced — holding firm");
-  } else if (grossFlow14d < 0.01 && ch.localRatio > targetLocalRatio + 0.2 && peerGate === "ok") {
+    reasons.push("velocity: steady outbound demand — small nudge up");
+  } else if (grossFlow14d >= 0.2 && Math.abs(netDrain14d) < 0.05) {
+    velocityMod = 1;
+    reasons.push("velocity: active and balanced — holding");
+  } else if (grossFlow14d < 0.01 && ch.localRatio > targetLocalRatio + 0.2) {
     velocityMod = 0.85;
     exploring = true;
-    reasons.push("idle test: good peer with idle outbound liquidity — testing a lower fee");
-  } else if (grossFlow14d < 0.01 && peerGate === "weak") {
-    reasons.push("peer gate: no 30d flow — not lowering an idle, weak-peer channel");
+    reasons.push("idle test: idle outbound liquidity — testing a lower fee");
   }
 
   // §4 conservative node-benchmark nudge
@@ -391,6 +390,18 @@ function buildRecommendation(
     );
   }
 
+  // Volume-first guard: never slam an actively-routing channel up in one move —
+  // raise gently and let measured elasticity justify bigger moves. This is what
+  // prevents pricing a working channel out of the market (the failure that killed
+  // routing). Floors below can still apply for real cost recovery.
+  if (f30.forwards > 0 && ctx.elasticityMod <= 1) {
+    const gentleCap = (currentPpm || cfg.neutralPpm) + 2 * cfg.stepPpm;
+    if (target > gentleCap) {
+      target = gentleCap;
+      reasons.push("guard: channel is routing — capping the rise to a small step");
+    }
+  }
+
   // §10 hard floors (always win). The binding floor's reason is unshifted to the
   // front so the *dominant* reason is shown first. Floors are safety/economics
   // limits, so they may exceed maxPpm — otherwise a low maxPpm would defeat
@@ -411,11 +422,28 @@ function buildRecommendation(
     floored = "recovering_cost";
     reasons.unshift(`profit floor: raised above refill cost (basis ${costBasisPpm} ppm × ${cfg.safetyMargin})`);
   }
-  if (ch.localRatio < 0.1) {
+  // Protect only a drained channel that is STILL in demand — a modest bump to
+  // slow the bleed, never a flat ceiling. A drained + idle channel is handled by
+  // the no-flow rule below (lowered), never slammed to a high fee.
+  if (ch.localRatio < 0.1 && f30.forwards > 0) {
     if (cfg.protectPpm > target) target = cfg.protectPpm;
     hardFloor = Math.max(hardFloor, cfg.protectPpm);
     floored = "protecting_liquidity";
-    reasons.unshift(`protect mode: channel nearly drained (${Math.round(ch.localRatio * 100)}% local) — raising fee`);
+    reasons.unshift(`protect: drained (${Math.round(ch.localRatio * 100)}% local) but still in demand — modest bump`);
+  }
+
+  // No routing → lower (the core volume-first safety): a channel that hasn't
+  // routed in the benchmark window gets cheaper each run, toward minPpm, to win
+  // flow back. Overrides the curve + floors (except new-channel protection) — the
+  // opposite of a drain reflex. We never price-kill an idle channel.
+  const isNewChan = ageDays != null && ageDays < cfg.newChannelProtectionDays;
+  if (f30.forwards === 0 && ch.localRatio >= 0.1 && !isNewChan) {
+    const stepped = currentPpm > 0 ? currentPpm - 3 * cfg.stepPpm : cfg.neutralPpm;
+    target = Math.max(cfg.minPpm, Math.min(target, stepped));
+    hardFloor = 0;
+    floored = null;
+    exploring = true;
+    reasons.unshift("no flow: nothing routed here recently — lowering toward min to win routing back");
   }
 
   // §10 clamp + round — floors may push the ceiling above maxPpm
@@ -442,7 +470,7 @@ function buildRecommendation(
 
   // §12 state (priority order)
   let state: FeeRecState = "normal";
-  if (ch.localRatio < 0.1) state = "protecting_liquidity";
+  if (floored === "protecting_liquidity") state = "protecting_liquidity";
   else if (floored === "recovering_cost") state = "recovering_cost";
   else if (grossFlow30d < 0.005 && peerGate === "weak") state = "close_candidate";
   else if (exploring) state = "exploring_lower_fee";

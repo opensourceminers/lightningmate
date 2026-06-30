@@ -132,6 +132,8 @@ interface PersistedState {
   lastSellAdaptiveAdjustAt: string | null;
   /** One-time flag: bumped installs from the old 60-min default to 30 min. */
   intervalMigrated?: boolean;
+  /** One-time flag: lowered the old aggressive fee ceiling (2000 → 1000 ppm). */
+  feePolicyMigrated?: boolean;
   history: AutopilotRun[];
 }
 
@@ -277,6 +279,13 @@ export class Autopilot {
     if (!this.state.intervalMigrated) {
       if (this.state.config.intervalMinutes === 60) this.state.config.intervalMinutes = 30;
       this.state.intervalMigrated = true;
+      this.persist();
+    }
+    // One-time: lower the old aggressive fee ceiling so the volume-first engine
+    // isn't capped by a stale 2000 ppm policy from before the rework.
+    if (!this.state.feePolicyMigrated) {
+      if (this.state.config.policy.maxPpm >= 2000) this.state.config.policy.maxPpm = 1000;
+      this.state.feePolicyMigrated = true;
       this.persist();
     }
     this.reschedule();
