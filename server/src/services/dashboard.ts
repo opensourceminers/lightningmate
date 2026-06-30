@@ -30,6 +30,10 @@ export interface DashboardData {
   routedSpark: number[];
   rebalancedCount: number;
   rebalancedSats: number;
+  /** Total channel capacity (sats) — the capital base for the yield figure. */
+  totalCapacitySats: number;
+  /** Routing earnings yield on capital, annualised (ppm/year). */
+  yieldPpmYear: number;
   activity: ActivityItem[];
   autopilot: {
     fees: boolean;
@@ -59,6 +63,7 @@ export function buildDashboard(
   onchain: OnchainTx[],
   rebalance: RebalanceSummary,
   autopilot: AutopilotState,
+  totalCapacitySats: number,
 ): DashboardData {
   const activity: ActivityItem[] = [];
 
@@ -112,6 +117,11 @@ export function buildDashboard(
     routedSpark: report.daily.map((d) => d.routedSats),
     rebalancedCount: rebalance.count,
     rebalancedSats: rebalance.totalAmountSats,
+    totalCapacitySats,
+    yieldPpmYear:
+      totalCapacitySats > 0
+        ? Math.round((report.totalFeesEarnedSats / totalCapacitySats) * (365 / Math.max(1, report.windowDays)) * 1_000_000)
+        : 0,
     activity: activity.slice(0, 14),
     autopilot: {
       fees: autopilot.config.enabled,

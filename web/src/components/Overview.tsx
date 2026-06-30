@@ -24,6 +24,9 @@ function signed(value: number): string {
 
 function KpiRow({ d, price }: { d: DashboardData; price?: PriceInfo | null }) {
   const earnedFiat = price ? fiat(d.earnedSats, price.btcPrice, price.currency) : null;
+  // Routing-alive signal: a collapse shows up immediately as 24h/7d going to zero.
+  const last24h = d.forwardsSpark.length ? d.forwardsSpark[d.forwardsSpark.length - 1] : 0;
+  const last7d = d.forwardsSpark.slice(-7).reduce((s, v) => s + v, 0);
   return (
     <div className="kpi-row">
       <div className="kpi">
@@ -35,7 +38,7 @@ function KpiRow({ d, price }: { d: DashboardData; price?: PriceInfo | null }) {
       <div className="kpi">
         <div className="kpi-label">Forwards · {d.windowDays}d</div>
         <div className="kpi-value">{d.forwardCount}</div>
-        <div className="kpi-sub">routing events</div>
+        <div className={`kpi-sub ${last7d === 0 ? "kpi-alert" : ""}`}>{last24h} in 24h · {last7d} in 7d</div>
         <div className="kpi-spark"><Sparkline data={d.forwardsSpark} width={150} height={30} /></div>
       </div>
       <div className="kpi">
@@ -48,7 +51,9 @@ function KpiRow({ d, price }: { d: DashboardData; price?: PriceInfo | null }) {
         <div className="kpi-label">Rebalanced</div>
         <div className="kpi-value">{d.rebalancedCount}<span className="kpi-unit"> runs</span></div>
         <div className="kpi-sub">{satsCompact(d.rebalancedSats)} sat moved</div>
-        <div className="kpi-spark" />
+        <div className="kpi-sub kpi-yield" title="Routing fees earned vs total channel capacity, annualised">
+          yield ≈ {d.yieldPpmYear.toLocaleString()} ppm/yr on capital
+        </div>
       </div>
     </div>
   );

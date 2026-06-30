@@ -563,6 +563,8 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .magma-ap-note { font-size: 12px; margin: 9px 0 0; line-height: 1.45; }
 .linklike { background: none; border: none; padding: 0; font: inherit; color: var(--accent); cursor: pointer; text-decoration: underline; }
 .linklike:hover { opacity: 0.85; }
+.kpi-sub.kpi-alert { color: #ff9b9b; font-weight: 600; }
+.kpi-sub.kpi-yield { color: var(--accent); }
 .magma-analytics {
   display: flex; flex-wrap: wrap; gap: 20px; padding: 13px 16px; margin-bottom: 14px;
   background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: var(--radius-sm);

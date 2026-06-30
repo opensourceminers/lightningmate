@@ -546,6 +546,8 @@ export interface DashboardData {
   routedSpark: number[];
   rebalancedCount: number;
   rebalancedSats: number;
+  totalCapacitySats: number;
+  yieldPpmYear: number;
   activity: ActivityItem[];
   autopilot: {
     fees: boolean;

@@ -558,12 +558,14 @@ export function createApiRouter(
   router.get(
     "/dashboard",
     wrap(async (_req, res) => {
-      const [report, ln, onchain] = await Promise.all([
+      const [report, ln, onchain, channels] = await Promise.all([
         getForwardsReport(lnd, 30),
         getLnActivity(lnd, 10),
         getOnchainTxs(lnd, 10),
+        getChannelsView(lnd),
       ]);
-      res.json(buildDashboard(report, ln, onchain, rebalanceLog.summary(), autopilot.getState()));
+      const totalCapacitySats = channels.reduce((s, c) => s + c.capacity, 0);
+      res.json(buildDashboard(report, ln, onchain, rebalanceLog.summary(), autopilot.getState(), totalCapacitySats));
     }),
   );
 
