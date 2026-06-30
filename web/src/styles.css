@@ -1188,3 +1188,7 @@ table { width: 100%; border-collapse: collapse; }
 .backup-dot.warn { background: #e0b341; box-shadow: 0 0 8px rgba(224, 179, 65, 0.5); }
 .backup-warn { color: #e0b341; }
 .backup-meta { font-size: 12px; margin: 0 0 14px; }
+
+/* Market seller-score header (shown across Buy/Sell/Orders) */
+.market-score { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; padding: 9px 13px; background: var(--line-soft); border: 1px solid var(--line); border-radius: 10px; font-size: 13px; }
+.market-score-main b { color: var(--accent); font-size: 15px; font-variant-numeric: tabular-nums; }
