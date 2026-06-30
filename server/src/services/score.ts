@@ -1,4 +1,4 @@
-import { getChainBalance, getFeeRates, type AuthenticatedLnd } from "lightning";
+import { getChainBalance, getChannelBalance, getFeeRates, type AuthenticatedLnd } from "lightning";
 import { getChannelsView } from "./channels.js";
 import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
@@ -49,12 +49,13 @@ const SCORE_TTL_MS = 5 * 60_000;
 
 export async function getNodeScore(lnd: AuthenticatedLnd): Promise<NodeScore> {
   if (scoreCache && Date.now() - scoreCache.at < SCORE_TTL_MS) return scoreCache.value;
-  const [channels, rates, flows, chain, ownKey] = await Promise.all([
+  const [channels, rates, flows, chain, ownKey, chanBal] = await Promise.all([
     getChannelsView(lnd),
     getFeeRates({ lnd }),
     getFlowSummary(lnd, 30),
     getChainBalance({ lnd }).catch(() => ({ chain_balance: 0 })),
     getOwnPubkey(lnd),
+    getChannelBalance({ lnd }).catch(() => ({ channel_balance: 0, inbound: 0 })),
   ]);
   const rank = await getNetworkRank(lnd, ownKey).catch(() => null);
 
@@ -66,11 +67,13 @@ export async function getNodeScore(lnd: AuthenticatedLnd): Promise<NodeScore> {
   // inbound liquidity available ACROSS THE NODE — not when every channel is
   // individually balanced. Dedicated source (outbound) and sink (inbound)
   // channels are normal and fine; what matters is the node can route both ways.
-  const totalLocal = active.reduce((s, c) => s + c.localBalance, 0);
-  const totalRemote = active.reduce((s, c) => s + c.remoteBalance, 0);
-  const sideTotal = totalLocal + totalRemote;
-  const outShare = sideTotal > 0 ? totalLocal / sideTotal : 0;
-  const inShare = sideTotal > 0 ? totalRemote / sideTotal : 0;
+  // Use LND's channel-balance (outbound) + inbound — the SAME numbers the Overview
+  // header shows — so the tile and the header always agree.
+  const outboundSats = chanBal.channel_balance ?? 0;
+  const inboundSats = chanBal.inbound ?? 0;
+  const sideTotal = outboundSats + inboundSats;
+  const outShare = sideTotal > 0 ? outboundSats / sideTotal : 0;
+  const inShare = sideTotal > 0 ? inboundSats / sideTotal : 0;
   // 50/50 across the node = best routing flexibility; heavily one-sided = limited.
   const liquidity = clamp01(2 * Math.min(outShare, inShare));
 
