@@ -3,6 +3,7 @@ import { api } from "../api";
 import type { AutopilotConfig, AutopilotRun, AutopilotState } from "../types";
 import { satsCompact, timeAgo } from "../format";
 import { RunState, Switch } from "./Switch";
+import { useUi } from "./Overlay";
 import { FeeRecommendations } from "./FeeRecommendations";
 import { RebalanceRecommendations } from "./RebalanceRecommendations";
 import { SuggestionsPanel } from "./SuggestionsPanel";
@@ -74,6 +75,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   );
   const [lastRun, setLastRun] = useState<AutopilotRun | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const { toast } = useUi();
   const [openItems, setOpenItems] = useState<Set<string>>(new Set());
   const toggleItem = (key: string) =>
     setOpenItems((s) => {
@@ -116,13 +118,14 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   const setBool = (key: keyof AutopilotConfig, value: boolean) =>
     setDraft((d) => (d ? { ...d, [key]: value } : d));
 
-  const save = async (overrides: Partial<AutopilotConfig> = {}) => {
+  const save = async (overrides: Partial<AutopilotConfig> = {}, successMsg?: string) => {
     setBusy(true);
     setError(null);
     try {
       const s = await api.autopilotSet({ ...draft, ...overrides });
       setServer(s);
       setDraft(s.config);
+      if (successMsg) toast(successMsg, "success");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -246,20 +249,26 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       <div className="ap-strategy">
         <div className="ap-strategy-head">
           <span className="ap-strategy-title">Strategy</span>
-          <span className="muted">one click — sets fees, rebalancing, channels & Magma together</span>
+          <span className="muted">one click — applied instantly, no Save needed</span>
         </div>
         <div className="ap-preset-grid">
-          {PRESETS.map((p) => (
-            <button
-              key={p.id}
-              className={`preset-opt ${matchesPreset(p.cfg) ? "active" : ""}`}
-              disabled={busy || writeOff}
-              onClick={() => save(p.cfg)}
-            >
-              <span className="preset-opt-label">{p.label}</span>
-              <span className="preset-opt-desc">{p.desc}</span>
-            </button>
-          ))}
+          {PRESETS.map((p) => {
+            const active = matchesPreset(p.cfg);
+            return (
+              <button
+                key={p.id}
+                className={`preset-opt ${active ? "active" : ""}`}
+                disabled={busy || writeOff}
+                onClick={() => save(p.cfg, `Strategy applied: ${p.label}`)}
+              >
+                <span className="preset-opt-label">
+                  {p.label}
+                  {active ? <span className="preset-opt-badge">✓ active</span> : null}
+                </span>
+                <span className="preset-opt-desc">{p.desc}</span>
+              </button>
+            );
+          })}
         </div>
       </div>
 

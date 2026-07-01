@@ -80,10 +80,16 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .refresh:hover { border-color: var(--accent); background: var(--panel-3); }
 .refresh:active { transform: translateY(1px); }
 .topbar-right { display: flex; align-items: center; gap: 12px; }
-.conn { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.conn {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600;
+  padding: 4px 11px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted);
+}
 .conn i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.conn.up { color: var(--green); background: rgba(52, 211, 153, 0.1); border-color: rgba(52, 211, 153, 0.3); }
 .conn.up i { background: var(--green); box-shadow: 0 0 8px rgba(52, 211, 153, 0.6); }
+.conn.down { color: var(--red); background: rgba(248, 113, 113, 0.1); border-color: rgba(248, 113, 113, 0.3); }
 .conn.down i { background: var(--red); animation: apulseRed 1.2s ease-in-out infinite; }
+.conn.wait { color: var(--accent); background: rgba(247, 147, 26, 0.1); border-color: rgba(247, 147, 26, 0.3); }
 .conn.wait i { background: var(--accent); }
 @keyframes apulseRed { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
 
@@ -615,6 +621,7 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .preset-opt:disabled { opacity: 0.55; cursor: default; }
 .preset-opt-label { font-weight: 700; font-size: 13.5px; }
 .preset-opt.active .preset-opt-label { color: var(--accent); }
+.preset-opt-badge { margin-left: 8px; font-size: 10px; font-weight: 700; color: var(--green); }
 .preset-opt-desc { font-size: 11px; color: var(--muted); line-height: 1.35; }
 
 /* ── Alerts ──────────────────────────────────────────────── */
