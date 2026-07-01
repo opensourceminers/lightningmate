@@ -20,6 +20,9 @@ import type { OverrideMap } from "./overrides.js";
 export interface FeePolicy {
   minPpm: number;
   maxPpm: number;
+  /** Balanced-channel fee (v2 engine) — where the fee curve sits at target ratio.
+   *  Lower = more competitive / more forwards; higher = fewer, richer forwards. */
+  neutralPpm: number;
   /** Flat base fee to set, in millisatoshis (1000 msat = 1 sat). */
   baseFeeMsat: number;
   /** Round proposed ppm to the nearest step (avoids noisy tiny updates). */
@@ -31,6 +34,7 @@ export interface FeePolicy {
 export const DEFAULT_POLICY: FeePolicy = {
   minPpm: 25,
   maxPpm: 1000,
+  neutralPpm: 80,
   baseFeeMsat: 0,
   step: 10,
   minChangePpm: 25,

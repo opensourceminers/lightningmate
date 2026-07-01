@@ -31,6 +31,7 @@ const FEE_NUM_FIELDS: { key: NumKey; label: string }[] = [
 ];
 const POLICY_FIELDS: { key: keyof AutopilotConfig["policy"]; label: string }[] = [
   { key: "minPpm", label: "Min ppm (full)" },
+  { key: "neutralPpm", label: "Neutral ppm (balanced)" },
   { key: "maxPpm", label: "Max ppm (drained)" },
   { key: "baseFeeMsat", label: "Base fee (msat)" },
   { key: "step", label: "Round to" },
@@ -173,39 +174,55 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     { id: "history", label: "History" },
   ];
 
-  // Every preset is profit-first; they differ only in WHERE the capital earns.
-  // Selling presets use "auto" pricing (adapts to find the income-maximising lease
-  // price). Rebalancing is off-chain and only ever runs profitable moves, so it
-  // stays on wherever it adds revenue without competing for on-chain capital.
+  // One goal, cascaded: each preset sets the fee curve (floor + balanced level +
+  // base fee) AND which autopilots run, so the parts never pull against each other.
+  // The per-subtab controls below still override anything a power user wants.
   const PRESETS: { id: string; label: string; desc: string; cfg: Partial<AutopilotConfig> }[] = [
     {
       id: "routing",
-      label: "Maximize routing",
-      desc: "Earn from forwarding. Magma off.",
-      cfg: { enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: false },
-    },
-    {
-      id: "magma",
-      label: "Magma leasing",
-      desc: "Lease capital at the best price. No new routing channels.",
-      cfg: { enabled: true, sellEnabled: true, sellAutoReprice: true, sellPricingMode: "auto", rebalanceEnabled: true, channelEnabled: false },
+      label: "Max routing",
+      desc: "Lowest fees, zero base — win the most forwards. Magma off.",
+      cfg: {
+        enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: false,
+        policy: { ...draft.policy, minPpm: 10, neutralPpm: 60, maxPpm: 1000, baseFeeMsat: 0 },
+      },
     },
     {
       id: "balanced",
       label: "Balanced",
-      desc: "Route, lease & grow — all profit-max.",
-      cfg: { enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: true, sellAutoReprice: true, sellPricingMode: "auto" },
+      desc: "Compete for flow and lease idle capital. Recommended.",
+      cfg: {
+        enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: true,
+        sellAutoReprice: true, sellPricingMode: "auto",
+        policy: { ...draft.policy, minPpm: 25, neutralPpm: 80, maxPpm: 1000, baseFeeMsat: 0 },
+      },
+    },
+    {
+      id: "profit",
+      label: "Max profit",
+      desc: "Higher fees, lease over routing — fewer, richer forwards.",
+      cfg: {
+        enabled: true, rebalanceEnabled: true, channelEnabled: false, sellEnabled: true,
+        sellAutoReprice: true, sellPricingMode: "auto",
+        policy: { ...draft.policy, minPpm: 80, neutralPpm: 150, maxPpm: 1500, baseFeeMsat: 0 },
+      },
     },
   ];
   const matchesPreset = (p: Partial<AutopilotConfig>) =>
-    (Object.keys(p) as (keyof AutopilotConfig)[]).every((k) => draft[k] === p[k]);
+    (Object.keys(p) as (keyof AutopilotConfig)[]).every((k) => {
+      if (k === "policy") {
+        const pol = p.policy as Partial<AutopilotConfig["policy"]>;
+        return (Object.keys(pol) as (keyof AutopilotConfig["policy"])[]).every((pk) => draft.policy[pk] === pol[pk]);
+      }
+      return draft[k] === p[k];
+    });
 
   return (
     <div>
       <div className="ap-strategy">
         <div className="ap-strategy-head">
           <span className="ap-strategy-title">Strategy</span>
-          <span className="muted">one click — each maximises profit its own way</span>
+          <span className="muted">one click — sets fees, rebalancing, channels & Magma together</span>
         </div>
         <div className="ap-preset-grid">
           {PRESETS.map((p) => (

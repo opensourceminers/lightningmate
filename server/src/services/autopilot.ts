@@ -231,6 +231,9 @@ export class Autopilot {
     return {
       minPpm: p.minPpm,
       maxPpm: p.maxPpm,
+      // Only override when set — an old persisted policy has no neutralPpm and we
+      // must not clobber the engine default with undefined.
+      ...(p.neutralPpm != null ? { neutralPpm: p.neutralPpm } : {}),
       baseFeeMsat: p.baseFeeMsat,
       stepPpm: p.step,
       minChangePpm: p.minChangePpm,
@@ -297,6 +300,7 @@ export class Autopilot {
     if (!this.state.feeVolumeMigrated) {
       if (this.state.config.policy.minPpm >= 50) this.state.config.policy.minPpm = 25;
       if (this.state.config.policy.baseFeeMsat >= 1000) this.state.config.policy.baseFeeMsat = 0;
+      if (this.state.config.policy.neutralPpm == null) this.state.config.policy.neutralPpm = 80;
       this.state.feeVolumeMigrated = true;
       this.persist();
     }

@@ -115,6 +115,7 @@ export interface ForwardsReport {
 export interface FeePolicy {
   minPpm: number;
   maxPpm: number;
+  neutralPpm: number;
   baseFeeMsat: number;
   step: number;
   minChangePpm: number;
