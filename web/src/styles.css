@@ -81,10 +81,10 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .refresh:active { transform: translateY(1px); }
 .topbar-right { display: flex; align-items: center; gap: 12px; }
 .conn {
-  display: inline-flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600;
-  padding: 4px 11px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted);
+  display: inline-flex; align-items: center; gap: 7px; font-size: 12px; font-weight: 600;
+  line-height: 1; padding: 6px 12px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted);
 }
-.conn i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+.conn i { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); flex: none; position: relative; top: 0.5px; }
 .conn.up { color: var(--green); background: rgba(52, 211, 153, 0.1); border-color: rgba(52, 211, 153, 0.3); }
 .conn.up i { background: var(--green); box-shadow: 0 0 8px rgba(52, 211, 153, 0.6); }
 .conn.down { color: var(--red); background: rgba(248, 113, 113, 0.1); border-color: rgba(248, 113, 113, 0.3); }
