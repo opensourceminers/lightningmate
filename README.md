@@ -11,21 +11,27 @@ standalone via Docker.
 ## Features
 
 - **Overview** — a node **health score** (six categories on a score ring), an
-  outbound/inbound **liquidity meter**, KPIs (earned / forwards / routed /
-  rebalanced), a **Profit & Loss** view (routing revenue vs channel-open and
-  rebalancing costs), a liquidity map, recent activity, your **top earning
-  channels** and graph-based **peer suggestions**.
+  outbound/inbound **liquidity meter**, KPIs (earned / forwards with 24h·7d at a
+  glance / routed / **yield on capital**), a **Profit & Loss** view (routing
+  revenue vs channel-open and rebalancing costs), a liquidity map, recent
+  activity, your **top earning channels** and graph-based **peer suggestions**.
 - **Channels** — live balance bars with source / sink / router roles, scored
-  peer suggestions, and close candidates.
+  peer suggestions, and close candidates. Closing opens a dialog to pick the
+  on-chain fee (fast / economy / custom) or force-close, and the channel stays
+  visible as "pending close" until it confirms.
 - **Market (Amboss Magma)** — **buy** inbound liquidity (USD-priced) and **sell**
   your own: create / edit offers and fulfil orders (accept + open a channel to
   the buyer), manually or via the autopilot.
 - **Wallet** — Lightning + on-chain: receive, send, decode and pay invoices.
 - **Routing** — a full forwards report (per-channel, daily, recent events).
-- **Autopilot** — tunes fees, runs only profitable rebalances, opens channels to
-  top peers, and fulfils Magma sell orders — all on recommended settings with
-  safe caps, per-channel cooldowns and an on-chain reserve. Off until you enable
-  it, and every fund-moving action is gated behind write access.
+- **Autopilot** — a one-click **Strategy** (Max routing / Balanced / Max profit)
+  tunes fees, rebalancing, channel-opening and Magma together. Fees are
+  volume-first (competitive, zero base fee) with profit floors so a channel never
+  routes below its refill cost; rebalances run only when profitable (within a
+  daily budget); channels open to top peers; Magma sell orders are fulfilled — all
+  on recommended settings with safe caps, per-channel cooldowns and an on-chain
+  reserve. Off until you enable it, and every fund-moving action is gated behind
+  write access.
 
 ## Architecture
 
