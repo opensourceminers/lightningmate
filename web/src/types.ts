@@ -117,6 +117,10 @@ export interface FeePolicy {
   maxPpm: number;
   neutralPpm: number;
   baseFeeMsat: number;
+  protectPpm: number;
+  safetyMargin: number;
+  noFlowRatchetSteps: number;
+  exploreLowerModifier: number;
   step: number;
   minChangePpm: number;
 }
@@ -170,6 +174,7 @@ export interface AutopilotConfig {
   rebalanceCooldownMinutes: number;
   rebalanceHourStart: number;
   rebalanceHourEnd: number;
+  rebalanceDailyBudgetSats: number;
   channelEnabled: boolean;
   channelReserveSats: number;
   channelSizeSats: number;

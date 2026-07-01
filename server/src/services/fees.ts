@@ -25,6 +25,14 @@ export interface FeePolicy {
   neutralPpm: number;
   /** Flat base fee to set, in millisatoshis (1000 msat = 1 sat). */
   baseFeeMsat: number;
+  /** Floor for a drained-but-still-wanted channel (v2 engine). */
+  protectPpm: number;
+  /** Profit floor = rebalance cost basis × this margin (v2 engine). */
+  safetyMargin: number;
+  /** How fast an idle channel's fee ratchets down (steps/run, v2 engine). */
+  noFlowRatchetSteps: number;
+  /** Explore-lower multiplier for idle over-local channels (<1, v2 engine). */
+  exploreLowerModifier: number;
   /** Round proposed ppm to the nearest step (avoids noisy tiny updates). */
   step: number;
   /** Only flag a change when |proposed − current| ≥ this (anti-churn). */
@@ -36,6 +44,10 @@ export const DEFAULT_POLICY: FeePolicy = {
   maxPpm: 1000,
   neutralPpm: 80,
   baseFeeMsat: 0,
+  protectPpm: 350,
+  safetyMargin: 1.15,
+  noFlowRatchetSteps: 3,
+  exploreLowerModifier: 0.85,
   step: 10,
   minChangePpm: 25,
 };

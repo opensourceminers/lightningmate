@@ -43,6 +43,9 @@ export interface AutopilotConfig {
    *  start/end = any time. e.g. 0→6 = only overnight, when routes are cheaper. */
   rebalanceHourStart: number;
   rebalanceHourEnd: number;
+  /** Cap total rebalance fees spent per day (sats). 0 = no cap. Stops many
+   *  "just profitable" moves from piling up. */
+  rebalanceDailyBudgetSats: number;
   /** Channel autopilot: open a channel to the top suggestion when funds allow. */
   channelEnabled: boolean;
   /** Keep at least this much on-chain (sats) untouched. */
@@ -136,6 +139,8 @@ interface PersistedState {
   feePolicyMigrated?: boolean;
   /** One-time flag: volume-first nudge — competitive floor + zero base fee. */
   feeVolumeMigrated?: boolean;
+  /** Rebalance fees spent today (resets on date change) — enforces the daily cap. */
+  perDayRebalanceSpend?: { day: string; sats: number };
   history: AutopilotRun[];
 }
 
@@ -151,6 +156,7 @@ const DEFAULT_CONFIG: AutopilotConfig = {
   rebalanceCooldownMinutes: 720,
   rebalanceHourStart: 0,
   rebalanceHourEnd: 24,
+  rebalanceDailyBudgetSats: 10_000,
   channelEnabled: false,
   channelReserveSats: 50_000,
   channelSizeSats: 0,
@@ -231,9 +237,13 @@ export class Autopilot {
     return {
       minPpm: p.minPpm,
       maxPpm: p.maxPpm,
-      // Only override when set — an old persisted policy has no neutralPpm and we
-      // must not clobber the engine default with undefined.
+      // Only override when set — an old persisted policy lacks these newer fields
+      // and we must not clobber the engine defaults with undefined.
       ...(p.neutralPpm != null ? { neutralPpm: p.neutralPpm } : {}),
+      ...(p.protectPpm != null ? { protectPpm: p.protectPpm } : {}),
+      ...(p.safetyMargin != null ? { safetyMargin: p.safetyMargin } : {}),
+      ...(p.noFlowRatchetSteps != null ? { noFlowRatchetSteps: p.noFlowRatchetSteps } : {}),
+      ...(p.exploreLowerModifier != null ? { exploreLowerModifier: p.exploreLowerModifier } : {}),
       baseFeeMsat: p.baseFeeMsat,
       stepPpm: p.step,
       minChangePpm: p.minChangePpm,
@@ -298,9 +308,16 @@ export class Autopilot {
     // a zero base fee (base fee deters LND path-finding the most). Only nudges
     // stale high defaults down; a user who set something lower is left alone.
     if (!this.state.feeVolumeMigrated) {
-      if (this.state.config.policy.minPpm >= 50) this.state.config.policy.minPpm = 25;
-      if (this.state.config.policy.baseFeeMsat >= 1000) this.state.config.policy.baseFeeMsat = 0;
-      if (this.state.config.policy.neutralPpm == null) this.state.config.policy.neutralPpm = 80;
+      const p = this.state.config.policy;
+      if (p.minPpm >= 50) p.minPpm = 25;
+      if (p.baseFeeMsat >= 1000) p.baseFeeMsat = 0;
+      if (p.neutralPpm == null) p.neutralPpm = 80;
+      // Backfill the newer cascadable behaviour knobs on older persisted policies.
+      if (p.protectPpm == null) p.protectPpm = 350;
+      if (p.safetyMargin == null) p.safetyMargin = 1.15;
+      if (p.noFlowRatchetSteps == null) p.noFlowRatchetSteps = 3;
+      if (p.exploreLowerModifier == null) p.exploreLowerModifier = 0.85;
+      if (this.state.config.rebalanceDailyBudgetSats == null) this.state.config.rebalanceDailyBudgetSats = 10_000;
       this.state.feeVolumeMigrated = true;
       this.persist();
     }
@@ -404,7 +421,14 @@ export class Autopilot {
   /** Execute eligible (profitable, off-cooldown) rebalances. */
   private async runRebalances(writeLnd: AuthenticatedLnd): Promise<AutopilotRebalance[]> {
     if (!this.inRebalanceWindow()) return [];
-    const { rebalancePolicy, maxRebalancesPerRun, rebalanceCooldownMinutes } = this.state.config;
+    const { rebalancePolicy, maxRebalancesPerRun, rebalanceCooldownMinutes, rebalanceDailyBudgetSats } =
+      this.state.config;
+    // Daily rebalance-fee budget — reset the counter when the day rolls over.
+    const today = new Date().toISOString().slice(0, 10);
+    if (!this.state.perDayRebalanceSpend || this.state.perDayRebalanceSpend.day !== today) {
+      this.state.perDayRebalanceSpend = { day: today, sats: 0 };
+    }
+    const dailyBudget = rebalanceDailyBudgetSats ?? 0;
     // v1 recommender — only acts on route_found_profitable (wouldRebalance), with
     // the fee-adjust-first / payback / profit gating already applied.
     const report = await getRebalanceRecommendations(
@@ -426,6 +450,18 @@ export class Autopilot {
 
     const out: AutopilotRebalance[] = [];
     for (const r of eligible) {
+      // Stop once today's rebalance-fee budget is used up.
+      if (dailyBudget > 0 && this.state.perDayRebalanceSpend.sats >= dailyBudget) {
+        out.push({
+          alias: r.alias,
+          amountSats: r.recommendedAmount as number,
+          feeSats: null,
+          costPpm: null,
+          ok: false,
+          error: `skipped: daily rebalance budget reached (${this.state.perDayRebalanceSpend.sats}/${dailyBudget} sat)`,
+        });
+        break;
+      }
       const res = await executeRebalance(this.readLnd, writeLnd, {
         targetId: r.channelId,
         sourceId: r.selectedSourceChannel as string,
@@ -450,6 +486,7 @@ export class Autopilot {
         ok: res.ok,
         error: res.error,
       });
+      if (res.ok && res.feeSats) this.state.perDayRebalanceSpend.sats += res.feeSats;
       out.push({
         alias: res.targetAlias,
         amountSats: res.amountSats,

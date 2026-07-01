@@ -135,23 +135,28 @@ At the top of the Autopilot tab are three one-click presets. Picking one **write
 fee curve AND which sub-autopilots run**, so the parts pull the same way. The detailed
 per-subtab controls below still override anything afterwards.
 
-| Preset | Fees (min / neutral / max, base) | Rebalance | Channels | Magma |
-|---|---|---|---|---|
-| **Max routing** | 10 / 60 / 1000 ppm, base 0 | on | on | **off** |
-| **Balanced** (default) | 25 / 80 / 1000 ppm, base 0 | on | on | on, auto-price |
-| **Max profit** | 80 / 150 / 1500 ppm, base 0 | on | **off** | on, auto-price |
+Each preset sets the full fee curve, its **behaviour** (protect floor, profit-floor margin,
+how fast idle channels get cheaper, how aggressive the explore-lower cut is) AND the
+**rebalance economics** (strictness + per-run cap + daily fee budget). Base fee is 0 on all.
 
-Rationale: "Max routing" = cheapest fees + zero base fee + no Magma → win the most forwards
-(explicitly *lots of forwards for few sats*). "Max profit" = higher fees, fewer/richer
-forwards, and lease idle capital rather than route it. "Balanced" competes for flow while
-leasing idle capital.
+| Preset | min/neutral/max | protect | safety­Margin | ratchet steps | explore mod | Rebalance: econRatio / max·run / daily budget | Channels | Magma |
+|---|---|---|---|---|---|---|---|---|
+| **Max routing** | 25 / 60 / 1000 | 250 | 1.05 | 4 | 0.75 | 0.9 / 4 / 25k sat | on | **off** |
+| **Balanced** (default) | 25 / 80 / 1000 | 350 | 1.15 | 3 | 0.85 | 0.8 / 2 / 10k sat | on | on, auto |
+| **Max profit** | 80 / 150 / 1500 | 600 | 1.35 | 1 | 0.90 | 0.6 / 1 / 5k sat | **off** | on, premium |
 
-**How the cascade reaches the engine:** the preset writes into the persisted config's
-`policy` object (`minPpm`, `neutralPpm`, `maxPpm`, `baseFeeMsat`) and the on/off flags. On
-each run, `feeV2Overrides()` maps `policy` → the fee engine's config (min/neutral/max/base/
-step/minChange/maxChangesPerRun). Everything else in the engine (protectPpm, cooldownHours,
-flow windows, the velocity/benchmark/elasticity/no-flow logic) uses fixed defaults —
-**the Strategy does not currently vary those.**
+Rationale: "Max routing" = cheapest fees + zero base + fast ratchet down + loose (still
+profitable) rebalancing → win the most forwards (*lots of forwards for few sats*). "Max
+profit" = higher fees, slow ratchet, strict rebalancing, lease idle capital rather than
+route it. "Balanced" competes for flow while leasing idle capital.
+
+**How the cascade reaches the engine:** the preset writes the persisted config's `policy`
+object (`minPpm`, `neutralPpm`, `maxPpm`, `baseFeeMsat`, `protectPpm`, `safetyMargin`,
+`noFlowRatchetSteps`, `exploreLowerModifier`), the `rebalancePolicy.econRatio` +
+`maxRebalancesPerRun` + `rebalanceDailyBudgetSats`, and the on/off flags. On each run,
+`feeV2Overrides()` maps `policy` → the fee engine's config. Still fixed across strategies
+(not yet cascaded): `cooldownHours`, the flow windows, and the exact velocity/benchmark
+tiers and the no-flow *trigger* (0 forwards / 30d) — only its *speed* is cascaded.
 
 ---
 
@@ -207,23 +212,18 @@ max/base), and `sellAutoReprice` + `sellPricingMode`.
 
 **Open questions / candidate improvements (for the reviewing AI):**
 
-1. **The Strategy only shifts the fee *baseline* + on/off — not the behavioral params.**
-   Should "Max routing" also: make the no-flow ratchet faster / bigger, make the "explore
-   lower" modifier more aggressive, and lower `protectPpm`? Should "Max profit" raise
-   `protectPpm` and the profit-floor `safetyMargin`? Right now these are identical across
-   all three presets.
+1. ~~The Strategy only shifts the fee baseline + on/off.~~ **DONE** — presets now also set
+   `protectPpm`, `safetyMargin`, `noFlowRatchetSteps` and `exploreLowerModifier` per goal.
 
-2. **Rebalance economics aren't strategy-linked.** Max routing wants cheap refills to keep
-   channels flowing (looser `econRatio`, bigger budget); max profit wants strict gating.
-   Currently `econRatio` is user-set and constant across strategies. Should the strategy set
-   the rebalance budget?
+2. ~~Rebalance economics aren't strategy-linked.~~ **DONE** — presets set `econRatio`,
+   `maxRebalancesPerRun` and a new `rebalanceDailyBudgetSats` (daily rebalance-fee cap).
 
 3. **The three presets conflate two axes:** *where to earn* (route vs lease) and *how
    aggressive on price* (volume vs margin). Would a 2-D model (goal × placement) be clearer,
    or does bundling keep it simple enough? Is three the right number?
 
-4. **`minPpm` 10 on Max routing** earns almost nothing and may attract probing traffic. Is
-   near-zero the right floor, or should "max routing" bottom out higher (e.g. 25–50)?
+4. ~~`minPpm` 10 on Max routing is near-zero.~~ **DONE** — Max routing now floors at 25 ppm
+   (10 is left for a possible future "experimental / ultra-volume" mode).
 
 5. **No closed-loop auto-tuning above the presets.** The engine learns per-channel
    elasticity, but the chosen strategy is static. Would an "auto" strategy that hill-climbs

@@ -25,6 +25,12 @@ export interface FeeRecConfig {
   /** Flat base fee (msat) to set on managed channels. 0 = volume-first: base fee
    *  deters LND path-finding (esp. small + multi-hop), so drop it to win forwards. */
   baseFeeMsat: number;
+  /** How many `stepPpm` steps the no-flow rule drops an idle channel per run.
+   *  Higher = wins routing back faster (volume); lower = eases down gently (profit). */
+  noFlowRatchetSteps: number;
+  /** Velocity "explore lower" multiplier for idle, over-local channels (<1).
+   *  Lower = more aggressive fee cuts to attract flow. */
+  exploreLowerModifier: number;
   minChangePpm: number;
   relativeChangeThreshold: number;
   stepPpm: number;
@@ -49,6 +55,8 @@ export const FEE_REC_DEFAULTS: FeeRecConfig = {
   protectPpm: 350,
   newChannelMinPpm: 80,
   baseFeeMsat: 0,
+  noFlowRatchetSteps: 3,
+  exploreLowerModifier: 0.85,
   minChangePpm: 25,
   relativeChangeThreshold: 0.2,
   stepPpm: 25,
@@ -350,7 +358,7 @@ function buildRecommendation(
     velocityMod = 1;
     reasons.push("velocity: active and balanced — holding");
   } else if (grossFlow14d < 0.01 && ch.localRatio > targetLocalRatio + 0.2) {
-    velocityMod = 0.85;
+    velocityMod = cfg.exploreLowerModifier;
     exploring = true;
     reasons.push("idle test: idle outbound liquidity — testing a lower fee");
   }
@@ -444,7 +452,7 @@ function buildRecommendation(
   // opposite of a drain reflex. We never price-kill an idle channel.
   const isNewChan = ageDays != null && ageDays < cfg.newChannelProtectionDays;
   if (f30.forwards === 0 && ch.localRatio >= 0.1 && !isNewChan) {
-    const stepped = currentPpm > 0 ? currentPpm - 3 * cfg.stepPpm : cfg.neutralPpm;
+    const stepped = currentPpm > 0 ? currentPpm - cfg.noFlowRatchetSteps * cfg.stepPpm : cfg.neutralPpm;
     target = Math.max(cfg.minPpm, Math.min(target, stepped));
     hardFloor = 0;
     floored = null;

@@ -14,6 +14,7 @@ type NumKey =
   | "maxChangesPerRun"
   | "maxRebalancesPerRun"
   | "rebalanceCooldownMinutes"
+  | "rebalanceDailyBudgetSats"
   | "rebalanceHourStart"
   | "rebalanceHourEnd"
   | "channelReserveSats"
@@ -33,12 +34,14 @@ const POLICY_FIELDS: { key: keyof AutopilotConfig["policy"]; label: string }[] =
   { key: "minPpm", label: "Min ppm (full)" },
   { key: "neutralPpm", label: "Neutral ppm (balanced)" },
   { key: "maxPpm", label: "Max ppm (drained)" },
+  { key: "protectPpm", label: "Protect ppm (drained+wanted)" },
   { key: "baseFeeMsat", label: "Base fee (msat)" },
   { key: "step", label: "Round to" },
   { key: "minChangePpm", label: "Min change" },
 ];
 const REB_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "maxRebalancesPerRun", label: "Max rebalances / run" },
+  { key: "rebalanceDailyBudgetSats", label: "Daily fee budget (sat, 0=∞)" },
   { key: "rebalanceCooldownMinutes", label: "Rebalance cooldown (min)" },
   { key: "rebalanceHourStart", label: "Run from hour (0–24)" },
   { key: "rebalanceHourEnd", label: "Run to hour (0–24)" },
@@ -177,14 +180,23 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   // One goal, cascaded: each preset sets the fee curve (floor + balanced level +
   // base fee) AND which autopilots run, so the parts never pull against each other.
   // The per-subtab controls below still override anything a power user wants.
+  // Each preset sets the full fee curve AND its behaviour (how fast idle channels
+  // get cheaper, how hard drained ones are protected, the profit-floor margin) AND
+  // the rebalance economics (strictness + daily budget) — so nothing pulls against
+  // the chosen goal. Per-subtab controls still override afterwards.
   const PRESETS: { id: string; label: string; desc: string; cfg: Partial<AutopilotConfig> }[] = [
     {
       id: "routing",
       label: "Max routing",
-      desc: "Lowest fees, zero base — win the most forwards. Magma off.",
+      desc: "Cheapest fees, zero base, loose rebalancing — win the most forwards. Magma off.",
       cfg: {
         enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: false,
-        policy: { ...draft.policy, minPpm: 10, neutralPpm: 60, maxPpm: 1000, baseFeeMsat: 0 },
+        policy: {
+          ...draft.policy, minPpm: 25, neutralPpm: 60, maxPpm: 1000, baseFeeMsat: 0,
+          protectPpm: 250, safetyMargin: 1.05, noFlowRatchetSteps: 4, exploreLowerModifier: 0.75,
+        },
+        rebalancePolicy: { ...draft.rebalancePolicy, econRatio: 0.9 },
+        maxRebalancesPerRun: 4, rebalanceDailyBudgetSats: 25_000,
       },
     },
     {
@@ -194,27 +206,39 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       cfg: {
         enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: true,
         sellAutoReprice: true, sellPricingMode: "auto",
-        policy: { ...draft.policy, minPpm: 25, neutralPpm: 80, maxPpm: 1000, baseFeeMsat: 0 },
+        policy: {
+          ...draft.policy, minPpm: 25, neutralPpm: 80, maxPpm: 1000, baseFeeMsat: 0,
+          protectPpm: 350, safetyMargin: 1.15, noFlowRatchetSteps: 3, exploreLowerModifier: 0.85,
+        },
+        rebalancePolicy: { ...draft.rebalancePolicy, econRatio: 0.8 },
+        maxRebalancesPerRun: 2, rebalanceDailyBudgetSats: 10_000,
       },
     },
     {
       id: "profit",
       label: "Max profit",
-      desc: "Higher fees, lease over routing — fewer, richer forwards.",
+      desc: "Higher fees, strict rebalancing, lease over routing — fewer, richer forwards.",
       cfg: {
         enabled: true, rebalanceEnabled: true, channelEnabled: false, sellEnabled: true,
-        sellAutoReprice: true, sellPricingMode: "auto",
-        policy: { ...draft.policy, minPpm: 80, neutralPpm: 150, maxPpm: 1500, baseFeeMsat: 0 },
+        sellAutoReprice: true, sellPricingMode: "premium",
+        policy: {
+          ...draft.policy, minPpm: 80, neutralPpm: 150, maxPpm: 1500, baseFeeMsat: 0,
+          protectPpm: 600, safetyMargin: 1.35, noFlowRatchetSteps: 1, exploreLowerModifier: 0.9,
+        },
+        rebalancePolicy: { ...draft.rebalancePolicy, econRatio: 0.6 },
+        maxRebalancesPerRun: 1, rebalanceDailyBudgetSats: 5_000,
       },
     },
   ];
+  // Compare nested objects (policy, rebalancePolicy) field-by-field, not by reference.
   const matchesPreset = (p: Partial<AutopilotConfig>) =>
     (Object.keys(p) as (keyof AutopilotConfig)[]).every((k) => {
-      if (k === "policy") {
-        const pol = p.policy as Partial<AutopilotConfig["policy"]>;
-        return (Object.keys(pol) as (keyof AutopilotConfig["policy"])[]).every((pk) => draft.policy[pk] === pol[pk]);
+      const pv = p[k];
+      if (pv && typeof pv === "object") {
+        const dv = draft[k] as unknown as Record<string, unknown>;
+        return Object.entries(pv as unknown as Record<string, unknown>).every(([sk, sv]) => dv?.[sk] === sv);
       }
-      return draft[k] === p[k];
+      return draft[k] === pv;
     });
 
   return (
