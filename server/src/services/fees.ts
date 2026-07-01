@@ -29,9 +29,9 @@ export interface FeePolicy {
 }
 
 export const DEFAULT_POLICY: FeePolicy = {
-  minPpm: 50,
+  minPpm: 25,
   maxPpm: 1000,
-  baseFeeMsat: 1000,
+  baseFeeMsat: 0,
   step: 10,
   minChangePpm: 25,
 };

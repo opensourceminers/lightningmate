@@ -134,6 +134,8 @@ interface PersistedState {
   intervalMigrated?: boolean;
   /** One-time flag: lowered the old aggressive fee ceiling (2000 → 1000 ppm). */
   feePolicyMigrated?: boolean;
+  /** One-time flag: volume-first nudge — competitive floor + zero base fee. */
+  feeVolumeMigrated?: boolean;
   history: AutopilotRun[];
 }
 
@@ -229,6 +231,7 @@ export class Autopilot {
     return {
       minPpm: p.minPpm,
       maxPpm: p.maxPpm,
+      baseFeeMsat: p.baseFeeMsat,
       stepPpm: p.step,
       minChangePpm: p.minChangePpm,
       maxChangesPerRun: this.state.config.maxChangesPerRun,
@@ -286,6 +289,15 @@ export class Autopilot {
     if (!this.state.feePolicyMigrated) {
       if (this.state.config.policy.maxPpm >= 2000) this.state.config.policy.maxPpm = 1000;
       this.state.feePolicyMigrated = true;
+      this.persist();
+    }
+    // One-time: bias existing installs toward volume — a competitive fee floor and
+    // a zero base fee (base fee deters LND path-finding the most). Only nudges
+    // stale high defaults down; a user who set something lower is left alone.
+    if (!this.state.feeVolumeMigrated) {
+      if (this.state.config.policy.minPpm >= 50) this.state.config.policy.minPpm = 25;
+      if (this.state.config.policy.baseFeeMsat >= 1000) this.state.config.policy.baseFeeMsat = 0;
+      this.state.feeVolumeMigrated = true;
       this.persist();
     }
     this.reschedule();
@@ -358,7 +370,7 @@ export class Autopilot {
       transactionId: r.transactionId as string,
       transactionVout: r.transactionVout as number,
       feeRatePpm: r.targetPpm,
-      baseFeeMsat: r.currentBaseMsat, // preserve the channel's base fee
+      baseFeeMsat: r.recommendedBaseMsat, // volume-first: drop base fee to win routes
     }));
 
     const results = items.length ? await applyFees(this.readLnd, writeLnd, items) : [];

@@ -22,6 +22,9 @@ export interface FeeRecConfig {
   neutralPpm: number;
   protectPpm: number;
   newChannelMinPpm: number;
+  /** Flat base fee (msat) to set on managed channels. 0 = volume-first: base fee
+   *  deters LND path-finding (esp. small + multi-hop), so drop it to win forwards. */
+  baseFeeMsat: number;
   minChangePpm: number;
   relativeChangeThreshold: number;
   stepPpm: number;
@@ -40,11 +43,12 @@ export interface FeeRecConfig {
 }
 
 export const FEE_REC_DEFAULTS: FeeRecConfig = {
-  minPpm: 50,
+  minPpm: 25,
   maxPpm: 1000,
-  neutralPpm: 120,
+  neutralPpm: 80,
   protectPpm: 350,
-  newChannelMinPpm: 120,
+  newChannelMinPpm: 80,
+  baseFeeMsat: 0,
   minChangePpm: 25,
   relativeChangeThreshold: 0.2,
   stepPpm: 25,
@@ -104,6 +108,8 @@ export interface FeeRecommendation {
   transactionId: string | null;
   transactionVout: number | null;
   currentBaseMsat: number;
+  /** Base fee (msat) the autopilot should set — volume-first default is 0. */
+  recommendedBaseMsat: number;
   wouldApply: boolean;
   blockedByGuards: string[];
   state: FeeRecState;
@@ -460,6 +466,14 @@ function buildRecommendation(
     reasons.unshift(`pinned to ${targetPpm} ppm (manual)`);
   }
 
+  // Base fee: volume-first drops it to cfg.baseFeeMsat (0) to win routes; an
+  // excluded channel keeps whatever it has.
+  const currentBaseMsat = rate ? Number(rate.base_fee_mtokens) : 0;
+  const recommendedBaseMsat = override?.mode === "exclude" ? currentBaseMsat : cfg.baseFeeMsat;
+  if (recommendedBaseMsat < currentBaseMsat) {
+    reasons.push(`base fee: lowering ${currentBaseMsat}→${recommendedBaseMsat} msat to win routes`);
+  }
+
   // §1/§8 base balance reason if nothing more specific fired
   if (reasons.length === 0) {
     const d = ch.localRatio - targetLocalRatio;
@@ -479,10 +493,15 @@ function buildRecommendation(
   // §11 apply guards (decide wouldApply only — never the target)
   const blockedByGuards: string[] = [];
   const minDelta = Math.max(cfg.minChangePpm, Math.round(currentPpm * cfg.relativeChangeThreshold));
+  const baseFeeChanged = recommendedBaseMsat !== currentBaseMsat;
+  const isRaise = targetPpm > currentPpm;
   if (override?.mode === "exclude") blockedByGuards.push("excluded (manual)");
   if (!ch.active) blockedByGuards.push("channel inactive");
-  if (Math.abs(targetPpm - currentPpm) < minDelta) blockedByGuards.push("change below threshold");
-  if (ctx.cooldown) {
+  // A base-fee drop is worth applying even when the ppm move is tiny.
+  if (Math.abs(targetPpm - currentPpm) < minDelta && !baseFeeChanged) blockedByGuards.push("change below threshold");
+  // Asymmetric cooldown: raises wait out the cooldown (never thrash a working
+  // channel up), but LOWERING to win flow back is allowed immediately.
+  if (ctx.cooldown && isRaise) {
     const last = ctx.cooldown.lastApplied[ch.id];
     if (last) {
       const elapsedH = (Date.now() - new Date(last).getTime()) / 3_600_000;
@@ -499,7 +518,8 @@ function buildRecommendation(
     targetPpm,
     transactionId: rate?.transaction_id ?? null,
     transactionVout: rate?.transaction_vout ?? null,
-    currentBaseMsat: rate ? Number(rate.base_fee_mtokens) : 0,
+    currentBaseMsat,
+    recommendedBaseMsat,
     wouldApply,
     blockedByGuards,
     state,
