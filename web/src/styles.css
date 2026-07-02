@@ -571,6 +571,26 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .linklike:hover { opacity: 0.85; }
 .kpi-sub.kpi-alert { color: #ff9b9b; font-weight: 600; }
 .kpi-sub.kpi-yield { color: var(--accent); }
+.kpi-sub.kpi-bench { font-size: 10.5px; margin-top: 10px; }
+
+/* Overview "today" digest strip */
+.digest { display: flex; gap: 10px; flex-wrap: wrap; margin: -6px 0 18px; }
+.digest-item {
+  display: inline-flex; align-items: center; gap: 8px; text-align: left; cursor: pointer;
+  font-size: 12.5px; line-height: 1.35; padding: 8px 14px; border-radius: 999px;
+  background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
+  transition: border-color var(--t);
+}
+.digest-item:hover { border-color: var(--accent); }
+.digest-item .go { color: var(--muted); flex: none; }
+.digest-item.warn { color: #ffb4b4; border-color: rgba(248, 113, 113, 0.35); background: rgba(248, 113, 113, 0.08); }
+
+.tag-opening { color: var(--green); border-color: rgba(52, 211, 153, 0.4); background: rgba(52, 211, 153, 0.1); }
+
+.preset-custom-chip {
+  font-size: 11px; font-weight: 600; color: var(--accent); border-radius: 999px; padding: 2px 10px;
+  border: 1px solid rgba(247, 147, 26, 0.35); background: rgba(247, 147, 26, 0.08);
+}
 .magma-analytics {
   display: flex; flex-wrap: wrap; gap: 20px; padding: 13px 16px; margin-bottom: 14px;
   background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
@@ -1008,6 +1028,30 @@ tr.pending td { opacity: 0.9; }
   .brand-sub { display: none; }
   .report-stats { grid-template-columns: repeat(2, 1fr); }
   .hero-row { grid-template-columns: 1fr; }
+}
+
+/* ── Mobile pass ─────────────────────────────────────────── */
+@media (max-width: 760px) {
+  .topbar { flex-wrap: wrap; gap: 10px; }
+  /* Tab bars scroll horizontally instead of wrapping into a mess. */
+  .tabs, .subnav {
+    overflow-x: auto; flex-wrap: nowrap; -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .tabs::-webkit-scrollbar, .subnav::-webkit-scrollbar { display: none; }
+  .tabs button, .subnav button { white-space: nowrap; flex: none; }
+  /* Wide tables scroll inside their panel instead of blowing up the page. */
+  table.channels, .fee-table, .feerec-table {
+    display: block; overflow-x: auto; white-space: nowrap;
+    -webkit-overflow-scrolling: touch;
+  }
+  .ap-preset-grid { grid-template-columns: 1fr; }
+  .policy-controls { grid-template-columns: repeat(2, 1fr); }
+  .digest { flex-direction: column; align-items: stretch; }
+  .digest-item { justify-content: space-between; }
+  .kpi-row { grid-template-columns: repeat(2, 1fr); }
+  .modal { padding: 18px 16px 14px; }
+  .fee-grid { gap: 7px; }
 }
 
 /* ── Skeletons & empty states ────────────────────────────── */

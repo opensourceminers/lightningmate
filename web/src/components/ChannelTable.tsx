@@ -114,14 +114,18 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
         </thead>
         <tbody>
           {rows.map((c) => {
-            const pending = c.status === "pending_close";
+            const pendingClose = c.status === "pending_close";
+            const pendingOpen = c.status === "pending_open";
+            const pending = pendingClose || pendingOpen;
             return (
             <tr key={c.id} className={pending ? "pending" : c.active ? "" : "inactive"}>
               <td>
                 <span className={`status ${pending ? "pending" : c.active ? "on" : "off"}`} />
                 {c.peerAlias}
-                {pending ? (
+                {pendingClose ? (
                   <span className="tag tag-pending">pending close</span>
+                ) : pendingOpen ? (
+                  <span className="tag tag-opening">pending open</span>
                 ) : c.private ? (
                   <span className="tag">priv</span>
                 ) : null}
@@ -145,8 +149,8 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
               </td>
               <td>
                 {pending ? (
-                  <span className="muted small" title="Waiting for the closing transaction to confirm">
-                    {c.timelockBlocks ? `~${c.timelockBlocks} blks` : "closing…"}
+                  <span className="muted small" title="Waiting for the transaction to confirm">
+                    {pendingOpen ? "confirming…" : c.timelockBlocks ? `~${c.timelockBlocks} blks` : "closing…"}
                   </span>
                 ) : canWrite ? (
                   <button

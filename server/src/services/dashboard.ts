@@ -43,6 +43,13 @@ export interface DashboardData {
     lastRunAt: string | null;
     lastApplied: number;
     lastAttempted: number;
+    /** Minutes between runs — lets the UI show "next run in ~X min". */
+    intervalMinutes: number;
+    /** Last run, summarised for the Overview digest. */
+    lastFeeChanges: number;
+    lastRebalances: number;
+    lastSells: number;
+    lastOpens: number;
   };
 }
 
@@ -52,9 +59,22 @@ interface RebalanceSummary {
 }
 
 interface AutopilotState {
-  config: { enabled: boolean; rebalanceEnabled: boolean; channelEnabled: boolean; sellEnabled: boolean };
+  config: {
+    enabled: boolean;
+    rebalanceEnabled: boolean;
+    channelEnabled: boolean;
+    sellEnabled: boolean;
+    intervalMinutes: number;
+  };
   lastRunAt: string | null;
-  history: { applied: number; attempted: number }[];
+  history: {
+    applied: number;
+    attempted: number;
+    changes?: { ok: boolean }[];
+    rebalances?: { ok: boolean }[];
+    sells?: { ok: boolean }[];
+    channels?: { ok: boolean }[];
+  }[];
 }
 
 export function buildDashboard(
@@ -107,6 +127,7 @@ export function buildDashboard(
   activity.sort((a, b) => b.at.localeCompare(a.at));
 
   const last = autopilot.history[0];
+  const okCount = (xs?: { ok: boolean }[]) => (xs ?? []).filter((x) => x.ok).length;
   return {
     windowDays: report.windowDays,
     earnedSats: report.totalFeesEarnedSats,
@@ -131,6 +152,11 @@ export function buildDashboard(
       lastRunAt: autopilot.lastRunAt,
       lastApplied: last?.applied ?? 0,
       lastAttempted: last?.attempted ?? 0,
+      intervalMinutes: autopilot.config.intervalMinutes,
+      lastFeeChanges: okCount(last?.changes),
+      lastRebalances: okCount(last?.rebalances),
+      lastSells: okCount(last?.sells),
+      lastOpens: okCount(last?.channels),
     },
   };
 }

@@ -250,6 +250,11 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
         <div className="ap-strategy-head">
           <span className="ap-strategy-title">Strategy</span>
           <span className="muted">one click — applied instantly, no Save needed</span>
+          {!PRESETS.some((p) => matchesPreset(p.cfg)) ? (
+            <span className="preset-custom-chip" title="Your settings differ from every preset — pick one to snap everything back to a coherent goal">
+              Custom settings active
+            </span>
+          ) : null}
         </div>
         <div className="ap-preset-grid">
           {PRESETS.map((p) => {

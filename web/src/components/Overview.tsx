@@ -51,7 +51,12 @@ function KpiRow({ d, price }: { d: DashboardData; price?: PriceInfo | null }) {
         <div className="kpi-label">Yield · {d.windowDays}d</div>
         <div className="kpi-value">{d.yieldPpmYear.toLocaleString()} <span className="kpi-unit">ppm/yr</span></div>
         <div className="kpi-sub">on capital</div>
-        <div className="kpi-spark"><Sparkline data={d.feesSpark} width={150} height={30} color="var(--accent)" /></div>
+        <div
+          className="kpi-sub kpi-bench"
+          title="Median market rate for leasing capital on Magma (~2.6% APR) — a reference for what this capital could earn leased out instead"
+        >
+          market lease ≈ 26k ppm/yr
+        </div>
       </div>
     </div>
   );
@@ -86,6 +91,79 @@ function RecentActivity({ items }: { items: ActivityItem[] }) {
         </div>
       )}
     </section>
+  );
+}
+
+/** "Today" digest — one glanceable strip answering "what happened / what needs
+ *  me?", built purely from data the Overview already loads. Each item jumps to
+ *  the right tab. */
+function DigestStrip({
+  d,
+  channels,
+  onNavigate,
+}: {
+  d: DashboardData;
+  channels?: ChannelView[] | null;
+  onNavigate?: (tab: string, sub?: string) => void;
+}) {
+  const a = d.autopilot;
+  const anyOn = a.fees || a.rebalance || a.channel || a.sell;
+  const last7d = d.forwardsSpark.slice(-7).reduce((s, v) => s + v, 0);
+  const pendingOpen = channels?.filter((c) => c.status === "pending_open").length ?? 0;
+  const pendingClose = channels?.filter((c) => c.status === "pending_close").length ?? 0;
+
+  const items: { key: string; text: string; warn?: boolean; tab: string; sub?: string }[] = [];
+  if (anyOn && a.lastRunAt) {
+    const parts = [
+      a.lastFeeChanges > 0 ? `${a.lastFeeChanges} fee${a.lastFeeChanges > 1 ? "s" : ""} adjusted` : null,
+      a.lastRebalances > 0 ? `${a.lastRebalances} rebalance${a.lastRebalances > 1 ? "s" : ""}` : null,
+      a.lastSells > 0 ? `${a.lastSells} Magma action${a.lastSells > 1 ? "s" : ""}` : null,
+      a.lastOpens > 0 ? `${a.lastOpens} channel${a.lastOpens > 1 ? "s" : ""} opened` : null,
+    ].filter(Boolean);
+    const nextMin = Math.max(
+      0,
+      Math.round((new Date(a.lastRunAt).getTime() + a.intervalMinutes * 60_000 - Date.now()) / 60_000),
+    );
+    items.push({
+      key: "ap",
+      text: `Autopilot ${timeAgo(a.lastRunAt)}: ${parts.length ? parts.join(" · ") : "nothing needed changing"} — next run in ~${nextMin} min`,
+      tab: "autopilot",
+      sub: "history",
+    });
+  }
+  if (last7d === 0) {
+    items.push({
+      key: "noflow",
+      text: "No forwards in 7 days — check fees & liquidity",
+      warn: true,
+      tab: "autopilot",
+      sub: "fees",
+    });
+  }
+  if (pendingOpen > 0) {
+    items.push({
+      key: "popen",
+      text: `${pendingOpen} channel${pendingOpen > 1 ? "s" : ""} opening — waiting for confirmation`,
+      tab: "channels",
+    });
+  }
+  if (pendingClose > 0) {
+    items.push({
+      key: "pclose",
+      text: `${pendingClose} channel${pendingClose > 1 ? "s" : ""} closing`,
+      tab: "channels",
+    });
+  }
+  if (items.length === 0) return null;
+
+  return (
+    <div className="digest">
+      {items.map((it) => (
+        <button key={it.key} className={`digest-item ${it.warn ? "warn" : ""}`} onClick={() => onNavigate?.(it.tab, it.sub)}>
+          {it.text} <span className="go" aria-hidden>↗</span>
+        </button>
+      ))}
+    </div>
   );
 }
 
@@ -147,6 +225,7 @@ export function Overview({
     <div className="overview">
       <SummaryBar node={node} price={price} />
       {dash ? <KpiRow d={dash} price={price} /> : null}
+      {dash ? <DigestStrip d={dash} channels={channels} onNavigate={onNavigate} /> : null}
       <div className="hero-row">
         <HealthScore />
         <PnlOverview price={price} />

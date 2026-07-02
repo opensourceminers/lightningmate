@@ -37,7 +37,7 @@ export interface ChannelView {
   totalSent: number;
   totalReceived: number;
   unsettled: number;
-  status: "open" | "pending_close";
+  status: "open" | "pending_close" | "pending_open";
   /** Force-close in progress: blocks until time-locked funds are spendable. */
   timelockBlocks?: number;
   role: ChannelRole;
@@ -572,6 +572,11 @@ export interface DashboardData {
     lastRunAt: string | null;
     lastApplied: number;
     lastAttempted: number;
+    intervalMinutes: number;
+    lastFeeChanges: number;
+    lastRebalances: number;
+    lastSells: number;
+    lastOpens: number;
   };
 }
 

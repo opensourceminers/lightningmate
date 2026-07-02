@@ -3,8 +3,8 @@ import { getAlias } from "./aliases.js";
 
 export type ChannelRole = "source" | "sink" | "router";
 
-/** "open" = live channel; "pending_close" = a close that hasn't confirmed yet. */
-export type ChannelStatus = "open" | "pending_close";
+/** "open" = live channel; "pending_close"/"pending_open" = awaiting confirmation. */
+export type ChannelStatus = "open" | "pending_close" | "pending_open";
 
 export interface ChannelView {
   id: string;
@@ -80,10 +80,12 @@ export async function getChannelsView(
     }),
   );
 
-  // Channels mid-close stay visible as "pending close" until the close confirms.
+  // Channels mid-open/mid-close stay visible as pending until they confirm —
+  // otherwise a fresh open (manual, autopilot or a Magma sale!) is invisible for
+  // ~6 blocks and looks like nothing happened.
   const closing = await Promise.all(
     pending.pending_channels
-      .filter((p) => p.is_closing)
+      .filter((p) => p.is_closing || p.is_opening)
       .map(async (p): Promise<ChannelView> => {
         const settled = p.local_balance + p.remote_balance;
         return {
@@ -102,7 +104,7 @@ export async function getChannelsView(
           totalSent: p.sent,
           totalReceived: p.received,
           unsettled: 0,
-          status: "pending_close",
+          status: p.is_closing ? "pending_close" : "pending_open",
           timelockBlocks: p.timelock_blocks,
           role: classify(p.sent, p.received),
         };
