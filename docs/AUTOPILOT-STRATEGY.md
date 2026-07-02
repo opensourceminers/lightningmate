@@ -121,8 +121,11 @@ maxChangesPerRun   6     # at most N fee changes applied per run
 
 13. **Apply guards (decide *whether* to apply, never the target):**
     - skip if `|target − current| < minChangePpm` **unless** the base fee also needs changing
-    - **asymmetric cooldown**: a **raise** must wait out `cooldownHours` (72h) since the last
-      apply; a **lowering** applies immediately (win flow back fast)
+    - **asymmetric pacing**: a **raise** waits `max(user cooldown, 72h)` since the last apply
+      (the user's generic cooldown is often just hours — without the 72h floor a routing
+      channel could creep up ~200 ppm/day); a **lowering** steps at most **once a day**
+      (price discovery, not a race to the floor — the loop runs every 30 min). A channel
+      with no prior change applies immediately either way.
     - at most `maxChangesPerRun` (6) actual applies, biggest moves first.
 
 Applying uses LND `updateRoutingFees`, preserving `cltv_delta` and HTLC limits.
@@ -154,9 +157,12 @@ route it. "Balanced" competes for flow while leasing idle capital.
 object (`minPpm`, `neutralPpm`, `maxPpm`, `baseFeeMsat`, `protectPpm`, `safetyMargin`,
 `noFlowRatchetSteps`, `exploreLowerModifier`), the `rebalancePolicy.econRatio` +
 `maxRebalancesPerRun` + `rebalanceDailyBudgetSats`, and the on/off flags. On each run,
-`feeV2Overrides()` maps `policy` → the fee engine's config. Still fixed across strategies
-(not yet cascaded): `cooldownHours`, the flow windows, and the exact velocity/benchmark
-tiers and the no-flow *trigger* (0 forwards / 30d) — only its *speed* is cascaded.
+`feeV2Overrides()` maps `policy` → the fee engine's config, and `rebalanceRecOverrides()`
+maps `econRatio` → the rebalance recommender's `profitShare` gate (so the strategy loosens
+or tightens which rebalances *qualify*, not just the execution budget). Still fixed across
+strategies (not yet cascaded): `cooldownHours`, the flow windows, and the exact
+velocity/benchmark tiers and the no-flow *trigger* (0 forwards / 30d) — only its *speed*
+is cascaded.
 
 ---
 
@@ -231,10 +237,11 @@ max/base), and `sellAutoReprice` + `sellPricingMode`.
    set-and-forget product? Note: over-automation previously caused an outage, so stability
    and explainability matter.
 
-6. **Interactions to sanity-check:** the asymmetric cooldown (raises wait 72h, lowers are
-   instant) combined with the no-flow ratchet — can a channel oscillate (drop to win flow →
-   flow arrives → slowly raise → flow stops → drop again)? Is that healthy price discovery
-   or churn? Should there be hysteresis?
+6. **Interactions to sanity-check:** oscillation (drop to win flow → flow arrives → slowly
+   raise → flow stops → drop again). PARTIALLY ADDRESSED — lowers now pace at 1/day and
+   raises wait ≥72h, so a full cycle takes weeks, not days. Still open: remember the
+   "flow-won price" (the ppm at which a lowered channel started routing again) as a
+   per-channel anchor instead of re-exploring from scratch each cycle.
 
 7. **Base fee is globally 0.** Are there channel types (e.g. very large or premium peers)
    where a small base fee is worth keeping? Should base fee be strategy- or per-channel-set?

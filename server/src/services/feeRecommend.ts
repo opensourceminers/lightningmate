@@ -142,6 +142,11 @@ export interface FeeRecReport {
   recommendations: FeeRecommendation[];
 }
 
+/** Lowers step at most once a day — price discovery, not a race to the floor.
+ *  (The autopilot loop runs every ~30 min; without pacing an idle channel would
+ *  ratchet from any fee to minPpm within hours, before the market can react.) */
+const LOWER_PACING_HOURS = 24;
+
 // ── small helpers ─────────────────────────────────────────────────────────────
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
 const median = (xs: number[]): number => {
@@ -507,13 +512,17 @@ function buildRecommendation(
   if (!ch.active) blockedByGuards.push("channel inactive");
   // A base-fee drop is worth applying even when the ppm move is tiny.
   if (Math.abs(targetPpm - currentPpm) < minDelta && !baseFeeChanged) blockedByGuards.push("change below threshold");
-  // Asymmetric cooldown: raises wait out the cooldown (never thrash a working
-  // channel up), but LOWERING to win flow back is allowed immediately.
-  if (ctx.cooldown && isRaise) {
+  // Asymmetric pacing so the market can respond and outcomes stay measurable:
+  // raises wait the LONG raise-cooldown (never thrash a working channel up — the
+  // user's generic cooldown is often just hours, which would allow big daily
+  // creep), lowers step at most once a day. A channel with no prior change
+  // applies immediately either way.
+  if (ctx.cooldown) {
     const last = ctx.cooldown.lastApplied[ch.id];
     if (last) {
       const elapsedH = (Date.now() - new Date(last).getTime()) / 3_600_000;
-      if (elapsedH < ctx.cooldown.cooldownHours) blockedByGuards.push("cooldown active");
+      const limitH = isRaise ? Math.max(ctx.cooldown.cooldownHours, cfg.cooldownHours) : LOWER_PACING_HOURS;
+      if (elapsedH < limitH) blockedByGuards.push(isRaise ? "raise cooldown active" : "lower pacing (1/day)");
     }
   }
   const wouldApply = blockedByGuards.length === 0;

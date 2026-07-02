@@ -477,6 +477,7 @@ export function createApiRouter(
           autopilot.feeCooldown(),
           autopilot.feeV2Overrides(),
           overrides.all(),
+          autopilot.rebalanceRecOverrides(),
         ),
       );
     }),

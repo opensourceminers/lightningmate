@@ -251,6 +251,15 @@ export class Autopilot {
     };
   }
 
+  /** Map the user's rebalance economics onto the v2 recommender. The user-facing
+   *  knob is econRatio ("spend up to this share of what refilled liquidity earns");
+   *  the recommender implements exactly that as profitShare — wire it through so
+   *  the Strategy presets actually loosen/tighten the GATE, not just the
+   *  execution-budget fallback. */
+  rebalanceRecOverrides(): { profitShare: number } {
+    return { profitShare: this.state.config.rebalancePolicy.econRatio };
+  }
+
   /** Magma pricing the recommendations should reflect — the configured mode + the
    *  live adaptive level — so the UI shows what the autopilot is actually doing. */
   magmaOverrides(): { sellPricingMode: "fast" | "balanced" | "premium" | "auto"; adaptiveLevel: number } {
@@ -437,6 +446,7 @@ export class Autopilot {
       this.feeCooldown(),
       this.feeV2Overrides(),
       this.overrides.all(),
+      this.rebalanceRecOverrides(),
     );
     const eligible = report.recommendations
       .filter(
@@ -651,16 +661,16 @@ export class Autopilot {
           }
         }
         // The market-tracking target price for an offer (already floor-clamped by the
-        // engine). `moved` guards against pointless identical updates.
+        // engine). Reprice only when the ENGINE says so (≥ max(25 ppm, 10%) off, or
+        // below the profit floor) — the old 1% check here churned an updateOffer on
+        // almost every run.
         const target = (off: { id: string; feeRatePpm: number }) => {
           const r = recByOffer.get(off.id);
           if (!r) return null;
-          const curEff = r.current?.effectiveFeePpm ?? off.feeRatePpm;
-          const recEff = r.recommended.effectiveFeePpm;
           return {
             fee: r.recommended.feeRatePpm,
             base: r.recommended.baseFeeSat,
-            moved: Math.abs(recEff - curEff) >= Math.max(5, recEff * 0.01),
+            moved: r.shouldReprice,
           };
         };
 
