@@ -300,6 +300,7 @@ export function createApiRouter(
           autopilot.feeV2Overrides(),
           overrides.all(),
           await autopilot.feeElasticityModifiers(),
+          autopilot.flowAnchors(),
         ),
       );
     }),

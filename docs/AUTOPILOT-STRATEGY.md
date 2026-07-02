@@ -109,10 +109,14 @@ maxChangesPerRun   6     # at most N fee changes applied per run
      to slow the bleed (only if it's still getting forwards).
 
 10. **No-flow rule (core volume lever):** if the channel routed **0 forwards in 30 days**,
-    has ≥10% local, and isn't brand-new → **ratchet the fee down** toward `minPpm`
-    (`current − 3×stepPpm` per run). Overrides the curve and floors (except new-channel).
-    The opposite of a drain reflex: we never price-kill an idle channel — we make it cheaper
-    until it wins flow back.
+    has ≥10% local, and isn't brand-new → **lower the fee** to win flow back (overrides the
+    curve and floors, except new-channel protection). Two modes:
+    - with a **flow-won anchor** (the ppm at which routing last returned here, remembered
+      per channel for 60 days): jump straight to that price — best evidence beats stepping;
+    - otherwise: ratchet down toward `minPpm` (`current − ratchetSteps×stepPpm` per step,
+      paced once a day).
+    The autopilot tracks each lowering episode and records the current fee as the new
+    anchor the moment outbound flow returns. We never price-kill an idle channel.
 
 11. **Clamp + round** to `stepPpm`. Manual per-channel overrides (`exclude` = don't touch;
     `fixed` = pin a ppm) win here.
@@ -237,11 +241,10 @@ max/base), and `sellAutoReprice` + `sellPricingMode`.
    set-and-forget product? Note: over-automation previously caused an outage, so stability
    and explainability matter.
 
-6. **Interactions to sanity-check:** oscillation (drop to win flow → flow arrives → slowly
-   raise → flow stops → drop again). PARTIALLY ADDRESSED — lowers now pace at 1/day and
-   raises wait ≥72h, so a full cycle takes weeks, not days. Still open: remember the
-   "flow-won price" (the ppm at which a lowered channel started routing again) as a
-   per-channel anchor instead of re-exploring from scratch each cycle.
+6. ~~Oscillation / hysteresis.~~ **DONE** — lowers pace at 1/day, raises wait ≥72h, and the
+   engine now remembers each channel's "flow-won price" (the ppm at which routing returned
+   after a no-flow lowering, kept 60 days) and jumps straight there on the next episode
+   instead of re-exploring from scratch.
 
 7. **Base fee is globally 0.** Are there channel types (e.g. very large or premium peers)
    where a small base fee is worth keeping? Should base fee be strategy- or per-channel-set?

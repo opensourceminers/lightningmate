@@ -118,6 +118,9 @@ export interface FeeRecommendation {
   currentBaseMsat: number;
   /** Base fee (msat) the autopilot should set — volume-first default is 0. */
   recommendedBaseMsat: number;
+  /** True when the no-flow rule set this target — the autopilot uses it to track
+   *  the episode and record the price at which flow eventually returns. */
+  noFlowLowering: boolean;
   wouldApply: boolean;
   blockedByGuards: string[];
   state: FeeRecState;
@@ -229,6 +232,9 @@ export async function getFeeRecommendations(
   channelOverrides: OverrideMap = {},
   /** Per-channel learned fee elasticity modifier (channelId → ~0.85..1.2). */
   elasticity: Map<string, number> = new Map(),
+  /** Per-channel "flow-won price" (channelId → ppm at which routing last returned
+   *  after a no-flow lowering) — jump straight there instead of blind stepping. */
+  flowAnchors: Map<string, number> = new Map(),
 ): Promise<FeeRecReport> {
   const cfg = { ...FEE_REC_DEFAULTS, ...configOverrides };
   const [channels, rates, fw14, fw30, wallet] = await Promise.all([
@@ -281,6 +287,7 @@ export async function getFeeRecommendations(
       earnerCutoff,
       cooldown,
       elasticityMod: elasticity.get(ch.id) ?? 1,
+      flowAnchor: flowAnchors.get(ch.id),
     }),
   );
 
@@ -316,6 +323,7 @@ interface BuildCtx {
   earnerCutoff: number;
   cooldown: CooldownInput | null;
   elasticityMod: number;
+  flowAnchor: number | undefined;
 }
 
 function buildRecommendation(
@@ -456,13 +464,25 @@ function buildRecommendation(
   // flow back. Overrides the curve + floors (except new-channel protection) — the
   // opposite of a drain reflex. We never price-kill an idle channel.
   const isNewChan = ageDays != null && ageDays < cfg.newChannelProtectionDays;
+  let noFlowLowering = false;
   if (f30.forwards === 0 && ch.localRatio >= 0.1 && !isNewChan) {
     const stepped = currentPpm > 0 ? currentPpm - cfg.noFlowRatchetSteps * cfg.stepPpm : cfg.neutralPpm;
-    target = Math.max(cfg.minPpm, Math.min(target, stepped));
+    // Flow-won anchor: if routing last returned here at a known price, jump
+    // straight to it (best evidence beats blind stepping — a lower can't hurt a
+    // channel that routed nothing for 30d). Only below the anchor do we resume
+    // slow stepping — demand may have moved.
+    const anchor = ctx.flowAnchor;
+    const lowered = anchor != null && currentPpm > anchor ? anchor : stepped;
+    target = Math.max(cfg.minPpm, Math.min(target, lowered));
     hardFloor = 0;
     floored = null;
     exploring = true;
-    reasons.unshift("no flow: nothing routed here recently — lowering toward min to win routing back");
+    noFlowLowering = true;
+    reasons.unshift(
+      anchor != null && currentPpm > anchor
+        ? `no flow: dropping to ${anchor} ppm — the last price that won routing back here`
+        : "no flow: nothing routed here recently — lowering toward min to win routing back",
+    );
   }
 
   // §10 clamp + round — floors may push the ceiling above maxPpm
@@ -537,6 +557,7 @@ function buildRecommendation(
     transactionVout: rate?.transaction_vout ?? null,
     currentBaseMsat,
     recommendedBaseMsat,
+    noFlowLowering,
     wouldApply,
     blockedByGuards,
     state,

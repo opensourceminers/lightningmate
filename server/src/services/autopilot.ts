@@ -141,6 +141,9 @@ interface PersistedState {
   feeVolumeMigrated?: boolean;
   /** Rebalance fees spent today (resets on date change) — enforces the daily cap. */
   perDayRebalanceSpend?: { day: string; sats: number };
+  /** Flow-won price memory per channel: an open no-flow lowering episode
+   *  (episodeAt) and/or the ppm at which routing last returned (anchor). */
+  perChannelFlowAnchor?: Record<string, { episodeAt?: string; anchorPpm?: number; anchorAt?: string }>;
   history: AutopilotRun[];
 }
 
@@ -249,6 +252,20 @@ export class Autopilot {
       minChangePpm: p.minChangePpm,
       maxChangesPerRun: this.state.config.maxChangesPerRun,
     };
+  }
+
+  /** Non-stale flow-won prices (channelId → ppm at which routing last returned
+   *  after a no-flow lowering) for the fee engine. Demand shifts, so anchors
+   *  older than 60 days are ignored. */
+  flowAnchors(): Map<string, number> {
+    const out = new Map<string, number>();
+    const cutoff = Date.now() - 60 * 86_400_000;
+    for (const [id, s] of Object.entries(this.state.perChannelFlowAnchor ?? {})) {
+      if (s.anchorPpm != null && s.anchorAt && new Date(s.anchorAt).getTime() >= cutoff) {
+        out.set(id, s.anchorPpm);
+      }
+    }
+    return out;
   }
 
   /** Map the user's rebalance economics onto the v2 recommender. The user-facing
@@ -390,7 +407,28 @@ export class Autopilot {
       this.feeV2Overrides(),
       this.overrides.all(),
       elasticity,
+      this.flowAnchors(),
     );
+
+    // Flow-anchor bookkeeping: a channel in an open no-flow episode that routed
+    // out again did so at its CURRENT fee — remember that price as its anchor
+    // (the next no-flow episode jumps straight there instead of blind stepping).
+    // Episodes with no outbound flow for 45 days are abandoned (peer is dead —
+    // the close-candidate path handles it, an anchor would be meaningless).
+    const fa = (this.state.perChannelFlowAnchor ??= {});
+    const nowIso = new Date().toISOString();
+    for (const r of report.recommendations) {
+      const s = fa[r.channelId];
+      if (!s?.episodeAt) continue;
+      if (r.metrics.routedOut14d > 0) {
+        s.anchorPpm = r.currentPpm;
+        s.anchorAt = nowIso;
+        delete s.episodeAt;
+      } else if (Date.now() - new Date(s.episodeAt).getTime() > 45 * 86_400_000) {
+        delete s.episodeAt;
+      }
+    }
+
     const eligible = report.recommendations.filter(
       (r) => r.wouldApply && r.transactionId !== null && r.transactionVout !== null,
     );
@@ -407,7 +445,11 @@ export class Autopilot {
     const byId = new Map(eligible.map((r) => [r.channelId, r]));
     return results.map((res) => {
       const r = byId.get(res.id);
-      if (res.ok) this.state.perChannelLastApplied[res.id] = new Date().toISOString();
+      if (res.ok) {
+        this.state.perChannelLastApplied[res.id] = new Date().toISOString();
+        // Applied a no-flow lowering → open (or refresh) the flow-won episode.
+        if (r?.noFlowLowering) fa[res.id] = { ...fa[res.id], episodeAt: new Date().toISOString() };
+      }
       return {
         id: res.id,
         alias: r?.alias ?? res.id,
