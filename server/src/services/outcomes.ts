@@ -93,6 +93,24 @@ export async function getAutopilotOutcomes(
   const now = Date.now();
 
   // ── Fee-change impact ──
+  // Clean-window requirement: a change is only measurable when NO other change to
+  // the same channel falls inside its ±feeWin window — overlapping changes would
+  // contaminate each other's before/after revenue and feed the elasticity learner
+  // noise instead of signal. (Pacing keeps overlaps rare now; older histories
+  // from the 30-min-loop era still contain bursts.)
+  const changeTimes = new Map<string, number[]>();
+  for (const run of history) {
+    const at = new Date(run.at).getTime();
+    for (const c of run.changes ?? []) {
+      if (!c.ok || c.fromPpm === c.toPpm) continue;
+      const list = changeTimes.get(c.id);
+      if (list) list.push(at);
+      else changeTimes.set(c.id, [at]);
+    }
+  }
+  const hasNeighbor = (id: string, at: number): boolean =>
+    (changeTimes.get(id) ?? []).some((t) => t !== at && Math.abs(t - at) < feeWin * DAY);
+
   const feeItems: FeeOutcome[] = [];
   for (const run of history) {
     const at = new Date(run.at).getTime();
@@ -101,6 +119,7 @@ export async function getAutopilotOutcomes(
     if (now - at < feeWin * DAY || now - at > lookback) continue;
     for (const c of run.changes ?? []) {
       if (!c.ok || c.fromPpm === c.toPpm) continue;
+      if (hasNeighbor(c.id, at)) continue; // contaminated window — unmeasurable
       const from = at - feeWin * DAY;
       const to = at + feeWin * DAY;
       const cBefore = sumWindow(c.id, from, at);
