@@ -144,6 +144,8 @@ interface PersistedState {
   /** Flow-won price memory per channel: an open no-flow lowering episode
    *  (episodeAt) and/or the ppm at which routing last returned (anchor). */
   perChannelFlowAnchor?: Record<string, { episodeAt?: string; anchorPpm?: number; anchorAt?: string }>;
+  /** Consecutive failed rebalance attempts per target — drives the backoff. */
+  perTargetRebalanceFails?: Record<string, number>;
   history: AutopilotRun[];
 }
 
@@ -392,7 +394,12 @@ export class Autopilot {
   private rebalanceCooldownOk(targetId: string, cooldownMin: number): boolean {
     const last = this.state.perTargetLastRebalanced[targetId];
     if (!last) return true;
-    return (Date.now() - new Date(last).getTime()) / 60_000 >= cooldownMin;
+    // Exponential backoff on consecutive failures (1× → 2× → 4× → 8× the
+    // cooldown): a target with no viable route isn't re-probed forever on the
+    // base cadence. A success resets the counter.
+    const fails = this.state.perTargetRebalanceFails?.[targetId] ?? 0;
+    const mult = Math.min(8, 2 ** fails);
+    return (Date.now() - new Date(last).getTime()) / 60_000 >= cooldownMin * mult;
   }
 
   /** Compute and apply eligible fee changes. */
@@ -524,6 +531,9 @@ export class Autopilot {
       // Mark the target on every attempt (success or fail) so the cooldown also
       // backs off failing targets — no more hammering the same dead route.
       this.state.perTargetLastRebalanced[r.channelId] = new Date().toISOString();
+      const fails = (this.state.perTargetRebalanceFails ??= {});
+      if (res.ok) delete fails[r.channelId];
+      else fails[r.channelId] = Math.min(3, (fails[r.channelId] ?? 0) + 1);
       this.rebalanceLog.append({
         at: new Date().toISOString(),
         via: "autopilot",

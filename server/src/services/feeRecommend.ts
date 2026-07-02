@@ -453,10 +453,18 @@ function buildRecommendation(
   // slow the bleed, never a flat ceiling. A drained + idle channel is handled by
   // the no-flow rule below (lowered), never slammed to a high fee.
   if (ch.localRatio < 0.1 && f30.forwards > 0) {
-    if (cfg.protectPpm > target) target = cfg.protectPpm;
-    hardFloor = Math.max(hardFloor, cfg.protectPpm);
+    // Ramp, don't slam: step toward protectPpm by at most 4 steps per change —
+    // the gentle-raise philosophy applies to safety bumps too (the old one-shot
+    // jump to protectPpm was the outage mechanic in miniature).
+    const ramped = Math.min(cfg.protectPpm, (currentPpm || cfg.neutralPpm) + 4 * cfg.stepPpm);
+    if (ramped > target) target = ramped;
+    hardFloor = Math.max(hardFloor, ramped);
     floored = "protecting_liquidity";
-    reasons.unshift(`protect: drained (${Math.round(ch.localRatio * 100)}% local) but still in demand — modest bump`);
+    reasons.unshift(
+      ramped < cfg.protectPpm
+        ? `protect: drained (${Math.round(ch.localRatio * 100)}% local) but still in demand — ramping toward ${cfg.protectPpm} ppm`
+        : `protect: drained (${Math.round(ch.localRatio * 100)}% local) but still in demand — modest bump`,
+    );
   }
 
   // No routing → lower (the core volume-first safety): a channel that hasn't
@@ -541,7 +549,13 @@ function buildRecommendation(
     const last = ctx.cooldown.lastApplied[ch.id];
     if (last) {
       const elapsedH = (Date.now() - new Date(last).getTime()) / 3_600_000;
-      const limitH = isRaise ? Math.max(ctx.cooldown.cooldownHours, cfg.cooldownHours) : LOWER_PACING_HOURS;
+      // The protect ramp may step at the user's cadence — it's hard-capped at
+      // protectPpm, unlike open-ended velocity raises which wait the long pause.
+      const limitH = isRaise
+        ? floored === "protecting_liquidity"
+          ? ctx.cooldown.cooldownHours
+          : Math.max(ctx.cooldown.cooldownHours, cfg.cooldownHours)
+        : LOWER_PACING_HOURS;
       if (elapsedH < limitH) blockedByGuards.push(isRaise ? "raise cooldown active" : "lower pacing (1/day)");
     }
   }
