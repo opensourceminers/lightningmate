@@ -2,7 +2,8 @@ import { getChannels, getChainBalance, type AuthenticatedLnd } from "lightning";
 import { JsonStore } from "../store.js";
 import { closeChannelByOutpoint, openChannelTo } from "./channelOps.js";
 import { createInvoice } from "./payments.js";
-import { acceptOrder, addOrderTransaction, createOffer, getMyOffers, getMyOrders, toggleOffer, updateOffer, type MyOrder } from "./amboss.js";
+import { acceptOrder, addOrderTransaction, createOffer, getMarket, getMyOffers, getMyOrders, toggleOffer, updateOffer, type MyOrder } from "./amboss.js";
+import { initMarketTelemetry, recordMarketSnapshot } from "./marketTelemetry.js";
 import { paySaleServiceFee } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
@@ -200,6 +201,7 @@ export class Autopilot {
     private readonly earnings: EarningsLog,
   ) {
     this.store = new JsonStore<PersistedState>(dataDir, "autopilot.json");
+    initMarketTelemetry(dataDir);
     this.state = this.store.read({
       config: DEFAULT_CONFIG,
       lastRunAt: null,
@@ -954,6 +956,11 @@ export class Autopilot {
       channels: [],
       sells: [],
     };
+    // Market fill telemetry: sample the order book on every tick — even in
+    // read-only mode — so fill history accrues from day one. Fire-and-forget.
+    void getMarket()
+      .then((m) => recordMarketSnapshot(m.offers))
+      .catch(() => {});
     if (this.running || !this.writeLnd) return emptyRun;
     this.running = true;
     this.onchainCommittedThisRun = 0; // shared capital budget for this run

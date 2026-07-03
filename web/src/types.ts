@@ -988,6 +988,15 @@ export interface MagmaV2Report {
     onchainCloseCostSat: number;
     onchainFeePerVbyte: number | null;
     pendingSellerOrders: number;
+    marketPulse: {
+      confirmed: number;
+      soldSats: number;
+      medianFilledPpm: number | null;
+      p25FilledPpm: number | null;
+      p75FilledPpm: number | null;
+      vanished: number;
+      trackedDays: number;
+    } | null;
     reasons: string[];
     warnings: string[];
     recommendations: MagmaSellRecommendation[];

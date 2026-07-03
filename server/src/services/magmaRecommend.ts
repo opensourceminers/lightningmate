@@ -6,6 +6,7 @@ import { getOwnPubkey } from "./node.js";
 import { computeNodeNeed, type NodeNeed } from "./suggestRecommend.js";
 import { saleFeeConfig } from "./serviceFee.js";
 import { getMarket, getMyOffers, getMyOrders, type MagmaOffer, type MyOffer, type MyOrder } from "./amboss.js";
+import { getMarketPulse, type MarketPulse } from "./marketTelemetry.js";
 
 /**
  * Magma v2 — a profit-aware recommendation layer on top of the existing Magma
@@ -202,6 +203,8 @@ export interface MagmaV2Report {
     onchainCloseCostSat: number;
     onchainFeePerVbyte: number | null;
     pendingSellerOrders: number;
+    /** Observed real fills from local order-book telemetry (null until sampled). */
+    marketPulse: MarketPulse | null;
     reasons: string[];
     warnings: string[];
     recommendations: MagmaSellRecommendation[];
@@ -384,7 +387,7 @@ export async function getMagmaRecommendations(
     // competitor by 1 ppm (no score premium — the point is to win the next order);
     // "auto" interpolates p10→p75 by the adaptive level the autopilot maintains.
     const undercut = seg.minCompetitor > 0 ? seg.minCompetitor - 1 : seg.p10;
-    const targetEff = Math.max(
+    const targetEffListed = Math.max(
       floorEff,
       cfg.sellPricingMode === "fast"
         ? undercut
@@ -394,6 +397,24 @@ export async function getMagmaRecommendations(
             ? Math.round(interp(seg.p10, seg.p75, cfg.adaptiveLevel) * (1 + premium))
             : Math.round(seg.median * (1 + premium)),
     );
+    // Fill-aware pricing: LISTED prices are asks, not sales. When the local
+    // telemetry has seen enough real fills, and our list-derived target sits well
+    // above where the market actually clears, pull the price toward the filled
+    // median (never below the profit floor). Premium mode is exempt — it
+    // deliberately prices above the market.
+    const pulse = getMarketPulse(30, minSize, maxSize) ?? getMarketPulse(30);
+    let targetEff = targetEffListed;
+    let pricedToFills = false;
+    if (
+      cfg.sellPricingMode !== "premium" &&
+      pulse != null &&
+      pulse.confirmed >= 3 &&
+      pulse.medianFilledPpm != null &&
+      targetEffListed > pulse.medianFilledPpm * 1.15
+    ) {
+      targetEff = Math.max(floorEff, Math.round(pulse.medianFilledPpm * 1.1));
+      pricedToFills = targetEff < targetEffListed;
+    }
     const recommended = pricePointFrom(targetEff, repSize, baseFee, minBlock);
     const recEcon = economics(repSize, minBlock, recommended.effectiveFeePpm);
     const beatsRouting = recEcon.leasePpmPerYear >= recommendedMinLeasePpmPerYear;
@@ -419,6 +440,13 @@ export async function getMagmaRecommendations(
     const reasons: string[] = [];
     const warnings: string[] = [];
     reasons.push(`priced against ${seg.count} comparable offers in your ${sizeBandLabel(minSize, maxSize)} band`);
+    if (pricedToFills && pulse?.medianFilledPpm != null) {
+      reasons.push(
+        `${pulse.confirmed} real sales observed in ${pulse.trackedDays}d clearing around ${pulse.medianFilledPpm} ppm — pricing to the FILLED price, not the listed asks`,
+      );
+    } else if (pulse && pulse.confirmed > 0 && pulse.medianFilledPpm != null) {
+      reasons.push(`fill telemetry: ${pulse.confirmed} real sales in ${pulse.trackedDays}d, median ~${pulse.medianFilledPpm} ppm`);
+    }
     if (seg.fallbackLevel === "all_offers")
       warnings.push("few offers in your exact size band — compared against the whole market");
     if (premium > 0.02) reasons.push(`your seller score is above the segment median — applying a ${Math.round(premium * 100)}% premium`);
@@ -684,6 +712,7 @@ export async function getMagmaRecommendations(
       onchainCloseCostSat,
       onchainFeePerVbyte,
       pendingSellerOrders: myOrdersView.pendingSeller,
+      marketPulse: getMarketPulse(30),
       reasons: sellReasons,
       warnings: sellWarnings,
       recommendations,

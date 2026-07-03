@@ -1311,3 +1311,17 @@ tr.pending td { opacity: 0.9; }
 /* Market seller-score header (shown across Buy/Sell/Orders) */
 .market-score { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; padding: 9px 13px; background: var(--line-soft); border: 1px solid var(--line); border-radius: 10px; font-size: 13px; }
 .market-score-main b { color: var(--accent); font-size: 15px; font-variant-numeric: tabular-nums; }
+.market-pulse { color: var(--green); font-size: 12px; font-variant-numeric: tabular-nums; }
+
+/* Seller-score coach */
+.score-coach { margin: -4px 0 14px; font-size: 13px; }
+.score-coach summary { cursor: pointer; color: var(--muted); font-size: 12.5px; padding: 2px 2px; }
+.score-coach summary:hover { color: var(--text); }
+.coach-list { display: flex; flex-direction: column; gap: 7px; padding: 10px 12px; margin-top: 8px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; }
+.coach-item { display: flex; gap: 9px; line-height: 1.45; }
+.coach-mark { flex: none; width: 16px; text-align: center; }
+.coach-item.ok .coach-mark { color: var(--green); }
+.coach-item.todo { color: var(--text); }
+.coach-item.todo .coach-mark { color: var(--accent); }
+.coach-item.ok { color: var(--muted); }
+.coach-item.info { color: var(--muted); font-size: 12px; }
