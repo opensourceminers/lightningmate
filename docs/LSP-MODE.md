@@ -76,6 +76,9 @@
    abuse caps (max pending orders), restart recovery of in-flight orders.
 4. **P4 — reach:** list the node in LSP directories; feature-bit/announcement
    per spec; docs for wallet users.
+   ✅ **Built 2026-07-03** (see "Reach" below). Feature bit 729 is announced
+   while the mode is on and withdrawn on disable; the Settings card shows the
+   announcement state, a copyable node URI and a ready-to-share buyer guide.
 
 ## Open decisions
 
@@ -84,6 +87,34 @@
 - ~~Default pricing mode~~ **Decided (P2):** same engine level as Magma (the
   autopilot's configured mode + adaptive level), duration-scaled, profit-floored.
 - Beta gating: community store only at first? (decide at release time)
+
+## Reach — how buyers find a LightningMate LSP (P4)
+
+Every LightningMate node is its own independent LSP; there is no central
+LightningMate directory. Discovery works through:
+
+1. **Feature bit 729 (`option_supports_lsps`, bLIP-50).** Set in the node
+   announcement via LND `peersrpc.UpdateNodeAnnouncement` whenever LSP mode is
+   enabled; withdrawn when disabled. Graph explorers (Amboss, mempool.space)
+   and LSPS-aware wallets can filter for it. Caveats: LND must include the
+   `peersrpc` subserver (official release builds do); a node **without public
+   channels has no node announcement** and can't set the bit — the card then
+   says so and direct sharing still works. The spec's optional init-message
+   feature bit can't be set through the LND API — node_announcement only.
+2. **Directly shared URI** (the practical channel). The Settings card offers
+   "copy buyer guide": node URI + wallet steps, ready to paste into a chat or
+   forum post. Buyer steps in ZEUS: Settings → Lightning Service Provider →
+   set the node as custom LSPS1 provider (pubkey@host), then Channels →
+   "Purchase Inbound". The BTCPay Server LSP plugin (2.2+) also speaks LSPS1
+   with a custom provider option.
+3. **Curated LSP lists.** The bLIP/LSPS ecosystem list
+   (github.com/BitcoinAndLightningLayerSpecs/lsp) accepts PRs; realistic for
+   committed operators, not every node. Not automated by the app on purpose.
+
+Reachability notes: a Tor-only node (Umbrel default) needs Tor-capable buyer
+wallets — ZEUS on Android works; hybrid clearnet+Tor widens reach (LND config,
+outside LightningMate's scope). Offer size is capped by deployable on-chain
+capital, so a thin wallet advertises (and sells) little.
 
 ## Risks
 

@@ -1,4 +1,5 @@
 import {
+  addAdvertisedFeature,
   cancelHodlInvoice,
   createHodlInvoice,
   getChainBalance,
@@ -10,6 +11,15 @@ import {
   subscribeToPeerMessages,
   type AuthenticatedLnd,
 } from "lightning";
+import * as lnService from "lightning";
+
+// lightning@10 exports removeAdvertisedFeature at runtime but forgot it in the
+// package typings (peers/index.d.ts) — same call shape as addAdvertisedFeature.
+const removeAdvertisedFeature = (
+  lnService as unknown as {
+    removeAdvertisedFeature: (args: { lnd: AuthenticatedLnd; feature: number }) => Promise<void>;
+  }
+).removeAdvertisedFeature;
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import { JsonStore } from "../store.js";
@@ -44,6 +54,11 @@ import { openChannelTo } from "./channelOps.js";
 
 /** BOLT8 custom message type carrying all LSPS traffic (bLIP-50). */
 export const LSPS0_MESSAGE_TYPE = 37913;
+
+/** `option_supports_lsps` (bLIP-50): advertised in the node announcement while
+ *  LSP mode is on, so graph crawlers and wallets can discover the node as an
+ *  LSP. Clients MUST NOT set this bit — we only ever set it as the LSP side. */
+export const LSPS_FEATURE_BIT = 729;
 
 /** Protocol-side offer constants (sizes shared with the Magma sell caps). */
 const LSPS1_LIMITS = {
@@ -84,6 +99,15 @@ const rpcError = (id: JsonRpcId, code: number, message: string, data?: unknown) 
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const sha256 = (buf: Buffer) => createHash("sha256").update(buf).digest("hex");
+
+/** ln-service throws array errors: [code, name, { err }] — dig out the detail. */
+function lndErrorDetail(err: unknown): string {
+  if (Array.isArray(err)) {
+    const extra = err[2] as { err?: { details?: string; message?: string } } | undefined;
+    return extra?.err?.details ?? extra?.err?.message ?? String(err[1] ?? err[0]);
+  }
+  return err instanceof Error ? err.message : String(err);
+}
 
 // ── orders ────────────────────────────────────────────────────────────────────
 
@@ -149,6 +173,8 @@ export interface Lsps1Status {
   earnedSat: number;
   /** Disclosed service fee on completed sales (same as Magma sales). */
   serviceFeeBps: number;
+  /** Graph discovery: feature bit 729 announced? null error = fine/unknown. */
+  featureBit: { set: boolean; error: string | null };
   /** What `lsps1.get_info` currently answers — shown in the Settings card. */
   offer: {
     minChannelSat: number;
@@ -184,6 +210,10 @@ export class Lsps1Service {
   /** Retry pacing — instance fields so tests can shrink the waits. */
   private openRetryDelayMs = OPEN_RETRY_DELAY_MS;
   private settleRetryBaseMs = 2_000;
+  private featureBitSet = false;
+  private featureBitError: string | null = null;
+  /** Last applied toggle state — detects on→off transitions (withdraw the bit). */
+  private lastEnabled: boolean | undefined;
 
   private readonly ordersStore: JsonStore<Lsps1Order[]>;
   private orders: Lsps1Order[];
@@ -215,10 +245,46 @@ export class Lsps1Service {
     void this.recoverOrders();
   }
 
-  /** Call after the LSP-mode toggle changes — starts/stops the subscription. */
+  /** Call after the LSP-mode toggle changes — starts/stops the subscription and
+   *  announces/withdraws the LSP feature bit in the node graph. */
   applySettings(): void {
-    if (this.settings.get().lspModeEnabled && this.writeLnd) this.startSub();
-    else this.stopSub();
+    const enabled = this.settings.get().lspModeEnabled && !!this.writeLnd;
+    if (enabled) {
+      this.startSub();
+      void this.advertiseFeature(true);
+    } else {
+      this.stopSub();
+      // Withdraw only on a real on→off transition — a boot with the mode off
+      // shouldn't touch (and needlessly re-gossip) the node announcement.
+      if (this.lastEnabled) void this.advertiseFeature(false);
+    }
+    this.lastEnabled = enabled;
+  }
+
+  /** Advertise (or withdraw) `option_supports_lsps` in the node announcement.
+   *  Best-effort: a node without a public graph presence, or an LND without the
+   *  peersrpc subserver, can't announce — LSP mode still works via directly
+   *  shared URIs, so this never blocks; the Settings card shows the outcome. */
+  private async advertiseFeature(on: boolean): Promise<void> {
+    if (!this.writeLnd) return;
+    try {
+      if (on) await addAdvertisedFeature({ lnd: this.writeLnd, feature: LSPS_FEATURE_BIT });
+      else await removeAdvertisedFeature({ lnd: this.writeLnd, feature: LSPS_FEATURE_BIT });
+      this.featureBitSet = on;
+      this.featureBitError = null;
+      console.log(`[lsps1] feature bit ${LSPS_FEATURE_BIT} ${on ? "announced" : "withdrawn"} in the node graph`);
+    } catch (err) {
+      const detail = lndErrorDetail(err);
+      // A no-op update means the bit already is in the desired state.
+      if (/already|no modification|not set|not advertised/i.test(detail)) {
+        this.featureBitSet = on;
+        this.featureBitError = null;
+        return;
+      }
+      if (on) this.featureBitSet = false;
+      this.featureBitError = detail;
+      console.warn(`[lsps1] could not ${on ? "announce" : "withdraw"} feature bit ${LSPS_FEATURE_BIT}: ${detail}`);
+    }
   }
 
   /** Capital promised to paid-but-not-yet-opened orders — the autopilot subtracts
@@ -269,6 +335,7 @@ export class Lsps1Service {
       ordersFailed: this.orders.filter((o) => o.orderState === "FAILED").length,
       earnedSat: completed.reduce((s, o) => s + o.feeTotalSat, 0),
       serviceFeeBps: saleFeeConfig().bps,
+      featureBit: { set: this.featureBitSet, error: this.featureBitError },
       offer,
     };
   }

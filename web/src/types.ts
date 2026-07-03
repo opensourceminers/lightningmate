@@ -466,6 +466,7 @@ export interface LspStatus {
   ordersFailed: number;
   earnedSat: number;
   serviceFeeBps: number;
+  featureBit: { set: boolean; error: string | null };
   offer: {
     minChannelSat: number;
     maxChannelSat: number;

@@ -110,6 +110,28 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
     setTimeout(() => setUriCopied(false), 1500);
   };
 
+  // Ready-to-share buyer instructions — the practical discovery channel while
+  // graph crawlers catch up on the feature bit.
+  const [guideCopied, setGuideCopied] = useState(false);
+  const copyBuyerGuide = () => {
+    if (!lsp) return;
+    const uri = lsp.uris[0] ?? lsp.pubkey;
+    const tor = uri.includes(".onion") ? " (reachable over Tor)" : "";
+    void navigator.clipboard.writeText(
+      [
+        "Buy an inbound Lightning channel directly from my node (LSPS1 / bLIP-51):",
+        "",
+        `Node URI: ${uri}${tor}`,
+        "",
+        "In ZEUS: Settings → Lightning Service Provider → set this node as your",
+        'LSPS1 provider (pubkey@host), then Channels → "Purchase Inbound".',
+        "Any LSPS1-capable wallet or the BTCPay Server LSP plugin works too.",
+      ].join("\n"),
+    );
+    setGuideCopied(true);
+    setTimeout(() => setGuideCopied(false), 1500);
+  };
+
   // Sign a message with the node (e.g. Amboss's "Login with Node" challenge)
   const [signInput, setSignInput] = useState("");
   const [signature, setSignature] = useState("");
@@ -254,22 +276,34 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
               A {lsp.serviceFeeBps / 100}% service fee on completed sales supports Lightning Mate’s development.
             </p>
           ) : null}
-          <p className="muted">Point a wallet at your node to test (it connects as a peer):</p>
-          {lsp.uris.length ? (
-            <div className="challenge-row">
-              <code className="challenge">{lsp.uris[0]}</code>
-              <button className="reset" onClick={() => copyUri(lsp.uris[0])}>
-                {uriCopied ? "copied" : "copy"}
-              </button>
-            </div>
-          ) : (
-            <div className="challenge-row">
-              <code className="challenge">{lsp.pubkey}</code>
-              <button className="reset" onClick={() => copyUri(lsp.pubkey)}>
-                {uriCopied ? "copied" : "copy"}
-              </button>
-            </div>
-          )}
+          <p className="muted">
+            {lsp.featureBit.set
+              ? "Announcing LSP support in the node graph (feature bit 729) — explorers and wallets can discover you."
+              : lsp.featureBit.error
+                ? `Graph announcement unavailable (${lsp.featureBit.error}) — share your URI directly instead.`
+                : "Graph announcement pending…"}
+          </p>
+          <p className="muted">Buyers point their wallet at your node (it connects as a peer):</p>
+          {(() => {
+            const uri = lsp.uris[0] ?? lsp.pubkey;
+            return (
+              <div className="challenge-row">
+                <code className="challenge">{uri}</code>
+                <button className="reset" onClick={() => copyUri(uri)}>
+                  {uriCopied ? "copied" : "copy"}
+                </button>
+                <button className="reset" onClick={copyBuyerGuide}>
+                  {guideCopied ? "copied" : "copy buyer guide"}
+                </button>
+              </div>
+            );
+          })()}
+          {(lsp.uris[0] ?? "").includes(".onion") ? (
+            <p className="hint">
+              Your node announces a Tor-only address — buyers need a Tor-capable wallet (e.g. ZEUS on
+              Android). A hybrid clearnet+Tor node setup reaches more wallets.
+            </p>
+          ) : null}
         </>
       ) : null}
 
