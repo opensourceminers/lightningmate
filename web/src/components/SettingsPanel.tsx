@@ -113,9 +113,13 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
   // Ready-to-share buyer instructions — the practical discovery channel while
   // graph crawlers catch up on the feature bit.
   const [guideCopied, setGuideCopied] = useState(false);
+  // Prefer a clearnet URI when the node announces both — more wallets reach it.
+  const preferredUri = (l: LspStatus) =>
+    l.uris.find((u) => !u.includes(".onion")) ?? l.uris[0] ?? l.pubkey;
+
   const copyBuyerGuide = () => {
     if (!lsp) return;
-    const uri = lsp.uris[0] ?? lsp.pubkey;
+    const uri = preferredUri(lsp);
     const tor = uri.includes(".onion") ? " (reachable over Tor)" : "";
     void navigator.clipboard.writeText(
       [
@@ -285,7 +289,7 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
           </p>
           <p className="muted">Buyers point their wallet at your node (it connects as a peer):</p>
           {(() => {
-            const uri = lsp.uris[0] ?? lsp.pubkey;
+            const uri = preferredUri(lsp);
             return (
               <div className="challenge-row">
                 <code className="challenge">{uri}</code>
@@ -298,7 +302,7 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
               </div>
             );
           })()}
-          {(lsp.uris[0] ?? "").includes(".onion") ? (
+          {lsp.uris.length > 0 && lsp.uris.every((u) => u.includes(".onion")) ? (
             <p className="hint">
               Your node announces a Tor-only address — buyers need a Tor-capable wallet (e.g. ZEUS on
               Android). A hybrid clearnet+Tor node setup reaches more wallets.
