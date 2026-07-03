@@ -21,6 +21,7 @@ import type {
   CreatedInvoice,
   DecodedRequest,
   LnActivity,
+  LspStatus,
   PayResult,
   OnchainState,
   OnchainTx,
@@ -106,6 +107,7 @@ export const api = {
   score: () => get<NodeScore>("/score"),
   getSettings: () => get<AppSettings>("/settings"),
   setSettings: (s: Partial<AppSettings>) => post<AppSettings>("/settings", s),
+  lspStatus: () => get<LspStatus>("/lsp/status"),
   price: () => get<PriceInfo>("/price"),
   overrides: () => get<OverrideMap>("/overrides"),
   setOverride: (channelId: string, mode: FeeMode, fixedPpm?: number) =>

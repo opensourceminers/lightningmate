@@ -450,6 +450,26 @@ export type FiatCurrency = "off" | "USD" | "EUR" | "GBP" | "CHF";
 
 export interface AppSettings {
   fiatCurrency: FiatCurrency;
+  lspModeEnabled: boolean;
+}
+
+/** LSP mode (LSPS1) live status from GET /lsp/status. */
+export interface LspStatus {
+  enabled: boolean;
+  running: boolean;
+  canWrite: boolean;
+  requestsServed: number;
+  lastRequestAt: string | null;
+  lastError: string | null;
+  offer: {
+    minChannelSat: number;
+    maxChannelSat: number;
+    deployableSat: number;
+    maxChannelExpiryBlocks: number;
+    minFundingConfirmsWithinBlocks: number;
+  } | null;
+  pubkey: string;
+  uris: string[];
 }
 
 export interface PriceInfo {

@@ -58,6 +58,7 @@ import type { Autopilot } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 import { BackupStore, exportScb, getBackupStatus } from "../services/backup.js";
 import type { EarningsLog } from "../services/earningsLog.js";
+import type { Lsps1Service } from "../services/lsps1.js";
 
 // Pull the numeric keys of a policy object out of the query string.
 function numericOverrides<T>(query: Request["query"], keys: (keyof T)[]): Partial<T> {
@@ -158,6 +159,7 @@ export function createApiRouter(
   amboss: AmbossStore,
   backup: BackupStore,
   earnings: EarningsLog,
+  lsps1: Lsps1Service,
 ): Router {
   const router = Router();
 
@@ -655,13 +657,39 @@ export function createApiRouter(
     res.json(settings.get());
   });
   router.post("/settings", (req, res) => {
-    const fiatCurrency = req.body?.fiatCurrency;
-    if (!["off", "USD", "EUR", "GBP", "CHF"].includes(fiatCurrency)) {
-      res.status(400).json({ error: "bad_request", message: "invalid fiatCurrency" });
-      return;
+    const { fiatCurrency, lspModeEnabled } = req.body ?? {};
+    const patch: Parameters<typeof settings.set>[0] = {};
+    if (fiatCurrency !== undefined) {
+      if (!["off", "USD", "EUR", "GBP", "CHF"].includes(fiatCurrency)) {
+        res.status(400).json({ error: "bad_request", message: "invalid fiatCurrency" });
+        return;
+      }
+      patch.fiatCurrency = fiatCurrency;
     }
-    res.json(settings.set({ fiatCurrency }));
+    if (lspModeEnabled !== undefined) {
+      if (typeof lspModeEnabled !== "boolean") {
+        res.status(400).json({ error: "bad_request", message: "invalid lspModeEnabled" });
+        return;
+      }
+      if (lspModeEnabled && !writeLnd) {
+        res.status(400).json({ error: "read_only", message: WRITE_DISABLED_MSG });
+        return;
+      }
+      patch.lspModeEnabled = lspModeEnabled;
+    }
+    const next = settings.set(patch);
+    lsps1.applySettings();
+    res.json(next);
   });
+
+  // LSP mode (LSPS1) — live status + the offer wallets currently see.
+  router.get(
+    "/lsp/status",
+    wrap(async (_req, res) => {
+      const [status, info] = await Promise.all([lsps1.status(), getWalletInfo({ lnd })]);
+      res.json({ ...status, pubkey: info.public_key, uris: info.uris ?? [] });
+    }),
+  );
 
   // Current BTC price in the chosen fiat currency (null when fiat is off).
   router.get(

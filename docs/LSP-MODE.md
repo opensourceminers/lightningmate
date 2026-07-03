@@ -13,8 +13,11 @@
   LND supports this via `SubscribeCustomMessages` / `SendCustomMessage`
   (ln-service: `subscribeToPeerMessages` / `sendMessageToPeer`).
 - **Methods (LSPS1):**
-  - `lsps1.get_info` → our offer: min/max channel size, min/max lease blocks,
-    fee schedule, min onchain confs.
+  - `lsps1.get_info` → our offer LIMITS only: min/max channel size, max lease
+    blocks, min onchain confs. (Spec-checked at P1 build: there is NO fee
+    schedule in `get_info` — the price is quoted per-order in the
+    `create_order` response. All sat amounts are JSON strings; fields are
+    top-level in `result`, no `options` wrapper.)
   - `lsps1.create_order` → buyer picks size/duration; we respond with an order
     id + payment options (BOLT11 invoice; optionally on-chain address).
   - `lsps1.get_order` → order status polling (created → paid → channel opening
@@ -48,6 +51,10 @@
 
 1. **P1 — skeleton (read-only):** LSPS0 transport + `lsps1.get_info` from live
    pricing. No orders yet. Verifiable with a ZEUS wallet pointing at the node.
+   ✅ **Built 2026-07-03** (`server/src/services/lsps1.ts`, Settings card "LSP
+   mode (beta)", `GET /api/lsp/status`). Offer limits come from chain balance
+   minus the shared Magma sell reserve, capped by `sellMaxChannelSats`;
+   `create_order`/`get_order` answer `-32601` until P2.
 2. **P2 — orders:** `create_order` + HODL invoice + open on payment +
    `get_order` states. Caps + earnings + UI.
 3. **P3 — hardening:** invoice expiry, refund paths, per-peer rate limits,

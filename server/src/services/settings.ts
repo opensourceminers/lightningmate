@@ -5,9 +5,11 @@ export type FiatCurrency = "off" | "USD" | "EUR" | "GBP" | "CHF";
 export interface AppSettings {
   /** "off" = no external price calls at all (privacy-first default). */
   fiatCurrency: FiatCurrency;
+  /** LSP mode (beta): answer LSPS1 (bLIP-51) requests from wallets. Off by default. */
+  lspModeEnabled: boolean;
 }
 
-export const DEFAULT_SETTINGS: AppSettings = { fiatCurrency: "off" };
+export const DEFAULT_SETTINGS: AppSettings = { fiatCurrency: "off", lspModeEnabled: false };
 
 /** Persisted user settings (currency, …). */
 export class SettingsStore {

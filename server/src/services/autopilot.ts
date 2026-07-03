@@ -287,6 +287,14 @@ export class Autopilot {
     return { sellPricingMode: this.state.config.sellPricingMode, adaptiveLevel: this.state.sellAdaptiveLevel };
   }
 
+  /** Sell caps shared with LSP mode — one capital budget across both demand sources. */
+  sellCaps(): { maxChannelSats: number; reserveSats: number } {
+    return {
+      maxChannelSats: this.state.config.sellMaxChannelSats,
+      reserveSats: this.state.config.sellReserveSats,
+    };
+  }
+
   /** Per-channel learned fee elasticity modifiers (from measured outcomes). */
   async feeElasticityModifiers(): Promise<Map<string, number>> {
     try {

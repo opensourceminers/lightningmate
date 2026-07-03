@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { AppSettings, FiatCurrency } from "../types";
+import type { AppSettings, FiatCurrency, LspStatus } from "../types";
 import { BackupCard } from "./BackupCard";
+import { Switch, RunState } from "./Switch";
+import { satsCompact, timeAgo } from "../format";
 
 const CURRENCIES: { value: FiatCurrency; label: string }[] = [
   { value: "off", label: "Off" },
@@ -66,6 +68,46 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
     } finally {
       setBusy(false);
     }
+  };
+
+  // LSP mode (beta) — sell channels to LSPS1 wallets, discovery-only phase.
+  const [lsp, setLsp] = useState<LspStatus | null>(null);
+  const [lspBusy, setLspBusy] = useState(false);
+  const [lspError, setLspError] = useState<string | null>(null);
+  const [uriCopied, setUriCopied] = useState(false);
+
+  useEffect(() => {
+    api.lspStatus().then(setLsp).catch(() => setLsp(null));
+  }, []);
+
+  // While the mode is on, poll so incoming get_info requests show up live —
+  // that's how you verify a wallet (e.g. ZEUS) actually reached the node.
+  useEffect(() => {
+    if (!lsp?.enabled) return;
+    const t = setInterval(() => {
+      api.lspStatus().then(setLsp).catch(() => undefined);
+    }, 10_000);
+    return () => clearInterval(t);
+  }, [lsp?.enabled]);
+
+  const toggleLsp = async (on: boolean) => {
+    if (lspBusy) return;
+    setLspBusy(true);
+    setLspError(null);
+    try {
+      setSettings(await api.setSettings({ lspModeEnabled: on }));
+      setLsp(await api.lspStatus());
+    } catch (e) {
+      setLspError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLspBusy(false);
+    }
+  };
+
+  const copyUri = (uri: string) => {
+    void navigator.clipboard.writeText(uri);
+    setUriCopied(true);
+    setTimeout(() => setUriCopied(false), 1500);
   };
 
   // Sign a message with the node (e.g. Amboss's "Login with Node" challenge)
@@ -160,6 +202,63 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
         </div>
       )}
       {ambossError ? <p className="banner error">{ambossError}</p> : null}
+
+      <h3 className="sub">LSP mode (beta)</h3>
+      <div className="dryrun-banner">
+        Sell inbound channels <strong>directly to wallets and nodes</strong> speaking the open
+        LSP standard (LSPS1 / bLIP-51) — a second demand source beside Magma, with no
+        marketplace in between. <strong>Off by default.</strong> This phase is discovery-only:
+        wallets like ZEUS can see your offer; ordering &amp; payment ship next. Needs write
+        mode (admin macaroon).
+      </div>
+      <div className="amboss-row">
+        <Switch
+          checked={settings?.lspModeEnabled ?? false}
+          disabled={lspBusy || !settings || (lsp !== null && !lsp.canWrite)}
+          onChange={(v) => void toggleLsp(v)}
+          label="LSP mode"
+        />
+        <RunState on={settings?.lspModeEnabled ?? false} />
+        {lsp && !lsp.canWrite ? <span className="muted">write mode is off — enable it to use LSP mode</span> : null}
+      </div>
+      {lspError ? <p className="banner error">{lspError}</p> : null}
+      {settings?.lspModeEnabled && lsp ? (
+        <>
+          <div className="amboss-row" style={{ marginTop: 10 }}>
+            <span className={`conn ${lsp.running ? "up" : "down"}`}>
+              <i /> {lsp.running ? "Listening for LSP clients" : "Not listening"}
+            </span>
+            <span className="muted">
+              get_info served: {lsp.requestsServed}
+              {lsp.lastRequestAt ? ` · last ${timeAgo(lsp.lastRequestAt)}` : ""}
+            </span>
+          </div>
+          {!lsp.running && lsp.lastError ? <p className="banner error">{lsp.lastError}</p> : null}
+          {lsp.offer ? (
+            <p className="muted">
+              Advertising {satsCompact(lsp.offer.minChannelSat)}–{satsCompact(lsp.offer.maxChannelSat)} sat
+              channels, leases up to ~{Math.round(lsp.offer.maxChannelExpiryBlocks / 144)} days
+              · {satsCompact(lsp.offer.deployableSat)} sat deployable on-chain
+            </p>
+          ) : null}
+          <p className="muted">Point a wallet at your node to test (it connects as a peer):</p>
+          {lsp.uris.length ? (
+            <div className="challenge-row">
+              <code className="challenge">{lsp.uris[0]}</code>
+              <button className="reset" onClick={() => copyUri(lsp.uris[0])}>
+                {uriCopied ? "copied" : "copy"}
+              </button>
+            </div>
+          ) : (
+            <div className="challenge-row">
+              <code className="challenge">{lsp.pubkey}</code>
+              <button className="reset" onClick={() => copyUri(lsp.pubkey)}>
+                {uriCopied ? "copied" : "copy"}
+              </button>
+            </div>
+          )}
+        </>
+      ) : null}
 
       <h3 className="sub">Sign a message</h3>
       <div className="dryrun-banner">
