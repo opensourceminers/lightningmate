@@ -23,6 +23,7 @@ const removeAdvertisedFeature = (
   }
 ).removeAdvertisedFeature;
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { lookup } from "node:dns/promises";
 import type { EventEmitter } from "node:events";
 import { JsonStore } from "../store.js";
 import type { SettingsStore } from "./settings.js";
@@ -250,6 +251,10 @@ export class Lsps1Service {
   start(): void {
     this.applySettings();
     void this.recoverOrders();
+    // Hourly re-check of the announced clearnet address: a DDNS name follows
+    // the home IP, so re-resolve and swap the announcement when it moved.
+    const timer = setInterval(() => void this.applyAnnouncedSocket(), 60 * 60_000);
+    timer.unref?.();
   }
 
   /** Call after the LSP-mode toggle or clearnet address changes — starts/stops
@@ -271,27 +276,40 @@ export class Lsps1Service {
   }
 
   /** Announce (or withdraw) the configured clearnet address via peersrpc.
-   *  Runtime announcements don't survive an LND restart, so this re-asserts on
-   *  every (re)connect; transitions remove the previously announced address. */
+   *
+   *  LND resolves a hostname only ONCE when it's announced, so for DDNS names
+   *  (dynamic home IPs) we resolve ourselves, announce the IP literal, and
+   *  re-check hourly — when the IP behind the name changes, the stale address
+   *  is withdrawn and the new one announced. Runtime announcements also don't
+   *  survive an LND restart, so the reconnect path re-asserts too. */
   private async applyAnnouncedSocket(): Promise<void> {
     if (!this.writeLnd) return;
     const desired = (this.settings.get().lspClearnetAddress ?? "").trim();
-    if (this.lastAppliedSocket === desired) return;
+    let target = ""; // the ip:port we actually announce ("" = withdraw)
     try {
-      // Address changed: withdraw what we announced before (boot = unknown,
-      // nothing to withdraw — LND lost runtime announcements on restart anyway).
+      if (desired) {
+        const [host, port] = desired.split(":");
+        const ip = /^\d+\.\d+\.\d+\.\d+$/.test(host) ? host : (await lookup(host, { family: 4 })).address;
+        target = `${ip}:${port}`;
+      }
+      if (this.lastAppliedSocket === target) {
+        this.socketError = null;
+        return; // same IP as announced — nothing to gossip
+      }
+      // IP changed / address cleared: withdraw the previous announcement (boot
+      // = unknown, nothing to withdraw — LND lost runtime updates on restart).
       if (this.lastAppliedSocket) {
         await this.lndRemoveSocket(this.lastAppliedSocket).catch(() => undefined);
       }
-      if (desired) await this.lndAddSocket(desired);
-      this.lastAppliedSocket = desired;
+      if (target) await this.lndAddSocket(target);
+      this.lastAppliedSocket = target;
       this.socketError = null;
-      if (desired) console.log(`[lsps1] announcing clearnet address ${desired} in the node graph`);
+      if (target) console.log(`[lsps1] announcing clearnet address ${target} (${desired}) in the node graph`);
     } catch (err) {
       const detail = lndErrorDetail(err);
       // A no-op add means the address is already announced (e.g. via lnd.conf).
       if (/already|no modification/i.test(detail)) {
-        this.lastAppliedSocket = desired;
+        this.lastAppliedSocket = target;
         this.socketError = null;
         return;
       }

@@ -330,8 +330,9 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
             </p>
           ) : null}
           <p className="muted" style={{ marginTop: 10 }}>
-            Announce a clearnet address (needs port 9735 forwarded on your router; use a DDNS name
-            if your IP changes). LightningMate keeps it announced across node restarts:
+            Announce a clearnet address (needs port 9735 forwarded on your router). With a dynamic
+            home IP, use a DDNS name — it&apos;s re-resolved hourly, and LightningMate keeps the
+            announcement alive across node restarts and IP changes:
           </p>
           <div className="amboss-row">
             <input
