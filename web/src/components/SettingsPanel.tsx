@@ -207,9 +207,9 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
       <div className="dryrun-banner">
         Sell inbound channels <strong>directly to wallets and nodes</strong> speaking the open
         LSP standard (LSPS1 / bLIP-51) — a second demand source beside Magma, with no
-        marketplace in between. <strong>Off by default.</strong> This phase is discovery-only:
-        wallets like ZEUS can see your offer; ordering &amp; payment ship next. Needs write
-        mode (admin macaroon).
+        marketplace in between. Orders are priced by the same engine as Magma selling; the
+        buyer pays a hold invoice that only settles once the channel is opening, so failures
+        refund automatically. <strong>Off by default.</strong> Needs write mode (admin macaroon).
       </div>
       <div className="amboss-row">
         <Switch
@@ -239,6 +239,19 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
               Advertising {satsCompact(lsp.offer.minChannelSat)}–{satsCompact(lsp.offer.maxChannelSat)} sat
               channels, leases up to ~{Math.round(lsp.offer.maxChannelExpiryBlocks / 144)} days
               · {satsCompact(lsp.offer.deployableSat)} sat deployable on-chain
+            </p>
+          ) : null}
+          {lsp.ordersPending + lsp.ordersCompleted + lsp.ordersFailed > 0 ? (
+            <p className="muted">
+              Orders: {lsp.ordersPending} pending · {lsp.ordersCompleted} completed
+              {lsp.ordersFailed > 0 ? ` · ${lsp.ordersFailed} failed` : ""}
+              {lsp.earnedSat > 0 ? ` · ${lsp.earnedSat.toLocaleString()} sat earned` : ""} — details
+              in Channels → Market → Orders
+            </p>
+          ) : null}
+          {lsp.serviceFeeBps > 0 ? (
+            <p className="fee-note">
+              A {lsp.serviceFeeBps / 100}% service fee on completed sales supports Lightning Mate’s development.
             </p>
           ) : null}
           <p className="muted">Point a wallet at your node to test (it connects as a peer):</p>

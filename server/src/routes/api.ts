@@ -691,6 +691,11 @@ export function createApiRouter(
     }),
   );
 
+  // LSPS1 orders for the Market → Orders tab (never exposes invoice secrets).
+  router.get("/lsp/orders", (_req, res) => {
+    res.json({ orders: lsps1.orderViews() });
+  });
+
   // Current BTC price in the chosen fiat currency (null when fiat is off).
   router.get(
     "/price",

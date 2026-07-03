@@ -103,7 +103,7 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
                 <div className="pnl-seg c-open" style={{ width: pct(opens) }} title={`Channel opens · ${sats(opens)} sat`} />
                 <div className="pnl-seg c-rebal" style={{ width: pct(rebal) }} title={`Rebalancing · ${sats(rebal)} sat`} />
                 <div className="pnl-seg c-close" style={{ width: pct(closes) }} title={`Channel closes · ${sats(closes)} sat`} />
-                <div className="pnl-seg c-fee" style={{ width: pct(svcFee) }} title={`Magma service fee · ${sats(svcFee)} sat`} />
+                <div className="pnl-seg c-fee" style={{ width: pct(svcFee) }} title={`Sales service fee · ${sats(svcFee)} sat`} />
               </div>
               <span className="pnl-bar-val cost">{totalCost > 0 ? `−${sats(totalCost)}` : "0"}</span>
             </div>

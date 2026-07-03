@@ -48,7 +48,20 @@ function main(): void {
   const earningsLog = new EarningsLog(config.dataDir);
   const autopilot = new Autopilot(config.dataDir, lnd, writeLnd, rebalanceLog, overrides, ambossStore, earningsLog);
   autopilot.start();
-  const lsps1 = new Lsps1Service(writeLnd, settings, () => autopilot.sellCaps());
+  const lsps1 = new Lsps1Service(
+    config.dataDir,
+    lnd,
+    writeLnd,
+    settings,
+    () => autopilot.sellCaps(),
+    () => autopilot.magmaOverrides(),
+    () => ambossStore.getKey(),
+    earningsLog,
+    (orderId, sizeSats, transactionId) => autopilot.recordExternalSell(orderId, sizeSats, transactionId),
+  );
+  // One capital budget across Magma + LSPS1: the autopilot's checks subtract
+  // whatever LSPS1 has promised to paid-but-unopened orders.
+  autopilot.setExternalCommitted(() => lsps1.committedSat());
   lsps1.start();
 
   const app = express();

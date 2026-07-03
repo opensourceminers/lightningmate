@@ -461,6 +461,11 @@ export interface LspStatus {
   requestsServed: number;
   lastRequestAt: string | null;
   lastError: string | null;
+  ordersPending: number;
+  ordersCompleted: number;
+  ordersFailed: number;
+  earnedSat: number;
+  serviceFeeBps: number;
   offer: {
     minChannelSat: number;
     maxChannelSat: number;
@@ -470,6 +475,22 @@ export interface LspStatus {
   } | null;
   pubkey: string;
   uris: string[];
+}
+
+/** One LSPS1 order (direct channel sale) from GET /lsp/orders. */
+export interface LspOrder {
+  orderId: string;
+  peer: string;
+  createdAt: string;
+  sizeSat: number;
+  feeSat: number;
+  orderState: "CREATED" | "COMPLETED" | "FAILED";
+  paymentState: "EXPECT_PAYMENT" | "HOLD" | "PAID" | "REFUNDED";
+  channelExpiryBlocks: number;
+  invoiceExpiresAt: string;
+  fundingOutpoint: string | null;
+  serviceFeePaidSat: number;
+  error?: string;
 }
 
 export interface PriceInfo {

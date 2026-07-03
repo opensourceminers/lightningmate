@@ -190,6 +190,9 @@ export class Autopilot {
    *  so the channel autopilot and Magma selling share one budget and can't both
    *  plan the same coins. Reset at the start of each run. */
   private onchainCommittedThisRun = 0;
+  /** Capital promised outside the autopilot (LSPS1 orders paid but not yet
+   *  opened) — same budget, third demand source. Wired up in index.ts. */
+  private externalCommittedSat: () => number = () => 0;
 
   constructor(
     dataDir: string,
@@ -293,6 +296,34 @@ export class Autopilot {
       maxChannelSats: this.state.config.sellMaxChannelSats,
       reserveSats: this.state.config.sellReserveSats,
     };
+  }
+
+  /** Register the external (LSPS1) capital commitment source. */
+  setExternalCommitted(fn: () => number): void {
+    this.externalCommittedSat = fn;
+  }
+
+  /** Total on-chain sats already spoken for: this run's own commitments plus
+   *  in-flight LSPS1 orders. Every capital check reads this, not the raw field. */
+  private committedOnchainSat(): number {
+    return this.onchainCommittedThisRun + this.externalCommittedSat();
+  }
+
+  /** A completed LSPS1 sale, surfaced as a run-history entry so it shows up in
+   *  the history and the Overview digest like any other capital action. */
+  recordExternalSell(orderId: string, sizeSats: number, transactionId: string): void {
+    this.state.history.unshift({
+      at: new Date().toISOString(),
+      attempted: 1,
+      applied: 1,
+      failed: 0,
+      changes: [],
+      rebalances: [],
+      channels: [],
+      sells: [{ orderId: `lsps1:${orderId}`, action: "open", sizeSats, ok: true, transactionId }],
+    });
+    this.state.history = this.state.history.slice(0, HISTORY_LIMIT);
+    this.persist();
   }
 
   /** Per-channel learned fee elasticity modifiers (from measured outcomes). */
@@ -582,7 +613,7 @@ export class Autopilot {
     }
 
     const { chain_balance } = await getChainBalance({ lnd: this.readLnd });
-    const available = chain_balance - cfg.channelReserveSats - this.onchainCommittedThisRun;
+    const available = chain_balance - cfg.channelReserveSats - this.committedOnchainSat();
     if (available <= 0) return [];
 
     const { suggestions } = await getChannelSuggestionsV2(this.readLnd, {});
@@ -753,7 +784,7 @@ export class Autopilot {
           const depleted = off.totalSizeSats < off.maxSizeSats;
 
           if (depleted && cfg.sellAutoRelist) {
-            if (off.maxSizeSats > chain_balance - cfg.sellReserveSats - this.onchainCommittedThisRun) continue;
+            if (off.maxSizeSats > chain_balance - cfg.sellReserveSats - this.committedOnchainSat()) continue;
             if (off.maxSizeSats > cfg.sellMaxDeploySats - deployed) continue;
             await updateOffer(key, off.id, {
               totalSizeSats: off.maxSizeSats,
@@ -787,7 +818,7 @@ export class Autopilot {
         const createRec = rec?.sell.recommendations.find((r) => r.mode === "create");
         if (offers.length === 0 && rec?.sell.state === "good_to_sell" && createRec) {
           const total = Math.min(
-            chain_balance - cfg.sellReserveSats - deployed - this.onchainCommittedThisRun,
+            chain_balance - cfg.sellReserveSats - deployed - this.committedOnchainSat(),
             cfg.sellMaxDeploySats - deployed,
           );
           const maxCh = Math.min(cfg.sellMaxChannelSats, total);
@@ -839,7 +870,7 @@ export class Autopilot {
           skip(o, "above max channel size");
         } else if (deployed + extra + o.sizeSats > cfg.sellMaxDeploySats) {
           skip(o, "deploy cap reached");
-        } else if (chain_balance - this.onchainCommittedThisRun - o.sizeSats < cfg.sellReserveSats) {
+        } else if (chain_balance - this.committedOnchainSat() - o.sizeSats < cfg.sellReserveSats) {
           skip(o, "would breach on-chain reserve");
         } else {
           try {
@@ -861,7 +892,7 @@ export class Autopilot {
           skip(o, "deploy cap reached");
           continue;
         }
-        if (chain_balance - this.onchainCommittedThisRun - o.sizeSats < cfg.sellReserveSats) {
+        if (chain_balance - this.committedOnchainSat() - o.sizeSats < cfg.sellReserveSats) {
           skip(o, "would breach on-chain reserve");
           continue;
         }

@@ -57,18 +57,33 @@
    `create_order`/`get_order` answer `-32601` until P2.
 2. **P2 — orders:** `create_order` + HODL invoice + open on payment +
    `get_order` states. Caps + earnings + UI.
+   ✅ **Built 2026-07-03.** Pricing = Magma engine level (market ppm/year from
+   the current sell recommendation, scaled to the requested lease duration),
+   floored by the profit floor (routing benchmark + live on-chain costs + min
+   net profit, net of the service fee); local-floor fallback when Amboss is
+   unreachable. Fund safety: the funding outpoint is persisted BEFORE settling
+   (a restart can never double-open), settle only after broadcast, every
+   failure path cancels the HODL invoice → auto-refund. Service fee: same
+   transparent `LM_SELL_FEE_BPS` (1%) as Magma sales, paid on completion,
+   disclosed with the same fee-note in the Settings card. Earnings →
+   `earningsLog` `via:"lsps1"` (flows into P&L); fills appear in the run
+   history/digest (`lsps1:<order>`); orders in Market → Orders ("Direct
+   sales"). Shared capital: autopilot subtracts LSPS1 held-order commitments
+   (`setExternalCommitted`). Basic P3 items already in: per-peer rate limit,
+   pending-order caps (2/peer, 10 total), invoice expiry (1 h), restart
+   recovery of in-flight orders (resume held → open/settle, expire dead).
 3. **P3 — hardening:** invoice expiry, refund paths, per-peer rate limits,
    abuse caps (max pending orders), restart recovery of in-flight orders.
 4. **P4 — reach:** list the node in LSP directories; feature-bit/announcement
    per spec; docs for wallet users.
 
-## Open decisions (ask the user during build)
+## Open decisions
 
-- Service fee: apply the same transparent 1% (`LM_SELL_FEE_BPS`) to LSPS1 sales?
-  (Consistent + funds the app; must stay clearly disclosed in the UI.)
-- Default pricing mode for LSPS1 vs Magma (same engine level, or slightly
-  premium since there's no marketplace fee?).
-- Beta gating: community store only at first?
+- ~~Service fee~~ **Decided (P2):** same transparent 1% (`LM_SELL_FEE_BPS`),
+  disclosed like the Magma fee (fee-note in the card, env-driven, never hidden).
+- ~~Default pricing mode~~ **Decided (P2):** same engine level as Magma (the
+  autopilot's configured mode + adaptive level), duration-scaled, profit-floored.
+- Beta gating: community store only at first? (decide at release time)
 
 ## Risks
 

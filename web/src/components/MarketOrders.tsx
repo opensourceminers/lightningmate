@@ -1,9 +1,18 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { MagmaV2Report, MyOrder, MyOrdersView } from "../types";
+import type { LspOrder, MagmaV2Report, MyOrder, MyOrdersView } from "../types";
 import { sats, satsCompact } from "../format";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
+
+/** Human status for a direct (LSPS1) sale — order + payment state in one word. */
+function lspStatusLabel(o: LspOrder): string {
+  if (o.orderState === "COMPLETED") return "Completed";
+  if (o.orderState === "FAILED") {
+    return o.paymentState === "REFUNDED" ? "Failed · refunded" : "Expired";
+  }
+  return o.paymentState === "HOLD" ? "Paid · opening channel" : "Awaiting payment";
+}
 
 export function MarketOrders() {
   const ui = useUi();
@@ -12,8 +21,11 @@ export function MarketOrders() {
   const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [rec, setRec] = useState<MagmaV2Report | null>(null);
+  const [lspOrders, setLspOrders] = useState<LspOrder[]>([]);
 
   const load = async () => {
+    // Direct LSPS1 sales are local — shown regardless of the Amboss connection.
+    api.lspOrders().then((r) => setLspOrders(r.orders)).catch(() => {});
     let conn = false;
     try {
       const s = await api.ambossStatus();
@@ -79,6 +91,40 @@ export function MarketOrders() {
     }
   };
 
+  // Direct LSPS1 sales — rendered below the Magma orders, and even when Amboss
+  // isn't connected (they don't involve the marketplace at all).
+  const lspBlock = lspOrders.length ? (
+    <>
+      <h3 className="sub">Direct sales · LSP mode</h3>
+      <div className="dryrun-banner">
+        Channels sold directly to wallets over the open LSP standard (LSPS1). The buyer pays a
+        hold invoice that only settles once the channel is opening — failures refund automatically.
+      </div>
+      <table className="fee-table">
+        <thead>
+          <tr>
+            <th>When</th>
+            <th className="num">Size</th>
+            <th className="num">Fee</th>
+            <th>Status</th>
+            <th>Channel</th>
+          </tr>
+        </thead>
+        <tbody>
+          {lspOrders.map((o) => (
+            <tr key={o.orderId}>
+              <td className="muted">{new Date(o.createdAt).toLocaleString()}</td>
+              <td className="num">{satsCompact(o.sizeSat)}</td>
+              <td className="num">{o.feeSat.toLocaleString()}</td>
+              <td title={o.error ?? undefined}>{lspStatusLabel(o)}</td>
+              <td className="muted">{o.fundingOutpoint ? `${o.fundingOutpoint.slice(0, 12)}…` : "—"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  ) : null;
+
   if (connected === false) {
     return (
       <section className="panel">
@@ -88,6 +134,7 @@ export function MarketOrders() {
         <div className="dryrun-banner">
           Connect your Amboss API key in <strong>Settings</strong> to see orders.
         </div>
+        {lspBlock}
       </section>
     );
   }
@@ -165,6 +212,8 @@ export function MarketOrders() {
           </tbody>
         </table>
       )}
+
+      {lspBlock}
     </section>
   );
 }

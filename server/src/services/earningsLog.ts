@@ -1,15 +1,15 @@
 import { JsonStore } from "../store.js";
 
 /**
- * Income trail for completed Magma liquidity sales — the missing half of P&L.
- * Each record is one fulfilled SELL order: the lease fee the buyer paid us
- * (gross Magma revenue) and the service fee we paid out on it. Persisted so the
- * P&L can show real lease income and net out the fee we actually paid, instead
- * of silently ignoring both.
+ * Income trail for completed liquidity sales (Magma and direct LSPS1) — the
+ * missing half of P&L. Each record is one fulfilled SELL order: the lease fee
+ * the buyer paid us (gross revenue) and the service fee we paid out on it.
+ * Persisted so the P&L can show real lease income and net out the fee we
+ * actually paid, instead of silently ignoring both.
  */
 export interface SaleRecord {
   at: string;
-  via: "manual" | "autopilot";
+  via: "manual" | "autopilot" | "lsps1";
   orderId: string;
   /** Lease fee the buyer paid us — our gross Magma revenue, in sats. */
   leaseSats: number;
