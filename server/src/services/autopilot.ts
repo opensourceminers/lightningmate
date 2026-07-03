@@ -765,7 +765,10 @@ export class Autopilot {
               baseFeeSats: t.base,
               minBlockLength: off.minBlockLength,
             });
-            out.push({ orderId: off.id, action: "reprice", sizeSats: off.totalSizeSats, ok: true });
+            // Deliberately NOT recorded in the run history — routine market
+            // tracking would drown out the actions that matter (accepts, opens,
+            // relists). The offer page always shows the current price anyway.
+            console.log(`[autopilot] repriced offer ${off.id} → ${t.fee} ppm`);
           }
         }
 
