@@ -110,6 +110,27 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
     setTimeout(() => setUriCopied(false), 1500);
   };
 
+  // Clearnet announcement (host:port) via the node API — Umbrel's own UI has
+  // no externalip field, so LightningMate keeps this announced for you.
+  const [clearnetInput, setClearnetInput] = useState("");
+  useEffect(() => {
+    if (settings) setClearnetInput(settings.lspClearnetAddress ?? "");
+  }, [settings?.lspClearnetAddress]);
+
+  const saveClearnet = async () => {
+    if (lspBusy) return;
+    setLspBusy(true);
+    setLspError(null);
+    try {
+      setSettings(await api.setSettings({ lspClearnetAddress: clearnetInput.trim() }));
+      setLsp(await api.lspStatus());
+    } catch (e) {
+      setLspError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLspBusy(false);
+    }
+  };
+
   // Ready-to-share buyer instructions — the practical discovery channel while
   // graph crawlers catch up on the feature bit.
   const [guideCopied, setGuideCopied] = useState(false);
@@ -305,8 +326,35 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
           {lsp.uris.length > 0 && lsp.uris.every((u) => u.includes(".onion")) ? (
             <p className="hint">
               Your node announces a Tor-only address — buyers need a Tor-capable wallet (e.g. ZEUS on
-              Android). A hybrid clearnet+Tor node setup reaches more wallets.
+              Android). Announce a clearnet address below to reach more wallets.
             </p>
+          ) : null}
+          <p className="muted" style={{ marginTop: 10 }}>
+            Announce a clearnet address (needs port 9735 forwarded on your router; use a DDNS name
+            if your IP changes). LightningMate keeps it announced across node restarts:
+          </p>
+          <div className="amboss-row">
+            <input
+              className="unlock-input amboss-key"
+              value={clearnetInput}
+              placeholder="mynode.example.com:9735 or 203.0.113.7:9735"
+              onChange={(e) => setClearnetInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void saveClearnet();
+              }}
+            />
+            <button
+              className="primary-btn"
+              disabled={lspBusy || clearnetInput.trim() === (settings?.lspClearnetAddress ?? "")}
+              onClick={() => void saveClearnet()}
+            >
+              {clearnetInput.trim() ? "Announce" : "Withdraw"}
+            </button>
+          </div>
+          {lsp.announcedSocket.error ? (
+            <p className="banner error">{lsp.announcedSocket.error}</p>
+          ) : lsp.announcedSocket.address && lsp.announcedSocket.applied ? (
+            <p className="muted">Announcing {lsp.announcedSocket.address} in the node graph ✓</p>
           ) : null}
         </>
       ) : null}

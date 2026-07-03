@@ -1,10 +1,12 @@
 import {
   addAdvertisedFeature,
+  addExternalSocket,
   cancelHodlInvoice,
   createHodlInvoice,
   getChainBalance,
   getChainFeeRate,
   getInvoice,
+  removeExternalSocket,
   sendMessageToPeer,
   settleHodlInvoice,
   subscribeToInvoice,
@@ -175,6 +177,8 @@ export interface Lsps1Status {
   serviceFeeBps: number;
   /** Graph discovery: feature bit 729 announced? null error = fine/unknown. */
   featureBit: { set: boolean; error: string | null };
+  /** Clearnet address announced via peersrpc ("" = none configured). */
+  announcedSocket: { address: string; applied: boolean; error: string | null };
   /** What `lsps1.get_info` currently answers — shown in the Settings card. */
   offer: {
     minChannelSat: number;
@@ -214,6 +218,9 @@ export class Lsps1Service {
   private featureBitError: string | null = null;
   /** Last applied toggle state — detects on→off transitions (withdraw the bit). */
   private lastEnabled: boolean | undefined;
+  /** Last clearnet socket applied via peersrpc; undefined = unknown (re-assert). */
+  private lastAppliedSocket: string | undefined;
+  private socketError: string | null = null;
 
   private readonly ordersStore: JsonStore<Lsps1Order[]>;
   private orders: Lsps1Order[];
@@ -245,13 +252,12 @@ export class Lsps1Service {
     void this.recoverOrders();
   }
 
-  /** Call after the LSP-mode toggle changes — starts/stops the subscription and
-   *  announces/withdraws the LSP feature bit in the node graph. */
+  /** Call after the LSP-mode toggle or clearnet address changes — starts/stops
+   *  the subscription and keeps the graph announcements in sync. */
   applySettings(): void {
     const enabled = this.settings.get().lspModeEnabled && !!this.writeLnd;
     if (enabled) {
-      this.startSub();
-      void this.advertiseFeature(true);
+      this.startSub(); // asserts the feature bit
     } else {
       this.stopSub();
       // Withdraw only on a real on→off transition — a boot with the mode off
@@ -259,6 +265,39 @@ export class Lsps1Service {
       if (this.lastEnabled) void this.advertiseFeature(false);
     }
     this.lastEnabled = enabled;
+    // The clearnet announcement is independent of the LSP toggle — reachability
+    // helps the node either way, and buyers may connect before enabling.
+    void this.applyAnnouncedSocket();
+  }
+
+  /** Announce (or withdraw) the configured clearnet address via peersrpc.
+   *  Runtime announcements don't survive an LND restart, so this re-asserts on
+   *  every (re)connect; transitions remove the previously announced address. */
+  private async applyAnnouncedSocket(): Promise<void> {
+    if (!this.writeLnd) return;
+    const desired = (this.settings.get().lspClearnetAddress ?? "").trim();
+    if (this.lastAppliedSocket === desired) return;
+    try {
+      // Address changed: withdraw what we announced before (boot = unknown,
+      // nothing to withdraw — LND lost runtime announcements on restart anyway).
+      if (this.lastAppliedSocket) {
+        await this.lndRemoveSocket(this.lastAppliedSocket).catch(() => undefined);
+      }
+      if (desired) await this.lndAddSocket(desired);
+      this.lastAppliedSocket = desired;
+      this.socketError = null;
+      if (desired) console.log(`[lsps1] announcing clearnet address ${desired} in the node graph`);
+    } catch (err) {
+      const detail = lndErrorDetail(err);
+      // A no-op add means the address is already announced (e.g. via lnd.conf).
+      if (/already|no modification/i.test(detail)) {
+        this.lastAppliedSocket = desired;
+        this.socketError = null;
+        return;
+      }
+      this.socketError = detail;
+      console.warn(`[lsps1] could not announce clearnet address "${desired}": ${detail}`);
+    }
   }
 
   /** Advertise (or withdraw) `option_supports_lsps` in the node announcement.
@@ -336,6 +375,11 @@ export class Lsps1Service {
       earnedSat: completed.reduce((s, o) => s + o.feeTotalSat, 0),
       serviceFeeBps: saleFeeConfig().bps,
       featureBit: { set: this.featureBitSet, error: this.featureBitError },
+      announcedSocket: {
+        address: (this.settings.get().lspClearnetAddress ?? "").trim(),
+        applied: !!this.lastAppliedSocket && this.socketError == null,
+        error: this.socketError,
+      },
       offer,
     };
   }
@@ -357,6 +401,11 @@ export class Lsps1Service {
       this.lastError = null;
       this.retryMs = 10_000;
       console.log("[lsps1] LSP mode on — listening for LSPS peer messages (type 37913)");
+      // (Re)assert the graph announcements: an LND restart (the usual reason
+      // this stream reconnects) drops runtime announcement updates.
+      void this.advertiseFeature(true);
+      this.lastAppliedSocket = undefined;
+      void this.applyAnnouncedSocket();
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
       this.scheduleReconnect();
@@ -554,6 +603,12 @@ export class Lsps1Service {
   }
   private lndFeeRate(confirmationTarget: number) {
     return getChainFeeRate({ lnd: this.writeLnd!, confirmation_target: confirmationTarget });
+  }
+  private lndAddSocket(socket: string) {
+    return addExternalSocket({ lnd: this.writeLnd!, socket });
+  }
+  private lndRemoveSocket(socket: string) {
+    return removeExternalSocket({ lnd: this.writeLnd!, socket });
   }
 
   // ── the offer ────────────────────────────────────────────────────────────────

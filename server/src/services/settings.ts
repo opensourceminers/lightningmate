@@ -7,9 +7,16 @@ export interface AppSettings {
   fiatCurrency: FiatCurrency;
   /** LSP mode (beta): answer LSPS1 (bLIP-51) requests from wallets. Off by default. */
   lspModeEnabled: boolean;
+  /** Clearnet address (host:port) to announce in the node graph, "" = none.
+   *  Applied via peersrpc at runtime — Umbrel's UI has no externalip field. */
+  lspClearnetAddress: string;
 }
 
-export const DEFAULT_SETTINGS: AppSettings = { fiatCurrency: "off", lspModeEnabled: false };
+export const DEFAULT_SETTINGS: AppSettings = {
+  fiatCurrency: "off",
+  lspModeEnabled: false,
+  lspClearnetAddress: "",
+};
 
 /** Persisted user settings (currency, …). */
 export class SettingsStore {

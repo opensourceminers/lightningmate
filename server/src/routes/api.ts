@@ -677,6 +677,28 @@ export function createApiRouter(
       }
       patch.lspModeEnabled = lspModeEnabled;
     }
+    const { lspClearnetAddress } = req.body ?? {};
+    if (lspClearnetAddress !== undefined) {
+      // host:port (IPv4 or domain), or "" to withdraw. Tor is announced by LND
+      // itself — .onion doesn't belong here.
+      const value = typeof lspClearnetAddress === "string" ? lspClearnetAddress.trim() : null;
+      const m = value != null ? /^([a-z0-9.-]+):(\d{1,5})$/i.exec(value) : null;
+      const okSocket =
+        value === "" ||
+        (m != null && !m[1].toLowerCase().endsWith(".onion") && Number(m[2]) >= 1 && Number(m[2]) <= 65535);
+      if (value == null || !okSocket) {
+        res.status(400).json({
+          error: "bad_request",
+          message: "invalid lspClearnetAddress — expected host:port (e.g. mynode.example.com:9735), not .onion",
+        });
+        return;
+      }
+      if (value && !writeLnd) {
+        res.status(400).json({ error: "read_only", message: WRITE_DISABLED_MSG });
+        return;
+      }
+      patch.lspClearnetAddress = value;
+    }
     const next = settings.set(patch);
     lsps1.applySettings();
     res.json(next);

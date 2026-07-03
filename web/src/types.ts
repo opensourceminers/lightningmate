@@ -451,6 +451,7 @@ export type FiatCurrency = "off" | "USD" | "EUR" | "GBP" | "CHF";
 export interface AppSettings {
   fiatCurrency: FiatCurrency;
   lspModeEnabled: boolean;
+  lspClearnetAddress: string;
 }
 
 /** LSP mode (LSPS1) live status from GET /lsp/status. */
@@ -467,6 +468,7 @@ export interface LspStatus {
   earnedSat: number;
   serviceFeeBps: number;
   featureBit: { set: boolean; error: string | null };
+  announcedSocket: { address: string; applied: boolean; error: string | null };
   offer: {
     minChannelSat: number;
     maxChannelSat: number;
