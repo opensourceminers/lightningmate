@@ -147,7 +147,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     }
   };
 
-  type BoolKey = "enabled" | "rebalanceEnabled" | "channelEnabled" | "sellEnabled";
+  type BoolKey = "enabled" | "rebalanceEnabled" | "channelEnabled" | "sellEnabled" | "maxHtlcEnabled";
   const toggleRow = (field: BoolKey, title: string, subtitle: string) => (
     <div className="ap-master">
       <Switch
@@ -297,6 +297,11 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       {sub === "fees" ? (
         <>
           {toggleRow("enabled", "Fee automation", "Apply the recommended fees below automatically, on a schedule")}
+          {toggleRow(
+            "maxHtlcEnabled",
+            "Advertise routable size",
+            "Keep each channel's max HTLC just under its spendable balance (rounded to powers of two) — senders skip depleted channels, so fewer forwards fail through you",
+          )}
           <details className="ap-customize">
             <summary>Customize fee policy</summary>
             <div className="policy-controls">
@@ -421,6 +426,11 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                   ...(run.rebalances ?? []).map((r) => ({ ok: r.ok, label: `Rebalance · ${r.alias}${r.ok ? ` — ${r.feeSats} sat` : ""}`, error: r.error })),
                   ...(run.channels ?? []).map((c) => ({ ok: c.ok, label: `Open · ${c.alias}${c.ok ? ` — ${satsCompact(c.sizeSats)}` : ""}`, error: c.error })),
                   ...(run.sells ?? []).map((s) => ({ ok: s.ok, label: `Magma ${s.action} · ${satsCompact(s.sizeSats)}`, error: s.error })),
+                  ...(run.maxHtlc ?? []).map((m) => ({
+                    ok: m.ok,
+                    label: `Max HTLC · ${m.alias}: ${m.fromSat != null ? satsCompact(m.fromSat) : "—"}→${satsCompact(m.toSat)}`,
+                    error: m.error,
+                  })),
                 ];
                 return (
                   <li key={`${run.at}-${i}`}>

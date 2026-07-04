@@ -4,6 +4,7 @@ import { closeChannelByOutpoint, openChannelTo } from "./channelOps.js";
 import { createInvoice } from "./payments.js";
 import { acceptOrder, addOrderTransaction, createOffer, getMarket, getMyOffers, getMyOrders, toggleOffer, updateOffer, type MyOrder } from "./amboss.js";
 import { initMarketTelemetry, recordMarketSnapshot } from "./marketTelemetry.js";
+import { runMaxHtlcPass, type MaxHtlcChange } from "./maxHtlc.js";
 import { paySaleServiceFee } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
@@ -73,6 +74,9 @@ export interface AutopilotConfig {
   /** Pricing level when auto-pricing: fast (undercut to sell quickly), balanced
    *  (market median), premium (top of the market), or auto (adapt to fill speed). */
   sellPricingMode: "fast" | "balanced" | "premium" | "auto";
+  /** Advertise routable size: keep each channel's max_htlc just under its
+   *  spendable balance (power-of-2 buckets) so senders skip depleted channels. */
+  maxHtlcEnabled: boolean;
 }
 
 export interface AutopilotChange {
@@ -119,6 +123,8 @@ export interface AutopilotRun {
   rebalances: AutopilotRebalance[];
   channels: AutopilotChannelOpen[];
   sells: AutopilotSell[];
+  /** Advertised-max_htlc bucket moves (present on newer runs only). */
+  maxHtlc?: MaxHtlcChange[];
 }
 
 interface PersistedState {
@@ -175,6 +181,7 @@ const DEFAULT_CONFIG: AutopilotConfig = {
   sellAutoRelist: false,
   sellAutoReprice: true,
   sellPricingMode: "balanced",
+  maxHtlcEnabled: false,
 };
 
 const HISTORY_LIMIT = 50;
@@ -353,6 +360,7 @@ export class Autopilot {
           rebalances: r.rebalances ?? [],
           channels: r.channels ?? [],
           sells: r.sells ?? [],
+          maxHtlc: r.maxHtlc ?? [],
         })),
     };
   }
@@ -410,6 +418,7 @@ export class Autopilot {
       this.state.config.enabled = false;
       this.state.config.rebalanceEnabled = false;
       this.state.config.channelEnabled = false;
+      this.state.config.maxHtlcEnabled = false;
     }
     this.persist();
     this.reschedule();
@@ -417,8 +426,8 @@ export class Autopilot {
 
   private reschedule(): void {
     this.stop();
-    const { enabled, rebalanceEnabled, channelEnabled, sellEnabled } = this.state.config;
-    if ((!enabled && !rebalanceEnabled && !channelEnabled && !sellEnabled) || !this.canWrite) return;
+    const { enabled, rebalanceEnabled, channelEnabled, sellEnabled, maxHtlcEnabled } = this.state.config;
+    if ((!enabled && !rebalanceEnabled && !channelEnabled && !sellEnabled && !maxHtlcEnabled) || !this.canWrite) return;
     const ms = Math.max(1, this.state.config.intervalMinutes) * 60_000;
     this.timer = setInterval(() => void this.runOnce(), ms);
     // Kick off one run shortly after enabling, without blocking.
@@ -1015,26 +1024,33 @@ export class Autopilot {
         : [];
       const channels = this.state.config.channelEnabled ? await this.runChannels(writeLnd) : [];
       const sells = await this.runSell(writeLnd);
+      // Advertised-size upkeep: only gossips when a channel's bucket moved.
+      const maxHtlc = this.state.config.maxHtlcEnabled
+        ? await runMaxHtlcPass(this.readLnd, writeLnd).catch(() => [] as MaxHtlcChange[])
+        : [];
       // "skip" entries are non-actions (cap/reserve) — don't count them as attempts.
       const acted = sells.filter((s) => s.action !== "skip");
 
       const run: AutopilotRun = {
         at: new Date().toISOString(),
-        attempted: changes.length + rebalances.length + channels.length + acted.length,
+        attempted: changes.length + rebalances.length + channels.length + acted.length + maxHtlc.length,
         applied:
           changes.filter((c) => c.ok).length +
           rebalances.filter((r) => r.ok).length +
           channels.filter((c) => c.ok).length +
-          acted.filter((s) => s.ok).length,
+          acted.filter((s) => s.ok).length +
+          maxHtlc.filter((m) => m.ok).length,
         failed:
           changes.filter((c) => !c.ok).length +
           rebalances.filter((r) => !r.ok).length +
           channels.filter((c) => !c.ok).length +
-          acted.filter((s) => !s.ok).length,
+          acted.filter((s) => !s.ok).length +
+          maxHtlc.filter((m) => !m.ok).length,
         changes,
         rebalances,
         channels,
         sells,
+        maxHtlc,
       };
 
       this.state.lastRunAt = run.at;

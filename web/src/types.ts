@@ -187,6 +187,16 @@ export interface AutopilotConfig {
   sellAutoRelist: boolean;
   sellAutoReprice: boolean;
   sellPricingMode: "fast" | "balanced" | "premium" | "auto";
+  maxHtlcEnabled: boolean;
+}
+
+export interface MaxHtlcChange {
+  id: string;
+  alias: string;
+  fromSat: number | null;
+  toSat: number;
+  ok: boolean;
+  error?: string;
 }
 
 export interface AutopilotChange {
@@ -233,6 +243,7 @@ export interface AutopilotRun {
   rebalances: AutopilotRebalance[];
   channels: AutopilotChannelOpen[];
   sells: AutopilotSell[];
+  maxHtlc?: MaxHtlcChange[];
 }
 
 export interface AutopilotState {
