@@ -22,6 +22,13 @@ standalone via Docker.
 - **Market (Amboss Magma)** — **buy** inbound liquidity (USD-priced) and **sell**
   your own: create / edit offers and fulfil orders (accept + open a channel to
   the buyer), manually or via the autopilot.
+- **LSP mode (beta)** — sell inbound channels **directly to wallets** speaking
+  the open LSPS1 standard (bLIP-51), with no marketplace in between: orders are
+  priced by the same profit-aware engine as Magma selling, paid via a **hold
+  invoice that only settles once the channel is opening** (every failure path
+  refunds the buyer automatically), and capital is guarded by the same reserve
+  and deployment caps. Includes graph discovery (feature bit 729), a shareable
+  buyer guide, and an optional clearnet-address announcement. Off by default.
 - **Wallet** — Lightning + on-chain: receive, send, decode and pay invoices.
 - **Routing** — a full forwards report (per-channel, daily, recent events).
 - **Autopilot** — a one-click **Strategy** (Max routing / Balanced / Max profit)
@@ -32,6 +39,11 @@ standalone via Docker.
   on recommended settings with safe caps, per-channel cooldowns and an on-chain
   reserve. Off until you enable it, and every fund-moving action is gated behind
   write access.
+- **More forwards** — the optional **Advertise routable size** pass keeps each
+  channel's gossiped max HTLC just under its spendable balance (power-of-2
+  buckets) so senders skip depleted channels, and the **Unserved demand** panel
+  shows the forwards your node had to refuse for lack of liquidity — exactly
+  where a rebalance pays for itself.
 
 ## Architecture
 

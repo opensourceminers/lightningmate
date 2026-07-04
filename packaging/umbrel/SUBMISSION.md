@@ -34,7 +34,7 @@ assets, provided in the PR). Docs: <https://github.com/getumbrel/umbrel-apps>.
 ## PR body template
 
 ```
-**Lightning Mate** v0.6.6 — profit-aware management & autopilot for an LND node.
+**Lightning Mate** vX.Y.Z — profit-aware management & autopilot for an LND node.
 
 - Source: https://github.com/opensourceminers/lightningmate (MIT)
 - Image: ghcr.io/opensourceminers/lightningmate (multi-arch, digest-pinned)

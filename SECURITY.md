@@ -11,9 +11,17 @@ security@opensourceminers.de (please don't open a public issue first).
   a write-capable macaroon.
 - **Minimal outbound traffic.** Beyond LND, outbound calls happen only for
   features you use: the optional fiat price lookup (mempool.space) when a
-  currency is set, and the Amboss Magma marketplace (api.amboss.space /
-  magma.amboss.tech) when you add an Amboss API key. Nothing else leaves your
-  node.
+  currency is set, the Amboss Magma marketplace (api.amboss.space /
+  magma.amboss.tech) when you add an Amboss API key, and — on a completed
+  liquidity sale with the service fee enabled — an LNURL-pay lookup of the
+  configured fee address. Nothing else leaves your node.
+- **LSP mode is off by default** and adds the only surface that processes input
+  from arbitrary network peers: LSPS1 (bLIP-51) JSON-RPC over BOLT8 custom
+  messages. It is rate-limited per peer, strictly validated, wrapped in a hard
+  crash boundary, and capital-guarded (on-chain reserve, per-channel and
+  aggregate deployment caps shared with Magma selling). Payments are collected
+  via **hold invoices that settle only after the channel's funding transaction
+  is broadcast** — every failure path cancels the invoice, refunding the buyer.
 - **Secrets** (`tls.cert`, macaroons) are read from the mounted LND data dir at
   runtime — never baked into the image, committed to git, or logged.
 - **Dependencies** are pinned and `npm audit` is kept at 0 known vulnerabilities
@@ -47,10 +55,13 @@ it:
 ```bash
 # in the Umbrel lightning app (or via lncli)
 lncli bakemacaroon \
-  info:read offchain:read onchain:read \
-  offchain:write onchain:write peers:write invoices:write \
+  info:read offchain:read onchain:read invoices:read \
+  offchain:write onchain:write peers:write invoices:write address:write \
   --save_to lightningmate.macaroon
 ```
+
+(`invoices:read` + `address:write` are used by LSP mode's hold-invoice flow;
+include them even if you don't plan to enable it — they grant no spend power.)
 
 Then in the app config:
 
