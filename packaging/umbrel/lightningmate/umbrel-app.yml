@@ -5,7 +5,7 @@ manifestVersion: 1
 id: lightningmate
 category: bitcoin
 name: Lightning Mate
-version: "0.6.10"
+version: "0.7.0"
 tagline: Profit-aware management & autopilot for your Lightning node
 description: >-
   Lightning Mate manages your Lightning node so you don't have to babysit it.
@@ -29,10 +29,35 @@ description: >-
   reserve caps.
 
 
+  LSP mode (beta) turns your node into a Lightning Service Provider: wallets
+  speaking the open LSPS1 standard (bLIP-51) can buy inbound channels from you
+  directly — priced automatically, paid via a hold invoice that only settles
+  once the channel is opening, refunded automatically on any failure. Off by
+  default.
+
+
   Lightning Mate signs in with the per-app password Umbrel generates for it
   (shown when you open the app), so no other app on your server can read your
   node or move your funds.
-releaseNotes: ""
+releaseNotes: >-
+  LSP mode (beta): sell inbound channels directly to wallets speaking the open
+  LSPS1 standard (bLIP-51) — a second demand source beside Magma with no
+  marketplace fee. Priced by the same profit-aware engine, paid via a hold
+  invoice that only settles once the channel is opening; every failure path
+  refunds the buyer automatically. Off by default (Settings → LSP mode).
+  Includes graph discovery (feature bit 729), a shareable buyer guide, and an
+  optional clearnet-address announcement for nodes with a static IP or DDNS.
+
+
+  More forwards: the new "Advertise routable size" autopilot option keeps each
+  channel's max HTLC just under its spendable balance so senders skip depleted
+  channels, and the new "Unserved demand" panel on the Rebalancing tab shows
+  the routing demand your node had to turn away — exactly where a rebalance
+  pays for itself.
+
+
+  Plus security hardening around the new LSP surface (shared capital
+  deployment cap across Magma + LSP sales, crash-proof peer-message handling).
 developer: opensourceminers.de
 website: https://opensourceminers.de
 dependencies:
