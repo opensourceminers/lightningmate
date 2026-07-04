@@ -200,6 +200,9 @@ export class Autopilot {
   /** Capital promised outside the autopilot (LSPS1 orders paid but not yet
    *  opened) — same budget, third demand source. Wired up in index.ts. */
   private externalCommittedSat: () => number = () => 0;
+  /** Capital already deployed into LSPS1-sold channels (unexpired leases) —
+   *  counts against the shared sellMaxDeploySats cap. Wired up in index.ts. */
+  private externalDeployedSat: () => number = () => 0;
 
   constructor(
     dataDir: string,
@@ -298,16 +301,22 @@ export class Autopilot {
   }
 
   /** Sell caps shared with LSP mode — one capital budget across both demand sources. */
-  sellCaps(): { maxChannelSats: number; reserveSats: number } {
+  sellCaps(): { maxChannelSats: number; reserveSats: number; maxDeploySats: number } {
     return {
       maxChannelSats: this.state.config.sellMaxChannelSats,
       reserveSats: this.state.config.sellReserveSats,
+      maxDeploySats: this.state.config.sellMaxDeploySats,
     };
   }
 
   /** Register the external (LSPS1) capital commitment source. */
   setExternalCommitted(fn: () => number): void {
     this.externalCommittedSat = fn;
+  }
+
+  /** Register the external (LSPS1) deployed-capital source (deploy-cap share). */
+  setExternalDeployed(fn: () => number): void {
+    this.externalDeployedSat = fn;
   }
 
   /** Total on-chain sats already spoken for: this run's own commitments plus
@@ -711,9 +720,10 @@ export class Autopilot {
     const { chain_balance } = await getChainBalance({ lnd: this.readLnd });
 
     // Capital already committed to currently-open sold channels (for the deploy cap).
-    const deployed = orders
-      .filter((o) => o.channelId && o.blocksUntilClosable > 0)
-      .reduce((s, o) => s + o.sizeSats, 0);
+    const deployed =
+      orders
+        .filter((o) => o.channelId && o.blocksUntilClosable > 0)
+        .reduce((s, o) => s + o.sizeSats, 0) + this.externalDeployedSat(); // LSPS1 shares the deploy cap
 
     // Adaptive pricing (mode "auto"): ratchet the price level UP when an order
     // fills (you could be charging more) and DOWN when the offer sits unsold —
@@ -867,9 +877,10 @@ export class Autopilot {
     const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
     const skip = (o: { id: string; sizeSats: number }, error: string) =>
       out.push({ orderId: o.id, action: "skip" as const, sizeSats: o.sizeSats, ok: false, error });
-    const deployed = orders
-      .filter((o) => o.channelId && o.blocksUntilClosable > 0)
-      .reduce((s, o) => s + o.sizeSats, 0);
+    const deployed =
+      orders
+        .filter((o) => o.channelId && o.blocksUntilClosable > 0)
+        .reduce((s, o) => s + o.sizeSats, 0) + this.externalDeployedSat(); // LSPS1 shares the deploy cap
     let extra = 0;
     let myChannels: { transaction_id: string; transaction_vout: number }[] | null = null;
 

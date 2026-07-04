@@ -63,6 +63,7 @@ function main(): void {
   // One capital budget across Magma + LSPS1: the autopilot's checks subtract
   // whatever LSPS1 has promised to paid-but-unopened orders.
   autopilot.setExternalCommitted(() => lsps1.committedSat());
+  autopilot.setExternalDeployed(() => lsps1.deployedSat());
   lsps1.start();
   // Failed-HTLC telemetry (read-only): unserved-demand history accrues from
   // day one, independent of any autopilot toggle.

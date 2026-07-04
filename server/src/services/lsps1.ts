@@ -235,8 +235,9 @@ export class Lsps1Service {
     private readonly readLnd: AuthenticatedLnd,
     private readonly writeLnd: AuthenticatedLnd | undefined,
     private readonly settings: SettingsStore,
-    /** Live sell caps (shared with Magma): max channel size + on-chain reserve. */
-    private readonly caps: () => { maxChannelSats: number; reserveSats: number },
+    /** Live sell caps (shared with Magma): max channel size, on-chain reserve,
+     *  aggregate deploy cap. */
+    private readonly caps: () => { maxChannelSats: number; reserveSats: number; maxDeploySats: number },
     /** Magma pricing mode + adaptive level, so both demand sources price alike. */
     private readonly pricingMode: () => { sellPricingMode: "fast" | "balanced" | "premium" | "auto"; adaptiveLevel: number },
     private readonly ambossKey: () => string,
@@ -352,6 +353,29 @@ export class Lsps1Service {
       .reduce((s, o) => s + o.lspBalanceSat, 0);
   }
 
+  /** Capital sitting in LSPS1-sold channels whose lease hasn't expired —
+   *  counts against the shared sellMaxDeploySats cap (as Magma's deployed does). */
+  deployedSat(): number {
+    const now = Date.now();
+    return this.orders
+      .filter(
+        (o) => o.orderState === "COMPLETED" && o.channel && new Date(o.channel.expiresAt).getTime() > now,
+      )
+      .reduce((s, o) => s + o.lspBalanceSat, 0);
+  }
+
+  /** Deploy-cap headroom for a NEW order: cap minus deployed (unexpired) minus
+   *  every open order (paid or not — an unpaid order reserves its size until it
+   *  expires, so two buyers can't oversell the cap together; MAX_PENDING_* keeps
+   *  the reservation window abuse-bounded). Magma's own deployed capital is
+   *  enforced on the autopilot side via setExternalDeployed. */
+  private deployHeadroomSat(): number {
+    const reserved = this.orders
+      .filter((o) => o.orderState === "CREATED")
+      .reduce((s, o) => s + o.lspBalanceSat, 0);
+    return Math.max(0, this.caps().maxDeploySats - this.deployedSat() - reserved);
+  }
+
   orderViews(): Lsps1OrderView[] {
     return this.orders.map((o) => ({
       orderId: o.orderId,
@@ -459,12 +483,20 @@ export class Lsps1Service {
   }
 
   private async onMessage(msg: { message: string; public_key: string; type: number }): Promise<void> {
-    if (msg.type !== LSPS0_MESSAGE_TYPE) return;
-    if (!this.settings.get().lspModeEnabled) return;
-    if (!this.allowPeer(msg.public_key)) return; // over budget → stay silent
-    const raw = Buffer.from(msg.message, "hex").toString("utf8");
-    const response = await this.dispatch(raw, msg.public_key);
-    if (response) await this.send(msg.public_key, response);
+    // Hard boundary: this handles input from ARBITRARY network peers, and the
+    // process-level unhandledRejection handler exits — nothing a peer sends may
+    // ever escape as a rejection, or a single message becomes a crash-loop DoS.
+    try {
+      if (msg.type !== LSPS0_MESSAGE_TYPE) return;
+      if (!this.settings.get().lspModeEnabled) return;
+      if (!this.allowPeer(msg.public_key)) return; // over budget → stay silent
+      const raw = Buffer.from(msg.message, "hex").toString("utf8");
+      const response = await this.dispatch(raw, msg.public_key);
+      if (response) await this.send(msg.public_key, response);
+    } catch (err) {
+      this.lastError = err instanceof Error ? err.message : String(err);
+      console.error(`[lsps1] peer message handling failed: ${this.lastError}`);
+    }
   }
 
   private async send(publicKey: string, payload: object): Promise<void> {
@@ -805,6 +837,11 @@ export class Lsps1Service {
     if (pending.length >= MAX_PENDING_TOTAL) {
       return rpcError(rid, 1, "Client rejected", { message: "LSP is at capacity — try again later" });
     }
+    // Aggregate deploy cap (shared with Magma selling): reject up front rather
+    // than refunding a paid order later.
+    if (lspBalanceSat > this.deployHeadroomSat()) {
+      return rpcError(rid, 1, "Client rejected", { message: "LSP is at its capital deployment cap — try again later" });
+    }
 
     const { feeTotalSat } = await this.quote(lspBalanceSat, expiryBlocks);
 
@@ -950,6 +987,12 @@ export class Lsps1Service {
       const deployable = await this.deployableSat(true);
       if (order.lspBalanceSat > deployable) {
         await this.failAndRefund(order, "insufficient on-chain capital at open time");
+        return;
+      }
+      // Deploy cap re-check at open time — catches a cap the user LOWERED
+      // after this order was created (create-time already serialized siblings).
+      if (this.deployedSat() + order.lspBalanceSat > this.caps().maxDeploySats) {
+        await this.failAndRefund(order, "capital deployment cap reached");
         return;
       }
 
