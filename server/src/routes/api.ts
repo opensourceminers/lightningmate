@@ -59,6 +59,7 @@ import type { RebalanceLog } from "../services/rebalanceLog.js";
 import { BackupStore, exportScb, getBackupStatus } from "../services/backup.js";
 import type { EarningsLog } from "../services/earningsLog.js";
 import type { Lsps1Service } from "../services/lsps1.js";
+import { getUnservedDemand, telemetryAgeDays } from "../services/htlcTelemetry.js";
 
 // Pull the numeric keys of a policy object out of the query string.
 function numericOverrides<T>(query: Request["query"], keys: (keyof T)[]): Partial<T> {
@@ -717,6 +718,24 @@ export function createApiRouter(
   router.get("/lsp/orders", (_req, res) => {
     res.json({ orders: lsps1.orderViews() });
   });
+
+  // Unserved demand — forwards we refused for lack of outbound liquidity,
+  // aggregated per outgoing channel (failed-HTLC telemetry).
+  router.get(
+    "/htlc/demand",
+    wrap(async (req, res) => {
+      const days = intIn(req.query.days, 1, 30) ?? 7;
+      const demand = getUnservedDemand(days);
+      // Join peer aliases so the UI can name the channels.
+      const channels = demand.length ? await getChannelsView(lnd) : [];
+      const alias = new Map(channels.map((c) => [c.id, c.peerAlias]));
+      res.json({
+        days,
+        trackedDays: telemetryAgeDays(),
+        channels: demand.map((d) => ({ ...d, alias: alias.get(d.outChannel) ?? d.outChannel })),
+      });
+    }),
+  );
 
   // Current BTC price in the chosen fiat currency (null when fiat is off).
   router.get(

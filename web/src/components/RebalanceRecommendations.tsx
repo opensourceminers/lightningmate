@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
-import type { FeeMode, OverrideMap, RebalanceLogResponse, RebalanceRecReport, RebalanceRecState } from "../types";
+import type { FeeMode, OverrideMap, RebalanceLogResponse, RebalanceRecReport, RebalanceRecState, UnservedDemandReport } from "../types";
 import { sats, satsCompact, timeAgo } from "../format";
 import { useUi } from "./Overlay";
 
@@ -49,11 +49,14 @@ export function RebalanceRecommendations() {
       .then((r) => (setData(r), setError(null)))
       .catch((e) => setError(e instanceof Error ? e.message : String(e)));
 
+  const [demand, setDemand] = useState<UnservedDemandReport | null>(null);
+
   useEffect(() => {
     void load();
     api.autopilotGet().then((s) => setCanWrite(s.canWrite)).catch(() => setCanWrite(false));
     api.rebalanceLog().then(setLog).catch(() => {});
     api.overrides().then(setOverrides).catch(() => {});
+    api.htlcDemand(7).then(setDemand).catch(() => {});
   }, []);
 
   const setOv = async (id: string, mode: FeeMode) => {
@@ -116,6 +119,42 @@ export function RebalanceRecommendations() {
         (raise the fee first). The autopilot runs the profitable ones when <strong>Auto-rebalance</strong> is on;
         you can also run one now.{canWrite ? null : <> Running is disabled (read-only macaroon).</>}
       </div>
+
+      {demand && demand.channels.some((d) => d.liquidityCount > 0) ? (
+        <>
+          <h3 className="sub">
+            Unserved demand <span className="muted">· refused forwards, last {Math.max(1, Math.min(demand.days, demand.trackedDays || demand.days))}d</span>
+          </h3>
+          <div className="dryrun-banner">
+            Payments that wanted to route through these channels but were <strong>refused for lack of
+            outbound liquidity</strong> — demand you didn&apos;t earn on. This is where a rebalance (or a
+            bigger channel) pays for itself.
+          </div>
+          <table className="fee-table">
+            <thead>
+              <tr>
+                <th>Out channel</th>
+                <th className="num">Refused</th>
+                <th className="num">Volume (sat)</th>
+                <th className="num">Other fails</th>
+              </tr>
+            </thead>
+            <tbody>
+              {demand.channels
+                .filter((d) => d.liquidityCount > 0)
+                .slice(0, 8)
+                .map((d) => (
+                  <tr key={d.outChannel}>
+                    <td>{d.alias}</td>
+                    <td className="num">{d.liquidityCount}</td>
+                    <td className="num">{sats(d.liquiditySats)}</td>
+                    <td className="num muted">{d.otherCount}</td>
+                  </tr>
+                ))}
+            </tbody>
+          </table>
+        </>
+      ) : null}
 
       {error ? <p className="banner error">{error}</p> : null}
       {!data && !error ? <p className="muted">Probing routes…</p> : null}

@@ -12,6 +12,7 @@ import { AmbossStore } from "./services/ambossStore.js";
 import { BackupStore } from "./services/backup.js";
 import { EarningsLog } from "./services/earningsLog.js";
 import { Lsps1Service } from "./services/lsps1.js";
+import { initHtlcTelemetry, startHtlcTelemetry } from "./services/htlcTelemetry.js";
 
 // Never let a startup error vanish silently — print it so it's diagnosable.
 process.on("uncaughtException", (err) => {
@@ -63,6 +64,10 @@ function main(): void {
   // whatever LSPS1 has promised to paid-but-unopened orders.
   autopilot.setExternalCommitted(() => lsps1.committedSat());
   lsps1.start();
+  // Failed-HTLC telemetry (read-only): unserved-demand history accrues from
+  // day one, independent of any autopilot toggle.
+  initHtlcTelemetry(config.dataDir);
+  startHtlcTelemetry(lnd);
 
   const app = express();
   app.disable("x-powered-by");

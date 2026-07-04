@@ -48,6 +48,7 @@ import type {
   BackupStatus,
   SuggestionPolicy,
   SuggestionsResponse,
+  UnservedDemandReport,
 } from "./types";
 
 // ── Session token ─────────────────────────────────────────────────────────────
@@ -110,6 +111,7 @@ export const api = {
   setSettings: (s: Partial<AppSettings>) => post<AppSettings>("/settings", s),
   lspStatus: () => get<LspStatus>("/lsp/status"),
   lspOrders: () => get<{ orders: LspOrder[] }>("/lsp/orders"),
+  htlcDemand: (days = 7) => get<UnservedDemandReport>(`/htlc/demand?days=${days}`),
   price: () => get<PriceInfo>("/price"),
   overrides: () => get<OverrideMap>("/overrides"),
   setOverride: (channelId: string, mode: FeeMode, fixedPpm?: number) =>

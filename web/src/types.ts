@@ -190,6 +190,19 @@ export interface AutopilotConfig {
   maxHtlcEnabled: boolean;
 }
 
+/** Failed-HTLC telemetry: routing demand we refused for lack of liquidity. */
+export interface UnservedDemandReport {
+  days: number;
+  trackedDays: number;
+  channels: {
+    outChannel: string;
+    alias: string;
+    liquidityCount: number;
+    liquiditySats: number;
+    otherCount: number;
+  }[];
+}
+
 export interface MaxHtlcChange {
   id: string;
   alias: string;
