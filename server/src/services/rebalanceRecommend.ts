@@ -54,11 +54,62 @@ export const REBAL_REC_DEFAULTS: RebalanceRecConfig = {
   targetDeficitThreshold: 0.2,
   sourceExcessThreshold: 0.2,
   feeAdjustFirstRelativeThreshold: 0.2,
-  minRevenuePpm: 100,
+  // Only require SOME proven outbound earnings (≥ the fee floor). A flat 100 ppm
+  // here structurally excluded volume-first channels (priced 25–80 to win flow)
+  // from ever being refilled, even when a cheap route made the refill profitable.
+  // The real profitability check is the per-route economic gate (maxCostPpm /
+  // payback / net profit) in probe(), which correctly rejects channels too cheap
+  // to refill — so this pre-filter only needs to prove the channel earns at all.
+  minRevenuePpm: 25,
   newChannelProtectionDays: 3,
   maxCandidates: 8,
   probeCeilingPpm: 3000,
 };
+
+export interface RebalancePlan {
+  run: RebalanceRecommendation[];
+  skipped: { rec: RebalanceRecommendation; reason: string }[];
+}
+
+/**
+ * Pure planning step for the autopilot's rebalance execution. Orders the
+ * already-eligible recommendations by expected net profit (so the run's slots
+ * and the daily budget go to the BEST moves first, not the biggest channels —
+ * the recommender returns them in capacity order), takes at most `maxPerRun`,
+ * and pre-skips any whose estimated route fee can't fit the remaining daily
+ * budget WITHOUT abandoning the cheaper moves behind it (the old executor loop
+ * `break`'d on the first over-budget move, starving cheaper profitable ones).
+ * The executor still guards against actual over-spend as real fees come in.
+ * Separated out so the money-affecting selection is unit-testable without a
+ * live node.
+ */
+export function selectRebalanceRuns(
+  eligible: RebalanceRecommendation[],
+  opts: { dailyBudgetSats: number; alreadySpentSats: number; maxPerRun: number },
+): RebalancePlan {
+  const ordered = [...eligible]
+    .sort((a, b) => (b.expectedNetProfitSats ?? 0) - (a.expectedNetProfitSats ?? 0))
+    .slice(0, Math.max(0, opts.maxPerRun));
+  const run: RebalanceRecommendation[] = [];
+  const skipped: { rec: RebalanceRecommendation; reason: string }[] = [];
+  let projectedSpend = opts.alreadySpentSats;
+  for (const rec of ordered) {
+    const remaining = opts.dailyBudgetSats > 0 ? opts.dailyBudgetSats - projectedSpend : Infinity;
+    const estFee = rec.estimatedRouteFeeSats ?? 0;
+    if (opts.dailyBudgetSats > 0 && remaining < estFee) {
+      skipped.push({
+        rec,
+        reason:
+          `skipped: ${Math.max(0, remaining)} sat left of the ${opts.dailyBudgetSats} sat daily budget — ` +
+          `too little for this move (~${estFee} sat)`,
+      });
+      continue; // a cheaper later move may still fit
+    }
+    run.push(rec);
+    projectedSpend += estFee; // project with the estimate so later moves see it shrink
+  }
+  return { run, skipped };
+}
 
 export type RebalanceRecState =
   | "not_needed"
@@ -343,17 +394,25 @@ function classify(
     return rec;
   }
 
-  // §1 fee-adjust-first — the heart
-  const feeIncreaseNeeded =
-    fee?.targetPpm != null && rec.currentPpm > 0 && fee.targetPpm > rec.currentPpm * (1 + cfg.feeAdjustFirstRelativeThreshold);
-  const belowProfitFloor = rec.profitFloorPpm != null && rec.currentPpm < rec.profitFloorPpm;
-  if (feeIncreaseNeeded || belowProfitFloor || fee?.state === "recovering_cost" || fee?.state === "protecting_liquidity") {
+  // §1 fee-adjust-first — but ONLY when refilling would be UNPROFITABLE at the
+  // current price, i.e. the outbound fee is below this channel's own refill-cost
+  // floor (its rebalance cost basis × safety margin). Then raising the fee must
+  // come first — buying liquidity back to route it out below cost just loses
+  // money each cycle. We deliberately do NOT block here merely because the
+  // channel is draining, is in "protect" mode, or the fee engine wants a higher
+  // price: a PROFITABLE refill that keeps serving demand beats choking it with a
+  // higher fee. Whether it's actually profitable is decided by the per-route
+  // economic gate below (maxCostPpm / payback / net profit); the fee engine still
+  // raises the fee in parallel on its own track. Removing the old blanket
+  // protect/target blockers is what breaks the fee-raise↔never-refill deadlock on
+  // exactly the hot channels that were draining and turning away demand.
+  const belowRefillCost = rec.profitFloorPpm != null && rec.currentPpm < rec.profitFloorPpm;
+  if (belowRefillCost) {
     rec.state = "fee_adjust_first";
-    rec.blockedBy.push("fee below target / profit floor");
+    rec.blockedBy.push("fee below refill-cost floor");
     rec.reasons.push(
-      `channel is draining, but its fee is below target/profit floor (now ${rec.currentPpm} ppm` +
-        `${fee?.targetPpm != null ? `, target ${fee.targetPpm}` : ""}${rec.profitFloorPpm != null ? `, floor ${rec.profitFloorPpm}` : ""}` +
-        `) — raise the fee before buying liquidity back`,
+      `draining, but the current fee (${rec.currentPpm} ppm) is below this channel's refill-cost floor` +
+        ` (${rec.profitFloorPpm} ppm) — raising the fee must come first, else you'd route it back out below cost`,
     );
     return rec;
   }

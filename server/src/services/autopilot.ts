@@ -19,7 +19,7 @@ import {
 } from "./fees.js";
 import { getFeeRecommendations, type FeeRecConfig } from "./feeRecommend.js";
 import { DEFAULT_REBALANCE_POLICY, executeRebalance, type RebalancePolicy } from "./rebalance.js";
-import { getRebalanceRecommendations } from "./rebalanceRecommend.js";
+import { getRebalanceRecommendations, selectRebalanceRuns } from "./rebalanceRecommend.js";
 import type { RebalanceLog } from "./rebalanceLog.js";
 import type { OverridesStore } from "./overrides.js";
 import type { EarningsLog } from "./earningsLog.js";
@@ -556,19 +556,33 @@ export class Autopilot {
       this.overrides.all(),
       this.rebalanceRecOverrides(),
     );
-    const eligible = report.recommendations
-      .filter(
-        (r) =>
-          r.wouldRebalance &&
-          r.selectedSourceChannel &&
-          r.recommendedAmount &&
-          this.rebalanceCooldownOk(r.channelId, rebalanceCooldownMinutes),
-      )
-      .slice(0, maxRebalancesPerRun);
+    const eligible = report.recommendations.filter(
+      (r) =>
+        r.wouldRebalance &&
+        r.selectedSourceChannel &&
+        r.recommendedAmount &&
+        this.rebalanceCooldownOk(r.channelId, rebalanceCooldownMinutes),
+    );
+    // Pure planner: order by profitability, cap to maxPerRun, and pre-skip moves
+    // that can't fit the remaining daily budget (without abandoning cheaper ones).
+    const plan = selectRebalanceRuns(eligible, {
+      dailyBudgetSats: dailyBudget,
+      alreadySpentSats: this.state.perDayRebalanceSpend.sats,
+      maxPerRun: maxRebalancesPerRun,
+    });
 
-    const out: AutopilotRebalance[] = [];
-    for (const r of eligible) {
-      // Stop once today's rebalance-fee budget is used up.
+    const out: AutopilotRebalance[] = plan.skipped.map((s) => ({
+      alias: s.rec.alias,
+      amountSats: s.rec.recommendedAmount as number,
+      feeSats: null,
+      costPpm: null,
+      ok: false,
+      error: s.reason,
+    }));
+
+    for (const r of plan.run) {
+      // Actual-spend backstop: an earlier move's real fee may exceed its estimate,
+      // so re-check the live budget before each execution — never overshoot.
       if (dailyBudget > 0 && this.state.perDayRebalanceSpend.sats >= dailyBudget) {
         out.push({
           alias: r.alias,
@@ -578,7 +592,7 @@ export class Autopilot {
           ok: false,
           error: `skipped: daily rebalance budget reached (${this.state.perDayRebalanceSpend.sats}/${dailyBudget} sat)`,
         });
-        break;
+        continue;
       }
       const res = await executeRebalance(this.readLnd, writeLnd, {
         targetId: r.channelId,
