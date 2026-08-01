@@ -74,6 +74,8 @@ export interface FlowSummary {
   recent: ForwardEvent[];
 }
 
+export type ChannelFlowDirection = "draining" | "filling" | "balanced";
+
 export interface ChannelForwardStat {
   channelId: string;
   alias: string;
@@ -81,7 +83,20 @@ export interface ChannelForwardStat {
   routedOutSats: number;
   routedInSats: number;
   feesEarnedSats: number;
+  localRatio: number;
+  capacity: number;
+  flow: ChannelFlowDirection;
   spark: number[];
+}
+
+export interface RoutingCorridor {
+  inChannel: string;
+  outChannel: string;
+  inAlias: string;
+  outAlias: string;
+  forwards: number;
+  routedSats: number;
+  feesSats: number;
 }
 
 export interface DailyBucket {
@@ -108,6 +123,7 @@ export interface ForwardsReport {
   maxForwardSats: number;
   busiestDay: string | null;
   perChannel: ChannelForwardStat[];
+  corridors: RoutingCorridor[];
   daily: DailyBucket[];
   recent: ResolvedForward[];
 }

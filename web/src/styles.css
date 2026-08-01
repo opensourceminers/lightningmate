@@ -814,6 +814,16 @@ tr.pending td { opacity: 0.9; }
 }
 .dryrun-banner strong { color: var(--text); }
 .dryrun-banner code { color: var(--accent-2); }
+.dryrun-banner.warn { border-left-color: #fbbf24; }
+.dryrun-banner.warn strong { color: #fbbf24; }
+
+/* Routing flow tags (draining / filling / balanced) */
+.flow-tag { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
+.flow-drain { color: #fbbf24; background: rgba(251, 191, 36, 0.12); }
+.flow-drain-urgent { color: var(--red); background: rgba(248, 113, 113, 0.14); }
+.flow-fill { color: var(--green); background: rgba(52, 211, 153, 0.12); }
+.flow-balanced { color: var(--muted); background: rgba(148, 163, 184, 0.1); }
+.fee-table tr.row-urgent { background: rgba(248, 113, 113, 0.06); }
 
 .policy-controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 16px; }
 .policy-field { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--muted); }

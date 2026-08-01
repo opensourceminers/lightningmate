@@ -20,13 +20,20 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
 
   // Amboss / Magma connection
   const [ambossConnected, setAmbossConnected] = useState<boolean | null>(null);
+  const [keyValid, setKeyValid] = useState<boolean | null | undefined>(undefined);
   const [keyInput, setKeyInput] = useState("");
   const [ambossBusy, setAmbossBusy] = useState(false);
   const [ambossError, setAmbossError] = useState<string | null>(null);
 
   useEffect(() => {
     api.getSettings().then(setSettings).catch((e) => setError(e instanceof Error ? e.message : String(e)));
-    api.ambossStatus().then((s) => setAmbossConnected(s.connected)).catch(() => setAmbossConnected(false));
+    api
+      .ambossStatus()
+      .then((s) => {
+        setAmbossConnected(s.connected);
+        setKeyValid(s.keyValid);
+      })
+      .catch(() => setAmbossConnected(false));
   }, []);
 
   const connectAmboss = async () => {
@@ -36,6 +43,7 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
     try {
       await api.ambossConnect(keyInput.trim());
       setAmbossConnected(true);
+      setKeyValid(true);
       setKeyInput("");
     } catch (e) {
       setAmbossError(e instanceof Error ? e.message : String(e));
@@ -50,6 +58,7 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
     try {
       await api.ambossDisconnect();
       setAmbossConnected(false);
+      setKeyValid(undefined);
     } catch (e) {
       setAmbossError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -222,10 +231,30 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
       </div>
       {ambossConnected === null ? (
         <p className="muted">Checking…</p>
+      ) : ambossConnected && keyValid === false ? (
+        <>
+          <div className="amboss-row">
+            <span className="conn down">
+              <i /> Amboss key expired or revoked
+            </span>
+            <button className="reset" disabled={ambossBusy} onClick={() => void disconnectAmboss()}>
+              {ambossBusy ? "…" : "Reconnect"}
+            </button>
+          </div>
+          <p className="banner error">
+            Amboss is rejecting your stored key, so buying and <strong>selling on Magma silently
+            do nothing</strong> — no offers are listed and no orders are fulfilled. Get a fresh key
+            at{" "}
+            <a href="https://account.amboss.tech/settings/api-keys" target="_blank" rel="noreferrer">
+              account.amboss.tech
+            </a>{" "}
+            and reconnect below.
+          </p>
+        </>
       ) : ambossConnected ? (
         <div className="amboss-row">
           <span className="conn up">
-            <i /> Amboss connected
+            <i /> Amboss connected{keyValid === true ? " · key valid" : ""}
           </span>
           <button className="reset" disabled={ambossBusy} onClick={() => void disconnectAmboss()}>
             {ambossBusy ? "…" : "Disconnect"}

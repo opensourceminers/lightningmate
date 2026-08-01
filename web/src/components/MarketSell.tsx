@@ -58,6 +58,7 @@ const asPct = (ppmPerYear: number) => `${(ppmPerYear / 10_000).toFixed(2)}%`;
 export function MarketSell() {
   const ui = useUi();
   const [connected, setConnected] = useState<boolean | null>(null);
+  const [keyValid, setKeyValid] = useState<boolean | null | undefined>(undefined);
   const [feeBps, setFeeBps] = useState(0);
   const [offers, setOffers] = useState<MyOffer[]>([]);
   const [draft, setDraft] = useState<Draft>(DEFAULTS);
@@ -76,6 +77,7 @@ export function MarketSell() {
       const s = await api.ambossStatus();
       conn = s.connected;
       setConnected(s.connected);
+      setKeyValid(s.keyValid);
       setFeeBps(s.saleFeeBps ?? 0);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -191,6 +193,13 @@ export function MarketSell() {
           </span>
         ) : null}
       </div>
+      {keyValid === false ? (
+        <p className="banner error">
+          Your Amboss key is expired or revoked — Magma selling <strong>silently does nothing</strong>{" "}
+          (no offers listed, no orders fulfilled). Reconnect with a fresh key in <strong>Settings</strong>{" "}
+          to start selling.
+        </p>
+      ) : null}
       <div className="dryrun-banner">
         Lease your idle liquidity where it earns more than routing. <strong>Important:</strong> when a buyer
         orders you must open a channel to them in time or your seller score drops — the Autopilot can do this

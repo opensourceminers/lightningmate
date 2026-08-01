@@ -198,7 +198,7 @@ export const api = {
     setToken("");
     onUnauthorized?.();
   },
-  ambossStatus: () => get<{ connected: boolean; saleFeeBps?: number }>("/amboss/status"),
+  ambossStatus: () => get<{ connected: boolean; keyValid?: boolean | null; saleFeeBps?: number }>("/amboss/status"),
   ambossMarket: () => get<MarketView>("/amboss/market"),
   ambossConnect: (apiKey: string) =>
     post<{ ok: boolean; connected: boolean; error?: string }>("/amboss/key", { apiKey }),

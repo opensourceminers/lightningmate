@@ -132,6 +132,12 @@ export async function getFlowSummary(
 
 // ── Forwards report (Thunderhub-style overview) ───────────────────────────────
 
+/** Which way liquidity actually moved through a channel over the window.
+ *  draining = mostly routed OUT (local balance falls → will deplete);
+ *  filling  = mostly routed IN (local balance rises → a natural rebalance source);
+ *  balanced = two-way flow. */
+export type ChannelFlowDirection = "draining" | "filling" | "balanced";
+
 export interface ChannelForwardStat {
   channelId: string;
   alias: string;
@@ -139,8 +145,25 @@ export interface ChannelForwardStat {
   routedOutSats: number;
   routedInSats: number;
   feesEarnedSats: number;
+  /** Current outbound share (local / (local+remote)), 0..1 — for urgency. */
+  localRatio: number;
+  capacity: number;
+  flow: ChannelFlowDirection;
   /** Daily fees earned, aligned to the report's `daily` dates (for sparklines). */
   spark: number[];
+}
+
+/** A routing corridor: an incoming→outgoing channel pair that actually carried
+ *  flow. Reveals which channel pairs are complementary — a profitable route
+ *  needs a good source AND a good sink; killing either end kills the corridor. */
+export interface RoutingCorridor {
+  inChannel: string;
+  outChannel: string;
+  inAlias: string;
+  outAlias: string;
+  forwards: number;
+  routedSats: number;
+  feesSats: number;
 }
 
 export interface DailyBucket {
@@ -167,6 +190,7 @@ export interface ForwardsReport {
   maxForwardSats: number;
   busiestDay: string | null;
   perChannel: ChannelForwardStat[];
+  corridors: RoutingCorridor[];
   daily: DailyBucket[];
   recent: ResolvedForward[];
 }
@@ -180,17 +204,33 @@ export async function getForwardsReport(
     getChannelsView(lnd),
   ]);
   const aliasById = new Map(channels.map((c) => [c.id, c.peerAlias]));
+  const chanInfo = new Map(channels.map((c) => [c.id, { localRatio: c.localRatio, capacity: c.capacity }]));
   const name = (id: string): string => aliasById.get(id) ?? id;
 
   const byChannel = new Map<string, ChannelForwardStat>();
   const ensure = (id: string): ChannelForwardStat => {
     let s = byChannel.get(id);
     if (!s) {
-      s = { channelId: id, alias: name(id), forwardCount: 0, routedOutSats: 0, routedInSats: 0, feesEarnedSats: 0, spark: [] };
+      const info = chanInfo.get(id);
+      s = {
+        channelId: id,
+        alias: name(id),
+        forwardCount: 0,
+        routedOutSats: 0,
+        routedInSats: 0,
+        feesEarnedSats: 0,
+        localRatio: info?.localRatio ?? 0,
+        capacity: info?.capacity ?? 0,
+        flow: "balanced",
+        spark: [],
+      };
       byChannel.set(id, s);
     }
     return s;
   };
+
+  // Routing corridors: incoming→outgoing channel pairs that carried flow.
+  const pairs = new Map<string, { forwards: number; routed: number; feeMsat: number }>();
 
   const dayMap = new Map<string, DailyBucket>();
   const dayFeeMsat = new Map<string, number>(); // date -> fee msat
@@ -224,13 +264,45 @@ export async function getForwardsReport(
       perChanDayMsat.set(e.outgoingChannel, chanDays);
     }
     chanDays.set(date, (chanDays.get(date) ?? 0) + e.feeMsat);
+
+    const pairKey = `${e.incomingChannel}>${e.outgoingChannel}`;
+    const p = pairs.get(pairKey) ?? { forwards: 0, routed: 0, feeMsat: 0 };
+    p.forwards += 1;
+    p.routed += e.tokens;
+    p.feeMsat += e.feeMsat;
+    pairs.set(pairKey, p);
   }
 
-  // Convert accumulated millisats → sats once.
-  for (const [id, msat] of chanFeeMsat) {
-    const s = byChannel.get(id);
-    if (s) s.feesEarnedSats = Math.round(msat / 1000);
+  // Convert accumulated millisats → sats once, and classify the flow direction.
+  for (const s of byChannel.values()) {
+    const msat = chanFeeMsat.get(s.channelId);
+    if (msat) s.feesEarnedSats = Math.round(msat / 1000);
+    const total = s.routedOutSats + s.routedInSats;
+    s.flow =
+      total === 0
+        ? "balanced"
+        : s.routedOutSats / total >= 0.75
+          ? "draining"
+          : s.routedOutSats / total <= 0.25
+            ? "filling"
+            : "balanced";
   }
+
+  const corridors: RoutingCorridor[] = [...pairs.entries()]
+    .map(([key, p]) => {
+      const [inC, outC] = key.split(">");
+      return {
+        inChannel: inC,
+        outChannel: outC,
+        inAlias: name(inC),
+        outAlias: name(outC),
+        forwards: p.forwards,
+        routedSats: p.routed,
+        feesSats: Math.round(p.feeMsat / 1000),
+      };
+    })
+    .sort((a, b) => b.feesSats - a.feesSats)
+    .slice(0, 8);
 
   // Continuous daily series (fill gaps with zeros) for the chart.
   const daily: DailyBucket[] = [];
@@ -275,6 +347,7 @@ export async function getForwardsReport(
     maxForwardSats: maxForward,
     busiestDay,
     perChannel,
+    corridors,
     daily,
     recent,
   };

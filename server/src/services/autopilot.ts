@@ -711,8 +711,14 @@ export class Autopilot {
     let orders;
     try {
       orders = (await getMyOrders(this.amboss.getKey())).orders.filter((o) => o.side === "SELL");
-    } catch {
-      return []; // Amboss unreachable — retry next run
+    } catch (err) {
+      // An invalid/expired key rejects every authenticated call — flip the
+      // stored validity so the UI surfaces "reconnect" instead of the whole
+      // selling path silently no-opping run after run.
+      if (/unauthorized|forbidden|invalid.*token/i.test(err instanceof Error ? err.message : String(err))) {
+        this.amboss.markInvalid();
+      }
+      return []; // Amboss unreachable or key rejected — retry next run
     }
 
     const key = this.amboss.getKey();

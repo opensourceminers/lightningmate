@@ -900,9 +900,15 @@ export function createApiRouter(
   // ── Amboss Magma (liquidity marketplace) ────────────────────────────────────
   // Reads (the marketplace + price) need no key. The key is stored per-install
   // and used later for buying/selling. All behind the app login gate already.
-  router.get("/amboss/status", (_req, res) => {
-    res.json({ connected: amboss.hasKey(), saleFeeBps: saleFeeConfig().bps });
-  });
+  router.get(
+    "/amboss/status",
+    wrap(async (_req, res) => {
+      // Report real key validity (cached), not just presence — a key that
+      // expired/was revoked otherwise shows "connected" while Magma silently fails.
+      const keyValid = await amboss.checkValidity();
+      res.json({ connected: amboss.hasKey(), keyValid, saleFeeBps: saleFeeConfig().bps });
+    }),
+  );
 
   router.get(
     "/amboss/market",

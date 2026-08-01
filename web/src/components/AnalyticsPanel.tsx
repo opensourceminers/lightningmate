@@ -164,7 +164,7 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
     <div>
       <div className="subnav an-head">
         <div className="an-subnav">
-          {([["performance", "Performance"], ["forwards", "Forwards"]] as [Sub, string][]).map(([id, label]) => (
+          {([["performance", "Performance"], ["forwards", "Routing"]] as [Sub, string][]).map(([id, label]) => (
             <button key={id} className={`subtab ${sub === id ? "active" : ""}`} onClick={() => setSub(id)}>
               {label}
             </button>
