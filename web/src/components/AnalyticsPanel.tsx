@@ -191,20 +191,15 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
         <>
           <div className="an-card-grid">
             <Kpi
-              label={`Net profit · ${days}d`}
+              label={`Routing profit · ${days}d`}
               value={`${kpis.net >= 0 ? "+" : "−"}${sats(Math.abs(kpis.net))}`}
               unit="sat"
               tone={kpis.net >= 0 ? "green" : "cost"}
               sub="routing revenue − rebalancing"
             />
-            <Kpi
-              label="Node yield"
-              value={kpis.nodeYield.toFixed(2)}
-              unit="% APY"
-              sub="fees earned on deployed capital"
-            />
             <Kpi label="Routing revenue" value={sats(kpis.revenue)} unit="sat" tone="green" sub={`${fr.totalForwards} forwards`} />
             <Kpi label="Routed volume" value={satsCompact(fr.totalRoutedSats)} unit="sat" sub={`avg ${fr.avgFeePpm} ppm earned`} />
+            <Kpi label="Node yield" value={kpis.nodeYield.toFixed(2)} unit="% APY" sub="on deployed capital" />
             <Kpi
               label="Rebalancing"
               value={kpis.rebalCost ? `−${sats(kpis.rebalCost)}` : "0"}
@@ -212,9 +207,27 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
               tone={kpis.rebalCost ? "cost" : undefined}
               sub={`${kpis.rebalCount} run${kpis.rebalCount === 1 ? "" : "s"}`}
             />
-            {magma && (kpis.magmaSold > 0 || kpis.magmaNet !== 0) ? (
-              <Kpi label="Magma leases" value={`${kpis.magmaNet >= 0 ? "+" : "−"}${sats(Math.abs(kpis.magmaNet))}`} unit="sat" tone="green" sub={`${kpis.magmaSold} sold · net`} />
-            ) : null}
+            <Kpi
+              label="Rebalance ROI"
+              value={outcomes?.rebalances.avgEarnedBackPct != null ? String(outcomes.rebalances.avgEarnedBackPct) : "—"}
+              unit={outcomes?.rebalances.avgEarnedBackPct != null ? "% back" : undefined}
+              tone={outcomes?.rebalances.avgEarnedBackPct != null ? (outcomes.rebalances.avgEarnedBackPct >= 100 ? "green" : "cost") : undefined}
+              sub={outcomes && outcomes.rebalances.measured > 0 ? `${outcomes.rebalances.paidBackCount}/${outcomes.rebalances.measured} paid back` : "no data yet"}
+            />
+            <Kpi
+              label="Fee tuning"
+              value={outcomes?.fees.avgRevenueDeltaPct != null ? `${outcomes.fees.avgRevenueDeltaPct >= 0 ? "+" : ""}${Math.round(outcomes.fees.avgRevenueDeltaPct * 100)}` : "—"}
+              unit={outcomes?.fees.avgRevenueDeltaPct != null ? "% rev" : undefined}
+              tone={outcomes?.fees.avgRevenueDeltaPct != null ? (outcomes.fees.avgRevenueDeltaPct >= 0 ? "green" : "cost") : undefined}
+              sub={outcomes && outcomes.fees.measured > 0 ? `${outcomes.fees.measured} change${outcomes.fees.measured === 1 ? "" : "s"} · ${outcomes.fees.raises}↑ ${outcomes.fees.cuts}↓` : "no data yet"}
+            />
+            <Kpi
+              label="Magma leases"
+              value={kpis.magmaSold > 0 || kpis.magmaNet !== 0 ? `${kpis.magmaNet >= 0 ? "+" : "−"}${sats(Math.abs(kpis.magmaNet))}` : "—"}
+              unit={kpis.magmaSold > 0 || kpis.magmaNet !== 0 ? "sat" : undefined}
+              tone={kpis.magmaSold > 0 || kpis.magmaNet !== 0 ? "green" : undefined}
+              sub={kpis.magmaSold > 0 ? `${kpis.magmaSold} sold · net` : "none sold yet"}
+            />
           </div>
 
           <TrendChart fr={fr} />
@@ -264,55 +277,37 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
             )}
           </section>
 
-          {outcomes && (outcomes.fees.measured > 0 || outcomes.rebalances.measured > 0) ? (
+          {outcomes && outcomes.fees.items.length > 0 ? (
             <section className="panel">
               <div className="panel-head">
-                <h2>Did the autopilot pay off? <span className="muted">· measured outcomes</span></h2>
+                <h2>Fee changes <span className="muted">· measured revenue impact vs the prior week</span></h2>
               </div>
-              <div className="an-card-grid">
-                <Kpi
-                  label="Fee changes"
-                  value={outcomes.fees.avgRevenueDeltaPct != null ? `${outcomes.fees.avgRevenueDeltaPct >= 0 ? "+" : ""}${Math.round(outcomes.fees.avgRevenueDeltaPct * 100)}` : "—"}
-                  unit="% rev"
-                  tone={outcomes.fees.avgRevenueDeltaPct != null && outcomes.fees.avgRevenueDeltaPct >= 0 ? "green" : outcomes.fees.avgRevenueDeltaPct != null ? "cost" : undefined}
-                  sub={`${outcomes.fees.measured} change${outcomes.fees.measured === 1 ? "" : "s"} · ${outcomes.fees.raises}↑ ${outcomes.fees.cuts}↓ · revenue vs prior week`}
-                />
-                <Kpi
-                  label="Rebalance ROI"
-                  value={outcomes.rebalances.avgEarnedBackPct != null ? `${outcomes.rebalances.avgEarnedBackPct}` : "—"}
-                  unit="% earned back"
-                  tone={outcomes.rebalances.avgEarnedBackPct != null && outcomes.rebalances.avgEarnedBackPct >= 100 ? "green" : outcomes.rebalances.avgEarnedBackPct != null ? "cost" : undefined}
-                  sub={`${outcomes.rebalances.paidBackCount}/${outcomes.rebalances.measured} paid back · ${outcomes.rebalances.netSats >= 0 ? "+" : "−"}${sats(Math.abs(outcomes.rebalances.netSats))} sat net (${outcomes.measureWindowDays}d)`}
-                />
-              </div>
-              {outcomes.fees.items.length ? (
-                <table className="fee-table">
-                  <thead>
-                    <tr>
-                      <th>Channel</th>
-                      <th className="num">Fee</th>
-                      <th className="num">Daily rev before → after</th>
-                      <th className="num">Δ</th>
+              <table className="fee-table">
+                <thead>
+                  <tr>
+                    <th>Channel</th>
+                    <th className="num">Fee</th>
+                    <th className="num">Daily rev before → after</th>
+                    <th className="num">Δ</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {outcomes.fees.items.slice(0, 12).map((f, i) => (
+                    <tr key={`${f.channelId}-${i}`}>
+                      <td className="an-alias">{f.alias}</td>
+                      <td className="num">
+                        {f.fromPpm} <span className={f.raised ? "delta-up" : "delta-down"}>→ {f.toPpm}</span>
+                      </td>
+                      <td className="num muted">
+                        {f.beforeDailyAvgSat} → {f.afterDailyAvgSat} sat
+                      </td>
+                      <td className={`num net ${f.deltaPct == null ? "" : f.deltaPct >= 0 ? "green" : "cost"}`}>
+                        {f.deltaPct == null ? "—" : `${f.deltaPct >= 0 ? "+" : ""}${Math.round(f.deltaPct * 100)}%`}
+                      </td>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {outcomes.fees.items.slice(0, 12).map((f, i) => (
-                      <tr key={`${f.channelId}-${i}`}>
-                        <td className="an-alias">{f.alias}</td>
-                        <td className="num">
-                          {f.fromPpm} <span className={f.raised ? "delta-up" : "delta-down"}>→ {f.toPpm}</span>
-                        </td>
-                        <td className="num muted">
-                          {f.beforeDailyAvgSat} → {f.afterDailyAvgSat} sat
-                        </td>
-                        <td className={`num net ${f.deltaPct == null ? "" : f.deltaPct >= 0 ? "green" : "cost"}`}>
-                          {f.deltaPct == null ? "—" : `${f.deltaPct >= 0 ? "+" : ""}${Math.round(f.deltaPct * 100)}%`}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : null}
+                  ))}
+                </tbody>
+              </table>
             </section>
           ) : null}
         </>

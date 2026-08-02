@@ -31,12 +31,15 @@ function flowHint(c: ChannelForwardStat): { label: string; cls: string; urgent: 
   return { label: "balanced", cls: "flow-balanced", urgent: false };
 }
 
-function Stat({ label, value, sub }: { label: string; value: string; sub?: string }) {
+function Stat({ label, value, unit, sub, tone }: { label: string; value: string; unit?: string; sub?: string; tone?: "green" }) {
   return (
-    <div className="stat">
-      <div className="stat-label">{label}</div>
-      <div className="stat-value">{value}</div>
-      {sub ? <div className="stat-sub">{sub}</div> : null}
+    <div className="an-card">
+      <span className="an-card-label">{label}</span>
+      <span className={`an-card-val ${tone ?? ""}`}>
+        {value}
+        {unit ? <span className="an-unit"> {unit}</span> : null}
+      </span>
+      {sub ? <span className="an-card-sub">{sub}</span> : null}
     </div>
   );
 }
@@ -73,7 +76,7 @@ export function ForwardsPanel() {
   return (
     <section className="panel">
       <div className="panel-head">
-        <h2>Forwards <span className="muted">· routing report</span></h2>
+        <h2>Routing <span className="muted">· last {days}d</span></h2>
         <div className="pnl-windows">
           {WINDOWS.map((w) => (
             <button key={w} className={`pnl-win ${days === w ? "active" : ""}`} onClick={() => setDays(w)}>
@@ -85,11 +88,11 @@ export function ForwardsPanel() {
 
       {error ? <p className="banner error">{error}</p> : null}
 
-      <div className="report-stats">
-        <Stat label="Forwards" value={String(data?.totalForwards ?? 0)} sub={data?.busiestDay ? `busiest ${data.busiestDay.slice(5)}` : undefined} />
-        <Stat label="Routed" value={`${satsCompact(data?.totalRoutedSats ?? 0)} sat`} />
-        <Stat label="Fees earned" value={`${sats(data?.totalFeesEarnedSats ?? 0)} sat`} />
-        <Stat label="Avg fee" value={`${data?.avgFeePpm ?? 0} ppm`} sub={data ? `max ${satsCompact(data.maxForwardSats)} sat` : undefined} />
+      <div className="an-card-grid">
+        <Stat label="Forwards" value={String(data?.totalForwards ?? 0)} sub={data?.busiestDay ? `busiest ${data.busiestDay.slice(5)}` : " "} />
+        <Stat label="Routed volume" value={satsCompact(data?.totalRoutedSats ?? 0)} unit="sat" sub={data ? `max ${satsCompact(data.maxForwardSats)} sat` : " "} />
+        <Stat label="Fees earned" value={sats(data?.totalFeesEarnedSats ?? 0)} unit="sat" tone="green" sub=" " />
+        <Stat label="Avg fee" value={`${data?.avgFeePpm ?? 0}`} unit="ppm" sub="earned per sat routed" />
       </div>
 
       {demand && demand.channels.some((c) => c.liquidityCount > 0) ? (
@@ -135,7 +138,9 @@ export function ForwardsPanel() {
         </div>
       ) : null}
 
-      <h3 className="sub">Per channel</h3>
+      <h3 className="sub">
+        Per channel{data?.perChannel.length ? <span className="muted"> · {data.perChannel.length}</span> : null}
+      </h3>
       <table className="fee-table">
         <thead>
           <tr>
@@ -154,7 +159,7 @@ export function ForwardsPanel() {
             const hint = flowHint(c);
             return (
               <tr key={c.channelId} className={hint.urgent ? "row-urgent" : ""}>
-                <td>{c.alias}</td>
+                <td className="an-alias" title={c.alias}>{c.alias}</td>
                 <td><span className={`flow-tag ${hint.cls}`}>{hint.label}</span></td>
                 <td className="num">{c.forwardCount}</td>
                 <td className="num">{satsCompact(c.routedOutSats)}</td>
@@ -179,14 +184,13 @@ export function ForwardsPanel() {
         <>
           <h3 className="sub">Routing corridors <span className="muted">· where flow actually goes</span></h3>
           <p className="hint" style={{ marginTop: 0 }}>
-            The channel pairs carrying your flow. A corridor needs both ends — a source that fills and a
-            sink that drains; closing either kills the route.
+            The channel pairs carrying your flow — liquidity comes IN one side and goes OUT the other. A
+            corridor needs both ends; closing either the source or the sink kills the route.
           </p>
           <table className="fee-table">
             <thead>
               <tr>
-                <th>In (source)</th>
-                <th>Out (sink)</th>
+                <th>Route <span className="muted">· in → out</span></th>
                 <th className="num">Forwards</th>
                 <th className="num">Routed</th>
                 <th className="num">Fees</th>
@@ -195,8 +199,11 @@ export function ForwardsPanel() {
             <tbody>
               {data.corridors.map((c) => (
                 <tr key={`${c.inChannel}>${c.outChannel}`}>
-                  <td>{c.inAlias}</td>
-                  <td>{c.outAlias}</td>
+                  <td className="corridor-route">
+                    <span className="corridor-in" title={c.inAlias}>{c.inAlias}</span>
+                    <span className="corridor-arrow">→</span>
+                    <span className="corridor-out" title={c.outAlias}>{c.outAlias}</span>
+                  </td>
                   <td className="num">{c.forwards}</td>
                   <td className="num">{satsCompact(c.routedSats)}</td>
                   <td className="num earned">{sats(c.feesSats)}</td>

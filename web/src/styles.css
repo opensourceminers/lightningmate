@@ -399,7 +399,8 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .an-kpi-val { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .an-kpi-val.green { color: var(--green); }
 .an-unit { font-size: 12px; font-weight: 500; color: var(--muted); }
-.an-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.an-card-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+@media (max-width: 900px) { .an-card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 .an-card {
   display: flex; flex-direction: column; gap: 4px; padding: 14px 16px;
   background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
@@ -824,6 +825,11 @@ tr.pending td { opacity: 0.9; }
 .flow-fill { color: var(--green); background: rgba(52, 211, 153, 0.12); }
 .flow-balanced { color: var(--muted); background: rgba(148, 163, 184, 0.1); }
 .fee-table tr.row-urgent { background: rgba(248, 113, 113, 0.06); }
+
+/* Routing corridor "in → out" route cell */
+.corridor-route { display: flex; align-items: center; gap: 8px; max-width: 340px; }
+.corridor-in, .corridor-out { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 0; min-width: 0; }
+.corridor-arrow { color: var(--accent); flex: none; font-weight: 700; }
 
 .policy-controls { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; margin-bottom: 16px; }
 .policy-field { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--muted); }
