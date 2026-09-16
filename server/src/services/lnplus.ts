@@ -174,15 +174,22 @@ interface RawPoolNode {
 }
 
 export interface PoolQuery {
-  minSizeSats?: number;
+  /**
+   * LN+ `min_size` filters on the node's CREDITS BALANCE, not on channel size
+   * (verified against the live API: min_size=50000000 returns exactly the nodes
+   * whose credits_balance_sats is at least that). Credits are what a pool node
+   * can spend to have a channel opened to it, so this is "who can afford size".
+   */
+  minCreditsSats?: number;
   limit?: number;
   search?: string;
 }
 
-/** Liquidity Pool participants (public, no key). */
+/** Liquidity Pool participants (public, no key). Returns at most 50 per page,
+ *  ordered by credits balance descending. */
 export async function getPoolNodes(q: PoolQuery = {}): Promise<LnPlusPoolNode[]> {
   const params = new URLSearchParams();
-  if (q.minSizeSats) params.set("min_size", String(q.minSizeSats));
+  if (q.minCreditsSats) params.set("min_size", String(q.minCreditsSats));
   if (q.limit) params.set("limit", String(q.limit));
   if (q.search) params.set("search", q.search);
   const qs = params.toString();

@@ -1153,7 +1153,14 @@ export interface LnPlusStatus {
   pubkey: string;
   onLnPlus: boolean;
   me: LnPlusNode | null;
-  cache: { cached: number; withProfile: number; paused: boolean; lastError: string | null };
+  cache: {
+    cached: number;
+    withProfile: number;
+    paused: boolean;
+    lastError: string | null;
+    callsToday: number;
+    remainingToday: number;
+  };
 }
 
 export interface LnPlusPoolNode {

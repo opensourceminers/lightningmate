@@ -27,12 +27,23 @@ interface Entry {
 
 interface CacheState {
   nodes: Record<string, Entry>;
+  /** Timestamps of calls we made, for the rolling 24h budget. Persisted, so a
+   *  restart cannot be used to reset the counter. */
+  calls?: number[];
 }
 
 const HIT_TTL_MS = 7 * 86_400_000;
 const MISS_TTL_MS = 14 * 86_400_000;
 /** Most fetches a single enrichment pass may spend. */
 const DEFAULT_BUDGET = 12;
+/**
+ * Hard ceiling on calls in any rolling 24h, well under the 100 LN+ documents.
+ * This is NOT optional bookkeeping: the autopilot alone runs every 30 minutes,
+ * so 48 runs × a 12-fetch pass would be 576 calls/day. The per-pass budget does
+ * not bound the day; this does. The headroom left over is for the user-facing
+ * Pool/Swaps/status views, which must keep working even after a busy night.
+ */
+const DAILY_CAP = 70;
 /** Parallel fetches — small on purpose, we are a guest on their API. */
 const CONCURRENCY = 3;
 /** After a rate-limit or outage, stop asking for a while. */
@@ -48,8 +59,25 @@ export class LnPlusStore {
 
   constructor(dataDir: string) {
     this.store = new JsonStore<CacheState>(dataDir, "lnplus-nodes.json");
-    this.state = this.store.read({ nodes: {} });
+    this.state = this.store.read({ nodes: {}, calls: [] });
     if (!this.state.nodes) this.state.nodes = {};
+    if (!Array.isArray(this.state.calls)) this.state.calls = [];
+  }
+
+  /** Calls made in the last rolling 24h, pruning as it counts. */
+  private callsToday(): number {
+    const cutoff = Date.now() - 86_400_000;
+    this.state.calls = (this.state.calls ?? []).filter((t) => t >= cutoff);
+    return this.state.calls.length;
+  }
+
+  /** How many calls we may still make in this rolling 24h window. */
+  remainingToday(): number {
+    return Math.max(0, DAILY_CAP - this.callsToday());
+  }
+
+  private noteCall(): void {
+    (this.state.calls ??= []).push(Date.now());
   }
 
   private fresh(e: Entry | undefined): boolean {
@@ -101,9 +129,12 @@ export class LnPlusStore {
       }
     }
 
-    if (!missing.length || this.isPaused() || budget <= 0) return out;
+    // The rolling day budget bounds everything: a per-pass budget alone would
+    // let 48 autopilot runs spend 576 calls against a 100/day allowance.
+    const allowed = Math.min(budget, this.remainingToday());
+    if (!missing.length || this.isPaused() || allowed <= 0) return out;
 
-    const queue = missing.slice(0, budget);
+    const queue = missing.slice(0, allowed);
     let dirty = false;
     let index = 0;
 
@@ -113,6 +144,8 @@ export class LnPlusStore {
         const i = index++;
         if (i >= queue.length) return;
         const pk = queue[i];
+        if (this.remainingToday() <= 0) return;
+        this.noteCall();
         try {
           const node = await getNode(pk);
           this.remember(pk, node);
@@ -135,10 +168,10 @@ export class LnPlusStore {
 
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, queue.length) }, worker));
 
-    if (dirty) {
-      this.prune();
-      this.store.write(this.state);
-    }
+    // Always persist: even a pass that learned nothing has spent calls, and that
+    // spend must survive a restart or the cap is trivially bypassed.
+    if (dirty) this.prune();
+    this.store.write(this.state);
     return out;
   }
 
@@ -150,13 +183,22 @@ export class LnPlusStore {
     return found.get(pubkey) ?? this.state.nodes[pubkey]?.node ?? null;
   }
 
-  stats(): { cached: number; withProfile: number; paused: boolean; lastError: string | null } {
+  stats(): {
+    cached: number;
+    withProfile: number;
+    paused: boolean;
+    lastError: string | null;
+    callsToday: number;
+    remainingToday: number;
+  } {
     const entries = Object.values(this.state.nodes);
     return {
       cached: entries.length,
       withProfile: entries.filter((e) => e.node).length,
       paused: this.isPaused(),
       lastError: this.getLastError(),
+      callsToday: this.callsToday(),
+      remainingToday: this.remainingToday(),
     };
   }
 }

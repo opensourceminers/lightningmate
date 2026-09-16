@@ -164,6 +164,7 @@ export function LnPlusPanel() {
   }, [sub, pool, swaps]);
 
   const me = status?.me ?? null;
+  const cache = status?.cache ?? null;
 
   return (
     <div>
@@ -193,6 +194,16 @@ export function LnPlusPanel() {
             Your node has no LN+ profile yet. Everything here still works read-only.
           </span>
         )}
+        {cache ? (
+          <span
+            className="muted"
+            title="LN+ allows 100 API calls per 24h. We cap ourselves below that and cache reputations for a week, so peer scoring keeps working."
+          >
+            API budget: {cache.remainingToday} of {cache.callsToday + cache.remainingToday} left today ·{" "}
+            {cache.withProfile} peer profile{cache.withProfile === 1 ? "" : "s"} cached
+            {cache.paused ? " · backing off" : ""}
+          </span>
+        ) : null}
       </div>
 
       <p className="muted pad">

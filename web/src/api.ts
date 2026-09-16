@@ -170,8 +170,8 @@ export const api = {
 
   // ── lightningnetwork.plus (read-only, no key) ──
   lnplusStatus: () => get<LnPlusStatus>("/lnplus/status"),
-  lnplusPool: (minSizeSats?: number) =>
-    get<LnPlusPoolResponse>(minSizeSats ? `/lnplus/pool?minSize=${minSizeSats}` : "/lnplus/pool"),
+  lnplusPool: (minCreditsSats?: number) =>
+    get<LnPlusPoolResponse>(minCreditsSats ? `/lnplus/pool?minCredits=${minCreditsSats}` : "/lnplus/pool"),
   lnplusSwaps: (status?: "pending" | "opening" | "completed") =>
     get<LnPlusSwapsResponse>(status ? `/lnplus/swaps?status=${status}` : "/lnplus/swaps"),
   channelOpen: (params: {

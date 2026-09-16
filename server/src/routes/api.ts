@@ -643,13 +643,14 @@ export function createApiRouter(
   );
 
   // Liquidity Pool participants: nodes that will open you a channel in exchange
-  // for liquidity credits rather than sats.
+  // for liquidity credits rather than sats. "minCredits" filters by how many
+  // credits a node holds, which is what it can actually spend on a channel.
   router.get(
     "/lnplus/pool",
     wrap(async (req, res) => {
-      const minSizeSats = Number(req.query.minSize);
+      const minCredits = Number(req.query.minCredits);
       const nodes = await getPoolNodes({
-        minSizeSats: Number.isFinite(minSizeSats) && minSizeSats > 0 ? minSizeSats : undefined,
+        minCreditsSats: Number.isFinite(minCredits) && minCredits > 0 ? minCredits : undefined,
         limit: 50,
       });
       // Our node is Tor-only on many installs, so say up front who we can reach.
