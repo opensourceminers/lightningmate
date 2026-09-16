@@ -2,8 +2,15 @@ name: build-image
 
 # Builds the multi-arch (amd64 + arm64) LightningMate image and pushes it to the
 # GitHub Container Registry (ghcr.io/<owner>/lightningmate). Runs on version tags
-# (v*) or manually. The resulting image digest is printed in the run summary —
-# paste it into packaging/umbrel/lightningmate/docker-compose.yml.
+# (v*) or manually. The final manifest digest is printed in the run summary —
+# paste it into the community store's docker-compose.yml.
+#
+# Each architecture builds on its OWN native runner and pushes by digest; a merge
+# job then stitches the two into one manifest list. We do NOT emulate arm64 with
+# QEMU any more: `npm ci` under qemu-user died with "uncaught target signal 4
+# (Illegal instruction)" on node:22-alpine, which is a QEMU limitation and not
+# something the Dockerfile can work around. Native runners are also ~4x faster.
+# GitHub provides arm64 runners free of charge for public repositories.
 
 on:
   push:
@@ -18,13 +25,73 @@ permissions:
   contents: read
   packages: write
 
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
 jobs:
-  docker:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            slug: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            slug: arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Push by digest only: the tags are applied once, on the merged manifest.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+          cache-from: type=gha,scope=${{ matrix.slug }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
+          build-args: |
+            APP_VERSION=${{ github.event.inputs.tag || github.ref_name }}
+
+      # The per-arch digest becomes a filename; the merge job turns the set of
+      # filenames back into the manifest-list members.
+      - name: Export digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.slug }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
       - uses: docker/setup-buildx-action@v3
 
       - uses: docker/login-action@v3
@@ -36,33 +103,33 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE }}
           tags: |
             type=ref,event=tag
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-            type=raw,value=latest,enable={{is_default_branch}}
 
-      - id: build
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          build-args: |
-            APP_VERSION=${{ github.event.inputs.tag || github.ref_name }}
+      - name: Create manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
 
       - name: Report digest
         run: |
+          TAG="$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
+          DIGEST="$(docker buildx imagetools inspect "$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           {
-            echo "### 🐳 Image pushed"
+            echo "### Image pushed"
             echo ""
             echo "Tags:"
             echo '```'
-            echo "${{ steps.meta.outputs.tags }}"
+            jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON"
             echo '```'
-            echo "Digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "Manifest digest: \`${DIGEST}\`"
             echo ""
-            echo "Paste \`ghcr.io/${{ github.repository }}@${{ steps.build.outputs.digest }}\` into packaging/umbrel/lightningmate/docker-compose.yml."
+            echo "Pin this in the community store's docker-compose.yml:"
+            echo '```'
+            echo "${TAG}@${DIGEST}"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
