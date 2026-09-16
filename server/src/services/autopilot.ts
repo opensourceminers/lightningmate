@@ -72,6 +72,12 @@ export interface AutopilotConfig {
   /** Keep an enabled offer continuously priced to the current market (never below
    *  the profit floor), instead of leaving it static. */
   sellAutoReprice: boolean;
+  /** Keep the offer's SIZE WINDOW and lease length in step with the market, up to
+   *  sellMaxChannelSats. Separate from pricing on purpose: sizing decides whether
+   *  a buyer can be matched with you at all, pricing only decides what you earn
+   *  when they are. An offer whose window misses the median order cannot fill at
+   *  any price, so this is usually the setting that matters. */
+  sellAutoSize: boolean;
   /** Pricing level when auto-pricing: fast (undercut to sell quickly), balanced
    *  (market median), premium (top of the market), or auto (adapt to fill speed). */
   sellPricingMode: "fast" | "balanced" | "premium" | "auto";
@@ -183,6 +189,7 @@ const DEFAULT_CONFIG: AutopilotConfig = {
   sellAutoClose: false,
   sellAutoRelist: false,
   sellAutoReprice: true,
+  sellAutoSize: true,
   sellPricingMode: "balanced",
   maxHtlcEnabled: false,
 };
@@ -236,6 +243,9 @@ export class Autopilot {
     // Merge in any newly added config defaults from older persisted state.
     this.state.config = { ...DEFAULT_CONFIG, ...this.state.config };
     this.state.perTargetLastRebalanced ??= {};
+    // Sizing used to ride along with auto-pricing. Existing installs keep exactly
+    // the behaviour they had; only the control is now separate.
+    this.state.config.sellAutoSize ??= this.state.config.sellAutoReprice;
     this.state.sellAdaptiveLevel ??= 0.5;
     // One-time repair: the removed downward ratchet left long-running installs at
     // a level near 0, i.e. priced at the very bottom of the ladder. Nothing about
@@ -309,8 +319,25 @@ export class Autopilot {
 
   /** Magma pricing the recommendations should reflect — the configured mode + the
    *  live adaptive level — so the UI shows what the autopilot is actually doing. */
-  magmaOverrides(): { sellPricingMode: "fast" | "balanced" | "premium" | "auto"; adaptiveLevel: number } {
-    return { sellPricingMode: this.state.config.sellPricingMode, adaptiveLevel: this.state.sellAdaptiveLevel };
+  /** What the engine needs to mirror the autopilot's actual behaviour: the price
+   *  level AND the capital caps, so the recommended size window can never exceed
+   *  what the autopilot would really be willing to serve. Without the caps the
+   *  Market page would advertise a size the autopilot then silently refuses. */
+  magmaOverrides(): {
+    sellPricingMode: "fast" | "balanced" | "premium" | "auto";
+    adaptiveLevel: number;
+    maxSellSizeSat: number;
+    onchainReserveSat: number;
+  } {
+    const c = this.state.config;
+    return {
+      sellPricingMode: c.sellPricingMode,
+      adaptiveLevel: this.state.sellAdaptiveLevel,
+      // A channel bigger than the whole deploy budget can never be served, so the
+      // effective ceiling is the smaller of the two.
+      maxSellSizeSat: Math.max(0, Math.min(c.sellMaxChannelSats, c.sellMaxDeploySats)),
+      onchainReserveSat: c.sellReserveSats,
+    };
   }
 
   /** Sell caps shared with LSP mode — one capital budget across both demand sources. */
@@ -788,12 +815,12 @@ export class Autopilot {
     // autopilot: the live offer always tracks the market so it actually fills.
     // Depleted offers are also topped back up. Relisting commits no funds; order
     // fulfillment re-checks the caps before any channel opens.
-    if (cfg.sellAutoRelist || cfg.sellAutoReprice) {
+    if (cfg.sellAutoRelist || cfg.sellAutoReprice || cfg.sellAutoSize) {
       try {
         const offers = await getMyOffers(key);
         let rec: MagmaV2Report | null = null;
         let recByOffer = new Map<string, MagmaSellRecommendation>();
-        if (cfg.sellAutoReprice) {
+        if (cfg.sellAutoReprice || cfg.sellAutoSize) {
           try {
             rec = await getMagmaRecommendations(this.readLnd, key, {
               sellPricingMode: cfg.sellPricingMode,
@@ -824,7 +851,7 @@ export class Autopilot {
         // the current one is materially worse than what the market asks for.
         // Returns null when the offer is already fine, so we don't churn updates.
         const reshape = (off: MyOffer) => {
-          if (!rec) return null;
+          if (!rec || !cfg.sellAutoSize) return null;
           const sell = rec.sell;
           const wantMin = sell.recommendedMinSizeSat;
           const room = Math.min(
@@ -877,7 +904,7 @@ export class Autopilot {
               minBlockLength: off.minBlockLength,
             });
             out.push({ orderId: off.id, action: "relist", sizeSats: off.maxSizeSats, ok: true });
-          } else if (!depleted && cfg.sellAutoReprice && (t?.moved || shape)) {
+          } else if (!depleted && ((cfg.sellAutoReprice && t?.moved) || shape)) {
             // Price is only half of it. An offer whose size window or lease
             // length is out of step with the market cannot be matched at any
             // price, and those fields used to be carried over untouched on every

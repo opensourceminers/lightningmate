@@ -1364,3 +1364,9 @@ tr.pending td { opacity: 0.9; }
 .magma-reach-head { font-size: 14px; margin-bottom: 4px; }
 .magma-reach .table { margin-top: 10px; }
 .table.compact th, .table.compact td { padding: 4px 8px; font-size: 12px; }
+
+/* Autopilot: what a cap actually reaches on the real market. */
+.ap-reach {
+  margin: 10px 0 4px; padding: 10px 12px; border-radius: 8px;
+  background: var(--panel-3); font-size: 12.5px; display: grid; gap: 8px;
+}

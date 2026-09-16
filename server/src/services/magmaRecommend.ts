@@ -222,6 +222,16 @@ export interface MagmaV2Report {
     recommendedMaxSizeSat: number;
     /** Smallest channel that still pays for its own open+close at market price. */
     minViableSizeSat: number;
+    /** Biggest order the caps + on-chain balance actually allow right now. */
+    effectiveMaxOrderSat: number;
+    /** What that ceiling reaches, and what raising it would reach. */
+    capReach: {
+      sharePctNow: number;
+      /** Share if the cap were the only limit (capital ignored). */
+      sharePctAtCap: number;
+      capSat: number;
+      capitalLimited: boolean;
+    } | null;
     projectedMonthlySat: number;
     onchainOpenCostSat: number;
     onchainCloseCostSat: number;
@@ -812,6 +822,27 @@ export async function getMagmaRecommendations(
   // market price no longer covers opening and closing the channel plus the
   // minimum profit, so taking the order would lose money — and it moves with the
   // mempool, which is why it cannot be the hardcoded 1M it used to be.
+  // What can actually be served today, and whether the binding limit is the
+  // user's cap or simply the coins on chain. Those need different answers: one is
+  // a setting, the other is a funding problem, and conflating them is how an
+  // offer stays idle while the operator tunes the wrong knob.
+  const effectiveMaxOrderSat = Math.min(cfg.maxSellSizeSat, Math.max(0, deployableCapitalSat));
+  const fitAtCap = demandFit(sellWindow.min, cfg.maxSellSizeSat);
+  const fitNow = demandFit(sellWindow.min, effectiveMaxOrderSat);
+  const capReach =
+    fitAtCap && fitNow
+      ? {
+          sharePctNow: fitNow.sharePct,
+          sharePctAtCap: fitAtCap.sharePct,
+          capSat: cfg.maxSellSizeSat,
+          capitalLimited: effectiveMaxOrderSat < cfg.maxSellSizeSat,
+        }
+      : null;
+  if (capReach?.capitalLimited)
+    sellWarnings.push(
+      `your cap allows ${sizeLabel(cfg.maxSellSizeSat)} orders but only ${sizeLabel(effectiveMaxOrderSat)} is funded on-chain — this is a capital limit, not a settings one`,
+    );
+
   const recommendedMaxSizeSat = sellWindow.max;
   const recommendedMinSizeSat = sellWindow.min;
   const minViableSizeSat = sellWindow.minViable;
@@ -860,6 +891,8 @@ export async function getMagmaRecommendations(
       recommendedMinSizeSat,
       recommendedMaxSizeSat,
       minViableSizeSat,
+      effectiveMaxOrderSat,
+      capReach,
       projectedMonthlySat,
       onchainOpenCostSat,
       onchainCloseCostSat,

@@ -202,6 +202,7 @@ export interface AutopilotConfig {
   sellAutoClose: boolean;
   sellAutoRelist: boolean;
   sellAutoReprice: boolean;
+  sellAutoSize: boolean;
   sellPricingMode: "fast" | "balanced" | "premium" | "auto";
   maxHtlcEnabled: boolean;
 }
@@ -1092,6 +1093,13 @@ export interface MagmaV2Report {
     recommendedMinSizeSat: number;
     recommendedMaxSizeSat: number;
     minViableSizeSat: number;
+    effectiveMaxOrderSat: number;
+    capReach: {
+      sharePctNow: number;
+      sharePctAtCap: number;
+      capSat: number;
+      capitalLimited: boolean;
+    } | null;
     projectedMonthlySat: number;
     onchainOpenCostSat: number;
     onchainCloseCostSat: number;

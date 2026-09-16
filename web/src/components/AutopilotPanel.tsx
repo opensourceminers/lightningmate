@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { AutopilotConfig, AutopilotRun, AutopilotState } from "../types";
+import type { AutopilotConfig, AutopilotRun, AutopilotState, MagmaV2Report } from "../types";
 import { satsCompact, timeAgo } from "../format";
 import { RunState, Switch } from "./Switch";
 import { useUi } from "./Overlay";
@@ -74,6 +74,8 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     initialSub && (SUBS as string[]).includes(initialSub) ? (initialSub as Sub) : "fees",
   );
   const [lastRun, setLastRun] = useState<AutopilotRun | null>(null);
+  // Market reality for the caps section. Needs no Amboss key.
+  const [magma, setMagma] = useState<MagmaV2Report | null>(null);
   const [error, setError] = useState<string | null>(null);
   const { toast } = useUi();
   const [openItems, setOpenItems] = useState<Set<string>>(new Set());
@@ -84,6 +86,10 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       else n.add(key);
       return n;
     });
+
+  useEffect(() => {
+    api.magmaRecommendations().then(setMagma).catch(() => setMagma(null));
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -208,7 +214,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       desc: "Compete for flow and lease idle capital. Recommended.",
       cfg: {
         enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: true,
-        sellAutoReprice: true, sellPricingMode: "auto",
+        sellAutoReprice: true, sellAutoSize: true, sellPricingMode: "auto",
         policy: {
           ...draft.policy, minPpm: 25, neutralPpm: 80, maxPpm: 1000, baseFeeMsat: 0,
           protectPpm: 350, safetyMargin: 1.15, noFlowRatchetSteps: 3, exploreLowerModifier: 0.85,
@@ -223,7 +229,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       desc: "Higher fees, strict rebalancing, lease over routing — fewer, richer forwards.",
       cfg: {
         enabled: true, rebalanceEnabled: true, channelEnabled: false, sellEnabled: true,
-        sellAutoReprice: true, sellPricingMode: "premium",
+        sellAutoReprice: true, sellAutoSize: true, sellPricingMode: "premium",
         policy: {
           ...draft.policy, minPpm: 80, neutralPpm: 150, maxPpm: 1500, baseFeeMsat: 0,
           protectPpm: 600, safetyMargin: 1.35, noFlowRatchetSteps: 1, exploreLowerModifier: 0.9,
@@ -388,6 +394,10 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
               Auto-price the enabled offer to the live market (at the level above, floor-protected)
             </label>
             <label className="check ap-check">
+              <input type="checkbox" checked={draft.sellAutoSize} onChange={(e) => setBool("sellAutoSize", e.target.checked)} />
+              Auto-size the offer: keep its size range and lease length in step with the market, up to your cap below
+            </label>
+            <label className="check ap-check">
               <input type="checkbox" checked={draft.sellAutoRelist} onChange={(e) => setBool("sellAutoRelist", e.target.checked)} />
               Auto-relist a depleted offer (top it back up within your caps so it keeps selling)
             </label>
@@ -398,7 +408,60 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
           </div>
 
           <h3 className="sub">Caps</h3>
+          <p className="muted ap-hint">
+            The max order size is the setting that decides whether buyers can be matched with you at all. An offer whose
+            size range misses the orders people actually place cannot fill at any price.
+          </p>
           <div className="policy-controls">{numFields(SELL_NUM_FIELDS)}</div>
+          {magma?.sell.capReach ? (
+            <div className="ap-reach">
+              <div>
+                At your current cap you can serve <b>{magma.sell.capReach.sharePctNow}%</b> of real Magma orders
+                {magma.sell.capReach.capitalLimited ? (
+                  <>
+                    {" "}
+                    — your cap would allow {satsCompact(magma.sell.capReach.capSat)} (
+                    {magma.sell.capReach.sharePctAtCap}%) but only{" "}
+                    {satsCompact(magma.sell.effectiveMaxOrderSat)} is funded on-chain, so this is a capital limit, not a
+                    settings one.
+                  </>
+                ) : (
+                  "."
+                )}
+              </div>
+              {magma.sell.demandFit?.ladder.length ? (
+                <table className="table compact">
+                  <thead>
+                    <tr>
+                      <th>If max order size were</th>
+                      <th className="num">You could serve</th>
+                      <th className="num">Orders/month</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {magma.sell.demandFit.ladder.map((l) => (
+                      <tr key={l.maxSizeSat}>
+                        <td>{satsCompact(l.maxSizeSat)}</td>
+                        <td className="num strong">{l.sharePct}%</td>
+                        <td className="num">{l.ordersPerMonth}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : null}
+              <div className="muted">
+                Raising the max order size also needs the capital cap and your on-chain balance to allow it — the
+                effective ceiling is the smallest of the three.
+              </div>
+            </div>
+          ) : null}
+          {draft.sellMaxChannelSats > draft.sellMaxDeploySats ? (
+            <div className="sug-warn">
+              ⚠ Max channel size ({satsCompact(draft.sellMaxChannelSats)}) is above your capital cap (
+              {satsCompact(draft.sellMaxDeploySats)}), so an order that big can never be served. The smaller number is
+              what actually applies.
+            </div>
+          ) : null}
           <div className="apply-row">
             <button className="primary-btn" disabled={busy} onClick={() => save()}>Save settings</button>
           </div>
