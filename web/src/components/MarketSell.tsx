@@ -84,10 +84,14 @@ export function MarketSell() {
       setConnected(false);
       return;
     }
+    // The market diagnosis needs no key: clearing price, real order sizes and
+    // whether our size window can be matched are all public. Loading it even when
+    // the key is missing or expired matters, because that user is exactly the one
+    // who needs to be told why nothing is selling.
+    api.magmaRecommendations().then(setRec).catch(() => setRec(null));
     if (!conn) return;
     // Best-effort — a flaky offers call (e.g. an expired key) shouldn't blank the tab.
     api.ambossMyOffers().then((r) => setOffers(r.offers)).catch(() => {});
-    api.magmaRecommendations().then(setRec).catch(() => setRec(null));
     api
       .autopilotGet()
       .then((s) => setApManaged(!!(s.config?.sellEnabled && s.config?.sellAutoReprice)))
@@ -253,6 +257,45 @@ export function MarketSell() {
             ) : null}
           </div>
 
+          {rec.sell.demandFit && rec.sell.demandFit.sharePct < 40 ? (
+            <div className="magma-reach">
+              <div className="magma-reach-head">
+                Your size window reaches <b>{rec.sell.demandFit.sharePct}%</b> of real Magma orders
+              </div>
+              <div className="muted">
+                About {rec.sell.demandFit.reachableOrdersPerMonth} of{" "}
+                {Math.round((rec.sell.demandFit.totalOrders / rec.sell.demandFit.windowDays) * 30)} orders a month could
+                even be matched with you. The median real order is{" "}
+                <b>{satsCompact(rec.sell.demandFit.medianOrderSat)}</b>.
+                {rec.sell.demandFit.maxSizeForHalfMarket
+                  ? ` A max size of ${satsCompact(rec.sell.demandFit.maxSizeForHalfMarket)} would put you in front of half the market.`
+                  : ""}{" "}
+                This is a capital and sizing limit, not a pricing one — cutting the price does not help, because Amboss
+                picks the seller.
+              </div>
+              {rec.sell.demandFit.ladder.length ? (
+                <table className="table compact">
+                  <thead>
+                    <tr>
+                      <th>Max channel size</th>
+                      <th className="num">Orders you could serve</th>
+                      <th className="num">Per month</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rec.sell.demandFit.ladder.map((l) => (
+                      <tr key={l.maxSizeSat}>
+                        <td>{satsCompact(l.maxSizeSat)}</td>
+                        <td className="num strong">{l.sharePct}%</td>
+                        <td className="num">{l.ordersPerMonth}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : null}
+            </div>
+          ) : null}
+
           {r0 ? (
             <>
               <div className="magma-compare">
@@ -291,8 +334,18 @@ export function MarketSell() {
                   {r0.market.myRank ? <span className="muted">your rank #{r0.market.myRank} of {r0.market.segmentCount}</span> : null}
                 </div>
                 <div className="magma-price-meta muted">
-                  {r0.market.sizeBand} band · p25 {r0.market.p25} · median {r0.market.median} · p75 {r0.market.p75} ppm · floor{" "}
-                  {r0.economics.profitFloorEffectivePpm}
+                  {rec.sell.clearing ? (
+                    <>
+                      {r0.market.sizeBand} band · <b>{rec.sell.clearing.count} real sales</b> in{" "}
+                      {rec.sell.clearing.windowDays}d paid {rec.sell.clearing.p25Ppm}–{rec.sell.clearing.p75Ppm} ppm,
+                      median {rec.sell.clearing.medianPpm} · floor {r0.economics.profitFloorEffectivePpm}
+                    </>
+                  ) : (
+                    <>
+                      {r0.market.sizeBand} band · no sale history, using LISTED asks · p25 {r0.market.p25} · median{" "}
+                      {r0.market.median} · p75 {r0.market.p75} ppm · floor {r0.economics.profitFloorEffectivePpm}
+                    </>
+                  )}
                   {r0.market.scorePremium ? ` · ${r0.market.scorePremium > 0 ? "+" : ""}${Math.round(r0.market.scorePremium * 100)}% score ${r0.market.scorePremium > 0 ? "premium" : "discount"}` : ""}
                 </div>
                 {(() => {

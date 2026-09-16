@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { AutopilotConfig, MagmaV2Report } from "../types";
-import { sats, satsCompact } from "../format";
+import { sats } from "../format";
 import { MarketBuy } from "./MarketBuy";
 import { MarketSell } from "./MarketSell";
 import { MarketOrders } from "./MarketOrders";
@@ -32,7 +32,9 @@ export function MarketPanel() {
   }, []);
 
   const a = rec?.analytics;
-  const pulse = rec?.sell.marketPulse ?? null;
+  const clearing = rec?.sell.clearing ?? null;
+  const fit = rec?.sell.demandFit ?? null;
+  const activity = rec?.sell.marketActivity ?? null;
   const offerState = rec?.sell.recommendations.find((r) => r.offerId)?.state;
 
   return (
@@ -60,14 +62,18 @@ export function MarketPanel() {
           <span className="muted">
             {a.filledOrdersAllTime} sold · {sats(a.netProfitSat)} sat net
           </span>
-          {pulse ? (
+          {clearing ? (
             <span
               className="market-pulse"
-              title="From local order-book telemetry: real sales observed across the market — listings are asks, this is what actually SOLD"
+              title="Completed Magma orders in your size band, from Amboss. Listed offers are asks; this is what buyers actually paid."
             >
-              {pulse.confirmed > 0 && pulse.medianFilledPpm != null
-                ? `market pulse: ${pulse.confirmed} sale${pulse.confirmed > 1 ? "s" : ""}/${pulse.trackedDays}d · fills ~${pulse.medianFilledPpm} ppm · ${satsCompact(pulse.soldSats)} sat sold`
-                : `market pulse: watching the order book (${pulse.trackedDays}d) — no sales observed yet`}
+              clears at ~{clearing.medianPpm} ppm · {clearing.count} real sale
+              {clearing.count === 1 ? "" : "s"}/{clearing.windowDays}d in your band
+              {activity ? ` · market ${activity.perDay}/day` : ""}
+            </span>
+          ) : activity ? (
+            <span className="market-pulse" title="Market-wide completed Magma orders, from Amboss.">
+              market {activity.perDay} orders/day · no sale history in your size band yet
             </span>
           ) : null}
         </div>
@@ -111,6 +117,16 @@ export function MarketPanel() {
                   : "Offer tracks the market price — priced offers fill, and fills build score"
               }
             />
+            {fit ? (
+              <CoachItem
+                ok={fit.sharePct >= 40}
+                text={
+                  fit.sharePct >= 40
+                    ? `Your size window can serve ${fit.sharePct}% of real orders (~${fit.reachableOrdersPerMonth}/month) — buyers can actually match you`
+                    : `Your size window only fits ${fit.sharePct}% of real orders (~${fit.reachableOrdersPerMonth}/month). The median order is ${(fit.medianOrderSat / 1e6).toFixed(1)}M${fit.maxSizeForHalfMarket ? `; a ${(fit.maxSizeForHalfMarket / 1e6).toFixed(1)}M max size would reach half the market` : ""} — size, not price, is the limit`
+                }
+              />
+            ) : null}
             <CoachItem info text="24/7 uptime matters — the score tracks your node's availability; an always-on Umbrel does this for you" />
           </div>
         </details>

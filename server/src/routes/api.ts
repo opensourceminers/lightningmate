@@ -32,7 +32,7 @@ import {
   newAddress,
   sendOnchain,
 } from "../services/onchain.js";
-import { closeChannelByOutpoint, openChannelTo } from "../services/channelOps.js";
+import { closeChannelByOutpoint, openChannelTo, MIN_CHANNEL_SATS } from "../services/channelOps.js";
 import { paySaleServiceFee, saleFeeConfig } from "../services/serviceFee.js";
 import { getFeeRecommendations } from "../services/feeRecommend.js";
 import { getRebalanceRecommendations } from "../services/rebalanceRecommend.js";
@@ -44,6 +44,7 @@ import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from ".
 import {
   acceptOrder,
   addOrderTransaction,
+  buyFromOffer,
   buyLiquidity,
   createOffer,
   getMarket,
@@ -1028,7 +1029,8 @@ export function createApiRouter(
         return;
       }
       const usdCents = Math.floor(Number(req.body?.usdCents));
-      if (!Number.isFinite(usdCents) || usdCents < 500) {
+      const wantsOffer = typeof req.body?.offerId === "string" && req.body.offerId.trim().length > 0;
+      if (!wantsOffer && (!Number.isFinite(usdCents) || usdCents < 500)) {
         res.status(400).json({ error: "bad_amount", message: "Minimum is $5 (500 cents)." });
         return;
       }
@@ -1039,6 +1041,29 @@ export function createApiRouter(
         res.status(400).json({
           error: "no_uri",
           message: "Your node has no public address, so a seller can't open a channel to it.",
+        });
+        return;
+      }
+      // Buying a SPECIFIC offer, when the user picked one from the ranked list.
+      // The generic `liquidity.buy` call takes only a dollar amount and lets
+      // Amboss choose the seller, which made the ranking decorative: whatever the
+      // user clicked, someone else could get the order. `market.order.create`
+      // takes an offer_id, so the pick decides.
+      const offerId = typeof req.body?.offerId === "string" ? req.body.offerId.trim() : "";
+      const sizeSats = Math.floor(Number(req.body?.sizeSats));
+      if (offerId) {
+        if (!Number.isFinite(sizeSats) || sizeSats < MIN_CHANNEL_SATS || sizeSats > MAX_CHANNEL_SATS) {
+          res.status(400).json({ error: "bad_size", message: "Choose a channel size within the offer's range." });
+          return;
+        }
+        const targeted = await buyFromOffer(amboss.getKey(), offerId, info.public_key, sizeSats, isPrivate);
+        const dec = await decodeRequest(lnd, targeted.paymentRequest);
+        res.json({
+          orderId: targeted.orderId,
+          paymentRequest: targeted.paymentRequest,
+          sats: dec.tokens,
+          channelSizeSats: targeted.channelSizeSats,
+          sellerChosen: true,
         });
         return;
       }
@@ -1120,7 +1145,13 @@ export function createApiRouter(
   router.get(
     "/amboss/recommendations",
     wrap(async (_req, res) => {
-      if (!needKey(res)) return;
+      // Deliberately NOT gated on an Amboss key. Almost everything that makes
+      // this page useful now comes from public data — the clearing price, the
+      // market's real order sizes, whether your size window can be matched at
+      // all. Gating it meant that the one user who most needs the diagnosis, the
+      // one whose key expired and whose offer therefore stopped selling, saw an
+      // empty page instead. The engine already tolerates a missing key: your own
+      // offers and orders simply come back empty.
       res.json(await getMagmaRecommendations(lnd, amboss.getKey(), autopilot.magmaOverrides()));
     }),
   );

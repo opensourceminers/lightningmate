@@ -2,8 +2,8 @@ import { getChannels, getChainBalance, type AuthenticatedLnd } from "lightning";
 import { JsonStore } from "../store.js";
 import { closeChannelByOutpoint, openChannelTo } from "./channelOps.js";
 import { createInvoice } from "./payments.js";
-import { acceptOrder, addOrderTransaction, createOffer, getMarket, getMyOffers, getMyOrders, toggleOffer, updateOffer, type MyOrder } from "./amboss.js";
-import { initMarketTelemetry, recordMarketSnapshot } from "./marketTelemetry.js";
+import { acceptOrder, addOrderTransaction, createOffer, getMarket, getMyOffers, getMyOrders, toggleOffer, updateOffer, type MyOffer, type MyOrder } from "./amboss.js";
+import { initMagmaHistory, refreshMagmaHistory } from "./magmaHistory.js";
 import { runMaxHtlcPass, type MaxHtlcChange } from "./maxHtlc.js";
 import { paySaleServiceFee } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
@@ -140,6 +140,8 @@ interface PersistedState {
   sellAdaptiveLevel: number;
   lastSellFilledCount: number;
   lastSellFillAt: string | null;
+  /** One-shot repair of levels the removed downward ratchet drove to the floor. */
+  adaptiveRatchetMigrated?: boolean;
   lastSellAdaptiveAdjustAt: string | null;
   /** One-time flag: bumped installs from the old 60-min default to 30 min. */
   intervalMigrated?: boolean;
@@ -217,7 +219,7 @@ export class Autopilot {
     private readonly lnplus?: LnPlusStore,
   ) {
     this.store = new JsonStore<PersistedState>(dataDir, "autopilot.json");
-    initMarketTelemetry(dataDir);
+    initMagmaHistory(dataDir);
     this.state = this.store.read({
       config: DEFAULT_CONFIG,
       lastRunAt: null,
@@ -235,6 +237,14 @@ export class Autopilot {
     this.state.config = { ...DEFAULT_CONFIG, ...this.state.config };
     this.state.perTargetLastRebalanced ??= {};
     this.state.sellAdaptiveLevel ??= 0.5;
+    // One-time repair: the removed downward ratchet left long-running installs at
+    // a level near 0, i.e. priced at the very bottom of the ladder. Nothing about
+    // that level was earned by evidence, so lift anything below the midpoint back
+    // to it and let real fills move it up from there.
+    if (!this.state.adaptiveRatchetMigrated) {
+      if (this.state.sellAdaptiveLevel < 0.5) this.state.sellAdaptiveLevel = 0.5;
+      this.state.adaptiveRatchetMigrated = true;
+    }
     this.state.lastSellFilledCount ??= 0;
     this.state.lastSellFillAt ??= null;
     this.state.lastSellAdaptiveAdjustAt ??= null;
@@ -750,25 +760,24 @@ export class Autopilot {
         .filter((o) => o.channelId && o.blocksUntilClosable > 0)
         .reduce((s, o) => s + o.sizeSats, 0) + this.externalDeployedSat(); // LSPS1 shares the deploy cap
 
-    // Adaptive pricing (mode "auto"): ratchet the price level UP when an order
-    // fills (you could be charging more) and DOWN when the offer sits unsold —
-    // converging on the price that just clears. Floor still applies downstream.
+    // Adaptive pricing (mode "auto"): ratchet the level UP when an order fills —
+    // you could have charged more — and hold it otherwise.
+    //
+    // There is deliberately NO downward ratchet any more. The old version cut the
+    // level by 0.1 for every day without a fill, which sounds like price discovery
+    // and is not: Magma's buy call carries no offer id, so Amboss picks the
+    // seller and being cheaper does not make you more likely to be picked. On this
+    // node that loop ran for months, walked the level to 0, and left the offer at
+    // roughly a fifth of the real clearing price — still unsold, now unprofitable
+    // too. When nothing fills, the honest answers are a wider size window, a lease
+    // length buyers actually ask for, and a better seller score. The engine
+    // surfaces all three; none of them is "charge less".
     if (cfg.sellPricingMode === "auto" && cfg.sellAutoReprice) {
       const filledNow = orders.filter((o) => o.transactionId).length;
-      const now = Date.now();
       if (filledNow > this.state.lastSellFilledCount) {
         this.state.sellAdaptiveLevel = Math.min(1, this.state.sellAdaptiveLevel + 0.15);
         this.state.lastSellFillAt = new Date().toISOString();
         this.state.lastSellAdaptiveAdjustAt = new Date().toISOString();
-      } else {
-        const staleFor = this.state.lastSellFillAt ? now - new Date(this.state.lastSellFillAt).getTime() : Infinity;
-        const sinceAdjust = this.state.lastSellAdaptiveAdjustAt
-          ? now - new Date(this.state.lastSellAdaptiveAdjustAt).getTime()
-          : Infinity;
-        if (staleFor > 3 * 86_400_000 && sinceAdjust > 86_400_000) {
-          this.state.sellAdaptiveLevel = Math.max(0, this.state.sellAdaptiveLevel - 0.1);
-          this.state.lastSellAdaptiveAdjustAt = new Date().toISOString();
-        }
       }
       this.state.lastSellFilledCount = filledNow;
     }
@@ -811,6 +820,34 @@ export class Autopilot {
           };
         };
 
+        // What the offer's SHAPE should be — size window and lease length — when
+        // the current one is materially worse than what the market asks for.
+        // Returns null when the offer is already fine, so we don't churn updates.
+        const reshape = (off: MyOffer) => {
+          if (!rec) return null;
+          const sell = rec.sell;
+          const wantMin = sell.recommendedMinSizeSat;
+          const room = Math.min(
+            chain_balance - cfg.sellReserveSats - deployed - this.committedOnchainSat(),
+            cfg.sellMaxDeploySats - deployed,
+            cfg.sellMaxChannelSats,
+          );
+          const wantMax = Math.max(wantMin, Math.min(sell.recommendedMaxSizeSat, room));
+          const wantBlocks = Math.min(off.minBlockLength || sell.popularLeaseBlocks, sell.popularLeaseBlocks);
+          if (wantMax < wantMin || room < wantMin) return null;
+          // Only act on a MEANINGFUL difference: >20% more reach, a lease length
+          // that locks buyers out, or a floor above what is economic.
+          const widens = wantMax > off.maxSizeSats * 1.2;
+          const lowersFloor = wantMin < off.minSizeSats * 0.8;
+          const fixesTerm = off.minBlockLength > wantBlocks;
+          if (!widens && !lowersFloor && !fixesTerm) return null;
+          return {
+            minSizeSats: Math.min(wantMin, off.minSizeSats),
+            maxSizeSats: Math.max(wantMax, off.maxSizeSats),
+            minBlockLength: wantBlocks,
+          };
+        };
+
         for (const off of offers) {
           // Magma autopilot is on → activate a disabled offer so it actually sells
           // (turning on Liquidity provision means "I want to sell"). Then price it.
@@ -825,6 +862,7 @@ export class Autopilot {
             continue;
           }
           const t = target(off);
+          const shape = reshape(off);
           const depleted = off.totalSizeSats < off.maxSizeSats;
 
           if (depleted && cfg.sellAutoRelist) {
@@ -839,19 +877,37 @@ export class Autopilot {
               minBlockLength: off.minBlockLength,
             });
             out.push({ orderId: off.id, action: "relist", sizeSats: off.maxSizeSats, ok: true });
-          } else if (!depleted && cfg.sellAutoReprice && t?.moved) {
+          } else if (!depleted && cfg.sellAutoReprice && (t?.moved || shape)) {
+            // Price is only half of it. An offer whose size window or lease
+            // length is out of step with the market cannot be matched at any
+            // price, and those fields used to be carried over untouched on every
+            // update — which is how a 1,0M–1,25M / 4032-block offer survived for
+            // months while the engine kept "fixing" the price.
             await updateOffer(key, off.id, {
-              totalSizeSats: off.totalSizeSats,
-              minSizeSats: off.minSizeSats,
-              maxSizeSats: off.maxSizeSats,
-              feeRatePpm: t.fee,
-              baseFeeSats: t.base,
-              minBlockLength: off.minBlockLength,
+              totalSizeSats: shape ? Math.max(off.totalSizeSats, shape.maxSizeSats) : off.totalSizeSats,
+              minSizeSats: shape?.minSizeSats ?? off.minSizeSats,
+              maxSizeSats: shape?.maxSizeSats ?? off.maxSizeSats,
+              feeRatePpm: t?.fee ?? off.feeRatePpm,
+              baseFeeSats: t?.base ?? off.baseFeeSats,
+              minBlockLength: shape?.minBlockLength ?? off.minBlockLength,
             });
+            if (shape)
+              out.push({
+                orderId: off.id,
+                action: "relist",
+                sizeSats: shape.maxSizeSats,
+                ok: true,
+              });
             // Deliberately NOT recorded in the run history — routine market
             // tracking would drown out the actions that matter (accepts, opens,
             // relists). The offer page always shows the current price anyway.
-            console.log(`[autopilot] repriced offer ${off.id} → ${t.fee} ppm`);
+            console.log(
+              `[autopilot] updated offer ${off.id}` +
+                (t?.moved ? ` → ${t.fee} ppm` : "") +
+                (shape
+                  ? ` → size ${Math.round(shape.minSizeSats / 1000)}k-${Math.round(shape.maxSizeSats / 1000)}k, ${shape.minBlockLength} blocks`
+                  : ""),
+            );
           }
         }
 
@@ -866,8 +922,13 @@ export class Autopilot {
             cfg.sellMaxDeploySats - deployed,
           );
           const maxCh = Math.min(cfg.sellMaxChannelSats, total);
-          const minCh = Math.min(1_000_000, maxCh);
-          if (total >= 1_000_000 && maxCh >= minCh) {
+          // Take the size window from the engine, not from a hardcoded 1M floor.
+          // A 1,0M–1,25M window can only be matched with about a tenth of the
+          // orders that actually happen, so the old default guaranteed an idle
+          // offer however well it was priced. The floor is now the smallest
+          // channel that still pays for its own open+close at the market price.
+          const minCh = Math.min(rec?.sell.minViableSizeSat ?? 1_000_000, maxCh);
+          if (total >= minCh && maxCh >= minCh) {
             await createOffer(key, {
               totalSizeSats: total,
               minSizeSats: minCh,
@@ -1043,11 +1104,10 @@ export class Autopilot {
       channels: [],
       sells: [],
     };
-    // Market fill telemetry: sample the order book on every tick — even in
-    // read-only mode — so fill history accrues from day one. Fire-and-forget.
-    void getMarket()
-      .then((m) => recordMarketSnapshot(m.offers))
-      .catch(() => {});
+    // Keep Amboss's real sale history warm on every tick, even read-only, so the
+    // Market page and the pricing engine always have something to price against.
+    // Self-throttled to a few hours inside the service; never throws.
+    void refreshMagmaHistory();
     if (this.running || !this.writeLnd) return emptyRun;
     this.running = true;
     this.onchainCommittedThisRun = 0; // shared capital budget for this run

@@ -1089,20 +1089,40 @@ export interface MagmaV2Report {
     adaptiveLevel: number;
     optimalSizeSat: number;
     optimalLeaseBlocks: number;
+    recommendedMinSizeSat: number;
+    recommendedMaxSizeSat: number;
+    minViableSizeSat: number;
     projectedMonthlySat: number;
     onchainOpenCostSat: number;
     onchainCloseCostSat: number;
     onchainFeePerVbyte: number | null;
     pendingSellerOrders: number;
-    marketPulse: {
-      confirmed: number;
-      soldSats: number;
-      medianFilledPpm: number | null;
-      p25FilledPpm: number | null;
-      p75FilledPpm: number | null;
-      vanished: number;
-      trackedDays: number;
+    /** Real completed Magma orders in our size band, straight from Amboss. */
+    clearing: {
+      count: number;
+      windowDays: number;
+      ordersPerMonth: number;
+      p25Ppm: number;
+      medianPpm: number;
+      p75Ppm: number;
+      medianApr: number;
+      medianSizeSat: number;
+      blocks: number;
     } | null;
+    /** How much of the real order flow our size window can serve. */
+    demandFit: {
+      windowDays: number;
+      totalOrders: number;
+      matchingOrders: number;
+      sharePct: number;
+      reachableOrdersPerMonth: number;
+      medianOrderSat: number;
+      maxSizeForHalfMarket: number | null;
+      ladder: { maxSizeSat: number; sharePct: number; ordersPerMonth: number }[];
+    } | null;
+    marketActivity: { orders: number; perDay: number; windowDays: number } | null;
+    historyAgeHours: number | null;
+    popularLeaseBlocks: number;
     reasons: string[];
     warnings: string[];
     recommendations: MagmaSellRecommendation[];

@@ -21,6 +21,8 @@ export function MarketBuy() {
   const [buyError, setBuyError] = useState<string | null>(null);
   const [orderId, setOrderId] = useState<string | null>(null);
   const [orderState, setOrderState] = useState<OrderState | null>(null);
+  /** Offer the user picked, if any. Empty = let Amboss match a seller. */
+  const [pick, setPick] = useState<{ offerId: string; sizeSats: number; seller: string } | null>(null);
 
   const load = async () => {
     setLoading(true);
@@ -80,12 +82,16 @@ export function MarketBuy() {
     }
     setBusy(true);
     try {
-      const q = await api.ambossBuyQuote(cents, isPrivate);
+      const q = await api.ambossBuyQuote(cents, isPrivate, pick ?? undefined);
       const ok = await ui.confirm({
         title: "Confirm liquidity purchase",
         message:
           `Pay a one-time ${q.sats.toLocaleString()} sat fee for a ~${satsCompact(q.channelSizeSats)} ` +
-          `inbound channel? A seller opens the channel to your node. This is a real Lightning payment.`,
+          `inbound channel? ` +
+          (pick
+            ? `Seller ${pick.seller.slice(0, 12)}… opens the channel to your node.`
+            : `Amboss picks the seller, who then opens the channel to your node.`) +
+          ` This is a real Lightning payment.`,
         confirmLabel: `Pay ${q.sats.toLocaleString()} sat`,
         danger: true,
       });
@@ -149,7 +155,15 @@ export function MarketBuy() {
             private
           </label>
           {estInbound ? <span className="muted">≈ {satsCompact(estInbound)} of value</span> : null}
-          <button className="primary-btn" disabled={busy || usd < 5} onClick={() => void buy()}>
+          {pick ? (
+            <div className="muted reason">
+              Buying from <code>{pick.seller.slice(0, 14)}…</code> at {satsCompact(pick.sizeSats)}.{" "}
+              <button className="link-btn" onClick={() => setPick(null)}>
+                clear
+              </button>
+            </div>
+          ) : null}
+          <button className="primary-btn" disabled={busy || (!pick && usd < 5)} onClick={() => void buy()}>
             {busy ? "Working…" : "Buy inbound"}
           </button>
           <span className="open-warn">⚠ real on-chain channel</span>
@@ -199,6 +213,7 @@ export function MarketBuy() {
                 <th className="num">Size range</th>
                 <th className="num">Available</th>
                 <th className="num">Fee*</th>
+                <th></th>
               </tr>
             </thead>
             <tbody>
@@ -234,6 +249,26 @@ export function MarketBuy() {
                     </td>
                     <td className="num">{satsCompact(o.availableSats)}</td>
                     <td className="num strong">{satsCompact(cost)}</td>
+                    <td>
+                      <button
+                        className="row-btn"
+                        disabled={busy || !connected}
+                        title={
+                          connected
+                            ? "Buy from this seller specifically, instead of letting Amboss match one"
+                            : "Connect Amboss in Settings first"
+                        }
+                        onClick={() =>
+                          setPick(
+                            pick?.offerId === o.id
+                              ? null
+                              : { offerId: o.id, sizeSats: o.minSizeSats, seller: o.sellerPubkey },
+                          )
+                        }
+                      >
+                        {pick?.offerId === o.id ? "Picked" : "Pick"}
+                      </button>
+                    </td>
                   </tr>
                 );
               })}
@@ -246,7 +281,10 @@ export function MarketBuy() {
                 seller reliability and size fit, not score alone.{" "}
               </>
             ) : null}
-            * one-time lease fee for the smallest channel. When you buy, Amboss matches you to a top-scored seller.
+            * one-time lease fee for the smallest channel.{" "}
+            {pick
+              ? "You picked a seller, so the order goes to them."
+              : "Without a pick, Amboss chooses the seller for you — the ranking above is then only advice."}
           </p>
         </>
       ) : null}

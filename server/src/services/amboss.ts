@@ -17,7 +17,12 @@ export interface MagmaOffer {
   baseFeeSats: number;
   feeRatePpm: number;
   sellerScore: number;
+  /** total_size minus what is already locked into live orders. */
   availableSats: number;
+  /** Listed capacity, before subtracting locked orders. */
+  totalSizeSats: number;
+  lockedSats: number;
+  minBlockLength: number;
 }
 
 export interface MarketView {
@@ -36,6 +41,8 @@ interface RawOffer {
   status: string;
   side: string;
   total_size: string;
+  min_block_length?: number | string | null;
+  orders?: { locked_size: string | null } | null;
 }
 
 async function gql<T>(
@@ -66,24 +73,36 @@ async function gql<T>(
 
 /** Live SELL offers on the Magma marketplace (no key required). */
 export async function getOffers(): Promise<MagmaOffer[]> {
+  // `orders { locked_size }` is what an offer has actually committed. Without it
+  // total_size reads as "available", which it is not: a seller with a full order
+  // book still lists their whole capacity.
   const query = `query {
     getOffers { list {
       id account min_size max_size base_fee fee_rate seller_score status side total_size
+      min_block_length
+      orders { locked_size }
     } }
   }`;
   const data = await gql<{ getOffers: { list: RawOffer[] } }>(AMBOSS_URL, query);
   return data.getOffers.list
     .filter((o) => o.side === "SELL" && o.status === "ENABLED")
-    .map((o) => ({
-      id: o.id,
-      sellerPubkey: o.account,
-      minSizeSats: Number(o.min_size),
-      maxSizeSats: Number(o.max_size),
-      baseFeeSats: Number(o.base_fee),
-      feeRatePpm: Number(o.fee_rate),
-      sellerScore: Number(o.seller_score),
-      availableSats: Number(o.total_size),
-    }))
+    .map((o) => {
+      const total = Number(o.total_size);
+      const locked = Number(o.orders?.locked_size ?? 0) || 0;
+      return {
+        id: o.id,
+        sellerPubkey: o.account,
+        minSizeSats: Number(o.min_size),
+        maxSizeSats: Number(o.max_size),
+        baseFeeSats: Number(o.base_fee),
+        feeRatePpm: Number(o.fee_rate),
+        sellerScore: Number(o.seller_score),
+        availableSats: Math.max(0, total - locked),
+        totalSizeSats: total,
+        lockedSats: locked,
+        minBlockLength: Number(o.min_block_length ?? 0) || 0,
+      };
+    })
     .sort((a, b) => b.sellerScore - a.sellerScore);
 }
 
@@ -406,4 +425,94 @@ export async function validateKey(apiKey: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+// ── Market history (public, no key) ───────────────────────────────────────────
+
+export interface RawMarketOrder {
+  date: string;
+  size: string;
+  block_duration: number;
+  /** Annualised rate the buyer actually paid, as a decimal string. */
+  lnr: string | null;
+  lny: string | null;
+  status: string | null;
+}
+
+/**
+ * Every completed Magma order since `from` (YYYY-MM-DD). This is the real fill
+ * history: size, lease length and the rate the buyer agreed to. Needs no key.
+ *
+ * It replaces the order-book diffing we used to do. Listed offers are asks;
+ * these are trades.
+ */
+export async function marketOrderHistory(from: string): Promise<RawMarketOrder[]> {
+  const query = `query History($from: String!) {
+    getMarketMetrics { order_details(from: $from) {
+      date size block_duration lnr lny status
+    } }
+  }`;
+  const data = await gql<{ getMarketMetrics: { order_details: RawMarketOrder[] } }>(
+    AMBOSS_URL,
+    query,
+    undefined,
+    { from },
+  );
+  return data.getMarketMetrics?.order_details ?? [];
+}
+
+// ── Buying a SPECIFIC offer ───────────────────────────────────────────────────
+
+/**
+ * Buy from one chosen offer.
+ *
+ * `liquidity.buy` (above) takes only a USD amount and lets Amboss pick the
+ * seller, which made the ranked "best offer" list in the Buy tab decorative:
+ * whatever the user picked, Amboss matched whoever it wanted. This mutation
+ * targets an offer_id, so the pick actually decides who opens the channel.
+ */
+export async function buyFromOffer(
+  apiKey: string,
+  offerId: string,
+  pubkey: string,
+  sizeSats: number,
+  isPrivate: boolean,
+): Promise<BuyQuote> {
+  const mutation = `mutation Order($input: CreateManualOrderInput!) {
+    market { order { create(input: $input) {
+      id
+      amount { satoshi { sats } }
+      fees { buyer { sats } }
+      payment { lightning { invoice } }
+    } } }
+  }`;
+  const input = {
+    offer_id: offerId,
+    pubkey,
+    size: String(Math.round(sizeSats)),
+    // PaymentMethod is { AMBUCKS, SATS } — we pay the invoice in sats.
+    payment_method: "SATS",
+    options: { private: isPrivate },
+  };
+  const data = await gql<{
+    market: {
+      order: {
+        create: {
+          id: string;
+          amount: { satoshi: { sats: string | null } | null } | null;
+          fees: { buyer: { sats: string | null } | null } | null;
+          payment: { lightning: { invoice: string | null } | null } | null;
+        };
+      };
+    };
+  }>(MAGMA_URL, mutation, apiKey, { input });
+  const o = data.market.order.create;
+  const invoice = o.payment?.lightning?.invoice ?? "";
+  if (!invoice) throw new Error("Amboss returned no invoice for the order");
+  return {
+    orderId: o.id,
+    paymentRequest: invoice,
+    sats: Number(o.fees?.buyer?.sats ?? 0),
+    channelSizeSats: Number(o.amount?.satoshi?.sats ?? sizeSats),
+  };
 }

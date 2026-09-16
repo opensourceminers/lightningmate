@@ -1355,3 +1355,12 @@ tr.pending td { opacity: 0.9; }
 .lnp-chip.neg { color: var(--red); background: rgba(248, 113, 113, 0.1); border-color: rgba(248, 113, 113, 0.25); }
 .lnp-ok { color: var(--green); font-weight: 600; }
 .pad { padding: 10px 2px; }
+
+/* Magma: the size-window banner. Size, not price, is usually what blocks fills. */
+.magma-reach {
+  margin: 12px 0; padding: 12px 14px; border-radius: 8px;
+  background: rgba(247, 147, 26, 0.06); border: 1px solid rgba(247, 147, 26, 0.22);
+}
+.magma-reach-head { font-size: 14px; margin-bottom: 4px; }
+.magma-reach .table { margin-top: 10px; }
+.table.compact th, .table.compact td { padding: 4px 8px; font-size: 12px; }
