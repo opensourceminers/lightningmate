@@ -4,6 +4,7 @@ import express from "express";
 import { loadConfig } from "./config.js";
 import { getLnd, getWriteLnd } from "./lnd.js";
 import { createApiRouter } from "./routes/api.js";
+import { LnPlusStore } from "./services/lnplusStore.js";
 import { Autopilot } from "./services/autopilot.js";
 import { RebalanceLog } from "./services/rebalanceLog.js";
 import { SettingsStore } from "./services/settings.js";
@@ -46,8 +47,11 @@ function main(): void {
   const overrides = new OverridesStore(config.dataDir);
   const ambossStore = new AmbossStore(config.dataDir);
   const backupStore = new BackupStore(config.dataDir);
+  // LN+ node reputation cache (public API, no key). Used to re-rank peer
+  // suggestions with a social trust signal the network graph cannot provide.
+  const lnplusStore = new LnPlusStore(config.dataDir);
   const earningsLog = new EarningsLog(config.dataDir);
-  const autopilot = new Autopilot(config.dataDir, lnd, writeLnd, rebalanceLog, overrides, ambossStore, earningsLog);
+  const autopilot = new Autopilot(config.dataDir, lnd, writeLnd, rebalanceLog, overrides, ambossStore, earningsLog, lnplusStore);
   autopilot.start();
   const lsps1 = new Lsps1Service(
     config.dataDir,
@@ -92,7 +96,7 @@ function main(): void {
   app.use(express.json({ limit: "256kb" }));
   app.use(
     "/api",
-    createApiRouter(lnd, writeLnd, config, autopilot, rebalanceLog, settings, overrides, ambossStore, backupStore, earningsLog, lsps1),
+    createApiRouter(lnd, writeLnd, config, autopilot, rebalanceLog, settings, overrides, ambossStore, backupStore, earningsLog, lsps1, lnplusStore),
   );
 
   // In production (Docker/Umbrel) we serve the built React app from the same

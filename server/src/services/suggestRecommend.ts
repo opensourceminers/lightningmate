@@ -13,6 +13,8 @@ import {
   type NodeStat,
   type SuggestionPolicy,
 } from "./suggestions.js";
+import type { LnPlusNode } from "./lnplus.js";
+import type { LnPlusStore } from "./lnplusStore.js";
 
 /**
  * Channel Suggestions v2 — demand-aware, quality-weighted, portfolio-aware.
@@ -33,12 +35,15 @@ export interface SuggestV2Config extends SuggestionPolicy {
   demandWindowDays: number;
   /** How hard to penalise a candidate whose new reach overlaps already-picked ones. */
   diversityPenaltyWeight: number;
+  /** Most LN+ profile fetches one suggestion run may spend (LN+ allows 100/24h). */
+  lnplusFetchBudget: number;
 }
 
 export const SUGGEST_V2_DEFAULTS: SuggestV2Config = {
   ...DEFAULT_SUGGESTION_POLICY,
   demandWindowDays: 30,
   diversityPenaltyWeight: 0.35,
+  lnplusFetchBudget: 12,
 };
 
 export type NodeNeed =
@@ -104,6 +109,19 @@ export interface SuggestionV2 {
   badges: string[];
   reasons: string[];
   warnings: string[];
+
+  /** LN+ reputation when the peer has a profile there, else null. */
+  lnplus: {
+    rank: number;
+    rankName: string;
+    prime: boolean;
+    verified: boolean;
+    positiveRatings: number;
+    negativeRatings: number;
+    profileUrl: string;
+    /** What the reputation did to the score, in percent (+8 = lifted by 8%). */
+    scoreEffectPct: number;
+  } | null;
 }
 
 export interface SuggestV2Report {
@@ -113,6 +131,17 @@ export interface SuggestV2Report {
   hasDemandData: boolean;
   suggestions: SuggestionV2[];
   graphAgeSec: number;
+  /** How much the LN+ reputation pass contributed to this run. */
+  lnplus: {
+    enabled: boolean;
+    /** Shortlisted candidates we have an LN+ answer for (profile or "none"). */
+    checked: number;
+    /** Of those, how many actually have an LN+ profile. */
+    known: number;
+    /** True while we are backing off after an LN+ error or rate limit. */
+    paused: boolean;
+    error: string | null;
+  };
   portfolioSummary: {
     selectedCount: number;
     estimatedNewReach: number;
@@ -132,6 +161,32 @@ function median(values: number[]): number {
 const roundTo100k = (n: number) => Math.round(n / 100_000) * 100_000;
 const avgChanOf = (s: NodeStat) => (s.degree ? s.totalCapacity / s.degree : 0);
 
+/**
+ * LN+ reputation as a bounded multiplier on the graph-derived score.
+ *
+ * Deliberately a MULTIPLIER, not a scoring component: most of the Lightning
+ * graph has no LN+ profile, and "not on LN+" must never read as "bad peer". A
+ * node without a profile scores exactly as it did before. A node WITH one can
+ * move within ±20%, which re-ranks the shortlist without ever overriding the
+ * topology and demand evidence that earned a candidate its place.
+ *
+ * The rating term is confidence-weighted: two positive ratings are an anecdote,
+ * fifty are evidence. Below ~10 ratings the sentiment barely moves the number.
+ */
+export function lnplusTrustMultiplier(n: LnPlusNode | null): number {
+  if (!n) return 1;
+  const total = n.positiveRatings + n.negativeRatings;
+  const approval = total > 0 ? n.positiveRatings / total : 0.5;
+  const confidence = Math.min(1, total / 10);
+  // -1 (all negative, well evidenced) … +1 (all positive, well evidenced)
+  const sentiment = (approval - 0.5) * 2 * confidence;
+
+  let bonus = 0.12 * clamp01(n.rank / 10) + 0.1 * sentiment;
+  if (n.prime) bonus += 0.04;
+  if (n.verified) bonus += 0.02;
+  return 1 + Math.min(0.2, Math.max(-0.15, bonus));
+}
+
 /** Smooth fee-reasonableness: sweet spot 1–600 ppm, decaying past that. */
 function feeReasonableness(avgFee: number): number {
   if (avgFee <= 0) return 0.6; // 0 ppm: could be a healthy hub, could be spam
@@ -144,6 +199,8 @@ function feeReasonableness(avgFee: number): number {
 export async function getChannelSuggestionsV2(
   lnd: AuthenticatedLnd,
   overrides: Partial<SuggestV2Config> = {},
+  /** Optional LN+ reputation source. Omit it and scoring is exactly as before. */
+  lnplus?: LnPlusStore,
 ): Promise<SuggestV2Report> {
   const policy = { ...SUGGEST_V2_DEFAULTS, ...overrides };
 
@@ -228,6 +285,7 @@ export async function getChannelSuggestionsV2(
       hasDemandData,
       suggestions: [],
       graphAgeSec: Math.round((now - graph.at) / 1000),
+      lnplus: { enabled: !!lnplus, checked: 0, known: 0, paused: lnplus?.isPaused() ?? false, error: null },
       portfolioSummary: { selectedCount: 0, estimatedNewReach: 0, estimatedWeightedNewReach: 0, demandCoveragePct: 0 },
     };
   }
@@ -274,6 +332,10 @@ export async function getChannelSuggestionsV2(
     demandOverlapCount: number;
     demandFlowSharePct: number;
     rawScore: number;
+    /** LN+ reputation, filled in later for the shortlist only (may stay null). */
+    lnplus: LnPlusNode | null;
+    /** Multiplier the LN+ reputation applies to rawScore (1 = no data). */
+    trustMultiplier: number;
   }
 
   // First pass: per-candidate raw components.
@@ -396,6 +458,8 @@ export async function getChannelSuggestionsV2(
       demandOverlapCount: p.demandOverlapCount,
       demandFlowSharePct: Math.round(p.demandFlowShare * 100),
       rawScore,
+      lnplus: null,
+      trustMultiplier: 1,
     };
   });
 
@@ -405,6 +469,33 @@ export async function getChannelSuggestionsV2(
   // cover the same cluster.
   scored.sort((a, b) => b.rawScore - a.rawScore);
   const pool = scored.slice(0, Math.max(policy.count * 4, 40));
+
+  // ── LN+ reputation pass (optional, best-effort) ─────────────────────────────
+  // Only the shortlist is enriched, never the thousands of candidates we scored:
+  // LN+ allows 100 calls/24h, and the cache makes repeat runs nearly free. If
+  // LN+ is down, rate-limiting or simply has no profile for a node, we keep the
+  // pure-graph score — the feature degrades, it never fails.
+  let lnplusChecked = 0;
+  let lnplusKnown = 0;
+  if (lnplus) {
+    const profiles = await lnplus
+      .enrich(pool.map((s) => s.e.pk), policy.lnplusFetchBudget)
+      .catch(() => new Map<string, LnPlusNode>());
+    for (const s of pool) {
+      const cached = lnplus.peek(s.e.pk);
+      const profile = profiles.get(s.e.pk) ?? (cached ?? null);
+      if (cached !== undefined) lnplusChecked += 1;
+      if (profile) {
+        s.lnplus = profile;
+        s.trustMultiplier = lnplusTrustMultiplier(profile);
+        s.rawScore *= s.trustMultiplier;
+        lnplusKnown += 1;
+      }
+    }
+    // Re-rank: the reputation pass may have reshuffled the shortlist.
+    pool.sort((a, b) => b.rawScore - a.rawScore);
+  }
+
   const selected: { s: Scored; overlap: number; rank: number }[] = [];
   const reachSet = new Set<string>();
   while (selected.length < policy.count && selected.length < pool.length) {
@@ -491,6 +582,24 @@ export async function getChannelSuggestionsV2(
     if (s.avgFee > 0 && s.avgFee <= 600) badges.push("moderate fees");
     if (avgChan >= 5_000_000) badges.push("high liquidity");
 
+    // LN+ reputation: the one signal the graph cannot carry — whether real
+    // operators have dealt with this node and would do it again.
+    const lp = s.lnplus;
+    if (lp) {
+      const ratings = lp.positiveRatings + lp.negativeRatings;
+      if (lp.rank >= 7) badges.push(`LN+ ${lp.rankName || `rank ${lp.rank}`}`);
+      if (lp.prime) badges.push("LN+ Prime");
+      if (lp.negativeRatings > 0 && lp.negativeRatings >= lp.positiveRatings) {
+        warnings.push(
+          `LN+ peers rate this node poorly: ${lp.positiveRatings} positive vs ${lp.negativeRatings} negative.`,
+        );
+      } else if (ratings >= 5 && lp.positiveRatings > lp.negativeRatings) {
+        reasons.push(
+          `Vouched for on LN+: rank ${lp.rank}/10${lp.rankName ? ` (${lp.rankName})` : ""}, ${lp.positiveRatings} positive rating${lp.positiveRatings === 1 ? "" : "s"} from real operators.`,
+        );
+      }
+    }
+
     const usefulness: SuggestionV2["usefulness"] =
       s.rawScore >= 0.55 ? "high" : s.rawScore >= 0.35 ? "medium" : "low";
 
@@ -522,6 +631,18 @@ export async function getChannelSuggestionsV2(
       badges,
       reasons,
       warnings,
+      lnplus: lp
+        ? {
+            rank: lp.rank,
+            rankName: lp.rankName,
+            prime: lp.prime,
+            verified: lp.verified,
+            positiveRatings: lp.positiveRatings,
+            negativeRatings: lp.negativeRatings,
+            profileUrl: lp.profileUrl,
+            scoreEffectPct: Math.round((s.trustMultiplier - 1) * 100),
+          }
+        : null,
     };
   });
 
@@ -545,6 +666,13 @@ export async function getChannelSuggestionsV2(
     hasDemandData,
     suggestions,
     graphAgeSec: Math.round((now - graph.at) / 1000),
+    lnplus: {
+      enabled: !!lnplus,
+      checked: lnplusChecked,
+      known: lnplusKnown,
+      paused: lnplus?.isPaused() ?? false,
+      error: lnplus?.getLastError() ?? null,
+    },
     portfolioSummary: {
       selectedCount: suggestions.length,
       estimatedNewReach,

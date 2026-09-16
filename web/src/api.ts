@@ -48,6 +48,9 @@ import type {
   BackupStatus,
   SuggestionPolicy,
   SuggestionsResponse,
+  LnPlusStatus,
+  LnPlusPoolResponse,
+  LnPlusSwapsResponse,
   UnservedDemandReport,
 } from "./types";
 
@@ -164,6 +167,13 @@ export const api = {
   },
   closeCandidates: (days?: number) =>
     get<CloseCandidatesResponse>(days ? `/suggestions/close?days=${days}` : "/suggestions/close"),
+
+  // ── lightningnetwork.plus (read-only, no key) ──
+  lnplusStatus: () => get<LnPlusStatus>("/lnplus/status"),
+  lnplusPool: (minSizeSats?: number) =>
+    get<LnPlusPoolResponse>(minSizeSats ? `/lnplus/pool?minSize=${minSizeSats}` : "/lnplus/pool"),
+  lnplusSwaps: (status?: "pending" | "opening" | "completed") =>
+    get<LnPlusSwapsResponse>(status ? `/lnplus/swaps?status=${status}` : "/lnplus/swaps"),
   channelOpen: (params: {
     pubkey: string;
     socket?: string;

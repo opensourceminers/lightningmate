@@ -2,7 +2,7 @@ import { Router, type Request, type Response, type NextFunction } from "express"
 import { getWalletInfo, signMessage, type AuthenticatedLnd } from "lightning";
 import { getNodeScore } from "../services/score.js";
 import type { Config } from "../config.js";
-import { getNodeSummary } from "../services/node.js";
+import { getNodeSummary, getOwnPubkey } from "../services/node.js";
 import { getChannelsView } from "../services/channels.js";
 import { getFlowSummary, getForwardsReport } from "../services/forwards.js";
 import { applyFees, getFeePreview, type FeeApplyItem, type FeePolicy } from "../services/fees.js";
@@ -13,6 +13,8 @@ import {
 } from "../services/rebalance.js";
 import { type SuggestionPolicy } from "../services/suggestions.js";
 import { getChannelSuggestionsV2, getCloseSuggestionsV2 } from "../services/suggestRecommend.js";
+import type { LnPlusStore } from "../services/lnplusStore.js";
+import { checkSwapEligibility, getPoolNodes, getSwaps, type NodeFacts } from "../services/lnplus.js";
 import { getMagmaRecommendations } from "../services/magmaRecommend.js";
 import { getAutopilotOutcomes } from "../services/outcomes.js";
 import { getPnl } from "../services/pnl.js";
@@ -161,6 +163,7 @@ export function createApiRouter(
   backup: BackupStore,
   earnings: EarningsLog,
   lsps1: Lsps1Service,
+  lnplus: LnPlusStore,
 ): Router {
   const router = Router();
 
@@ -599,7 +602,7 @@ export function createApiRouter(
       if (req.query.requireClearnet !== undefined) {
         overrides.requireClearnet = req.query.requireClearnet === "true";
       }
-      res.json(await getChannelSuggestionsV2(lnd, overrides));
+      res.json(await getChannelSuggestionsV2(lnd, overrides, lnplus));
     }),
   );
 
@@ -615,6 +618,79 @@ export function createApiRouter(
           overrides.all(),
         ),
       );
+    }),
+  );
+
+  // ── lightningnetwork.plus (LN+) ─────────────────────────────────────────────
+  // Read-only and key-free. LN+ adds a social trust layer on top of the graph:
+  // ratings real operators gave each other, plus two liquidity marketplaces
+  // (Pool and Swaps) that work differently from Magma — you trade channels for
+  // channels or for credits, not for sats.
+
+  // Our own LN+ standing, and what the reputation cache is doing.
+  router.get(
+    "/lnplus/status",
+    wrap(async (_req, res) => {
+      const ownKey = await getOwnPubkey(lnd);
+      const me = await lnplus.lookup(ownKey).catch(() => null);
+      res.json({
+        pubkey: ownKey,
+        onLnPlus: !!me,
+        me,
+        cache: lnplus.stats(),
+      });
+    }),
+  );
+
+  // Liquidity Pool participants: nodes that will open you a channel in exchange
+  // for liquidity credits rather than sats.
+  router.get(
+    "/lnplus/pool",
+    wrap(async (req, res) => {
+      const minSizeSats = Number(req.query.minSize);
+      const nodes = await getPoolNodes({
+        minSizeSats: Number.isFinite(minSizeSats) && minSizeSats > 0 ? minSizeSats : undefined,
+        limit: 50,
+      });
+      // Our node is Tor-only on many installs, so say up front who we can reach.
+      const peers = new Set((await getChannelsView(lnd)).map((c) => c.peerPubkey));
+      res.json({
+        nodes: nodes.map((n) => ({ ...n, alreadyPeered: peers.has(n.pubkey) })),
+      });
+    }),
+  );
+
+  // Liquidity Swaps, annotated with whether THIS node could actually join —
+  // checked locally against the gates LN+ publishes, so we never invite the
+  // user into a swap that would reject them.
+  router.get(
+    "/lnplus/swaps",
+    wrap(async (req, res) => {
+      const status = req.query.status === "opening" || req.query.status === "completed"
+        ? (req.query.status as "opening" | "completed")
+        : "pending";
+      const [swaps, channels, info, ownKey] = await Promise.all([
+        getSwaps({ status, limit: 50 }),
+        getChannelsView(lnd),
+        getWalletInfo({ lnd }),
+        getOwnPubkey(lnd),
+      ]);
+      const mine = await lnplus.lookup(ownKey).catch(() => null);
+      const uris: string[] = info.uris ?? [];
+      const facts: NodeFacts = {
+        capacitySats: channels.reduce((s, c) => s + c.capacity, 0),
+        channelCount: channels.length,
+        hasClearnet: uris.some((u) => !u.includes(".onion")),
+        hasTor: uris.some((u) => u.includes(".onion")),
+        prime: mine?.prime ?? false,
+        pro: mine?.pro ?? false,
+      };
+      res.json({
+        me: facts,
+        swaps: swaps
+          .filter((s) => !s.isPrivate)
+          .map((s) => ({ ...s, eligibility: checkSwapEligibility(s, facts) })),
+      });
     }),
   );
 

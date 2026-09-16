@@ -8,6 +8,7 @@ import { runMaxHtlcPass, type MaxHtlcChange } from "./maxHtlc.js";
 import { paySaleServiceFee } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
+import type { LnPlusStore } from "./lnplusStore.js";
 import { getMagmaRecommendations, type MagmaSellRecommendation, type MagmaV2Report } from "./magmaRecommend.js";
 import { onchainCosts } from "./nodeEconomics.js";
 import { getFeeElasticity } from "./outcomes.js";
@@ -212,6 +213,8 @@ export class Autopilot {
     private readonly overrides: OverridesStore,
     private readonly amboss: AmbossStore,
     private readonly earnings: EarningsLog,
+    /** LN+ reputation cache — optional; without it peer picking is graph-only. */
+    private readonly lnplus?: LnPlusStore,
   ) {
     this.store = new JsonStore<PersistedState>(dataDir, "autopilot.json");
     initMarketTelemetry(dataDir);
@@ -648,7 +651,9 @@ export class Autopilot {
     const available = chain_balance - cfg.channelReserveSats - this.committedOnchainSat();
     if (available <= 0) return [];
 
-    const { suggestions } = await getChannelSuggestionsV2(this.readLnd, {});
+    // The autopilot opens channels with real capital, so it gets the LN+ trust
+    // signal too: a peer other operators rate badly is a bad place to lock funds.
+    const { suggestions } = await getChannelSuggestionsV2(this.readLnd, {}, this.lnplus);
     const top = suggestions[0];
     if (!top) return [];
 

@@ -1341,3 +1341,17 @@ tr.pending td { opacity: 0.9; }
 .coach-item.todo .coach-mark { color: var(--accent); }
 .coach-item.ok { color: var(--muted); }
 .coach-item.info { color: var(--muted); font-size: 12px; }
+
+/* ── lightningnetwork.plus ────────────────────────────────────────────────── */
+/* A distinct blue so an LN+ reputation chip never reads as one of our own
+   orange badges — it is a third-party signal and should look like one. */
+.lnp-chip {
+  display: inline-block; margin-left: 6px; vertical-align: middle;
+  font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 4px;
+  text-decoration: none; white-space: nowrap;
+  color: #6fb4f5; background: rgba(111, 180, 245, 0.1); border: 1px solid rgba(111, 180, 245, 0.25);
+}
+.lnp-chip:hover { background: rgba(111, 180, 245, 0.18); }
+.lnp-chip.neg { color: var(--red); background: rgba(248, 113, 113, 0.1); border-color: rgba(248, 113, 113, 0.25); }
+.lnp-ok { color: var(--green); font-weight: 600; }
+.pad { padding: 10px 2px; }

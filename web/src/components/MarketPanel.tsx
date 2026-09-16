@@ -5,8 +5,9 @@ import { sats, satsCompact } from "../format";
 import { MarketBuy } from "./MarketBuy";
 import { MarketSell } from "./MarketSell";
 import { MarketOrders } from "./MarketOrders";
+import { LnPlusPanel } from "./LnPlusPanel";
 
-type Sub = "buy" | "sell" | "orders";
+type Sub = "buy" | "sell" | "orders" | "lnplus";
 
 /** One seller-score coach line: what typically drives the Amboss seller score,
  *  checked against what we can actually see locally. */
@@ -46,9 +47,12 @@ export function MarketPanel() {
         <button className={`subtab ${sub === "orders" ? "active" : ""}`} onClick={() => setSub("orders")}>
           Orders
         </button>
+        <button className={`subtab ${sub === "lnplus" ? "active" : ""}`} onClick={() => setSub("lnplus")}>
+          LN+
+        </button>
       </div>
 
-      {a ? (
+      {a && sub !== "lnplus" ? (
         <div className="market-score">
           <span className="market-score-main">
             Seller score <b>{a.mySellerScore != null ? a.mySellerScore.toFixed(1) : "—"}</b>
@@ -69,7 +73,7 @@ export function MarketPanel() {
         </div>
       ) : null}
 
-      {a && rec ? (
+      {a && rec && sub !== "lnplus" ? (
         <details className="score-coach">
           <summary>Improve your seller score</summary>
           <div className="coach-list">
@@ -112,7 +116,15 @@ export function MarketPanel() {
         </details>
       ) : null}
 
-      {sub === "buy" ? <MarketBuy /> : sub === "sell" ? <MarketSell /> : <MarketOrders />}
+      {sub === "buy" ? (
+        <MarketBuy />
+      ) : sub === "sell" ? (
+        <MarketSell />
+      ) : sub === "orders" ? (
+        <MarketOrders />
+      ) : (
+        <LnPlusPanel />
+      )}
     </div>
   );
 }

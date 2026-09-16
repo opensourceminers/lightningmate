@@ -207,6 +207,19 @@ export function SuggestionsPanel() {
                   <td>
                     <div className="sug-peer">
                       {s.alias} {s.hasClearnet ? "🌐" : "🧅"}
+                      {s.lnplus ? (
+                        <a
+                          className={`lnp-chip${s.lnplus.scoreEffectPct < 0 ? " neg" : ""}`}
+                          href={s.lnplus.profileUrl}
+                          target="_blank"
+                          rel="noreferrer noopener"
+                          onClick={(e) => e.stopPropagation()}
+                          title={`LN+ rank ${s.lnplus.rank}/10${s.lnplus.rankName ? ` (${s.lnplus.rankName})` : ""} · ${s.lnplus.positiveRatings} positive / ${s.lnplus.negativeRatings} negative ratings${s.lnplus.prime ? " · Prime" : ""} — moves this score by ${s.lnplus.scoreEffectPct > 0 ? "+" : ""}${s.lnplus.scoreEffectPct}%`}
+                        >
+                          LN+ {s.lnplus.rank}/10
+                          {s.lnplus.prime ? " ★" : ""}
+                        </a>
+                      ) : null}
                     </div>
                     {s.badges.length ? (
                       <div className="sug-badges">
@@ -270,6 +283,17 @@ export function SuggestionsPanel() {
                           ))}
                         </div>
                         <div className="feerec-metrics">
+                          {s.lnplus ? (
+                            <span>
+                              LN+ {s.lnplus.rankName || `rank ${s.lnplus.rank}`} · {s.lnplus.positiveRatings}
+                              {" "}positive / {s.lnplus.negativeRatings} negative
+                              {s.lnplus.prime ? " · Prime" : ""}
+                              {s.lnplus.verified ? " · verified" : ""}
+                              {" · "}
+                              {s.lnplus.scoreEffectPct > 0 ? "+" : ""}
+                              {s.lnplus.scoreEffectPct}% on this score
+                            </span>
+                          ) : null}
                           <span>{s.channels} channels · {satsCompact(s.capacitySats)} total · {satsCompact(s.avgChannelSats)} avg</span>
                           <span>seen {s.lastSeenDays}d ago · {s.demandOverlapCount} demand-node overlap</span>
                           <span className="muted">{s.sizeReason}</span>

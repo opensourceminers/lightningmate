@@ -408,6 +408,21 @@ export interface ChannelSuggestion {
   badges: string[];
   reasons: string[];
   warnings: string[];
+
+  /** LN+ reputation when the peer has a profile there, else null. */
+  lnplus: LnPlusRating | null;
+}
+
+export interface LnPlusRating {
+  rank: number;
+  rankName: string;
+  prime: boolean;
+  verified: boolean;
+  positiveRatings: number;
+  negativeRatings: number;
+  profileUrl: string;
+  /** What the reputation did to the score, in percent (+8 = lifted by 8%). */
+  scoreEffectPct: number;
 }
 
 export interface CloseCandidate {
@@ -460,6 +475,13 @@ export interface SuggestionsResponse {
   hasDemandData: boolean;
   suggestions: ChannelSuggestion[];
   graphAgeSec: number;
+  lnplus: {
+    enabled: boolean;
+    checked: number;
+    known: number;
+    paused: boolean;
+    error: string | null;
+  };
   portfolioSummary: {
     selectedCount: number;
     estimatedNewReach: number;
@@ -1104,4 +1126,99 @@ export interface BackupStatus {
   lastExportChannelCount: number | null;
   stale: boolean;
   reason: string;
+}
+
+// ── lightningnetwork.plus ────────────────────────────────────────────────────
+
+export interface LnPlusNode {
+  pubkey: string;
+  alias: string;
+  rank: number;
+  rankName: string;
+  prime: boolean;
+  pro: boolean;
+  verified: boolean;
+  positiveRatings: number;
+  negativeRatings: number;
+  positiveGiven: number;
+  negativeGiven: number;
+  badges: string[];
+  openChannels: number;
+  capacitySats: number;
+  minChannelSizeSats: number;
+  profileUrl: string;
+}
+
+export interface LnPlusStatus {
+  pubkey: string;
+  onLnPlus: boolean;
+  me: LnPlusNode | null;
+  cache: { cached: number; withProfile: number; paused: boolean; lastError: string | null };
+}
+
+export interface LnPlusPoolNode {
+  pubkey: string;
+  alias: string;
+  creditsBalanceSats: number;
+  minChannelSizeSats: number;
+  capacitySats: number;
+  openChannels: number;
+  connection: string;
+  clearnetAddress: string;
+  torAddress: string;
+  rank: number;
+  rankName: string;
+  positiveRatings: number;
+  negativeRatings: number;
+  profileUrl: string;
+  reachableOverTor: boolean;
+  alreadyPeered: boolean;
+}
+
+export interface LnPlusSwapParticipant {
+  identifier: string;
+  pubkey: string;
+  alias: string;
+  status: string;
+  cancelled: boolean;
+}
+
+export interface LnPlusSwap {
+  id: number;
+  url: string;
+  status: string;
+  statusText: string;
+  capacitySats: number;
+  durationMonths: number;
+  maxParticipants: number;
+  appliedParticipants: number;
+  openSeats: number;
+  requiresPrime: boolean;
+  requiresPro: boolean;
+  minCapacitySats: number | null;
+  minChannelsCount: number | null;
+  clearnetAllowed: boolean;
+  torAllowed: boolean;
+  isPrivate: boolean;
+  createdAt: string;
+  startsAt: string | null;
+  endsAt: string | null;
+  participants: LnPlusSwapParticipant[];
+  eligibility: { eligible: boolean; blockers: string[] };
+}
+
+export interface LnPlusSwapsResponse {
+  me: {
+    capacitySats: number;
+    channelCount: number;
+    hasClearnet: boolean;
+    hasTor: boolean;
+    prime: boolean;
+    pro: boolean;
+  };
+  swaps: LnPlusSwap[];
+}
+
+export interface LnPlusPoolResponse {
+  nodes: LnPlusPoolNode[];
 }
