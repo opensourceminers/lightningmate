@@ -1093,6 +1093,8 @@ export interface MagmaV2Report {
     recommendedMinSizeSat: number;
     recommendedMaxSizeSat: number;
     minViableSizeSat: number;
+    minNetLeaseProfitSat: number;
+    serviceFeeRate: number;
     effectiveMaxOrderSat: number;
     capReach: {
       sharePctNow: number;

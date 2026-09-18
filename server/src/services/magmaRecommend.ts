@@ -222,6 +222,10 @@ export interface MagmaV2Report {
     recommendedMaxSizeSat: number;
     /** Smallest channel that still pays for its own open+close at market price. */
     minViableSizeSat: number;
+    /** Inputs to that floor, so a caller pricing at a DIFFERENT price (the
+     *  operator's own, with auto-pricing off) can recompute it honestly. */
+    minNetLeaseProfitSat: number;
+    serviceFeeRate: number;
     /** Biggest order the caps + on-chain balance actually allow right now. */
     effectiveMaxOrderSat: number;
     /** What that ceiling reaches, and what raising it would reach. */
@@ -891,6 +895,8 @@ export async function getMagmaRecommendations(
       recommendedMinSizeSat,
       recommendedMaxSizeSat,
       minViableSizeSat,
+      minNetLeaseProfitSat: cfg.minNetLeaseProfitSat,
+      serviceFeeRate: cfg.serviceFeeRate,
       effectiveMaxOrderSat,
       capReach,
       projectedMonthlySat,

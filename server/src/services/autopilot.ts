@@ -148,6 +148,8 @@ interface PersistedState {
   lastSellFillAt: string | null;
   /** One-shot repair of levels the removed downward ratchet drove to the floor. */
   adaptiveRatchetMigrated?: boolean;
+  /** One-shot: derived sellAutoSize for upgraded installs (see constructor). */
+  sellAutoSizeMigrated?: boolean;
   lastSellAdaptiveAdjustAt: string | null;
   /** One-time flag: bumped installs from the old 60-min default to 30 min. */
   intervalMigrated?: boolean;
@@ -240,12 +242,34 @@ export class Autopilot {
       lastSellAdaptiveAdjustAt: null,
       history: [],
     });
+    // Must be read BEFORE the defaults are merged in below. Otherwise every
+    // upgraded install looks as if it had already chosen a value — which is
+    // exactly the bug 0.7.6 shipped: the default `true` landed first, the
+    // migration further down never fired, and upgrading switched auto-sizing on
+    // for operators who had deliberately left auto-pricing off.
+    const persistedHadAutoSize = Object.prototype.hasOwnProperty.call(
+      this.state.config ?? {},
+      "sellAutoSize",
+    );
     // Merge in any newly added config defaults from older persisted state.
     this.state.config = { ...DEFAULT_CONFIG, ...this.state.config };
     this.state.perTargetLastRebalanced ??= {};
-    // Sizing used to ride along with auto-pricing. Existing installs keep exactly
-    // the behaviour they had; only the control is now separate.
-    this.state.config.sellAutoSize ??= this.state.config.sellAutoReprice;
+    // Sizing used to ride along with auto-pricing. Upgrading must keep exactly
+    // the behaviour an install had, so one-shot:
+    //   - config from before the switch existed: inherit auto-pricing's value;
+    //   - config written by 0.7.6, whose broken migration forced sizing ON even
+    //     with pricing OFF: undo that, and ONLY in that direction. The repair may
+    //     switch automation off, never on, so it cannot overturn an operator who
+    //     deliberately turned sizing off.
+    // Persisted immediately so a restart cannot re-derive it after the operator
+    // has since made an explicit choice.
+    if (!this.state.sellAutoSizeMigrated) {
+      const c = this.state.config;
+      if (!persistedHadAutoSize) c.sellAutoSize = c.sellAutoReprice;
+      else if (c.sellAutoSize && !c.sellAutoReprice) c.sellAutoSize = false;
+      this.state.sellAutoSizeMigrated = true;
+      this.store.write(this.state);
+    }
     this.state.sellAdaptiveLevel ??= 0.5;
     // One-time repair: the removed downward ratchet left long-running installs at
     // a level near 0, i.e. priced at the very bottom of the ladder. Nothing about
@@ -837,7 +861,14 @@ export class Autopilot {
         // engine). Reprice only when the ENGINE says so (≥ max(25 ppm, 10%) off, or
         // below the profit floor) — the old 1% check here churned an updateOffer on
         // almost every run.
+        // The price the engine would like — handed out ONLY when the operator has
+        // delegated pricing. The recommendation is also fetched for auto-sizing,
+        // and in 0.7.6 every consumer below treated "we have a recommendation" as
+        // "we may reprice": auto-sizing, relisting and offer creation all wrote the
+        // engine's price while auto-pricing was switched off. Gating it here, at
+        // the single source, covers every one of those paths at once.
         const target = (off: { id: string; feeRatePpm: number }) => {
+          if (!cfg.sellAutoReprice) return null;
           const r = recByOffer.get(off.id);
           if (!r) return null;
           return {
@@ -853,7 +884,25 @@ export class Autopilot {
         const reshape = (off: MyOffer) => {
           if (!rec || !cfg.sellAutoSize) return null;
           const sell = rec.sell;
-          const wantMin = sell.recommendedMinSizeSat;
+          // The size floor only holds at the price it was computed for. The
+          // engine's figure assumes ITS recommended price; with auto-pricing off
+          // the offer keeps the operator's own price, so the floor has to come
+          // from that price — otherwise sizing could open the window to orders
+          // that lose money at the price actually listed. If no size pays at the
+          // operator's price, sizing leaves the offer alone (the Market page
+          // already flags the price as below the profit floor).
+          const floorAtOwnPrice = (): number => {
+            const cost =
+              (sell.onchainOpenCostSat + sell.onchainCloseCostSat + sell.minNetLeaseProfitSat) /
+              Math.max(0.01, 1 - sell.serviceFeeRate);
+            const stillNeeded = cost - off.baseFeeSats; // what the rate must earn on top of the base
+            if (stillNeeded <= 0) return 0; // the base fee alone covers any size
+            if (off.feeRatePpm <= 0) return Number.POSITIVE_INFINITY;
+            return Math.ceil((stillNeeded * 1_000_000) / off.feeRatePpm / 50_000) * 50_000;
+          };
+          const wantMin = cfg.sellAutoReprice
+            ? sell.recommendedMinSizeSat
+            : Math.max(sell.recommendedMinSizeSat, floorAtOwnPrice());
           const room = Math.min(
             chain_balance - cfg.sellReserveSats - deployed - this.committedOnchainSat(),
             cfg.sellMaxDeploySats - deployed,
@@ -943,7 +992,10 @@ export class Autopilot {
         // recommended price. (Only when no offer exists — a disabled offer is
         // treated as a deliberate choice and left alone.)
         const createRec = rec?.sell.recommendations.find((r) => r.mode === "create");
-        if (offers.length === 0 && rec?.sell.state === "good_to_sell" && createRec) {
+        // Listing a brand-new offer means choosing its price, which only the
+        // auto-pricing switch may do. (Before 0.7.6 this was implicitly true,
+        // because the recommendation was only fetched with pricing on.)
+        if (cfg.sellAutoReprice && offers.length === 0 && rec?.sell.state === "good_to_sell" && createRec) {
           const total = Math.min(
             chain_balance - cfg.sellReserveSats - deployed - this.committedOnchainSat(),
             cfg.sellMaxDeploySats - deployed,
