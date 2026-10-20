@@ -6,6 +6,8 @@
  * Reads (offers, price) need no key; the key is for buying/selling + key checks.
  */
 
+import { HTTP_TIMEOUTS, HttpTimeoutError, httpRequest, type TimedResponse } from "./http.js";
+
 const AMBOSS_URL = "https://api.amboss.space/graphql";
 const MAGMA_URL = "https://magma.amboss.tech/graphql";
 
@@ -51,21 +53,34 @@ async function gql<T>(
   apiKey?: string,
   variables?: Record<string, unknown>,
 ): Promise<T> {
-  let res: Response;
+  // Every call is deadline-bound (see http.ts): a stalled Amboss must not hold
+  // the autopilot hostage. Mutations get a longer budget than reads.
+  const timeoutMs = /^\s*mutation\b/.test(query) ? HTTP_TIMEOUTS.ambossMutationMs : HTTP_TIMEOUTS.ambossQueryMs;
+  let res: TimedResponse;
   try {
-    res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+    res = await httpRequest(
+      url,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+        body: JSON.stringify(variables ? { query, variables } : { query }),
       },
-      body: JSON.stringify(variables ? { query, variables } : { query }),
-    });
+      timeoutMs,
+    );
   } catch (e) {
+    if (e instanceof HttpTimeoutError) throw new Error(`Amboss ${e.message}`);
     throw new Error(`Amboss unreachable: ${e instanceof Error ? e.message : String(e)}`);
   }
   if (!res.ok) throw new Error(`Amboss HTTP ${res.status}`);
-  const json = (await res.json()) as { data?: T; errors?: { message: string }[] };
+  let json: { data?: T; errors?: { message: string }[] };
+  try {
+    json = await res.json<{ data?: T; errors?: { message: string }[] }>();
+  } catch (e) {
+    throw new Error(`Amboss ${e instanceof Error ? e.message : String(e)}`);
+  }
   if (json.errors?.length) throw new Error(json.errors[0].message);
   if (!json.data) throw new Error("Amboss returned no data");
   return json.data;

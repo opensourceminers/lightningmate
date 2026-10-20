@@ -1,7 +1,16 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { AutopilotConfig, AutopilotRun, AutopilotState, MagmaV2Report } from "../types";
+import type {
+  AutopilotConfig,
+  AutopilotConfigPatch,
+  AutopilotRun,
+  AutopilotState,
+  FeePolicy,
+  MagmaV2Report,
+  NumberBounds,
+} from "../types";
 import { satsCompact, timeAgo } from "../format";
+import { parseNumField } from "../numField";
 import { RunState, Switch } from "./Switch";
 import { useUi } from "./Overlay";
 import { FeeRecommendations } from "./FeeRecommendations";
@@ -42,7 +51,7 @@ const POLICY_FIELDS: { key: keyof AutopilotConfig["policy"]; label: string }[] =
 ];
 const REB_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "maxRebalancesPerRun", label: "Max rebalances / run" },
-  { key: "rebalanceDailyBudgetSats", label: "Daily fee budget (sat, 0=∞)" },
+  { key: "rebalanceDailyBudgetSats", label: "Daily fee budget (sat)" },
   { key: "rebalanceCooldownMinutes", label: "Rebalance cooldown (min)" },
   { key: "rebalanceHourStart", label: "Run from hour (0–24)" },
   { key: "rebalanceHourEnd", label: "Run to hour (0–24)" },
@@ -66,9 +75,36 @@ const SELL_NUM_FIELDS: { key: NumKey; label: string }[] = [
 
 const SUBS: Sub[] = ["fees", "rebalancing", "channels", "magma", "history"];
 
+/** Field labels by edit path, for validation messages. */
+const LABELS: Partial<Record<string, string>> = Object.fromEntries([
+  ...[...FEE_NUM_FIELDS, ...REB_NUM_FIELDS, ...CHANNEL_NUM_FIELDS, ...SELL_NUM_FIELDS].map((f) => [f.key, f.label]),
+  ...POLICY_FIELDS.map((f) => [`policy.${f.key}`, f.label]),
+  ...REB_POLICY_FIELDS.map((f) => [`rebalancePolicy.${f.key}`, f.label]),
+]);
+
+/** Numeric edits are keyed by path: "intervalMinutes", "policy.minPpm", … */
+type NumPath = NumKey | `policy.${keyof FeePolicy}` | `rebalancePolicy.${RebKey}`;
+
+function boundsFor(state: AutopilotState, path: NumPath): NumberBounds | undefined {
+  const [section, key] = path.split(".") as [string, string | undefined];
+  if (key === undefined) return state.bounds?.config[section as NumKey];
+  if (section === "policy") return state.bounds?.policy[key as keyof FeePolicy];
+  return state.bounds?.rebalancePolicy[key as RebKey];
+}
+
+function savedValue(config: AutopilotConfig, path: NumPath): number | null {
+  const [section, key] = path.split(".") as [string, string | undefined];
+  if (key === undefined) return config[section as NumKey];
+  if (section === "policy") return config.policy[key as keyof FeePolicy];
+  return config.rebalancePolicy[key as RebKey];
+}
+
 export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   const [server, setServer] = useState<AutopilotState | null>(null);
-  const [draft, setDraft] = useState<AutopilotConfig | null>(null);
+  // Unsaved numeric edits, as typed. Everything else (switches, tiles,
+  // checkboxes, presets) saves at once and sends ONLY its own field — a toggle
+  // can no longer save, or wipe, a half-typed number somewhere else.
+  const [edits, setEdits] = useState<Partial<Record<NumPath, string>>>({});
   const [busy, setBusy] = useState(false);
   const [sub, setSub] = useState<Sub>(
     initialSub && (SUBS as string[]).includes(initialSub) ? (initialSub as Sub) : "fees",
@@ -93,51 +129,73 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
 
   useEffect(() => {
     let cancelled = false;
-    const load = (seedDraft: boolean) =>
+    const load = () =>
       api
         .autopilotGet()
         .then((s) => {
-          if (cancelled) return;
-          setServer(s);
-          if (seedDraft) setDraft(s.config);
+          if (!cancelled) setServer(s);
         })
         .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)));
-    load(true);
-    const id = setInterval(() => load(false), 15_000);
+    load();
+    const id = setInterval(load, 15_000);
     return () => {
       cancelled = true;
       clearInterval(id);
     };
   }, []);
 
-  if (!server || !draft) {
+  if (!server) {
     return <section className="panel"><p className="muted empty">Loading autopilot…</p></section>;
   }
   const writeOff = !server.canWrite;
+  const config = server.config;
 
-  const setNum = (key: NumKey, value: number) =>
-    setDraft((d) => (d ? { ...d, [key]: Math.max(0, value || 0) } : d));
-  const setPolicyNum = (key: keyof AutopilotConfig["policy"], value: number) =>
-    setDraft((d) => (d ? { ...d, policy: { ...d.policy, [key]: Math.max(0, value || 0) } } : d));
-  const setRebPolicyNum = (key: RebKey, value: number) =>
-    setDraft((d) => (d ? { ...d, rebalancePolicy: { ...d.rebalancePolicy, [key]: Math.max(0, value || 0) } } : d));
-  const setBool = (key: keyof AutopilotConfig, value: boolean) =>
-    setDraft((d) => (d ? { ...d, [key]: value } : d));
+  /** What a numeric field shows: the unsaved text, else the saved value. */
+  const shownNum = (path: NumPath): number | null => {
+    const text = edits[path];
+    if (text !== undefined && text.trim() !== "" && Number.isFinite(Number(text))) return Number(text);
+    return savedValue(config, path);
+  };
 
-  const save = async (overrides: Partial<AutopilotConfig> = {}, successMsg?: string) => {
+  const save = async (patch: AutopilotConfigPatch, successMsg?: string): Promise<boolean> => {
     setBusy(true);
     setError(null);
     try {
-      const s = await api.autopilotSet({ ...draft, ...overrides });
-      setServer(s);
-      setDraft(s.config);
+      setServer(await api.autopilotSet(patch));
       if (successMsg) toast(successMsg, "success");
+      return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+      return false;
     } finally {
       setBusy(false);
     }
   };
+
+  /** "Save settings": validate every edited number first — a blank or
+   *  out-of-range field is reported, never sent (and never sent as 0). */
+  const saveNumbers = async () => {
+    const patch: AutopilotConfigPatch = {};
+    const errors: string[] = [];
+    for (const [path, text] of Object.entries(edits) as [NumPath, string][]) {
+      const parsed = parseNumField(text, boundsFor(server, path), LABELS[path] ?? path);
+      if (!parsed.ok) {
+        errors.push(parsed.error);
+        continue;
+      }
+      const [section, key] = path.split(".") as [string, string | undefined];
+      if (key === undefined) Object.assign(patch, { [section]: parsed.value });
+      else if (section === "policy") patch.policy = { ...patch.policy, [key]: parsed.value };
+      else patch.rebalancePolicy = { ...patch.rebalancePolicy, [key]: parsed.value };
+    }
+    if (errors.length) {
+      setError(errors.join(" · "));
+      return;
+    }
+    if (Object.keys(patch).length === 0) return;
+    if (await save(patch, "Settings saved")) setEdits({});
+  };
+  const unsaved = Object.keys(edits).length > 0;
 
   const runNow = async () => {
     setBusy(true);
@@ -157,26 +215,81 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   const toggleRow = (field: BoolKey, title: string, subtitle: string) => (
     <div className="ap-master">
       <Switch
-        checked={draft[field]}
+        checked={config[field]}
         disabled={busy || writeOff}
-        onChange={(v) => save({ [field]: v })}
+        onChange={(v) => void save({ [field]: v })}
         label={title}
       />
       <div className="ap-master-text">
         <div className="ap-master-title">{title}</div>
         <div className="ap-master-sub">{subtitle}</div>
       </div>
-      <RunState on={server.config[field]} />
+      <RunState on={config[field]} />
     </div>
   );
 
-  const numFields = (fields: { key: NumKey; label: string }[]) =>
-    fields.map((f) => (
-      <label key={f.key} className="policy-field">
-        <span>{f.label}</span>
-        <input type="number" min={0} value={draft[f.key] as number} onChange={(e) => setNum(f.key, Number(e.target.value))} />
+  const numInput = (path: NumPath, label: string, step?: number) => {
+    const b = boundsFor(server, path);
+    const saved = savedValue(config, path);
+    return (
+      <label key={path} className="policy-field">
+        <span>{label}</span>
+        <input
+          type="number"
+          min={b?.min}
+          max={b?.max}
+          step={step ?? (b && !b.integer ? "any" : 1)}
+          title={b ? `${b.min}–${b.max}` : undefined}
+          value={edits[path] ?? (saved ?? "")}
+          onChange={(e) => {
+            const text = e.target.value;
+            setEdits((ed) => ({ ...ed, [path]: text }));
+          }}
+        />
       </label>
-    ));
+    );
+  };
+
+  const numFields = (fields: { key: NumKey; label: string }[]) =>
+    fields.map((f) =>
+      f.key === "rebalanceDailyBudgetSats" && config.rebalanceDailyBudgetSats === null && edits[f.key] === undefined ? (
+        <label key={f.key} className="policy-field">
+          <span>{f.label}</span>
+          <input type="text" value="No limit" disabled />
+        </label>
+      ) : (
+        numInput(f.key, f.label)
+      ),
+    );
+
+  /** Explicit "no cap" for the rebalance budget — 0 no longer means that. */
+  const noBudgetLimit = (
+    <label className="check ap-check">
+      <input
+        type="checkbox"
+        checked={config.rebalanceDailyBudgetSats === null}
+        disabled={busy || writeOff}
+        onChange={(e) => {
+          setEdits((ed) => {
+            const next = { ...ed };
+            delete next.rebalanceDailyBudgetSats;
+            return next;
+          });
+          void save({ rebalanceDailyBudgetSats: e.target.checked ? null : 10_000 });
+        }}
+      />
+      No daily limit on rebalance fees (each move must still pass the profit check)
+    </label>
+  );
+
+  const saveRow = (
+    <div className="apply-row">
+      <button className="primary-btn" disabled={busy || !unsaved} onClick={() => void saveNumbers()}>
+        Save settings
+      </button>
+      {unsaved ? <span className="muted">Unsaved changes</span> : null}
+    </div>
+  );
 
   const TABS: { id: Sub; label: string }[] = [
     { id: "fees", label: "Fees" },
@@ -193,7 +306,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   // get cheaper, how hard drained ones are protected, the profit-floor margin) AND
   // the rebalance economics (strictness + daily budget) — so nothing pulls against
   // the chosen goal. Per-subtab controls still override afterwards.
-  const PRESETS: { id: string; label: string; desc: string; cfg: Partial<AutopilotConfig> }[] = [
+  const PRESETS: { id: string; label: string; desc: string; cfg: AutopilotConfigPatch }[] = [
     {
       id: "routing",
       label: "Max routing",
@@ -201,10 +314,10 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       cfg: {
         enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: false,
         policy: {
-          ...draft.policy, minPpm: 25, neutralPpm: 60, maxPpm: 1000, baseFeeMsat: 0,
+          ...config.policy, minPpm: 25, neutralPpm: 60, maxPpm: 1000, baseFeeMsat: 0,
           protectPpm: 250, safetyMargin: 1.05, noFlowRatchetSteps: 4, exploreLowerModifier: 0.75,
         },
-        rebalancePolicy: { ...draft.rebalancePolicy, econRatio: 0.9 },
+        rebalancePolicy: { ...config.rebalancePolicy, econRatio: 0.9 },
         maxRebalancesPerRun: 4, rebalanceDailyBudgetSats: 25_000,
       },
     },
@@ -216,10 +329,10 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
         enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: true,
         sellAutoReprice: true, sellAutoSize: true, sellPricingMode: "auto",
         policy: {
-          ...draft.policy, minPpm: 25, neutralPpm: 80, maxPpm: 1000, baseFeeMsat: 0,
+          ...config.policy, minPpm: 25, neutralPpm: 80, maxPpm: 1000, baseFeeMsat: 0,
           protectPpm: 350, safetyMargin: 1.15, noFlowRatchetSteps: 3, exploreLowerModifier: 0.85,
         },
-        rebalancePolicy: { ...draft.rebalancePolicy, econRatio: 0.8 },
+        rebalancePolicy: { ...config.rebalancePolicy, econRatio: 0.8 },
         maxRebalancesPerRun: 2, rebalanceDailyBudgetSats: 10_000,
       },
     },
@@ -231,23 +344,23 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
         enabled: true, rebalanceEnabled: true, channelEnabled: false, sellEnabled: true,
         sellAutoReprice: true, sellAutoSize: true, sellPricingMode: "premium",
         policy: {
-          ...draft.policy, minPpm: 80, neutralPpm: 150, maxPpm: 1500, baseFeeMsat: 0,
+          ...config.policy, minPpm: 80, neutralPpm: 150, maxPpm: 1500, baseFeeMsat: 0,
           protectPpm: 600, safetyMargin: 1.35, noFlowRatchetSteps: 1, exploreLowerModifier: 0.9,
         },
-        rebalancePolicy: { ...draft.rebalancePolicy, econRatio: 0.6 },
+        rebalancePolicy: { ...config.rebalancePolicy, econRatio: 0.6 },
         maxRebalancesPerRun: 1, rebalanceDailyBudgetSats: 5_000,
       },
     },
   ];
   // Compare nested objects (policy, rebalancePolicy) field-by-field, not by reference.
-  const matchesPreset = (p: Partial<AutopilotConfig>) =>
+  const matchesPreset = (p: AutopilotConfigPatch) =>
     (Object.keys(p) as (keyof AutopilotConfig)[]).every((k) => {
       const pv = p[k];
       if (pv && typeof pv === "object") {
-        const dv = draft[k] as unknown as Record<string, unknown>;
+        const dv = config[k] as unknown as Record<string, unknown>;
         return Object.entries(pv as unknown as Record<string, unknown>).every(([sk, sv]) => dv?.[sk] === sv);
       }
-      return draft[k] === pv;
+      return config[k] === pv;
     });
 
   return (
@@ -270,7 +383,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                 key={p.id}
                 className={`preset-opt ${active ? "active" : ""}`}
                 disabled={busy || writeOff}
-                onClick={() => save(p.cfg, `Strategy applied: ${p.label}`)}
+                onClick={() => void save(p.cfg, `Strategy applied: ${p.label}`)}
               >
                 <span className="preset-opt-label">
                   {p.label}
@@ -312,16 +425,9 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
             <summary>Customize fee policy</summary>
             <div className="policy-controls">
               {numFields(FEE_NUM_FIELDS)}
-              {POLICY_FIELDS.map((f) => (
-                <label key={f.key} className="policy-field">
-                  <span>{f.label}</span>
-                  <input type="number" min={0} value={draft.policy[f.key]} onChange={(e) => setPolicyNum(f.key, Number(e.target.value))} />
-                </label>
-              ))}
+              {POLICY_FIELDS.map((f) => numInput(`policy.${f.key}`, f.label))}
             </div>
-            <div className="apply-row">
-              <button className="primary-btn" disabled={busy} onClick={() => save()}>Save settings</button>
-            </div>
+            {saveRow}
           </details>
           <FeeRecommendations />
         </>
@@ -332,16 +438,10 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
             <summary>Customize rebalance policy</summary>
             <div className="policy-controls">
               {numFields(REB_NUM_FIELDS)}
-              {REB_POLICY_FIELDS.map((f) => (
-                <label key={f.key} className="policy-field">
-                  <span>{f.label}</span>
-                  <input type="number" min={0} step={f.step} value={draft.rebalancePolicy[f.key]} onChange={(e) => setRebPolicyNum(f.key, Number(e.target.value))} />
-                </label>
-              ))}
+              {REB_POLICY_FIELDS.map((f) => numInput(`rebalancePolicy.${f.key}`, f.label, f.step))}
             </div>
-            <div className="apply-row">
-              <button className="primary-btn" disabled={busy} onClick={() => save()}>Save settings</button>
-            </div>
+            <div className="ap-checks">{noBudgetLimit}</div>
+            {saveRow}
           </details>
           <RebalanceRecommendations />
         </>
@@ -351,9 +451,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
           <details className="ap-customize">
             <summary>Customize channel policy</summary>
             <div className="policy-controls">{numFields(CHANNEL_NUM_FIELDS)}</div>
-            <div className="apply-row">
-              <button className="primary-btn" disabled={busy} onClick={() => save()}>Save settings</button>
-            </div>
+            {saveRow}
           </details>
           <SuggestionsPanel />
         </>
@@ -377,9 +475,9 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
             ).map(([id, label, desc]) => (
               <button
                 key={id}
-                className={`mode-opt ${draft.sellPricingMode === id ? "active" : ""}`}
+                className={`mode-opt ${config.sellPricingMode === id ? "active" : ""}`}
                 disabled={busy || writeOff}
-                onClick={() => save({ sellPricingMode: id })}
+                onClick={() => void save({ sellPricingMode: id })}
               >
                 <span className="mode-opt-label">{label}</span>
                 <span className="mode-opt-desc">{desc}</span>
@@ -390,19 +488,19 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
           <h3 className="sub">Automation</h3>
           <div className="ap-checks">
             <label className="check ap-check">
-              <input type="checkbox" checked={draft.sellAutoReprice} onChange={(e) => setBool("sellAutoReprice", e.target.checked)} />
+              <input type="checkbox" checked={config.sellAutoReprice} disabled={busy || writeOff} onChange={(e) => void save({ sellAutoReprice: e.target.checked })} />
               Auto-price the enabled offer to the live market (at the level above, floor-protected)
             </label>
             <label className="check ap-check">
-              <input type="checkbox" checked={draft.sellAutoSize} onChange={(e) => setBool("sellAutoSize", e.target.checked)} />
+              <input type="checkbox" checked={config.sellAutoSize} disabled={busy || writeOff} onChange={(e) => void save({ sellAutoSize: e.target.checked })} />
               Auto-size the offer: keep its size range and lease length in step with the market, up to your cap below
             </label>
             <label className="check ap-check">
-              <input type="checkbox" checked={draft.sellAutoRelist} onChange={(e) => setBool("sellAutoRelist", e.target.checked)} />
+              <input type="checkbox" checked={config.sellAutoRelist} disabled={busy || writeOff} onChange={(e) => void save({ sellAutoRelist: e.target.checked })} />
               Auto-relist a depleted offer (top it back up within your caps so it keeps selling)
             </label>
             <label className="check ap-check">
-              <input type="checkbox" checked={draft.sellAutoClose} onChange={(e) => setBool("sellAutoClose", e.target.checked)} />
+              <input type="checkbox" checked={config.sellAutoClose} disabled={busy || writeOff} onChange={(e) => void save({ sellAutoClose: e.target.checked })} />
               Auto-close channels after the lease ends (reclaim the capital on-chain)
             </label>
           </div>
@@ -455,16 +553,14 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
               </div>
             </div>
           ) : null}
-          {draft.sellMaxChannelSats > draft.sellMaxDeploySats ? (
+          {(shownNum("sellMaxChannelSats") ?? 0) > (shownNum("sellMaxDeploySats") ?? 0) ? (
             <div className="sug-warn">
-              ⚠ Max channel size ({satsCompact(draft.sellMaxChannelSats)}) is above your capital cap (
-              {satsCompact(draft.sellMaxDeploySats)}), so an order that big can never be served. The smaller number is
-              what actually applies.
+              ⚠ Max channel size ({satsCompact(shownNum("sellMaxChannelSats") ?? 0)}) is above your capital cap (
+              {satsCompact(shownNum("sellMaxDeploySats") ?? 0)}), so an order that big can never be served. The smaller
+              number is what actually applies.
             </div>
           ) : null}
-          <div className="apply-row">
-            <button className="primary-btn" disabled={busy} onClick={() => save()}>Save settings</button>
-          </div>
+          {saveRow}
         </section>
       ) : (
         <section className="panel">

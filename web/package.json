@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "node --import tsx --test --test-timeout=60000 \"test/**/*.test.tsx\""
   },
   "dependencies": {
     "qrcode.react": "^4.2.0",
@@ -15,9 +16,11 @@
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
+    "@types/node": "^22.10.5",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vite": "^6.0.7"
   }

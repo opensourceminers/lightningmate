@@ -1,4 +1,5 @@
 import type { FiatCurrency } from "./settings.js";
+import { HTTP_TIMEOUTS, httpRequest } from "./http.js";
 
 interface PriceCache {
   at: number;
@@ -11,9 +12,8 @@ const TTL_MS = 5 * 60_000;
 
 /**
  * Current BTC price in the given fiat currency, or null when fiat is off.
- * Fetched from mempool.space (bitcoin-native) and cached for 5 min. This is the
- * only outbound network call in the app, and only happens when the user opts in
- * to a currency.
+ * Fetched from mempool.space (bitcoin-native) and cached for 5 min. Only happens
+ * when the user opts in to a currency; deadline-bound like every outbound call.
  */
 export async function getBtcPrice(currency: FiatCurrency): Promise<number | null> {
   if (currency === "off") return null;
@@ -21,9 +21,9 @@ export async function getBtcPrice(currency: FiatCurrency): Promise<number | null
     return cache.price;
   }
   try {
-    const res = await fetch("https://mempool.space/api/v1/prices");
+    const res = await httpRequest("https://mempool.space/api/v1/prices", {}, HTTP_TIMEOUTS.priceMs);
     if (!res.ok) throw new Error(`price http ${res.status}`);
-    const data = (await res.json()) as Record<string, number>;
+    const data = await res.json<Record<string, number>>();
     const price = data[currency];
     if (typeof price === "number" && price > 0) {
       cache = { at: Date.now(), currency, price };

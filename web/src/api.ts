@@ -3,7 +3,7 @@ import type {
   AppSettings,
   CloseCandidatesResponse,
   CloseChannelResult,
-  AutopilotConfig,
+  AutopilotConfigPatch,
   AutopilotRun,
   AutopilotState,
   ChannelView,
@@ -18,6 +18,7 @@ import type {
   FeeRecReport,
   FlowSummary,
   ForwardsReport,
+  HealthInfo,
   CreatedInvoice,
   DecodedRequest,
   LnActivity,
@@ -120,6 +121,8 @@ export const api = {
   setOverride: (channelId: string, mode: FeeMode, fixedPpm?: number) =>
     post<OverrideMap>("/overrides", { channelId, mode, fixedPpm }),
   alerts: () => get<Alert[]>("/alerts"),
+  alertAck: (id: string) => post<{ ok: boolean }>("/alerts/ack", { id }),
+  health: () => get<HealthInfo>("/health"),
   channelClose: (transactionId: string, transactionVout: number, isForce: boolean, feeRate?: number) =>
     post<CloseChannelResult>("/channels/close", { transactionId, transactionVout, isForce, feeRate }),
   feeEstimates: () => get<FeeEstimates>("/chain/fee-estimates"),
@@ -136,8 +139,7 @@ export const api = {
     post<{ results: FeeApplyResult[] }>("/fees/apply", { items }),
   feesRecommendations: () => get<FeeRecReport>("/fees/recommendations"),
   autopilotGet: () => get<AutopilotState>("/autopilot"),
-  autopilotSet: (partial: Partial<AutopilotConfig>) =>
-    post<AutopilotState>("/autopilot", partial),
+  autopilotSet: (patch: AutopilotConfigPatch) => post<AutopilotState>("/autopilot", patch),
   autopilotRun: () =>
     post<{ run: AutopilotRun; state: AutopilotState }>("/autopilot/run", {}),
   rebalanceCandidates: (policy?: Partial<RebalancePolicy>) => {

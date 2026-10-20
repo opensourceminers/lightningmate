@@ -7,6 +7,7 @@ import {
 import { getFlowSummary } from "./forwards.js";
 import type { RebalanceLog } from "./rebalanceLog.js";
 import type { EarningsLog } from "./earningsLog.js";
+import type { ServiceFeeLedger } from "./serviceFee.js";
 
 /**
  * Profit & loss over a window:
@@ -17,9 +18,10 @@ import type { EarningsLog } from "./earningsLog.js";
  *
  * On-chain fees are attributed by matching our chain transactions against the
  * funding/closing txids of our channels — a tx only shows a fee we paid if we
- * created it, so opens/closes we didn't initiate don't get counted. Magma lease
- * income + the service fee paid come from the earnings log (recorded on each
- * completed sale), so the marketplace side of the ledger is no longer ignored.
+ * created it, so opens/closes we didn't initiate don't get counted. Lease income
+ * comes from the earnings log (one record per completed sale); the service fee
+ * comes from the service-fee ledger, which records what was ACTUALLY paid and
+ * when (it is paid asynchronously, after the sale).
  */
 export interface PnlSummary {
   windowDays: number;
@@ -33,7 +35,8 @@ export interface PnlSummary {
   channelOpenCostSats: number;
   channelCloseCostSats: number;
   otherChainFeesSats: number;
-  /** Magma service fees we paid out over the window. */
+  /** Service fees actually paid out over the window, incl. the routing fee to
+   *  deliver them. */
   serviceFeePaidSats: number;
   totalCostSats: number;
   netProfitSats: number;
@@ -44,6 +47,7 @@ export async function getPnl(
   rebalanceLog: RebalanceLog,
   earnings: EarningsLog,
   windowDays: number,
+  serviceFees?: Pick<ServiceFeeLedger, "paidSince">,
 ): Promise<PnlSummary> {
   const cutoff = Date.now() - windowDays * 86_400_000;
 
@@ -81,7 +85,15 @@ export async function getPnl(
 
   const saleRecords = earnings.recent().filter((s) => new Date(s.at).getTime() >= cutoff);
   const magmaRevenueSats = saleRecords.reduce((sum, s) => sum + (s.leaseSats ?? 0), 0);
-  const serviceFeePaidSats = saleRecords.reduce((sum, s) => sum + (s.feePaidSats ?? 0), 0);
+  // Older sales paid the fee inline and stored it on the sale record; newer
+  // ones are paid by the ledger. Both count, neither twice (new records carry
+  // no feePaidSats).
+  const legacyFeeSats = saleRecords.reduce((sum, s) => sum + (s.feePaidSats ?? 0), 0);
+  const ledgerFeeSats = (serviceFees?.paidSince(cutoff) ?? []).reduce(
+    (sum, f) => sum + f.paidSats + f.routingFeeSats,
+    0,
+  );
+  const serviceFeePaidSats = legacyFeeSats + ledgerFeeSats;
 
   const routingRevenueSats = flows.totalFeesEarnedSats;
   const totalCostSats =

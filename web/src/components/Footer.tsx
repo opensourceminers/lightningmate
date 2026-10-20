@@ -1,3 +1,5 @@
+import { formatVersion } from "../version";
+
 const DONATE_URL = "https://btcpay.opensourceminers.de/apps/3Vo4BjAK9GYCqQPqDKHAkQ9xHPZq/pos";
 const GITHUB = "https://github.com/opensourceminers/lightningmate";
 const X_URL = "https://x.com/opensource_de";
@@ -34,7 +36,8 @@ function BoltIcon() {
   );
 }
 
-export function Footer() {
+export function Footer({ version }: { version?: string }) {
+  const shown = formatVersion(version);
   return (
     <footer className="foot">
       <div className="foot-row">
@@ -54,6 +57,7 @@ export function Footer() {
 
       <div className="foot-copy muted">
         © {new Date().getFullYear()} opensourceminers.de · MIT License · Lightning Mate
+        {shown ? <span className="foot-version"> {shown}</span> : null}
       </div>
     </footer>
   );

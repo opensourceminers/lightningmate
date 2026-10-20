@@ -47,18 +47,36 @@ let state: HtlcTelemetryState | null = null;
 let dirty = false;
 let sub: EventEmitter | undefined;
 let retryMs = RETRY_BASE_MS;
+let flushTimer: NodeJS.Timeout | undefined;
+let retryTimer: NodeJS.Timeout | undefined;
+let stopped = false;
 
 export function initHtlcTelemetry(dataDir: string): void {
   store = new JsonStore<HtlcTelemetryState>(dataDir, "htlc-telemetry.json");
   state = store.read({ startedAt: null, buckets: [] });
+  if (!Array.isArray(state.buckets)) state.buckets = [];
   state.startedAt ??= new Date().toISOString();
-  const flush = setInterval(() => {
-    if (dirty && store && state) {
-      store.write(state);
-      dirty = false;
-    }
-  }, FLUSH_MS);
-  flush.unref?.();
+  flushTimer = setInterval(flushHtlcTelemetry, FLUSH_MS);
+  flushTimer.unref?.();
+}
+
+/** Write pending counters now (also called on shutdown, so up to a minute of
+ *  events isn't lost on every restart). */
+export function flushHtlcTelemetry(): void {
+  if (dirty && store && state) {
+    if (store.write(state)) dirty = false;
+  }
+}
+
+/** Shutdown: stop listening and stop the flush timer (call flush afterwards). */
+export function stopHtlcTelemetry(): void {
+  stopped = true;
+  if (flushTimer) clearInterval(flushTimer);
+  if (retryTimer) clearTimeout(retryTimer);
+  flushTimer = undefined;
+  retryTimer = undefined;
+  sub?.removeAllListeners();
+  sub = undefined;
 }
 
 /** LND's failure detail when the outgoing channel lacked balance. */
@@ -102,7 +120,7 @@ export function recordForwardEvent(event: {
 /** Subscribe to LND's HTLC events (read-only) and keep the counters current.
  *  Reconnects with backoff — LND restarts drop the stream. */
 export function startHtlcTelemetry(lnd: AuthenticatedLnd): void {
-  if (sub) return;
+  if (sub || stopped) return;
   try {
     sub = subscribeToForwards({ lnd });
     sub.on("forward", (event: Parameters<typeof recordForwardEvent>[0]) => recordForwardEvent(event));
@@ -111,8 +129,8 @@ export function startHtlcTelemetry(lnd: AuthenticatedLnd): void {
       sub = undefined;
       const delay = retryMs;
       retryMs = Math.min(retryMs * 2, 300_000);
-      const t = setTimeout(() => startHtlcTelemetry(lnd), delay);
-      t.unref?.();
+      retryTimer = setTimeout(() => startHtlcTelemetry(lnd), delay);
+      retryTimer.unref?.();
     });
     retryMs = RETRY_BASE_MS;
   } catch {

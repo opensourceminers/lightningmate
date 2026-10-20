@@ -14,7 +14,8 @@ security@opensourceminers.de (please don't open a public issue first).
   currency is set, the Amboss Magma marketplace (api.amboss.space /
   magma.amboss.tech) when you add an Amboss API key, and — on a completed
   liquidity sale with the service fee enabled — an LNURL-pay lookup of the
-  configured fee address. Nothing else leaves your node.
+  configured fee address. Nothing else leaves your node, and every outbound
+  request has a hard deadline.
 - **LSP mode is off by default** and adds the only surface that processes input
   from arbitrary network peers: LSPS1 (bLIP-51) JSON-RPC over BOLT8 custom
   messages. It is rate-limited per peer, strictly validated, wrapped in a hard
@@ -35,15 +36,63 @@ security@opensourceminers.de (please don't open a public issue first).
   API; it also runs behind Umbrel's `app_proxy`. The container binds `0.0.0.0`
   (so app_proxy can reach it) — set via `LM_BIND`. `$APP_PASSWORD` / `$APP_SEED`
   are injected by Umbrel and used to verify and sign the session token.
-- **Standalone/dev:** with no `APP_PASSWORD` set it binds **`127.0.0.1`** and
-  runs without a login, so the API is reachable only from the same machine.
-  Don't expose it to a LAN/WAN without an authenticating reverse proxy.
+- **Standalone/dev:** with no `APP_PASSWORD` set it runs without a login, so it
+  **refuses to start unless bound to loopback** (`127.0.0.1`/`::1`, the default).
+  To bind anything else (e.g. `LM_BIND=0.0.0.0` inside Docker), set
+  `APP_PASSWORD`. Don't expose it to a LAN/WAN without an authenticating
+  reverse proxy.
 - **No CORS** is sent, so a malicious web page can't read responses or make
   cross-site JSON requests to the API.
-- `LM_ALLOWED_HOSTS` (comma-separated) optionally pins accepted `Host` headers
-  to defend against DNS rebinding.
+- **DNS rebinding:** without a login, only loopback `Host` headers
+  (`localhost`, `127.0.0.1`, `::1`) are served by default. `LM_ALLOWED_HOSTS`
+  (comma-separated) sets the list explicitly, in any mode.
 - All state-changing endpoints validate inputs (pubkey/txid/channel-id formats,
-  sat/ppm bounds) and are globally rate-limited.
+  sat/ppm bounds; every autopilot setting has a range — out-of-range or blank
+  values are rejected, never coerced). Write and login limits are kept **per
+  client address**, and only failed logins count, so another container on the
+  Docker network can't lock the owner out.
+
+## Service fee (completed sales)
+
+The transparent 1% fee on completed liquidity sales is paid to the Lightning
+Address in `LM_SELL_FEE_ADDRESS` (set by the app store compose, rate in
+`LM_SELL_FEE_BPS`). It **fails closed**: the invoice the fee server returns is
+paid only if it is for exactly the computed fee (LUD-06 amount check), unexpired
+and not to this node; the LNURL callback must be https on the address's own
+host; and with `LM_SELL_FEE_PUBKEY` set, only invoices to that node id are paid.
+Fees are paid from a persistent ledger in the background — never inside an
+order's accept/open/settle path — with a hard per-attempt timeout, retries with
+backoff, and a recorded payment hash so a crash or timeout can never pay twice.
+A fee refused for a security reason (wrong amount, wrong payee, foreign
+callback) raises an alert at once; a fee that still has not gone through after
+10 attempts (about three days) is given up and raises an alert too. Dismissing
+an alert silences only the problem it showed: a later, different one — another
+kind of refusal, or the give-up after a dismissed refusal — is alerted again.
+
+## State on disk
+
+All state files are written atomically (temp file → fsync → rename; the previous
+version is kept as `.bak`). A damaged file is never silently replaced by
+defaults: it is moved aside as `<name>.corrupt-<time>`, the backup is restored
+when possible, and an alert stays up until acknowledged. The same goes for a
+file that is missing while its backup or a damaged copy is still there (a
+recovery cut short by a crash or a full disk); only a first start, with
+neither, begins from defaults without an alert. Each loss is alerted once:
+finding it again because the disk is still full adds no second alert, but a
+file lost again after it was saved is a new alert. The Amboss API key is the
+exception to keeping old versions: when it is replaced or removed
+(Disconnect), no copy of the old key stays on disk — no `.bak`, no damaged
+copy, and on a full disk the file is deleted rather than left behind — and a
+damaged amboss.json is reported without quoting its contents. Autopilot
+settings an older version saved outside today's limits are adjusted on load to
+the closest valid value, and a fraction in a whole-number setting is rounded
+toward doing less. The run interval may be as long as a timer can hold (about
+25 days), so a slow schedule an older version honoured is kept as it was. Where
+even the closest value would let the autopilot do more than the saved value
+allowed — a channel size below the minimum (no open ever went through) or
+above the 10 BTC maximum (an open waited until the whole size was on-chain), a
+rebalance cost cap of 0, an hour window that never opened — that automation is
+switched off instead. Either way the adjustment is shown as an alert.
 
 ## Least-privilege write macaroon (recommended)
 

@@ -1,25 +1,20 @@
 import { getChannels, getChainBalance, type AuthenticatedLnd } from "lightning";
-import { JsonStore } from "../store.js";
+import { JsonStore, recordStoreIncident } from "../store.js";
 import { closeChannelByOutpoint, openChannelTo } from "./channelOps.js";
 import { createInvoice } from "./payments.js";
 import { acceptOrder, addOrderTransaction, createOffer, getMarket, getMyOffers, getMyOrders, toggleOffer, updateOffer, type MyOffer, type MyOrder } from "./amboss.js";
 import { initMagmaHistory, refreshMagmaHistory } from "./magmaHistory.js";
 import { runMaxHtlcPass, type MaxHtlcChange } from "./maxHtlc.js";
-import { paySaleServiceFee } from "./serviceFee.js";
+import type { ServiceFeeLedger } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
 import type { LnPlusStore } from "./lnplusStore.js";
 import { getMagmaRecommendations, type MagmaSellRecommendation, type MagmaV2Report } from "./magmaRecommend.js";
 import { onchainCosts } from "./nodeEconomics.js";
 import { getFeeElasticity } from "./outcomes.js";
-import {
-  applyFees,
-  DEFAULT_POLICY,
-  type FeeApplyItem,
-  type FeePolicy,
-} from "./fees.js";
+import { DEFAULT_POLICY, applyFees, type FeeApplyItem } from "./fees.js";
 import { getFeeRecommendations, type FeeRecConfig } from "./feeRecommend.js";
-import { DEFAULT_REBALANCE_POLICY, executeRebalance, type RebalancePolicy } from "./rebalance.js";
+import { executeRebalance, type RebalanceExecParams } from "./rebalance.js";
 import { getRebalanceRecommendations, selectRebalanceRuns } from "./rebalanceRecommend.js";
 import type { RebalanceLog } from "./rebalanceLog.js";
 import type { OverridesStore } from "./overrides.js";
@@ -27,64 +22,21 @@ import type { EarningsLog } from "./earningsLog.js";
 import { getChannelsView } from "./channels.js";
 import { getForwardsReport } from "./forwards.js";
 import { routingYieldStats } from "./capitalAllocator.js";
+import {
+  AUTOPILOT_CONFIG_BOUNDS,
+  ConfigValidationError,
+  DEFAULT_CONFIG,
+  applyPatch,
+  rebalanceWindowOpen,
+  repairCrossFields,
+  sanitizePersistedConfig,
+  schedulerIntervalMs,
+  validateAutopilotPatch,
+  type AutopilotConfig,
+} from "./autopilotConfig.js";
 
-export interface AutopilotConfig {
-  enabled: boolean;
-  intervalMinutes: number;
-  /** Per-channel minimum time between fee changes — prevents gossip spam. */
-  cooldownMinutes: number;
-  /** Max channels changed in a single run — caps blast radius. */
-  maxChangesPerRun: number;
-  policy: FeePolicy;
-  /** Auto-rebalancing — independent of fee automation, also default off. */
-  rebalanceEnabled: boolean;
-  rebalancePolicy: RebalancePolicy;
-  maxRebalancesPerRun: number;
-  /** Per-target minimum time between rebalances. */
-  rebalanceCooldownMinutes: number;
-  /** Only auto-rebalance within this hour window (node local time, 0–24). Equal
-   *  start/end = any time. e.g. 0→6 = only overnight, when routes are cheaper. */
-  rebalanceHourStart: number;
-  rebalanceHourEnd: number;
-  /** Cap total rebalance fees spent per day (sats). 0 = no cap. Stops many
-   *  "just profitable" moves from piling up. */
-  rebalanceDailyBudgetSats: number;
-  /** Channel autopilot: open a channel to the top suggestion when funds allow. */
-  channelEnabled: boolean;
-  /** Keep at least this much on-chain (sats) untouched. */
-  channelReserveSats: number;
-  /** Channel size to open; 0 = use the suggestion's recommended size. */
-  channelSizeSats: number;
-  /** Minimum time between auto-opens. */
-  channelCooldownMinutes: number;
-  /** Magma liquidity provision: auto-fulfill sell orders (accept + open channel). */
-  sellEnabled: boolean;
-  /** Max total capital deployed into sold channels (sats). */
-  sellMaxDeploySats: number;
-  /** On-chain balance to always keep when fulfilling (sats). */
-  sellReserveSats: number;
-  /** Max channel size to fulfill per order (sats). */
-  sellMaxChannelSats: number;
-  /** Auto-close sold channels once the lease is over, to reclaim capital. */
-  sellAutoClose: boolean;
-  /** Top a depleted offer back up (within the caps) so it keeps taking orders. */
-  sellAutoRelist: boolean;
-  /** Keep an enabled offer continuously priced to the current market (never below
-   *  the profit floor), instead of leaving it static. */
-  sellAutoReprice: boolean;
-  /** Keep the offer's SIZE WINDOW and lease length in step with the market, up to
-   *  sellMaxChannelSats. Separate from pricing on purpose: sizing decides whether
-   *  a buyer can be matched with you at all, pricing only decides what you earn
-   *  when they are. An offer whose window misses the median order cannot fill at
-   *  any price, so this is usually the setting that matters. */
-  sellAutoSize: boolean;
-  /** Pricing level when auto-pricing: fast (undercut to sell quickly), balanced
-   *  (market median), premium (top of the market), or auto (adapt to fill speed). */
-  sellPricingMode: "fast" | "balanced" | "premium" | "auto";
-  /** Advertise routable size: keep each channel's max_htlc just under its
-   *  spendable balance (power-of-2 buckets) so senders skip depleted channels. */
-  maxHtlcEnabled: boolean;
-}
+export type { AutopilotConfig } from "./autopilotConfig.js";
+export { ConfigValidationError } from "./autopilotConfig.js";
 
 export interface AutopilotChange {
   id: string;
@@ -167,44 +119,20 @@ interface PersistedState {
   history: AutopilotRun[];
 }
 
-const DEFAULT_CONFIG: AutopilotConfig = {
-  enabled: false,
-  intervalMinutes: 30,
-  cooldownMinutes: 360,
-  maxChangesPerRun: 5,
-  policy: DEFAULT_POLICY,
-  rebalanceEnabled: false,
-  rebalancePolicy: DEFAULT_REBALANCE_POLICY,
-  maxRebalancesPerRun: 2,
-  rebalanceCooldownMinutes: 720,
-  rebalanceHourStart: 0,
-  rebalanceHourEnd: 24,
-  rebalanceDailyBudgetSats: 10_000,
-  channelEnabled: false,
-  channelReserveSats: 50_000,
-  channelSizeSats: 0,
-  channelCooldownMinutes: 1_440,
-  sellEnabled: false,
-  sellMaxDeploySats: 2_000_000,
-  sellReserveSats: 50_000,
-  sellMaxChannelSats: 5_000_000,
-  sellAutoClose: false,
-  sellAutoRelist: false,
-  sellAutoReprice: true,
-  sellAutoSize: true,
-  sellPricingMode: "balanced",
-  maxHtlcEnabled: false,
-};
-
 const HISTORY_LIMIT = 50;
 
 export class Autopilot {
+  private readonly dataDir: string;
   private readonly store: JsonStore<PersistedState>;
   private state: PersistedState;
   private timer: NodeJS.Timeout | undefined;
   /** Fast, separate loop just for time-critical Magma order fulfilment. */
   private fastTimer: NodeJS.Timeout | undefined;
+  /** One-shot "run soon after enabling" kicks — tracked so stop() clears them. */
+  private readonly kickTimers = new Set<NodeJS.Timeout>();
   private running = false;
+  /** Set by shutdown(): no new run may start, the process is going away. */
+  private shuttingDown = false;
   /** On-chain sats committed so far THIS run (channel opens + Magma fulfilments),
    *  so the channel autopilot and Magma selling share one budget and can't both
    *  plan the same coins. Reset at the start of each run. */
@@ -215,6 +143,11 @@ export class Autopilot {
   /** Capital already deployed into LSPS1-sold channels (unexpired leases) —
    *  counts against the shared sellMaxDeploySats cap. Wired up in index.ts. */
   private externalDeployedSat: () => number = () => 0;
+  /** Whether the stored fee policy carried a balanced level of its own. Policies
+   *  saved before that setting existed get the default from the volume
+   *  migration in start() — after sanitizing, a filled-in default can no longer
+   *  be told apart from a stored value, hence the flag. */
+  private readonly policyHadNeutral: boolean;
 
   constructor(
     dataDir: string,
@@ -224,9 +157,12 @@ export class Autopilot {
     private readonly overrides: OverridesStore,
     private readonly amboss: AmbossStore,
     private readonly earnings: EarningsLog,
+    /** Where completed sales enqueue their service fee (paid in the background). */
+    private readonly serviceFees: ServiceFeeLedger,
     /** LN+ reputation cache — optional; without it peer picking is graph-only. */
     private readonly lnplus?: LnPlusStore,
   ) {
+    this.dataDir = dataDir;
     this.store = new JsonStore<PersistedState>(dataDir, "autopilot.json");
     initMagmaHistory(dataDir);
     this.state = this.store.read({
@@ -251,8 +187,17 @@ export class Autopilot {
       this.state.config ?? {},
       "sellAutoSize",
     );
-    // Merge in any newly added config defaults from older persisted state.
-    this.state.config = { ...DEFAULT_CONFIG, ...this.state.config };
+    const storedPolicy = (this.state.config as { policy?: { neutralPpm?: unknown } | null } | undefined)?.policy;
+    this.policyHadNeutral = storedPolicy?.neutralPpm != null;
+    // Merge in newly added defaults AND bring every stored value into range:
+    // older versions saved whatever the API was sent (a 40,000-min interval,
+    // "false" as a string, policy: null). Clamp what can be clamped, default
+    // what can't, and say so in the log.
+    const { config, repairs } = sanitizePersistedConfig(this.state.config);
+    this.state.config = config;
+    this.reportRepairs(repairs);
+    this.state.history = Array.isArray(this.state.history) ? this.state.history : [];
+    this.state.perChannelLastApplied ??= {};
     this.state.perTargetLastRebalanced ??= {};
     // Sizing used to ride along with auto-pricing. Upgrading must keep exactly
     // the behaviour an install had, so one-shot:
@@ -268,6 +213,8 @@ export class Autopilot {
       if (!persistedHadAutoSize) c.sellAutoSize = c.sellAutoReprice;
       else if (c.sellAutoSize && !c.sellAutoReprice) c.sellAutoSize = false;
       this.state.sellAutoSizeMigrated = true;
+      this.store.write(this.state);
+    } else if (repairs.length > 0) {
       this.store.write(this.state);
     }
     this.state.sellAdaptiveLevel ??= 0.5;
@@ -421,6 +368,8 @@ export class Autopilot {
     return {
       canWrite: this.canWrite,
       config: this.state.config,
+      /** Allowed range of every numeric setting — the UI mirrors these. */
+      bounds: AUTOPILOT_CONFIG_BOUNDS,
       lastRunAt: this.state.lastRunAt,
       // Only surface runs that did something; hide any older "0 applied" no-ops.
       // Normalise older persisted runs that predate newer arrays.
@@ -461,31 +410,80 @@ export class Autopilot {
       const p = this.state.config.policy;
       if (p.minPpm >= 50) p.minPpm = 25;
       if (p.baseFeeMsat >= 1000) p.baseFeeMsat = 0;
-      if (p.neutralPpm == null) p.neutralPpm = 80;
-      // Backfill the newer cascadable behaviour knobs on older persisted policies.
-      if (p.protectPpm == null) p.protectPpm = 350;
-      if (p.safetyMargin == null) p.safetyMargin = 1.15;
-      if (p.noFlowRatchetSteps == null) p.noFlowRatchetSteps = 3;
-      if (p.exploreLowerModifier == null) p.exploreLowerModifier = 0.85;
-      if (this.state.config.rebalanceDailyBudgetSats == null) this.state.config.rebalanceDailyBudgetSats = 10_000;
+      // A policy from before the balanced level existed gets the default one,
+      // as it always did. Sanitizing already filled it in, but clamped to the
+      // OLD floor (the default may sit below a floor this migration just lowered).
+      if (!this.policyHadNeutral) p.neutralPpm = DEFAULT_POLICY.neutralPpm;
+      // (The newer behaviour knobs and a missing daily budget are filled with
+      // their defaults by sanitizePersistedConfig; a null budget now means an
+      // explicit "no limit".)
       this.state.feeVolumeMigrated = true;
       this.persist();
     }
+    // The migrations above move the fee range on their own and can leave the
+    // balanced level outside it — which would make every later save that
+    // touches the fee range fail. Repair, say so, and keep it.
+    const repairs = repairCrossFields(this.state.config);
+    this.reportRepairs(repairs);
+    if (repairs.length > 0) this.persist();
     this.reschedule();
+  }
+
+  /** Settings adjusted on load are logged AND raised as an alert that stays
+   *  until acknowledged: a repair can switch a feature off, and the operator
+   *  must learn why from the UI, not from container logs. */
+  private reportRepairs(repairs: string[]): void {
+    if (repairs.length === 0) return;
+    for (const r of repairs) console.warn(`[autopilot] settings repaired — ${r}`);
+    recordStoreIncident(this.dataDir, { file: "autopilot.json", kind: "adjusted", detail: repairs.join("; ") });
   }
 
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     if (this.fastTimer) clearInterval(this.fastTimer);
+    for (const t of this.kickTimers) clearTimeout(t);
+    this.kickTimers.clear();
     this.timer = undefined;
     this.fastTimer = undefined;
   }
 
-  setConfig(partial: Partial<AutopilotConfig>): void {
-    this.state.config = { ...this.state.config, ...partial };
-    if (partial.policy) {
-      this.state.config.policy = { ...this.state.config.policy, ...partial.policy };
+  /** Process shutdown: stop scheduling for good. A run already in progress
+   *  starts no further payment, channel open or Magma order step — the one
+   *  under way finishes (see waitIdle) — and no new run starts. */
+  shutdown(): void {
+    this.shuttingDown = true;
+    this.stop();
+  }
+
+  /** True while a run or fulfilment poll holds the lock. */
+  isRunning(): boolean {
+    return this.running;
+  }
+
+  /** Resolves once no run is in progress, or after `timeoutMs` (false). */
+  async waitIdle(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.running) {
+      if (Date.now() >= deadline) return false;
+      await new Promise((r) => setTimeout(r, 100));
     }
+    return true;
+  }
+
+  /** Write the current state now (shutdown flush). */
+  flush(): void {
+    this.persist();
+  }
+
+  /**
+   * Apply a settings update. The patch is validated against the bounds in
+   * autopilotConfig.ts; an invalid value throws ConfigValidationError (the API
+   * answers 400) and NOTHING is changed.
+   */
+  setConfig(raw: unknown): void {
+    const result = validateAutopilotPatch(raw, this.state.config);
+    if (!result.ok) throw new ConfigValidationError(result.errors);
+    this.state.config = applyPatch(this.state.config, result.patch);
     if (!this.canWrite) {
       // Refuse to "enable" anything when we have no write macaroon.
       this.state.config.enabled = false;
@@ -497,20 +495,30 @@ export class Autopilot {
     this.reschedule();
   }
 
+  private kick(fn: () => Promise<unknown>, delayMs: number): void {
+    const t = setTimeout(() => {
+      this.kickTimers.delete(t);
+      void fn();
+    }, delayMs);
+    this.kickTimers.add(t);
+  }
+
   private reschedule(): void {
     this.stop();
+    if (this.shuttingDown) return;
     const { enabled, rebalanceEnabled, channelEnabled, sellEnabled, maxHtlcEnabled } = this.state.config;
     if ((!enabled && !rebalanceEnabled && !channelEnabled && !sellEnabled && !maxHtlcEnabled) || !this.canWrite) return;
-    const ms = Math.max(1, this.state.config.intervalMinutes) * 60_000;
-    this.timer = setInterval(() => void this.runOnce(), ms);
+    // Clamped again here, whatever reached the config: Node turns any delay
+    // above 2^31-1 ms into 1 ms, i.e. a back-to-back loop.
+    this.timer = setInterval(() => void this.runOnce(), schedulerIntervalMs(this.state.config.intervalMinutes));
     // Kick off one run shortly after enabling, without blocking.
-    setTimeout(() => void this.runOnce(), 2_000);
+    this.kick(() => this.runOnce(), 2_000);
     // Fast lane: poll Magma orders every 3 min so a buyer's order is accepted +
     // opened within minutes (protects the seller score), independent of the heavy
     // optimisation cadence above.
     if (sellEnabled) {
       this.fastTimer = setInterval(() => void this.pollSellOrders(), 3 * 60_000);
-      setTimeout(() => void this.pollSellOrders(), 5_000);
+      this.kick(() => this.pollSellOrders(), 5_000);
     }
   }
 
@@ -530,15 +538,7 @@ export class Autopilot {
     // v2 engine — wouldApply already folds in the relative/absolute threshold,
     // cooldown and max-changes-per-run, so we just apply the eligible ones.
     const elasticity = await this.feeElasticityModifiers();
-    const report = await getFeeRecommendations(
-      this.readLnd,
-      this.rebalanceLog.recent(200),
-      this.feeCooldown(),
-      this.feeV2Overrides(),
-      this.overrides.all(),
-      elasticity,
-      this.flowAnchors(),
-    );
+    const report = await this.feeReport(elasticity);
 
     // Flow-anchor bookkeeping: a channel in an open no-flow episode that routed
     // out again did so at its CURRENT fee — remember that price as its anchor
@@ -571,9 +571,9 @@ export class Autopilot {
       baseFeeMsat: r.recommendedBaseMsat, // volume-first: drop base fee to win routes
     }));
 
-    const results = items.length ? await applyFees(this.readLnd, writeLnd, items) : [];
+    const results = items.length ? await this.feeApply(writeLnd, items) : [];
     const byId = new Map(eligible.map((r) => [r.channelId, r]));
-    return results.map((res) => {
+    const changes = results.map((res) => {
       const r = byId.get(res.id);
       if (res.ok) {
         this.state.perChannelLastApplied[res.id] = new Date().toISOString();
@@ -589,14 +589,16 @@ export class Autopilot {
         error: res.error,
       };
     });
+    // Cooldowns protect against gossip spam only if they survive a crash in a
+    // later stage of this run — record them now, not at the end.
+    if (changes.length) this.persist();
+    return changes;
   }
 
   /** Within the configured rebalance hour window (node local time)? */
   private inRebalanceWindow(): boolean {
     const { rebalanceHourStart: s, rebalanceHourEnd: e } = this.state.config;
-    if (s === e) return true; // any time
-    const h = new Date().getHours();
-    return s < e ? h >= s && h < e : h >= s || h < e; // handles midnight wrap
+    return rebalanceWindowOpen(s, e, new Date().getHours());
   }
 
   /** Execute eligible (profitable, off-cooldown) rebalances. */
@@ -609,17 +611,12 @@ export class Autopilot {
     if (!this.state.perDayRebalanceSpend || this.state.perDayRebalanceSpend.day !== today) {
       this.state.perDayRebalanceSpend = { day: today, sats: 0 };
     }
-    const dailyBudget = rebalanceDailyBudgetSats ?? 0;
+    // null = the operator explicitly chose "no limit" (validated settings can
+    // no longer reach 0 by accident). Infinity keeps every budget check inert.
+    const dailyBudget = rebalanceDailyBudgetSats === null ? Number.POSITIVE_INFINITY : rebalanceDailyBudgetSats;
     // v1 recommender — only acts on route_found_profitable (wouldRebalance), with
     // the fee-adjust-first / payback / profit gating already applied.
-    const report = await getRebalanceRecommendations(
-      this.readLnd,
-      this.rebalanceLog.recent(200),
-      this.feeCooldown(),
-      this.feeV2Overrides(),
-      this.overrides.all(),
-      this.rebalanceRecOverrides(),
-    );
+    const report = await this.rebalanceReport();
     const eligible = report.recommendations.filter(
       (r) =>
         r.wouldRebalance &&
@@ -645,6 +642,19 @@ export class Autopilot {
     }));
 
     for (const r of plan.run) {
+      // Shutdown: the payment already under way finishes (it is being awaited
+      // right here); none of the moves planned after it starts.
+      if (this.shuttingDown) {
+        out.push({
+          alias: r.alias,
+          amountSats: r.recommendedAmount as number,
+          feeSats: null,
+          costPpm: null,
+          ok: false,
+          error: "skipped: shutting down",
+        });
+        continue;
+      }
       // Actual-spend backstop: an earlier move's real fee may exceed its estimate,
       // so re-check the live budget before each execution — never overshoot.
       if (dailyBudget > 0 && this.state.perDayRebalanceSpend.sats >= dailyBudget) {
@@ -658,7 +668,7 @@ export class Autopilot {
         });
         continue;
       }
-      const res = await executeRebalance(this.readLnd, writeLnd, {
+      const res = await this.rebalanceExec(writeLnd, {
         targetId: r.channelId,
         sourceId: r.selectedSourceChannel as string,
         amountSats: r.recommendedAmount as number,
@@ -686,6 +696,9 @@ export class Autopilot {
         error: res.error,
       });
       if (res.ok && res.feeSats) this.state.perDayRebalanceSpend.sats += res.feeSats;
+      // Spent sats and the backoff must not be forgotten if a later stage of
+      // this run throws or the process restarts: save after every payment.
+      this.persist();
       out.push({
         alias: res.targetAlias,
         amountSats: res.amountSats,
@@ -714,7 +727,7 @@ export class Autopilot {
 
     // The autopilot opens channels with real capital, so it gets the LN+ trust
     // signal too: a peer other operators rate badly is a bad place to lock funds.
-    const { suggestions } = await getChannelSuggestionsV2(this.readLnd, {}, this.lnplus);
+    const { suggestions } = await this.channelSuggestions();
     const top = suggestions[0];
     if (!top) return [];
 
@@ -757,6 +770,11 @@ export class Autopilot {
       ];
     }
 
+    // The reads above take a while (graph, forwards, fee estimate). A shutdown
+    // signal that arrived meanwhile must not be followed by a funding broadcast.
+    if (this.shuttingDown) {
+      return [{ alias: top.alias, sizeSats: size, ok: false, error: "skipped: shutting down" }];
+    }
     const res = await openChannelTo(writeLnd, {
       pubkey: top.pubkey,
       socket: top.socket || undefined,
@@ -765,6 +783,9 @@ export class Autopilot {
     if (res.ok) {
       this.state.lastChannelOpenAt = new Date().toISOString();
       this.onchainCommittedThisRun += size; // share the budget with Magma selling
+      // The open cooldown is the only thing between runs that stops another
+      // open — it must survive a crash right after this one.
+      this.persist();
     }
 
     return [
@@ -839,7 +860,9 @@ export class Autopilot {
     // autopilot: the live offer always tracks the market so it actually fills.
     // Depleted offers are also topped back up. Relisting commits no funds; order
     // fulfillment re-checks the caps before any channel opens.
-    if (cfg.sellAutoRelist || cfg.sellAutoReprice || cfg.sellAutoSize) {
+    // Offer upkeep can wait for the next start; its Amboss calls must not use
+    // up the shutdown grace that order fulfilment may still need.
+    if (!this.shuttingDown && (cfg.sellAutoRelist || cfg.sellAutoReprice || cfg.sellAutoSize)) {
       try {
         const offers = await getMyOffers(key);
         let rec: MagmaV2Report | null = null;
@@ -925,6 +948,7 @@ export class Autopilot {
         };
 
         for (const off of offers) {
+          if (this.shuttingDown) break;
           // Magma autopilot is on → activate a disabled offer so it actually sells
           // (turning on Liquidity provision means "I want to sell"). Then price it.
           if (off.status === "DISABLED") {
@@ -995,7 +1019,13 @@ export class Autopilot {
         // Listing a brand-new offer means choosing its price, which only the
         // auto-pricing switch may do. (Before 0.7.6 this was implicitly true,
         // because the recommendation was only fetched with pricing on.)
-        if (cfg.sellAutoReprice && offers.length === 0 && rec?.sell.state === "good_to_sell" && createRec) {
+        if (
+          !this.shuttingDown &&
+          cfg.sellAutoReprice &&
+          offers.length === 0 &&
+          rec?.sell.state === "good_to_sell" &&
+          createRec
+        ) {
           const total = Math.min(
             chain_balance - cfg.sellReserveSats - deployed - this.committedOnchainSat(),
             cfg.sellMaxDeploySats - deployed,
@@ -1050,6 +1080,15 @@ export class Autopilot {
     let myChannels: { transaction_id: string; transaction_vout: number }[] | null = null;
 
     for (const o of orders) {
+      // Shutdown: the order step under way finishes; no new accept, open or
+      // close starts. Amboss keeps the order, so the next start picks it up
+      // (an end-of-lease close simply waits).
+      if (this.shuttingDown) {
+        if (o.status === "WAITING_FOR_SELLER_APPROVAL" || o.status === "WAITING_FOR_CHANNEL_OPEN") {
+          skip(o, "shutting down");
+        }
+        continue;
+      }
       if (o.status === "WAITING_FOR_SELLER_APPROVAL") {
         if (o.sizeSats > cfg.sellMaxChannelSats) {
           skip(o, "above max channel size");
@@ -1068,6 +1107,7 @@ export class Autopilot {
             extra += o.sizeSats; // committed — it will need funding when it opens
             this.onchainCommittedThisRun += o.sizeSats; // shared budget
             out.push({ orderId: o.id, action: "accept", sizeSats: o.sizeSats, ok: true });
+            this.persist();
           } catch (e) {
             out.push({ orderId: o.id, action: "accept", sizeSats: o.sizeSats, ok: false, error: msg(e) });
           }
@@ -1089,24 +1129,39 @@ export class Autopilot {
         const res = await openChannelTo(writeLnd, { pubkey, socket: socket || undefined, localTokens: o.sizeSats });
         if (res.ok && res.transactionId) {
           try {
-            await addOrderTransaction(key, o.id, `${res.transactionId}:${res.transactionVout}`);
+            const added = await addOrderTransaction(key, o.id, `${res.transactionId}:${res.transactionVout}`);
             extra += o.sizeSats;
             this.onchainCommittedThisRun += o.sizeSats; // shared budget
-            // Disclosed service fee on a completed sale — best-effort, never throws.
-            const fee = await paySaleServiceFee(writeLnd, o.feeSats);
-            if (fee.paid) console.log(`[fee] order ${o.id}: paid ${fee.sats} sat service fee`);
-            // Record the sale for P&L: gross lease income + the fee we paid out.
-            this.earnings.append({
-              at: new Date().toISOString(),
-              via: "autopilot",
-              orderId: o.id,
-              leaseSats: o.feeSats,
-              feePaidSats: fee.paid ? fee.sats : 0,
-            });
-            out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: true, transactionId: res.transactionId });
+            if (added) {
+              // A completed sale: book the income and ENQUEUE the disclosed
+              // service fee. The fee is paid by the ledger in the background —
+              // never awaited here, where a stuck HTLC would hold up every
+              // other order. Both are idempotent per order.
+              this.earnings.appendOnce({
+                at: new Date().toISOString(),
+                via: "autopilot",
+                orderId: o.id,
+                leaseSats: o.feeSats,
+              });
+              // The buyer paid our invoice (a plain one in this flow, so it
+              // settled on payment) before Amboss moved the order to
+              // WAITING_FOR_CHANNEL_OPEN: o.feeSats is income already received.
+              this.serviceFees.enqueue({ source: "magma", orderId: o.id, earnedSats: o.feeSats });
+              out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: true, transactionId: res.transactionId });
+            } else {
+              out.push({
+                orderId: o.id,
+                action: "open",
+                sizeSats: o.sizeSats,
+                ok: false,
+                transactionId: res.transactionId,
+                error: "channel opened but Amboss did not confirm the funding transaction",
+              });
+            }
           } catch (e) {
             out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: false, error: `channel opened but Amboss update failed: ${msg(e)}` });
           }
+          this.persist();
         } else {
           out.push({ orderId: o.id, action: "open", sizeSats: o.sizeSats, ok: false, error: res.error });
         }
@@ -1136,7 +1191,7 @@ export class Autopilot {
    *  main run via the shared `running` lock. */
   async pollSellOrders(): Promise<void> {
     const cfg = this.state.config;
-    if (!cfg.sellEnabled || !this.amboss.hasKey() || !this.writeLnd || this.running) return;
+    if (this.shuttingDown || !cfg.sellEnabled || !this.amboss.hasKey() || !this.writeLnd || this.running) return;
     this.running = true;
     this.onchainCommittedThisRun = 0;
     try {
@@ -1186,23 +1241,27 @@ export class Autopilot {
     // Keep Amboss's real sale history warm on every tick, even read-only, so the
     // Market page and the pricing engine always have something to price against.
     // Self-throttled to a few hours inside the service; never throws.
+    if (this.shuttingDown) return emptyRun;
     void refreshMagmaHistory();
     if (this.running || !this.writeLnd) return emptyRun;
     this.running = true;
     this.onchainCommittedThisRun = 0; // shared capital budget for this run
     const writeLnd = this.writeLnd;
 
+    // After a shutdown signal no further stage starts; inside a stage, every
+    // payment, channel open and order step checks again before it begins.
+    const stage = <T>(on: boolean, run: () => Promise<T[]>): Promise<T[]> =>
+      on && !this.shuttingDown ? run() : Promise.resolve([]);
+
     try {
-      const changes = this.state.config.enabled ? await this.runFees(writeLnd) : [];
-      const rebalances = this.state.config.rebalanceEnabled
-        ? await this.runRebalances(writeLnd)
-        : [];
-      const channels = this.state.config.channelEnabled ? await this.runChannels(writeLnd) : [];
-      const sells = await this.runSell(writeLnd);
+      const changes = await stage(this.state.config.enabled, () => this.runFees(writeLnd));
+      const rebalances = await stage(this.state.config.rebalanceEnabled, () => this.runRebalances(writeLnd));
+      const channels = await stage(this.state.config.channelEnabled, () => this.runChannels(writeLnd));
+      const sells = await stage(true, () => this.runSell(writeLnd));
       // Advertised-size upkeep: only gossips when a channel's bucket moved.
-      const maxHtlc = this.state.config.maxHtlcEnabled
-        ? await runMaxHtlcPass(this.readLnd, writeLnd).catch(() => [] as MaxHtlcChange[])
-        : [];
+      const maxHtlc = await stage(this.state.config.maxHtlcEnabled, () =>
+        runMaxHtlcPass(this.readLnd, writeLnd).catch(() => [] as MaxHtlcChange[]),
+      );
       // "skip" entries are non-actions (cap/reserve) — don't count them as attempts.
       const acted = sells.filter((s) => s.action !== "skip");
 
@@ -1235,14 +1294,52 @@ export class Autopilot {
         this.state.history.unshift(run);
         this.state.history = this.state.history.slice(0, HISTORY_LIMIT);
       }
-      this.persist();
       return run;
     } catch (err) {
       console.error("[autopilot] run failed:", err);
       return emptyRun;
     } finally {
+      // Also on a failed run: whatever earlier stages recorded (fee cooldowns,
+      // rebalance spend, flow anchors) must reach the disk.
+      this.persist();
       this.running = false;
     }
+  }
+
+  // ── node seams ─────────────────────────────────────────────────────────────
+  // The planning reads and the node writes of the money-moving stages go
+  // through these one-liners (as LSPS1's LND seams do), so a test can drive a
+  // whole run without building a routing node with history and a network graph.
+
+  private feeReport(elasticity: Map<string, number>) {
+    return getFeeRecommendations(
+      this.readLnd,
+      this.rebalanceLog.recent(200),
+      this.feeCooldown(),
+      this.feeV2Overrides(),
+      this.overrides.all(),
+      elasticity,
+      this.flowAnchors(),
+    );
+  }
+  private feeApply(writeLnd: AuthenticatedLnd, items: FeeApplyItem[]) {
+    return applyFees(this.readLnd, writeLnd, items);
+  }
+  private rebalanceReport() {
+    return getRebalanceRecommendations(
+      this.readLnd,
+      this.rebalanceLog.recent(200),
+      this.feeCooldown(),
+      this.feeV2Overrides(),
+      this.overrides.all(),
+      this.rebalanceRecOverrides(),
+    );
+  }
+  private rebalanceExec(writeLnd: AuthenticatedLnd, params: RebalanceExecParams) {
+    return executeRebalance(this.readLnd, writeLnd, params);
+  }
+  private channelSuggestions() {
+    return getChannelSuggestionsV2(this.readLnd, {}, this.lnplus);
   }
 
   private persist(): void {

@@ -30,7 +30,7 @@ import type { SettingsStore } from "./settings.js";
 import type { EarningsLog } from "./earningsLog.js";
 import { getMagmaRecommendations, MAGMA_V2_DEFAULTS } from "./magmaRecommend.js";
 import { onchainCosts } from "./nodeEconomics.js";
-import { paySaleServiceFee, saleFeeConfig } from "./serviceFee.js";
+import { saleFeeConfig, type ServiceFeeLedger } from "./serviceFee.js";
 import { openChannelTo } from "./channelOps.js";
 
 /**
@@ -141,6 +141,8 @@ export interface Lsps1Order {
   invoiceSecret: string;
   invoiceExpiresAt: string;
   channel: { fundedAt: string; fundingOutpoint: string; expiresAt: string } | null;
+  /** LEGACY: fee paid inline by older versions. The service-fee ledger is the
+   *  source of truth for orders completed since. */
   serviceFeePaidSat: number;
   error?: string;
 }
@@ -229,6 +231,11 @@ export class Lsps1Service {
   private readonly invoiceSubs = new Map<string, EventEmitter>();
   /** Orders currently in the open-and-settle critical section. */
   private readonly fulfilling = new Set<string>();
+  /** Opens whose funding outpoint is not yet on disk — shutdown waits for these. */
+  private opensInFlight = 0;
+  /** Set by stop(): no new channel open may begin. */
+  private stopping = false;
+  private socketTimer: NodeJS.Timeout | undefined;
 
   constructor(
     dataDir: string,
@@ -242,6 +249,8 @@ export class Lsps1Service {
     private readonly pricingMode: () => { sellPricingMode: "fast" | "balanced" | "premium" | "auto"; adaptiveLevel: number },
     private readonly ambossKey: () => string,
     private readonly earnings: EarningsLog,
+    /** Completed sales enqueue their service fee here (paid in the background). */
+    private readonly serviceFees: ServiceFeeLedger,
     /** Surface a completed sale in the run history / Overview digest. */
     private readonly onSale?: (orderId: string, sizeSats: number, transactionId: string) => void,
   ) {
@@ -254,8 +263,38 @@ export class Lsps1Service {
     void this.recoverOrders();
     // Hourly re-check of the announced clearnet address: a DDNS name follows
     // the home IP, so re-resolve and swap the announcement when it moved.
-    const timer = setInterval(() => void this.applyAnnouncedSocket(), 60 * 60_000);
-    timer.unref?.();
+    this.socketTimer = setInterval(() => void this.applyAnnouncedSocket(), 60 * 60_000);
+    this.socketTimer.unref?.();
+  }
+
+  /**
+   * Process shutdown. Stops listening and refuses to start new channel opens;
+   * the graph announcements are left as they are (this is not "LSP mode off").
+   * Held payments stay held — restart recovery resumes them, and every state
+   * change is already on disk. Await `waitForOpens()` before exiting so an open
+   * that already started can record its funding outpoint.
+   */
+  stop(): void {
+    this.stopping = true;
+    if (this.socketTimer) clearInterval(this.socketTimer);
+    this.socketTimer = undefined;
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = undefined;
+    // Detach directly (stopSub() would log "LSP mode off", which it isn't).
+    this.sub?.removeAllListeners();
+    this.sub = undefined;
+    for (const sub of this.invoiceSubs.values()) sub.removeAllListeners();
+    this.invoiceSubs.clear();
+  }
+
+  /** Resolves when no channel open is between broadcast and its record on disk. */
+  async waitForOpens(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.opensInFlight > 0) {
+      if (Date.now() >= deadline) return false;
+      await sleep(100);
+    }
+    return true;
   }
 
   /** Call after the LSP-mode toggle or clearnet address changes — starts/stops
@@ -388,7 +427,7 @@ export class Lsps1Service {
       channelExpiryBlocks: o.channelExpiryBlocks,
       invoiceExpiresAt: o.invoiceExpiresAt,
       fundingOutpoint: o.channel?.fundingOutpoint ?? null,
-      serviceFeePaidSat: o.serviceFeePaidSat,
+      serviceFeePaidSat: this.serviceFees.paidFor("lsps1", o.orderId) ?? o.serviceFeePaidSat,
       error: o.error,
     }));
   }
@@ -429,7 +468,7 @@ export class Lsps1Service {
   // ── transport ────────────────────────────────────────────────────────────────
 
   private startSub(): void {
-    if (this.sub || !this.writeLnd) return;
+    if (this.sub || !this.writeLnd || this.stopping) return;
     try {
       const sub = subscribeToPeerMessages({ lnd: this.writeLnd });
       sub.on("message_received", (m: { message: string; public_key: string; type: number }) => {
@@ -472,7 +511,7 @@ export class Lsps1Service {
   private scheduleReconnect(): void {
     this.sub?.removeAllListeners();
     this.sub = undefined;
-    if (!this.settings.get().lspModeEnabled || this.retryTimer) return;
+    if (!this.settings.get().lspModeEnabled || this.retryTimer || this.stopping) return;
     const delay = this.retryMs;
     this.retryMs = Math.min(this.retryMs * 2, 300_000);
     this.retryTimer = setTimeout(() => {
@@ -1010,6 +1049,9 @@ export class Lsps1Service {
       let lastError = "open not attempted";
       for (let attempt = 0; attempt < OPEN_RETRY_ATTEMPTS; attempt++) {
         if (attempt > 0) await sleep(this.openRetryDelayMs);
+        // Shutting down: leave the payment held. Restart recovery resumes this
+        // order from its saved state — far better than being killed mid-open.
+        if (this.stopping) return;
         // Stop if the payment is no longer held (expired/cancelled meanwhile).
         try {
           const inv = await this.lndInvoice(order.invoiceId);
@@ -1020,12 +1062,34 @@ export class Lsps1Service {
         } catch {
           // Invoice lookup failing shouldn't abort the open attempt.
         }
-        const res = await this.lndOpen(order, feeRate);
-        if (res.ok && res.transactionId) {
-          await this.completeOrder(order, `${res.transactionId}:${res.transactionVout ?? 0}`);
-          return;
+        // Check again: the lookup above waited on LND, and a shutdown that
+        // began meanwhile has already been told "no open in flight" (the count
+        // below is still 0) — the process may exit at any moment. An open
+        // started now could fund a channel whose outpoint never reaches disk,
+        // and restart recovery would then open a SECOND channel for this paid
+        // order. Leave the payment held instead. Nothing below awaits before
+        // the count goes up, so this check cannot go stale.
+        if (this.stopping) return;
+        // Never move funds we couldn't record: if the order file can't be
+        // written now, the funding outpoint couldn't be either, and a restart
+        // would open a second channel for this order. Refund instead.
+        try {
+          this.ordersStore.writeOrThrow(this.orders);
+        } catch (err) {
+          lastError = `cannot save order state (${err instanceof Error ? err.message : String(err)}) — refunded instead of opening`;
+          break;
         }
-        lastError = res.error ?? "open failed";
+        this.opensInFlight += 1;
+        try {
+          const res = await this.lndOpen(order, feeRate);
+          if (res.ok && res.transactionId) {
+            await this.completeOrder(order, `${res.transactionId}:${res.transactionVout ?? 0}`);
+            return;
+          }
+          lastError = res.error ?? "open failed";
+        } finally {
+          this.opensInFlight -= 1;
+        }
         // Only a connect problem is worth waiting out; anything else is final.
         if (!lastError.includes("couldn't connect")) break;
       }
@@ -1073,26 +1137,32 @@ export class Lsps1Service {
     order.paymentState = "PAID";
     order.orderState = "COMPLETED";
     order.error = undefined;
-
-    // Disclosed service fee on a completed sale — best-effort, never throws
-    // (same rules as Magma sales: env-driven rate, skipped when self/disabled).
-    const fee = await paySaleServiceFee(this.writeLnd, order.feeTotalSat);
-    if (fee.paid) console.log(`[fee] lsps1 order ${order.orderId}: paid ${fee.sats} sat service fee`);
-    order.serviceFeePaidSat = fee.paid ? fee.sats : 0;
+    // Book the sale BEFORE saving COMPLETED: if we crash in between, recovery
+    // sees a settled invoice on a not-yet-completed order and books it then —
+    // recordSale is idempotent, so it can never count twice.
+    this.recordSale(order);
     this.persistOrders();
-
-    // Record the sale for P&L, and surface it in the run history / digest.
-    this.earnings.append({
-      at: new Date().toISOString(),
-      via: "lsps1",
-      orderId: order.orderId,
-      leaseSats: order.feeTotalSat,
-      feePaidSats: order.serviceFeePaidSat,
-    });
     this.onSale?.(order.orderId, order.lspBalanceSat, order.channel?.fundingOutpoint.split(":")[0] ?? "");
     console.log(
       `[lsps1] order ${order.orderId} COMPLETED: ${order.lspBalanceSat} sat channel, ${order.feeTotalSat} sat fee collected`,
     );
+  }
+
+  /** P&L income + the disclosed service fee for a settled order. The fee is
+   *  only ENQUEUED — the ledger pays it in the background, so it can never
+   *  delay or fail the settle. Income is feeTotalSat, our fee for the lease —
+   *  not the hold invoice's amount (orderTotalSat), which would also carry a
+   *  client balance: that part is the buyer's own, handed back to them in the
+   *  channel. (Today a client balance is refused at order time, so the two are
+   *  equal.) Both steps are idempotent per order. */
+  private recordSale(order: Lsps1Order): void {
+    this.earnings.appendOnce({
+      at: new Date().toISOString(),
+      via: "lsps1",
+      orderId: order.orderId,
+      leaseSats: order.feeTotalSat,
+    });
+    this.serviceFees.enqueue({ source: "lsps1", orderId: order.orderId, earnedSats: order.feeTotalSat });
   }
 
   /** Any failure with a held payment ends in a refund — cancel the HODL invoice. */
@@ -1121,12 +1191,16 @@ export class Lsps1Service {
         const inv = await this.lndInvoice(order.invoiceId);
         if (inv.is_confirmed) {
           // We settled before the crash: the channel open succeeded first
-          // (settle strictly follows broadcast), only the bookkeeping is lost.
-          if (order.paymentState !== "PAID") {
+          // (settle strictly follows broadcast), only the bookkeeping is lost —
+          // so book the sale now (idempotent), or it vanishes from P&L and its
+          // service fee is never paid.
+          if (order.paymentState !== "PAID" || order.orderState !== "COMPLETED") {
             order.paymentState = "PAID";
             order.orderState = "COMPLETED";
             order.error = order.channel ? undefined : "completed across restart — funding outpoint not recorded";
+            this.recordSale(order);
             this.persistOrders();
+            this.onSale?.(order.orderId, order.lspBalanceSat, order.channel?.fundingOutpoint.split(":")[0] ?? "");
           }
         } else if (inv.is_held) {
           order.paymentState = "HOLD";

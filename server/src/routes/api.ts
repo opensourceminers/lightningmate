@@ -33,14 +33,17 @@ import {
   sendOnchain,
 } from "../services/onchain.js";
 import { closeChannelByOutpoint, openChannelTo, MIN_CHANNEL_SATS } from "../services/channelOps.js";
-import { paySaleServiceFee, saleFeeConfig } from "../services/serviceFee.js";
+import { saleFeeConfig, type ServiceFeeLedger } from "../services/serviceFee.js";
 import { getFeeRecommendations } from "../services/feeRecommend.js";
 import { getRebalanceRecommendations } from "../services/rebalanceRecommend.js";
 import { getBtcPrice } from "../services/price.js";
 import type { SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
-import { getAlerts } from "../services/alerts.js";
+import { getAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
 import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
+import { SlidingWindowLimiter } from "../services/rateLimit.js";
+import { acknowledgeStoreIncident } from "../store.js";
+import { ConfigValidationError } from "../services/autopilotConfig.js";
 import {
   acceptOrder,
   addOrderTransaction,
@@ -165,23 +168,15 @@ export function createApiRouter(
   earnings: EarningsLog,
   lsps1: Lsps1Service,
   lnplus: LnPlusStore,
+  serviceFees: ServiceFeeLedger,
 ): Router {
   const router = Router();
 
-  // Simple global rate limit on state-changing requests — blocks runaway loops
-  // or a compromised client spamming fund-moving actions. Generous for a human.
-  const writeHits: number[] = [];
-  router.use((req, res, next) => {
-    if (req.method === "GET") return next();
-    const now = Date.now();
-    while (writeHits.length && now - writeHits[0] > 60_000) writeHits.shift();
-    if (writeHits.length >= 60) {
-      res.status(429).json({ error: "rate_limited", message: "Too many write requests; slow down." });
-      return;
-    }
-    writeHits.push(now);
-    next();
-  });
+  // Limits are kept PER CLIENT ADDRESS. Umbrel's app_proxy (the owner's
+  // browser) and other containers on the Docker network arrive from different
+  // addresses, so a noisy neighbour can only exhaust its own budget — with
+  // single global buckets it could lock the owner out of logging in or saving.
+  const clientKey = (req: Request): string => req.socket.remoteAddress ?? "unknown";
 
   // ── Auth gate ───────────────────────────────────────────────────────────────
   // The whole API requires a session token (proves the per-install app password
@@ -198,25 +193,41 @@ export function createApiRouter(
     res.status(401).json({ error: "unauthorized", message: "Sign in to continue." });
   });
 
+  // Rate limit on state-changing requests — blocks runaway loops or a
+  // compromised client spamming fund-moving actions. Generous for a human.
+  // Mounted AFTER the auth gate, so unauthenticated requests (401 above) never
+  // count; the login has its own failure-only limiter below.
+  const writeLimiter = new SlidingWindowLimiter({ windowMs: 60_000, max: 60 });
+  router.use((req, res, next) => {
+    if (req.method === "GET" || OPEN_PATHS.has(req.path)) return next();
+    if (!writeLimiter.tryHit(clientKey(req))) {
+      res.status(429).json({ error: "rate_limited", message: "Too many write requests; slow down." });
+      return;
+    }
+    next();
+  });
+
   // Whether a login is required, and whether this request is already signed in.
   router.get("/auth/status", (req, res) => {
     res.json({ authRequired: authRequired(), unlocked: verifyToken(bearer(req)) });
   });
 
-  // Exchange the app password for a session token. Brute-force guarded.
-  const unlockHits: number[] = [];
+  // Exchange the app password for a session token. Brute-force guarded by
+  // counting FAILED attempts per client: guessing from one address can't lock
+  // out the owner, whose correct password always gets through.
+  const unlockFailures = new SlidingWindowLimiter({ windowMs: 60_000, max: 8 });
   router.post("/auth/unlock", (req, res) => {
-    const now = Date.now();
-    while (unlockHits.length && now - unlockHits[0] > 60_000) unlockHits.shift();
-    if (unlockHits.length >= 8) {
+    const key = clientKey(req);
+    if (unlockFailures.limited(key)) {
       res.status(429).json({ error: "rate_limited", message: "Too many attempts; wait a minute." });
       return;
     }
-    unlockHits.push(now);
     if (!verifyPassword(req.body?.password)) {
+      unlockFailures.hit(key);
       res.status(401).json({ error: "bad_password", message: "Wrong password." });
       return;
     }
+    unlockFailures.reset(key);
     res.json({ token: issueToken() });
   });
 
@@ -368,13 +379,35 @@ export function createApiRouter(
     res.json(overrides.set(channelId, override));
   });
 
-  // Derived alerts (offline channels, low balances, …).
+  // Alerts: damaged/unsaveable state files and service-fee problems (these
+  // stay until acknowledged), plus derived node alerts (offline channels, …).
   router.get(
     "/alerts",
     wrap(async (_req, res) => {
-      res.json(await getAlerts(lnd));
+      res.json(await getAlerts(lnd, [...stateAlerts(config.dataDir), ...serviceFeeAlerts(serviceFees)]));
     }),
   );
+
+  // Operator has read an acknowledgeable alert ("state:<id>" / "fee:<key>").
+  router.post("/alerts/ack", (req, res) => {
+    const id = typeof req.body?.id === "string" ? req.body.id : "";
+    const ok = id.startsWith("state:")
+      ? acknowledgeStoreIncident(config.dataDir, id.slice("state:".length))
+      : id.startsWith("fee:")
+        ? serviceFees.acknowledge(id.slice("fee:".length))
+        : false;
+    if (!ok) {
+      res.status(404).json({ error: "not_found", message: "No such alert." });
+      return;
+    }
+    res.json({ ok: true });
+  });
+
+  // The service-fee ledger, for transparency: what was owed, paid or refused.
+  router.get("/service-fees", (_req, res) => {
+    const { bps, address } = saleFeeConfig();
+    res.json({ bps, address, entries: serviceFees.entries() });
+  });
 
   // Close a channel by funding outpoint — real on-chain action, write only.
   router.post(
@@ -437,9 +470,19 @@ export function createApiRouter(
     res.json(autopilot.getState());
   });
 
-  // Update autopilot config (enable/disable, interval, cooldown, policy).
+  // Update autopilot config (enable/disable, interval, cooldown, policy). Every
+  // value is checked against its bounds; one bad field rejects the whole update
+  // with a message naming it, and nothing is saved.
   router.post("/autopilot", (req, res) => {
-    autopilot.setConfig(req.body ?? {});
+    try {
+      autopilot.setConfig(req.body);
+    } catch (err) {
+      if (err instanceof ConfigValidationError) {
+        res.status(400).json({ error: "invalid_config", message: err.message, errors: err.errors });
+        return;
+      }
+      throw err;
+    }
     res.json(autopilot.getState());
   });
 
@@ -561,7 +604,7 @@ export function createApiRouter(
     wrap(async (req, res) => {
       const days = Number(req.query.days ?? config.flowWindowDays);
       const windowDays = Number.isFinite(days) && days > 0 ? days : config.flowWindowDays;
-      res.json(await getPnl(lnd, rebalanceLog, earnings, windowDays));
+      res.json(await getPnl(lnd, rebalanceLog, earnings, windowDays, serviceFees));
     }),
   );
 
@@ -1343,19 +1386,17 @@ export function createApiRouter(
       const outpoint = `${opened.transactionId}:${opened.transactionVout}`;
       const added = await addOrderTransaction(amboss.getKey(), id, outpoint);
       if (added) {
-        // Disclosed service fee on a completed sale — best-effort, never blocks.
-        const fee = await paySaleServiceFee(writeLnd, order.feeSats);
-        if (fee.paid) console.log(`[fee] order ${id}: paid ${fee.sats} sat service fee`);
-        else if (fee.reason && fee.reason !== "disabled" && fee.reason !== "self")
-          console.warn(`[fee] order ${id}: skipped ${fee.sats} sat (${fee.reason})`);
-        // Record the sale for P&L: gross lease income + the fee we paid out.
-        earnings.append({
+        // A completed sale: book the income and ENQUEUE the disclosed service
+        // fee — the ledger pays it in the background, so a slow fee payment
+        // can never hold this request (or anything else) up. Both steps are
+        // idempotent per order, shared with the autopilot's path.
+        earnings.appendOnce({
           at: new Date().toISOString(),
           via: "manual",
           orderId: id,
           leaseSats: order.feeSats,
-          feePaidSats: fee.paid ? fee.sats : 0,
         });
+        serviceFees.enqueue({ source: "magma", orderId: id, earnedSats: order.feeSats });
       }
       res.json({ ok: added, transactionId: opened.transactionId, outpoint });
     }),

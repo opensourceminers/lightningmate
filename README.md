@@ -104,16 +104,32 @@ Use `LND_CERT_PATH` / `LND_MACAROON_PATH` instead.)
 ```bash
 npm install            # installs both server and web workspaces
 npm run dev            # backend (:3001) + frontend (:5173) together
+npm run typecheck      # server + web, including the tests
+npm test               # server + web test suites (node:test, fake LND, no network)
 ```
 
-Open http://localhost:5173.
+Open http://localhost:5173. CI runs `npm ci`, the type-check, the tests and the
+build on every push and pull request (`.github/workflows/ci.yml`).
 
 ## Production (single container)
 
 ```bash
 docker build -t lightningmate .
-docker run -p 3001:3001 --env-file .env lightningmate   # standalone
+# standalone: inside the container the API must bind 0.0.0.0, so it requires a
+# login — set LM_BIND=0.0.0.0 and APP_PASSWORD in .env (see .env.example), not
+# with -e on the command line, where the password would end up in your shell
+# history and in `ps`. The port is published on this machine only.
+docker run -p 127.0.0.1:3001:3001 --env-file .env lightningmate
 ```
+
+LightningMate refuses to start when it would serve its API beyond loopback
+without a login. On `docker stop` it answers new state-changing requests with
+`503` (send them again once it is back up; reads keep working), starts no new
+payment, channel open or order step of its own, and gives whatever is already
+under way — an autopilot step, an LSP channel open, a request sent from the UI,
+even one whose browser or proxy connection has already gone — about half a
+minute to finish (a held LSP payment is left for restart recovery). Then it
+saves its state and exits.
 
 The published multi-arch image is built by CI on version tags and pushed to
 `ghcr.io/opensourceminers/lightningmate` (amd64 + arm64, digest-pinned).

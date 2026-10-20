@@ -1,22 +1,32 @@
 /**
  * Channel backup (SCB) watchdog + export (server-only, self-contained).
  *
- * Uses only READ-ONLY LND calls (getChannels + getBackups / ExportAllChannelBackups,
- * offchain:read). By construction this module can never move funds or change
- * channels. The exported hex blob is streamed straight to the operator's browser
- * for download — it is never written to disk or uploaded anywhere. Only the
- * export timestamp + channel count metadata are persisted, so the watchdog can
- * detect a stale or missing backup. NO seed phrase, key, or backup blob is ever
- * stored here.
+ * Uses only READ-ONLY LND calls (getChannels, getPendingChannels and getBackups
+ * / ExportAllChannelBackups, offchain:read). By construction this module can
+ * never move funds or change channels. The exported hex blob is streamed
+ * straight to the operator's browser for download — it is never written to
+ * disk or uploaded anywhere. Only the export time and the list of channel
+ * funding outpoints the backup contains are persisted, so the watchdog can
+ * tell exactly which channels a backup covers. NO seed phrase, key, or backup
+ * blob is ever stored here.
  */
 
-import { getChannels, getBackups, type AuthenticatedLnd, type GetBackupsResult } from "lightning";
+import {
+  getBackups,
+  getChannels,
+  getPendingChannels,
+  type AuthenticatedLnd,
+  type GetBackupsResult,
+} from "lightning";
 import { JsonStore } from "../store.js";
 
 /** Persisted metadata — non-sensitive, used only to detect a stale backup. */
 interface BackupState {
   lastExportAt?: string;
   lastExportChannelCount?: number;
+  /** Funding outpoints ("txid:vout") contained in the last exported backup.
+   *  Absent on exports made by versions that only counted channels. */
+  lastExportOutpoints?: string[];
 }
 
 const DEFAULT: BackupState = {};
@@ -37,12 +47,12 @@ export class BackupStore {
     return { ...this.state };
   }
 
-  /** Record that the operator exported a fresh channel backup. */
-  recordExport(channelCount: number | undefined, atIso: string): void {
+  /** Record that the operator exported a backup covering `outpoints`. */
+  recordExport(outpoints: string[], atIso: string): void {
     this.state = {
-      ...this.state,
       lastExportAt: atIso,
-      lastExportChannelCount: channelCount ?? this.state.lastExportChannelCount,
+      lastExportChannelCount: outpoints.length,
+      lastExportOutpoints: [...outpoints].sort(),
     };
     this.store.write(this.state);
   }
@@ -50,9 +60,14 @@ export class BackupStore {
 
 export interface BackupStatusResult {
   available: boolean;
+  /** Channels that need to be in a backup: open + pending-open. */
   currentChannelCount: number;
   lastExportAt: string | null;
   lastExportChannelCount: number | null;
+  /** Channels open (or opening) now that the last backup does not contain. */
+  notInBackupCount: number;
+  /** Channels in the last backup that have since fully closed. */
+  closedSinceExportCount: number;
   stale: boolean;
   reason: string;
 }
@@ -72,83 +87,98 @@ function isPermissionError(msg: string): boolean {
   return /permission|unauthorized|not authorized|macaroon/i.test(msg);
 }
 
+const outpoint = (c: { transaction_id: string; transaction_vout: number }): string =>
+  `${c.transaction_id}:${c.transaction_vout}`;
+
 /**
- * Read-only backup status: current channel count + last-export metadata, with a
- * staleness verdict. Tolerates LND errors gracefully (returns available:false).
- * Never throws, never writes.
+ * The node's channels as two sets:
+ *  - `needed`: open + pending-open — every one of these must be in the backup;
+ *  - `known`:  everything LND still tracks, incl. channels that are closing.
+ * Counting channels was not enough: one close plus one open keeps the count,
+ * and the new channel would silently be missing from the "current" backup.
  */
-export async function getBackupStatus(
-  lnd: AuthenticatedLnd,
-  store: BackupStore,
-): Promise<BackupStatusResult> {
+async function channelOutpoints(lnd: AuthenticatedLnd): Promise<{ needed: Set<string>; known: Set<string> }> {
+  const [{ channels }, { pending_channels }] = await Promise.all([getChannels({ lnd }), getPendingChannels({ lnd })]);
+  const needed = new Set<string>(channels.map(outpoint));
+  const known = new Set<string>(needed);
+  for (const p of pending_channels) {
+    known.add(outpoint(p));
+    if (p.is_opening) needed.add(outpoint(p));
+  }
+  return { needed, known };
+}
+
+/**
+ * Read-only backup status with a staleness verdict. Tolerates LND errors
+ * gracefully (returns available:false). Never throws, never writes.
+ */
+export async function getBackupStatus(lnd: AuthenticatedLnd, store: BackupStore): Promise<BackupStatusResult> {
   const persisted = store.get();
   const lastExportAt = persisted.lastExportAt ?? null;
   const lastExportChannelCount = persisted.lastExportChannelCount ?? null;
+  const base = { lastExportAt, lastExportChannelCount, notInBackupCount: 0, closedSinceExportCount: 0 };
 
-  let currentChannelCount = 0;
+  let current: { needed: Set<string>; known: Set<string> };
   try {
-    const { channels } = await getChannels({ lnd });
-    currentChannelCount = Array.isArray(channels) ? channels.length : 0;
+    current = await channelOutpoints(lnd);
   } catch (err) {
     return {
+      ...base,
       available: false,
       currentChannelCount: 0,
-      lastExportAt,
-      lastExportChannelCount,
       stale: true,
       reason: `Could not read channels: ${errToMessage(err)}`,
     };
   }
+  const result = (stale: boolean, reason: string, extra: Partial<BackupStatusResult> = {}): BackupStatusResult => ({
+    ...base,
+    available: true,
+    currentChannelCount: current.needed.size,
+    stale,
+    reason,
+    ...extra,
+  });
 
-  if (!lastExportAt) {
-    return {
-      available: true,
-      currentChannelCount,
-      lastExportAt,
-      lastExportChannelCount,
-      stale: true,
-      reason: "No backup exported yet",
-    };
+  if (!lastExportAt) return result(true, "No backup exported yet");
+  if (!persisted.lastExportOutpoints) {
+    return result(
+      true,
+      "This backup was made by an older version that only counted channels — download it once more so every channel can be tracked",
+    );
   }
 
-  if (lastExportChannelCount !== null && currentChannelCount !== lastExportChannelCount) {
-    return {
-      available: true,
-      currentChannelCount,
-      lastExportAt,
-      lastExportChannelCount,
-      stale: true,
-      reason: "Channel set changed since last export — re-export recommended",
-    };
+  const exported = new Set(persisted.lastExportOutpoints);
+  const notInBackup = [...current.needed].filter((o) => !exported.has(o)).length;
+  // A closing channel is still covered by LND's backup until it is gone, so it
+  // only counts as "closed" once LND no longer tracks it at all.
+  const closed = [...exported].filter((o) => !current.known.has(o)).length;
+  if (notInBackup > 0) {
+    return result(
+      true,
+      `${notInBackup} channel${notInBackup > 1 ? "s are" : " is"} not in your last backup — download a fresh one now`,
+      { notInBackupCount: notInBackup, closedSinceExportCount: closed },
+    );
+  }
+  if (closed > 0) {
+    return result(
+      true,
+      `${closed} channel${closed > 1 ? "s" : ""} in your last backup closed since — re-export recommended`,
+      { closedSinceExportCount: closed },
+    );
   }
 
   const ageMs = Date.now() - new Date(lastExportAt).getTime();
   if (Number.isFinite(ageMs) && ageMs > STALE_AFTER_MS) {
-    return {
-      available: true,
-      currentChannelCount,
-      lastExportAt,
-      lastExportChannelCount,
-      stale: true,
-      reason: "Backup is over 30 days old — re-export recommended",
-    };
+    return result(true, "Backup is over 30 days old — re-export recommended");
   }
-
-  return {
-    available: true,
-    currentChannelCount,
-    lastExportAt,
-    lastExportChannelCount,
-    stale: false,
-    reason: "Backup current",
-  };
+  return result(false, "Backup current — it covers every open and pending channel");
 }
 
 /**
  * Export the all-channels static channel backup (read-only LND call). On success
- * persist the export timestamp + channel count so the watchdog knows a fresh
- * backup exists. The hex blob is returned to the caller (for download) and never
- * persisted. Handles permission errors gracefully.
+ * persist the export time + the funding outpoints the backup contains, so the
+ * watchdog knows exactly which channels it covers. The hex blob is returned to
+ * the caller (for download) and never persisted. Handles permission errors.
  */
 export async function exportScb(
   lnd: AuthenticatedLnd,
@@ -171,8 +201,10 @@ export async function exportScb(
     return { ok: false, error: "LND returned an empty channel backup." };
   }
 
-  const channelCount = Array.isArray(value.channels) ? value.channels.length : undefined;
-  store.recordExport(channelCount, new Date().toISOString());
+  // What the file actually contains — LND's SCB covers open, pending-open and
+  // closing channels — not a separate (racy) channel listing.
+  const outpoints = Array.isArray(value.channels) ? value.channels.map(outpoint) : [];
+  store.recordExport(outpoints, new Date().toISOString());
 
-  return { ok: true, backupHex: String(value.backup), channelCount };
+  return { ok: true, backupHex: String(value.backup), channelCount: outpoints.length };
 }

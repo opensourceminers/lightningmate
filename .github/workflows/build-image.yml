@@ -64,6 +64,11 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
           build-args: |
             APP_VERSION=${{ github.event.inputs.tag || github.ref_name }}
+          # Traceability: which repo and commit an image was built from.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ github.event.inputs.tag || github.ref_name }}
 
       # The per-arch digest becomes a filename; the merge job turns the set of
       # filenames back into the manifest-list members.

@@ -4,6 +4,7 @@ import type { AppSettings, FiatCurrency, LspStatus } from "../types";
 import { BackupCard } from "./BackupCard";
 import { Switch, RunState } from "./Switch";
 import { satsCompact, timeAgo } from "../format";
+import { formatVersion } from "../version";
 
 const CURRENCIES: { value: FiatCurrency; label: string }[] = [
   { value: "off", label: "Off" },
@@ -13,7 +14,7 @@ const CURRENCIES: { value: FiatCurrency; label: string }[] = [
   { value: "CHF", label: "CHF" },
 ];
 
-export function SettingsPanel({ onChange }: { onChange: () => void }) {
+export function SettingsPanel({ onChange, version }: { onChange: () => void; version?: string }) {
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -418,6 +419,12 @@ export function SettingsPanel({ onChange }: { onChange: () => void }) {
       <p className="hint">
         More settings (autopilot safety caps, refresh intervals, alerts) live in their own
         tabs — this page will grow.
+      </p>
+
+      <h3 className="sub">About</h3>
+      <p className="muted">
+        Lightning Mate <strong>{formatVersion(version) || "version unknown"}</strong> — include this when
+        you report a problem.
       </p>
     </section>
 

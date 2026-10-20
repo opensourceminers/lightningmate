@@ -1,9 +1,11 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
-import express from "express";
+import type { Server } from "node:http";
 import { loadConfig } from "./config.js";
 import { getLnd, getWriteLnd } from "./lnd.js";
 import { createApiRouter } from "./routes/api.js";
+import { createHttpApp } from "./app.js";
+import { assertSafeExposure } from "./exposure.js";
+import { RequestGate, appShutdownSteps, createShutdown } from "./shutdown.js";
+import { authRequired } from "./services/auth.js";
 import { LnPlusStore } from "./services/lnplusStore.js";
 import { Autopilot } from "./services/autopilot.js";
 import { RebalanceLog } from "./services/rebalanceLog.js";
@@ -13,7 +15,13 @@ import { AmbossStore } from "./services/ambossStore.js";
 import { BackupStore } from "./services/backup.js";
 import { EarningsLog } from "./services/earningsLog.js";
 import { Lsps1Service } from "./services/lsps1.js";
-import { initHtlcTelemetry, startHtlcTelemetry } from "./services/htlcTelemetry.js";
+import { ServiceFeeLedger, lndFeeLightning } from "./services/serviceFee.js";
+import {
+  flushHtlcTelemetry,
+  initHtlcTelemetry,
+  startHtlcTelemetry,
+  stopHtlcTelemetry,
+} from "./services/htlcTelemetry.js";
 
 // Never let a startup error vanish silently — print it so it's diagnosable.
 process.on("uncaughtException", (err) => {
@@ -24,6 +32,17 @@ process.on("unhandledRejection", (err) => {
   console.error(`\n⚡ LightningMate unhandled rejection: ${err instanceof Error ? err.stack : err}\n`);
   process.exit(1);
 });
+
+/** Stay well inside docker's stop_grace_period (1 min in our composes). */
+const SHUTDOWN_GRACE_MS = 45_000;
+
+function closeServer(server: Server): Promise<void> {
+  return new Promise((resolve) => {
+    server.close(() => resolve());
+    // Idle keep-alive sockets would otherwise hold close() open.
+    server.closeIdleConnections?.();
+  });
+}
 
 function main(): void {
   let config;
@@ -40,6 +59,14 @@ function main(): void {
     console.error("Tip: the cert/macaroon must each be a single unbroken base64 line.\n");
     process.exit(1);
   }
+  // Fail closed: never serve the (fund-moving) API beyond loopback without a
+  // login. Checked before anything starts.
+  try {
+    assertSafeExposure(config.bindHost, authRequired());
+  } catch (err) {
+    console.error(`\n⚡ LightningMate refused to start:\n  ${err instanceof Error ? err.message : String(err)}\n`);
+    process.exit(1);
+  }
 
   const writeLnd = getWriteLnd(config);
   const rebalanceLog = new RebalanceLog(config.dataDir);
@@ -51,7 +78,20 @@ function main(): void {
   // suggestions with a social trust signal the network graph cannot provide.
   const lnplusStore = new LnPlusStore(config.dataDir);
   const earningsLog = new EarningsLog(config.dataDir);
-  const autopilot = new Autopilot(config.dataDir, lnd, writeLnd, rebalanceLog, overrides, ambossStore, earningsLog, lnplusStore);
+  // The disclosed service fee on completed sales is paid from this persistent
+  // ledger in the background — never inline in an accept/open/settle path.
+  const serviceFees = new ServiceFeeLedger(config.dataDir, writeLnd ? lndFeeLightning(writeLnd) : null);
+  const autopilot = new Autopilot(
+    config.dataDir,
+    lnd,
+    writeLnd,
+    rebalanceLog,
+    overrides,
+    ambossStore,
+    earningsLog,
+    serviceFees,
+    lnplusStore,
+  );
   autopilot.start();
   const lsps1 = new Lsps1Service(
     config.dataDir,
@@ -62,6 +102,7 @@ function main(): void {
     () => autopilot.magmaOverrides(),
     () => ambossStore.getKey(),
     earningsLog,
+    serviceFees,
     (orderId, sizeSats, transactionId) => autopilot.recordExternalSell(orderId, sizeSats, transactionId),
   );
   // One capital budget across Magma + LSPS1: the autopilot's checks subtract
@@ -69,51 +110,64 @@ function main(): void {
   autopilot.setExternalCommitted(() => lsps1.committedSat());
   autopilot.setExternalDeployed(() => lsps1.deployedSat());
   lsps1.start();
+  serviceFees.start();
   // Failed-HTLC telemetry (read-only): unserved-demand history accrues from
   // day one, independent of any autopilot toggle.
   initHtlcTelemetry(config.dataDir);
   startHtlcTelemetry(lnd);
 
-  const app = express();
-  app.disable("x-powered-by");
+  // Closed by the first shutdown step: from then on new state-changing API
+  // requests get 503, and the shutdown waits for the ones already running.
+  const requestGate = new RequestGate();
+  const app = createHttpApp({
+    requestGate,
+    apiRouter: createApiRouter(
+      lnd,
+      writeLnd,
+      config,
+      autopilot,
+      rebalanceLog,
+      settings,
+      overrides,
+      ambossStore,
+      backupStore,
+      earningsLog,
+      lsps1,
+      lnplusStore,
+      serviceFees,
+    ),
+    allowedHosts: config.allowedHosts,
+    authRequired: authRequired(),
+    webDir: config.webDir,
+  });
 
-  // Optional Host-header allowlist — defends against DNS-rebinding. Off unless
-  // LM_ALLOWED_HOSTS is set, so it never breaks default access.
-  if (config.allowedHosts.length > 0) {
-    app.use((req, res, next) => {
-      const host = (req.headers.host ?? "").split(":")[0].toLowerCase();
-      if (!config.allowedHosts.includes(host)) {
-        res.status(403).json({ error: "forbidden_host" });
-        return;
-      }
-      next();
-    });
-  }
-
-  // No CORS: the UI is served same-origin (Vite proxies /api in dev), so a
-  // cross-origin site can neither read responses nor make preflighted JSON
-  // POSTs — closing the cross-site / CSRF vector on the fund-moving API.
-  app.use(express.json({ limit: "256kb" }));
-  app.use(
-    "/api",
-    createApiRouter(lnd, writeLnd, config, autopilot, rebalanceLog, settings, overrides, ambossStore, backupStore, earningsLog, lsps1, lnplusStore),
-  );
-
-  // In production (Docker/Umbrel) we serve the built React app from the same
-  // origin, so the whole tool is a single container behind Umbrel's app_proxy.
-  if (config.webDir && existsSync(config.webDir)) {
-    const webDir = config.webDir;
-    app.use(express.static(webDir));
-    // SPA fallback — anything not under /api returns index.html.
-    app.get("*", (_req, res) => res.sendFile(join(webDir, "index.html")));
-    console.log(`   Serving web UI from ${webDir}`);
-  }
-
-  app.listen(config.port, config.bindHost, () => {
+  const server = app.listen(config.port, config.bindHost, () => {
     console.log(`⚡ LightningMate listening on ${config.bindHost}:${config.port}`);
     const mode = config.writeEnabled ? "read + write" : "read-only";
     console.log(`   LND socket: ${config.lnd.socket}  (${mode})`);
   });
+
+  // Stop starting new work → let started work reach a recorded state → flush
+  // → stop serving → exit 0 (see appShutdownSteps). The wait leaves time for
+  // the flush, and the flush runs even if the wait used everything up.
+  const waitBudgetMs = SHUTDOWN_GRACE_MS - 8_000;
+  const shutdown = createShutdown({
+    graceMs: SHUTDOWN_GRACE_MS,
+    exit: (code) => process.exit(code),
+    steps: appShutdownSteps(
+      {
+        requests: requestGate,
+        autopilot,
+        lsps1,
+        serviceFees,
+        telemetry: { stop: stopHtlcTelemetry, flush: flushHtlcTelemetry },
+        closeServer: () => closeServer(server),
+      },
+      waitBudgetMs,
+    ),
+  });
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
 }
 
 main();

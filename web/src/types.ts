@@ -190,7 +190,8 @@ export interface AutopilotConfig {
   rebalanceCooldownMinutes: number;
   rebalanceHourStart: number;
   rebalanceHourEnd: number;
-  rebalanceDailyBudgetSats: number;
+  /** null = explicitly no daily cap. */
+  rebalanceDailyBudgetSats: number | null;
   channelEnabled: boolean;
   channelReserveSats: number;
   channelSizeSats: number;
@@ -276,9 +277,32 @@ export interface AutopilotRun {
   maxHtlc?: MaxHtlcChange[];
 }
 
+/** Allowed range of one numeric setting (mirrors server autopilotConfig.ts). */
+export interface NumberBounds {
+  min: number;
+  max: number;
+  integer: boolean;
+  /** null is a meaningful value (e.g. "no limit"). */
+  nullable?: boolean;
+}
+
+export interface AutopilotBounds {
+  config: Partial<Record<keyof AutopilotConfig, NumberBounds>>;
+  policy: Record<keyof FeePolicy, NumberBounds>;
+  rebalancePolicy: Record<keyof RebalancePolicy, NumberBounds>;
+}
+
+/** A settings update: any subset of fields; the policies merge field by field. */
+export type AutopilotConfigPatch = Partial<Omit<AutopilotConfig, "policy" | "rebalancePolicy">> & {
+  policy?: Partial<FeePolicy>;
+  rebalancePolicy?: Partial<RebalancePolicy>;
+};
+
 export interface AutopilotState {
   canWrite: boolean;
   config: AutopilotConfig;
+  /** Server-side bounds of every numeric setting. */
+  bounds: AutopilotBounds;
   lastRunAt: string | null;
   history: AutopilotRun[];
 }
@@ -501,6 +525,17 @@ export type OverrideMap = Record<string, ChannelOverride>;
 export interface Alert {
   level: "warn" | "info";
   message: string;
+  /** Present on alerts that stay until acknowledged (damaged state files,
+   *  service-fee problems); POST it to /alerts/ack to dismiss. */
+  id?: string;
+}
+
+/** GET /api/health — open (no login needed). */
+export interface HealthInfo {
+  ok: boolean;
+  service: string;
+  /** Image version (git tag, e.g. "v0.7.8"), or "dev". */
+  version: string;
 }
 
 export interface CloseChannelResult {
@@ -1151,9 +1186,14 @@ export interface MagmaV2Report {
 // ── Channel backup (SCB) watchdog ──
 export interface BackupStatus {
   available: boolean;
+  /** Channels that must be in a backup: open + pending-open. */
   currentChannelCount: number;
   lastExportAt: string | null;
   lastExportChannelCount: number | null;
+  /** Channels open (or opening) now that the last backup does not contain. */
+  notInBackupCount: number;
+  /** Channels in the last backup that have since fully closed. */
+  closedSinceExportCount: number;
   stale: boolean;
   reason: string;
 }

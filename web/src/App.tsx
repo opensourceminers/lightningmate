@@ -15,6 +15,7 @@ import { SkeletonPanel } from "./components/Skeleton";
 import { TabIcon } from "./components/TabIcon";
 import { WalletPanel } from "./components/WalletPanel";
 import { usePolledData } from "./usePolledData";
+import { useAppVersion } from "./useAppVersion";
 
 type Tab = "overview" | "channels" | "market" | "wallet" | "analytics" | "autopilot" | "settings";
 
@@ -32,6 +33,7 @@ export function App() {
   const node = usePolledData(api.node, 15_000);
   const channels = usePolledData(api.channels, 30_000);
   const price = usePolledData(api.price, 300_000);
+  const version = useAppVersion();
   const [tab, setTab] = useState<Tab>("overview");
   // Sub-tab to open when navigating from an Overview tile (e.g. Channels → suggestions).
   const [pendingSub, setPendingSub] = useState<string | undefined>(undefined);
@@ -127,10 +129,10 @@ export function App() {
         {tab === "wallet" ? <WalletPanel price={price.data} /> : null}
         {tab === "analytics" ? <AnalyticsPanel initialSub={pendingSub} /> : null}
         {tab === "autopilot" ? <AutopilotPanel initialSub={pendingSub} /> : null}
-        {tab === "settings" ? <SettingsPanel onChange={price.refresh} /> : null}
+        {tab === "settings" ? <SettingsPanel onChange={price.refresh} version={version} /> : null}
       </div>
 
-      <Footer />
+      <Footer version={version} />
     </div>
   );
 }

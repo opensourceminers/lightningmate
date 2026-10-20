@@ -17,6 +17,8 @@
  * later, separate step.
  */
 
+import { HTTP_TIMEOUTS, httpRequest, type TimedResponse } from "./http.js";
+
 const BASE = "https://lightningnetwork.plus/api/2";
 const UA = "LightningMate";
 
@@ -28,23 +30,22 @@ export class LnPlusNotFound extends Error {
   }
 }
 
-async function get<T>(path: string, timeoutMs = 10_000): Promise<T> {
-  const ctl = new AbortController();
-  const timer = setTimeout(() => ctl.abort(), timeoutMs);
-  let res: Response;
+async function get<T>(path: string): Promise<T> {
+  // The deadline also covers reading the body — the old AbortController timer
+  // was cleared as soon as headers arrived, so a stalled body could still hang.
+  let res: TimedResponse;
   try {
-    res = await fetch(`${BASE}${path}`, {
-      headers: { Accept: "application/json", "User-Agent": UA },
-      signal: ctl.signal,
-    });
+    res = await httpRequest(
+      `${BASE}${path}`,
+      { headers: { Accept: "application/json", "User-Agent": UA } },
+      HTTP_TIMEOUTS.lnplusMs,
+    );
   } catch (e) {
     throw new Error(`LN+ unreachable: ${e instanceof Error ? e.message : String(e)}`);
-  } finally {
-    clearTimeout(timer);
   }
   if (res.status === 429) throw new Error("LN+ rate limit reached");
   if (!res.ok) throw new Error(`LN+ HTTP ${res.status}`);
-  return (await res.json()) as T;
+  return res.json<T>();
 }
 
 // ── Node profile ─────────────────────────────────────────────────────────────

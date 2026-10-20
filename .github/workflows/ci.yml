@@ -1,0 +1,41 @@
+name: ci
+
+# The gate for every change: install from the lockfile, type-check the sources
+# AND the tests, run the test suite, and build — on Node 22, the same major the
+# Docker image runs. Releases (build-image.yml) are cut by tag, by hand; this
+# workflow is what tells you whether a commit is fit to tag.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install (lockfile)
+        run: npm ci
+
+      - name: Type-check (server, web, tests)
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build

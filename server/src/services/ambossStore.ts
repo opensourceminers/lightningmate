@@ -24,7 +24,7 @@ export class AmbossStore {
   private checkedAt = 0;
 
   constructor(dataDir: string) {
-    this.store = new JsonStore<AmbossConfig>(dataDir, "amboss.json");
+    this.store = new JsonStore<AmbossConfig>(dataDir, "amboss.json", { secret: true });
     this.config = { ...DEFAULT, ...this.store.read(DEFAULT) };
   }
 
@@ -37,18 +37,45 @@ export class AmbossStore {
   }
 
   setKey(apiKey: string): void {
-    this.config = { apiKey: apiKey.trim() };
-    this.store.write(this.config);
+    const key = apiKey.trim();
+    const replaced = key !== this.config.apiKey;
+    this.config = { apiKey: key };
+    if (replaced) this.saveForgettingOldKey();
+    else this.store.write(this.config);
     // A freshly connected key was just validated by the caller.
     this.valid = this.config.apiKey.length > 0 ? true : null;
     this.checkedAt = Date.now();
   }
 
+  /** Disconnect: the key is gone from memory and from disk. */
   clear(): void {
     this.config = { ...DEFAULT };
-    this.store.write(this.config);
+    // No file at all is "no key" — and deleting needs no free space.
+    this.store.erase();
     this.valid = null;
     this.checkedAt = 0;
+  }
+
+  /**
+   * Save a new key so the one it replaces survives nowhere on disk: no `.bak`
+   * of it is kept, and copies left from before (a `.bak`, damaged copies moved
+   * aside) are deleted. If the save fails — a full disk — the old file is
+   * deleted instead: the new key then lasts until the next restart (the
+   * failed save is alerted), but the old one can never come back. Before,
+   * the `.bak` kept a removed key, and a later damaged or missing amboss.json
+   * brought it back — Magma automation running on a key the operator removed.
+   */
+  private saveForgettingOldKey(): void {
+    try {
+      this.store.writeOrThrow(this.config, { keepBackup: false });
+      this.store.discardCopies();
+    } catch (err) {
+      console.error(
+        `[amboss] could not save the new key (${err instanceof Error ? err.message : String(err)}) — ` +
+          "deleted the old one from disk instead",
+      );
+      this.store.erase();
+    }
   }
 
   /** Last known validity without hitting the network. */

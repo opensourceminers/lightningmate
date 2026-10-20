@@ -1,0 +1,10 @@
+{
+  // Type-checks the web sources AND the web unit tests (run under node:test via
+  // tsx, which does not type-check). `npm run build` still uses tsconfig.json.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "noEmit": true
+  },
+  "include": ["src", "test"]
+}
