@@ -234,7 +234,10 @@ test("a run that fails still saves what its earlier stages learned", async (t) =
   laterStageFails(t, seams, dir);
 
   const run = await autopilot.runOnce();
-  assert.equal(run.attempted, 0, "the run failed");
+  // A stage that throws no longer aborts the run (each stage is isolated, so
+  // a failing stage can't starve the others): it is recorded as the run's error.
+  assert.deepEqual(run.errors?.map((e) => e.stage), ["magma"], "the failing stage is on record");
+  assert.equal(run.applied, 0);
   // No fee changed, so the fee stage saved nothing itself — the price at which
   // routing returned is only on disk because the run saves on its way out.
   const anchor = savedState(dir).perChannelFlowAnchor?.["800001x1x0"];

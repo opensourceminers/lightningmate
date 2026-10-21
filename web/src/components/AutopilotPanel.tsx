@@ -11,6 +11,7 @@ import type {
 } from "../types";
 import { satsCompact, timeAgo } from "../format";
 import { parseNumField } from "../numField";
+import { runProgress } from "../statusNotes";
 import { RunState, Switch } from "./Switch";
 import { useUi } from "./Overlay";
 import { FeeRecommendations } from "./FeeRecommendations";
@@ -412,6 +413,12 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
         </div>
       ) : null}
       {error ? <p className="banner error">{error}</p> : null}
+      {(() => {
+        // A main run that takes far longer than usual is stuck on something
+        // (a payment, a call to the node): say so, on every tab.
+        const run = runProgress(server.runningSince, Date.now());
+        return run?.stuck ? <p className="banner error">{run.text}</p> : null;
+      })()}
 
       {sub === "fees" ? (
         <>
@@ -565,8 +572,12 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       ) : (
         <section className="panel">
           <div className="apply-row">
-            <button className="reset" disabled={busy} onClick={runNow}>Run once now</button>
+            <button className="reset" disabled={busy || !!server.runningSince} onClick={runNow}>Run once now</button>
             <span className="muted">{server.lastRunAt ? `last run ${timeAgo(server.lastRunAt)}` : "never run"}</span>
+            {(() => {
+              const run = runProgress(server.runningSince, Date.now());
+              return run && !run.stuck ? <span className="muted">· {run.text}</span> : null;
+            })()}
           </div>
           {lastRun ? (
             <p className="muted">
@@ -590,6 +601,8 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                     label: `Max HTLC · ${m.alias}: ${m.fromSat != null ? satsCompact(m.fromSat) : "—"}→${satsCompact(m.toSat)}`,
                     error: m.error,
                   })),
+                  // A stage that threw (the others still ran).
+                  ...(run.errors ?? []).map((e) => ({ ok: false, label: `${e.stage} stage failed`, error: e.error })),
                 ];
                 return (
                   <li key={`${run.at}-${i}`}>

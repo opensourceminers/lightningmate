@@ -104,13 +104,18 @@ export function makePaymentRequest(opts: {
   expiresAt?: string;
   createdAt?: string;
   secret?: string;
+  /** A given payment hash (a HODL invoice: the preimage stays unknown). */
+  id?: string;
+  /** min_final_cltv_expiry, in blocks. */
+  cltvDelta?: number;
   network?: "bitcoin" | "testnet" | "regtest";
 }): MadeRequest {
   const key = opts.key ?? makeNodeKey();
-  const secret = opts.secret ?? randomBytes(32).toString("hex");
-  const id = createHash("sha256").update(Buffer.from(secret, "hex")).digest("hex");
+  const secret = opts.id ? "" : (opts.secret ?? randomBytes(32).toString("hex"));
+  const id = opts.id ?? createHash("sha256").update(Buffer.from(secret, "hex")).digest("hex");
   const unsigned = invoices.createUnsignedRequest({
     created_at: opts.createdAt,
+    ...(opts.cltvDelta ? { cltv_delta: opts.cltvDelta } : {}),
     description: opts.description ?? "",
     destination: key.publicKey,
     expires_at: opts.expiresAt ?? new Date(Date.now() + 3_600_000).toISOString(),

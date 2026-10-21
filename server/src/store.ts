@@ -113,7 +113,11 @@ export type StoreIncidentKind =
   /** The file was readable, but values in it were outside today's limits and
    *  its owner adjusted them on load (`detail` lists what changed). Not
    *  damage — but a change the operator didn't make must not be silent. */
-  | "adjusted";
+  | "adjusted"
+  /** Money moved (a channel was opened) but the record of it could not be
+   *  saved. The app does not repeat it, and recovers it from LND after a
+   *  restart — but the operator must know. Stays until acknowledged. */
+  | "unrecorded_open";
 
 export interface StoreIncident {
   id: string;
@@ -192,6 +196,20 @@ class IncidentRegistry {
 
   clearWriteFailure(file: string): void {
     this.writeFailures.delete(file);
+  }
+
+  /**
+   * Copies of `file` named in `deleted` were just deleted on purpose (the
+   * Amboss key was removed or replaced). An alert that points the operator
+   * to one of them would now name a file that no longer exists, and asks for
+   * something that has been dealt with (reconnect the key) — settle it.
+   */
+  settleDeletedCopies(file: string, deleted: string[]): void {
+    if (deleted.length === 0) return;
+    const gone = new Set(deleted);
+    const before = this.persisted.length;
+    this.persisted = this.persisted.filter((i) => !(i.file === file && i.quarantinedAs && gone.has(i.quarantinedAs)));
+    if (this.persisted.length !== before) this.save();
   }
 
   /** A loss of `file` already reported (and not yet acknowledged) whose
@@ -548,7 +566,8 @@ export class JsonStore<T> {
    * Delete every other copy of this file: the `.bak` and the damaged copies
    * moved aside. For a store whose secret was just replaced or removed — a
    * copy left behind would hold the old one, and a later recovery could bring
-   * it back. Returns false when a copy could not be deleted (logged).
+   * it back. Alerts that named a deleted copy are settled with it. Returns
+   * false when a copy could not be deleted (logged).
    */
   discardCopies(): boolean {
     let names: string[] = [];
@@ -559,14 +578,17 @@ export class JsonStore<T> {
       return false;
     }
     let ok = true;
+    const deleted: string[] = [];
     for (const f of names) {
       try {
         rmSync(join(this.dataDir, f), { force: true });
+        deleted.push(f);
       } catch (err) {
         ok = false;
         console.error(`[store] could not delete ${f}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+    registryFor(this.dataDir).settleDeletedCopies(this.name, deleted);
     return ok;
   }
 

@@ -3,6 +3,7 @@ import { QRCodeSVG } from "qrcode.react";
 import { api } from "../api";
 import type { OnchainState, OnchainTx, PriceInfo } from "../types";
 import { fiat, sats, timeAgo } from "../format";
+import { promisedSpend, spendPromisedQuestion } from "../statusNotes";
 import { useUi } from "./Overlay";
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -75,8 +76,28 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
     });
     if (!ok) return;
     setSending(true);
+    const sendNow = (spendPromised: boolean) =>
+      api.onchainSend({ address: toAddr.trim(), tokens: amt, feeRate: rate, ...(spendPromised ? { spendPromised } : {}) });
     try {
-      const r = await api.onchainSend({ address: toAddr.trim(), tokens: amt, feeRate: rate });
+      let r: Awaited<ReturnType<typeof sendNow>>;
+      try {
+        r = await sendNow(false);
+      } catch (e) {
+        // Coins promised to buyers: only with an explicit yes that names them.
+        const promised = promisedSpend(e);
+        if (!promised) throw e;
+        const yes = await confirm({
+          title: "Spend coins promised to buyers?",
+          message: spendPromisedQuestion(promised),
+          confirmLabel: "Send anyway",
+          danger: true,
+        });
+        if (!yes) {
+          toast(promised.message, "error");
+          return;
+        }
+        r = await sendNow(true);
+      }
       if (r.ok && r.transactionId) {
         toast(`Sent — tx ${r.transactionId.slice(0, 12)}…`, "success");
         setToAddr("");

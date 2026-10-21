@@ -37,8 +37,12 @@ import type {
   MagmaV2Report,
   MarketView,
   OutcomesReport,
+  AmbossStatus,
+  DeskResult,
   MyOffer,
+  MyOffersResponse,
   MyOrdersView,
+  OfferSyncStatus,
   OrderState,
   PnlSummary,
   RebalanceAnalysis,
@@ -54,6 +58,9 @@ import type {
   LnPlusSwapsResponse,
   UnservedDemandReport,
 } from "./types";
+import { ApiError } from "./apiError";
+
+export { ApiError };
 
 // ── Session token ─────────────────────────────────────────────────────────────
 let token = localStorage.getItem("lm_token") ?? "";
@@ -75,13 +82,15 @@ async function handle<T>(res: Response): Promise<T> {
   if (!res.ok) {
     if (res.status === 401) onUnauthorized?.();
     let detail = res.statusText;
+    let body: unknown = null;
     try {
-      const body = (await res.json()) as { message?: string };
-      if (body.message) detail = body.message;
+      body = await res.json();
+      const message = (body as { message?: unknown } | null)?.message;
+      if (typeof message === "string" && message) detail = message;
     } catch {
       // non-JSON error body — keep statusText
     }
-    throw new Error(detail);
+    throw new ApiError(detail, res.status, body);
   }
   return (await res.json()) as T;
 }
@@ -176,12 +185,16 @@ export const api = {
     get<LnPlusPoolResponse>(minCreditsSats ? `/lnplus/pool?minCredits=${minCreditsSats}` : "/lnplus/pool"),
   lnplusSwaps: (status?: "pending" | "opening" | "completed") =>
     get<LnPlusSwapsResponse>(status ? `/lnplus/swaps?status=${status}` : "/lnplus/swaps"),
+  /** A 409 "capital_promised" refusal (coins promised to buyers) is thrown
+   *  as an ApiError; send again with `spendPromised: true` only after the
+   *  operator confirmed spending them (see statusNotes promisedSpend). */
   channelOpen: (params: {
     pubkey: string;
     socket?: string;
     localTokens: number;
     feeRate?: number;
     isPrivate?: boolean;
+    spendPromised?: boolean;
   }) => post<OpenChannelResult>("/channels/open", params),
   lnActivity: () => get<LnActivity>("/ln/activity"),
   lnDecode: (request: string) => post<DecodedRequest>("/ln/decode", { request }),
@@ -192,7 +205,7 @@ export const api = {
   onchainState: () => get<OnchainState>("/onchain"),
   onchainTxs: () => get<OnchainTx[]>("/onchain/txs"),
   onchainAddress: () => post<NewAddress>("/onchain/address", {}),
-  onchainSend: (params: { address: string; tokens: number; feeRate: number }) =>
+  onchainSend: (params: { address: string; tokens: number; feeRate: number; spendPromised?: boolean }) =>
     post<OnchainSendResult>("/onchain/send", params),
   authStatus: () => get<{ authRequired: boolean; unlocked: boolean }>("/auth/status"),
   login: async (password: string): Promise<boolean> => {
@@ -210,7 +223,9 @@ export const api = {
     setToken("");
     onUnauthorized?.();
   },
-  ambossStatus: () => get<{ connected: boolean; keyValid?: boolean | null; saleFeeBps?: number }>("/amboss/status"),
+  ambossStatus: () => get<AmbossStatus>("/amboss/status"),
+  /** Ask Amboss about the key now (the "Re-check" button). */
+  ambossKeyCheck: () => post<AmbossStatus>("/amboss/key/check", {}),
   ambossMarket: () => get<MarketView>("/amboss/market"),
   ambossConnect: (apiKey: string) =>
     post<{ ok: boolean; connected: boolean; error?: string }>("/amboss/key", { apiKey }),
@@ -226,7 +241,8 @@ export const api = {
     post<{ ok: boolean; sats: number }>("/amboss/buy/pay", { orderId, paymentRequest, maxSats }),
   ambossOrder: (id: string) => get<OrderState>(`/amboss/order?id=${encodeURIComponent(id)}`),
   signMessage: (message: string) => post<{ signature: string }>("/sign", { message }),
-  ambossMyOffers: () => get<{ offers: MyOffer[] }>("/amboss/my-offers"),
+  ambossMyOffers: () => get<MyOffersResponse>("/amboss/my-offers"),
+  ambossOfferSync: () => get<OfferSyncStatus>("/amboss/offer-sync"),
   ambossMyOrders: () => get<MyOrdersView>("/amboss/my-orders"),
   magmaRecommendations: () => get<MagmaV2Report>("/amboss/recommendations"),
   autopilotOutcomes: () => get<OutcomesReport>("/autopilot/outcomes"),
@@ -237,7 +253,7 @@ export const api = {
     feeRatePpm: number;
     baseFeeSats: number;
     minBlockLength: number;
-  }) => post<{ ok: boolean }>("/amboss/offer", p),
+  }) => post<{ ok: boolean; offerId: string }>("/amboss/offer", p),
   ambossUpdateOffer: (
     id: string,
     p: {
@@ -248,11 +264,13 @@ export const api = {
       baseFeeSats: number;
       minBlockLength: number;
     },
-  ) => post<{ ok: boolean }>("/amboss/offer/update", { id, ...p }),
+  ) => post<{ ok: boolean; verified: boolean | null; offer: MyOffer | null }>("/amboss/offer/update", { id, ...p }),
   ambossToggleOffer: (id: string) => post<{ status: string }>("/amboss/offer/toggle", { id }),
-  ambossAcceptOrder: (id: string) => post<{ ok: boolean }>("/amboss/order/accept", { id }),
-  ambossOpenOrder: (id: string) =>
-    post<{ ok: boolean; transactionId: string; outpoint: string }>("/amboss/order/open", { id }),
+  // Manual order actions go through the same order journal as the autopilot;
+  // a failure answers with an error status (thrown here), never 200 + ok:false.
+  ambossAcceptOrder: (id: string) => post<DeskResult>("/amboss/order/accept", { id }),
+  ambossOpenOrder: (id: string) => post<DeskResult>("/amboss/order/open", { id }),
+  ambossRejectOrder: (id: string) => post<DeskResult>("/amboss/order/reject", { id }),
   backupStatus: () => get<BackupStatus>("/backup/status"),
   // Download the channel backup with the auth header, then trigger a browser
   // download of a `channel.backup` file from the response blob.

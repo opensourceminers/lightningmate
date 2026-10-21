@@ -4,10 +4,11 @@ import { getLnd, getWriteLnd } from "./lnd.js";
 import { createApiRouter } from "./routes/api.js";
 import { createHttpApp } from "./app.js";
 import { assertSafeExposure } from "./exposure.js";
-import { RequestGate, appShutdownSteps, createShutdown } from "./shutdown.js";
+import { RequestGate, SHUTDOWN_GRACE_MS, SHUTDOWN_WAIT_MS, appShutdownSteps, createShutdown } from "./shutdown.js";
 import { authRequired } from "./services/auth.js";
 import { LnPlusStore } from "./services/lnplusStore.js";
 import { Autopilot } from "./services/autopilot.js";
+import { CapitalLedger } from "./services/capital.js";
 import { RebalanceLog } from "./services/rebalanceLog.js";
 import { SettingsStore } from "./services/settings.js";
 import { OverridesStore } from "./services/overrides.js";
@@ -32,9 +33,6 @@ process.on("unhandledRejection", (err) => {
   console.error(`\n⚡ LightningMate unhandled rejection: ${err instanceof Error ? err.stack : err}\n`);
   process.exit(1);
 });
-
-/** Stay well inside docker's stop_grace_period (1 min in our composes). */
-const SHUTDOWN_GRACE_MS = 45_000;
 
 function closeServer(server: Server): Promise<void> {
   return new Promise((resolve) => {
@@ -81,6 +79,9 @@ function main(): void {
   // The disclosed service fee on completed sales is paid from this persistent
   // ledger in the background — never inline in an accept/open/settle path.
   const serviceFees = new ServiceFeeLedger(config.dataDir, writeLnd ? lndFeeLightning(writeLnd) : null);
+  // One on-chain budget for every demand on the wallet: Magma sales, LSPS1
+  // sales, routing opens. One mutex, one set of (persisted) reservations.
+  const capital = new CapitalLedger();
   const autopilot = new Autopilot(
     config.dataDir,
     lnd,
@@ -91,8 +92,8 @@ function main(): void {
     earningsLog,
     serviceFees,
     lnplusStore,
+    capital,
   );
-  autopilot.start();
   const lsps1 = new Lsps1Service(
     config.dataDir,
     lnd,
@@ -104,11 +105,9 @@ function main(): void {
     earningsLog,
     serviceFees,
     (orderId, sizeSats, transactionId) => autopilot.recordExternalSell(orderId, sizeSats, transactionId),
+    capital,
   );
-  // One capital budget across Magma + LSPS1: the autopilot's checks subtract
-  // whatever LSPS1 has promised to paid-but-unopened orders.
-  autopilot.setExternalCommitted(() => lsps1.committedSat());
-  autopilot.setExternalDeployed(() => lsps1.deployedSat());
+  autopilot.start();
   lsps1.start();
   serviceFees.start();
   // Failed-HTLC telemetry (read-only): unserved-demand history accrues from
@@ -149,8 +148,9 @@ function main(): void {
 
   // Stop starting new work → let started work reach a recorded state → flush
   // → stop serving → exit 0 (see appShutdownSteps). The wait leaves time for
-  // the flush, and the flush runs even if the wait used everything up.
-  const waitBudgetMs = SHUTDOWN_GRACE_MS - 8_000;
+  // the flush, and the flush runs even if the wait used everything up. The
+  // wait outlasts any single Amboss call (shutdown.ts checks the deadlines).
+  const waitBudgetMs = SHUTDOWN_WAIT_MS;
   const shutdown = createShutdown({
     graceMs: SHUTDOWN_GRACE_MS,
     exit: (code) => process.exit(code),

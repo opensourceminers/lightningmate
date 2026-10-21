@@ -1,10 +1,11 @@
 import { useEffect, useState } from "react";
 import { goTo } from "../nav";
 import { api } from "../api";
-import type { MagmaSellOfferState, MagmaV2Report, MyOffer, PricePoint } from "../types";
+import type { AmbossKeyCheck, MagmaSellOfferState, MagmaV2Report, MyOffer, OfferSyncStatus, PricePoint } from "../types";
 import { sats, satsCompact } from "../format";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
+import { failedOfferWrite } from "../statusNotes";
 
 const DEFAULTS = {
   totalSizeSats: 5_000_000,
@@ -59,6 +60,8 @@ export function MarketSell() {
   const ui = useUi();
   const [connected, setConnected] = useState<boolean | null>(null);
   const [keyValid, setKeyValid] = useState<boolean | null | undefined>(undefined);
+  const [keyCheck, setKeyCheck] = useState<AmbossKeyCheck>("unknown");
+  const [sync, setSync] = useState<OfferSyncStatus | null>(null);
   const [feeBps, setFeeBps] = useState(0);
   const [offers, setOffers] = useState<MyOffer[]>([]);
   const [draft, setDraft] = useState<Draft>(DEFAULTS);
@@ -70,6 +73,9 @@ export function MarketSell() {
   // True when the Autopilot is auto-repricing Magma offers — manual pricing would
   // just be overwritten, so we disable the manual buttons to avoid the conflict.
   const [apManaged, setApManaged] = useState(false);
+  // Liquidity provision on: the autopilot writes to the offer (capital clamp,
+  // enable/disable) even with auto-pricing off — a failed write must show.
+  const [sellOn, setSellOn] = useState(false);
 
   const load = async () => {
     let conn = false;
@@ -78,6 +84,7 @@ export function MarketSell() {
       conn = s.connected;
       setConnected(s.connected);
       setKeyValid(s.keyValid);
+      setKeyCheck(s.keyCheck);
       setFeeBps(s.saleFeeBps ?? 0);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -91,11 +98,23 @@ export function MarketSell() {
     api.magmaRecommendations().then(setRec).catch(() => setRec(null));
     if (!conn) return;
     // Best-effort — a flaky offers call (e.g. an expired key) shouldn't blank the tab.
-    api.ambossMyOffers().then((r) => setOffers(r.offers)).catch(() => {});
+    api
+      .ambossMyOffers()
+      .then((r) => {
+        setOffers(r.offers);
+        setSync(r.sync);
+      })
+      .catch(() => {});
     api
       .autopilotGet()
-      .then((s) => setApManaged(!!(s.config?.sellEnabled && s.config?.sellAutoReprice)))
-      .catch(() => setApManaged(false));
+      .then((s) => {
+        setSellOn(!!s.config?.sellEnabled);
+        setApManaged(!!(s.config?.sellEnabled && s.config?.sellAutoReprice));
+      })
+      .catch(() => {
+        setSellOn(false);
+        setApManaged(false);
+      });
   };
 
   useEffect(() => {
@@ -197,12 +216,20 @@ export function MarketSell() {
           </span>
         ) : null}
       </div>
-      {keyValid === false ? (
-        <p className="banner error">
-          Your Amboss key is expired or revoked — Magma selling <strong>silently does nothing</strong>{" "}
-          (no offers listed, no orders fulfilled). Reconnect with a fresh key in <strong>Settings</strong>{" "}
-          to start selling.
+      {keyCheck === "unreachable" ? (
+        <p className="banner">
+          Amboss is unreachable right now — retrying. Your key stays connected; selling resumes when Amboss
+          answers again.
         </p>
+      ) : keyValid === false ? (
+        <p className="banner error">
+          Amboss rejects your API key (expired or revoked) — Magma selling <strong>does nothing</strong>{" "}
+          (no offers managed, no orders fulfilled). Connect a fresh key in <strong>Settings</strong> to start
+          selling.
+        </p>
+      ) : null}
+      {sellOn && failedOfferWrite(sync) ? (
+        <p className="banner error">The autopilot could not update your offer on Amboss: {failedOfferWrite(sync)}</p>
       ) : null}
       <div className="dryrun-banner">
         Lease your idle liquidity where it earns more than routing. <strong>Important:</strong> when a buyer
@@ -393,7 +420,7 @@ export function MarketSell() {
                   </button>
                   <button className="row-btn primary" disabled={apManaged} onClick={() => applyPrice(r0.recommended)}>Apply recommended</button>
                 </div>
-                {apManaged ? (
+                {apManaged && !failedOfferWrite(sync) ? (
                   <p className="magma-ap-note muted">
                     Autopilot is managing your Magma pricing automatically.{" "}
                     <button className="linklike" onClick={() => goTo("autopilot", "magma")}>

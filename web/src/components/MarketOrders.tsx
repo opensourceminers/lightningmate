@@ -4,6 +4,30 @@ import type { LspOrder, MagmaV2Report, MyOrder, MyOrdersView } from "../types";
 import { sats, satsCompact } from "../format";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
+import { awaitsYourDecision, laneBanner } from "../statusNotes";
+
+/** This node's own record of a Magma order, in a few words (journal phase). */
+const LOCAL_LABEL: Record<string, string> = {
+  seen: "seen",
+  accepting: "accepting…",
+  accepted: "accepted · awaiting payment",
+  held: "paid (held) · channel to open",
+  opening: "opening channel…",
+  funded: "channel opened · reporting to Amboss",
+  reported: "channel reported · awaiting confirmation",
+  settled: "completed · payment settled",
+  cancelled: "cancelled · buyer refunded",
+  rejected: "rejected",
+  failed: "failed",
+};
+
+/** Why the order is where it is: the reason, the lane's last decision, or the
+ *  last error — whichever applies (shown on hover). */
+function localDetail(o: MyOrder): string | undefined {
+  const l = o.local;
+  if (!l) return undefined;
+  return l.lastError ?? l.reason ?? l.decision?.reason ?? undefined;
+}
 
 /** Human status for a direct (LSPS1) sale — order + payment state in one word. */
 function lspStatusLabel(o: LspOrder): string {
@@ -22,6 +46,7 @@ export function MarketOrders() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [rec, setRec] = useState<MagmaV2Report | null>(null);
   const [lspOrders, setLspOrders] = useState<LspOrder[]>([]);
+  const [ordersInFlight, setOrdersInFlight] = useState(0);
 
   const load = async () => {
     // Direct LSPS1 sales are local — shown regardless of the Amboss connection.
@@ -31,6 +56,7 @@ export function MarketOrders() {
       const s = await api.ambossStatus();
       conn = s.connected;
       setConnected(s.connected);
+      setOrdersInFlight(s.ordersInFlight ?? 0);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setConnected(false);
@@ -48,18 +74,20 @@ export function MarketOrders() {
   }, []);
 
   const accept = async (o: MyOrder) => {
+    const fee = o.feeSats > 0 ? `${o.feeSats.toLocaleString()} sat ` : "";
     const ok = await ui.confirm({
       title: "Accept order",
       message:
-        `Accept this order? You'll create a ${o.feeSats.toLocaleString()} sat invoice for the fee and ` +
-        `commit to opening a ${satsCompact(o.sizeSats)} channel to the buyer next. No funds move yet.`,
+        `Accept this order? You'll create a ${fee}hold invoice for the fee — the buyer's payment is held, ` +
+        `and only settles once Amboss confirms the ${satsCompact(o.sizeSats)} channel you then open ` +
+        `(any failure refunds the buyer). No funds move yet.`,
       confirmLabel: "Accept",
     });
     if (!ok) return;
     setBusyId(o.id);
     try {
       await api.ambossAcceptOrder(o.id);
-      ui.toast("Order accepted — open the channel next.", "success");
+      ui.toast("Order accepted — open the channel once the buyer has paid.", "success");
       await load();
     } catch (e) {
       ui.toast(e instanceof Error ? e.message : String(e), "error");
@@ -82,7 +110,33 @@ export function MarketOrders() {
     setBusyId(o.id);
     try {
       const r = await api.ambossOpenOrder(o.id);
-      ui.toast(`Channel opening — funding ${r.transactionId.slice(0, 12)}…`, "success");
+      const tx = r.transactionId ? ` — funding ${r.transactionId.slice(0, 12)}…` : "";
+      ui.toast(
+        r.reported === false
+          ? `Channel opening${tx}. Amboss hasn't taken it yet — reporting it is retried automatically.`
+          : `Channel opening${tx}`,
+        "success",
+      );
+      await load();
+    } catch (e) {
+      ui.toast(e instanceof Error ? e.message : String(e), "error");
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const reject = async (o: MyOrder) => {
+    const ok = await ui.confirm({
+      title: "Reject order",
+      message: `Reject this ${satsCompact(o.sizeSats)} order? Rejecting is better for your seller score than letting it time out.`,
+      confirmLabel: "Reject",
+      danger: true,
+    });
+    if (!ok) return;
+    setBusyId(o.id);
+    try {
+      await api.ambossRejectOrder(o.id);
+      ui.toast("Order rejected.", "success");
       await load();
     } catch (e) {
       ui.toast(e instanceof Error ? e.message : String(e), "error");
@@ -134,12 +188,20 @@ export function MarketOrders() {
         <div className="dryrun-banner">
           Connect your Amboss API key in <strong>Settings</strong> to see orders.
         </div>
+        {ordersInFlight > 0 ? (
+          <p className="banner error">
+            {ordersInFlight === 1 ? "1 Magma order is" : `${ordersInFlight} Magma orders are`} still in flight. Without a
+            key they can't be opened, reported or settled — LightningMate only releases held payments back to the
+            buyers before they expire. Connect a key to finish {ordersInFlight === 1 ? "it" : "them"}.
+          </p>
+        ) : null}
         {lspBlock}
       </section>
     );
   }
 
   const orders = data?.orders ?? [];
+  const laneNote = laneBanner(data?.lane);
 
   return (
     <section className="panel">
@@ -152,10 +214,12 @@ export function MarketOrders() {
         ) : null}
       </div>
       <div className="dryrun-banner">
-        Orders buyers placed on your offers. <strong>Accept</strong> creates the fee invoice, then{" "}
-        <strong>Open channel</strong> funds the channel to the buyer — you verify each step. The
-        Autopilot can do this automatically (enable <strong>Liquidity provision</strong>).
+        Orders buyers placed on your offers. <strong>Accept</strong> creates a hold invoice for the fee,
+        then — once the buyer has paid — <strong>Open channel</strong> funds the channel to the buyer; the
+        payment settles only when Amboss confirms the channel. The Autopilot can do this automatically
+        (enable <strong>Liquidity provision</strong>); orders it can't serve are rejected right away.
       </div>
+      {laneNote ? <p className="banner error">{laneNote}</p> : null}
       {error ? <p className="banner error">{error}</p> : null}
 
       {rec ? (
@@ -194,13 +258,21 @@ export function MarketOrders() {
                 <td className="muted">{new Date(o.createdAt).toLocaleString()}</td>
                 <td className="num">{satsCompact(o.sizeSats)}</td>
                 <td className="num">{o.feeSats > 0 ? o.feeSats.toLocaleString() : "—"}</td>
-                <td>{o.status}</td>
+                <td title={localDetail(o)}>
+                  {o.status}
+                  {o.local ? <span className="muted"> · {LOCAL_LABEL[o.local.phase] ?? o.local.phase}</span> : null}
+                </td>
                 <td className="muted">{o.channelId ? `${o.channelId.slice(0, 12)}…` : "—"}</td>
                 <td>
-                  {o.side === "SELL" && o.status === "WAITING_FOR_SELLER_APPROVAL" ? (
-                    <button className="row-btn" disabled={busyId !== null} onClick={() => void accept(o)}>
-                      {busyId === o.id ? "…" : "Accept"}
-                    </button>
+                  {awaitsYourDecision(o) ? (
+                    <div className="row-actions">
+                      <button className="row-btn" disabled={busyId !== null} onClick={() => void accept(o)}>
+                        {busyId === o.id ? "…" : "Accept"}
+                      </button>
+                      <button className="row-btn ghost" disabled={busyId !== null} onClick={() => void reject(o)}>
+                        Reject
+                      </button>
+                    </div>
                   ) : o.side === "SELL" && o.status === "WAITING_FOR_CHANNEL_OPEN" ? (
                     <button className="row-btn" disabled={busyId !== null} onClick={() => void openCh(o)}>
                       {busyId === o.id ? "…" : "Open channel"}

@@ -2,12 +2,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import net, { type AddressInfo } from "node:net";
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Router } from "express";
 import { createHttpApp } from "../src/app.js";
 import { storeIncidents } from "../src/store.js";
-import { RequestGate, appShutdownSteps, createShutdown, type ShutdownParts } from "../src/shutdown.js";
+import { RequestGate, SHUTDOWN_WAIT_MS, appShutdownSteps, createShutdown, type ShutdownParts } from "../src/shutdown.js";
+import { HTTP_TIMEOUTS } from "../src/services/http.js";
+import { JsonStore } from "../src/store.js";
+import type { MagmaJournalEntry } from "../src/services/magmaJournal.js";
 import { Autopilot, type AutopilotRun } from "../src/services/autopilot.js";
 import { RebalanceLog } from "../src/services/rebalanceLog.js";
 import { OverridesStore } from "../src/services/overrides.js";
@@ -18,13 +21,11 @@ import { Lsps1Service, type Lsps1Order } from "../src/services/lsps1.js";
 import { ServiceFeeLedger } from "../src/services/serviceFee.js";
 import { flushHtlcTelemetry, initHtlcTelemetry, recordForwardEvent, stopHtlcTelemetry } from "../src/services/htlcTelemetry.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
-import { AMBOSS_API, mockAmbossSeller, sellerOrder } from "./helpers/amboss.js";
-import { autopilotWith, paidRebalance, plannedRebalance, suggestion } from "./helpers/autopilot.js";
+import { BUYER, autopilotWith, paidRebalance, plannedRebalance, sellerSetup, suggestion } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { makeTempDir, type AfterHook } from "./helpers/tmp.js";
 
 const quiet = () => undefined;
-const BUYER = "02" + "ab".repeat(32);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -350,39 +351,32 @@ test("a shutdown while a channel open is being planned: no funding transaction i
 });
 
 test("a shutdown during a Magma order step: that step completes, the next order's steps don't start", async (t) => {
-  for (const [status, mutation] of [
-    ["WAITING_FOR_CHANNEL_OPEN", "sellerAddTransaction"],
-    ["WAITING_FOR_SELLER_APPROVAL", "sellerAcceptOrder"],
+  for (const [stage, mutation] of [
+    ["awaiting approval", "AcceptOrder"],
+    ["paid", "AddTransaction"],
   ] as const) {
-    const { autopilot, node, http } = autopilotWith(t, {
-      sellEnabled: true,
-      sellMaxDeploySats: 50_000_000,
-      sellMaxChannelSats: 10_000_000,
-    });
+    const { autopilot, node, magma } = sellerSetup(t);
+    const orders = [magma.addSale({ buyerPubkey: BUYER }), magma.addSale({ buyerPubkey: "02" + "cd".repeat(32) })];
+    if (stage === "paid") {
+      await autopilot.magma.tick(); // accepted, both
+      for (const o of orders) magma.buyerPays(o.id, node);
+    }
     // SIGTERM arrives while Amboss is answering the first order's step.
-    http.onGraphql(AMBOSS_API, mutation, () => {
-      autopilot.shutdown();
-      return { data: { [mutation]: true } };
-    });
-    mockAmbossSeller(http, {
-      orders: [
-        sellerOrder({ id: "first", status, destination: `${BUYER}@1.2.3.4:9735` }),
-        sellerOrder({ id: "second", status, destination: `${BUYER}@1.2.3.4:9735` }),
-      ],
-    });
-
+    magma.onMutation = (op) => {
+      if (op === mutation) autopilot.shutdown();
+    };
+    const before = magma.count(mutation);
     await autopilot.pollSellOrders();
-    assert.equal(http.mutations.length, 1, `${status}: one Amboss step, for the first order only`);
-    const opens = node.callsTo("default.openChannel").length;
-    assert.equal(opens, status === "WAITING_FOR_CHANNEL_OPEN" ? 1 : 0, `${status}: channel opens`);
-    const sells = autopilot.getState().history[0]?.sells ?? [];
-    assert.equal(sells.find((s) => s.orderId === "first")?.ok, true, `${status}: the step under way completed`);
+    assert.equal(magma.count(mutation) - before, 1, `${stage}: one Amboss step, for one order only`);
+    assert.equal(node.callsTo("default.openChannel").length, stage === "paid" ? 1 : 0, `${stage}: channel opens`);
+    const phases = orders.map((o) => autopilot.magma.journal.get(o.id)?.phase ?? "untouched").sort();
     assert.deepEqual(
-      sells.filter((s) => s.orderId === "second").map((s) => [s.action, s.error]),
-      [["skip", "shutting down"]],
-      `${status}: the next order waits for the next start`,
+      phases,
+      stage === "paid" ? ["accepted", "reported"] : ["accepted", "untouched"],
+      `${stage}: the step under way completed and is on record; the next order waits for the next start`,
     );
-    http.restore();
+    assert.equal(await autopilot.waitIdle(1_000), true);
+    magma.onMutation = null;
   }
 });
 
@@ -393,7 +387,8 @@ test("a shutdown during a Magma order step: that step completes, the next order'
  */
 function lspWithHeldOrder(t: AfterHook) {
   const dir = makeTempDir(t);
-  const node = new FakeLnd({ chainBalance: 50_000_000 });
+  // The buyer placed its order over BOLT8: it is a connected peer.
+  const node = new FakeLnd({ chainBalance: 50_000_000, peers: ["02" + "ab".repeat(32)] });
   const svc = new Lsps1Service(
     dir,
     node.lnd,
@@ -449,7 +444,7 @@ function lspWithHeldOrder(t: AfterHook) {
     serviceFeePaidSat: 0,
   };
   seams.orders.unshift(order);
-  return { dir, svc, seams, order, counts };
+  return { dir, node, svc, seams, order, counts };
 }
 
 test("a stopping LSP service starts no new channel open and leaves the payment held", async (t) => {
@@ -667,4 +662,166 @@ test("HTLC telemetry can be flushed on shutdown instead of losing up to a minute
   assert.ok(existsSync(file));
   const saved = JSON.parse(readFileSync(file, "utf8")) as { buckets: { liquiditySats: number }[] };
   assert.equal(saved.buckets[0].liquiditySats, 50_000);
+});
+
+// ── deadlines and records across a shutdown (P1a) ─────────────────────────────
+
+test("the shutdown wait outlasts any single Amboss call, so a step in flight ends — answered or timed out — before the exit", () => {
+  // Before: a 37 s wait against a 45 s mutation deadline. A slow
+  // add_transaction could be cut off by the exit with its outcome unknown.
+  const margin = 5_000; // the journal saves around the call
+  assert.ok(HTTP_TIMEOUTS.ambossMutationMs + margin <= SHUTDOWN_WAIT_MS, `${HTTP_TIMEOUTS.ambossMutationMs} vs ${SHUTDOWN_WAIT_MS}`);
+  assert.ok(HTTP_TIMEOUTS.ambossQueryMs + margin <= SHUTDOWN_WAIT_MS);
+});
+
+test("SIGTERM during an order-lane mutation: the shutdown waits for it, the attempt is on record, and the next start finishes the order with one channel", async (t) => {
+  const saved = HTTP_TIMEOUTS.ambossMutationMs;
+  HTTP_TIMEOUTS.ambossMutationMs = 300;
+  t.after(() => {
+    HTTP_TIMEOUTS.ambossMutationMs = saved;
+  });
+  t.mock.method(console, "warn", () => undefined);
+  t.mock.method(console, "log", () => undefined);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  await s.autopilot.pollSellOrders();
+  s.magma.buyerPays(sale.id, s.node);
+  s.magma.behave.AddTransaction = (n) => (n === 0 ? "hang" : "ok"); // Amboss slow to answer
+  s.magma.onMutation = (op) => {
+    if (op === "AddTransaction") s.autopilot.shutdown(); // SIGTERM arrives now
+  };
+  const lane = s.autopilot.pollSellOrders();
+  await waitFor(() => s.magma.count("AddTransaction") === 1, "the report is under way");
+  assert.equal(await s.autopilot.waitIdle(20), false, "the shutdown waits for the step under way");
+  assert.equal(await s.autopilot.waitIdle(5_000), true, "and it ends within its deadline");
+  await lane;
+  const onDisk = (JSON.parse(readFileSync(join(s.dir, "magma-orders.json"), "utf8")) as MagmaJournalEntry[]).find(
+    (e) => e.orderId === sale.id,
+  );
+  assert.equal(onDisk?.phase, "funded", "the open is on record with its outpoint");
+  assert.ok(onDisk?.fundingOutpoint);
+  assert.ok(onDisk?.reportSentAt, "and so is the report that was in flight");
+  assert.match(onDisk?.lastError ?? "", /not confirmed/);
+
+  const next = s.restart();
+  await next.pollSellOrders(); // reports the journalled outpoint again
+  s.magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  await next.pollSellOrders();
+  assert.equal(s.node.callsTo("default.openChannel").length, 1);
+  assert.equal(next.magma.journal.get(sale.id)?.phase, "settled");
+});
+
+test("an LSP channel whose outpoint can't be saved after the open (the disk filled meanwhile): alert, no second open — a restart finds it in LND", async (t) => {
+  const { dir, node, svc, seams, order, counts } = lspWithHeldOrder(t);
+  t.mock.method(console, "error", () => undefined);
+  t.mock.method(console, "log", () => undefined);
+  const outpoint = { transactionId: "cc".repeat(32), transactionVout: 1 };
+  let full: { mock: { restore(): void } } | undefined;
+  seams.lndOpen = async () => {
+    counts.opens += 1;
+    node.pending.push({ partnerPublicKey: order.peer, capacity: order.lspBalanceSat, ...outpoint });
+    // The save before the open went through; now the disk is full.
+    full = t.mock.method(JsonStore.prototype as unknown as { replaceFile(): void }, "replaceFile", () => {
+      throw new Error("ENOSPC: no space left on device");
+    });
+    return { ok: true, ...outpoint };
+  };
+  seams.lndSettle = async () => {
+    throw new Error("LND busy"); // the payment stays held: the restart must finish it
+  };
+  (seams as unknown as { settleRetryBaseMs: number }).settleRetryBaseMs = 1;
+  await seams.fulfill(order);
+  assert.ok(
+    storeIncidents(dir).some((i) => i.kind === "unrecorded_open" && i.detail.includes(`${outpoint.transactionId}:1`)),
+    "raised as an alert (it used to be a silent failed save)",
+  );
+  assert.equal(order.channel?.fundingOutpoint, `${outpoint.transactionId}:1`, "kept in memory");
+  await seams.fulfill(order);
+  assert.equal(counts.opens, 1, "this process never opens again for the order");
+  svc.stop();
+  full?.mock.restore();
+  const onDisk = (JSON.parse(readFileSync(join(dir, "lsps1-orders.json"), "utf8")) as Lsps1Order[])[0];
+  assert.equal(onDisk.channel, null, "on disk: no outpoint …");
+  assert.ok(onDisk.opening, "… but the open that was started");
+
+  // A new process, same disk and LND, the payment still held.
+  const again = new Lsps1Service(
+    dir,
+    node.lnd,
+    node.lnd,
+    new SettingsStore(dir),
+    () => ({ maxChannelSats: 10_000_000, reserveSats: 50_000, maxDeploySats: 50_000_000 }),
+    () => ({ sellPricingMode: "balanced", adaptiveLevel: 0.5 }),
+    () => "",
+    new EarningsLog(dir),
+    new ServiceFeeLedger(dir, null),
+  );
+  t.after(() => again.stop());
+  const s2 = again as unknown as typeof seams & { recoverOrders(): Promise<void>; watchInvoice(): void };
+  s2.watchInvoice = () => undefined;
+  s2.lndInvoice = async () => ({ is_held: true });
+  s2.lndSettle = async () => undefined;
+  s2.lndFeeRate = async () => ({ tokens_per_vbyte: 5 });
+  s2.lndOpen = async () => {
+    counts.opens += 1;
+    return { ok: true, transactionId: "dd".repeat(32), transactionVout: 0 };
+  };
+  await s2.recoverOrders();
+  const recovered = again.orderViews()[0];
+  assert.equal(counts.opens, 1, "the restart found the channel in LND instead of opening a second one");
+  assert.equal(recovered.fundingOutpoint, `${outpoint.transactionId}:1`);
+  assert.equal(recovered.orderState, "COMPLETED");
+});
+
+test("an LSP open interrupted before LND acted: after LND had ample time and shows no channel, it is opened — once", async (t) => {
+  const { dir, node, seams, order, counts } = lspWithHeldOrder(t);
+  t.mock.method(console, "log", () => undefined);
+  // On disk: the open had started 11 minutes ago, no channel recorded.
+  order.opening = { startedAt: new Date(Date.now() - 11 * 60_000).toISOString(), preExisting: [] };
+  writeFileSync(join(dir, "lsps1-orders.json"), JSON.stringify([order]));
+  void node;
+  await seams.fulfill(order);
+  assert.equal(counts.opens, 1);
+  assert.equal(order.orderState, "COMPLETED");
+});
+
+test("an LSP open whose outcome is unclear (the stream dropped): no refund and no second open until LND has shown — or not shown — the channel", async (t) => {
+  const { node, svc, seams, order, counts } = lspWithHeldOrder(t);
+  t.mock.method(console, "log", () => undefined);
+  t.mock.method(console, "warn", () => undefined);
+  seams.lndOpen = async () => {
+    counts.opens += 1;
+    return { ok: false, error: "FailedToOpenChannel: Connection dropped" };
+  };
+  await seams.fulfill(order);
+  // Before: the "opening" mark was cleared and the payment refunded at once —
+  // and if LND had funded the channel after all, the buyer kept it for free.
+  assert.equal(counts.cancels, 0, "not refunded: a channel may exist");
+  assert.equal(order.orderState, "CREATED");
+  assert.equal(order.paymentState, "HOLD");
+  assert.match(order.opening?.unclear ?? "", /Connection dropped/);
+
+  // LND shows the channel a moment later: adopted and settled, not reopened.
+  node.pending.push({ partnerPublicKey: order.peer, capacity: order.lspBalanceSat, transactionId: "cd".repeat(32), transactionVout: 0 });
+  await seams.fulfill(order);
+  assert.equal(counts.opens, 1, "no second open");
+  assert.equal(order.orderState, "COMPLETED");
+  assert.equal(order.channel?.fundingOutpoint, `${"cd".repeat(32)}:0`);
+  svc.stop();
+});
+
+test("an LSP buyer whose node takes one pending channel at a time is waited out, not refunded", async (t) => {
+  const { seams, order, counts } = lspWithHeldOrder(t);
+  t.mock.method(console, "log", () => undefined);
+  (seams as unknown as { openRetryDelayMs: number }).openRetryDelayMs = 1;
+  seams.lndOpen = async () => {
+    counts.opens += 1;
+    return counts.opens === 1
+      ? { ok: false, error: "PeerPendingChannelsExceedMaximumAllowable" }
+      : { ok: true, transactionId: "ee".repeat(32), transactionVout: 0 };
+  };
+  await seams.fulfill(order);
+  assert.equal(counts.cancels, 0, "before: refunded at the first refusal");
+  assert.equal(counts.opens, 2);
+  assert.equal(order.orderState, "COMPLETED");
 });

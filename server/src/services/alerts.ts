@@ -22,6 +22,11 @@ const RESET_CONSEQUENCE: Record<string, string> = {
   "overrides.json": "Per-channel fee overrides (incl. exclusions) are gone — re-check them on the Channels tab.",
   "settings.json": "Check your Settings (LSP mode, currency).",
   "service-fees.json": "Pending service-fee records were lost.",
+  "magma-orders.json":
+    "Magma orders in progress lost their record, and with it what claims their held payments. No channel is opened " +
+    "for such an order: when Amboss asks for one, its held payment is released back to the buyer instead (LND releases " +
+    "any other before it expires), and nothing is booked as a sale. Check Market → Orders and your channels in LND for " +
+    "channels already opened for them — those can no longer be paid for.",
 };
 
 /** What an "adjusted" file holds, in plain words, for the alert text. */
@@ -48,6 +53,8 @@ function incidentMessage(i: StoreIncident): string {
       return `Could not save ${i.file} (${i.detail}) — recent changes will be lost on restart. Is the disk full?`;
     case "adjusted":
       return `${ADJUSTED_WHAT[i.file] ?? `Values in ${i.file}`} were outside the current limits and were adjusted: ${i.detail}.`;
+    case "unrecorded_open":
+      return `${i.detail} Is the disk full?`;
   }
 }
 

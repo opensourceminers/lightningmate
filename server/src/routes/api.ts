@@ -6,11 +6,7 @@ import { getNodeSummary, getOwnPubkey } from "../services/node.js";
 import { getChannelsView } from "../services/channels.js";
 import { getFlowSummary, getForwardsReport } from "../services/forwards.js";
 import { applyFees, getFeePreview, type FeeApplyItem, type FeePolicy } from "../services/fees.js";
-import {
-  executeRebalance,
-  getRebalanceCandidates,
-  type RebalancePolicy,
-} from "../services/rebalance.js";
+import { getRebalanceCandidates, type RebalancePolicy } from "../services/rebalance.js";
 import { type SuggestionPolicy } from "../services/suggestions.js";
 import { getChannelSuggestionsV2, getCloseSuggestionsV2 } from "../services/suggestRecommend.js";
 import type { LnPlusStore } from "../services/lnplusStore.js";
@@ -32,7 +28,8 @@ import {
   newAddress,
   sendOnchain,
 } from "../services/onchain.js";
-import { closeChannelByOutpoint, openChannelTo, MIN_CHANNEL_SATS } from "../services/channelOps.js";
+import { closeChannelByOutpoint, connectForOpen, fundChannel, MIN_CHANNEL_SATS } from "../services/channelOps.js";
+import { promisedSpendRefusal, type PromisedSpendRefusal } from "../services/capital.js";
 import { saleFeeConfig, type ServiceFeeLedger } from "../services/serviceFee.js";
 import { getFeeRecommendations } from "../services/feeRecommend.js";
 import { getRebalanceRecommendations } from "../services/rebalanceRecommend.js";
@@ -44,23 +41,20 @@ import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from ".
 import { SlidingWindowLimiter } from "../services/rateLimit.js";
 import { acknowledgeStoreIncident } from "../store.js";
 import { ConfigValidationError } from "../services/autopilotConfig.js";
+import { buyFromOffer, buyLiquidity, getMarket, getOrder, isAuthError } from "../services/amboss.js";
 import {
-  acceptOrder,
-  addOrderTransaction,
-  buyFromOffer,
-  buyLiquidity,
+  checkKey,
   createOffer,
-  getMarket,
+  getMyOffer,
   getMyOffers,
   getMyOrders,
-  getOrder,
-  getSellerOrder,
   toggleOffer,
   updateOffer,
-  validateKey,
-} from "../services/amboss.js";
+  type OfferTerms,
+} from "../services/magmaApi.js";
+import type { DeskResult } from "../services/magmaDesk.js";
 import type { AmbossStore } from "../services/ambossStore.js";
-import type { Autopilot } from "../services/autopilot.js";
+import { ambossFields, type Autopilot, type OfferWrite } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 import { BackupStore, exportScb, getBackupStatus } from "../services/backup.js";
 import type { EarningsLog } from "../services/earningsLog.js";
@@ -559,28 +553,17 @@ export function createApiRouter(
         });
         return;
       }
-      const result = await executeRebalance(lnd, writeLnd, {
-        targetId,
-        sourceId,
-        amountSats: amount,
-        econRatio: ratio,
-        ...(maxFee !== null && maxFee !== undefined ? { maxFeePpm: maxFee } : {}),
-      });
-      rebalanceLog.append({
-        at: new Date().toISOString(),
-        via: "manual",
-        targetId: result.targetId,
-        targetAlias: result.targetAlias,
-        sourceId: result.sourceId,
-        sourceAlias: result.sourceAlias,
-        amountSats: result.amountSats,
-        budgetPpm: result.budgetPpm,
-        feeSats: result.feeSats,
-        costPpm: result.costPpm,
-        ok: result.ok,
-        error: result.error,
-      });
-      res.json(result);
+      // Logged as manual. A payment still in flight at the hard limit is
+      // tracked until LND knows how it ended, and logged then (autopilot.ts).
+      res.json(
+        await autopilot.rebalanceByHand({
+          targetId,
+          sourceId,
+          amountSats: amount,
+          econRatio: ratio,
+          ...(maxFee !== null && maxFee !== undefined ? { maxFeePpm: maxFee } : {}),
+        }),
+      );
     }),
   );
 
@@ -739,6 +722,13 @@ export function createApiRouter(
     }),
   );
 
+  /** 409 for a manual spend that would take coins promised to buyers. The
+   *  orders are named, so the UI can ask "spend them anyway?" — and send the
+   *  request again with `spendPromised: true` only after a yes. */
+  const refusePromisedSpend = (res: Response, r: PromisedSpendRefusal): void => {
+    res.status(409).json({ error: "capital_promised", ...r });
+  };
+
   // Open a channel to a peer — real on-chain action, requires write access.
   router.post(
     "/channels/open",
@@ -762,15 +752,43 @@ export function createApiRouter(
         res.status(400).json({ error: "bad_request", message: "feeRate out of range (1–10000 sat/vByte)." });
         return;
       }
-      res.json(
-        await openChannelTo(writeLnd, {
-          pubkey,
-          socket: socket ? String(socket) : undefined,
-          localTokens: amount,
-          feeRate: fee ?? undefined,
-          isPrivate: Boolean(isPrivate),
-        }),
-      );
+      const spendPromised = req.body?.spendPromised;
+      if (spendPromised !== undefined && typeof spendPromised !== "boolean") {
+        res.status(400).json({ error: "bad_request", message: "spendPromised must be true or false." });
+        return;
+      }
+      const params = {
+        pubkey,
+        socket: socket ? String(socket) : undefined,
+        localTokens: amount,
+        feeRate: fee ?? undefined,
+        isPrivate: Boolean(isPrivate),
+      };
+      // Coins promised to buyers are not the click's to spend (unless the
+      // operator confirmed exactly that): a cheap look before the dial, so a
+      // peer isn't dialed for an open that would be refused anyway.
+      const early = spendPromised ? null : await promisedSpendRefusal(lnd, autopilot.capital, amount, { newChannel: true });
+      if (early) {
+        refusePromisedSpend(res, early);
+        return;
+      }
+      // Dial first, outside the mutex (over Tor that can take a minute and a
+      // half) — then the open itself, taken in turn with every other on-chain
+      // commitment (Magma, LSPS1, autopilot opens), so none of those can check
+      // the balance while this open is spending it.
+      const connected = await connectForOpen(writeLnd, params);
+      if (!connected.ok) {
+        res.json({ ok: false, pubkey, localTokens: amount, error: connected.error });
+        return;
+      }
+      const done = await autopilot.capital.mutex.run("manual open", async (): Promise<{ refusal: PromisedSpendRefusal } | { opened: unknown }> => {
+        // Again, with the balance as it is now: an order may have been
+        // accepted (or paid) while the peer was dialed.
+        const refusal = spendPromised ? null : await promisedSpendRefusal(lnd, autopilot.capital, amount, { newChannel: true });
+        return refusal ? { refusal } : { opened: await fundChannel(writeLnd, params) };
+      });
+      if ("refusal" in done) refusePromisedSpend(res, done.refusal);
+      else res.json(done.opened);
     }),
   );
 
@@ -981,21 +999,32 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { address, tokens, feeRate } = req.body ?? {};
+      const { address, tokens, feeRate, spendPromised } = req.body ?? {};
       const amount = intIn(tokens, 546, MAX_ONCHAIN_SEND_SATS); // ≥ dust
       const rate = intIn(feeRate, 1, MAX_FEE_RATE);
-      if (!isBtcAddress(address) || amount === null || rate === null) {
+      if (!isBtcAddress(address) || amount === null || rate === null || (spendPromised !== undefined && typeof spendPromised !== "boolean")) {
         res.status(400).json({
           error: "bad_request",
-          message: "valid address, tokens (≥546 sat) and feeRate (1–2000 sat/vB) required.",
+          message: "valid address, tokens (≥546 sat), feeRate (1–2000 sat/vB) and an optional spendPromised (true/false) required.",
         });
         return;
       }
+      // Taken in turn with every channel open (Magma, LSPS1, the autopilot,
+      // manual): a send in the middle of an open's check would spend what
+      // that check counted on. Coins promised to buyers are refused unless
+      // the operator confirmed spending them.
+      let done: { refusal: PromisedSpendRefusal } | { sent: unknown };
       try {
-        res.json(await sendOnchain(writeLnd, { address: address.trim(), tokens: amount, feeRate: rate }));
+        done = await autopilot.capital.mutex.run("on-chain send", async () => {
+          const refusal = spendPromised ? null : await promisedSpendRefusal(lnd, autopilot.capital, amount, { newChannel: false });
+          return refusal ? { refusal } : { sent: await sendOnchain(writeLnd, { address: address.trim(), tokens: amount, feeRate: rate }) };
+        });
       } catch (err) {
         res.json({ ok: false, transactionId: "", error: describeError(err) });
+        return;
       }
+      if ("refusal" in done) refusePromisedSpend(res, done.refusal);
+      else res.json(done.sent);
     }),
   );
 
@@ -1020,14 +1049,49 @@ export function createApiRouter(
 
   // ── Amboss Magma (liquidity marketplace) ────────────────────────────────────
   // Reads (the marketplace + price) need no key. The key is stored per-install
-  // and used later for buying/selling. All behind the app login gate already.
+  // and used for buying/selling. All behind the app login gate already.
+
+  /** Run an Amboss call for a route. A refusal for the key (401/403,
+   *  FORBIDDEN) has the key checked again — that check's definitive answer
+   *  decides; an outage never touches the key. The error still reaches the
+   *  client. */
+  const withAmboss = async <T>(fn: () => Promise<T>): Promise<T> => {
+    try {
+      return await fn();
+    } catch (err) {
+      if (isAuthError(err)) await amboss.recheckAfterRefusal();
+      throw err;
+    }
+  };
+
+  /** The key's state, plus how many Magma orders are in flight — Settings
+   *  warns with that count before the key is removed: without a key those
+   *  orders can't be opened, reported or settled (held payments are still
+   *  released before they expire). */
+  const keyStatus = () => ({
+    ...amboss.status(),
+    saleFeeBps: saleFeeConfig().bps,
+    ordersInFlight: autopilot.magma.ordersInFlight(),
+  });
+
   router.get(
     "/amboss/status",
     wrap(async (_req, res) => {
       // Report real key validity (cached), not just presence — a key that
-      // expired/was revoked otherwise shows "connected" while Magma silently fails.
-      const keyValid = await amboss.checkValidity();
-      res.json({ connected: amboss.hasKey(), keyValid, saleFeeBps: saleFeeConfig().bps });
+      // expired/was revoked otherwise shows "connected" while Magma silently
+      // fails. An outage is reported as keyCheck "unreachable", never as a
+      // bad key: the last real verdict stays.
+      await amboss.checkValidity();
+      res.json(keyStatus());
+    }),
+  );
+
+  // "Re-check" in the UI: ask Amboss now instead of trusting the cached verdict.
+  router.post(
+    "/amboss/key/check",
+    wrap(async (_req, res) => {
+      await amboss.checkValidity(true);
+      res.json(keyStatus());
     }),
   );
 
@@ -1044,9 +1108,17 @@ export function createApiRouter(
       res.status(400).json({ error: "missing_key", message: "Missing API key." });
       return;
     }
-    const valid = await validateKey(apiKey);
-    if (!valid) {
+    const { verdict, error } = await checkKey(apiKey);
+    if (verdict === false) {
       res.status(400).json({ error: "invalid_key", message: "Amboss rejected this API key." });
+      return;
+    }
+    if (verdict === null) {
+      // Not a verdict on the key: say so, and keep nothing unverified.
+      res.status(503).json({
+        error: "amboss_unreachable",
+        message: `Could not reach Amboss to check the key (${error ?? "no answer"}) — nothing was saved. Try again in a moment.`,
+      });
       return;
     }
     amboss.setKey(apiKey);
@@ -1099,7 +1171,7 @@ export function createApiRouter(
           res.status(400).json({ error: "bad_size", message: "Choose a channel size within the offer's range." });
           return;
         }
-        const targeted = await buyFromOffer(amboss.getKey(), offerId, info.public_key, sizeSats, isPrivate);
+        const targeted = await withAmboss(() => buyFromOffer(amboss.getKey(), offerId, info.public_key, sizeSats, isPrivate));
         const dec = await decodeRequest(lnd, targeted.paymentRequest);
         res.json({
           orderId: targeted.orderId,
@@ -1110,7 +1182,7 @@ export function createApiRouter(
         });
         return;
       }
-      const quote = await buyLiquidity(amboss.getKey(), uri, usdCents, isPrivate);
+      const quote = await withAmboss(() => buyLiquidity(amboss.getKey(), uri, usdCents, isPrivate));
       // Decode the invoice ourselves — authoritative amount for the confirm + cap.
       const decoded = await decodeRequest(lnd, quote.paymentRequest);
       res.json({
@@ -1172,12 +1244,12 @@ export function createApiRouter(
         res.status(400).json({ error: "bad_request", message: "Missing order id." });
         return;
       }
-      const order = await getOrder(amboss.getKey(), id);
+      const order = await withAmboss(() => getOrder(amboss.getKey(), id));
       res.json({ ...order, payment: magmaPays.get(id) ?? null });
     }),
   );
 
-  // ── Magma selling (offers) ──────────────────────────────────────────────────
+  // ── Magma selling (offers + orders, on the Magma API) ───────────────────────
   const needKey = (res: Response): boolean => {
     if (amboss.hasKey()) return true;
     res.status(400).json({ error: "no_key", message: "Connect Amboss in Settings first." });
@@ -1199,58 +1271,92 @@ export function createApiRouter(
     }),
   );
 
+  // Your offers, plus the sync status: what the autopilot wants for each vs
+  // what Amboss has, and how the last write went (nothing silent).
   router.get(
     "/amboss/my-offers",
     wrap(async (_req, res) => {
       if (!needKey(res)) return;
-      res.json({ offers: await getMyOffers(amboss.getKey()) });
+      const offers = await withAmboss(() => getMyOffers(amboss.getKey()));
+      res.json({ offers, sync: autopilot.offerSyncStatus() });
     }),
   );
 
+  router.get("/amboss/offer-sync", (_req, res) => {
+    res.json(autopilot.offerSyncStatus());
+  });
+
+  // Your sales, with this node's own record of each (order journal: phase,
+  // why it was rejected or skipped, the funding outpoint) and the order lane.
   router.get(
     "/amboss/my-orders",
     wrap(async (_req, res) => {
       if (!needKey(res)) return;
-      res.json(await getMyOrders(amboss.getKey()));
+      const view = await withAmboss(() => getMyOrders(amboss.getKey()));
+      res.json({
+        pendingSeller: view.pendingSeller,
+        lane: autopilot.magma.laneStatus(),
+        orders: view.orders.map((o) => {
+          const local = autopilot.magma.localView(o.id);
+          return { ...o, transactionId: local?.fundingOutpoint?.split(":")[0] ?? o.transactionId, local };
+        }),
+      });
     }),
   );
+
+  /** Offer terms from a request body (sizes in sats, rate in ppm, lease in blocks). */
+  const parseOfferTerms = (b: Record<string, unknown>, res: Response): OfferTerms | null => {
+    const terms = {
+      totalSizeSats: Math.floor(Number(b.totalSizeSats)),
+      minSizeSats: Math.floor(Number(b.minSizeSats)),
+      maxSizeSats: Math.floor(Number(b.maxSizeSats)),
+      feeRatePpm: Math.floor(Number(b.feeRatePpm)),
+      baseFeeSats: Math.floor(Number(b.baseFeeSats)),
+      minBlockLength: Math.floor(Number(b.minBlockLength)),
+    };
+    if (!Object.values(terms).every((n) => Number.isFinite(n) && n >= 0)) {
+      res.status(400).json({ error: "bad_request", message: "Fill in all fields with valid numbers." });
+      return null;
+    }
+    if (terms.minSizeSats <= 0 || terms.maxSizeSats < terms.minSizeSats || terms.totalSizeSats < terms.maxSizeSats) {
+      res.status(400).json({ error: "bad_sizes", message: "Sizes must satisfy 0 < min ≤ max ≤ total." });
+      return null;
+    }
+    if (terms.baseFeeSats <= 0) {
+      res.status(400).json({
+        error: "bad_fee",
+        message: "Set a base fee above 0 — offers are priced with a base fee + fee rate.",
+      });
+      return null;
+    }
+    if (terms.minBlockLength <= 0) {
+      res.status(400).json({ error: "bad_lease", message: "Set a minimum lease length in blocks." });
+      return null;
+    }
+    return terms;
+  };
 
   router.post(
     "/amboss/offer",
     wrap(async (req, res) => {
       if (!needKey(res)) return;
-      const b = req.body ?? {};
-      const totalSizeSats = Math.floor(Number(b.totalSizeSats));
-      const minSizeSats = Math.floor(Number(b.minSizeSats));
-      const maxSizeSats = Math.floor(Number(b.maxSizeSats));
-      const feeRatePpm = Math.floor(Number(b.feeRatePpm));
-      const baseFeeSats = Math.floor(Number(b.baseFeeSats));
-      const minBlockLength = Math.floor(Number(b.minBlockLength));
-      const nums = [totalSizeSats, minSizeSats, maxSizeSats, feeRatePpm, baseFeeSats, minBlockLength];
-      if (!nums.every((n) => Number.isFinite(n) && n >= 0)) {
-        res.status(400).json({ error: "bad_request", message: "Fill in all fields with valid numbers." });
+      const terms = parseOfferTerms(req.body ?? {}, res);
+      if (!terms) return;
+      const write: OfferWrite = { at: new Date().toISOString(), by: "manual", action: "create", fields: ambossFields(terms), ok: false };
+      let offerId: string;
+      try {
+        const { public_key } = await getWalletInfo({ lnd });
+        offerId = await withAmboss(() => createOffer(amboss.getKey(), public_key, terms));
+      } catch (err) {
+        write.error = describeError(err);
+        autopilot.recordOfferWrite(null, "new-offer", write);
+        res.status(502).json({ error: "amboss_failed", message: `Amboss did not create the offer: ${write.error}` });
         return;
       }
-      if (minSizeSats <= 0 || maxSizeSats < minSizeSats || totalSizeSats < maxSizeSats) {
-        res.status(400).json({ error: "bad_sizes", message: "Sizes must satisfy 0 < min ≤ max ≤ total." });
-        return;
-      }
-      if (baseFeeSats <= 0) {
-        res.status(400).json({
-          error: "bad_fee",
-          message: "Set a base fee above 0 — offers are priced with a base fee + fee rate.",
-        });
-        return;
-      }
-      const ok = await createOffer(amboss.getKey(), {
-        totalSizeSats,
-        minSizeSats,
-        maxSizeSats,
-        feeRatePpm,
-        baseFeeSats,
-        minBlockLength,
-      });
-      res.json({ ok });
+      write.ok = true;
+      const created = await getMyOffer(amboss.getKey(), offerId).catch(() => null);
+      autopilot.recordOfferWrite(created, offerId, { ...write, verified: created ? created.id === offerId : undefined });
+      res.json({ ok: true, offerId });
     }),
   );
 
@@ -1264,34 +1370,32 @@ export function createApiRouter(
         res.status(400).json({ error: "bad_request", message: "Missing offer id." });
         return;
       }
-      const totalSizeSats = Math.floor(Number(b.totalSizeSats));
-      const minSizeSats = Math.floor(Number(b.minSizeSats));
-      const maxSizeSats = Math.floor(Number(b.maxSizeSats));
-      const feeRatePpm = Math.floor(Number(b.feeRatePpm));
-      const baseFeeSats = Math.floor(Number(b.baseFeeSats));
-      const minBlockLength = Math.floor(Number(b.minBlockLength));
-      const nums = [totalSizeSats, minSizeSats, maxSizeSats, feeRatePpm, baseFeeSats, minBlockLength];
-      if (!nums.every((n) => Number.isFinite(n) && n >= 0)) {
-        res.status(400).json({ error: "bad_request", message: "Fill in all fields with valid numbers." });
+      const terms = parseOfferTerms(b, res);
+      if (!terms) return;
+      const write: OfferWrite = { at: new Date().toISOString(), by: "manual", action: "update", fields: ambossFields(terms), ok: false };
+      try {
+        write.ok = await withAmboss(() => updateOffer(amboss.getKey(), id, terms));
+        if (!write.ok) write.error = "Amboss did not apply the update (success: false)";
+      } catch (err) {
+        write.error = describeError(err);
+      }
+      if (!write.ok) {
+        autopilot.recordOfferWrite(null, id, write);
+        res.status(502).json({ error: "amboss_refused", message: `Offer not updated: ${write.error}` });
         return;
       }
-      if (minSizeSats <= 0 || maxSizeSats < minSizeSats || totalSizeSats < maxSizeSats) {
-        res.status(400).json({ error: "bad_sizes", message: "Sizes must satisfy 0 < min ≤ max ≤ total." });
-        return;
-      }
-      if (baseFeeSats <= 0) {
-        res.status(400).json({ error: "bad_fee", message: "Set a base fee above 0." });
-        return;
-      }
-      const ok = await updateOffer(amboss.getKey(), id, {
-        totalSizeSats,
-        minSizeSats,
-        maxSizeSats,
-        feeRatePpm,
-        baseFeeSats,
-        minBlockLength,
-      });
-      res.json({ ok });
+      // "success" is Amboss's word; reading the offer back is the proof.
+      const read = await getMyOffer(amboss.getKey(), id).catch(() => null);
+      write.verified = read
+        ? read.totalSizeSats === terms.totalSizeSats &&
+          read.minSizeSats === terms.minSizeSats &&
+          read.maxSizeSats === terms.maxSizeSats &&
+          read.feeRatePpm === terms.feeRatePpm &&
+          read.baseFeeSats === terms.baseFeeSats &&
+          read.minBlockLength === terms.minBlockLength
+        : undefined;
+      autopilot.recordOfferWrite(read, id, write);
+      res.json({ ok: true, verified: write.verified ?? null, offer: read });
     }),
   );
 
@@ -1304,101 +1408,74 @@ export function createApiRouter(
         res.status(400).json({ error: "bad_request", message: "Missing offer id." });
         return;
       }
-      res.json({ status: await toggleOffer(amboss.getKey(), id) });
+      const write: OfferWrite = { at: new Date().toISOString(), by: "manual", action: "update", fields: { offer_id: id }, ok: false };
+      let status: string;
+      try {
+        status = await withAmboss(() => toggleOffer(amboss.getKey(), id));
+      } catch (err) {
+        write.error = describeError(err);
+        autopilot.recordOfferWrite(null, id, write);
+        throw err;
+      }
+      write.ok = true;
+      write.action = status === "ENABLED" ? "enable" : "disable";
+      autopilot.recordOfferWrite(await getMyOffer(amboss.getKey(), id).catch(() => null), id, write);
+      res.json({ status });
     }),
   );
 
-  // Seller fulfillment — step 1: accept the order (creates the fee invoice).
+  // Seller fulfilment by hand. Each goes through the SAME order journal,
+  // per-order serialisation and on-chain mutex as the autopilot's order lane
+  // (magmaDesk.ts): a click can never race the lane into a second channel,
+  // and a failure is an error status, never "200 { ok: false }".
+  const sendDesk = (res: Response, r: DeskResult): void => {
+    if (r.ok) {
+      res.json(r);
+      return;
+    }
+    const status =
+      r.code === "read_only" ? 403
+      : r.code === "no_key" ? 400
+      : r.code === "shutting_down" || r.code === "journal" ? 503
+      : r.code === "bad_status" || r.code === "capital" || r.code === "unreachable" || r.code === "not_held" ? 409
+      : 502;
+    res.status(status).json({ ...r, error: r.code ?? "failed" });
+  };
+
+  const orderId = (req: Request, res: Response): string | null => {
+    const id = typeof req.body?.id === "string" ? req.body.id.trim() : "";
+    if (!id || id.length > 100) {
+      res.status(400).json({ error: "bad_request", message: "Missing order id." });
+      return null;
+    }
+    return id;
+  };
+
+  // Accept: a HODL invoice for the order's fee (the buyer's payment is held
+  // until the channel is confirmed; any failure refunds it).
   router.post(
     "/amboss/order/accept",
     wrap(async (req, res) => {
-      if (!needKey(res)) return;
-      if (!writeLnd) {
-        res.status(403).json({ error: "read_only", message: "Enable write mode to fulfill orders." });
-        return;
-      }
-      const id = typeof req.body?.id === "string" ? req.body.id : "";
-      if (!id) {
-        res.status(400).json({ error: "bad_request", message: "Missing order id." });
-        return;
-      }
-      const order = await getSellerOrder(amboss.getKey(), id);
-      if (!order) {
-        res.status(404).json({ error: "not_found", message: "Order not found." });
-        return;
-      }
-      if (order.status !== "WAITING_FOR_SELLER_APPROVAL") {
-        res.status(400).json({ error: "bad_status", message: `Order is ${order.status}, not awaiting approval.` });
-        return;
-      }
-      if (!(order.feeSats > 0)) {
-        res.status(400).json({ error: "bad_amount", message: "Order has no fee amount yet." });
-        return;
-      }
-      // The invoice must outlive Amboss' 48h fulfillment window.
-      const inv = await createInvoice(writeLnd, {
-        tokens: order.feeSats,
-        description: `Magma order ${id}`,
-        expirySec: 49 * 3600,
-      });
-      const ok = await acceptOrder(amboss.getKey(), id, inv.request);
-      res.json({ ok });
+      const id = orderId(req, res);
+      if (id) sendDesk(res, await autopilot.magma.accept(id));
     }),
   );
 
-  // Seller fulfillment — step 2: open the channel to the buyer + report the tx.
+  // Open the channel to the buyer and report it (idempotent per order).
   router.post(
     "/amboss/order/open",
     wrap(async (req, res) => {
-      if (!needKey(res)) return;
-      if (!writeLnd) {
-        res.status(403).json({ error: "read_only", message: "Enable write mode to fulfill orders." });
-        return;
-      }
-      const id = typeof req.body?.id === "string" ? req.body.id : "";
-      if (!id) {
-        res.status(400).json({ error: "bad_request", message: "Missing order id." });
-        return;
-      }
-      const order = await getSellerOrder(amboss.getKey(), id);
-      if (!order) {
-        res.status(404).json({ error: "not_found", message: "Order not found." });
-        return;
-      }
-      if (order.status !== "WAITING_FOR_CHANNEL_OPEN") {
-        res.status(400).json({ error: "bad_status", message: `Order is ${order.status}, not ready for channel open.` });
-        return;
-      }
-      const [pubkey, socket] = order.destination.split("@");
-      if (!pubkey) {
-        res.status(400).json({ error: "bad_destination", message: "Order has no buyer endpoint." });
-        return;
-      }
-      const opened = await openChannelTo(writeLnd, {
-        pubkey,
-        socket: socket || undefined,
-        localTokens: order.sizeSats,
-      });
-      if (!opened.ok || !opened.transactionId) {
-        res.status(502).json({ error: "open_failed", message: opened.error ?? "Channel open failed." });
-        return;
-      }
-      const outpoint = `${opened.transactionId}:${opened.transactionVout}`;
-      const added = await addOrderTransaction(amboss.getKey(), id, outpoint);
-      if (added) {
-        // A completed sale: book the income and ENQUEUE the disclosed service
-        // fee — the ledger pays it in the background, so a slow fee payment
-        // can never hold this request (or anything else) up. Both steps are
-        // idempotent per order, shared with the autopilot's path.
-        earnings.appendOnce({
-          at: new Date().toISOString(),
-          via: "manual",
-          orderId: id,
-          leaseSats: order.feeSats,
-        });
-        serviceFees.enqueue({ source: "magma", orderId: id, earnedSats: order.feeSats });
-      }
-      res.json({ ok: added, transactionId: opened.transactionId, outpoint });
+      const id = orderId(req, res);
+      if (id) sendDesk(res, await autopilot.magma.open(id));
+    }),
+  );
+
+  // Reject an order that can't be served (only while it awaits approval).
+  router.post(
+    "/amboss/order/reject",
+    wrap(async (req, res) => {
+      const id = orderId(req, res);
+      if (id) sendDesk(res, await autopilot.magma.reject(id));
     }),
   );
 

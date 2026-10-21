@@ -1,10 +1,13 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { AppSettings, FiatCurrency, LspStatus } from "../types";
+import type { AmbossKeyCheck, AppSettings, FiatCurrency, LspStatus } from "../types";
 import { BackupCard } from "./BackupCard";
+import { AmbossKeyStatus } from "./AmbossKeyStatus";
 import { Switch, RunState } from "./Switch";
+import { useUi } from "./Overlay";
 import { satsCompact, timeAgo } from "../format";
 import { formatVersion } from "../version";
+import { removeKeyMessage } from "../statusNotes";
 
 const CURRENCIES: { value: FiatCurrency; label: string }[] = [
   { value: "off", label: "Off" },
@@ -15,6 +18,7 @@ const CURRENCIES: { value: FiatCurrency; label: string }[] = [
 ];
 
 export function SettingsPanel({ onChange, version }: { onChange: () => void; version?: string }) {
+  const ui = useUi();
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -22,6 +26,9 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
   // Amboss / Magma connection
   const [ambossConnected, setAmbossConnected] = useState<boolean | null>(null);
   const [keyValid, setKeyValid] = useState<boolean | null | undefined>(undefined);
+  const [keyCheck, setKeyCheck] = useState<AmbossKeyCheck>("unknown");
+  const [keyCheckError, setKeyCheckError] = useState<string | null>(null);
+  const [ordersInFlight, setOrdersInFlight] = useState(0);
   const [keyInput, setKeyInput] = useState("");
   const [ambossBusy, setAmbossBusy] = useState(false);
   const [ambossError, setAmbossError] = useState<string | null>(null);
@@ -33,9 +40,29 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
       .then((s) => {
         setAmbossConnected(s.connected);
         setKeyValid(s.keyValid);
+        setKeyCheck(s.keyCheck);
+        setKeyCheckError(s.lastError);
+        setOrdersInFlight(s.ordersInFlight ?? 0);
       })
       .catch(() => setAmbossConnected(false));
   }, []);
+
+  // "Re-check": ask Amboss about the stored key now. Never deletes it.
+  const recheckAmboss = async () => {
+    setAmbossBusy(true);
+    setAmbossError(null);
+    try {
+      const s = await api.ambossKeyCheck();
+      setKeyValid(s.keyValid);
+      setKeyCheck(s.keyCheck);
+      setKeyCheckError(s.lastError);
+      setOrdersInFlight(s.ordersInFlight ?? 0);
+    } catch (e) {
+      setAmbossError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAmbossBusy(false);
+    }
+  };
 
   const connectAmboss = async () => {
     if (!keyInput.trim() || ambossBusy) return;
@@ -45,6 +72,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
       await api.ambossConnect(keyInput.trim());
       setAmbossConnected(true);
       setKeyValid(true);
+      setKeyCheck("valid");
       setKeyInput("");
     } catch (e) {
       setAmbossError(e instanceof Error ? e.message : String(e));
@@ -53,7 +81,24 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
     }
   };
 
+  // Removing the key is never a single click: it is confirmed, and the
+  // confirmation says what happens to Magma orders still in flight (fetched
+  // fresh — the count on screen may be minutes old).
   const disconnectAmboss = async () => {
+    let inFlight = ordersInFlight;
+    try {
+      inFlight = (await api.ambossStatus()).ordersInFlight ?? inFlight;
+      setOrdersInFlight(inFlight);
+    } catch {
+      // keep the last known count
+    }
+    const ok = await ui.confirm({
+      title: inFlight > 0 ? "Remove the Amboss key? Orders are in flight" : "Remove the Amboss key?",
+      message: removeKeyMessage(inFlight),
+      confirmLabel: "Remove key",
+      danger: true,
+    });
+    if (!ok) return;
     setAmbossBusy(true);
     setAmbossError(null);
     try {
@@ -232,35 +277,16 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
       </div>
       {ambossConnected === null ? (
         <p className="muted">Checking…</p>
-      ) : ambossConnected && keyValid === false ? (
-        <>
-          <div className="amboss-row">
-            <span className="conn down">
-              <i /> Amboss key expired or revoked
-            </span>
-            <button className="reset" disabled={ambossBusy} onClick={() => void disconnectAmboss()}>
-              {ambossBusy ? "…" : "Reconnect"}
-            </button>
-          </div>
-          <p className="banner error">
-            Amboss is rejecting your stored key, so buying and <strong>selling on Magma silently
-            do nothing</strong> — no offers are listed and no orders are fulfilled. Get a fresh key
-            at{" "}
-            <a href="https://account.amboss.tech/settings/api-keys" target="_blank" rel="noreferrer">
-              account.amboss.tech
-            </a>{" "}
-            and reconnect below.
-          </p>
-        </>
       ) : ambossConnected ? (
-        <div className="amboss-row">
-          <span className="conn up">
-            <i /> Amboss connected{keyValid === true ? " · key valid" : ""}
-          </span>
-          <button className="reset" disabled={ambossBusy} onClick={() => void disconnectAmboss()}>
-            {ambossBusy ? "…" : "Disconnect"}
-          </button>
-        </div>
+        <AmbossKeyStatus
+          keyValid={keyValid}
+          keyCheck={keyCheck}
+          lastError={keyCheckError}
+          busy={ambossBusy}
+          onRecheck={() => void recheckAmboss()}
+          onRemove={() => void disconnectAmboss()}
+          ordersInFlight={ordersInFlight}
+        />
       ) : (
         <div className="amboss-row">
           <input

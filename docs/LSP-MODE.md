@@ -34,17 +34,20 @@
 |---|---|
 | Pricing (fee = fixed + ppm × size, duration-scaled) | `magmaRecommend` profit floor + **fill telemetry** (price to what sells) |
 | Capital guards (on-chain reserve, max deploy, max channel size, per-run budget) | Magma fulfilment path in `autopilot.runSell` |
-| Channel opening | `channelOps.openChannelTo` |
+| Channel opening | `channelOps.connectForOpen` (dial, outside the on-chain mutex) + `channelOps.fundChannel` (the open, inside it) |
 | Earnings/P&L recording | `earningsLog` (new `via: "lsps1"`) |
-| Fast reaction | autopilot fast lane pattern (3-min poll → here: event-driven) |
+| Fast reaction | the Magma order lane (45 s poll, its own lane) → here: event-driven |
 
 ## Architecture
 
 - `server/src/services/lsps1.ts` — peer-message router (JSON-RPC parse/dispatch,
   per-peer rate limiting), order state machine, `JsonStore("lsps1-orders.json")`.
 - Settings card **"LSP mode (beta)"** — OFF by default. Caps shared with the
-  Magma sell caps (one capital budget across both demand sources — the
-  `onchainCommittedThisRun` counter already models this).
+  Magma sell caps: one capital budget across both demand sources and the
+  channel autopilot (`capital.ts` — one on-chain mutex for every open, and
+  the coins promised to unopened orders reserved from both order files). A
+  manual open or on-chain send may not spend those promised coins unless the
+  operator confirms it.
 - Orders appear in Market → Orders alongside Magma orders; digest item on fills.
 
 ## Phases
@@ -68,8 +71,20 @@
    disclosed with the same fee-note in the Settings card. Earnings →
    `earningsLog` `via:"lsps1"` (flows into P&L); fills appear in the run
    history/digest (`lsps1:<order>`); orders in Market → Orders ("Direct
-   sales"). Shared capital: autopilot subtracts LSPS1 held-order commitments
-   (`setExternalCommitted`). Basic P3 items already in: per-peer rate limit,
+   sales"). Shared capital: every PAID LSPS1 order without a channel is a
+   reservation in the shared capital ledger (`capital.ts`) — with its funding
+   fee and its step of LND's anchor reserve. Unpaid quotes count only against
+   LSPS1's own next quotes and deploy headroom (any connected peer can ask for
+   one, so they never take capital from a Magma buyer). `create_order` checks
+   the capital fresh, inside the shared on-chain mutex, and each open runs
+   under that mutex too (the held payment is settled once the mutex is
+   released, so settle retries never hold up a Magma accept); an "opening"
+   mark is saved before the open, so a restart — or an open whose outcome LND
+   left unclear — finds the channel in LND instead of opening twice, and never
+   adopts a channel that a Magma sale to the same buyer has claimed (the search
+   runs under the on-chain mutex, so a channel another sale has just broadcast
+   but not yet recorded is never taken; and LND not answering is never read as
+   "no channel"). Basic P3 items already in: per-peer rate limit,
    pending-order caps (2/peer, 10 total), invoice expiry (1 h), restart
    recovery of in-flight orders (resume held → open/settle, expire dead).
 3. **P3 — hardening:** invoice expiry, refund paths, per-peer rate limits,

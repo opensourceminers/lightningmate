@@ -125,3 +125,57 @@ test("on a full disk, Disconnect still removes the key, and a new key never revi
   assert.deepEqual(filesHolding(dir, "NEW-KEY-8888"), []);
   assert.equal(restart(dir).hasKey(), false);
 });
+
+test("when the new key is written, the old one is in no file but amboss.json itself (no window for a .bak to bring it back)", (t) => {
+  const dir = makeTempDir(t);
+  quietErrors(t);
+  const amboss = new AmbossStore(dir);
+  amboss.setKey("OLD-KEY-6060");
+  amboss.setKey("OLD-KEY-6060"); // a .bak of it now exists
+  // A power cut can come at any point: look at the disk at the very moment
+  // the new key is written.
+  const seen: string[][] = [];
+  const proto = JsonStore.prototype as unknown as { replaceFile(data: string, keepBackup: boolean): void };
+  const real = proto.replaceFile;
+  t.mock.method(proto, "replaceFile", function (this: unknown, data: string, keepBackup: boolean) {
+    if (data.includes("NEW-KEY-7070")) seen.push(filesHolding(dir, "OLD-KEY-6060"));
+    return real.call(this, data, keepBackup);
+  });
+  amboss.setKey("NEW-KEY-7070");
+  assert.equal(seen.length, 1, "the new key was written once");
+  // amboss.json still holds the old key until the atomic rename replaces it in
+  // one step; no backup or other copy may hold it at that moment. (Before,
+  // the copies were deleted only AFTER the write: a power cut in between left
+  // the old key in amboss.json.bak, and a later loss of amboss.json restored it.)
+  assert.deepEqual(seen[0].filter((f) => f !== "amboss.json"), []);
+  assert.deepEqual(filesHolding(dir, "OLD-KEY-6060"), []);
+});
+
+test("after Disconnect, no alert names a damaged copy that Disconnect deleted", (t) => {
+  const dir = makeTempDir(t);
+  quietErrors(t);
+  restart(dir).setKey("SECRET-KEY-8080");
+  writeFileSync(join(dir, "amboss.json"), '{"apiKey": SECRET-KEY-8080}'); // damaged
+  const amboss = restart(dir);
+  const [incident] = storeIncidents(dir).filter((i) => i.file === "amboss.json");
+  assert.ok(incident?.quarantinedAs, "an alert pointing at the damaged copy");
+  amboss.clear(); // deletes the key and every copy of it, the damaged one included
+  assert.deepEqual(
+    storeIncidents(dir).filter((i) => i.quarantinedAs === incident.quarantinedAs),
+    [],
+    "the alert no longer points at a file that is gone",
+  );
+});
+
+test("connecting a new key after a damaged amboss.json also settles the alert about the deleted copy", (t) => {
+  const dir = makeTempDir(t);
+  quietErrors(t);
+  restart(dir).setKey("SECRET-KEY-9090");
+  writeFileSync(join(dir, "amboss.json"), '{"apiKey": SECRET-KEY-9090');
+  const amboss = restart(dir);
+  const [incident] = storeIncidents(dir).filter((i) => i.file === "amboss.json");
+  assert.ok(incident?.quarantinedAs);
+  amboss.setKey("FRESH-KEY-1111"); // "Reconnect your Amboss key" — done
+  assert.deepEqual(storeIncidents(dir).filter((i) => i.quarantinedAs === incident.quarantinedAs), []);
+  assert.deepEqual(filesHolding(dir, "SECRET-KEY-9090"), []);
+});

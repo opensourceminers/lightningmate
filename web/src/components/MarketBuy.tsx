@@ -86,8 +86,9 @@ export function MarketBuy() {
       const ok = await ui.confirm({
         title: "Confirm liquidity purchase",
         message:
-          `Pay a one-time ${q.sats.toLocaleString()} sat fee for a ~${satsCompact(q.channelSizeSats)} ` +
-          `inbound channel? ` +
+          // A dollar-priced order doesn't name its channel size up front.
+          `Pay a one-time ${q.sats.toLocaleString()} sat fee for ` +
+          (q.channelSizeSats > 0 ? `a ~${satsCompact(q.channelSizeSats)} inbound channel? ` : `an inbound channel? `) +
           (pick
             ? `Seller ${pick.seller.slice(0, 12)}… opens the channel to your node.`
             : `Amboss picks the seller, who then opens the channel to your node.`) +

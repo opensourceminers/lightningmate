@@ -52,4 +52,9 @@ export class EarningsLog {
   recent(n = LIMIT): SaleRecord[] {
     return this.records.slice(0, n);
   }
+
+  /** The sale already recorded for an order, if any. */
+  find(kind: "magma" | "lsps1", orderId: string): SaleRecord | undefined {
+    return this.records.find((r) => r.orderId === orderId && saleKind(r.via) === kind);
+  }
 }

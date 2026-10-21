@@ -258,7 +258,22 @@ export interface AutopilotChannelOpen {
 
 export interface AutopilotSell {
   orderId: string;
-  action: "accept" | "open" | "close" | "skip";
+  action:
+    | "accept"
+    | "reject"
+    | "open"
+    | "report"
+    | "settle"
+    | "cancel"
+    | "close"
+    | "skip"
+    | "relist"
+    | "reprice"
+    | "resize"
+    | "enable"
+    | "disable"
+    | "create"
+    | "error";
   sizeSats: number;
   ok: boolean;
   transactionId?: string;
@@ -275,6 +290,24 @@ export interface AutopilotRun {
   channels: AutopilotChannelOpen[];
   sells: AutopilotSell[];
   maxHtlc?: MaxHtlcChange[];
+  /** Stages that threw (each stage is isolated; the others still ran). */
+  errors?: { stage: string; error: string }[];
+}
+
+/** The Magma order lane (every 45 s, independent of the main run). */
+export interface MagmaLaneStatus {
+  lastTickAt: string | null;
+  /** null: the last pass had nothing to do (see `idle`). */
+  ok: boolean | null;
+  error: string | null;
+  /** Whether the lane's next pass may clear `error` by itself. False when it
+   *  can't: Amboss rejects LightningMate's request as such (only an update
+   *  fixes that), or there is no key to ask with. */
+  retrying?: boolean;
+  /** Why the last pass had nothing to do, when it hadn't. */
+  idle?: string | null;
+  running: boolean;
+  openOrders: number;
 }
 
 /** Allowed range of one numeric setting (mirrors server autopilotConfig.ts). */
@@ -305,6 +338,9 @@ export interface AutopilotState {
   bounds: AutopilotBounds;
   lastRunAt: string | null;
   history: AutopilotRun[];
+  /** The main run in progress, if any: since when. */
+  runningSince?: string | null;
+  magmaLane?: MagmaLaneStatus;
 }
 
 export interface RebalancePolicy {
@@ -353,6 +389,9 @@ export interface RebalanceExecResult {
   feeSats: number | null;
   costPpm: number | null;
   error?: string;
+  /** Stopped waiting at the hard limit while the payment was still in
+   *  flight: it may still land. Tracked, and logged once LND knows. */
+  inFlight?: { paymentId: string; maxFeeSats: number };
 }
 
 export interface RebalanceRecord {
@@ -955,27 +994,146 @@ export interface MyOffer {
   status: string;
   minSizeSats: number;
   maxSizeSats: number;
+  /** Listed capacity, including what live orders have locked. */
   totalSizeSats: number;
+  lockedSats: number;
+  /** What a new buyer can still order (total − locked). */
+  availableSats: number;
   baseFeeSats: number;
   feeRatePpm: number;
   minBlockLength: number;
+  feeRateCapPpm: number | null;
+  baseFeeCapSats: number | null;
+  filledOrders: number;
+  createdAt: string;
+}
+
+/** This node's own record of a Magma sale (server: magmaJournal.ts). */
+export type MagmaPhase =
+  | "seen"
+  | "accepting"
+  | "accepted"
+  | "held"
+  | "opening"
+  | "funded"
+  | "reported"
+  | "settled"
+  | "cancelled"
+  | "rejected"
+  | "failed";
+
+export interface MagmaOrderLocal {
+  phase: MagmaPhase;
+  via: "autopilot" | "manual" | "legacy";
+  updatedAt: string;
+  fundingOutpoint: string | null;
+  /** Why it was rejected, cancelled or failed. */
+  reason: string | null;
+  /** The order lane's latest decision (accept / reject / skip / wait) and why. */
+  decision: { at: string; action: string; reason: string } | null;
+  lastError: string | null;
 }
 
 export interface MyOrder {
   id: string;
   status: string;
-  side: string;
+  side: "SELL";
   sizeSats: number;
+  /** What you earn (Amboss reports 0 until it has settled it). */
   feeSats: number;
+  /** The buyer's node id. */
   destination: string;
+  buyerAlias: string | null;
+  isPrivate: boolean;
   paymentStatus: string | null;
   channelId: string | null;
+  transactionId: string | null;
+  blocksUntilClosable: number | null;
+  leaseActive: boolean;
+  sold: boolean;
+  timeout: string | null;
   createdAt: string;
+  local: MagmaOrderLocal | null;
 }
 
 export interface MyOrdersView {
   orders: MyOrder[];
   pendingSeller: number;
+  lane?: MagmaLaneStatus;
+}
+
+/** An offer's terms as Amboss has them, or as the autopilot wants them. */
+export interface OfferFields {
+  status: string;
+  minSizeSats: number;
+  maxSizeSats: number;
+  totalSizeSats: number;
+  availableSats: number;
+  feeRatePpm: number;
+  baseFeeSats: number;
+  minBlockLength: number;
+}
+
+export interface OfferWrite {
+  at: string;
+  by: "autopilot" | "manual";
+  action: "create" | "update" | "enable" | "disable";
+  fields: Record<string, number | string>;
+  ok: boolean;
+  error?: string;
+  verified?: boolean;
+  reason?: string;
+}
+
+export interface OfferSyncEntry {
+  offerId: string;
+  checkedAt: string;
+  amboss: OfferFields;
+  wanted: OfferFields | null;
+  inSync: boolean;
+  differences: string[];
+  lastWrite: OfferWrite | null;
+}
+
+/** What the autopilot wants for your offers vs what Amboss has. */
+export interface OfferSyncStatus {
+  at: string | null;
+  managed: boolean;
+  offers: OfferSyncEntry[];
+  lastError: { at: string; message: string } | null;
+}
+
+export interface MyOffersResponse {
+  offers: MyOffer[];
+  sync: OfferSyncStatus;
+}
+
+/** valid / rejected (Amboss refused it) / unreachable (no answer — the last
+ *  verdict is kept) / unknown (not checked yet). */
+export type AmbossKeyCheck = "valid" | "rejected" | "unreachable" | "unknown";
+
+export interface AmbossStatus {
+  connected: boolean;
+  keyValid: boolean | null;
+  keyCheck: AmbossKeyCheck;
+  checkedAt: string | null;
+  lastError: string | null;
+  saleFeeBps?: number;
+  /** Magma orders this node has taken on and not finished (accepted, paid,
+   *  opening, …): without a key they can't be fulfilled. */
+  ordersInFlight?: number;
+}
+
+/** Outcome of a manual order action (accept / open / reject). */
+export interface DeskResult {
+  ok: boolean;
+  code?: string;
+  message: string;
+  phase?: MagmaPhase;
+  outpoint?: string;
+  transactionId?: string;
+  /** For an opened channel: has Amboss taken its funding transaction yet? */
+  reported?: boolean;
 }
 
 // ── Magma v2 (profit-aware recommendations) ──

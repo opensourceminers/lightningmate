@@ -21,7 +21,13 @@ standalone via Docker.
   visible as "pending close" until it confirms.
 - **Market (Amboss Magma)** — **buy** inbound liquidity (USD-priced) and **sell**
   your own: create / edit offers and fulfil orders (accept + open a channel to
-  the buyer), manually or via the autopilot.
+  the buyer), manually or via the autopilot. Selling runs on Amboss's Magma API:
+  an order is accepted with a **hold invoice** that settles only once Amboss
+  confirms the channel (any failure refunds the buyer automatically), every
+  step is recorded in a per-order journal before it happens (a crash or a lost
+  answer never leads to a second channel), and orders the node can't serve are
+  rejected at once instead of being left to time out. Amboss decides which
+  seller gets matched; the app makes the sell path correct and reliable.
 - **LSP mode (beta)** — sell inbound channels **directly to wallets** speaking
   the open LSPS1 standard (bLIP-51), with no marketplace in between: orders are
   priced by the same profit-aware engine as Magma selling, paid via a **hold

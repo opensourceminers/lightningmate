@@ -3,6 +3,7 @@ import {
   decodePaymentRequest,
   getFeeRates,
   getRouteToDestination,
+  getWalletInfo,
   payViaPaymentDetails,
   type AuthenticatedLnd,
 } from "lightning";
@@ -116,6 +117,39 @@ function adaptiveAmounts(target: number): number[] {
 // Pathfinding budget per attempt. Generous because over a dev SSH tunnel each
 // route attempt is a slow round-trip; on Umbrel (direct) it resolves far quicker.
 const PATHFINDING_TIMEOUT_MS = 45_000;
+
+/**
+ * Hard wall-clock limit for one rebalance, all amounts together. LND's
+ * pathfinding timeout only stops NEW attempts: a payment with an HTLC stuck
+ * at a downstream hop stays in flight until that HTLC resolves — hours or
+ * days — and the autopilot run awaiting it stood still all that time. Past
+ * this limit we stop WAITING (the payment may still land) and report it as
+ * in flight; the autopilot charges its maximum fee to the daily budget and
+ * learns the real outcome on a later run (getPayment).
+ */
+export const REBALANCE_HARD_TIMEOUT_MS = 150_000;
+
+/**
+ * How far above the chain tip the route's total CLTV may reach. Without it
+ * LND allows 2016 blocks (two weeks of funds locked by a stuck HTLC). A
+ * circular route of 3–4 hops needs roughly 250–450 blocks, so a tight limit
+ * (+144) would block nearly every route; one week is a safe ceiling.
+ */
+export const REBALANCE_MAX_TIMEOUT_BLOCKS = 1_008;
+
+const TIMED_OUT = Symbol("timed-out");
+
+/** Resolve with the work's value, or TIMED_OUT once `ms` have passed. The
+ *  work keeps running; its eventual rejection is swallowed here (the caller
+ *  has stopped listening — an unhandled rejection would end the process). */
+function waitAtMost<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_OUT> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
+    timer = setTimeout(() => resolve(TIMED_OUT), ms);
+  });
+  work.catch(() => undefined);
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
+}
 
 function verdictFor(outboundPpm: number, costPpm: number | null, profitable: boolean): string {
   if (costPpm === null) return "no cheap route — try a smaller amount or run it manually";
@@ -241,6 +275,15 @@ export interface RebalanceExecResult {
   feeSats: number | null;
   costPpm: number | null;
   error?: string;
+  /** We stopped waiting (REBALANCE_HARD_TIMEOUT_MS) while the payment was
+   *  still in flight: it may still succeed. Its hash lets a later run learn
+   *  the outcome; until then its maximum fee counts as spent. */
+  inFlight?: { paymentId: string; maxFeeSats: number };
+}
+
+export interface RebalanceExecOptions {
+  /** Wall-clock limit for the whole rebalance (default REBALANCE_HARD_TIMEOUT_MS). */
+  hardTimeoutMs?: number;
 }
 
 /** ln-service throws errors as [code, name, { ... }] arrays — surface the cause. */
@@ -268,7 +311,9 @@ export async function executeRebalance(
   readLnd: AuthenticatedLnd,
   writeLnd: AuthenticatedLnd,
   params: RebalanceExecParams,
+  opts: RebalanceExecOptions = {},
 ): Promise<RebalanceExecResult> {
+  const deadline = Date.now() + (opts.hardTimeoutMs ?? REBALANCE_HARD_TIMEOUT_MS);
   const channels = await getChannelsView(readLnd);
   const target = channels.find((c) => c.id === params.targetId);
   const source = channels.find((c) => c.id === params.sourceId);
@@ -305,6 +350,10 @@ export async function executeRebalance(
   }
 
   const ownKey = await getOwnPubkey(readLnd);
+  // The CLTV ceiling is relative to the tip; without a height, LND's default applies.
+  const tip = await getWalletInfo({ lnd: readLnd })
+    .then((w) => w.current_block_height)
+    .catch(() => null);
 
   // Adaptive: try the requested amount, then progressively smaller, paying the
   // first that actually routes. LND's multi-path payment retries across many
@@ -312,11 +361,16 @@ export async function executeRebalance(
   // return via the target's peer, never exceeding the per-amount fee budget.
   let lastErr: unknown = null;
   for (const amount of adaptiveAmounts(params.amountSats)) {
+    const left = deadline - Date.now();
+    if (left <= 0) {
+      lastErr ??= new Error("rebalance time limit reached");
+      break;
+    }
     const maxFeeSats = Math.max(1, Math.floor((amount * budgetPpm) / 1_000_000));
     try {
       const invoice = await createInvoice({ lnd: writeLnd, tokens: amount });
       const decoded = await decodePaymentRequest({ lnd: readLnd, request: invoice.request });
-      const paid = await payViaPaymentDetails({
+      const paying = payViaPaymentDetails({
         lnd: writeLnd,
         id: invoice.id,
         destination: ownKey,
@@ -326,8 +380,20 @@ export async function executeRebalance(
         incoming_peer: target.peerPubkey,
         payment: decoded.payment,
         mtokens: decoded.mtokens,
-        pathfinding_timeout: PATHFINDING_TIMEOUT_MS,
+        pathfinding_timeout: Math.min(PATHFINDING_TIMEOUT_MS, left),
+        ...(tip ? { max_timeout_height: tip + REBALANCE_MAX_TIMEOUT_BLOCKS } : {}),
       });
+      const paid = await waitAtMost(paying, left);
+      if (paid === TIMED_OUT) {
+        // Never try the next amount now: this one may still go through.
+        return {
+          ...base,
+          budgetPpm,
+          amountSats: amount,
+          inFlight: { paymentId: invoice.id, maxFeeSats },
+          error: `payment still in flight after ${Math.round((opts.hardTimeoutMs ?? REBALANCE_HARD_TIMEOUT_MS) / 1000)}s — it may still land; LightningMate keeps checking and logs how it ends`,
+        };
+      }
       const feeSats = paid.safe_fee ?? paid.fee;
       return {
         ...base,

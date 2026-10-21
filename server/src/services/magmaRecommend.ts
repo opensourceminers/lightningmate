@@ -5,7 +5,8 @@ import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
 import { computeNodeNeed, type NodeNeed } from "./suggestRecommend.js";
 import { saleFeeConfig } from "./serviceFee.js";
-import { getMarket, getMyOffers, getMyOrders, type MagmaOffer, type MyOffer, type MyOrder } from "./amboss.js";
+import { getMarket, type MagmaOffer } from "./amboss.js";
+import { getMyOffers, getMyOrders, type MyOffer, type MyOrder } from "./magmaApi.js";
 import {
   clearingFor,
   demandFit,
@@ -593,7 +594,7 @@ export async function getMagmaRecommendations(
     } else if (!beatsRouting && cfg.sellPricingMode !== "premium") {
       state = "do_not_list_unprofitable";
       reasons.push("even the recommended price barely beats routing — better to keep this capital routing");
-    } else if (offer && offer.totalSizeSats < offer.maxSizeSats) {
+    } else if (offer && offer.availableSats < offer.maxSizeSats) {
       state = "exhausted";
       reasons.push("offer is depleted — relist at today's recommended price, not the old one");
       shouldReprice = current ? recommended.effectiveFeePpm > current.effectiveFeePpm : false;
@@ -754,14 +755,17 @@ export async function getMagmaRecommendations(
   // ── Analytics ──
   const now = Date.now();
   const within30 = (at: string) => now - new Date(at).getTime() <= 30 * 86_400_000;
-  const filled = myOrders.filter((o) => o.transactionId);
+  // Sold = the channel was funded and Amboss has it (the Magma API carries no
+  // funding txid in its order list; the status says it).
+  const filled = myOrders.filter((o) => o.sold);
   const filled30 = filled.filter((o) => within30(o.createdAt));
   const grossEarningsSat = filled.reduce((s, o) => s + o.feeSats, 0);
   const serviceFeesSat = Math.round(grossEarningsSat * cfg.serviceFeeRate);
   const onchainCostsSat = filled.length * (cfg.defaultOpenCostSat + (cfg.includeCloseCost ? cfg.defaultCloseCostSat : 0));
   const leasePpms = filled.filter((o) => o.sizeSats > 0).map((o) => (o.feeSats / o.sizeSats) * 1_000_000);
-  const offersActive = myOffers.filter((o) => o.status === "ENABLED" && o.totalSizeSats >= o.maxSizeSats).length;
-  const offersExhausted = myOffers.filter((o) => o.status === "ENABLED" && o.totalSizeSats < o.maxSizeSats).length;
+  // Listed liquidity a new buyer can still order is total − locked (Amboss).
+  const offersActive = myOffers.filter((o) => o.status === "ENABLED" && o.availableSats >= o.maxSizeSats).length;
+  const offersExhausted = myOffers.filter((o) => o.status === "ENABLED" && o.availableSats < o.maxSizeSats).length;
   const offersInactive = myOffers.filter((o) => o.status !== "ENABLED").length;
   const analytics: MagmaSellAnalytics = {
     mySellerScore,
@@ -769,8 +773,8 @@ export async function getMagmaRecommendations(
     offersInactive,
     offersExhausted,
     totalListedSat: myOffers.reduce((s, o) => s + o.totalSizeSats, 0),
-    availableSat: myOffers.filter((o) => o.status === "ENABLED").reduce((s, o) => s + o.totalSizeSats, 0),
-    deployedSat: myOrders.filter((o) => o.channelId && o.blocksUntilClosable > 0).reduce((s, o) => s + o.sizeSats, 0),
+    availableSat: myOffers.filter((o) => o.status === "ENABLED").reduce((s, o) => s + o.availableSats, 0),
+    deployedSat: myOrders.filter((o) => o.leaseActive).reduce((s, o) => s + o.sizeSats, 0),
     filledOrders30d: filled30.length,
     filledOrdersAllTime: filled.length,
     grossEarningsSat,
@@ -779,7 +783,8 @@ export async function getMagmaRecommendations(
     netProfitSat: grossEarningsSat - serviceFeesSat - onchainCostsSat,
     avgLeaseFeePpm: leasePpms.length ? Math.round(median(leasePpms)) : null,
     fillRate: myOrders.length ? Math.round((filled.length / myOrders.length) * 100) / 100 : null,
-    closableSoon: myOrders.filter((o) => o.channelId && o.blocksUntilClosable > 0 && o.blocksUntilClosable <= 288).length,
+    // The Magma API's list says only when a lease is over (0 blocks left).
+    closableSoon: myOrders.filter((o) => o.blocksUntilClosable !== null && o.blocksUntilClosable <= 288).length,
   };
 
   // ── On-chain cost surfaced + spike warning (#4) ──

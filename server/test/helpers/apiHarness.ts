@@ -15,6 +15,7 @@ import { EarningsLog } from "../../src/services/earningsLog.js";
 import { LnPlusStore } from "../../src/services/lnplusStore.js";
 import { Lsps1Service } from "../../src/services/lsps1.js";
 import { ServiceFeeLedger, lndFeeLightning } from "../../src/services/serviceFee.js";
+import { CapitalLedger } from "../../src/services/capital.js";
 import { FakeLnd } from "./fakeLnd.js";
 import { makeTempDir, type AfterHook } from "./tmp.js";
 
@@ -37,6 +38,7 @@ import { makeTempDir, type AfterHook } from "./tmp.js";
 export interface ApiHarness {
   dir: string;
   node: FakeLnd;
+  capital: CapitalLedger;
   autopilot: Autopilot;
   lsps1: Lsps1Service;
   serviceFees: ServiceFeeLedger;
@@ -73,7 +75,9 @@ export async function startApi(
   const serviceFees = new ServiceFeeLedger(dir, writeLnd ? lndFeeLightning(writeLnd) : null, {
     payTimeoutMs: opts.payTimeoutMs ?? 200,
   });
-  const autopilot = new Autopilot(dir, node.lnd, writeLnd, rebalanceLog, overrides, amboss, earnings, serviceFees, lnplus);
+  // One on-chain budget for Magma, LSPS1 and the autopilot — as in index.ts.
+  const capital = new CapitalLedger();
+  const autopilot = new Autopilot(dir, node.lnd, writeLnd, rebalanceLog, overrides, amboss, earnings, serviceFees, lnplus, capital);
   const lsps1 = new Lsps1Service(
     dir,
     node.lnd,
@@ -84,6 +88,8 @@ export async function startApi(
     () => amboss.getKey(),
     earnings,
     serviceFees,
+    undefined,
+    capital,
   );
   const config: Config = {
     port: 0,
@@ -182,6 +188,7 @@ export async function startApi(
   return {
     dir,
     node,
+    capital,
     autopilot,
     lsps1,
     serviceFees,

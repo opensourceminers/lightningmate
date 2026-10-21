@@ -8,8 +8,10 @@ import type {
   SuggestionsResponse,
 } from "../types";
 import { sats, satsCompact } from "../format";
+import { promisedSpend, spendPromisedQuestion } from "../statusNotes";
 import { Scanning } from "./Scanning";
 import { EmptyState } from "./Skeleton";
+import { useUi } from "./Overlay";
 
 type NumKey = "count" | "minChannels" | "maxStaleDays";
 
@@ -57,6 +59,7 @@ function CopyButton({ pubkey }: { pubkey: string }) {
 }
 
 export function SuggestionsPanel() {
+  const ui = useUi();
   const [draft, setDraft] = useState(DEFAULTS);
   const [data, setData] = useState<SuggestionsResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -107,8 +110,28 @@ export function SuggestionsPanel() {
   const submitOpen = async (s: ChannelSuggestion) => {
     setOpening(true);
     setResult(null);
+    const open = (spendPromised: boolean) =>
+      api.channelOpen({ pubkey: s.pubkey, socket: s.socket, localTokens: size, ...(spendPromised ? { spendPromised } : {}) });
     try {
-      const res = await api.channelOpen({ pubkey: s.pubkey, socket: s.socket, localTokens: size });
+      let res: OpenChannelResult;
+      try {
+        res = await open(false);
+      } catch (e) {
+        // Coins promised to buyers: only with an explicit yes that names them.
+        const promised = promisedSpend(e);
+        if (!promised) throw e;
+        const yes = await ui.confirm({
+          title: "Spend coins promised to buyers?",
+          message: spendPromisedQuestion(promised),
+          confirmLabel: "Open anyway",
+          danger: true,
+        });
+        if (!yes) {
+          setResult({ ok: false, pubkey: s.pubkey, localTokens: size, error: promised.message });
+          return;
+        }
+        res = await open(true);
+      }
       setResult(res);
       if (res.ok) setOpenFor(null);
     } catch (e) {

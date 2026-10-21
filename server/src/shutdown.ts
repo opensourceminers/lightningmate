@@ -11,6 +11,24 @@ import type { RequestHandler } from "express";
  * recorded state, flush state to disk and exit cleanly well inside the grace.
  */
 
+/** Total shutdown budget: well inside docker's stop_grace_period (1 min in
+ *  our composes), after which the process is SIGKILLed. */
+export const SHUTDOWN_GRACE_MS = 45_000;
+/** Kept back from the wait for the flush and the server close. */
+export const SHUTDOWN_FLUSH_RESERVE_MS = 8_000;
+/**
+ * How long the shutdown waits for work under way (an autopilot step, an
+ * order-lane step, an LSP open, a request). It must outlast the longest
+ * single Amboss call — HTTP_TIMEOUTS.ambossMutationMs (http.ts) plus the
+ * journal save around it — so a Magma accept, add_transaction or reject that
+ * is in flight when the signal comes either completes or times out, and is
+ * recorded either way, before the process exits. (It used to be 37 s against
+ * a 45 s mutation deadline: a slow add_transaction could be cut off with its
+ * outcome unknown.) Every such step is also written to the order journal
+ * before it is sent, so even a SIGKILL leaves a record to reconcile from.
+ */
+export const SHUTDOWN_WAIT_MS = SHUTDOWN_GRACE_MS - SHUTDOWN_FLUSH_RESERVE_MS;
+
 export interface ShutdownStep {
   name: string;
   run: () => void | Promise<unknown>;
@@ -193,7 +211,7 @@ export function appShutdownSteps(p: ShutdownParts, waitBudgetMs: number): Shutdo
       },
     },
     {
-      name: "wait for in-flight work (autopilot pass, LSP channel opens, write requests)",
+      name: "wait for in-flight work (autopilot pass, Magma order step, LSP channel opens, write requests)",
       timeoutMs: waitBudgetMs,
       run: () =>
         Promise.all([

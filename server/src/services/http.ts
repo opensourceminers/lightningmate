@@ -12,10 +12,15 @@
 /** Per-service deadlines, in one place. Mutable so tests can shrink them. */
 export const HTTP_TIMEOUTS = {
   /** Amboss GraphQL reads (offers, orders, history, key checks). */
-  ambossQueryMs: 20_000,
+  ambossQueryMs: 15_000,
   /** Amboss mutations get longer: a timed-out mutation may still have been
-   *  applied server-side, so give a slow-but-working Amboss time to answer. */
-  ambossMutationMs: 45_000,
+   *  applied server-side, so give a slow-but-working Amboss time to answer.
+   *  Must stay well below the shutdown wait (shutdown.ts SHUTDOWN_WAIT_MS),
+   *  so a mutation in flight at SIGTERM ends — answered or timed out, and
+   *  recorded — before the process exits. A timeout is not a guess either:
+   *  the Magma order journal re-reads the order from Amboss on the next pass
+   *  and acts on what actually happened. */
+  ambossMutationMs: 25_000,
   lnplusMs: 10_000,
   priceMs: 10_000,
   /** LNURL-pay lookups for the service fee. */

@@ -25,10 +25,15 @@ import { makeNodeKey, makePaymentRequest, parsePaymentRequest, type NodeKey } fr
  *   default.exportAllChannelBackups → getBackups
  *   default.decodePayReq → decodePaymentRequest
  *   default.addInvoice / default.lookupInvoice → createInvoice / getInvoice
+ *   default.listInvoices → getInvoices (newest first, paged, created_after)
+ *   invoices.addHoldInvoice / settleInvoice / cancelInvoice → createHodlInvoice,
+ *     settleHodlInvoice, cancelHodlInvoice; invoices.subscribeSingleInvoice
+ *     (stream) → subscribeToInvoice
  *   default.listPeers / default.connectPeer → getPeers / addPeer
  *   default.openChannel (stream) → openChannel
- *   router.sendPaymentV2 (stream) → pay / payViaPaymentRequest
+ *   router.sendPaymentV2 (stream) → pay / payViaPaymentRequest / payViaPaymentDetails
  *   router.trackPaymentV2 (stream) → getPayment
+ *   chain.registerBlockEpochNtfn (stream) → subscribeToBlocks / getHeight
  *
  * Anything else: `node.override("default.feeReport", (args, cb) => cb(null, {...}))`.
  * A method that is neither implemented nor overridden is ABSENT, so the
@@ -37,6 +42,9 @@ import { makeNodeKey, makePaymentRequest, parsePaymentRequest, type NodeKey } fr
  * Payments: `payOutcome` decides what `sendPaymentV2` does — "succeed",
  * "fail", or "hang" (stays IN_FLIGHT until `resolvePayment()`), which is how
  * a test reproduces a stuck HTLC.
+ *
+ * HODL invoices: `payHoldInvoice(id)` plays the buyer — an HTLC arrives and is
+ * held (state ACCEPTED) until the code under test settles or cancels it.
  */
 
 type Callback = (err: unknown, res?: unknown) => void;
@@ -55,6 +63,8 @@ export interface FakeChannel {
   transactionVout: number;
   isActive?: boolean;
   isPrivate?: boolean;
+  /** Opened by the peer, not by this node (default: by this node). */
+  partnerInitiated?: boolean;
 }
 
 export interface FakePendingChannel {
@@ -65,18 +75,29 @@ export interface FakePendingChannel {
   transactionVout: number;
   /** "opening" (default) or a cooperative/force close waiting to confirm. */
   state?: "opening" | "waiting_close";
+  /** Opened by the peer, not by this node (default: by this node). */
+  partnerInitiated?: boolean;
 }
 
 export interface FakeInvoice {
   id: string;
+  /** Preimage — "" for a HODL invoice until it is settled. */
   secret: string;
   request: string;
   tokens: number;
+  /** Exact amount, millisats. */
+  mtokens: string;
   description: string;
   createdAtSec: number;
   expirySec: number;
   state: "OPEN" | "ACCEPTED" | "SETTLED" | "CANCELED";
   receivedSats: number;
+  /** A HODL invoice (settles only with settleInvoice). */
+  hold?: boolean;
+  /** Final CLTV delta asked for when it was created. */
+  cltvDelta?: number;
+  /** HTLCs paying it (held, settled or cancelled). */
+  htlcs?: { amtMsat: string; expiryHeight: number; acceptHeight: number; state: "ACCEPTED" | "SETTLED" | "CANCELED" }[];
 }
 
 export interface FakePayment {
@@ -124,6 +145,10 @@ const constraints = {
   min_htlc_msat: "1",
 };
 
+/** Our side of a pending channel: all of it when we funded it, none when the
+ *  peer did (unless the test says otherwise). */
+const pendingLocal = (p: FakePendingChannel): number => p.localBalance ?? (p.partnerInitiated ? 0 : p.capacity);
+
 /** Emit on the next tick so listeners attached after the call still see it. */
 function later(fn: () => void): void {
   setImmediate(fn);
@@ -153,8 +178,13 @@ export class FakeLnd {
   openFailure: string | null = null;
   /** Every gRPC call, in order. */
   readonly calls: { method: string; args: GrpcArgs }[] = [];
+  /** Runs as each call arrives, before LND acts on it — e.g. to look at the
+   *  disk at exactly that moment. */
+  beforeCall: ((method: string, args: GrpcArgs) => void) | null = null;
   private readonly overrides = new Map<string, UnaryImpl | StreamImpl>();
+  private readonly failures: { method: string; details: string; when: () => boolean }[] = [];
   private readonly paymentStreams = new Map<string, EventEmitter[]>();
+  private readonly invoiceStreams = new Map<string, EventEmitter[]>();
 
   constructor(opts: FakeLndOptions = {}) {
     this.key = opts.key ?? makeNodeKey();
@@ -183,7 +213,7 @@ export class FakeLnd {
         channelBalance: (_a, cb) =>
           cb(null, {
             balance: String(this.channels.reduce((s, c) => s + c.localBalance, 0)),
-            pending_open_balance: String(this.pending.reduce((s, p) => s + (p.localBalance ?? p.capacity), 0)),
+            pending_open_balance: String(this.pending.reduce((s, p) => s + pendingLocal(p), 0)),
           }),
         exportAllChannelBackups: (_a, cb) => cb(null, this.backupsRpc()),
         decodePayReq: (a, cb) => {
@@ -200,6 +230,7 @@ export class FakeLnd {
           if (!inv) cb({ details: "unable to locate invoice" });
           else cb(null, this.invoiceRpc(inv));
         },
+        listInvoices: (a, cb) => cb(null, this.listInvoicesRpc(a)),
         listPeers: (_a, cb) => cb(null, { peers: this.peers.map((pk) => this.peerRpc(pk)) }),
         connectPeer: (a, cb) => {
           const addr = a.addr as { pubkey: string };
@@ -211,6 +242,48 @@ export class FakeLnd {
       router: {
         sendPaymentV2: (a: GrpcArgs) => this.sendPaymentStream(a),
         trackPaymentV2: (a: GrpcArgs) => this.trackPaymentStream(a),
+      },
+      chain: {
+        // Block notifications: the current tip right away (as LND does).
+        registerBlockEpochNtfn: () => {
+          const s = stream();
+          later(() => s.emit("data", { hash: randomBytes(32), height: this.blockHeight }));
+          return s;
+        },
+      },
+      invoices: {
+        addHoldInvoice: (a, cb) => cb(null, this.addHoldInvoiceRpc(a)),
+        settleInvoice: (a, cb) => {
+          const secret = Buffer.from(a.preimage as Buffer).toString("hex");
+          const inv = this.invoices.get(paymentHashOf(secret));
+          if (!inv) return cb({ details: "unable to locate invoice" });
+          if (inv.state === "SETTLED") return cb(null, {});
+          if (inv.state !== "ACCEPTED") return cb({ details: inv.state === "OPEN" ? "invoice still open" : "invoice already canceled" });
+          inv.state = "SETTLED";
+          inv.secret = secret;
+          for (const h of inv.htlcs ?? []) if (h.state === "ACCEPTED") h.state = "SETTLED";
+          this.emitInvoice(inv);
+          cb(null, {});
+        },
+        cancelInvoice: (a, cb) => {
+          const inv = this.invoices.get(Buffer.from(a.payment_hash as Buffer).toString("hex"));
+          if (!inv) return cb({ details: "unable to locate invoice" });
+          if (inv.state === "SETTLED") return cb({ details: "invoice already settled" });
+          inv.state = "CANCELED";
+          for (const h of inv.htlcs ?? []) if (h.state === "ACCEPTED") h.state = "CANCELED";
+          this.emitInvoice(inv);
+          cb(null, {});
+        },
+        subscribeSingleInvoice: (a: GrpcArgs) => {
+          const id = Buffer.from(a.r_hash as Buffer).toString("hex");
+          const s = stream();
+          this.invoiceStreams.set(id, [...(this.invoiceStreams.get(id) ?? []), s]);
+          later(() => {
+            const inv = this.invoices.get(id);
+            if (inv) s.emit("data", this.invoiceRpc(inv));
+          });
+          return s;
+        },
       },
     };
 
@@ -225,6 +298,12 @@ export class FakeLnd {
             if (!impl) return undefined;
             return (args: GrpcArgs, cb?: Callback) => {
               this.calls.push({ method: name, args });
+              this.beforeCall?.(name, args);
+              const failure = cb ? this.failures.findIndex((f) => f.method === name && f.when()) : -1;
+              if (failure >= 0) {
+                const [f] = this.failures.splice(failure, 1);
+                return cb!({ details: f.details });
+              }
               return cb ? (impl as UnaryImpl)(args, cb) : (impl as StreamImpl)(args);
             };
           },
@@ -251,6 +330,13 @@ export class FakeLnd {
     this.overrides.set(method, impl);
   }
 
+  /** The next call of the unary method `method` for which `when` says yes
+   *  fails with LND's `details` text (once); every other call is answered as
+   *  usual — LND blinking at exactly one moment. */
+  failNext(method: string, details: string, when: () => boolean = () => true): void {
+    this.failures.push({ method, details, when });
+  }
+
   /** Arguments of every call to one gRPC method, in order. */
   callsTo(method: string): GrpcArgs[] {
     return this.calls.filter((c) => c.method === method).map((c) => c.args);
@@ -259,6 +345,58 @@ export class FakeLnd {
   /** An invoice issued BY this node (destination = this node's key). */
   makeOwnRequest(tokens: number, description = ""): string {
     return makePaymentRequest({ key: this.key, tokens, description }).request;
+  }
+
+  /**
+   * The buyer pays a HODL invoice: an HTLC for its amount (or `mtokens`)
+   * arrives and is HELD until settled or cancelled. `expiryHeight` is the
+   * HTLC's CLTV expiry (default: tip + the invoice's final CLTV delta).
+   */
+  payHoldInvoice(id: string, opts: { mtokens?: string; expiryHeight?: number } = {}): void {
+    const inv = this.invoices.get(id);
+    if (!inv) throw new Error(`no invoice ${id}`);
+    if (!inv.hold) throw new Error(`invoice ${id} is not a HODL invoice`);
+    if (inv.state !== "OPEN") throw new Error(`invoice ${id} is ${inv.state}`);
+    inv.htlcs = [
+      ...(inv.htlcs ?? []),
+      {
+        amtMsat: opts.mtokens ?? inv.mtokens,
+        expiryHeight: opts.expiryHeight ?? this.blockHeight + (inv.cltvDelta ?? 40),
+        acceptHeight: this.blockHeight,
+        state: "ACCEPTED",
+      },
+    ];
+    inv.state = "ACCEPTED";
+    this.emitInvoice(inv);
+  }
+
+  /**
+   * A plain (non-HODL) invoice of this node — the kind 0.7.x accepted Magma
+   * orders with. `paid` settles it as the buyer's payment would have (a plain
+   * invoice settles the moment it is paid). Returns its payment hash.
+   */
+  addPlainInvoice(opts: { tokens: number; description: string; paid?: boolean }): string {
+    const res = this.addInvoiceRpc({ value_msat: String(opts.tokens * 1000), memo: opts.description, expiry: 49 * 3600 });
+    const id = Buffer.from(res.r_hash).toString("hex");
+    const inv = this.invoices.get(id)!;
+    if (opts.paid) {
+      inv.state = "SETTLED";
+      inv.receivedSats = opts.tokens;
+    }
+    return id;
+  }
+
+  /** LND's own expiry handling: a held HTLC near its expiry is cancelled. */
+  expireHoldInvoice(id: string): void {
+    const inv = this.invoices.get(id);
+    if (!inv) throw new Error(`no invoice ${id}`);
+    inv.state = "CANCELED";
+    for (const h of inv.htlcs ?? []) if (h.state === "ACCEPTED") h.state = "CANCELED";
+    this.emitInvoice(inv);
+  }
+
+  private emitInvoice(inv: FakeInvoice): void {
+    for (const s of this.invoiceStreams.get(inv.id) ?? []) s.emit("data", this.invoiceRpc(inv));
   }
 
   /** Finish a payment left IN_FLIGHT by payOutcome "hang". */
@@ -309,7 +447,7 @@ export class FakeLnd {
       commitment_type: "ANCHORS",
       csv_delay: 144,
       fee_per_kw: "253",
-      initiator: true,
+      initiator: !c.partnerInitiated,
       lifetime: "86400",
       local_balance: String(c.localBalance),
       local_chan_reserve_sat: "10000",
@@ -338,8 +476,8 @@ export class FakeLnd {
       channel_point: `${p.transactionId}:${p.transactionVout}`,
       chan_status_flags: "",
       commitment_type: "ANCHORS",
-      initiator: "INITIATOR_LOCAL",
-      local_balance: String(p.localBalance ?? p.capacity),
+      initiator: p.partnerInitiated ? "INITIATOR_REMOTE" : "INITIATOR_LOCAL",
+      local_balance: String(pendingLocal(p)),
       local_chan_reserve_sat: "0",
       memo: "",
       num_forwarding_packages: "0",
@@ -365,7 +503,7 @@ export class FakeLnd {
       })),
       waiting_close_channels: closing.map((p) => ({
         channel: this.pendingChannelRpc(p),
-        limbo_balance: String(p.localBalance ?? p.capacity),
+        limbo_balance: String(pendingLocal(p)),
         closing_txid: rand32(),
         closing_tx_hex: "",
       })),
@@ -430,6 +568,7 @@ export class FakeLnd {
       secret,
       request: made.request,
       tokens: mtokens ? Math.floor(Number(mtokens) / 1000) : 0,
+      mtokens: mtokens ?? "0",
       description: typeof a.memo === "string" ? a.memo : "",
       createdAtSec: nowSec(),
       expirySec,
@@ -444,18 +583,83 @@ export class FakeLnd {
     };
   }
 
+  private addHoldInvoiceRpc(a: GrpcArgs) {
+    const id = Buffer.from(a.hash as Buffer).toString("hex");
+    const mtokens = a.value_msat ? String(a.value_msat) : a.value ? String(Number(a.value) * 1000) : "0";
+    const expirySec = Number(a.expiry) || 3600;
+    const cltvDelta = Number(a.cltv_expiry) || undefined;
+    const made = makePaymentRequest({
+      key: this.key,
+      id,
+      mtokens: mtokens === "0" ? undefined : mtokens,
+      description: typeof a.memo === "string" ? a.memo : "",
+      expiresAt: new Date(Date.now() + expirySec * 1000).toISOString(),
+      cltvDelta,
+    });
+    this.invoices.set(id, {
+      id,
+      secret: "",
+      request: made.request,
+      tokens: Math.floor(Number(mtokens) / 1000),
+      mtokens,
+      description: typeof a.memo === "string" ? a.memo : "",
+      createdAtSec: nowSec(),
+      expirySec,
+      state: "OPEN",
+      receivedSats: 0,
+      hold: true,
+      cltvDelta,
+      htlcs: [],
+    });
+    return { payment_request: made.request, add_index: String(this.invoices.size), payment_addr: randomBytes(32) };
+  }
+
+  /** ListInvoices with reversed=true, as the library asks: the newest
+   *  `num_max_invoices` added before `index_offset` (all, when 0), within the
+   *  creation dates given. Add indexes follow the order invoices were made. */
+  private listInvoicesRpc(a: GrpcArgs) {
+    const start = Number(a.creation_date_start) || 0;
+    const end = Number(a.creation_date_end) || Number.POSITIVE_INFINITY;
+    const offset = Number(a.index_offset) || 0;
+    const max = Number(a.num_max_invoices) || 100;
+    const indexed = [...this.invoices.values()]
+      .map((inv, i) => ({ inv, index: i + 1 }))
+      .filter(({ inv }) => inv.createdAtSec >= start && inv.createdAtSec <= end)
+      .filter(({ inv }) => a.pending_only !== true || inv.state === "OPEN" || inv.state === "ACCEPTED");
+    const page = (offset > 0 ? indexed.filter((x) => x.index < offset) : indexed).slice(-max);
+    return {
+      invoices: page.map(({ inv, index }) => ({ ...this.invoiceRpc(inv), add_index: String(index) })),
+      first_index_offset: String(page[0]?.index ?? 0),
+      last_index_offset: String(page[page.length - 1]?.index ?? 0),
+    };
+  }
+
   private invoiceRpc(inv: FakeInvoice) {
+    const htlcs = inv.htlcs ?? [];
+    const paidMsat = htlcs.filter((h) => h.state !== "CANCELED").reduce((s, h) => s + BigInt(h.amtMsat), 0n);
+    const paid = inv.hold ? paidMsat : BigInt(inv.receivedSats) * 1000n;
     return {
       add_index: "1",
-      amt_paid_msat: String(inv.receivedSats * 1000),
-      amt_paid_sat: String(inv.receivedSats),
-      cltv_expiry: "80",
+      amt_paid_msat: String(paid),
+      amt_paid_sat: String(paid / 1000n),
+      cltv_expiry: String(inv.cltvDelta ?? 80),
       creation_date: String(inv.createdAtSec),
       description_hash: Buffer.alloc(0),
       expiry: String(inv.expirySec),
       fallback_addr: "",
       features: {},
-      htlcs: [],
+      htlcs: htlcs.map((h, i) => ({
+        accept_height: h.acceptHeight,
+        accept_time: String(nowSec()),
+        amt_msat: h.amtMsat,
+        chan_id: chanNumber("800000x1x0"),
+        custom_records: {},
+        expiry_height: h.expiryHeight,
+        htlc_index: String(i + 1),
+        mpp_total_amt_msat: h.amtMsat,
+        resolve_time: h.state === "ACCEPTED" ? "0" : String(nowSec()),
+        state: h.state,
+      })),
       is_amp: false,
       is_keysend: false,
       memo: inv.description,
@@ -468,7 +672,7 @@ export class FakeLnd {
       settle_index: inv.state === "SETTLED" ? "1" : "0",
       state: inv.state,
       value: String(inv.tokens),
-      value_msat: String(inv.tokens * 1000),
+      value_msat: inv.mtokens,
     };
   }
 
@@ -559,7 +763,17 @@ export class FakeLnd {
     later(() => {
       const request = typeof a.payment_request === "string" ? a.payment_request : undefined;
       if (!request) {
-        s.emit("error", { details: "fake LND only pays payment requests" });
+        // Paying by details (payViaPaymentDetails — e.g. a circular rebalance).
+        if (!a.dest || !a.payment_hash) {
+          s.emit("error", { details: "fake LND needs a payment request or dest + payment_hash" });
+          return;
+        }
+        const msat = a.amt_msat !== undefined ? Number(a.amt_msat) : Number(a.amt ?? 0) * 1000;
+        this.startPayment(s, a, {
+          id: Buffer.from(a.payment_hash as Buffer).toString("hex"),
+          destination: Buffer.from(a.dest as Buffer).toString("hex"),
+          tokens: Math.floor(msat / 1000),
+        });
         return;
       }
       const parsed = parsePaymentRequest(request);
@@ -576,27 +790,35 @@ export class FakeLnd {
         return;
       }
       const tokens = parsed.tokens > 0 ? parsed.tokens : Number(a.amt ?? 0);
-      const payment: FakePayment = {
-        id: parsed.id,
-        request,
-        destination: parsed.destination,
-        tokens,
-        feeMsat: String(this.routingFeeMsat),
-        status: "IN_FLIGHT",
-        preimage: rand32(),
-        params: a,
-      };
-      this.payments.set(payment.id, payment);
-      this.paymentStreams.set(payment.id, [...(this.paymentStreams.get(payment.id) ?? []), s]);
-      const outcome = typeof this.payOutcome === "function" ? this.payOutcome(payment) : this.payOutcome;
-      if (outcome === "hang") {
-        s.emit("data", this.paymentRpc(payment));
-        return;
-      }
-      payment.status = outcome === "succeed" ? "SUCCEEDED" : "FAILED";
-      s.emit("data", this.paymentRpc(payment));
+      this.startPayment(s, a, { id: parsed.id, request, destination: parsed.destination, tokens });
     });
     return s;
+  }
+
+  private startPayment(
+    s: EventEmitter,
+    a: GrpcArgs,
+    p: { id: string; request?: string; destination: string; tokens: number },
+  ): void {
+    const payment: FakePayment = {
+      id: p.id,
+      request: p.request,
+      destination: p.destination,
+      tokens: p.tokens,
+      feeMsat: String(this.routingFeeMsat),
+      status: "IN_FLIGHT",
+      preimage: rand32(),
+      params: a,
+    };
+    this.payments.set(payment.id, payment);
+    this.paymentStreams.set(payment.id, [...(this.paymentStreams.get(payment.id) ?? []), s]);
+    const outcome = typeof this.payOutcome === "function" ? this.payOutcome(payment) : this.payOutcome;
+    if (outcome === "hang") {
+      s.emit("data", this.paymentRpc(payment));
+      return;
+    }
+    payment.status = outcome === "succeed" ? "SUCCEEDED" : "FAILED";
+    s.emit("data", this.paymentRpc(payment));
   }
 
   private trackPaymentStream(a: GrpcArgs) {

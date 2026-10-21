@@ -1,32 +1,33 @@
 /**
- * Every place a sale completes (autopilot Magma fulfilment, the manual "open
- * channel" route, an LSPS1 settle and its restart recovery) must book the sale
- * once and ENQUEUE the service fee — never await the fee payment. The fake node
- * is set to leave payments hanging, as a stuck HTLC would: before the fix each
- * of these paths awaited that payment and never returned.
+ * Every place a sale completes (a Magma order settling after Amboss confirmed
+ * its channel — taken on by the autopilot or by hand — an LSPS1 settle and its
+ * restart recovery) must book the sale once and ENQUEUE the service fee —
+ * never await the fee payment. The fake node is set to leave payments
+ * hanging, as a stuck HTLC would: before the fix each of these paths awaited
+ * that payment and never returned.
+ *
+ * A Magma sale is complete when Amboss reports VALID_CHANNEL_OPENING and the
+ * buyer's held payment is settled — not when the channel is merely opened.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { Autopilot } from "../src/services/autopilot.js";
-import { RebalanceLog } from "../src/services/rebalanceLog.js";
-import { OverridesStore } from "../src/services/overrides.js";
-import { AmbossStore } from "../src/services/ambossStore.js";
 import { EarningsLog } from "../src/services/earningsLog.js";
 import { SettingsStore } from "../src/services/settings.js";
 import { Lsps1Service, type Lsps1Order } from "../src/services/lsps1.js";
 import { ServiceFeeLedger, lndFeeLightning } from "../src/services/serviceFee.js";
+import { HTTP_TIMEOUTS } from "../src/services/http.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
 import { mockLnurlPayServer } from "./helpers/lnurl.js";
-import { mockAmbossSeller, sellerOrder } from "./helpers/amboss.js";
+import { FakeMagma } from "./helpers/magma.js";
+import { BUYER, sellerSetup } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { makeTempDir, type AfterHook } from "./helpers/tmp.js";
 import { withEnv } from "./helpers/env.js";
 
 const ADDRESS = "fees@fees.example";
-const BUYER = "02" + "ab".repeat(32);
 
 function feeEnv(t: AfterHook): void {
   withEnv(t, { LM_SELL_FEE_BPS: "100", LM_SELL_FEE_ADDRESS: ADDRESS, LM_SELL_FEE_PUBKEY: undefined });
@@ -45,44 +46,47 @@ async function within<T>(ms: number, p: Promise<T>, what: string): Promise<T> {
   }
 }
 
-test("autopilot Magma fulfilment books the sale and enqueues the fee without waiting for it", async (t) => {
+/** Temporarily shrink one deadline. */
+function shrink(t: AfterHook, key: keyof typeof HTTP_TIMEOUTS, ms: number): void {
+  const saved = HTTP_TIMEOUTS[key];
+  HTTP_TIMEOUTS[key] = ms;
+  t.after(() => {
+    HTTP_TIMEOUTS[key] = saved;
+  });
+}
+
+/** An autopilot selling on Magma, one order accepted and paid by the buyer. */
+async function paidOrder(t: AfterHook, opts: Parameters<typeof sellerSetup>[1] = {}) {
+  const s = sellerSetup(t, opts);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  await s.autopilot.pollSellOrders(); // accept with a HODL invoice
+  assert.equal(s.magma.sales.get(sale.id)?.status, "WAITING_FOR_BUYER_PAYMENT");
+  s.magma.buyerPays(sale.id, s.node);
+  return { ...s, sale };
+}
+
+test("a Magma sale is booked and its fee enqueued when it completes — without waiting for the fee payment", async (t) => {
   feeEnv(t);
-  const dir = makeTempDir(t);
-  writeFileSync(
-    join(dir, "autopilot.json"),
-    JSON.stringify({
-      config: { sellEnabled: true, sellMaxDeploySats: 50_000_000, sellMaxChannelSats: 10_000_000 },
-      history: [],
-      sellAutoSizeMigrated: true,
-    }),
-  );
-  const http = installFetchMock(t);
-  mockAmbossSeller(http, { orders: [sellerOrder({ id: "ord-1", destination: `${BUYER}@1.2.3.4:9735` })] });
+  const { autopilot, node, magma, sale, earnings, fees, http } = await paidOrder(t, { payFees: true, payTimeoutMs: 100 });
   mockLnurlPayServer(http, { address: ADDRESS });
-  const node = new FakeLnd({ chainBalance: 20_000_000 });
   node.payOutcome = "hang"; // a stuck HTLC
 
-  const amboss = new AmbossStore(dir);
-  amboss.setKey("test-key");
-  const earnings = new EarningsLog(dir);
-  const fees = new ServiceFeeLedger(dir, lndFeeLightning(node.lnd), { payTimeoutMs: 100 });
-  const autopilot = new Autopilot(dir, node.lnd, node.lnd, new RebalanceLog(dir), new OverridesStore(dir), amboss, earnings, fees);
-  t.after(() => {
-    autopilot.shutdown();
-    fees.stop();
-  });
+  await autopilot.pollSellOrders(); // open + report
+  assert.equal(earnings.recent().length, 0, "an opened channel is not a sale yet");
+  assert.equal(fees.entries().length, 0, "and owes no fee yet");
 
-  await within(10_000, autopilot.pollSellOrders(), "pollSellOrders");
+  magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  await within(10_000, autopilot.pollSellOrders(), "the order lane");
 
-  const open = autopilot.getState().history[0]?.sells.find((s) => s.action === "open");
-  assert.equal(open?.ok, true);
   assert.deepEqual(
     earnings.recent().map((r) => [r.orderId, r.leaseSats]),
-    [["ord-1", 12_345]],
+    [[sale.id, 12_345]],
   );
   const [entry] = fees.entries();
-  assert.equal(entry.key, "magma:ord-1");
+  assert.equal(entry.key, `magma:${sale.id}`);
   assert.equal(entry.feeSats, 123);
+  const settle = autopilot.getState().history[0]?.sells.find((s) => s.action === "settle");
+  assert.equal(settle?.ok, true);
 
   // The fee is paid in the background (and here stays in flight).
   await fees.processDue();
@@ -90,118 +94,139 @@ test("autopilot Magma fulfilment books the sale and enqueues the fee without wai
   assert.equal(fees.entries()[0].state, "inflight");
 });
 
-test("the same Magma sale completed twice is booked and charged once", async (t) => {
+test("the same Magma sale seen complete twice is booked and charged once", async (t) => {
   feeEnv(t);
-  const dir = makeTempDir(t);
-  writeFileSync(
-    join(dir, "autopilot.json"),
-    JSON.stringify({ config: { sellEnabled: true, sellMaxDeploySats: 50_000_000 }, history: [], sellAutoSizeMigrated: true }),
-  );
-  const http = installFetchMock(t);
-  mockAmbossSeller(http, { orders: [sellerOrder({ id: "ord-2", destination: `${BUYER}@1.2.3.4:9735` })] });
+  const { autopilot, node, magma, sale, earnings, fees, http } = await paidOrder(t, { payFees: true });
   mockLnurlPayServer(http, { address: ADDRESS });
-  const node = new FakeLnd({ chainBalance: 20_000_000 });
-  const amboss = new AmbossStore(dir);
-  amboss.setKey("test-key");
-  const earnings = new EarningsLog(dir);
-  // This fee payment goes through: give it time (on a busy machine the fake
-  // payment can take longer than a short timeout, and "paid" would read
-  // "still in flight").
-  const fees = new ServiceFeeLedger(dir, lndFeeLightning(node.lnd), { payTimeoutMs: 10_000 });
-  const autopilot = new Autopilot(dir, node.lnd, node.lnd, new RebalanceLog(dir), new OverridesStore(dir), amboss, earnings, fees);
-  t.after(() => {
-    autopilot.shutdown();
-    fees.stop();
-  });
-
   await autopilot.pollSellOrders();
-  await autopilot.pollSellOrders(); // Amboss still reports WAITING_FOR_CHANNEL_OPEN
+  magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  await autopilot.pollSellOrders();
+  magma.setStatus(sale.id, "CHANNEL_MONITORING_FINISHED"); // Amboss reports it again, later
+  await autopilot.pollSellOrders();
+  await autopilot.magma.tick();
   await fees.processDue();
-  assert.equal(earnings.recent().filter((r) => r.orderId === "ord-2").length, 1);
+  assert.equal(earnings.recent().filter((r) => r.orderId === sale.id).length, 1);
   assert.equal(fees.entries().length, 1);
   assert.equal(fees.entries()[0].state, "paid");
   assert.equal(node.callsTo("router.sendPaymentV2").length, 1, "one fee payment");
+  assert.equal(node.callsTo("invoices.settleInvoice").length, 1, "one settle");
 });
 
-test("a channel Amboss did not confirm is not booked as a sale and owes no fee", async (t) => {
+test("a channel Amboss did not confirm is not booked as a sale and owes no fee — the buyer is refunded", async (t) => {
   feeEnv(t);
-  const dir = makeTempDir(t);
-  writeFileSync(
-    join(dir, "autopilot.json"),
-    JSON.stringify({ config: { sellEnabled: true, sellMaxDeploySats: 50_000_000 }, history: [], sellAutoSizeMigrated: true }),
-  );
-  const http = installFetchMock(t);
-  mockAmbossSeller(http, {
-    orders: [sellerOrder({ id: "ord-x", destination: `${BUYER}@1.2.3.4:9735` })],
-    addTransactionResult: false,
-  });
-  const node = new FakeLnd({ chainBalance: 20_000_000 });
-  const amboss = new AmbossStore(dir);
-  amboss.setKey("test-key");
-  const earnings = new EarningsLog(dir);
-  const fees = new ServiceFeeLedger(dir, lndFeeLightning(node.lnd), { payTimeoutMs: 100 });
-  const autopilot = new Autopilot(dir, node.lnd, node.lnd, new RebalanceLog(dir), new OverridesStore(dir), amboss, earnings, fees);
-  t.after(() => {
-    autopilot.shutdown();
-    fees.stop();
-  });
-
+  const { autopilot, node, magma, sale, earnings, fees } = await paidOrder(t);
+  magma.behave.AddTransaction = "false"; // Amboss doesn't take the funding transaction
   await autopilot.pollSellOrders();
-  const open = autopilot.getState().history[0]?.sells.find((s) => s.action === "open");
-  assert.equal(open?.ok, false, "reported as a failure, not a sale");
-  assert.match(open?.error ?? "", /did not confirm/);
+  const report = autopilot.getState().history[0]?.sells.find((s) => s.action === "report");
+  assert.equal(report?.ok, false, "reported as a failure, not a sale");
+  assert.match(report?.error ?? "", /did not accept the funding transaction/);
+  magma.setStatus(sale.id, "INVALID_CHANNEL_OPENING");
+  await autopilot.pollSellOrders();
   assert.equal(earnings.recent().length, 0);
   assert.equal(fees.entries().length, 0);
+  assert.equal(node.callsTo("invoices.settleInvoice").length, 0, "never settled");
+  assert.equal(node.callsTo("invoices.cancelInvoice").length, 1, "the held payment was released");
 });
 
-// ── Hand-off: the per-order Magma journal ─────────────────────────────────────
-// Amboss mutations now have a deadline (http.ts). A mutation that timed out may
-// still have been applied, and only a persisted per-order record of the funding
-// outpoint can tell the two cases apart. That journal comes with the move of
-// the seller flow to Amboss's Magma API (the legacy seller mutations used here
-// are deprecated). These are its acceptance cases — listed by `npm test`, not
-// failing it — so they cannot get lost on the way.
-test.todo(
-  "order journal: add_transaction timed out but Amboss applied it — the sale is booked and its fee enqueued exactly once, when Amboss shows the order past WAITING_FOR_CHANNEL_OPEN with the journalled outpoint",
-);
-test.todo(
-  "order journal: add_transaction timed out and was not applied — the next poll re-sends the journalled outpoint and never opens a second channel for that order",
-);
+// ── The per-order Magma journal (P0's hand-off) ────────────────────────────────
+// Amboss mutations have a deadline (http.ts). A mutation that timed out may
+// still have been applied; only the persisted per-order record of the funding
+// outpoint tells the two cases apart.
 
-test("the manual 'open channel' route enqueues the fee and answers without waiting for it", async (t) => {
+test("order journal: add_transaction timed out but Amboss applied it — the sale is booked and its fee enqueued exactly once, when Amboss shows the order past WAITING_FOR_CHANNEL_OPEN with the journalled outpoint", async (t) => {
+  feeEnv(t);
+  shrink(t, "ambossMutationMs", 150);
+  const { autopilot, node, magma, sale, earnings, fees } = await paidOrder(t);
+  magma.behave.AddTransaction = "apply-then-hang"; // applied, but the answer never comes
+
+  await autopilot.pollSellOrders();
+  const report = autopilot.getState().history[0]?.sells.find((s) => s.action === "report");
+  assert.equal(report?.ok, false);
+  assert.match(report?.error ?? "", /report not confirmed/);
+  const journalled = autopilot.magma.journal.get(sale.id)?.fundingOutpoint;
+  assert.ok(journalled, "the outpoint is on record");
+  assert.equal(magma.sales.get(sale.id)?.transactionId, journalled, "Amboss has exactly that outpoint");
+
+  await autopilot.pollSellOrders(); // Amboss: SELLER_SENT_TRANSACTION
+  assert.equal(autopilot.magma.journal.get(sale.id)?.phase, "reported");
+  magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  await autopilot.pollSellOrders();
+  await autopilot.pollSellOrders();
+
+  assert.equal(node.callsTo("default.openChannel").length, 1, "one channel");
+  assert.equal(magma.count("AddTransaction"), 1, "no need to report it again");
+  assert.equal(earnings.recent().length, 1, "booked once");
+  assert.deepEqual(fees.entries().map((e) => e.key), [`magma:${sale.id}`], "one fee");
+});
+
+test("order journal: add_transaction timed out and was not applied — the next poll re-sends the journalled outpoint and never opens a second channel for that order", async (t) => {
+  feeEnv(t);
+  shrink(t, "ambossMutationMs", 150);
+  const { autopilot, node, magma, sale, fees } = await paidOrder(t);
+  magma.behave.AddTransaction = (n) => (n === 0 ? "hang" : "ok"); // the first one is lost
+
+  await autopilot.pollSellOrders();
+  assert.equal(magma.sales.get(sale.id)?.status, "WAITING_FOR_CHANNEL_OPEN", "Amboss never got it");
+  const journalled = autopilot.magma.journal.get(sale.id)?.fundingOutpoint;
+  assert.ok(journalled);
+
+  await autopilot.pollSellOrders();
+  const sent = magma.calls.filter((c) => c.op === "AddTransaction").map((c) => (c.variables.input as { tx_id: string }).tx_id);
+  assert.deepEqual(sent, [journalled, journalled], "the same outpoint, sent again");
+  assert.equal(node.callsTo("default.openChannel").length, 1, "never a second channel");
+  assert.equal(autopilot.magma.journal.get(sale.id)?.phase, "reported");
+  magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  await autopilot.pollSellOrders();
+  assert.equal(fees.entries().length, 1);
+});
+
+test("the manual 'open channel' route answers without waiting for a fee; the sale is booked when Amboss confirms it", async (t) => {
   feeEnv(t);
   const http = installFetchMock(t);
-  mockAmbossSeller(http, { orders: [sellerOrder({ id: "ord-3", destination: `${BUYER}@1.2.3.4:9735` })] });
+  const magma = new FakeMagma(http, t);
   mockLnurlPayServer(http, { address: ADDRESS });
   const node = new FakeLnd({ chainBalance: 20_000_000 });
   node.payOutcome = "hang";
   const api = await startApi(t, { node });
   api.amboss.setKey("test-key");
+  const sale = magma.addSale({ buyerPubkey: BUYER });
 
-  const res = await within(10_000, api.request("POST", "/amboss/order/open", { id: "ord-3" }), "POST /amboss/order/open");
-  assert.equal(res.status, 200);
+  const accepted = await api.request("POST", "/amboss/order/accept", { id: sale.id });
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+  magma.buyerPays(sale.id, node);
+  const res = await within(10_000, api.request("POST", "/amboss/order/open", { id: sale.id }), "POST /amboss/order/open");
+  assert.equal(res.status, 200, JSON.stringify(res.body));
   assert.equal(res.body.ok, true);
+  assert.equal(res.body.reported, true);
+  assert.equal(api.earnings.recent().length, 0, "not a sale until Amboss confirms the channel");
+
+  magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  await within(10_000, api.autopilot.pollSellOrders(), "the order lane"); // runs for orders taken on by hand too
   assert.equal(api.earnings.recent().length, 1);
-  assert.equal(api.serviceFees.entries()[0]?.key, "magma:ord-3");
+  assert.equal(api.serviceFees.entries()[0]?.key, `magma:${sale.id}`);
   await api.serviceFees.processDue();
 });
 
-test("the manual 'open channel' route books no sale and owes no fee when Amboss doesn't confirm the channel", async (t) => {
+test("the manual 'open channel' route books no sale and owes no fee while Amboss hasn't taken the channel", async (t) => {
   feeEnv(t);
   const http = installFetchMock(t);
-  mockAmbossSeller(http, {
-    orders: [sellerOrder({ id: "ord-4", destination: `${BUYER}@1.2.3.4:9735` })],
-    addTransactionResult: false,
-  });
+  const magma = new FakeMagma(http, t);
+  magma.behave.AddTransaction = "false";
   const node = new FakeLnd({ chainBalance: 20_000_000 });
   const api = await startApi(t, { node });
   api.amboss.setKey("test-key");
+  const sale = magma.addSale({ buyerPubkey: BUYER });
+  await api.request("POST", "/amboss/order/accept", { id: sale.id });
+  magma.buyerPays(sale.id, node);
 
-  const res = await api.request("POST", "/amboss/order/open", { id: "ord-4" });
-  assert.equal(res.status, 200);
-  assert.equal(res.body.ok, false, "the UI is told the order isn't complete");
-  assert.ok(res.body.outpoint, "and which channel was opened, to report it again");
+  const res = await api.request("POST", "/amboss/order/open", { id: sale.id });
+  assert.equal(res.status, 200, "the channel was opened");
+  assert.equal(res.body.reported, false, "the UI is told Amboss doesn't have it yet");
+  assert.ok(res.body.outpoint, "and which channel was opened");
   assert.equal(node.callsTo("default.openChannel").length, 1);
+  const again = await api.request("POST", "/amboss/order/open", { id: sale.id });
+  assert.equal(again.status, 200);
+  assert.equal(node.callsTo("default.openChannel").length, 1, "a second click reports again, never opens again");
   // Amboss didn't take the funding transaction: no sale yet, so nothing is
   // earned and no service fee is owed.
   assert.equal(api.earnings.recent().length, 0);

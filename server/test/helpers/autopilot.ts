@@ -5,7 +5,9 @@ import { RebalanceLog } from "../../src/services/rebalanceLog.js";
 import { OverridesStore } from "../../src/services/overrides.js";
 import { AmbossStore } from "../../src/services/ambossStore.js";
 import { EarningsLog } from "../../src/services/earningsLog.js";
-import { ServiceFeeLedger } from "../../src/services/serviceFee.js";
+import { ServiceFeeLedger, lndFeeLightning } from "../../src/services/serviceFee.js";
+import { CapitalLedger } from "../../src/services/capital.js";
+import { FakeMagma } from "./magma.js";
 import type { FeeApplyItem, FeeApplyResult } from "../../src/services/fees.js";
 import type { FeeRecommendation, FeeRecReport } from "../../src/services/feeRecommend.js";
 import type { RebalanceExecParams, RebalanceExecResult } from "../../src/services/rebalance.js";
@@ -59,6 +61,97 @@ export function autopilotWith(t: AfterHook, config: Record<string, unknown>, sto
   t.after(() => autopilot.shutdown());
   const seams = autopilot as unknown as AutopilotSeams;
   return { autopilot, node, seams, http, dir };
+}
+
+/** A buyer's node id (any valid 33-byte key works with the fake LND). */
+export const BUYER = "02" + "ab".repeat(32);
+
+/**
+ * Magma selling on a fake node against a fake Magma API: Liquidity provision
+ * on, auto-pricing/sizing/relisting off (no market reads), generous caps.
+ * `restart()` builds a NEW autopilot on the same data dir, node and Amboss —
+ * what a process restart sees: the disk and LND, nothing from memory.
+ */
+export function sellerSetup(
+  t: AfterHook,
+  opts: { config?: Record<string, unknown>; chainBalance?: number; payFees?: boolean; payTimeoutMs?: number } = {},
+) {
+  const http = installFetchMock(t);
+  http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
+  const magma = new FakeMagma(http, t);
+  const node = new FakeLnd({ chainBalance: opts.chainBalance ?? 20_000_000 });
+  const dir = makeTempDir(t);
+  writeFileSync(
+    join(dir, "autopilot.json"),
+    JSON.stringify({
+      config: {
+        sellEnabled: true,
+        sellMaxDeploySats: 50_000_000,
+        sellMaxChannelSats: 10_000_000,
+        sellAutoReprice: false,
+        sellAutoSize: false,
+        sellAutoRelist: false,
+        ...opts.config,
+      },
+      history: [],
+      sellAutoSizeMigrated: true,
+    }),
+  );
+  const amboss = new AmbossStore(dir);
+  amboss.setKey("test-key");
+  const earnings = new EarningsLog(dir);
+  const fees = new ServiceFeeLedger(dir, opts.payFees ? lndFeeLightning(node.lnd) : null, {
+    payTimeoutMs: opts.payTimeoutMs ?? 10_000,
+  });
+  const started: Autopilot[] = [];
+  const make = () => {
+    const ap = new Autopilot(
+      dir,
+      node.lnd,
+      node.lnd,
+      new RebalanceLog(dir),
+      new OverridesStore(dir),
+      new AmbossStore(dir),
+      new EarningsLog(dir),
+      new ServiceFeeLedger(dir, null),
+      undefined,
+      new CapitalLedger(),
+    );
+    started.push(ap);
+    return ap;
+  };
+  const capital = new CapitalLedger();
+  const autopilot = new Autopilot(
+    dir,
+    node.lnd,
+    node.lnd,
+    new RebalanceLog(dir),
+    new OverridesStore(dir),
+    amboss,
+    earnings,
+    fees,
+    undefined,
+    capital,
+  );
+  started.push(autopilot);
+  t.after(() => {
+    for (const ap of started) ap.shutdown();
+    fees.stop();
+  });
+  return {
+    autopilot,
+    desk: autopilot.magma,
+    node,
+    http,
+    magma,
+    dir,
+    amboss,
+    earnings,
+    fees,
+    capital,
+    /** A fresh process on the same disk and node (its own stores, ledger, memory). */
+    restart: make,
+  };
 }
 
 /** A rebalance the planner would run (only the fields the autopilot reads). */

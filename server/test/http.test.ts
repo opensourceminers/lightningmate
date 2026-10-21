@@ -3,11 +3,12 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import { HTTP_TIMEOUTS, HttpTimeoutError, httpRequest } from "../src/services/http.js";
-import { getOffers, updateOffer } from "../src/services/amboss.js";
+import { getOffers } from "../src/services/amboss.js";
+import { updateOffer } from "../src/services/magmaApi.js";
 import { getPoolNodes } from "../src/services/lnplus.js";
 import { getBtcPrice } from "../src/services/price.js";
 import { hang, installFetchMock, stalledBody } from "./helpers/fetchMock.js";
-import { AMBOSS_API } from "./helpers/amboss.js";
+import { AMBOSS_API, MAGMA_API } from "./helpers/amboss.js";
 
 /** A local server whose handler decides how (badly) to answer. */
 async function localServer(
@@ -85,9 +86,9 @@ test("Amboss mutations get their own, longer deadline", async (t) => {
   shrink(t, "ambossQueryMs", 50);
   shrink(t, "ambossMutationMs", 2_000);
   const mock = installFetchMock(t);
-  mock.onGraphql(AMBOSS_API, "updateOffer", async () => {
+  mock.onGraphql(MAGMA_API, "UpdateOffer", async () => {
     await new Promise((r) => setTimeout(r, 200)); // slower than a read may take
-    return { data: { updateOffer: true } };
+    return { data: { market: { offer: { update: { success: true } } } } };
   });
   const offer = { totalSizeSats: 2e6, minSizeSats: 1e6, maxSizeSats: 2e6, feeRatePpm: 500, baseFeeSats: 1, minBlockLength: 4320 };
   assert.equal(await updateOffer("key", "offer-1", offer), true);

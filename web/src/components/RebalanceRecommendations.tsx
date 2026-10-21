@@ -88,9 +88,14 @@ export function RebalanceRecommendations() {
         econRatio: 0.8,
         maxFeePpm: r.maxCostPpm ?? undefined,
       });
+      // Still in flight is not a failure: it may land, and the log will say.
       ui.toast(
-        res.ok ? `Rebalanced ${satsCompact(res.amountSats)} for ${res.feeSats} sat` : `Failed: ${res.error}`,
-        res.ok ? "success" : "error",
+        res.ok
+          ? `Rebalanced ${satsCompact(res.amountSats)} for ${res.feeSats} sat`
+          : res.inFlight
+            ? `Still in flight: ${res.error}`
+            : `Failed: ${res.error}`,
+        res.ok ? "success" : res.inFlight ? "info" : "error",
       );
       await Promise.all([load(), api.rebalanceLog().then(setLog).catch(() => {})]);
     } catch (e) {

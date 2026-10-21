@@ -11,8 +11,9 @@ security@opensourceminers.de (please don't open a public issue first).
   a write-capable macaroon.
 - **Minimal outbound traffic.** Beyond LND, outbound calls happen only for
   features you use: the optional fiat price lookup (mempool.space) when a
-  currency is set, the Amboss Magma marketplace (api.amboss.space /
-  magma.amboss.tech) when you add an Amboss API key, and — on a completed
+  currency is set, the Amboss Magma marketplace (api.amboss.space for public
+  market data, magma.amboss.tech for everything that acts) when you add an
+  Amboss API key, and — on a completed
   liquidity sale with the service fee enabled — an LNURL-pay lookup of the
   configured fee address. Nothing else leaves your node, and every outbound
   request has a hard deadline.
@@ -23,6 +24,21 @@ security@opensourceminers.de (please don't open a public issue first).
   aggregate deployment caps shared with Magma selling). Payments are collected
   via **hold invoices that settle only after the channel's funding transaction
   is broadcast** — every failure path cancels the invoice, refunding the buyer.
+- **Magma sales** are collected the same way: the order is accepted with a
+  hold invoice for the order's fee, the preimage is saved before the invoice
+  exists, and the payment is settled only once Amboss confirms the channel
+  (VALID_CHANNEL_OPENING). Every failure — the open fails, the channel doesn't
+  match, the held payment nears its expiry — cancels the invoice, refunding the
+  buyer. Each step is written to `magma-orders.json` before it happens, so a
+  restart never opens a second channel for an order. Every channel open and
+  every on-chain send takes one on-chain lock; Magma, LSPS1 and autopilot opens
+  share one capital budget, and a manual open or send may not spend the coins
+  promised to buyers (accepted Magma orders, paid LSPS1 orders) unless you
+  confirm it — the confirmation names those orders. If the order journal is
+  lost, no channel is opened for an order whose held payment can no longer be
+  claimed: that payment is released back to the buyer — and any unpaid invoice
+  of ours for an order that gets no channel is cancelled, so no payment can
+  land on it later.
 - **Secrets** (`tls.cert`, macaroons) are read from the mounted LND data dir at
   runtime — never baked into the image, committed to git, or logged.
 - **Dependencies** are pinned and `npm audit` is kept at 0 known vulnerabilities
@@ -82,8 +98,11 @@ finding it again because the disk is still full adds no second alert, but a
 file lost again after it was saved is a new alert. The Amboss API key is the
 exception to keeping old versions: when it is replaced or removed
 (Disconnect), no copy of the old key stays on disk — no `.bak`, no damaged
-copy, and on a full disk the file is deleted rather than left behind — and a
-damaged amboss.json is reported without quoting its contents. Autopilot
+copy (they are deleted before the new key is written, so not even a power cut
+in between leaves one), and on a full disk the file is deleted rather than
+left behind — and a damaged amboss.json is reported without quoting its
+contents. A key is only marked invalid when Amboss definitively refuses it;
+an outage leaves it alone. Autopilot
 settings an older version saved outside today's limits are adjusted on load to
 the closest valid value, and a fraction in a whole-number setting is rounded
 toward doing less. The run interval may be as long as a timer can hold (about
