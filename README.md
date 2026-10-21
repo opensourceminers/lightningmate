@@ -19,10 +19,12 @@ standalone via Docker.
   peer suggestions, and close candidates — never a channel still opening or
   closing, or one inside its lease (sold on Magma or over LSPS1, or bought on
   Magma; the table tags those — a sale older than the app's order journal is
-  known from Amboss's listing, kept on disk and asked again hourly while an
-  Amboss key is set, and a sale that listing still reports running stays
-  protected even after the journal's own count has ended), and a peer counts
-  as offline only after days away.
+  known from Amboss's listing, kept on disk and asked again — when it is over
+  an hour old — before the close list or a close goes by it, while an Amboss
+  key is set; a sale that listing still reports running stays protected, its
+  routing-fee promise kept and its channel never drained by a rebalance, even
+  after the journal's own count has ended), and a peer counts as offline only
+  after days away.
   Closing opens a dialog to pick the on-chain fee (fast / economy / custom); a
   peer that is away is offered a reconnect first, a force-close is
   its own step that says what it does, and breaking a lease needs an explicit
@@ -44,14 +46,28 @@ standalone via Docker.
   answer never leads to a second channel), and orders the node can't serve are
   rejected at once instead of being left to time out. Amboss decides which
   seller gets matched; the app makes the sell path correct and reliable.
-- **LSP mode (beta)** — sell inbound channels **directly to wallets** speaking
-  the open LSPS1 standard (bLIP-51), with no marketplace in between: orders are
-  priced by the same profit-aware engine as Magma selling, paid via a **hold
-  invoice that only settles once the channel is opening** (every failure path
-  refunds the buyer automatically), and capital is guarded by the same reserve
-  and deployment caps. Includes graph discovery (feature bit 729), a shareable
-  buyer guide, and an optional clearnet-address announcement. Off by default.
+- **LSP mode (experimental)** — sell inbound channels **directly to wallets**
+  speaking the open LSPS1 standard (bLIP-51) over Lightning peer messages, with
+  no marketplace in between: orders are priced by the same profit-aware engine
+  as Magma selling, paid via a **hold invoice that only settles once the
+  channel is opening** (every failure path refunds the buyer automatically),
+  and capital is guarded by the same reserve and deployment caps. Few wallets
+  can order this way — as far as we know, ZEUS with its embedded node; wallets
+  that order over HTTPS can't — and on a Tor-only node the buyer also needs
+  Tor (ZEUS's embedded Tor, off by default). Includes graph discovery (feature
+  bit 729), a shareable buyer guide, and an optional clearnet-address
+  announcement (which publishes that address for good). Off by default.
 - **Wallet** — Lightning + on-chain: receive, send, decode and pay invoices.
+  An on-chain send is previewed first — its fee in sats from LND's own size
+  of the transaction, LND's next-block rate beside it (its 2-block rate on
+  LND before 0.20), and what stays — and a rate above 3× that, a fee above
+  2 % of the amount, or a send that dips into the on-chain reserve needs a
+  second yes (the server checks it again). "Max" sends the most that keeps
+  the reserve and the coins promised to buyers (the page's "available to
+  send" is the same figure for a typical send at the suggested rate); a send
+  that would take promised coins is refused unless you confirm it with the
+  orders named. "Send everything" empties the wallet (LND keeps
+  its anchor reserve).
 - **Routing** — a full forwards report (per-channel, daily, recent events).
 - **Autopilot** — a one-click **Strategy** (Max routing / Balanced / Max profit)
   tunes fees, rebalancing and channel opening together; no preset ever touches

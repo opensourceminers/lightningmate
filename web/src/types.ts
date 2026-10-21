@@ -70,6 +70,9 @@ export interface ChannelLease {
   /** A purchase: what it cost (sat) and when it was paid. */
   costSats?: number;
   paidAt?: string | null;
+  /** A purchase still being paid: the payment is held until Amboss confirms
+   *  the seller's channel — a close now cancels the purchase. */
+  paying?: boolean;
   /** A sale whose lease runs because Amboss reports it running — one only
    *  Amboss knows of (no journal record), or one the journal counts as over
    *  (Amboss confirmed the channel late): its end is Amboss's to say. */
@@ -90,6 +93,9 @@ export interface OfflineInfo {
 
 export interface FeeEstimates {
   fast: number | null;
+  /** The confirmation target `fast` is LND's rate for: 1 — or 2 on an LND
+   *  that won't estimate for one block (before 0.20). */
+  fastTarget: 1 | 2 | null;
   normal: number | null;
   economy: number | null;
 }
@@ -822,9 +828,28 @@ export interface LspStatus {
   enabled: boolean;
   running: boolean;
   canWrite: boolean;
+  /** Requests answered with a result (any method). */
   requestsServed: number;
+  /** The last request of any kind — served or refused. */
   lastRequestAt: string | null;
   lastError: string | null;
+  /** Per method: served, and refused by JSON-RPC error code (with the last
+   *  message sent). "other": unknown methods and unreadable messages. */
+  requests: {
+    method: string;
+    served: number;
+    errors: { code: number; count: number; lastMessage: string; lastAt: string }[];
+  }[];
+  /** Parameters wallets sent that this LSP accepts and ignores (D14). */
+  ignoredParams: { name: string; count: number }[];
+  /** Wallets that named themselves (client_info), the latest first. */
+  clients: { app: string; version: string; lastAt: string }[];
+  /** Recovery: orders waiting on LND, tried again with backoff. `waiting`
+   *  counts them all; of those, `refunds` are failed orders whose payment LND
+   *  still holds (it refused the cancel) and `settles` are opened channels
+   *  whose payment LND hasn't claimed (it refused the settle). The rest are
+   *  orders LND hasn't answered for (e.g. while it starts up). */
+  recovery: { waiting: number; refunds: number; settles: number; lastError: string | null; nextTryAt: string | null };
   ordersPending: number;
   ordersCompleted: number;
   ordersFailed: number;
@@ -856,6 +881,13 @@ export interface LspOrder {
   invoiceExpiresAt: string;
   fundingOutpoint: string | null;
   serviceFeePaidSat: number;
+  /** Paid; the open waits for the buyer to come online (since then). */
+  waitingForBuyerSince?: string;
+  /** Replaced by a newer order of the same buyer before it was paid. */
+  superseded?: boolean;
+  /** Failed, and LND still holds the buyer's payment: the refund is tried
+   *  again until LND confirms it. */
+  refundPending?: boolean;
   error?: string;
 }
 
@@ -924,6 +956,42 @@ export interface OnchainState {
   pendingSats: number;
   utxos: OnchainUtxo[];
   suggestedFeeRate: number | null;
+  /** What the wallet can spare: what "Max" fills in at `feeRate` (the
+   *  suggested rate the send form starts with) for a typical send — the
+   *  confirmed coins less the on-chain reserve (D5), the coins promised to
+   *  buyers and the fee (null: LND couldn't say). */
+  budget: { reserveSats: number; promisedSats: number; availableSats: number; feeRate: number | null } | null;
+}
+
+/** Something about an on-chain send the operator must confirm a second time. */
+export type SendCheckCode = "fee_rate_high" | "fee_share_high" | "below_reserve";
+export interface SendCheck {
+  code: SendCheckCode;
+  message: string;
+}
+
+/** GET /onchain/send-preview: what a send costs and leaves, before it is sent. */
+export interface SendPreview {
+  mode: "amount" | "max" | "all";
+  address: string;
+  /** What the address receives (estimated for "all"). */
+  amountSats: number;
+  feeRate: number;
+  vbytes: number;
+  feeSats: number;
+  /** The size is the app's estimate from the wallet's coins, not LND's. */
+  feeApprox: boolean;
+  estimates: FeeEstimates;
+  confirmedSats: number;
+  reserveSats: number;
+  promisedSats: number;
+  availableSats: number;
+  remainingSats: number;
+  /** The send takes coins promised to buyers (asked separately, naming the orders). */
+  touchesPromised: boolean;
+  checks: SendCheck[];
+  /** Why this send can't be made. */
+  error?: string;
 }
 
 export interface OnchainTx {
@@ -1944,6 +2012,9 @@ export interface LnPlusStatus {
   enabled: boolean;
   /** LN+ lookups go through Umbrel's Tor proxy right now. */
   viaTor: boolean;
+  /** The app has Umbrel's Tor proxy (when it does and viaTor is false, the
+   *  Tor route is set to Direct). */
+  torProxy: boolean;
   pubkey: string;
   onLnPlus: boolean;
   me: LnPlusNode | null;

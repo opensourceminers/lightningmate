@@ -29,17 +29,25 @@ export const HTTP_TIMEOUTS = {
   lnurlMs: 15_000,
 };
 
-/** What an outbound request is for — what decides its route. */
-export type OutboundPurpose = "amboss" | "lnplus" | "price" | "lnurl";
+/** What an outbound request is for — what decides its route.
+ *  "amboss_public": an Amboss read made without the API key (the public
+ *  market data, this node's own seller score by its public key);
+ *  "amboss": a call with the key (offers, orders, purchases). */
+export type OutboundPurpose = "amboss" | "amboss_public" | "lnplus" | "price" | "lnurl";
 
 /**
  * Which outbound requests go through the Tor proxy (when one is available):
  *  - "lookups" (default): the third-party lookups that tie this server's IP
- *    to the node — LN+ (its own pubkey included) and the BTC price;
- *  - "all": Amboss (Magma market, offers, orders — tied to the Amboss
- *    account anyway; slower over Tor) and the service-fee LNURL too;
+ *    to the node — LN+ (its own pubkey included), the BTC price and
+ *    Amboss's public market data (this node's own seller score included);
+ *  - "all": the Amboss calls made with the API key (offers, orders,
+ *    purchases — tied to the Amboss account anyway; their orders have
+ *    deadlines, and Tor is slower) and the service-fee LNURL too;
  *  - "direct": nothing (a lookup service that blocks Tor exits).
  * Without a proxy every request goes direct, and the Settings page says so.
+ * (Review of P4: under "lookups" the keyless Amboss reads went direct too —
+ * a node with no Amboss key linked its home IP to its public key at Amboss
+ * about once a day.)
  */
 export type TorRoute = "lookups" | "all" | "direct";
 
@@ -66,7 +74,20 @@ export function outboundRouting(): Readonly<OutboundRouting> {
 /** Whether a request for `purpose` goes through the Tor proxy right now. */
 export function viaTor(purpose: OutboundPurpose | undefined): boolean {
   if (!routing.proxy || !purpose || routing.route === "direct") return false;
-  return routing.route === "all" || purpose === "lnplus" || purpose === "price";
+  return routing.route === "all" || purpose === "lnplus" || purpose === "price" || purpose === "amboss_public";
+}
+
+/**
+ * Said with a lookup that failed: ` through Tor (Settings → Privacy, Tor
+ * route "…")` when requests for `purpose` go through Tor now, else "". A Tor
+ * exit a service refuses is then not taken for the service being down, and
+ * the operator sees which setting decides the route. (The labels are the
+ * Settings card's — web/src/privacyView.ts TOR_ROUTES; a web test keeps the
+ * two the same.)
+ */
+export function torVia(purpose: OutboundPurpose): string {
+  if (!viaTor(purpose)) return "";
+  return ` through Tor (Settings → Privacy, Tor route "${routing.route === "all" ? "Everything via Tor" : "Lookups via Tor"}")`;
 }
 
 export class HttpTimeoutError extends Error {

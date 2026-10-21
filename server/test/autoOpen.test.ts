@@ -744,3 +744,44 @@ test("an open by hand starts at the fee engine's new-channel fee — the Open fo
     [true, 80, true, String(starting.baseFeeMsat), 3],
   );
 });
+
+// ── review of P4: two open-path guards with no test ─────────────────────────
+
+test("the starting routing fee stays inside the operator's fee range: a 50 ppm maximum starts new channels at 50 (not the engine's 80), a 200 ppm minimum at 200 — the autopilot's open, the Open form's estimate and a manual open alike", async (t) => {
+  const cases = [
+    { policy: { minPpm: 25, neutralPpm: 40, maxPpm: 50 }, ppm: 50 },
+    { policy: { minPpm: 200, neutralPpm: 300, maxPpm: 1000 }, ppm: 200 },
+  ];
+  for (const [i, c] of cases.entries()) {
+    // The autopilot's own open.
+    const s = stage(t);
+    s.autopilot.setConfig({ policy: { ...s.autopilot.getState().config.policy, ...c.policy } });
+    s.node.peers.push(suggestion.pubkey);
+    s.seams.channelSuggestions = async () => ({ suggestions: [suggestion] });
+    await s.autopilot.runOnce();
+    const [auto] = s.node.callsTo("default.openChannel");
+    // Before the clamp (or with it removed): 80 ppm whatever the range — for
+    // good, with fee automation off.
+    assert.deepEqual([auto?.use_fee_rate, Number(auto?.fee_rate)], [true, c.ppm], JSON.stringify(c.policy));
+
+    // The Open form's estimate, and an open by hand.
+    const node = new FakeLnd({ chainBalance: 5_000_000, peers: [GOSSIP_PEER] });
+    node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: "750" })); // 3 sat/vB
+    const api = await startApi(t, { node });
+    api.autopilot.setConfig({ policy: { ...api.autopilot.getState().config.policy, ...c.policy } });
+    const est = await api.request("GET", "/channels/open-estimate?size=2000000");
+    assert.equal(est.status, 200, JSON.stringify(est.body));
+    assert.equal(est.body.initialRoutingFee.feeRatePpm, c.ppm);
+    const res = await api.request("POST", "/channels/open", { pubkey: PK(81 + i), socket: "peer81.onion:9735", localTokens: 2_000_000, feeRate: 3 });
+    assert.equal(res.body.ok, true, res.body.error);
+    const [manual] = node.callsTo("default.openChannel");
+    assert.equal(Number(manual.fee_rate), c.ppm);
+  }
+});
+
+test("auto-size rising to a peer's minimum rounds UP to the next 100k: a 1,234,567 sat minimum opens 1,300,000 — rounded down (1,200,000) the peer would refuse it on every run", () => {
+  const plan = planOpen(cand({ peerMinChannelSats: 1_234_567, recommendedSizeSats: 1_000_000 }), ctx({ maxRaiseSat: 5_000_000 }));
+  assert.deepEqual(plan, { sizeSats: 1_300_000, why: "sized up to its 1,234,567 sat minimum" });
+  // A round minimum is met exactly.
+  assert.deepEqual(planOpen(cand({ peerMinChannelSats: 3_000_000, recommendedSizeSats: 1_000_000 }), ctx()), { sizeSats: 3_000_000, why: "sized up to its 3,000,000 sat minimum" });
+});

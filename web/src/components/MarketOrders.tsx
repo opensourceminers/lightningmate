@@ -6,6 +6,7 @@ import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
 import { awaitsYourDecision, laneBanner } from "../statusNotes";
 import { localLabel, purchaseLabel } from "../magmaView";
+import { lspOrderLabel } from "../lspView";
 
 /** Why the order is where it is: the reason, the lane's last decision, or the
  *  last error — whichever applies (shown on hover). */
@@ -13,15 +14,6 @@ function localDetail(o: MyOrder): string | undefined {
   const l = o.local;
   if (!l) return undefined;
   return l.lastError ?? l.reason ?? l.decision?.reason ?? undefined;
-}
-
-/** Human status for a direct (LSPS1) sale — order + payment state in one word. */
-function lspStatusLabel(o: LspOrder): string {
-  if (o.orderState === "COMPLETED") return "Completed";
-  if (o.orderState === "FAILED") {
-    return o.paymentState === "REFUNDED" ? "Failed · refunded" : "Expired";
-  }
-  return o.paymentState === "HOLD" ? "Paid · opening channel" : "Awaiting payment";
 }
 
 export function MarketOrders() {
@@ -192,7 +184,7 @@ export function MarketOrders() {
               <td className="muted">{new Date(o.createdAt).toLocaleString()}</td>
               <td className="num">{satsCompact(o.sizeSat)}</td>
               <td className="num">{o.feeSat.toLocaleString()}</td>
-              <td title={o.error ?? undefined}>{lspStatusLabel(o)}</td>
+              <td title={o.error ?? undefined}>{lspOrderLabel(o)}</td>
               <td className="muted">{o.fundingOutpoint ? `${o.fundingOutpoint.slice(0, 12)}…` : "—"}</td>
             </tr>
           ))}

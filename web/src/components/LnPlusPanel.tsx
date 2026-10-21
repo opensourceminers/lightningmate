@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { LnPlusPoolNode, LnPlusStatus, LnPlusSwap, LnPlusSwapsResponse } from "../types";
 import { satsCompact } from "../format";
+import { lnplusDirectNote } from "../privacyView";
 
 /**
  * lightningnetwork.plus — the second liquidity market, and a different trade.
@@ -221,8 +222,8 @@ export function LnPlusPanel() {
           LN+ lookups are switched off (Settings → Privacy): nothing is asked of lightningnetwork.plus. Peer picking uses the
           reputations already cached.
         </div>
-      ) : status && !status.viaTor ? (
-        <p className="muted pad">LN+ lookups leave from this server's IP address (no Tor proxy — see Settings → Privacy).</p>
+      ) : status && lnplusDirectNote(status) ? (
+        <p className="muted pad">{lnplusDirectNote(status)}</p>
       ) : null}
 
       <p className="muted pad">

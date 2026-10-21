@@ -22,11 +22,18 @@ import {
   payRequest,
 } from "../services/payments.js";
 import {
+  MIN_SEND_SATS,
   getFeeEstimates,
   getOnchainState,
   getOnchainTxs,
   newAddress,
+  planSend,
+  previewSend,
+  sendBudget,
   sendOnchain,
+  type SendCheckCode,
+  type SendPreview,
+  type SendRequest,
 } from "../services/onchain.js";
 import { closeChannelByOutpoint, connectForOpen, fundChannel, MIN_CHANNEL_SATS, type OpenChannelResult } from "../services/channelOps.js";
 import { promisedSpendRefusal, spendableOnchain, type PromisedSpendRefusal } from "../services/capital.js";
@@ -860,6 +867,9 @@ export function createApiRouter(
       res.json({
         enabled: lnplus.isEnabled(),
         viaTor: viaTor("lnplus"),
+        // Whether the app has Umbrel's Tor proxy at all: "direct" with a
+        // proxy is the operator's route setting, not a missing proxy.
+        torProxy: !!outboundRouting().proxy,
         pubkey: ownKey,
         onLnPlus: !!me,
         me,
@@ -1128,11 +1138,19 @@ export function createApiRouter(
       lnplusLookups: s.lnplusLookups,
       destinations: [
         {
-          service: "Amboss (api.amboss.space, magma.amboss.tech)",
-          // The public book (eligibility, buy offers) asks for this node's own
-          // seller score — by its public key — with or without a key.
-          what: "Magma market data, your own node's public seller score included (by its public key), with or without a key; with your key also your offers, orders and purchases — tied to your Amboss account",
+          service: "Amboss public market data (api.amboss.space, magma.amboss.tech)",
+          // The public book (eligibility, the Overview's lease benchmark, buy
+          // offers) asks for this node's own seller score — by its public
+          // key — with or without an Amboss key. Read without the key: a
+          // public lookup, through Tor on the default route (review of P4).
+          what: "Magma offers, recent sales and the dollar rate — your own node's public seller score included (by its public key), read without your API key",
           active: true,
+          viaTor: viaTor("amboss_public"),
+        },
+        {
+          service: "Amboss account (magma.amboss.tech)",
+          what: "with your API key: your offers, orders and purchases — tied to your Amboss account",
+          active: amboss.hasKey(),
           viaTor: viaTor("amboss"),
         },
         {
@@ -1288,11 +1306,17 @@ export function createApiRouter(
 
   // ── On-chain wallet ────────────────────────────────────────────────────────
 
-  // Balance + UTXOs + suggested fee rate (read-only).
+  // Balance + UTXOs + suggested fee rate (read-only), and what the wallet
+  // can spare: confirmed coins less the on-chain reserve (D5) and the coins
+  // promised to buyers (null when LND can't say).
   router.get(
     "/onchain",
     wrap(async (_req, res) => {
-      res.json(await getOnchainState(lnd));
+      const [state, budget] = await Promise.all([
+        getOnchainState(lnd),
+        sendBudget(lnd, autopilot.capital, autopilot.onchainReserveSetting()).catch(() => null),
+      ]);
+      res.json({ ...state, budget });
     }),
   );
 
@@ -1316,7 +1340,46 @@ export function createApiRouter(
     }),
   );
 
-  // Send on-chain. Requires write access; amount + fee rate validated.
+  /** An on-chain send as asked (the preview's query or the send's body):
+   *  an address, a fee rate, and one of an amount, `max` or `all` (sweep).
+   *  Null after a 400 naming what is wrong. */
+  const parseSend = (input: Record<string, unknown>, res: Response): SendRequest | null => {
+    const flag = (v: unknown): boolean | null => (v === undefined ? false : v === true || v === "1" || v === "true" ? true : v === false || v === "0" || v === "false" ? false : null);
+    const max = flag(input.max);
+    const sendAll = flag(input.all ?? input.sendAll);
+    const rate = intIn(input.feeRate, 1, MAX_FEE_RATE);
+    const amount = input.tokens === undefined || input.tokens === "" ? undefined : intIn(input.tokens, MIN_SEND_SATS, MAX_ONCHAIN_SEND_SATS);
+    const modes = [amount !== undefined, max === true, sendAll === true].filter(Boolean).length;
+    if (!isBtcAddress(input.address) || rate === null || amount === null || max === null || sendAll === null || modes !== 1) {
+      res.status(400).json({
+        error: "bad_request",
+        message: `a valid address, feeRate (1–${MAX_FEE_RATE} sat/vB) and one of tokens (≥${MIN_SEND_SATS} sat), max or sendAll required.`,
+      });
+      return null;
+    }
+    return { address: input.address.trim(), feeRate: rate, ...(amount !== undefined ? { tokens: amount } : {}), ...(max ? { max: true } : {}), ...(sendAll ? { sendAll: true } : {}) };
+  };
+
+  // What a send would cost and leave, before anything is sent: the fee in
+  // sats (LND's own size of the transaction at the chosen rate), LND's
+  // next-block rate to compare with, the reserve and the promised coins that
+  // stay, and what needs a second yes (review a4-lsp-payments:onchain-send-
+  // guardrails). `max=1`: the most that can go while all of that stays;
+  // `all=1`: every coin (LND keeps its anchor reserve).
+  router.get(
+    "/onchain/send-preview",
+    wrap(async (req, res) => {
+      const ask = parseSend(req.query as Record<string, unknown>, res);
+      if (!ask) return;
+      res.json(await previewSend(lnd, autopilot.capital, autopilot.onchainReserveSetting(), ask));
+    }),
+  );
+
+  // Send on-chain. Requires write access. The preview is made again here,
+  // inside the on-chain mutex: what it asks a second yes for must be in
+  // `confirmed` (the codes the operator confirmed), or nothing is sent (409
+  // confirm_send, with the checks) — a page that skipped the question can't
+  // skip the check.
   router.post(
     "/onchain/send",
     wrap(async (req, res) => {
@@ -1324,32 +1387,52 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { address, tokens, feeRate, spendPromised } = req.body ?? {};
-      const amount = intIn(tokens, 546, MAX_ONCHAIN_SEND_SATS); // ≥ dust
-      const rate = intIn(feeRate, 1, MAX_FEE_RATE);
-      if (!isBtcAddress(address) || amount === null || rate === null || (spendPromised !== undefined && typeof spendPromised !== "boolean")) {
-        res.status(400).json({
-          error: "bad_request",
-          message: "valid address, tokens (≥546 sat), feeRate (1–2000 sat/vB) and an optional spendPromised (true/false) required.",
-        });
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      const { spendPromised, confirmed } = body;
+      const codes = Array.isArray(confirmed) ? confirmed : confirmed === undefined ? [] : null;
+      if ((spendPromised !== undefined && typeof spendPromised !== "boolean") || codes === null || !codes.every((c) => typeof c === "string")) {
+        res.status(400).json({ error: "bad_request", message: "spendPromised must be true/false and confirmed a list of check codes." });
         return;
       }
+      if (body.max !== undefined) {
+        res.status(400).json({ error: "bad_request", message: "send an amount (the preview's max) or sendAll — not max." });
+        return;
+      }
+      const ask = parseSend(body, res);
+      if (!ask) return;
       // Taken in turn with every channel open (Magma, LSPS1, the autopilot,
       // manual): a send in the middle of an open's check would spend what
       // that check counted on. Coins promised to buyers are refused unless
-      // the operator confirmed spending them.
-      let done: { refusal: PromisedSpendRefusal } | { sent: unknown };
+      // the operator confirmed spending them — judged by the plan itself,
+      // with the send's own fee, exactly as its preview's touchesPromised.
+      let done:
+        | { refusal: PromisedSpendRefusal }
+        | { invalid: string }
+        | { confirm: { checks: SendPreview["checks"]; preview: SendPreview } }
+        | { sent: unknown };
       try {
         done = await autopilot.capital.mutex.run("on-chain send", async () => {
-          const refusal = spendPromised ? null : await promisedSpendRefusal(lnd, autopilot.capital, amount, { newChannel: false });
-          return refusal ? { refusal } : { sent: await sendOnchain(writeLnd, { address: address.trim(), tokens: amount, feeRate: rate }) };
+          const { preview, promised } = await planSend(lnd, autopilot.capital, autopilot.onchainReserveSetting(), ask);
+          if (preview.error) return { invalid: preview.error };
+          const unconfirmed = preview.checks.filter((c) => !(codes as SendCheckCode[]).includes(c.code));
+          if (unconfirmed.length) return { confirm: { checks: unconfirmed, preview } };
+          if (promised && !spendPromised) return { refusal: promised };
+          return { sent: await sendOnchain(writeLnd, { address: ask.address, feeRate: ask.feeRate, ...(ask.sendAll ? { sendAll: true } : { tokens: ask.tokens }) }) };
         });
       } catch (err) {
         res.json({ ok: false, transactionId: "", error: describeError(err) });
         return;
       }
       if ("refusal" in done) refusePromisedSpend(res, done.refusal);
-      else res.json(done.sent);
+      else if ("invalid" in done) res.status(400).json({ error: "bad_send", message: done.invalid });
+      else if ("confirm" in done) {
+        res.status(409).json({
+          error: "confirm_send",
+          message: done.confirm.checks.map((c) => c.message).join(" "),
+          checks: done.confirm.checks,
+          preview: done.confirm.preview,
+        });
+      } else res.json(done.sent);
     }),
   );
 
@@ -1604,9 +1687,20 @@ export function createApiRouter(
     wrap(async (req, res) => {
       if (!needKey(res)) return;
       const orderId = typeof req.body?.orderId === "string" ? req.body.orderId : "";
-      const p = autopilot.purchases.get(orderId);
-      if (!p) {
+      if (!autopilot.purchases.get(orderId)) {
         res.status(404).json({ error: "not_found", message: "No quote on record for this order." });
+        return;
+      }
+      // A failure only the pay call reported (a dropped stream, a restart)
+      // may still be in flight: LND is asked first. Cancelling an order whose
+      // payment then lands would record "declined" for inbound that was paid
+      // for (review of P1b).
+      const p = (await autopilot.checkPurchasePayment(orderId)) ?? autopilot.purchases.get(orderId)!;
+      if (p.state === "pay_failed" && !p.failureConfirmed) {
+        res.status(409).json({
+          error: "payment_unclear",
+          message: "LND hasn't confirmed that the payment failed — it may still be in flight. The order is followed automatically; cancel it once the payment has ended.",
+        });
         return;
       }
       if (p.state !== "quoted" && p.state !== "pay_failed") {
@@ -1647,11 +1741,13 @@ export function createApiRouter(
         res.status(400).json({ error: "bad_request", message: "Missing order or confirmed amount." });
         return;
       }
-      const p = autopilot.purchases.get(orderId);
-      if (!p) {
+      if (!autopilot.purchases.get(orderId)) {
         res.status(404).json({ error: "not_found", message: "No quote on record for this order — get a new quote." });
         return;
       }
+      // A failure only the pay call reported: LND says first whether the
+      // payment is still in flight (then this is "paying" — not paid again).
+      const p = (await autopilot.checkPurchasePayment(orderId)) ?? autopilot.purchases.get(orderId)!;
       if (p.state !== "quoted" && p.state !== "pay_failed") {
         res.status(409).json({ error: "bad_state", message: `This order is ${p.state} — not paying it again.` });
         return;
@@ -1948,24 +2044,37 @@ export function createApiRouter(
       if (!(await ownOffer(id, res))) return;
       const terms: OfferTerms = { ...parsed, ...autopilot.offerFeeCaps() };
       const write: OfferWrite = { at: new Date().toISOString(), by: "manual", action: "update", fields: ambossFields(terms), ok: false };
-      try {
-        write.ok = await withAmboss(() => updateOffer(amboss.getKey(), id, terms));
-        if (!write.ok) write.error = "Amboss did not apply the update (success: false)";
-      } catch (err) {
-        write.error = describeError(err);
-      }
-      if (!write.ok) {
-        autopilot.recordOfferWrite(null, id, write);
+      // One write per offer at a time (withOffer), as the autopilot's own
+      // terms writes and status flips: this edit and its read-back never
+      // cross one of them. Before (review of P1b), an autopilot write could
+      // land between this one and its read-back — the edit reported "not
+      // stored" — or after it, undoing it.
+      const read = await autopilot.withOffer(id, async (): Promise<MyOffer | null | undefined> => {
+        try {
+          write.ok = await withAmboss(() => updateOffer(amboss.getKey(), id, terms));
+          if (!write.ok) write.error = "Amboss did not apply the update (success: false)";
+        } catch (err) {
+          write.error = describeError(err);
+        }
+        if (!write.ok) {
+          autopilot.recordOfferWrite(null, id, write);
+          return undefined;
+        }
+        // Edited by hand: the operator's terms now — the autopilot leaves
+        // them alone until handed back (it used to overwrite them at its next
+        // run). Set before the lock is released: an autopilot write planned
+        // on the old terms, waiting for this lock, then sends nothing.
+        autopilot.pauseOfferAutomation(id, "you edited this offer");
+        // "success" is Amboss's word; reading the offer back is the proof.
+        const back = await getMyOffer(amboss.getKey(), id).catch(() => null);
+        write.verified = back ? termsMatch(back, terms) : undefined;
+        autopilot.recordOfferWrite(back, id, write);
+        return back;
+      });
+      if (read === undefined) {
         res.status(502).json({ error: "amboss_refused", message: `Offer not updated: ${write.error}` });
         return;
       }
-      // Edited by hand: the operator's terms now — the autopilot leaves them
-      // alone until handed back (it used to overwrite them at its next run).
-      autopilot.pauseOfferAutomation(id, "you edited this offer");
-      // "success" is Amboss's word; reading the offer back is the proof.
-      const read = await getMyOffer(amboss.getKey(), id).catch(() => null);
-      write.verified = read ? termsMatch(read, terms) : undefined;
-      autopilot.recordOfferWrite(read, id, write);
       res.json({ ok: true, verified: write.verified ?? null, offer: read });
     }),
   );

@@ -31,6 +31,8 @@ import type {
   OnchainTx,
   NewAddress,
   OnchainSendResult,
+  SendCheckCode,
+  SendPreview,
   DashboardData,
   NodeScore,
   NodeSummary,
@@ -216,8 +218,23 @@ export const api = {
   onchainState: () => get<OnchainState>("/onchain"),
   onchainTxs: () => get<OnchainTx[]>("/onchain/txs"),
   onchainAddress: () => post<NewAddress>("/onchain/address", {}),
-  onchainSend: (params: { address: string; tokens: number; feeRate: number; spendPromised?: boolean }) =>
-    post<OnchainSendResult>("/onchain/send", params),
+  onchainPreview: (q: { address: string; feeRate: number; tokens?: number; max?: boolean; all?: boolean }) =>
+    get<SendPreview>(
+      `/onchain/send-preview?${new URLSearchParams(
+        Object.entries(q)
+          .filter(([, v]) => v !== undefined && v !== false)
+          .map(([k, v]) => [k, v === true ? "1" : String(v)]),
+      )}`,
+    ),
+  onchainSend: (params: {
+    address: string;
+    feeRate: number;
+    tokens?: number;
+    sendAll?: boolean;
+    spendPromised?: boolean;
+    /** The checks of the preview the operator confirmed a second time. */
+    confirmed?: SendCheckCode[];
+  }) => post<OnchainSendResult>("/onchain/send", params),
   authStatus: () => get<{ authRequired: boolean; unlocked: boolean }>("/auth/status"),
   login: async (password: string): Promise<boolean> => {
     const res = await fetch("/api/auth/unlock", {

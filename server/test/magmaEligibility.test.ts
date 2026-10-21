@@ -170,6 +170,28 @@ test("GET /amboss/eligibility answers from the public book — with no Amboss ke
   assert.ok(res.body.own.listableSat > 1_000_000 && res.body.own.listableSat < 1_400_000, `listable ${res.body.own.listableSat}`);
 });
 
+// Review of P4: the own-score lookup's failure was swallowed — a node with a
+// score read as one with none ("not set yet"), with nothing said. Through
+// Tor (the default route since then) a refused exit is a real possibility.
+test("an own-score lookup that fails is said — the node is compared as one with no score, and the reason says why", async (t) => {
+  quiet(t);
+  const http = installFetchMock(t);
+  http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
+  const market = new FakeMarket(http, t);
+  fillMarket(market, () => 0);
+  market.ownScore = 40;
+  market.ownLookup = "throw";
+  const api = await startApi(t, { node: new FakeLnd({ chainBalance: 1_400_000 }) });
+  const res = await api.request("GET", "/amboss/eligibility");
+  assert.equal(res.status, 200);
+  assert.equal(res.body.own.sellerScore, null);
+  assert.ok(
+    (res.body.reasons as string[]).some((r) => /^Your node's own seller score could not be read \(Amboss HTTP 502\) — it is compared as a seller with no score yet; up to /.test(r)),
+    JSON.stringify(res.body.reasons),
+  );
+  assert.ok(!(res.body.reasons as string[]).some((r) => /seller score not set yet/.test(r)), "not passed off as 'no score yet'");
+});
+
 /** A selling node with one aged routing channel and an enabled offer on record. */
 async function deferralSetup(t: Parameters<typeof sellerSetup>[0], fills: (score: number) => number) {
   const s = sellerSetup(t, { chainBalance: 20_000_000 });

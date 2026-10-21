@@ -52,6 +52,9 @@ export interface LeaseCap {
   baseFeeCapMsat: number;
   /** The lease: how many blocks after the funding confirmed the promise holds. */
   leaseBlocks: number;
+  /** Amboss's last listing has this sale's lease running (MagmaDesk): the
+   *  promise holds while it does — whatever the count above says. */
+  ambossRunning?: boolean;
 }
 
 /**
@@ -121,8 +124,16 @@ export function activeCap(
   const funded = fundingHeight(channel.channelId);
   for (const c of caps) {
     if (c.fundingOutpoint !== channel.outpoint) continue;
-    const untilHeight = funded === null ? null : leaseEndHeight(c, funded);
-    if (untilHeight !== null && currentHeight > 0 && currentHeight >= untilHeight) continue; // lease over
+    let untilHeight = funded === null ? null : leaseEndHeight(c, funded);
+    if (untilHeight !== null && currentHeight > 0 && currentHeight >= untilHeight) {
+      // Over by its own count — unless Amboss still lists the lease running
+      // (it counts from its own confirmation of the channel, which can come
+      // more than a day after funding). Fail closed: the promise holds, and
+      // its end is Amboss's to say. (Review of P4: the fee could rise past
+      // the cap while Amboss still monitored the lease.)
+      if (!c.ambossRunning) continue; // lease over
+      untilHeight = null;
+    }
     if (
       !found ||
       c.feeRateCapPpm < found.feeRateCapPpm ||
@@ -141,17 +152,29 @@ export function activeCap(
  * out through it hands the buyer's inbound back to them, unpaid).
  */
 export interface SoldLease {
-  /** "txid:vout" of the sold channel. */
+  /** "txid:vout" of the sold channel ("" for a sale only Amboss knows of —
+   *  then `channelId` names it). */
   fundingOutpoint: string;
   source: LeaseCap["source"];
   orderId: string;
   /** Blocks after funding the lease runs (absent on record: 4,320). */
   leaseBlocks: number;
+  /** Amboss's last listing has the lease running: it runs while it does. */
+  ambossRunning?: boolean;
+  /** The channel as Amboss names it ("BLOCKxTXxOUT" or its number) — for a
+   *  sale this node's journal never recorded. */
+  channelId?: string;
 }
 
 /** Whether a sold channel is still inside its lease — measured as the fee
- *  promise is (leaseEndHeight); one not confirmed yet always is. */
-export function leaseRunning(lease: Pick<SoldLease, "source" | "leaseBlocks">, channelId: string | null | undefined, currentHeight: number): boolean {
+ *  promise is (leaseEndHeight); one not confirmed yet always is, and one
+ *  Amboss lists as running too (fail closed). */
+export function leaseRunning(
+  lease: Pick<SoldLease, "source" | "leaseBlocks" | "ambossRunning">,
+  channelId: string | null | undefined,
+  currentHeight: number,
+): boolean {
+  if (lease.ambossRunning) return true;
   const funded = fundingHeight(channelId);
   if (funded === null || currentHeight <= 0) return true;
   return currentHeight < leaseEndHeight(lease, funded);

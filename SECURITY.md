@@ -16,35 +16,54 @@ security@opensourceminers.de (please don't open a public issue first).
     for the Pool and Swaps views. This includes a lookup of this node's own
     public key. LN+ lookups are **on by default**; switch them off under
     Settings → Privacy ("LN+ lookups").
-  - **Amboss**: public Magma market data from api.amboss.space (offers,
-    recent sales, and this node's public seller score, so its public key too).
-    This is fetched **with or without an Amboss API key**, by the autopilot's
-    runs and the Market pages. With a key, the app also reads and manages
-    your offers, orders and purchases (magma.amboss.tech for everything that
-    acts). Those calls are tied to your Amboss account.
+  - **Amboss**: public Magma market data from api.amboss.space and
+    magma.amboss.tech (offers, recent sales, the dollar rate, and this node's
+    public seller score, so its public key too). This is read **with or
+    without an Amboss API key** — by the autopilot's runs, the Market pages
+    and the Overview's lease benchmark — and never carries the key. With a
+    key, the app also reads and manages your offers, orders and purchases
+    (magma.amboss.tech for everything that acts). Those calls carry the key
+    and are tied to your Amboss account.
   - **mempool.space**: the BTC price, only while a fiat currency is chosen.
   - **The service-fee lightning address**: an LNURL-pay lookup after a
     completed liquidity sale with the service fee enabled.
 
   The route depends on whether Umbrel gives the app its Tor proxy
   (`TOR_PROXY_IP` / `TOR_PROXY_PORT`):
-  - **With the proxy**, LN+ and the price lookup go through Tor by default
-    ("Lookups via Tor"). Amboss and the LNURL lookup go through Tor only with
-    "Everything via Tor", and "Direct" sends nothing through it (Settings →
-    Privacy). A lookup routed through Tor never falls back to a direct
-    connection.
+  - **With the proxy**, LN+, the price lookup and Amboss's public market data
+    (this node's own seller score included) go through Tor by default
+    ("Lookups via Tor"). The Amboss calls made with your API key and the
+    LNURL lookup go through Tor only with "Everything via Tor", and "Direct"
+    sends nothing through it (Settings → Privacy). A lookup routed through
+    Tor never falls back to a direct connection: when Amboss can't be read
+    through Tor, the selling check and the Overview's lease benchmark say so
+    and name the route setting.
   - **Without the proxy**, every one of them leaves from this server's
     internet connection, which is your home IP address.
 
   Settings → Privacy lists each destination with the route it takes right
   now. Every outbound request has a hard deadline.
-- **LSP mode is off by default** and adds the only surface that processes input
-  from arbitrary network peers: LSPS1 (bLIP-51) JSON-RPC over BOLT8 custom
-  messages. It is rate-limited per peer, strictly validated, wrapped in a hard
-  crash boundary, and capital-guarded (on-chain reserve, per-channel and
-  aggregate deployment caps shared with Magma selling). Payments are collected
+- **LSP mode is off by default** (experimental) and adds the only surface that
+  processes input from arbitrary network peers: LSPS1 (bLIP-51) JSON-RPC over
+  BOLT8 custom messages. It is rate-limited per peer, wrapped in a hard crash
+  boundary, and capital-guarded (on-chain reserve, per-channel and aggregate
+  deployment caps shared with Magma selling). New orders are capped and paced
+  per peer (two open, one replaced quote a minute, six an hour; the same
+  request again gets the quote already made) and ten open in all. A request
+  those limits rule out, or one the wallet can't fund (LND's balance as last
+  read, at most 30 seconds old), is turned away before it takes the on-chain
+  lock, under which every order is checked again before it is made — so a
+  peer can't fill LND with hold invoices or keep the on-chain lock busy.
+  Every parameter it uses is validated strictly; a parameter it doesn't know
+  (a wallet's informational `client_info`, say) is ignored, never used — its
+  name is logged and counted, made safe for the log and bounded in number,
+  like the wallet names `client_info` carries. Payments are collected
   via **hold invoices that settle only after the channel's funding transaction
   is broadcast** — every failure path cancels the invoice, refunding the buyer.
+  A settle or a refund LND refuses is tried again, with backoff, until LND
+  answers; should LND release a payment before it could be claimed, the
+  channel was given away — that raises an alert, it is never filed as a
+  refund.
 - **Magma sales** are collected the same way: the order is accepted with a
   hold invoice for the order's fee, the preimage is saved before the invoice
   exists, and the payment is settled only once Amboss confirms the channel

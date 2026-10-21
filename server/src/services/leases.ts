@@ -46,6 +46,10 @@ export interface ChannelLease {
    *  fee, sat), and when. */
   costSats?: number;
   paidAt?: string | null;
+  /** A purchase still being paid: the hold invoice keeps the payment in
+   *  flight until Amboss confirms the seller's channel. A close now cancels
+   *  the purchase (Amboss refunds the payment) and gives up the inbound. */
+  paying?: boolean;
   /** A sale whose lease runs because Amboss reports it still running: one
    *  this node's journal never recorded (completed before it existed, or
    *  with another tool), or one the journal did record whose lease by the
@@ -85,8 +89,20 @@ export interface LeaseSources {
 const DEFAULT_LEASE_BLOCKS = 4_320;
 const MS_PER_BLOCK = 10 * 60_000;
 
-/** A purchase whose seller opened (or is opening) the channel. */
-const BOUGHT_STATES = new Set<MagmaPurchase["state"]>(["paid", "channel_open"]);
+/**
+ * A purchase whose seller opened (or is opening) the channel — or may be:
+ * one still being paid. A Magma purchase pays a hold invoice, and the
+ * payment stays in flight ("paying") until Amboss confirms the seller's
+ * channel; a failure only the pay call reported may still be in flight too.
+ * Fail closed: the channel being bought is protected like a bought one.
+ * (Before, only "paid" and "channel_open" counted: while the seller's channel
+ * confirmed, it carried no lease, and the close route closed it unasked —
+ * Amboss would refund the payment, but the inbound being paid for was gone.)
+ */
+const bought = (p: MagmaPurchase): boolean =>
+  p.state === "paid" || p.state === "channel_open" || p.state === "paying" || (p.state === "pay_failed" && !p.failureConfirmed);
+/** Still being paid (Amboss hasn't confirmed the channel yet). */
+const beingPaid = (p: MagmaPurchase): boolean => p.state === "paying" || p.state === "pay_failed";
 
 /** Slack when the block an order was placed in is estimated from its time:
  *  a day of blocks, plus a tenth of the blocks since. Blocks come faster than
@@ -226,11 +242,11 @@ export function channelLeases(
   // Newest purchases first; a channel claimed by a sale or another purchase
   // is not claimed again.
   const purchases = sources.purchases
-    .filter((p) => BOUGHT_STATES.has(p.state))
+    .filter(bought)
     .sort((a, b) => Date.parse(b.paidAt ?? b.updatedAt) - Date.parse(a.paidAt ?? a.updatedAt));
   const claim = (p: MagmaPurchase, c: LeaseChannelRef) => {
     const lease = measure("magma_purchase", p.orderId, p.leaseBlocks && p.leaseBlocks > 0 ? p.leaseBlocks : DEFAULT_LEASE_BLOCKS, c.id, currentHeight, nowMs);
-    out.set(c.id, { ...lease, costSats: p.feeSats + (p.routingFeeSats ?? 0), paidAt: p.paidAt ?? null });
+    out.set(c.id, { ...lease, costSats: p.feeSats + (p.routingFeeSats ?? 0), paidAt: p.paidAt ?? null, ...(beingPaid(p) ? { paying: true } : {}) });
   };
 
   // 1. Every purchase Amboss named a channel for claims that channel — or
@@ -322,6 +338,8 @@ export function leaseProtection(l: ChannelLease, nowMs = Date.now()): string {
     case "lsps1_sale":
       return `sold to an LSP client (order ${l.orderId.slice(0, 8)}…) — this node promised to keep it open ${until}`;
     case "magma_purchase":
-      return `bought on Magma for ${Math.round(l.costSats ?? 0).toLocaleString("en-US")} sat (order ${l.orderId.slice(0, 8)}…) — the inbound you paid for is leased ${until}; closing it throws that away`;
+      return l.paying
+        ? `being bought on Magma for ${Math.round(l.costSats ?? 0).toLocaleString("en-US")} sat (order ${l.orderId.slice(0, 8)}…) — your payment is held until Amboss confirms this channel; closing it now cancels the purchase (Amboss refunds the payment) and gives up the inbound`
+        : `bought on Magma for ${Math.round(l.costSats ?? 0).toLocaleString("en-US")} sat (order ${l.orderId.slice(0, 8)}…) — the inbound you paid for is leased ${until}; closing it throws that away`;
   }
 }

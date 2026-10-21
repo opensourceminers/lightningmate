@@ -117,7 +117,12 @@ export type StoreIncidentKind =
   /** Money moved (a channel was opened) but the record of it could not be
    *  saved. The app does not repeat it, and recovers it from LND after a
    *  restart — but the operator must know. Stays until acknowledged. */
-  | "unrecorded_open";
+  | "unrecorded_open"
+  /** A channel was opened for a sale, but the buyer's payment could not be
+   *  claimed (LND released it, or lost the invoice): the buyer has the
+   *  channel without paying. `detail` names the order and the channel.
+   *  Stays until acknowledged. */
+  | "unpaid_channel";
 
 export interface StoreIncident {
   id: string;

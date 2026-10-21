@@ -61,6 +61,8 @@ function incidentMessage(i: StoreIncident): string {
       return `${ADJUSTED_WHAT[i.file] ?? `Values in ${i.file}`} were outside the current limits and were adjusted: ${i.detail}.`;
     case "unrecorded_open":
       return `${i.detail} Is the disk full?`;
+    case "unpaid_channel":
+      return `${i.detail} The buyer was not charged. The channel is yours: close it to take the capital back, or keep it for routing.`;
   }
 }
 

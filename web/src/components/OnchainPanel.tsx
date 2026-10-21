@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { api } from "../api";
-import type { OnchainState, OnchainTx, PriceInfo } from "../types";
+import type { OnchainState, OnchainTx, PriceInfo, SendPreview } from "../types";
 import { fiat, sats, timeAgo } from "../format";
 import { promisedSpend, spendPromisedQuestion } from "../statusNotes";
+import { budgetLine, sendDoubleCheck, sendNeedsConfirm, sendSummary } from "../onchainView";
 import { useUi } from "./Overlay";
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -22,6 +23,8 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
   // Send
   const [toAddr, setToAddr] = useState("");
   const [amount, setAmount] = useState("");
+  /** Send everything LND may spend (a sweep) instead of an amount. */
+  const [sendAll, setSendAll] = useState(false);
   const [feeRate, setFeeRate] = useState("");
   const [sending, setSending] = useState(false);
 
@@ -61,28 +64,77 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
     setTimeout(() => setCopied(false), 1500);
   };
 
+  // The most that can go while the reserve and the coins promised to buyers
+  // stay, at the chosen fee rate (the server's own preview).
+  const fillMax = async () => {
+    const rate = Number(feeRate) || 0;
+    if (!toAddr.trim() || rate <= 0) {
+      toast("Enter the address and the fee rate first.", "error");
+      return;
+    }
+    try {
+      const p = await api.onchainPreview({ address: toAddr.trim(), feeRate: rate, max: true });
+      if (p.error) {
+        toast(p.error, "error");
+        return;
+      }
+      setSendAll(false);
+      setAmount(String(p.amountSats));
+    } catch (e) {
+      toast(msg(e), "error");
+    }
+  };
+
   const send = async () => {
     const amt = Number(amount) || 0;
     const rate = Number(feeRate) || 0;
-    if (!toAddr.trim() || amt <= 0 || rate <= 0) {
+    if (!toAddr.trim() || (!sendAll && amt <= 0) || rate <= 0) {
       toast("Enter address, amount and fee rate.", "error");
       return;
     }
+    const what = sendAll ? { sendAll: true } : { tokens: amt };
+    // What it costs and leaves, before the first yes; what needs a second
+    // yes (an unusual rate or fee, the reserve) gets one. The server checks
+    // the same again and refuses what wasn't confirmed.
+    let preview: SendPreview;
+    setSending(true);
+    try {
+      preview = await api.onchainPreview({ address: toAddr.trim(), feeRate: rate, ...(sendAll ? { all: true } : { tokens: amt }) });
+    } catch (e) {
+      toast(msg(e), "error");
+      return;
+    } finally {
+      setSending(false);
+    }
+    if (preview.error) {
+      toast(preview.error, "error");
+      return;
+    }
     const ok = await confirm({
-      title: "Send on-chain",
-      message: `Send ${sats(amt)} sat to ${toAddr.trim().slice(0, 16)}… at ${rate} sat/vByte? On-chain sends are irreversible.`,
-      confirmLabel: "Send now",
+      title: sendAll ? "Send everything on-chain" : "Send on-chain",
+      message: sendSummary(preview),
+      confirmLabel: preview.checks.length ? "Continue" : "Send now",
       danger: true,
     });
     if (!ok) return;
-    setSending(true);
+    const second = sendDoubleCheck(preview.checks);
+    if (second && !(await confirm({ title: "Check before sending", message: second, confirmLabel: "Send anyway", danger: true }))) return;
+    const confirmed = preview.checks.map((c) => c.code);
     const sendNow = (spendPromised: boolean) =>
-      api.onchainSend({ address: toAddr.trim(), tokens: amt, feeRate: rate, ...(spendPromised ? { spendPromised } : {}) });
+      api.onchainSend({ address: toAddr.trim(), feeRate: rate, ...what, confirmed, ...(spendPromised ? { spendPromised } : {}) });
+    setSending(true);
     try {
       let r: Awaited<ReturnType<typeof sendNow>>;
       try {
         r = await sendNow(false);
       } catch (e) {
+        // Something changed since the preview (the balance, LND's rates):
+        // nothing was sent — review it again.
+        const changed = sendNeedsConfirm(e);
+        if (changed) {
+          toast(`Not sent — it changed since the preview: ${changed.map((c) => c.message).join(" ")} Review it again.`, "error");
+          return;
+        }
         // Coins promised to buyers: only with an explicit yes that names them.
         const promised = promisedSpend(e);
         if (!promised) throw e;
@@ -102,6 +154,7 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
         toast(`Sent — tx ${r.transactionId.slice(0, 12)}…`, "success");
         setToAddr("");
         setAmount("");
+        setSendAll(false);
         load();
       } else {
         toast(`Send failed: ${r.error ?? "unknown"}`, "error");
@@ -133,6 +186,7 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
           {state && state.pendingSats > 0 ? (
             <div className="muted">+ {sats(state.pendingSats)} sat pending</div>
           ) : null}
+          {state && budgetLine(state) ? <div className="muted">{budgetLine(state)}</div> : null}
         </div>
         <div className="oc-bal-meta">
           {state?.suggestedFeeRate ? <div className="muted">≈ {state.suggestedFeeRate} sat/vB to confirm</div> : null}
@@ -174,15 +228,31 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
             </label>
             <label className="policy-field">
               <span>Amount (sat)</span>
-              <input type="number" min={0} value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="0" />
-              {amount && fiatOf(Number(amount) || 0) ? <span className="muted">≈ {fiatOf(Number(amount) || 0)}</span> : null}
+              <input
+                type="number"
+                min={0}
+                value={sendAll ? "" : amount}
+                disabled={sendAll}
+                onChange={(e) => setAmount(e.target.value)}
+                placeholder={sendAll ? "everything" : "0"}
+              />
+              {!sendAll && amount && fiatOf(Number(amount) || 0) ? <span className="muted">≈ {fiatOf(Number(amount) || 0)}</span> : null}
             </label>
+            <div className="amboss-row">
+              <button className="row-btn" disabled={!canWrite || sending} onClick={() => void fillMax()} title="The most that can go while the on-chain reserve and the coins promised to buyers stay">
+                Max
+              </button>
+              <label className="muted">
+                <input type="checkbox" checked={sendAll} disabled={!canWrite || sending} onChange={(e) => setSendAll(e.target.checked)} /> Send everything
+                (empty the wallet — LND keeps only its anchor reserve)
+              </label>
+            </div>
             <label className="policy-field">
               <span>Fee rate (sat/vByte)</span>
               <input type="number" min={1} value={feeRate} onChange={(e) => setFeeRate(e.target.value)} />
             </label>
             <button className="primary-btn btn-danger" disabled={!canWrite || sending} onClick={send}>
-              {sending ? "Sending…" : "Send now"}
+              {sending ? "Sending…" : "Review & send"}
             </button>
           </div>
         </section>

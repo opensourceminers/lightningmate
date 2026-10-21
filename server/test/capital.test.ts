@@ -869,8 +869,11 @@ test("an LSPS1 settle that retries (LND busy) doesn't hold the on-chain mutex: t
   assert.equal(await within(500, api.capital.mutex.run("magma accept (test)", async () => "done"), "a Magma accept"), "done");
   await fulfilled;
   assert.equal(attempts, 5);
-  assert.equal(order.orderState, "CREATED", "the payment stays held — restart recovery settles it, never a second open");
-  assert.match(order.error ?? "", /settle failed/);
+  // Recovery tries the settle again with its backoff (lsps1.test.ts) —
+  // never a second open: the channel is on record.
+  assert.equal(order.orderState, "CREATED", "the payment stays held, its channel on record");
+  assert.match(order.error ?? "", /LND hasn't claimed the buyer's payment yet — tried again automatically/);
+  assert.equal(api.capital.mutex.busy, false, "and nobody holds the mutex while the settle waits for its next try");
 });
 
 test("an order accepted while a manual open dials its peer: the open's own check, inside the mutex, refuses — the buyer's coins stay the buyer's", async (t) => {

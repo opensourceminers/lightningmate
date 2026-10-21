@@ -26,11 +26,26 @@ import {
  *     treat "canceled" as a normal outcome, never as an error.
  */
 
+/** Release a held payment this many blocks before its HTLC would expire
+ *  (LND itself cancels at 12; we do it earlier, and on the record). Shared
+ *  by Magma selling and LSPS1. */
+export const HODL_CANCEL_MARGIN_BLOCKS = 24;
+
 export interface HodlSecret {
   /** Payment hash, hex — the invoice id. */
   id: string;
   /** Preimage, hex — releases the held payment. */
   secret: string;
+}
+
+/** The lowest CLTV expiry height among the HTLCs an invoice holds right now
+ *  (null when it holds none, or LND names no height): the block by which
+ *  the payment must be settled or released. */
+export function heldUntilHeightOf(inv: { payments?: readonly { is_held?: boolean; timeout?: number }[] }): number | null {
+  const heights = (inv.payments ?? [])
+    .filter((p) => p.is_held && Number.isFinite(p.timeout) && (p.timeout as number) > 0)
+    .map((p) => p.timeout as number);
+  return heights.length ? Math.min(...heights) : null;
 }
 
 export const sha256Hex = (buf: Buffer): string => createHash("sha256").update(buf).digest("hex");
@@ -113,7 +128,7 @@ export async function hodlStatus(lnd: AuthenticatedLnd, id: string): Promise<Hod
     // The typings lack `mtokens` (the library returns it); tokens is whole sats.
     mtokens: BigInt((inv as { mtokens?: string }).mtokens ?? String(BigInt(inv.tokens ?? 0) * 1000n)),
     heldMtokens: held.reduce((s, p) => s + BigInt(p.mtokens ?? "0"), 0n),
-    heldUntilHeight: held.length ? Math.min(...held.map((p) => p.timeout)) : null,
+    heldUntilHeight: heldUntilHeightOf(inv),
     expiresAt: inv.expires_at ?? null,
   };
 }

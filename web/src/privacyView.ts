@@ -11,12 +11,14 @@ export const TOR_ROUTES: { id: TorRoute; label: string; desc: string }[] = [
   {
     id: "lookups",
     label: "Lookups via Tor",
-    desc: "LN+ and the BTC price go through Tor. Amboss and the service-fee lookup go direct: Amboss knows your account anyway, and its orders have deadlines Tor can make tight.",
+    desc:
+      "LN+, the BTC price and Amboss's public market data (your node's own seller score included) go through Tor. " +
+      "Amboss calls made with your API key and the service-fee lookup go direct: those Amboss calls act for your account, and its orders have deadlines Tor can make tight.",
   },
   {
     id: "all",
     label: "Everything via Tor",
-    desc: "Amboss and the service-fee lookup go through Tor too — slower, and a service may refuse some Tor exits.",
+    desc: "Amboss calls made with your API key and the service-fee lookup go through Tor too — slower, and a service may refuse some Tor exits.",
   },
   {
     id: "direct",
@@ -41,4 +43,14 @@ export function privacySummary(p: PrivacyInfo): string {
 export function destinationLine(d: PrivacyInfo["destinations"][number]): string {
   const how = !d.active ? "not used now" : d.viaTor ? "through Tor" : "direct, from this server's IP address";
   return `${d.service} — ${d.what}: ${how}`;
+}
+
+/** Why LN+ lookups leave from this server's IP (null when they go through
+ *  Tor): no proxy at all, or the operator's route set to Direct. Before,
+ *  the LN+ panel said "no Tor proxy" in both cases (review of P4). */
+export function lnplusDirectNote(s: { viaTor: boolean; torProxy: boolean }): string | null {
+  if (s.viaTor) return null;
+  return s.torProxy
+    ? "LN+ lookups leave from this server's IP address: the Tor route is set to Direct (Settings → Privacy)."
+    : "LN+ lookups leave from this server's IP address (no Tor proxy — see Settings → Privacy).";
 }

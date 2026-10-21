@@ -24,7 +24,7 @@ import {
 } from "./magmaHistory.js";
 import { assessEligibility, cachedPublicBook, publicBook, publicBookFailure, type Eligibility } from "./magmaEligibility.js";
 import type { LeaseBenchmark } from "./dashboard.js";
-import { MagmaPurchases, type PaymentReport } from "./magmaPurchases.js";
+import { MagmaPurchases, type MagmaPurchase, type PaymentReport } from "./magmaPurchases.js";
 import { ChannelUptime } from "./channelUptime.js";
 import type { LeaseSources } from "./leases.js";
 import { getOrder } from "./amboss.js";
@@ -33,6 +33,7 @@ import { saleFeeConfig, type ServiceFeeLedger } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { errorText } from "./errorText.js";
 import { getOwnPubkey } from "./node.js";
+import { torVia } from "./http.js";
 import { getChannelSuggestionsV2, type SuggestionV2 } from "./suggestRecommend.js";
 import {
   MAX_CAPITAL_SHARE_PER_OPEN,
@@ -646,6 +647,14 @@ function offerDifferences(have: OfferFields, want: OfferFields | null): string[]
     .map((k) => `${FIELD_LABEL[k]}: Amboss has ${have[k]}, wanted ${want[k]}`);
 }
 
+/** The same terms and status — what an edit changes (the listed liquidity
+ *  also moves with every sale, so it is not compared). */
+function sameTerms(a: MyOffer, b: MyOffer): boolean {
+  const x = fieldsOf(a);
+  const y = fieldsOf(b);
+  return (Object.keys(x) as (keyof OfferFields)[]).every((k) => k === "availableSats" || x[k] === y[k]);
+}
+
 /** The fields to send to bring `have` to `want` (null = nothing to change). */
 function termsUpdate(have: MyOffer, want: OfferFields): Partial<OfferTerms> | null {
   const p: Partial<OfferTerms> = {};
@@ -1052,6 +1061,14 @@ export class Autopilot {
       reserveSats: this.state.config.sellReserveSats,
       maxDeploySats: this.state.config.sellMaxDeploySats,
     };
+  }
+
+  /** The on-chain reserve the operator's settings keep — the larger of the
+   *  channel-open and the sell reserve: what an on-chain send is warned
+   *  about dipping into (onchain.ts previewSend). */
+  onchainReserveSetting(): number {
+    const c = this.state.config;
+    return Math.max(c.channelReserveSats, c.sellReserveSats);
   }
 
   /** A completed LSPS1 sale, surfaced as a run-history entry so it shows up in
@@ -2952,20 +2969,36 @@ export class Autopilot {
       reason: want.reasons.join("; "),
     };
     let after = off;
-    try {
-      write.ok = await updateOffer(key, off.id, update);
-      if (!write.ok) write.error = "Amboss did not apply the update (success: false)";
-    } catch (err) {
-      write.error = errText(err);
-    }
-    if (write.ok) {
-      // Read it back: "success" is Amboss's word; the stored offer is the proof.
-      const read = await getMyOffer(key, off.id).catch(() => null);
-      if (read) {
-        after = read;
-        write.verified = termsMatch(read, update);
-        if (!write.verified) write.error = "Amboss answered success, but the offer reads back different";
+    // One write per offer at a time (withOffer): an edit on Market → Sell
+    // waits for this write and its read-back, and this one for the edit's.
+    // Inside, the offer is read afresh: one whose terms changed since this
+    // run read it — the operator's edit, or one on amboss.tech — is left as
+    // it now is; the next run starts from it. (Review of P1b: the manual
+    // write and this one crossed, the later one won, and the other's
+    // read-back reported "not stored".)
+    const changed = await this.withOffer(off.id, async (): Promise<MyOffer | null> => {
+      const fresh = await getMyOffer(key, off.id).catch(() => null);
+      const takenOver = !control.manual && !!this.offerControlOf(off.id).manual;
+      if (takenOver || (fresh && !sameTerms(fresh, off))) return fresh ?? off;
+      try {
+        write.ok = await updateOffer(key, off.id, update);
+        if (!write.ok) write.error = "Amboss did not apply the update (success: false)";
+      } catch (err) {
+        write.error = errText(err);
       }
+      if (write.ok) {
+        // Read it back: "success" is Amboss's word; the stored offer is the proof.
+        const read = await getMyOffer(key, off.id).catch(() => null);
+        if (read) {
+          after = read;
+          write.verified = termsMatch(read, update);
+          if (!write.verified) write.error = "Amboss answered success, but the offer reads back different";
+        }
+      }
+      return null;
+    });
+    if (changed) {
+      return this.syncEntry(changed, null, undefined, "the offer changed while this run priced it (an edit on Market → Sell or on amboss.tech) — left as it is now; the next run starts from it");
     }
     const ok = write.ok && write.verified !== false;
     out.push({ orderId: off.id, action: want.kind, sizeSats: want.fields.maxSizeSats, ok, ...(ok ? {} : { error: write.error }) });
@@ -3448,7 +3481,7 @@ export class Autopilot {
         grossAprPct: null,
         sales: null,
         windowDays: null,
-        text: failed ? "the Magma market could not be read — asked again in a few minutes" : "the Magma market is being read",
+        text: failed ? `the Magma market could not be read${torVia("amboss_public")} — asked again in a few minutes` : "the Magma market is being read",
       };
     }
     if (e.verdict === "not_realistic") {
@@ -3611,6 +3644,23 @@ export class Autopilot {
       });
     } finally {
       this.followingPurchases = false;
+    }
+  }
+
+  /**
+   * Ask LND now how one purchase's payment stands, and record it — before a
+   * cancel or a new payment acts on a failure only the pay call reported (a
+   * dropped stream, a restart): that payment may still be in flight. LND not
+   * answering changes nothing (the record stays as unclear as it was).
+   */
+  async checkPurchasePayment(orderId: string): Promise<MagmaPurchase | undefined> {
+    const p = this.purchases.get(orderId);
+    // Paying, or failed by the pay call's word only: LND has the last word.
+    if (!p || !(p.state === "paying" || (p.state === "pay_failed" && !p.failureConfirmed))) return p;
+    try {
+      return this.purchases.paymentOutcome(orderId, await this.purchasePaymentReport(p.paymentHash));
+    } catch {
+      return this.purchases.get(orderId);
     }
   }
 

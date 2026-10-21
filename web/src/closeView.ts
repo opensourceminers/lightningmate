@@ -60,6 +60,7 @@ export function leaseLeft(l: Pick<ChannelLease, "blocksLeft" | "reportedByAmboss
 export function leaseTag(l: ChannelLease | null | undefined): string | null {
   if (!l) return null;
   if (!l.running) return l.kind === "magma_purchase" ? "bought on Magma · lease over" : null;
+  if (l.kind === "magma_purchase" && l.paying) return "being bought on Magma · payment held";
   const what = l.kind === "magma_sale" ? "Magma lease" : l.kind === "lsps1_sale" ? "LSP lease" : "bought on Magma";
   return `${what} · ${leaseLeft(l)}`;
 }
@@ -80,7 +81,9 @@ export function leaseBreakWarning(l: ChannelLease | null | undefined): string | 
     case "lsps1_sale":
       return `This channel was sold to an LSP client, and this node promised to keep it open ${until}. Closing it now breaks that promise.`;
     case "magma_purchase":
-      return `You bought this channel on Magma for ${sats(l.costSats ?? 0)} sat; its lease runs ${until}. Closing it now throws away the inbound you paid for.`;
+      return l.paying
+        ? `You are buying this channel on Magma for ${sats(l.costSats ?? 0)} sat: your payment is held until Amboss confirms it. Closing it now cancels the purchase — Amboss refunds the payment — and the inbound is gone.`
+        : `You bought this channel on Magma for ${sats(l.costSats ?? 0)} sat; its lease runs ${until}. Closing it now throws away the inbound you paid for.`;
   }
 }
 

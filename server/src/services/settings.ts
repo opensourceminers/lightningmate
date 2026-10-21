@@ -13,7 +13,7 @@ export interface AppSettings {
   /** Which outbound requests go through Umbrel's Tor proxy when the app has
    *  one (http.ts TorRoute). */
   torRoute: TorRoute;
-  /** LSP mode (beta): answer LSPS1 (bLIP-51) requests from wallets. Off by default. */
+  /** LSP mode (experimental): answer LSPS1 (bLIP-51) requests from wallets. Off by default. */
   lspModeEnabled: boolean;
   /** Clearnet address (host:port) to announce in the node graph, "" = none.
    *  Applied via peersrpc at runtime — Umbrel's UI has no externalip field. */

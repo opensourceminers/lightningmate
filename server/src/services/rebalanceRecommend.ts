@@ -11,6 +11,7 @@ import {
   type FeeRecState,
 } from "./feeRecommend.js";
 import { leaseRunning, type SoldLease } from "./leaseCaps.js";
+import { standardChannelId } from "./leases.js";
 import type { OverrideMap } from "./overrides.js";
 
 /**
@@ -301,8 +302,13 @@ export function buildSourcePool(
 ): SourceInfo[] {
   const revenue = (c: ChannelView) => feeById.get(c.id)?.metrics.revenue30d ?? 0;
   const best = active.reduce<ChannelView | null>((top, c) => (revenue(c) > (top ? revenue(top) : 0) ? c : top), null);
+  // By outpoint, or — for a sale only Amboss knows of — by the channel it names.
   const sold = (c: ChannelView) =>
-    ctx.soldLeases.some((l) => l.fundingOutpoint === `${c.transactionId}:${c.transactionVout}` && leaseRunning(l, c.id, ctx.currentBlock));
+    ctx.soldLeases.some(
+      (l) =>
+        (l.fundingOutpoint === `${c.transactionId}:${c.transactionVout}` || (!!l.channelId && standardChannelId(l.channelId) === c.id)) &&
+        leaseRunning(l, c.id, ctx.currentBlock),
+    );
   return active
     .flatMap((c): SourceInfo[] => {
       if (overrides[c.id]?.mode === "exclude") return [];

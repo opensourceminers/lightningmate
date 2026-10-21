@@ -35,6 +35,10 @@ import { makeNodeKey, makePaymentRequest, parsePaymentRequest, type NodeKey } fr
  *   router.sendPaymentV2 (stream) → pay / payViaPaymentRequest / payViaPaymentDetails
  *   router.trackPaymentV2 (stream) → getPayment
  *   chain.registerBlockEpochNtfn (stream) → subscribeToBlocks / getHeight
+ *   default.SubscribeCustomMessages (stream) / default.sendCustomMessage →
+ *     subscribeToPeerMessages / sendMessageToPeer (BOLT8 custom messages,
+ *     the LSPS0 transport): `peerMessage()` plays a peer sending one, and
+ *     `sentMessages` records what the node sent
  *
  * Anything else: `node.override("default.feeReport", (args, cb) => cb(null, {...}))`.
  * A method that is neither implemented nor overridden is ABSENT, so the
@@ -70,6 +74,8 @@ export interface FakeChannel {
   maxPendingMsat?: number;
   /** LND's lifetime "sent" counter of the channel (sat; default 0). */
   totalSent?: number;
+  /** The description the open gave it (LND's memo; default none). */
+  memo?: string;
 }
 
 export interface FakePendingChannel {
@@ -82,6 +88,8 @@ export interface FakePendingChannel {
   state?: "opening" | "waiting_close";
   /** Opened by the peer, not by this node (default: by this node). */
   partnerInitiated?: boolean;
+  /** The description the open gave it (LND's memo; default none). */
+  memo?: string;
 }
 
 export interface FakeInvoice {
@@ -193,6 +201,11 @@ export class FakeLnd {
   private readonly failures: { method: string; details: string; when: () => boolean }[] = [];
   private readonly paymentStreams = new Map<string, EventEmitter[]>();
   private readonly invoiceStreams = new Map<string, EventEmitter[]>();
+  private readonly messageStreams: EventEmitter[] = [];
+  /** Custom messages this node sent to peers (sendCustomMessage), in order. */
+  readonly sentMessages: { peer: string; type: number; data: Buffer }[] = [];
+  /** Runs as each custom message is sent (e.g. to answer it as the peer). */
+  onSentMessage: ((m: { peer: string; type: number; data: Buffer }) => void) | null = null;
 
   constructor(opts: FakeLndOptions = {}) {
     this.key = opts.key ?? makeNodeKey();
@@ -247,6 +260,19 @@ export class FakeLnd {
         },
         openChannel: (a: GrpcArgs) => this.openChannelStream(a),
         closeChannel: (a: GrpcArgs) => this.closeChannelStream(a),
+        // BOLT8 custom messages from peers arrive on this stream.
+        SubscribeCustomMessages: () => {
+          const s = stream();
+          this.messageStreams.push(s);
+          return s;
+        },
+        sendCustomMessage: (a, cb) => {
+          const m = { peer: Buffer.from(a.peer as Buffer).toString("hex"), type: Number(a.type), data: Buffer.from(a.data as Buffer) };
+          if (!this.peers.includes(m.peer)) return cb({ details: "peer is not connected" });
+          this.sentMessages.push(m);
+          this.onSentMessage?.(m);
+          cb(null, {});
+        },
       },
       router: {
         sendPaymentV2: (a: GrpcArgs) => this.sendPaymentStream(a),
@@ -332,6 +358,22 @@ export class FakeLnd {
 
   get publicKey(): string {
     return this.key.publicKey;
+  }
+
+  /** A connected peer sends this node a BOLT8 custom message. */
+  peerMessage(pubkey: string, type: number, data: Buffer | string): void {
+    const payload = typeof data === "string" ? Buffer.from(data, "utf8") : data;
+    for (const s of this.messageStreams) s.emit("data", { data: payload, peer: Buffer.from(pubkey, "hex"), type });
+  }
+
+  /** LND restarts: the peer-message streams and every invoice watch break
+   *  (whoever follows them gets an error), while invoices and payments stay
+   *  as they are in LND. */
+  dropSubscriptions(details = "Connection dropped"): void {
+    const message = this.messageStreams.splice(0);
+    const invoices = [...this.invoiceStreams.values()].flat();
+    this.invoiceStreams.clear();
+    for (const s of [...message, ...invoices]) s.emit("error", { details });
   }
 
   /** Replace or add a gRPC method, e.g. "default.feeReport". */
@@ -469,7 +511,7 @@ export class FakeLnd {
       local_balance: String(c.localBalance),
       local_chan_reserve_sat: "10000",
       local_constraints: c.maxPendingMsat ? { ...constraints, max_pending_amt_msat: String(c.maxPendingMsat) } : constraints,
-      memo: "",
+      memo: c.memo ?? "",
       num_updates: "12",
       pending_htlcs: [],
       private: c.isPrivate ?? false,
@@ -496,7 +538,7 @@ export class FakeLnd {
       initiator: p.partnerInitiated ? "INITIATOR_REMOTE" : "INITIATOR_LOCAL",
       local_balance: String(pendingLocal(p)),
       local_chan_reserve_sat: "0",
-      memo: "",
+      memo: p.memo ?? "",
       num_forwarding_packages: "0",
       private: false,
       remote_balance: "0",
@@ -728,7 +770,9 @@ export class FakeLnd {
       const amount = Number(a.local_funding_amount);
       const txid = rand32();
       this.chainBalance -= amount;
-      this.pending.push({ partnerPublicKey: partner, capacity: amount, transactionId: txid, transactionVout: 0 });
+      // LND keeps the open's description (memo) with the channel.
+      const memo = typeof a.memo === "string" && a.memo ? a.memo : undefined;
+      this.pending.push({ partnerPublicKey: partner, capacity: amount, transactionId: txid, transactionVout: 0, ...(memo ? { memo } : {}) });
       s.emit("data", { update: "chan_pending", chan_pending: { txid: txidBytes(txid), output_index: 0 } });
     });
     return s;
@@ -753,6 +797,7 @@ export class FakeLnd {
         localBalance: c.localBalance,
         transactionId: c.transactionId,
         transactionVout: c.transactionVout,
+        ...(c.memo ? { memo: c.memo } : {}),
         state: "waiting_close",
       });
       s.emit("data", { update: "close_pending", close_pending: { txid: txidBytes(rand32()), output_index: 0 } });

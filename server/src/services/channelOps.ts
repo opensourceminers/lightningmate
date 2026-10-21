@@ -19,6 +19,9 @@ export interface OpenChannelParams {
    *  LND before 0.16. */
   routingFeePpm?: number;
   routingBaseFeeMsat?: number;
+  /** Kept by LND with the channel (its memo, LND ≥ 0.17; older versions
+   *  ignore it): a sale's open names its order (capital.ts saleTag). */
+  description?: string;
 }
 
 export interface OpenChannelResult {
@@ -241,6 +244,7 @@ export async function fundChannel(writeLnd: AuthenticatedLnd, params: OpenChanne
       // A string: "0" is a base fee of zero (the library tests it for
       // presence, and "0" is set).
       ...(params.routingBaseFeeMsat !== undefined ? { base_fee_mtokens: String(params.routingBaseFeeMsat) } : {}),
+      ...(params.description ? { description: params.description } : {}),
     });
     return {
       ...base,

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { FeeEstimates } from "../types";
 import { satsCompact } from "../format";
+import { fastRateHint } from "../onchainView";
 import {
   closeButtons,
   dialogLease,
@@ -147,7 +148,7 @@ export function CloseChannelDialog({
   };
 
   const presets = [
-    { key: "fast", label: "Fast", hint: "next block", rate: fees?.fast ?? null },
+    { key: "fast", label: "Fast", hint: fees ? fastRateHint(fees) : "next block", rate: fees?.fast ?? null },
     { key: "normal", label: "Normal", hint: "~30 min", rate: fees?.normal ?? null },
     { key: "economy", label: "Economy", hint: "~hours", rate: fees?.economy ?? null },
   ];

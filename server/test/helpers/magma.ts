@@ -197,6 +197,13 @@ export class FakeMagma {
   /** Runs as each mutation arrives, before Amboss acts on it (e.g. SIGTERM
    *  arriving while Amboss is answering). */
   onMutation: ((op: string, variables: Record<string, unknown>) => void) | null = null;
+  /** Runs as each mutation arrives (after onMutation): a promise it returns
+   *  holds that mutation — Amboss neither applies nor answers it — until the
+   *  promise resolves. Two writes crossing, one step at a time. */
+  holdMutation: ((op: string, variables: Record<string, unknown>) => Promise<void> | null) | null = null;
+  /** Runs as each read query arrives, before it is answered — e.g. an edit
+   *  made on amboss.tech landing between two reads of one offer. */
+  onRead: ((op: string, variables: Record<string, unknown>) => void) | null = null;
   private readonly counts = new Map<string, number>();
 
   constructor(http: FetchMock, t?: AfterHook) {
@@ -279,6 +286,10 @@ export class FakeMagma {
     if (req.graphql?.isMutation) {
       this.calls.push({ op, variables });
       this.onMutation?.(op, variables);
+      const held = this.holdMutation?.(op, variables);
+      if (held) await held;
+    } else {
+      this.onRead?.(op, variables);
     }
 
     const read = (data: () => unknown): Promise<Response | Record<string, unknown>> | Response | Record<string, unknown> => {

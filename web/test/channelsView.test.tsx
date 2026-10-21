@@ -20,7 +20,7 @@ import type { OpenEstimate } from "../src/types";
 
 const estimate = (o: Partial<OpenEstimate> = {}): OpenEstimate => ({
   sizeSats: 2_000_000,
-  fees: { fast: 30, normal: 12, economy: 4 },
+  fees: { fast: 30, fastTarget: 1, normal: 12, economy: 4 },
   spendableSat: 5_000_000,
   reserveSat: 61_000,
   promisedSat: 0,

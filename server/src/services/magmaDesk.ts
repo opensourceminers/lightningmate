@@ -25,6 +25,7 @@ import {
 } from "./magmaApi.js";
 import { MagmaJournal, TERMINAL_PHASES, type MagmaJournalEntry, type MagmaPhase } from "./magmaJournal.js";
 import {
+  HODL_CANCEL_MARGIN_BLOCKS,
   cancelHodl,
   createHodl,
   findInvoicesByDescription,
@@ -50,6 +51,7 @@ import type { EarningsLog } from "./earningsLog.js";
 import type { ServiceFeeLedger } from "./serviceFee.js";
 import { errorText } from "./errorText.js";
 import { getOwnPubkey } from "./node.js";
+import type { SoldLease } from "./leaseCaps.js";
 
 /**
  * Magma selling, end to end, on the Magma API — the "order desk".
@@ -96,8 +98,9 @@ const MIN_INVOICE_LIFE_MS = 48 * 3_600_000 + 5 * 60_000;
  *  and Amboss's check (~2 days), well inside a sender's 2016-block limit. */
 export const HODL_CLTV_DELTA = 288;
 /** Release a held payment this many blocks before its HTLC would expire
- *  (LND itself cancels at 12; we do it earlier, and on the record). */
-export const CANCEL_MARGIN_BLOCKS = 24;
+ *  (LND itself cancels at 12; we do it earlier, and on the record) — the
+ *  margin LSPS1 keeps too (hodl.ts). */
+export const CANCEL_MARGIN_BLOCKS = HODL_CANCEL_MARGIN_BLOCKS;
 /** An open needs the held payment to outlive the cancel margin by the time
  *  the channel takes to confirm and Amboss to validate it (~6 h). With only
  *  the cancel margin, an open at 25 blocks left was followed one block later
@@ -429,9 +432,32 @@ export class MagmaDesk {
       reservations: () => this.journal.reservations(deps.config().sellReserveSats),
       deployedSat: () => this.deployed.sats,
       claimedOutpoints: () => this.journal.claimedOutpoints(),
-      leaseCaps: () => this.journal.leaseCaps(),
-      soldLeases: () => this.journal.soldLeases(),
+      // A lease Amboss still lists as running holds — the routing-fee
+      // promise and the rebalancer's hands-off alike — whatever the
+      // journal's own count says (review of P4: only the close protections
+      // took Amboss's word).
+      leaseCaps: () => this.markRunningOnAmboss(this.journal.leaseCaps()),
+      soldLeases: () => this.soldLeasesWithAmboss(),
     });
+  }
+
+  /** The journal's sale records, each marked when Amboss's last listing has
+   *  its lease running. */
+  private markRunningOnAmboss<T extends { orderId: string }>(items: T[]): (T & { ambossRunning?: boolean })[] {
+    const running = new Set(this.ambossLeases.map((l) => l.orderId));
+    return items.map((i) => (running.has(i.orderId) ? { ...i, ambossRunning: true } : i));
+  }
+
+  /** Every channel sold on Magma whose lease may run: the journal's, marked
+   *  as above — and the sales only Amboss knows of (completed before the
+   *  journal existed, or with another tool), by the channel Amboss names. */
+  private soldLeasesWithAmboss(): SoldLease[] {
+    const own = this.markRunningOnAmboss(this.journal.soldLeases());
+    const known = new Set(own.map((l) => l.orderId));
+    const onlyAmboss = this.ambossLeases
+      .filter((l) => !known.has(l.orderId))
+      .map((l): SoldLease => ({ fundingOutpoint: "", source: "magma", orderId: l.orderId, leaseBlocks: 0, ambossRunning: true, channelId: l.channelId }));
+    return [...own, ...onlyAmboss];
   }
 
   // ── lifecycle ──────────────────────────────────────────────────────────────

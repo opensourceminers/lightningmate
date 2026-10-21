@@ -256,7 +256,8 @@ idle).
 
 13. **Lease promise (D7)** — last: a channel sold through Magma or LSPS1 stays within the
     caps its order locked, for the lease (a Magma lease a day of blocks longer, since Amboss
-    counts it from its own confirmation) — over every rule above, pins included.
+    counts it from its own confirmation — and for as long as Amboss's listing still reports
+    the lease running, whatever that count says) — over every rule above, pins included.
 
 14. **Apply guards (decide *whether* to apply, never the target):**
     - skip when the fee is within the threshold of the aim, **unless** the base fee also needs
@@ -342,7 +343,8 @@ the expected earnings, it nets at least `minNetProfitSats` and pays back within
 `maxPaybackDays` — and **the payment's max fee is that same limit at every size it tries**
 (the halved fallbacks too), never more than is left of today's budget.
 Sources: never a channel younger than 14 days, a private one, one sold through Magma or LSPS1
-in its lease, one with any net outflow in 14 days, a top earner or the node's single best
+in its lease (or one whose Magma lease Amboss still lists as running — a sale the order
+journal never recorded too), one with any net outflow in 14 days, a top earner or the node's single best
 earner; each gives at most its balance above its own target share + 5 %, and the moves
 planned from it shrink what it can give the next target. Up to three sources are tried per
 target, the next one when no route pays from the one before; a failed source backs off for

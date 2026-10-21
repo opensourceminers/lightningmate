@@ -20,7 +20,9 @@ import http from "node:http";
 import https from "node:https";
 import net, { type AddressInfo } from "node:net";
 import { join } from "node:path";
-import { HttpTimeoutError, httpRequest, setOutboundRouting, viaTor } from "../src/services/http.js";
+import { HttpTimeoutError, httpRequest, setOutboundRouting, torVia, viaTor } from "../src/services/http.js";
+import { ambossGql } from "../src/services/amboss.js";
+import { __resetEligibilityCache } from "../src/services/magmaEligibility.js";
 import { socksFetch, torProxyFromEnv } from "../src/services/torProxy.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
 import { startApi } from "./helpers/apiHarness.js";
@@ -143,23 +145,33 @@ test("through the proxy the destination is sent by NAME (Tor resolves it — no 
   assert.equal(web.seen[0].host, "lightningnetwork.plus");
 });
 
-test("with a proxy, LN+ and price lookups go through Tor; Amboss and the fee lookup stay direct unless the operator routes everything — and 'direct' routes nothing", async (t) => {
+test("with a proxy, LN+, price lookups and Amboss's keyless reads go through Tor; Amboss calls with the key and the fee lookup stay direct unless the operator routes everything — and 'direct' routes nothing", async (t) => {
   restoreRouting(t);
   const web = await webServer(t);
   const socks = await socksServer(t, () => web.port);
   const fetchMock = installFetchMock(t);
   fetchMock.on("http://api.amboss.example/graphql", () => ({ data: {} }));
   setOutboundRouting({ proxy: socks.proxy, route: "lookups" });
-  assert.deepEqual([viaTor("lnplus"), viaTor("price"), viaTor("amboss"), viaTor("lnurl")], [true, true, false, false]);
+  assert.deepEqual(
+    [viaTor("lnplus"), viaTor("price"), viaTor("amboss_public"), viaTor("amboss"), viaTor("lnurl")],
+    [true, true, true, false, false],
+  );
   const lnplus = await httpRequest("http://lightningnetwork.plus/api/2/get_swaps/", { headers: { Accept: "application/json" } }, 5_000, "lnplus");
   assert.equal(lnplus.status, 200);
   assert.equal((await lnplus.json<{ path: string }>()).path, "/api/2/get_swaps/");
-  await httpRequest("http://api.amboss.example/graphql", { method: "POST", body: "{}" }, 5_000, "amboss");
-  assert.deepEqual(socks.asked.map((a) => a.host), ["lightningnetwork.plus"], "Amboss went direct");
-  assert.deepEqual(fetchMock.requests.map((r) => r.url), ["http://api.amboss.example/graphql"], "and LN+ never touched the direct path");
+  // A read without the key — the public book, this node's own seller score
+  // by its public key: through Tor. Review of P4: it went direct, so a node
+  // with no Amboss key linked its home IP to its key at Amboss.
+  await ambossGql("http://api.amboss.example/graphql", "query { x }").catch(() => undefined);
+  assert.deepEqual(socks.asked.map((a) => a.host), ["lightningnetwork.plus", "api.amboss.example"], "the keyless Amboss read went through Tor");
+  // A call with the key acts for the Amboss account: direct.
+  await ambossGql("http://api.amboss.example/graphql", "query { x }", "the-key");
+  assert.equal(socks.asked.length, 2, "the keyed call did not");
+  assert.deepEqual(fetchMock.requests.map((r) => r.url), ["http://api.amboss.example/graphql"], "and only it took the direct path");
+  assert.equal(fetchMock.requests[0].headers.authorization, "Bearer the-key");
 
   setOutboundRouting({ route: "all" });
-  assert.deepEqual([viaTor("amboss"), viaTor("lnurl")], [true, true]);
+  assert.deepEqual([viaTor("amboss"), viaTor("amboss_public"), viaTor("lnurl")], [true, true, true]);
   const amboss = await httpRequest("http://api.amboss.example/graphql", { method: "POST", headers: { "Content-Type": "application/json" }, body: '{"query":"{ x — ü }"}' }, 5_000, "amboss");
   assert.equal(amboss.status, 200);
   assert.equal(web.seen.at(-1)?.method, "POST");
@@ -169,7 +181,7 @@ test("with a proxy, LN+ and price lookups go through Tor; Amboss and the fee loo
   assert.equal(fetchMock.requests.length, 1, "nothing more went direct");
 
   setOutboundRouting({ route: "direct" });
-  assert.deepEqual([viaTor("lnplus"), viaTor("price")], [false, false]);
+  assert.deepEqual([viaTor("lnplus"), viaTor("price"), viaTor("amboss_public")], [false, false, false]);
   // Without a proxy nothing can go through Tor, whatever the setting.
   setOutboundRouting({ proxy: null, route: "all" });
   assert.equal(viaTor("lnplus"), false);
@@ -239,18 +251,30 @@ test("LN+ can be switched off: no LN+ request at all — the views say so — an
 
   const privacy = await api.request("GET", "/privacy");
   assert.equal(privacy.body.torProxy, null, "no proxy in this environment: everything goes direct, and the card says so");
-  assert.deepEqual(
-    (privacy.body.destinations as { service: string; active: boolean; viaTor: boolean }[]).map((d) => [d.service, d.active, d.viaTor]),
-    [
-      ["Amboss (api.amboss.space, magma.amboss.tech)", true, false],
-      ["lightningnetwork.plus", false, false],
-      ["mempool.space", false, false],
-      ["the service-fee lightning address", true, false],
-    ],
-  );
-  // With Umbrel's proxy: LN+ and price through Tor; "all" adds Amboss.
+  const rows = (b: { destinations: { service: string; active: boolean; viaTor: boolean }[] }) => b.destinations.map((d) => [d.service, d.active, d.viaTor]);
+  assert.deepEqual(rows(privacy.body), [
+    ["Amboss public market data (api.amboss.space, magma.amboss.tech)", true, false],
+    ["Amboss account (magma.amboss.tech)", false, false],
+    ["lightningnetwork.plus", false, false],
+    ["mempool.space", false, false],
+    ["the service-fee lightning address", true, false],
+  ]);
+  // With Umbrel's proxy and the default route: LN+, price and Amboss's public
+  // data through Tor — the account calls (with a key) direct.
   setOutboundRouting({ proxy: { host: "10.21.21.11", port: 9050 } });
-  await api.request("POST", "/settings", { lnplusLookups: true, torRoute: "all" });
+  api.amboss.setKey("test-key");
+  await api.request("POST", "/settings", { lnplusLookups: true, torRoute: "lookups" });
+  const lookups = await api.request("GET", "/privacy");
+  assert.deepEqual(rows(lookups.body).map(([service, , tor]) => [service, tor]), [
+    ["Amboss public market data (api.amboss.space, magma.amboss.tech)", true],
+    ["Amboss account (magma.amboss.tech)", false],
+    ["lightningnetwork.plus", true],
+    ["mempool.space", true],
+    ["the service-fee lightning address", false],
+  ]);
+  assert.equal(lookups.body.destinations[1].active, true, "with a key the account calls are made");
+  // "all" adds the account calls and the fee lookup.
+  await api.request("POST", "/settings", { torRoute: "all" });
   const withTor = await api.request("GET", "/privacy");
   assert.equal(withTor.body.torProxy, "10.21.21.11:9050");
   assert.ok((withTor.body.destinations as { viaTor: boolean }[]).every((d) => d.viaTor));
@@ -271,6 +295,63 @@ test("SECURITY.md names every destination the Privacy card lists — and the car
     for (const host of hosts) assert.ok(security.includes(host), `SECURITY.md names ${host}`);
     if (hosts.length === 0) assert.ok(security.toLowerCase().includes(d.service.replace(/^the /, "").toLowerCase()), `SECURITY.md names ${d.service}`);
   }
-  const amboss = destinations.find((d) => d.service.startsWith("Amboss"));
-  assert.match(amboss?.what ?? "", /your own node's public seller score included \(by its public key\), with or without a key/);
+  const amboss = destinations.find((d) => d.service.startsWith("Amboss public"));
+  assert.match(amboss?.what ?? "", /your own node's public seller score included \(by its public key\), read without your API key/);
+  // Every trigger of the own-key lookup is named — the Overview's lease
+  // benchmark too (review of P4: it was missing).
+  assert.match(security, /by the autopilot's runs, the Market pages and the Overview's lease benchmark/);
+});
+
+// Review of P4: where a Tor-routed Amboss read fails, the page says that it
+// failed and which setting routes it — never a quiet fallback to direct.
+test("an Amboss read that fails through Tor says so and names the route setting — the selling check, the Overview's benchmark — and nothing goes direct", async (t) => {
+  restoreRouting(t);
+  __resetEligibilityCache();
+  t.after(() => __resetEligibilityCache());
+  const fetchMock = installFetchMock(t);
+  const closed = net.createServer();
+  await new Promise<void>((r) => closed.listen(0, "127.0.0.1", () => r()));
+  const deadPort = (closed.address() as AddressInfo).port;
+  await new Promise<void>((r) => closed.close(() => r()));
+  setOutboundRouting({ proxy: { host: "127.0.0.1", port: deadPort }, route: "lookups" });
+  assert.equal(torVia("amboss_public"), ' through Tor (Settings → Privacy, Tor route "Lookups via Tor")');
+  assert.equal(torVia("amboss"), "", "keyed calls go direct on this route: nothing to name");
+  const api = await startApi(t);
+  const check = await api.request("GET", "/amboss/eligibility");
+  assert.equal(check.status, 200, JSON.stringify(check.body));
+  assert.equal(check.body.verdict, "unknown");
+  assert.equal(
+    check.body.reasons[0],
+    'Amboss\'s public offer book could not be read through Tor (Settings → Privacy, Tor route "Lookups via Tor") — no comparison is possible right now.',
+  );
+  const benchmark = await api.autopilot.leaseBenchmark();
+  assert.equal(benchmark.text, 'the Magma market could not be read through Tor (Settings → Privacy, Tor route "Lookups via Tor") — asked again in a few minutes');
+  assert.equal(fetchMock.requests.length, 0, "never a quiet fallback to a direct connection");
+  setOutboundRouting({ route: "all" });
+  assert.equal(torVia("amboss"), ' through Tor (Settings → Privacy, Tor route "Everything via Tor")');
+});
+
+// Review of P4: GET /lnplus/status's viaTor was untested, and the LN+ panel
+// said "no Tor proxy" whenever it was false — also when Umbrel's proxy is
+// there and the operator chose "Direct".
+test("GET /lnplus/status: through Tor with a proxy on the default route, not with 'Direct' — and whether there is a proxy at all", async (t) => {
+  restoreRouting(t);
+  installFetchMock(t); // any LN+ request would fail the test: lookups are off
+  const closed = net.createServer();
+  await new Promise<void>((r) => closed.listen(0, "127.0.0.1", () => r()));
+  const deadPort = (closed.address() as AddressInfo).port;
+  await new Promise<void>((r) => closed.close(() => r()));
+  const api = await startApi(t);
+  await api.request("POST", "/settings", { lnplusLookups: false });
+  const status = async () => {
+    const r = await api.request("GET", "/lnplus/status");
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+    return [r.body.viaTor, r.body.torProxy];
+  };
+  assert.deepEqual(await status(), [false, false], "no proxy");
+  setOutboundRouting({ proxy: { host: "127.0.0.1", port: deadPort } });
+  await api.request("POST", "/settings", { torRoute: "lookups" });
+  assert.deepEqual(await status(), [true, true]);
+  await api.request("POST", "/settings", { torRoute: "direct" });
+  assert.deepEqual(await status(), [false, true], "a proxy, routed around");
 });

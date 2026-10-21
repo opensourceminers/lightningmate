@@ -9,6 +9,7 @@ import type {
   SuggestionsResponse,
 } from "../types";
 import { sats, satsCompact } from "../format";
+import { fastRateHint } from "../onchainView";
 import { openLines, startingFeeText } from "../openView";
 import { promisedSpend, spendPromisedQuestion } from "../statusNotes";
 import { Scanning } from "./Scanning";
@@ -397,7 +398,7 @@ export function SuggestionsPanel() {
                             [
                               ["economy", "Economy", "~hours"],
                               ["normal", "Normal", "~30 min"],
-                              ["fast", "Fast", "next block"],
+                              ["fast", "Fast", estimate ? fastRateHint(estimate.fees) : "next block"],
                             ] as const
                           ).map(([key, label, hint]) => {
                             const r = estimate?.fees[key] ?? null;

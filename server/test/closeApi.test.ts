@@ -310,6 +310,47 @@ test("the Amboss listing of older sales is kept on disk — a restart still prot
   assert.match(stale.body.protected[0]?.reason ?? "", /— Amboss reports its lease still running \(as of \d{4}-\d{2}-\d{2}\); closing it early/);
 });
 
+// Review of P4: only GET /suggestions/close was tested for asking Amboss
+// again; POST /channels/close reading the cached listing passed every test.
+test("POST /channels/close asks Amboss again when its listing is over an hour old — as the first request after a start: a lease Amboss says is over closes, one still running is refused", async (t) => {
+  t.mock.method(console, "log", () => undefined);
+  const http = installFetchMock(t);
+  http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
+  const magma = new FakeMagma(http, t);
+  const salesReads = () => http.requests.filter((r) => /sales/.test(r.body ?? "")).length;
+  const id = `${HEIGHT - 9_000}x7x0`;
+  for (const [status, closes] of [["CHANNEL_MONITORING_FINISHED", true], ["VALID_CHANNEL_OPENING", false]] as const) {
+    const node = feeNode({
+      blockHeight: HEIGHT,
+      channels: [{ id, partnerPublicKey: PEER(7), capacity: 3_000_000, localBalance: 3_000_000, transactionId: TX(7), transactionVout: 0, feeRatePpm: 100, baseFeeMsat: 0 }],
+    });
+    node.override("default.describeGraph", (_a, cb) => cb(null, { edges: [], nodes: [] }));
+    magma.sellerPubkey = node.publicKey;
+    magma.sales.clear();
+    // A sale only Amboss knows of (no journal record); the listing on disk —
+    // 3 hours old — still has its lease running.
+    const sale = magma.addSale({ buyerPubkey: PEER(7), status, sizeSats: 3_000_000, channelId: chanNumber(id) });
+    const dir = makeTempDir(t);
+    writeFileSync(
+      join(dir, "magma-amboss-leases.json"),
+      JSON.stringify({ at: new Date(Date.now() - 3 * 3_600_000).toISOString(), leases: [{ orderId: sale.id, channelId: chanNumber(id) }] }),
+    );
+    const api = await startApi(t, { node, dir });
+    api.amboss.setKey("test-key");
+    const before = salesReads();
+    const res = await api.request("POST", "/channels/close", { transactionId: TX(7), transactionVout: 0, isForce: false, feeRate: 2 });
+    assert.ok(salesReads() > before, `${status}: Amboss is asked again before the close`);
+    if (closes) {
+      assert.equal(res.status, 200, JSON.stringify(res.body));
+      assert.equal(res.body.ok, true, res.body.error);
+      assert.equal(node.callsTo("default.closeChannel").length, 1, "the lease is over on Amboss: closed");
+    } else {
+      assert.deepEqual([res.status, res.body.error], [409, "lease_active"], "still running on Amboss");
+      assert.equal(node.callsTo("default.closeChannel").length, 0);
+    }
+  }
+});
+
 // ── review 2 of P4: a repeat purchase, and Amboss's word on a sale's lease ──
 
 type LeaseBody = { orderId: string; running: boolean; untilHeight: number | null; blocksLeft: number | null; leaseBlocks: number; reportedByAmboss?: boolean } | null;
@@ -327,8 +368,9 @@ test("a repeat purchase from the same seller at the same size, paid but its chan
     join(dir, "magma-purchases.json"),
     JSON.stringify([
       bought({ orderId: "older-B-180d", leaseBlocks: 25_920, channelId: chanNumber(X.id), createdAt: ago(150 * DAY + 600_000), paidAt: ago(150 * DAY) }),
-      // A: ordered and paid minutes ago; the seller hasn't funded it yet.
-      bought({ orderId: "newer-A-30d", leaseBlocks: 4_320, state: "paid", orderStatus: "WAITING_FOR_CHANNEL_OPEN", channelId: null, createdAt: ago(1_200_000), paidAt: ago(600_000) }),
+      // A: ordered minutes ago, its payment held by the hold invoice
+      // ("paying") until Amboss confirms the channel — not funded yet.
+      bought({ orderId: "newer-A-30d", leaseBlocks: 4_320, state: "paying", orderStatus: "WAITING_FOR_CHANNEL_OPEN", channelId: null, createdAt: ago(1_200_000), paidAt: undefined, payStartedAt: ago(600_000), routingFeeSats: null }),
     ]),
   );
   const api = await startApi(t, { node, dir });

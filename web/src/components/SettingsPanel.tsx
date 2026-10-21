@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { AmbossKeyCheck, AppSettings, FiatCurrency, LspStatus, PrivacyInfo, TorRoute } from "../types";
+import { CLEARNET_WARNING, lspBuyerGuide, lspIgnoredLine, lspReachText, lspRecoveryLine, lspRefusalLines, lspServedLine } from "../lspView";
 import { TOR_ROUTES, destinationLine, privacySummary } from "../privacyView";
 import { BackupCard } from "./BackupCard";
 import { AmbossKeyStatus } from "./AmbossKeyStatus";
@@ -145,7 +146,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
     }
   };
 
-  // LSP mode (beta) — sell channels to LSPS1 wallets, discovery-only phase.
+  // LSP mode (experimental) — sell channels to LSPS1 wallets over BOLT8.
   const [lsp, setLsp] = useState<LspStatus | null>(null);
   const [lspBusy, setLspBusy] = useState(false);
   const [lspError, setLspError] = useState<string | null>(null);
@@ -155,8 +156,8 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
     api.lspStatus().then(setLsp).catch(() => setLsp(null));
   }, []);
 
-  // While the mode is on, poll so incoming get_info requests show up live —
-  // that's how you verify a wallet (e.g. ZEUS) actually reached the node.
+  // While the mode is on, poll so incoming requests show up live — served
+  // or refused — which is how you verify a wallet (e.g. ZEUS) reached the node.
   useEffect(() => {
     if (!lsp?.enabled) return;
     const t = setInterval(() => {
@@ -209,25 +210,14 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
   // Ready-to-share buyer instructions — the practical discovery channel while
   // graph crawlers catch up on the feature bit.
   const [guideCopied, setGuideCopied] = useState(false);
-  // Prefer a clearnet URI when the node announces both — more wallets reach it.
+  // The node's announced clearnet URI when it has one (a buyer without Tor
+  // can reach that one), else its .onion URI.
   const preferredUri = (l: LspStatus) =>
     l.uris.find((u) => !u.includes(".onion")) ?? l.uris[0] ?? l.pubkey;
 
   const copyBuyerGuide = () => {
     if (!lsp) return;
-    const uri = preferredUri(lsp);
-    const tor = uri.includes(".onion") ? " (reachable over Tor)" : "";
-    void navigator.clipboard.writeText(
-      [
-        "Buy an inbound Lightning channel directly from my node (LSPS1 / bLIP-51):",
-        "",
-        `Node URI: ${uri}${tor}`,
-        "",
-        "In ZEUS: Settings → Lightning Service Provider → set this node as your",
-        'LSPS1 provider (pubkey@host), then Channels → "Purchase Inbound".',
-        "Any LSPS1-capable wallet or the BTCPay Server LSP plugin works too.",
-      ].join("\n"),
-    );
+    void navigator.clipboard.writeText(lspBuyerGuide(preferredUri(lsp)));
     setGuideCopied(true);
     setTimeout(() => setGuideCopied(false), 1500);
   };
@@ -367,13 +357,14 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
       )}
       {ambossError ? <p className="banner error">{ambossError}</p> : null}
 
-      <h3 className="sub">LSP mode (beta)</h3>
+      <h3 className="sub">LSP mode (experimental)</h3>
       <div className="dryrun-banner">
-        Sell inbound channels <strong>directly to wallets and nodes</strong> speaking the open
-        LSP standard (LSPS1 / bLIP-51) — a second demand source beside Magma, with no
-        marketplace in between. Orders are priced by the same engine as Magma selling; the
-        buyer pays a hold invoice that only settles once the channel is opening, so failures
-        refund automatically. <strong>Off by default.</strong> Needs write mode (admin macaroon).
+        Sell inbound channels <strong>directly to wallets</strong> speaking the open LSP standard
+        (LSPS1 / bLIP-51) over Lightning peer messages — with no marketplace in between. Orders
+        are priced by the same engine as Magma selling; the buyer pays a hold invoice that only
+        settles once the channel is opening, so failures refund automatically.{" "}
+        <strong>Experimental and off by default</strong>: few wallets can order this way, and on a
+        Tor-only node fewer still (see below). Needs write mode (admin macaroon).
       </div>
       <div className="amboss-row">
         <Switch
@@ -386,6 +377,8 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
         {lsp && !lsp.canWrite ? <span className="muted">write mode is off — enable it to use LSP mode</span> : null}
       </div>
       {lspError ? <p className="banner error">{lspError}</p> : null}
+      {/* Who can order here — before the mode is switched on, too. */}
+      {lsp ? <p className="hint">{lspReachText(lsp.uris)}</p> : null}
       {settings?.lspModeEnabled && lsp ? (
         <>
           <div className="amboss-row" style={{ marginTop: 10 }}>
@@ -393,11 +386,21 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
               <i /> {lsp.running ? "Listening for LSP clients" : "Not listening"}
             </span>
             <span className="muted">
-              get_info served: {lsp.requestsServed}
-              {lsp.lastRequestAt ? ` · last ${timeAgo(lsp.lastRequestAt)}` : ""}
+              Requests answered: {lspServedLine(lsp)}
+              {lsp.lastRequestAt ? ` · last request ${timeAgo(lsp.lastRequestAt)}` : ""}
             </span>
           </div>
           {!lsp.running && lsp.lastError ? <p className="banner error">{lsp.lastError}</p> : null}
+          {lspRefusalLines(lsp).map((line) => (
+            <p key={line} className="banner error">Refused — {line}</p>
+          ))}
+          {lsp.clients.length > 0 ? (
+            <p className="muted">
+              Wallets seen: {lsp.clients.map((c) => `${c.app}${c.version ? ` ${c.version}` : ""} (${timeAgo(c.lastAt)})`).join(", ")}
+            </p>
+          ) : null}
+          {lspIgnoredLine(lsp) ? <p className="muted">Wallet extras ignored (accepted, not used): {lspIgnoredLine(lsp)}</p> : null}
+          {lspRecoveryLine(lsp) ? <p className="banner error">{lspRecoveryLine(lsp)}</p> : null}
           {lsp.offer ? (
             <p className="muted">
               Advertising {satsCompact(lsp.offer.minChannelSat)}–{satsCompact(lsp.offer.maxChannelSat)} sat
@@ -440,16 +443,10 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
               </div>
             );
           })()}
-          {lsp.uris.length > 0 && lsp.uris.every((u) => u.includes(".onion")) ? (
-            <p className="hint">
-              Your node announces a Tor-only address — buyers need a Tor-capable wallet (e.g. ZEUS on
-              Android). Announce a clearnet address below to reach more wallets.
-            </p>
-          ) : null}
-          <p className="muted" style={{ marginTop: 10 }}>
-            Announce a clearnet address (needs port 9735 forwarded on your router). With a dynamic
-            home IP, use a DDNS name — it&apos;s re-resolved hourly, and LightningMate keeps the
-            announcement alive across node restarts and IP changes:
+          <div className="dryrun-banner warn" style={{ marginTop: 10 }}>{CLEARNET_WARNING}</div>
+          <p className="muted">
+            Optional clearnet address (host:port, with port 9735 forwarded on your router). A DDNS
+            name is re-resolved hourly and kept announced across node restarts and IP changes:
           </p>
           <div className="amboss-row">
             <input

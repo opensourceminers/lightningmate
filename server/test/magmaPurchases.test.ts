@@ -117,6 +117,68 @@ test("a pay stream that dropped while LND kept the HTLC in flight: the purchase 
   assert.equal(api.autopilot.purchases.paidCosts().length, 1);
 });
 
+// Review of P1b: POST /amboss/buy/cancel took a "pay_failed" the pay call
+// alone had reported — while LND still had the HTLC in flight. The order was
+// cancelled on Amboss and recorded "declined"; had the payment then landed,
+// inbound paid for would have read as declined.
+test("a cancel waits for LND's word on a payment only the pay call said failed: refused while LND has it in flight, done once LND confirms the failure", async (t) => {
+  quiet(t);
+  const { api, magma } = await buyApi(t);
+  const { orderId, hash, sats } = await payHeld(api);
+  api.node.dropPaymentStreams(hash);
+  await until(() => api.autopilot.purchases.get(orderId)?.state === "pay_failed", "the pay call's failure");
+  assert.equal(api.autopilot.purchases.get(orderId)?.failureConfirmed, undefined);
+  const early = await api.request("POST", "/amboss/buy/cancel", { orderId });
+  assert.deepEqual([early.status, early.body.error], [409, "bad_state"]);
+  assert.equal(api.autopilot.purchases.get(orderId)?.state, "paying", "LND: still in flight");
+  assert.equal((await api.request("POST", "/amboss/buy/pay", { orderId, maxSats: sats })).status, 409, "nor paid a second time");
+  assert.equal(magma.count("CancelOrder"), 0, "nothing sent to Amboss");
+
+  api.node.resolvePayment(hash, "fail"); // LND's word: it failed
+  const late = await api.request("POST", "/amboss/buy/cancel", { orderId });
+  assert.equal(late.status, 200, JSON.stringify(late.body));
+  assert.equal(api.autopilot.purchases.get(orderId)?.state, "declined");
+  assert.equal(magma.count("CancelOrder"), 1);
+});
+
+// Review of P5: the cancel test above also tried /amboss/buy/pay — but only
+// after the cancel had already asked LND and moved the record to "paying",
+// so the pay route's own question to LND went untested.
+test("paying again, as the first call after the pay stream dropped while LND keeps the payment in flight, is refused — no second payment; once LND confirms the failure it may be paid again", async (t) => {
+  quiet(t);
+  const { api } = await buyApi(t);
+  const { orderId, hash, sats } = await payHeld(api);
+  api.node.dropPaymentStreams(hash);
+  await until(() => api.autopilot.purchases.get(orderId)?.state === "pay_failed", "the pay call's failure");
+  assert.equal(api.autopilot.purchases.get(orderId)?.failureConfirmed, undefined, "only the stream's word");
+  // Before LND was asked here, the record's "pay_failed" let a second
+  // payment of the same invoice start while the first was still in flight.
+  const again = await api.request("POST", "/amboss/buy/pay", { orderId, maxSats: sats });
+  assert.deepEqual([again.status, again.body.error], [409, "bad_state"]);
+  assert.equal(again.body.message, "This order is paying — not paying it again.");
+  assert.equal(api.node.callsTo("router.sendPaymentV2").length, 1, "no second payment");
+  assert.equal(api.autopilot.purchases.get(orderId)?.state, "paying", "LND: still in flight");
+
+  api.node.resolvePayment(hash, "fail"); // LND's word: it failed
+  const retry = await api.request("POST", "/amboss/buy/pay", { orderId, maxSats: sats });
+  assert.equal(retry.status, 200, JSON.stringify(retry.body));
+  await until(() => api.node.callsTo("router.sendPaymentV2").length === 2, "the second payment");
+});
+
+test("a cancel of a payment LND can't speak for yet (no record of it, minutes after the start) answers payment_unclear — nothing cancelled", async (t) => {
+  quiet(t);
+  const { api, magma } = await buyApi(t);
+  const quote = (await api.request("POST", "/amboss/buy/quote", { offerId: "offer-a", sizeSats: 2_000_000 })).body;
+  const ledger = api.autopilot.purchases;
+  ledger.startPayment(quote.orderId);
+  ledger.paymentOutcome(quote.orderId, { status: "failed", error: "the stream dropped", confirmed: false });
+  const res = await api.request("POST", "/amboss/buy/cancel", { orderId: quote.orderId });
+  assert.deepEqual([res.status, res.body.error], [409, "payment_unclear"]);
+  assert.match(res.body.message, /LND hasn't confirmed that the payment failed — it may still be in flight/);
+  assert.equal(ledger.get(quote.orderId)?.state, "pay_failed");
+  assert.equal(magma.count("CancelOrder"), 0);
+});
+
 test("a purchase first followed after its lease ran out (CHANNEL_MONITORING_FINISHED) is done — not 'paying' for good", async (t) => {
   quiet(t);
   const { api, magma } = await buyApi(t);

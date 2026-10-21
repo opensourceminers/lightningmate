@@ -192,7 +192,8 @@ export interface ReserveInputs {
   fundingFeeSat: number;
 }
 
-const anchorReserveFor = (anchorChannels: number): number =>
+/** What LND keeps on-chain for `anchorChannels` anchor channels. */
+export const anchorReserveFor = (anchorChannels: number): number =>
   Math.min(ANCHOR_RESERVE_MAX_SAT, ANCHOR_RESERVE_PER_CHANNEL_SAT * anchorChannels);
 
 /** Anchor-type channels LND must be able to fee-bump: open, opening, closing. */
@@ -274,10 +275,15 @@ export function spendableFrom(
   userReserveSat: number,
   pending: readonly Reservation[],
   newChannel = true,
+  /** The spend's own fee when it is known — an on-chain send's, at the
+   *  operator's rate: it takes the place of the funding-fee estimate the
+   *  reserve counts for the spend itself. */
+  ownFeeSat?: number,
 ): Spendable {
   const reserve = reserveFor(inputs, userReserveSat, pending, newChannel);
   const reservedSat = pending.reduce((s, r) => s + Math.max(0, r.sats), 0);
-  const left = chainSat - reserve.totalSat - reservedSat;
+  const keep = ownFeeSat === undefined ? reserve.totalSat : reserve.totalSat - reserve.fundingFeeSat + ownFeeSat;
+  const left = chainSat - keep - reservedSat;
   // Fail closed: a NaN anywhere (a bad fee estimate, a malformed record)
   // must read as "nothing to spend" — never pass every `spendable < size`.
   return { chainSat, reserve, reservedSat, spendableSat: Number.isFinite(left) ? Math.max(0, left) : 0 };
@@ -293,6 +299,25 @@ export interface SpendableOpts {
   newChannel?: boolean;
 }
 
+/** What a spend's check reads from LND: the confirmed balance and what the
+ *  reserve depends on. */
+export interface ChainReads {
+  chainSat: number;
+  inputs: ReserveInputs;
+}
+
+export async function readChain(lnd: AuthenticatedLnd): Promise<ChainReads> {
+  const [{ chain_balance }, inputs] = await Promise.all([getChainBalance({ lnd }), reserveInputs(lnd)]);
+  return { chainSat: chain_balance, inputs };
+}
+
+/** spendableOnchain from LND reads already made, against the promises as
+ *  they stand now. */
+export function spendableWith(reads: ChainReads, ledger: CapitalLedger, userReserveSat: number, opts: SpendableOpts = {}): Spendable {
+  const pending = [...ledger.pending(opts.exceptKey), ...(opts.extra ?? []).filter((r) => r.key !== opts.exceptKey && r.sats > 0)];
+  return spendableFrom(reads.chainSat, reads.inputs, userReserveSat, pending, opts.newChannel ?? true);
+}
+
 /** What a new on-chain commitment may spend right now. Call it inside the
  *  mutex when the answer decides an open. */
 export async function spendableOnchain(
@@ -301,9 +326,7 @@ export async function spendableOnchain(
   userReserveSat: number,
   opts: SpendableOpts = {},
 ): Promise<Spendable> {
-  const [{ chain_balance }, inputs] = await Promise.all([getChainBalance({ lnd }), reserveInputs(lnd)]);
-  const pending = [...ledger.pending(opts.exceptKey), ...(opts.extra ?? []).filter((r) => r.key !== opts.exceptKey && r.sats > 0)];
-  return spendableFrom(chain_balance, inputs, userReserveSat, pending, opts.newChannel ?? true);
+  return spendableWith(await readChain(lnd), ledger, userReserveSat, opts);
 }
 
 /** One promise standing in the way of a manual spend. */
@@ -337,16 +360,35 @@ export interface PromisedSpendRefusal {
  * — no reserve of the autopilot's is imposed on a manual spend; LND applies
  * its own limits. Null: go ahead. Call it inside the on-chain mutex when the
  * answer decides the spend.
+ *
+ * `sendFeeSat`: an on-chain send's own fee (its preview's). The spend then
+ * pays that, not a funding-fee estimate — the same sum the send's preview
+ * uses, so "Max" never reads as touching the promised coins, nor a send
+ * the preview flags as touching them as not (onchain.ts planSend).
  */
 export async function promisedSpendRefusal(
   lnd: AuthenticatedLnd,
   ledger: CapitalLedger,
   amountSat: number,
-  opts: { newChannel: boolean },
+  opts: { newChannel: boolean; sendFeeSat?: number },
 ): Promise<PromisedSpendRefusal | null> {
   const pending = ledger.pending();
   if (pending.length === 0) return null;
-  const sp = await spendableOnchain(lnd, ledger, 0, { newChannel: opts.newChannel });
+  const [{ chain_balance }, inputs] = await Promise.all([getChainBalance({ lnd }), reserveInputs(lnd)]);
+  return promisedSpendFrom(chain_balance, inputs, pending, amountSat, opts);
+}
+
+/** promisedSpendRefusal from figures already read: the confirmed balance,
+ *  LND's reserve inputs and the promises standing (`pending`). */
+export function promisedSpendFrom(
+  chainSat: number,
+  inputs: ReserveInputs,
+  pending: readonly Reservation[],
+  amountSat: number,
+  opts: { newChannel: boolean; sendFeeSat?: number },
+): PromisedSpendRefusal | null {
+  if (pending.length === 0) return null;
+  const sp = spendableFrom(chainSat, inputs, 0, pending, opts.newChannel, opts.sendFeeSat);
   if (amountSat <= sp.spendableSat) return null;
   const promised = pending.map((r) => {
     const at = r.key.indexOf(":");
@@ -408,11 +450,29 @@ export interface PeerChannel {
   ours: boolean;
   /** Funding block height for confirmed channels (from the short channel id). */
   fundedHeight: number | null;
+  /** The description the open gave it (LND ≥ 0.17 keeps it with the
+   *  channel; "" when none). A sale's open names its order (saleTag). */
+  description: string;
 }
+
+/**
+ * The description a sale's channel open carries — "lsps1:<order id>" — kept
+ * by LND with the channel (OpenChannelRequest.memo, LND ≥ 0.17). An open
+ * whose outcome is unclear (a dropped stream, a crash before its outpoint
+ * was saved) is then found in LND by its own order, not only by peer, size
+ * and time: a channel another order's open funded is never taken for it.
+ */
+export const saleTag = (source: string, orderId: string): string => `${source}:${orderId}`;
+
+/** A description that names a sale's order (saleTag). */
+const SALE_TAG = /^(lsps1|magma):\S+$/;
 
 /** Every channel to `pubkey` that LND knows: open, or pending open. */
 export async function channelsWith(lnd: AuthenticatedLnd, pubkey: string): Promise<PeerChannel[]> {
   const [open, pending] = await Promise.all([getChannels({ lnd, partner_public_key: pubkey }), getPendingChannels({ lnd })]);
+  // The library returns `description` (the channel's memo) on both, but its
+  // typings for getChannels leave it out.
+  const described = (c: object): string => String((c as { description?: unknown }).description ?? "");
   return [
     ...open.channels
       .filter((c) => c.partner_public_key === pubkey)
@@ -422,6 +482,7 @@ export async function channelsWith(lnd: AuthenticatedLnd, pubkey: string): Promi
         pending: false,
         ours: !c.is_partner_initiated,
         fundedHeight: Number(c.id.split("x")[0]) || null,
+        description: described(c),
       })),
     ...pending.pending_channels
       .filter((p) => p.is_opening && p.partner_public_key === pubkey)
@@ -431,6 +492,7 @@ export async function channelsWith(lnd: AuthenticatedLnd, pubkey: string): Promi
         pending: true,
         ours: !p.is_partner_initiated,
         fundedHeight: null,
+        description: described(p),
       })),
   ];
 }
@@ -441,10 +503,17 @@ export async function channelsWith(lnd: AuthenticatedLnd, pubkey: string): Promi
  * exactly `capacity`, that existed neither before the open started
  * (`exclude` holds the outpoints seen then, plus those other orders claim)
  * nor confirmed before `notBeforeHeight`.
+ *
+ * `tag`: the description this order's open gave its channel (saleTag). A
+ * channel carrying it is the one; a channel whose description names another
+ * sale's order is never a match, whatever its peer and size (two orders of
+ * one buyer, one size, both opening: before, only the size and the time
+ * told them apart). A channel with no description (LND before 0.17, or an
+ * open from before the tag) is judged as before.
  */
 export async function findOpenedChannel(
   lnd: AuthenticatedLnd,
-  q: { pubkey: string; capacity: number; exclude: Iterable<string>; notBeforeHeight?: number },
+  q: { pubkey: string; capacity: number; exclude: Iterable<string>; notBeforeHeight?: number; tag?: string },
 ): Promise<PeerChannel | null> {
   const exclude = new Set(q.exclude);
   const candidates = (await channelsWith(lnd, q.pubkey)).filter(
@@ -452,9 +521,12 @@ export async function findOpenedChannel(
       c.ours &&
       c.capacity === q.capacity &&
       !exclude.has(c.outpoint) &&
+      !(SALE_TAG.test(c.description) && c.description !== q.tag) &&
       (q.notBeforeHeight === undefined || c.fundedHeight === null || c.fundedHeight >= q.notBeforeHeight),
   );
-  // Pending first: a fresh open is the likeliest match.
-  candidates.sort((a, b) => Number(b.pending) - Number(a.pending));
+  // Its own tag first; then pending: a fresh open is the likeliest match.
+  candidates.sort(
+    (a, b) => Number(!!q.tag && b.description === q.tag) - Number(!!q.tag && a.description === q.tag) || Number(b.pending) - Number(a.pending),
+  );
   return candidates[0] ?? null;
 }

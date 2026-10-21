@@ -1,4 +1,5 @@
 import { getNodeMarket, getOffers, getPublicOffers, dollarRates, type MagmaOffer, type PublicOffer } from "./amboss.js";
+import { torVia } from "./http.js";
 
 /**
  * Can this node realistically SELL on Magma? (D8)
@@ -60,7 +61,13 @@ export interface PublicBook {
   inboundSatsPerUsd: number | null;
   /** The bitcoin price: sats per US dollar. */
   satsPerUsd?: number | null;
-  own: { pubkey: string; sellerScore: number | null; confirmedSells: number | null };
+  own: {
+    pubkey: string;
+    sellerScore: number | null;
+    confirmedSells: number | null;
+    /** The own-key lookup failed: why, and the route it took ("" direct). */
+    lookupError?: { error: string; via: string };
+  };
 }
 
 export interface CellStats {
@@ -201,7 +208,7 @@ export function assessEligibility(
     reasons: [],
   };
   if (!book || book.offers.length === 0) {
-    base.reasons.push("Amboss's public offer book could not be read — no comparison is possible right now.");
+    base.reasons.push(`Amboss's public offer book could not be read${torVia("amboss_public")} — no comparison is possible right now.`);
     return base;
   }
 
@@ -276,10 +283,14 @@ export function assessEligibility(
         `${base.otherSide.offers} offers, ${base.otherSide.sold} sold, ~${fmtRate(base.otherSide.fillsPerMonth)} fills a month per offer.`,
     );
   }
+  const lookup = book.own.lookupError;
   base.reasons.push(
-    `Your node: seller score ${own.sellerScore === null ? "not set yet" : own.sellerScore}` +
-      `${own.confirmedSells === null ? "" : `, ${own.confirmedSells} completed sale${own.confirmedSells === 1 ? "" : "s"}`}; ` +
-      `up to ${fmtSats(own.listableSat)} sat listable now.`,
+    lookup
+      ? `Your node's own seller score could not be read${lookup.via} (${lookup.error}) — it is compared as a seller with no score yet; ` +
+          `up to ${fmtSats(own.listableSat)} sat listable now.`
+      : `Your node: seller score ${own.sellerScore === null ? "not set yet" : own.sellerScore}` +
+          `${own.confirmedSells === null ? "" : `, ${own.confirmedSells} completed sale${own.confirmedSells === 1 ? "" : "s"}`}; ` +
+          `up to ${fmtSats(own.listableSat)} sat listable now.`,
   );
   if (base.usdOrders) {
     const u = base.usdOrders;
@@ -399,7 +410,13 @@ export async function publicBook(ownPubkey: string, force = false): Promise<Publ
       const [legacy, live, own, rates] = await Promise.all([
         getOffers(),
         getPublicOffers(),
-        getNodeMarket(ownPubkey).catch(() => ({ sellerScore: null, confirmedSells: null })),
+        // Its failure is no failure of the book — but it is said (a Tor exit
+        // Amboss refuses would otherwise read as "no score yet").
+        getNodeMarket(ownPubkey).catch((err: unknown) => ({
+          sellerScore: null,
+          confirmedSells: null,
+          lookupError: { error: err instanceof Error ? err.message : String(err), via: torVia("amboss_public") },
+        })),
         dollarRates(),
       ]);
       const book: PublicBook = {

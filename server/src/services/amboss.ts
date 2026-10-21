@@ -211,7 +211,9 @@ export async function ambossGql<T>(
         body: JSON.stringify(variables ? { query, variables } : { query }),
       },
       timeoutMs,
-      "amboss",
+      // A read without the key is a public lookup — through Tor with the
+      // default route; a call with the key is the account's (http.ts).
+      apiKey ? "amboss" : "amboss_public",
     );
   } catch (e) {
     if (e instanceof HttpTimeoutError) throw new AmbossError("timeout", `Amboss ${e.message}`);

@@ -70,6 +70,9 @@ export class FakeMarket {
   /** "throw": the public endpoints answer HTTP 502. "hang": they never
    *  answer (the caller's deadline fires). */
   behaviour: "ok" | "throw" | "hang" = "ok";
+  /** The node's own record alone (getNode): "throw" answers HTTP 502 while
+   *  the offer book answers. */
+  ownLookup: "ok" | "throw" = "ok";
   /** How the public offer list answers its `page` argument. "whole-list":
    *  as magma.amboss.tech does (checked 2026-10-21) — every page is the whole
    *  list, `total` its length. "pages": offset/limit honoured. */
@@ -139,6 +142,7 @@ export class FakeMarket {
     const query = req.graphql?.query ?? "";
     if (/NodeMarket/.test(query)) {
       this.calls.push("NodeMarket");
+      if (this.ownLookup === "throw") return new Response("upstream error", { status: 502 });
       return {
         data: {
           getNode: {

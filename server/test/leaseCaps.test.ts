@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { MAGMA_LEASE_MARGIN_BLOCKS, activeCap, clampToCap, leaseCapFrom, offerFeeCaps, type LeaseCap } from "../src/services/leaseCaps.js";
+import { MAGMA_LEASE_MARGIN_BLOCKS, activeCap, clampToCap, leaseCapFrom, leaseRunning, offerFeeCaps, type LeaseCap } from "../src/services/leaseCaps.js";
 import { getFeeRecommendations } from "../src/services/feeRecommend.js";
 import { applyFees } from "../src/services/fees.js";
 import { Autopilot, LEASE_PROMISE_CHECK_MS } from "../src/services/autopilot.js";
@@ -732,4 +732,59 @@ test("POST /fees/apply refuses an item whose id is not the channel at its outpoi
   assert.equal(honest.status, 200);
   assert.deepEqual(node.policyWrites, [{ outpoint: `${TX(3)}:0`, feeRatePpm: 2200, baseFeeMsat: 0 }]);
   assert.deepEqual(api.autopilot.feeChanges().map((c) => [c.channelId, c.toPpm]), [["859000x3x0", 2200]]);
+});
+
+// Review of P4: Amboss's "still running" listing extended only the close
+// protections. The fee clamp (activeCap) ended a Magma lease on the journal's
+// own count — funding + lease + a day — so a channel Amboss confirmed more
+// than a day after funding could have its fee lifted past the promised cap
+// while Amboss still monitored the lease.
+test("past the journal's end of a Magma lease that Amboss still lists as running, the promise is kept: the lease keeper lowers the fee — and the sold lease still runs for the rebalancer (fail closed)", async (t) => {
+  // Funded 4,608 blocks ago: by the journal's count (4,320 + 144) over 144 blocks ago.
+  const id = `${HEIGHT - 4_608}x5x0`;
+  const node = feeNode({
+    blockHeight: HEIGHT,
+    channels: [{ id, partnerPublicKey: PEER(5), capacity: 2_000_000, localBalance: 1_000_000, transactionId: TX(5), transactionVout: 0, feeRatePpm: 3000 }],
+  });
+  const http = installFetchMock(t);
+  http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
+  const autopilotFor = (listed: boolean) => {
+    const dir = makeTempDir(t);
+    writeFileSync(join(dir, "magma-orders.json"), JSON.stringify([journalSale("magma-5", TX(5))]));
+    writeFileSync(join(dir, "autopilot.json"), JSON.stringify({ config: {}, history: [], sellAutoSizeMigrated: true }));
+    if (listed) {
+      // …and a sale only Amboss knows of (sold before the journal existed).
+      writeFileSync(
+        join(dir, "magma-amboss-leases.json"),
+        JSON.stringify({ at: new Date().toISOString(), leases: [{ orderId: "magma-5", channelId: id }, { orderId: "old-sale", channelId: "850000x9x0" }] }),
+      );
+    }
+    const autopilot = new Autopilot(dir, node.lnd, node.lnd, new RebalanceLog(dir), new OverridesStore(dir), new AmbossStore(dir), new EarningsLog(dir), new ServiceFeeLedger(dir, null));
+    suppressSchedulerKicks(autopilot);
+    t.after(() => autopilot.shutdown());
+    return autopilot;
+  };
+  const at = (a: Autopilot) => activeCap(a.capital.leaseCaps(), { outpoint: `${TX(5)}:0`, channelId: id }, HEIGHT);
+
+  // The journal alone: the lease is over — no promise, nothing written.
+  const journalOnly = autopilotFor(false);
+  assert.equal(at(journalOnly), null);
+  assert.deepEqual(await journalOnly.keepLeasePromisesNow(), []);
+  assert.equal(leaseRunning(journalOnly.capital.soldLeases()[0], id, HEIGHT), false);
+  assert.equal(node.policyWrites.length, 0);
+
+  // Amboss's listing has it running: the promise holds, its end Amboss's to say.
+  const listed = autopilotFor(true);
+  const cap = at(listed);
+  assert.deepEqual([cap?.orderId, cap?.feeRateCapPpm, cap?.untilHeight], ["magma-5", 2200, null]);
+  await listed.keepLeasePromisesNow();
+  assert.deepEqual(node.policyWrites, [{ outpoint: `${TX(5)}:0`, feeRatePpm: 2200, baseFeeMsat: 1000 }]);
+  const [sold, onlyAmboss] = listed.capital.soldLeases();
+  assert.deepEqual([sold.orderId, sold.ambossRunning, leaseRunning(sold, id, HEIGHT)], ["magma-5", true, true]);
+  // The rebalancer leaves the channel of a sale only Amboss knows of alone too.
+  assert.deepEqual(
+    [onlyAmboss?.orderId, onlyAmboss?.fundingOutpoint, onlyAmboss?.channelId, onlyAmboss?.ambossRunning],
+    ["old-sale", "", "850000x9x0", true],
+  );
+  assert.equal(listed.capital.leaseCaps().length, 1, "no promise is made up for it: its terms are unknown");
 });

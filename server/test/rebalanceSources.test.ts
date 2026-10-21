@@ -141,6 +141,30 @@ test("a source is never a fresh, private, sold, draining or best-earning channel
   assert.ok(later.some((s) => s.ch.id === "857000x5x0"));
 });
 
+// Review of P4: Amboss's "still running" listing extended only the close
+// protections; the sold-lease guard ended a Magma lease on the journal's own
+// count. A channel Amboss confirmed late — or one sold before the journal
+// existed — was drained as a source while Amboss still monitored the lease.
+test("a sold channel past its lease by the journal's count is still no source while Amboss lists the lease running — nor is a sale only Amboss knows of", () => {
+  const n = nodeOf([
+    drained(1),
+    { n: 2, local: 4_000_000 }, // the one real donor
+    { n: 5, local: 4_750_000, block: 850_000 }, // sold, lease 4,320 + 144: over at 854,464 by the journal
+    { n: 8, local: 4_750_000, block: 850_000 }, // sold before the journal existed: only Amboss knows
+  ]);
+  const journalOnly: SoldLease[] = [{ fundingOutpoint: `${TX(5)}:0`, source: "magma", orderId: "m-5", leaseBlocks: 4320 }];
+  const ids = (sold: SoldLease[]) => buildSourcePool(n.channels, n.feeById, {}, REBAL_REC_DEFAULTS, { soldLeases: sold, currentBlock: HEIGHT }).map((s) => s.ch.id).sort();
+  assert.deepEqual(ids(journalOnly), ["850000x2x0", "850000x5x0", "850000x8x0"], "the journal alone: both read as ordinary channels");
+  const withAmboss: SoldLease[] = [
+    { ...journalOnly[0], ambossRunning: true },
+    { fundingOutpoint: "", source: "magma", orderId: "m-8", leaseBlocks: 0, ambossRunning: true, channelId: "850000x8x0" },
+  ];
+  assert.deepEqual(ids(withAmboss), ["850000x2x0"], "Amboss's word keeps both out (fail closed)");
+  // Amboss names a channel by its number too.
+  const asNumber = String((850_000n << 40n) | (8n << 16n));
+  assert.deepEqual(ids([{ ...withAmboss[1], channelId: asNumber }]), ["850000x2x0", "850000x5x0"]);
+});
+
 test("each move is capped at the source's spare balance, and a source's planned moves shrink what it can give the next target", async () => {
   const n = nodeOf([
     // The more valuable target (1M demand-sized) is planned first …

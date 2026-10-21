@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { rankCloseCandidates, type CloseInput } from "../src/services/suggestRecommend.js";
-import { channelLeases, standardChannelId, type ChannelLease } from "../src/services/leases.js";
+import { channelLeases, leaseProtection, standardChannelId, type ChannelLease } from "../src/services/leases.js";
 import { ChannelUptime, MAX_GAP_MS, OFFLINE_CLOSE_SIGNAL_HOURS, type OfflineInfo } from "../src/services/channelUptime.js";
 import type { ChannelView } from "../src/services/channels.js";
 import type { FeeRecommendation } from "../src/services/feeRecommend.js";
@@ -199,8 +199,10 @@ test("a repeat order from the same seller at the same size, paid but its channel
   // X: bought 150 days ago as order B with a 180-day lease — a month left.
   const X = sellers(41, { ageBlocks: 21_600 });
   const B = purchase({ orderId: "older-B-180d", leaseBlocks: 25_920, channelId: standardNumber(X.id), createdAt: ago(150 * DAY + 600_000), paidAt: ago(150 * DAY) });
-  // A: the same seller and size, paid minutes ago; Amboss names no channel yet.
-  const A = purchase({ orderId: "newer-A-30d", leaseBlocks: 4_320, channelId: null, state: "paid", orderStatus: "WAITING_FOR_CHANNEL_OPEN", createdAt: ago(1_200_000), paidAt: ago(600_000) });
+  // A: the same seller and size, its payment sent minutes ago — held by the
+  // hold invoice ("paying") until Amboss confirms the channel; Amboss names
+  // no channel yet.
+  const A = purchase({ orderId: "newer-A-30d", leaseBlocks: 4_320, channelId: null, state: "paying", orderStatus: "WAITING_FOR_CHANNEL_OPEN", createdAt: ago(1_200_000), paidAt: undefined, payStartedAt: ago(600_000), routingFeeSats: null });
   for (const purchases of [[B, A], [A, B]]) {
     const l = channelLeases([X], { soldLeases: [], purchases }, HEIGHT, nowMs).get(X.id);
     // Before: A (the newest) came first and took X — B's lease was lost, X
@@ -218,15 +220,61 @@ test("a repeat order from the same seller at the same size, paid but its channel
   // yesterday — after both orders.
   const X2 = sellers(43, { ageBlocks: 144 });
   const B2 = purchase({ orderId: "older-B2-90d", leaseBlocks: 12_960, channelId: standardNumber(X2.id), createdAt: ago(3 * DAY + 600_000), paidAt: ago(3 * DAY) });
-  const A2 = purchase({ orderId: "newer-A2-30d", leaseBlocks: 4_320, channelId: null, state: "paid", createdAt: ago(2 * DAY + 600_000), paidAt: ago(2 * DAY) });
+  const A2 = purchase({ orderId: "newer-A2-30d", leaseBlocks: 4_320, channelId: null, state: "paying", orderStatus: "WAITING_FOR_CHANNEL_OPEN", createdAt: ago(2 * DAY + 600_000), paidAt: undefined, payStartedAt: ago(2 * DAY), routingFeeSats: null });
   const l2 = channelLeases([X2], { soldLeases: [], purchases: [A2, B2] }, HEIGHT, nowMs).get(X2.id);
   assert.deepEqual([l2?.orderId, l2?.untilHeight], ["older-B2-90d", 859_856 + 12_960 + 144]);
+});
+
+// Review of P4 (PROBE-F06): the purchases Amboss names no channel for are
+// matched newest first. Walked oldest first, the older order's 180-day lease
+// claimed the NEWER channel, the newer order couldn't take the older channel
+// (funded before it was placed) — and the older order's real channel was left
+// with no lease at all: unprotected in the close list and the close route.
+test("two purchases of one seller and size, neither named by Amboss yet: each claims its own channel — newest order to newest channel — whatever order the ledger lists them in", () => {
+  const nowMs = Date.now();
+  const ago = (ms: number) => new Date(nowMs - ms).toISOString();
+  // P1 ordered 20 days ago (a 180-day lease), its channel C1 funded 19 days ago;
+  // P2 ordered 5 days ago, its channel C2 funded 4 days ago.
+  const P1 = purchase({ orderId: "P1-older", leaseBlocks: 25_920, createdAt: ago(20 * DAY), paidAt: ago(19 * DAY) });
+  const P2 = purchase({ orderId: "P2-newer", leaseBlocks: 4_320, createdAt: ago(5 * DAY), paidAt: ago(4 * DAY) });
+  const C1 = sellers(61, { ageBlocks: 2_736 });
+  const C2 = sellers(62, { ageBlocks: 576 });
+  for (const purchases of [[P1, P2], [P2, P1]]) {
+    const l = channelLeases([C1, C2], { soldLeases: [], purchases }, HEIGHT, nowMs);
+    assert.deepEqual([l.get(C1.id)?.orderId, l.get(C2.id)?.orderId], ["P1-older", "P2-newer"], purchases.map((p) => p.orderId).join(","));
+    assert.equal(l.get(C1.id)?.untilHeight, HEIGHT - 2_736 + 25_920 + 144, "C1 keeps P1's 180-day lease");
+  }
+});
+
+// Review of P4: BOUGHT_STATES left out "paying" — a hold-invoice purchase
+// whose seller channel was confirming carried no lease until Amboss's
+// VALID_CHANNEL_OPENING. Decided: protected (fail closed), and said so.
+test("a purchase still being paid protects the seller's channel it pays for — saying a close cancels the purchase; one LND confirmed failed claims nothing", () => {
+  const nowMs = Date.now();
+  const ago = (ms: number) => new Date(nowMs - ms).toISOString();
+  const confirming = sellers(63, { ageBlocks: 2 }); // funded two blocks ago
+  const paying = purchase({ orderId: "paying-1", state: "paying", orderStatus: "WAITING_FOR_ON_CHAIN_CONFIRMATION", channelId: null, createdAt: ago(3 * 3_600_000), paidAt: undefined, payStartedAt: ago(2 * 3_600_000), routingFeeSats: null });
+  const l = channelLeases([confirming], { soldLeases: [], purchases: [paying] }, HEIGHT, nowMs).get(confirming.id);
+  assert.deepEqual([l?.orderId, l?.running, l?.paying], ["paying-1", true, true]);
+  assert.equal(
+    leaseProtection(l!),
+    "being bought on Magma for 18,000 sat (order paying-1…) — your payment is held until Amboss confirms this channel; closing it now cancels the purchase (Amboss refunds the payment) and gives up the inbound",
+  );
+  const [c] = rankCloseCandidates(input([confirming], { leases: channelLeases([confirming], { soldLeases: [], purchases: [paying] }, HEIGHT, nowMs) })).protected;
+  assert.deepEqual([c?.channelId, c?.lease?.paying], [confirming.id, true], "kept out of the close list by the purchase");
+  assert.match(c?.reason ?? "", /^being bought on Magma/);
+  // A failure only the pay call reported may still be in flight: protected too.
+  const unclear = { ...paying, state: "pay_failed" as const, failureConfirmed: undefined };
+  assert.equal(channelLeases([confirming], { soldLeases: [], purchases: [unclear] }, HEIGHT, nowMs).get(confirming.id)?.orderId, "paying-1");
+  // LND's word that it failed: nothing bought, nothing claimed.
+  const failed = { ...paying, state: "pay_failed" as const, failureConfirmed: true };
+  assert.equal(channelLeases([confirming], { soldLeases: [], purchases: [failed] }, HEIGHT, nowMs).size, 0);
 });
 
 test("a purchase Amboss hasn't named a channel for never takes a channel the seller funded before the order was placed — an estimate from the clock, with slack for fast blocks", () => {
   const nowMs = Date.now();
   const ago = (ms: number) => new Date(nowMs - ms).toISOString();
-  const A = purchase({ orderId: "newer-A-30d", leaseBlocks: 4_320, channelId: null, state: "paid", createdAt: ago(1_200_000), paidAt: ago(600_000) });
+  const A = purchase({ orderId: "newer-A-30d", leaseBlocks: 4_320, channelId: null, state: "paying", orderStatus: "WAITING_FOR_CHANNEL_OPEN", createdAt: ago(1_200_000), paidAt: undefined, payStartedAt: ago(600_000), routingFeeSats: null });
   // Z: a channel the seller opened to us on its own 150 days ago — no
   // purchase on record names it. Before, A took it while A's own channel
   // was not open yet: Z read "bought on Magma" with A's cost and lease.

@@ -27,6 +27,7 @@ import { sellerSetup } from "./helpers/autopilot.js";
 import { quiet } from "./helpers/lifecycle.js";
 import { HTTP_TIMEOUTS } from "../src/services/http.js";
 import type { AfterHook } from "./helpers/tmp.js";
+import { until } from "./helpers/wait.js";
 
 /** The API with Liquidity provision on (auto-size on: it would fix the lease). */
 async function sellingApi(t: AfterHook, chainBalance = 5_000_000) {
@@ -420,4 +421,98 @@ test("a click on 'disable' while the autopilot's re-list is under way waits for 
   assert.deepEqual(res.body, { status: "DISABLED", changed: true });
   assert.equal(offer.status, "DISABLED");
   assert.ok(api.autopilot.offerControls()[offer.id]?.disabledByHandAt);
+});
+
+// Review of P1b: a manual offer edit was not serialised with the per-offer
+// lock. An autopilot terms write could land between the edit and its
+// read-back — the edit then reported "not stored" — or after it, putting the
+// standard lease back over the operator's own.
+test("an edit saved while the autopilot's terms write is under way waits for it and its read-back — then lands, reads back stored, and stands", async (t) => {
+  quiet(t);
+  const { api, magma } = await sellingApi(t);
+  // An old 4,032-block offer: auto-size gives it the standard lease and promise.
+  const offer = magma.addOffer({ minSats: 1_000_000, maxSats: 2_000_000, totalSats: 2_000_000, minBlockLength: 4032 });
+  let release = () => undefined as void;
+  let edit: Promise<{ status: number; body: any }> | undefined;
+  let editSent = false;
+  magma.holdMutation = (op, v) => {
+    if (op !== "UpdateOffer") return null;
+    if ((v.input as Record<string, unknown>).fee_rate === 4321) {
+      editSent = true; // the operator's
+      return null;
+    }
+    // The autopilot's write is on its way to Amboss: the operator saves an edit now.
+    edit ??= api.request("POST", "/amboss/offer/update", { id: offer.id, ...TERMS, feeRatePpm: 4321, minBlockLength: 12_960 });
+    return new Promise<void>((r) => (release = r));
+  };
+  const run = api.autopilot.runOnce();
+  await until(() => !!edit, "the autopilot's write is under way");
+  await new Promise((r) => setTimeout(r, 150));
+  // Before: the edit went out at once, crossing the autopilot's write.
+  assert.equal(editSent, false, "the edit waits for the autopilot's write and its read-back");
+  release();
+  await run;
+  const res = await edit!;
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.verified, true, "read back as stored");
+  assert.deepEqual([offer.feeRatePpm, offer.minBlockLength], [4321, 12_960], "the operator's terms stand");
+});
+
+test("an autopilot terms write planned on the offer as it was before an edit is not sent over the edit", async (t) => {
+  quiet(t);
+  const { api, magma } = await sellingApi(t);
+  const offer = magma.addOffer({ minSats: 1_000_000, maxSats: 2_000_000, totalSats: 2_000_000, minBlockLength: 4032 });
+  // The operator's edit holds the offer's lock; Amboss is slow to take it.
+  let releaseEdit = () => undefined as void;
+  let editHeld = false;
+  magma.holdMutation = (op, v) => {
+    if (op !== "UpdateOffer" || (v.input as Record<string, unknown>).fee_rate !== 4321) return null;
+    editHeld = true;
+    return new Promise<void>((r) => (releaseEdit = r));
+  };
+  const edit = api.request("POST", "/amboss/offer/update", { id: offer.id, ...TERMS, feeRatePpm: 4321, minBlockLength: 12_960 });
+  await until(() => editHeld, "the edit is being written");
+  const chains = (api.autopilot as unknown as { offerChains: Map<string, unknown> }).offerChains;
+  const editsTurn = chains.get(offer.id);
+  // The autopilot run reads the offer as it still is (4,032 blocks, its own),
+  // plans the standard lease — and queues behind the edit for its write.
+  const run = api.autopilot.runOnce();
+  await until(() => chains.get(offer.id) !== editsTurn, "the autopilot's write waits for the edit");
+  releaseEdit();
+  const [res] = await Promise.all([edit, run]);
+  assert.equal(res.status, 200);
+  assert.equal(res.body.verified, true);
+  // Before (no lock, or a lock without a fresh look): the planned write went
+  // out too and put the standard lease back over the operator's 12,960 blocks.
+  assert.deepEqual(magma.calls.filter((c) => c.op === "UpdateOffer").map((c) => (c.variables.input as Record<string, unknown>).fee_rate), [4321]);
+  assert.deepEqual([offer.feeRatePpm, offer.minBlockLength], [4321, 12_960]);
+  const entry = api.autopilot.offerSyncStatus().offers.find((e) => e.offerId === offer.id);
+  assert.match(entry?.differences.join() ?? "", /the offer changed while this run priced it/);
+});
+
+test("an autopilot terms write is not sent when the offer's terms changed on Amboss since the run read them — an edit made on amboss.tech stands", async (t) => {
+  quiet(t);
+  const { api, magma } = await sellingApi(t);
+  // An old 4,032-block offer: the run plans the standard lease and promise.
+  const offer = magma.addOffer({ minSats: 1_000_000, maxSats: 2_000_000, totalSats: 2_000_000, minBlockLength: 4032 });
+  const chains = (api.autopilot as unknown as { offerChains: Map<string, unknown> }).offerChains;
+  let edited = false;
+  magma.onRead = (op, v) => {
+    // The run's write is next: under the offer's lock, it reads the offer
+    // afresh. Just before, the operator edits it on amboss.tech — not here,
+    // so nothing pauses the automation.
+    if (op !== "MyOffer" || v.id !== offer.id || !chains.has(offer.id) || edited) return;
+    edited = true;
+    offer.feeRatePpm = 4321;
+    offer.minBlockLength = 12_960;
+  };
+  await api.autopilot.runOnce();
+  assert.ok(edited, "the edit landed between the run's read and its write");
+  // Before (a takeover check alone): the write planned on the old terms went
+  // out and put the standard lease back over the operator's 12,960 blocks.
+  assert.equal(magma.calls.filter((c) => c.op === "UpdateOffer").length, 0, "no write over the edit");
+  assert.deepEqual([offer.feeRatePpm, offer.minBlockLength], [4321, 12_960]);
+  const entry = api.autopilot.offerSyncStatus().offers.find((e) => e.offerId === offer.id);
+  assert.match(entry?.differences.join() ?? "", /the offer changed while this run priced it/);
+  assert.equal(api.autopilot.offerControls()[offer.id]?.manual, undefined, "nothing took it over here: the next run starts from the edit");
 });
