@@ -1,6 +1,6 @@
 import { getChainBalance, getChannels, getPendingChannels, type AuthenticatedLnd } from "lightning";
 import { onchainCosts } from "./nodeEconomics.js";
-import type { LeaseCap } from "./leaseCaps.js";
+import type { LeaseCap, SoldLease } from "./leaseCaps.js";
 
 /**
  * One on-chain budget for every demand on the wallet's coins: Magma sales,
@@ -100,6 +100,9 @@ export interface CapitalSource {
   /** The routing-fee promises of the channels it sold (leaseCaps.ts) — the
    *  fee autopilot and manual fee applies keep those channels within them. */
   leaseCaps?(): LeaseCap[];
+  /** Every channel it sold whose lease may still run, promise or not — the
+   *  rebalancer never drains a buyer's channel (leaseCaps.ts SoldLease). */
+  soldLeases?(): SoldLease[];
 }
 
 export class CapitalLedger {
@@ -148,6 +151,11 @@ export class CapitalLedger {
   /** Every routing-fee promise of a sold channel, Magma's and LSPS1's. */
   leaseCaps(): LeaseCap[] {
     return [...this.sources.values()].flatMap((s) => s.leaseCaps?.() ?? []);
+  }
+
+  /** Every channel sold through Magma or LSPS1, with its lease. */
+  soldLeases(): SoldLease[] {
+    return [...this.sources.values()].flatMap((s) => s.soldLeases?.() ?? []);
   }
 }
 

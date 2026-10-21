@@ -67,6 +67,8 @@ export interface FakeChannel {
   partnerInitiated?: boolean;
   /** LND's max pending amount on our side (msat; default 990,000 sat). */
   maxPendingMsat?: number;
+  /** LND's lifetime "sent" counter of the channel (sat; default 0). */
+  totalSent?: number;
 }
 
 export interface FakePendingChannel {
@@ -115,6 +117,9 @@ export interface FakePayment {
 }
 
 export type PayOutcome = "succeed" | "fail" | "hang";
+
+/** BOLT 9 feature bits of the invoices LND makes (even = required). */
+export const INVOICE_FEATURE = { tlvOnionRequired: 8, paymentAddrRequired: 14, multiPathOptional: 17 } as const;
 
 export interface FakeLndOptions {
   key?: NodeKey;
@@ -473,7 +478,7 @@ export class FakeLnd {
       remote_pubkey: c.partnerPublicKey,
       thaw_height: 0,
       total_satoshis_received: "0",
-      total_satoshis_sent: "0",
+      total_satoshis_sent: String(c.totalSent ?? 0),
       unsettled_balance: "0",
       uptime: "86400",
       zero_conf_confirmed_scid: "0",
@@ -558,7 +563,8 @@ export class FakeLnd {
       cltv_expiry: String(p.cltv_delta ?? 40),
       route_hints: [],
       payment_addr: p.payment ? Buffer.from(p.payment, "hex") : Buffer.alloc(0),
-      features: {},
+      // The invoice's own feature bits, as LND reports them (even = required).
+      features: Object.fromEntries(p.features.map((f) => [String(f.bit), { name: "", is_known: true, is_required: f.bit % 2 === 0 }])),
     };
   }
 
@@ -572,6 +578,9 @@ export class FakeLnd {
       description: typeof a.memo === "string" ? a.memo : "",
       expiresAt: new Date(Date.now() + expirySec * 1000).toISOString(),
       secret,
+      // What LND puts in its own invoices: TLV onion and payment address
+      // required, multi-path payments optional (lnd feature/default_sets.go).
+      features: [INVOICE_FEATURE.tlvOnionRequired, INVOICE_FEATURE.paymentAddrRequired, INVOICE_FEATURE.multiPathOptional],
     });
     this.invoices.set(made.id, {
       id: made.id,

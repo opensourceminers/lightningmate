@@ -109,6 +109,8 @@ export function makePaymentRequest(opts: {
   /** min_final_cltv_expiry, in blocks. */
   cltvDelta?: number;
   network?: "bitcoin" | "testnet" | "regtest";
+  /** Feature bits (default: var_onion and payment_secret, optional/required). */
+  features?: number[];
 }): MadeRequest {
   const key = opts.key ?? makeNodeKey();
   const secret = opts.id ? "" : (opts.secret ?? randomBytes(32).toString("hex"));
@@ -119,7 +121,7 @@ export function makePaymentRequest(opts: {
     description: opts.description ?? "",
     destination: key.publicKey,
     expires_at: opts.expiresAt ?? new Date(Date.now() + 3_600_000).toISOString(),
-    features: [{ bit: 9 }, { bit: 14 }],
+    features: (opts.features ?? [9, 14]).map((bit) => ({ bit })),
     id,
     mtokens: opts.mtokens,
     network: opts.network ?? "bitcoin",

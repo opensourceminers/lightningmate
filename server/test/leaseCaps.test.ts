@@ -685,3 +685,51 @@ test("after shutdown the lease keeper writes nothing — a check that fires as t
   assert.deepEqual(await autopilot.keepLeasePromisesNow(), []);
   assert.equal(node.policyRequests.length, 0);
 });
+
+// ── P2 final review carry-over (package P3) ─────────────────────────────────
+
+test("POST /fees/apply refuses an item whose id is not the channel at its outpoint — a sold channel's outpoint with an older channel's id was written past its promise and booked on the wrong channel", async (t) => {
+  const node = feeNode({
+    blockHeight: HEIGHT,
+    channels: [
+      { id: "859000x3x0", partnerPublicKey: PEER(3), capacity: 2_000_000, localBalance: 1_000_000, transactionId: TX(3), transactionVout: 0, feeRatePpm: 500, baseFeeMsat: 0 },
+      { id: "700000x1x0", partnerPublicKey: PEER(1), capacity: 2_000_000, localBalance: 1_000_000, transactionId: TX(1), transactionVout: 0, feeRatePpm: 500, baseFeeMsat: 0 },
+    ],
+  });
+  const dir = makeTempDir(t);
+  // The channel at TX(3) was sold on Magma with a 2,200 ppm promise.
+  writeFileSync(join(dir, "magma-orders.json"), JSON.stringify([journalSale("magma-3", TX(3))]));
+  const api = await startApi(t, { node, dir });
+  const forged = await api.request("POST", "/fees/apply", {
+    // The older channel's id with the sold channel's outpoint: the lease
+    // clamp read the funding height from the id (lease over) — 5,000 ppm.
+    items: [{ id: "700000x1x0", transactionId: TX(3), transactionVout: 0, feeRatePpm: 5000, baseFeeMsat: 0 }],
+  });
+  assert.equal(forged.status, 400, JSON.stringify(forged.body));
+  assert.match(forged.body.message, /700000x1x0: the channel at .*:0 is 859000x3x0/);
+  assert.equal(node.policyRequests.length, 0, "nothing written");
+  assert.deepEqual(api.autopilot.feeChanges(), [], "nothing booked");
+  assert.equal(api.autopilot.feeCooldown().lastApplied["700000x1x0"], undefined, "no cooldown on the wrong channel");
+  // An outpoint the node has no channel at: refused too.
+  const unknown = await api.request("POST", "/fees/apply", {
+    items: [{ id: "859000x3x0", transactionId: TX(9), transactionVout: 0, feeRatePpm: 300, baseFeeMsat: 0 }],
+  });
+  assert.equal(unknown.status, 400);
+  assert.match(unknown.body.message, /no open channel has this funding outpoint/);
+  // One bad item refuses the whole request: nothing of the good one is written either.
+  const mixed = await api.request("POST", "/fees/apply", {
+    items: [
+      { id: "859000x3x0", transactionId: TX(3), transactionVout: 0, feeRatePpm: 300, baseFeeMsat: 0 },
+      { id: "859000x3x0", transactionId: TX(1), transactionVout: 0, feeRatePpm: 300, baseFeeMsat: 0 },
+    ],
+  });
+  assert.equal(mixed.status, 400);
+  assert.equal(node.policyRequests.length, 0);
+  // The honest item: written, clamped to the promise, booked on its own channel.
+  const honest = await api.request("POST", "/fees/apply", {
+    items: [{ id: "859000x3x0", transactionId: TX(3), transactionVout: 0, feeRatePpm: 5000, baseFeeMsat: 0 }],
+  });
+  assert.equal(honest.status, 200);
+  assert.deepEqual(node.policyWrites, [{ outpoint: `${TX(3)}:0`, feeRatePpm: 2200, baseFeeMsat: 0 }]);
+  assert.deepEqual(api.autopilot.feeChanges().map((c) => [c.channelId, c.toPpm]), [["859000x3x0", 2200]]);
+});

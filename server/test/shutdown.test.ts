@@ -20,7 +20,9 @@ import { SettingsStore } from "../src/services/settings.js";
 import { Lsps1Service, type Lsps1Order } from "../src/services/lsps1.js";
 import { ServiceFeeLedger } from "../src/services/serviceFee.js";
 import { flushHtlcTelemetry, initHtlcTelemetry, recordForwardEvent, stopHtlcTelemetry } from "../src/services/htlcTelemetry.js";
+import type { RebalanceRecommendation } from "../src/services/rebalanceRecommend.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
+import { feeNode, type FeeChannel } from "./helpers/feeNode.js";
 import { BUYER, autopilotWith, paidRebalance, plannedRebalance, sellerSetup, suggestion } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { makeTempDir, type AfterHook } from "./helpers/tmp.js";
@@ -284,6 +286,28 @@ test("the shutdown waits for an autopilot payment still in flight", async (t) =>
   assert.equal(idle, true, "idle once the payment came back and was recorded");
 });
 
+test("the shutdown waits for a manual refill's payment still in flight too — it no longer holds the main run's lock", async (t) => {
+  const { autopilot, seams } = autopilotWith(t, {});
+  const { released, release } = heldUntilReleased(t);
+  let paying = false;
+  seams.rebalanceExec = async (_writeLnd, p) => {
+    paying = true;
+    await released; // the HTLC is out; LND hasn't said how it ended
+    return paidRebalance(p);
+  };
+  const manual = autopilot.rebalanceByHand({ targetId: "800001x1x0", sourceId: "800002x1x0", amountSats: 400_000, econRatio: 0.8 });
+  await waitFor(() => paying, "the manual refill is paying");
+  autopilot.shutdown();
+  let idle: boolean | undefined;
+  const waited = autopilot.waitIdle(5_000).then((v) => (idle = v));
+  await sleep(200);
+  assert.equal(idle, undefined, "still waiting while the payment is in flight");
+  release();
+  assert.equal((await manual)?.ok, true);
+  await waited;
+  assert.equal(idle, true, "idle once the refill came back and was booked");
+});
+
 test("the shutdown waits for an LSP channel open until its funding outpoint is on disk", async (t) => {
   const { dir, svc, seams, order } = lspWithHeldOrder(t);
   const { released, release } = heldUntilReleased(t);
@@ -331,12 +355,138 @@ test("a shutdown mid-run: the rebalance in flight finishes, nothing planned afte
 
   const run = await autopilot.runOnce();
   assert.deepEqual(paid, ["800001x1x0"], "only the payment already under way");
-  assert.equal(run.rebalances.length, 2);
+  // The move left undone is a deliberate skip, not a failed attempt (D15):
+  // it is in the rebalance decision, not a red line in the run history.
+  assert.equal(run.rebalances.length, 1);
   assert.equal(run.rebalances[0].ok, true, "it finished and is recorded");
-  assert.match(run.rebalances[1].error ?? "", /skipped: shutting down/);
+  assert.equal(run.failed, 0);
+  assert.match(autopilot.getState().decisions.rebalance?.text ?? "", /peer-800002x1x0: skipped, shutting down/);
   assert.deepEqual(run.channels, [], "the channel stage doesn't even start planning");
   assert.equal(node.callsTo("default.openChannel").length, 0, "no channel open after the signal");
   assert.equal(await autopilot.waitIdle(100), true);
+});
+
+// ── inside one refill: no new attempt after the signal ─────────────────────────
+
+const PEER = (n: number) => "02" + n.toString(16).padStart(2, "0").repeat(32);
+const TX = (n: number) => n.toString(16).padStart(2, "0").repeat(32);
+const TARGET = "850000x1x0";
+const SRC_A = "850000x3x0";
+const SRC_B = "850000x5x0";
+
+/** A drained 5M target at 400 ppm and two full 5M sources on a fake LND;
+ *  a payment left hanging fails when the test ends. */
+function refillNode(t: AfterHook) {
+  const ch = (id: string, n: number, o: Partial<FeeChannel> = {}): FeeChannel => ({
+    id, partnerPublicKey: PEER(n), capacity: 5_000_000, localBalance: 4_000_000, transactionId: TX(n), transactionVout: 0, feeRatePpm: 100, baseFeeMsat: 0, ...o,
+  });
+  const node = feeNode({ channels: [ch(TARGET, 1, { localBalance: 750_000, feeRatePpm: 400 }), ch(SRC_A, 3), ch(SRC_B, 5)] });
+  t.after(() => {
+    for (const p of node.payments.values()) if (p.status === "IN_FLIGHT") node.resolvePayment(p.id, "fail");
+  });
+  return node;
+}
+
+/** The planner's move into the target, from source A then source B: 400k
+ *  valued at 400 ppm — the gate leaves fee room only at the full size. */
+const refillPlan = () =>
+  ({
+    channelId: TARGET, alias: "router", state: "route_found_profitable", wouldRebalance: true, recommendedAmount: 400_000, selectedSourceChannel: SRC_A,
+    sourceCandidates: [SRC_A, SRC_B].map((id) => ({ channelId: id, alias: id, localRatio: 0.8, spareSats: 1_250_000, keepRatio: 0.55, reason: "" })),
+    estimatedRouteFeeSats: 20, expectedNetProfitSats: 300, maxCostPpm: 320, maxCostSatsByPayback: 1_000, expectedRevenuePpm: 400, earningDemandSats: 1_200_000, minNetProfitSats: 100,
+  }) as unknown as RebalanceRecommendation;
+
+interface RefillState {
+  perPairRebalanceFails?: Record<string, { fails: number }>;
+  perTargetLastRebalanced: Record<string, string>;
+  pendingRebalances?: unknown[];
+}
+const refillState = (autopilot: Autopilot) => (autopilot as unknown as { state: RefillState }).state;
+
+test("a shutdown inside a refill: the attempt under way is awaited, and no smaller size or other source starts after the signal — only the source that really failed backs off, and the refill is a skip, not a failed run", async (t) => {
+  t.mock.method(console, "log", () => undefined);
+  const node = refillNode(t);
+  node.payOutcome = "hang"; // the first attempt's HTLC is out
+  const { autopilot, seams, dir } = autopilotWith(t, { rebalanceEnabled: true, rebalanceDailyBudgetSats: 1_000 }, {}, {}, node);
+  seams.rebalanceReport = async () => ({ recommendations: [refillPlan()] });
+  const run = autopilot.runOnce();
+  await waitFor(() => [...node.payments.values()].some((p) => p.status === "IN_FLIGHT"), "the first attempt is in flight");
+  const [first] = [...node.payments.values()];
+  autopilot.shutdown(); // SIGTERM (an update) while it is out
+  node.payOutcome = "fail"; // (a regression's next payment fails at once instead of hanging)
+  node.resolvePayment(first.id, "fail"); // … and it fails after the signal
+  const done = await run;
+  // Before: the fallback chain went on — source B's 400k was sent during
+  // the update's shutdown window (up to 3 sources × 3 sizes per refill).
+  assert.equal(node.callsTo("router.sendPaymentV2").length, 1, "only the attempt under way");
+  assert.equal(node.callsTo("default.addInvoice").length, 1, "not even an invoice for another attempt");
+  const state = refillState(autopilot);
+  assert.equal(state.perPairRebalanceFails?.[`${SRC_A}>${TARGET}`]?.fails, 1, "the source that failed backs off");
+  assert.equal(state.perPairRebalanceFails?.[`${SRC_B}>${TARGET}`], undefined, "the one never tried does not");
+  assert.ok(state.perTargetLastRebalanced[TARGET], "an attempt was made: the target's cooldown stands");
+  // A deliberate skip (D15): no failed run, no failure in the log.
+  assert.deepEqual([done.rebalances.length, done.failed], [0, 0]);
+  assert.deepEqual(new RebalanceLog(dir).recent(), []);
+  assert.match(autopilot.getState().decisions.rebalance?.text ?? "", /router: skipped, shutting down \(after a source found no route\)/);
+  assert.deepEqual(state.pendingRebalances, []);
+  assert.equal(await autopilot.waitIdle(1_000), true);
+});
+
+test("a shutdown inside a manual refill: no smaller size is sent after the signal — it reports a stop, not a failure", async (t) => {
+  t.mock.method(console, "log", () => undefined);
+  const node = refillNode(t);
+  node.payOutcome = "hang";
+  const { autopilot, dir } = autopilotWith(t, {}, {}, {}, node);
+  // No gate: every size has fee room — 400k, then 200k, then 100k.
+  const manual = autopilot.rebalanceByHand({ targetId: TARGET, sourceId: SRC_A, amountSats: 400_000, econRatio: 0.8, maxFeePpm: 320 });
+  await waitFor(() => [...node.payments.values()].some((p) => p.status === "IN_FLIGHT"), "the manual refill's first attempt is in flight");
+  const [first] = [...node.payments.values()];
+  autopilot.shutdown();
+  node.payOutcome = "fail";
+  node.resolvePayment(first.id, "fail");
+  const res = await manual;
+  assert.equal(node.callsTo("router.sendPaymentV2").length, 1, "the 200k attempt was not sent");
+  assert.deepEqual([res?.ok, res?.stopped, res?.failedSourceIds], [false, true, [SRC_A]]);
+  assert.match(res?.error ?? "", /^skipped: shutting down/);
+  assert.equal(refillState(autopilot).perPairRebalanceFails?.[`${SRC_A}>${TARGET}`]?.fails, 1);
+  assert.deepEqual(new RebalanceLog(dir).recent(), [], "nothing for the log: it was stopped, not finished");
+});
+
+test("a refill the shutdown stops before its first attempt was no attempt: nothing sent, nothing backs off, and the target's cooldown is as it was", async (t) => {
+  t.mock.method(console, "log", () => undefined);
+  const node = refillNode(t);
+  const { autopilot, seams } = autopilotWith(t, { rebalanceEnabled: true, rebalanceDailyBudgetSats: 1_000 }, {}, {}, node);
+  seams.rebalanceReport = async () => ({ recommendations: [refillPlan()] });
+  // SIGTERM arrives while the executor reads the node (its fee rates), after
+  // the stage's own check before the move.
+  node.beforeCall = (method) => {
+    if (method === "default.feeReport") autopilot.shutdown();
+  };
+  const done = await autopilot.runOnce();
+  assert.equal(node.callsTo("router.sendPaymentV2").length, 0);
+  const state = refillState(autopilot);
+  assert.equal(state.perTargetLastRebalanced[TARGET], undefined, "no cooldown for a refill that never went out");
+  assert.deepEqual(state.perPairRebalanceFails ?? {}, {});
+  assert.deepEqual([done.rebalances.length, done.failed], [0, 0]);
+  assert.match(autopilot.getState().decisions.rebalance?.text ?? "", /router: skipped, shutting down$/);
+});
+
+test("a signal that comes while an attempt's invoice is being made stops it before it is sent — nothing is paid or recorded, no source backs off", async (t) => {
+  t.mock.method(console, "log", () => undefined);
+  const node = refillNode(t);
+  const { autopilot, seams, dir } = autopilotWith(t, { rebalanceEnabled: true, rebalanceDailyBudgetSats: 1_000 }, {}, {}, node);
+  seams.rebalanceReport = async () => ({ recommendations: [refillPlan()] });
+  node.beforeCall = (method) => {
+    if (method === "default.addInvoice") autopilot.shutdown(); // after the check before the attempt
+  };
+  const done = await autopilot.runOnce();
+  assert.equal(node.callsTo("router.sendPaymentV2").length, 0, "asked again right before it goes out");
+  const state = refillState(autopilot);
+  assert.deepEqual(state.perPairRebalanceFails ?? {}, {});
+  assert.deepEqual(state.pendingRebalances ?? [], [], "nothing on the books: it was never sent");
+  assert.equal(state.perTargetLastRebalanced[TARGET], undefined);
+  assert.deepEqual([done.rebalances.length, done.failed], [0, 0]);
+  assert.deepEqual(new RebalanceLog(dir).recent(), []);
 });
 
 test("a shutdown while a channel open is being planned: no funding transaction is broadcast", async (t) => {

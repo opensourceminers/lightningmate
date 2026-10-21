@@ -50,7 +50,10 @@ standalone via Docker.
   (competitive, zero base fee) with profit floors so a channel never routes
   below its refill cost — and every channel sold through Magma or LSPS1 is kept
   within the routing-fee cap its buyer was promised, for the lease; rebalances
-  run only when profitable (within a daily budget); channels open to top peers;
+  run only when they pass the profit check (valued at the fee the channel keeps
+  after the refill, the payment capped by that check), within one daily fee
+  budget that manual runs count toward too — on a small, low-fee node that is
+  rarely; channels open to top peers;
   with Liquidity provision on, Magma sell orders are fulfilled — all on
   recommended settings with safe caps, per-channel cooldowns and an on-chain
   reserve. Off until you enable it, and every fund-moving action is gated behind

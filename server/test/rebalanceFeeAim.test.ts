@@ -58,7 +58,7 @@ test("the refill budget is bounded by where the fee engine is taking the fee —
     nowMs: Date.parse("2026-10-21T12:00:00.000Z"),
   });
   assert.deepEqual([fee.targetPpm, fee.aimPpm], [870, 510], fee.reasons.join(" | "));
-  const rec = classify(ch, fee, [], new Map([[ch.id, ch]]), REBAL_REC_DEFAULTS, {});
+  const rec = classify(ch, fee, REBAL_REC_DEFAULTS, {});
   // Before: min(800 earned, 900 now, 870 next) = 800 ppm.
   assert.equal(rec.expectedRevenuePpm, 510);
   assert.equal(rec.maxCostPpm, Math.round(510 * REBAL_REC_DEFAULTS.profitShare));

@@ -78,9 +78,10 @@ export async function getPnl(
     else otherChainFeesSats += tx.fee;
   }
 
-  const rebRecords = rebalanceLog
-    .recent(500)
-    .filter((r) => r.ok && new Date(r.at).getTime() >= cutoff);
+  // Every rebalance fee paid in the window — the log keeps successes for
+  // SUCCESS_KEEP_DAYS, apart from failed attempts (it held 200 records of
+  // both, while this asked for 500).
+  const rebRecords = rebalanceLog.successes(cutoff);
   const rebalanceCostSats = rebRecords.reduce((sum, r) => sum + (r.feeSats ?? 0), 0);
 
   const saleRecords = earnings.recent().filter((s) => new Date(s.at).getTime() >= cutoff);

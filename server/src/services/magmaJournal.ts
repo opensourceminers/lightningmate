@@ -1,6 +1,6 @@
 import { JsonStore } from "../store.js";
 import type { Reservation } from "./capital.js";
-import { MAGMA_LEASE_MARGIN_BLOCKS, leaseCapFrom, type LeaseCap } from "./leaseCaps.js";
+import { MAGMA_LEASE_MARGIN_BLOCKS, leaseCapFrom, type LeaseCap, type SoldLease } from "./leaseCaps.js";
 
 /**
  * The per-order journal of Magma sales: what this node has done for each order,
@@ -241,6 +241,19 @@ export class MagmaJournal {
         }),
       )
       .filter((c): c is LeaseCap => c !== null);
+  }
+
+  /** Every channel this node sold and opened whose lease may still run —
+   *  with or without a fee promise (the rebalancer never pulls from them). */
+  soldLeases(): SoldLease[] {
+    return this.entries
+      .filter((e) => (e.phase === "funded" || e.phase === "reported" || e.phase === "settled") && !e.closedAt && !!e.fundingOutpoint)
+      .map((e) => ({
+        fundingOutpoint: e.fundingOutpoint as string,
+        source: "magma" as const,
+        orderId: e.orderId,
+        leaseBlocks: e.leaseBlocks && e.leaseBlocks > 0 ? e.leaseBlocks : 4_320,
+      }));
   }
 
   /** Funding outpoints already tied to an order — never adopt one twice. */

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { ChannelForwardStat, DailyBucket, ForwardsReport, UnservedDemandReport } from "../types";
 import { sats, satsCompact, timeAgo, percent } from "../format";
-import { MIN_DEMAND_DAYS, demandSummary } from "../feeView";
+import { MIN_DEMAND_DAYS, demandHeadline, demandSummary } from "../feeView";
 import { Sparkline } from "./Sparkline";
 
 const WINDOWS = [7, 30, 90];
@@ -133,10 +133,7 @@ export function ForwardsPanel() {
         }
         return (
           <div className="dryrun-banner warn">
-            <strong>
-              {d.attempts} payment{d.attempts === 1 ? "" : "s"} turned away for lack of outbound
-            </strong>{" "}
-            in {d.window} that a refilled channel could have carried — possible demand of {satsCompact(d.sats)} sat
+            <strong>{demandHeadline(d)}</strong> — possible demand of {satsCompact(d.sats)} sat
             {d.missedFeesSats ? <> (~{sats(d.missedFeesSats)} sat in fees at your current rates)</> : null}.{" "}
             <span className="muted">
               Of {d.raw} refused HTLCs in {d.rawWindow}, {d.probes} looked like probes (≥ 90% of the channel), {d.retries} were

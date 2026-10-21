@@ -185,6 +185,15 @@ export function demandSummary(report: UnservedDemandReport | null, nowMs = Date.
 }
 
 /**
+ * The banner's headline when there is possible demand: refused HTLCs a
+ * refilled channel could have carried — never "payments turned away" (D20;
+ * P3 review: the de-noising is a heuristic, these are not proven payments).
+ */
+export function demandHeadline(d: Pick<DemandSummary, "attempts" | "window">): string {
+  return `${d.attempts} refused HTLC${d.attempts === 1 ? "" : "s"} in ${d.window} that a refilled channel could have carried`;
+}
+
+/**
  * The "Fee tuning" figure on Analytics (review a5): a number only over at
  * least `minMeasured` changes that earned something before, revenue-weighted
  * — coloured only then — and always how many changes it rests on.

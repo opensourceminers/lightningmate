@@ -488,3 +488,25 @@ test("a manual Apply books returning flow first: the flow-won price is the fee a
   await autopilot.runOnce();
   assert.equal(autopilot.flowAnchors().get("850000x1x0"), 270);
 });
+
+test("F09: a max_htlc update that fails outright (an error, not a refusal) is recorded as failed and backs off like a refusal", async () => {
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 1_500_000 })] });
+  let asked = 0;
+  node.override("default.updateChannelPolicy", (_a, cb) => {
+    asked += 1;
+    cb({ details: "LND is shutting down" });
+  });
+  const backoff = new Map<string, number>();
+  const [first] = await runMaxHtlcPass(node.lnd, node.lnd, backoff);
+  assert.equal(first?.ok, false);
+  assert.ok(first?.error, "the failure is on record");
+  assert.equal(asked, 1);
+  // Within the back-off: no request at all.
+  const again = await runMaxHtlcPass(node.lnd, node.lnd, backoff);
+  assert.deepEqual(again, []);
+  assert.equal(asked, 1, "not retried every run");
+  // After it: tried again.
+  backoff.set("850000x1x0", Date.now() - MAX_HTLC_BACKOFF_MS - 1);
+  await runMaxHtlcPass(node.lnd, node.lnd, backoff);
+  assert.equal(asked, 2);
+});

@@ -50,10 +50,9 @@ import type {
   OfferSyncStatus,
   OrderState,
   PnlSummary,
-  RebalanceAnalysis,
+  RebalanceExecRequest,
   RebalanceExecResult,
   RebalanceLogResponse,
-  RebalancePolicy,
   RebalanceRecReport,
   BackupStatus,
   SuggestionPolicy,
@@ -160,21 +159,11 @@ export const api = {
   autopilotSet: (patch: AutopilotConfigPatch) => post<AutopilotState>("/autopilot", patch),
   autopilotRun: () =>
     post<{ run: AutopilotRun; state: AutopilotState }>("/autopilot/run", {}),
-  rebalanceCandidates: (policy?: Partial<RebalancePolicy>) => {
-    const qs = policy
-      ? "?" + new URLSearchParams(
-          Object.entries(policy).map(([k, v]) => [k, String(v)]),
-        ).toString()
-      : "";
-    return get<RebalanceAnalysis>(`/rebalance/candidates${qs}`);
-  },
-  rebalanceExecute: (params: {
-    targetId: string;
-    sourceId: string;
-    amountSats: number;
-    econRatio: number;
-    maxFeePpm?: number;
-  }) => post<RebalanceExecResult>("/rebalance/execute", params),
+  /** A refill by hand. It counts toward the daily rebalance budget: its fee
+   *  is capped at what is left (and at maxFeeSats, what the confirm dialog
+   *  promised); with nothing left — or a payment still in flight through one
+   *  of its channels — the server answers 409. */
+  rebalanceExecute: (params: RebalanceExecRequest) => post<RebalanceExecResult>("/rebalance/execute", params),
   rebalanceLog: () => get<RebalanceLogResponse>("/rebalance/log"),
   rebalanceRecommendations: () => get<RebalanceRecReport>("/rebalance/recommendations"),
   suggestions: (policy?: Partial<SuggestionPolicy>) => {

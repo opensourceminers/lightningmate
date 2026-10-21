@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Autopilot } from "../src/services/autopilot.js";
-import { RebalanceLog } from "../src/services/rebalanceLog.js";
+import { RebalanceLog, type RebalanceRecord } from "../src/services/rebalanceLog.js";
 import { OverridesStore } from "../src/services/overrides.js";
 import { AmbossStore } from "../src/services/ambossStore.js";
 import { EarningsLog } from "../src/services/earningsLog.js";
@@ -155,7 +155,7 @@ interface SavedState {
   perChannelLastApplied: Record<string, string>;
   perTargetLastRebalanced: Record<string, string>;
   perTargetRebalanceFails?: Record<string, number>;
-  perDayRebalanceSpend?: { day: string; sats: number };
+  perPairRebalanceFails?: Record<string, { fails: number; at: string }>;
   perChannelFlowAnchor?: Record<string, { episodeAt?: string; anchorPpm?: number }>;
 }
 
@@ -195,12 +195,24 @@ test("each rebalance payment's spend, cooldown and backoff are on disk before th
   });
   seams.rebalanceExec = async (_writeLnd, p) => (p.targetId === "800001x1x0" ? paidRebalance(p, 7) : failedRebalance(p));
   const onDiskMidRun = laterStageFails(t, seams, dir);
+  // Today's spend is read from the rebalance log (rebalanceBudget): what a
+  // restart at that moment would find there.
+  let logMidRun: RebalanceRecord[] = [];
+  const later = seams.runSell;
+  seams.runSell = async () => {
+    logMidRun = JSON.parse(readFileSync(join(dir, "rebalances.json"), "utf8")) as RebalanceRecord[];
+    return later();
+  };
 
   await autopilot.runOnce();
   const saved = onDiskMidRun();
-  assert.equal(saved.perDayRebalanceSpend?.sats, 7, "today's spend counts against the daily budget after a restart");
+  assert.deepEqual(
+    logMidRun.filter((r) => r.ok).map((r) => [r.targetId, r.feeSats]),
+    [["800001x1x0", 7]],
+    "today's spend counts against the daily budget after a restart",
+  );
   assert.ok(saved.perTargetLastRebalanced["800001x1x0"] && saved.perTargetLastRebalanced["800002x1x0"]);
-  assert.deepEqual(saved.perTargetRebalanceFails, { "800002x1x0": 1 }, "and the failing target backs off");
+  assert.equal(saved.perPairRebalanceFails?.["800000x1x0>800002x1x0"]?.fails, 1, "and the failing source → target pair backs off");
 });
 
 test("a fee batch's cooldowns are on disk before the run goes on", async (t) => {

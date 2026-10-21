@@ -1,8 +1,27 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
-import type { FeeMode, OverrideMap, RebalanceLogResponse, RebalanceRecReport, RebalanceRecState, UnservedDemandReport } from "../types";
+import type {
+  FeeMode,
+  OverrideMap,
+  RebalanceLogResponse,
+  RebalanceRecReport,
+  RebalanceRecState,
+  RebalanceRecommendation,
+  RefillInFlight,
+  UnservedDemandReport,
+} from "../types";
 import { sats, satsCompact, timeAgo } from "../format";
 import { demandSummary } from "../feeView";
+import {
+  afterRefillText,
+  budgetBlocked,
+  budgetLine,
+  confirmRefillText,
+  inFlightLine,
+  inFlightThrough,
+  manualRefillRequest,
+  refillOutcome,
+} from "../rebalanceView";
 import { useUi } from "./Overlay";
 
 const STATE_LABEL: Record<RebalanceRecState, string> = {
@@ -26,6 +45,28 @@ const STATE_CLASS: Record<RebalanceRecState, string> = {
   close_candidate: "s-close",
 };
 const pct = (n: number) => `${Math.round(n * 100)}%`;
+
+/** A recommended row's run area: the Run button — or, while a payment
+ *  through one of its channels may still land, why there is none (the
+ *  server refuses a refill there until LND says how that payment ended). */
+export function RefillAction(props: { r: RebalanceRecommendation; inFlight: RefillInFlight[] | undefined; running: boolean; onRun: () => void }) {
+  const busy = inFlightThrough(props.r, props.inFlight);
+  if (busy) return <p className="muted small">{inFlightLine(busy)}</p>;
+  return (
+    <div className="apply-row">
+      <button
+        className="primary-btn"
+        disabled={props.running}
+        onClick={(e) => {
+          e.stopPropagation();
+          props.onRun();
+        }}
+      >
+        {props.running ? "Running…" : `Run rebalance — move ${satsCompact(props.r.recommendedAmount ?? 0)}`}
+      </button>
+    </div>
+  );
+}
 
 export function RebalanceRecommendations() {
   const ui = useUi();
@@ -71,33 +112,21 @@ export function RebalanceRecommendations() {
   };
 
   const execute = async (r: RebalanceRecReport["recommendations"][number]) => {
-    if (!r.selectedSourceChannel || !r.recommendedAmount) return;
+    // The fee caps the dialog promises and the gate go with it (the server
+    // caps it at what is left of today's budget as well).
+    const request = manualRefillRequest(r, data?.config?.profitShare);
+    if (!request) return;
     const ok = await ui.confirm({
       title: "Run rebalance",
-      message:
-        `Move ${satsCompact(r.recommendedAmount)} into ${r.alias} from ${r.sourceCandidates[0]?.alias ?? "a source channel"}, ` +
-        `paying at most ${r.maxCostPpm} ppm (~${sats(r.maxCostSatsByPayback ?? 0)} sat)? This sends a real payment.`,
+      message: confirmRefillText(r, data?.budget),
       confirmLabel: "Run it",
     });
     if (!ok) return;
     setRunning(r.channelId);
     try {
-      const res = await api.rebalanceExecute({
-        targetId: r.channelId,
-        sourceId: r.selectedSourceChannel,
-        amountSats: r.recommendedAmount,
-        econRatio: 0.8,
-        maxFeePpm: r.maxCostPpm ?? undefined,
-      });
-      // Still in flight is not a failure: it may land, and the log will say.
-      ui.toast(
-        res.ok
-          ? `Rebalanced ${satsCompact(res.amountSats)} for ${res.feeSats} sat`
-          : res.inFlight
-            ? `Still in flight: ${res.error}`
-            : `Failed: ${res.error}`,
-        res.ok ? "success" : res.inFlight ? "info" : "error",
-      );
+      const res = await api.rebalanceExecute(request);
+      const outcome = refillOutcome(res);
+      ui.toast(outcome.text, outcome.kind);
       await Promise.all([load(), api.rebalanceLog().then(setLog).catch(() => {})]);
     } catch (e) {
       ui.toast(e instanceof Error ? e.message : String(e), "error");
@@ -125,9 +154,13 @@ export function RebalanceRecommendations() {
 
       <div className="dryrun-banner">
         Rebalance only when it pays back — and never refill liquidity Fee Autopilot says is being sold too cheaply
-        (raise the fee first). The autopilot runs the profitable ones when <strong>Auto-rebalance</strong> is on;
-        you can also run one now.{canWrite ? null : <> Running is disabled (read-only macaroon).</>}
+        (raise the fee first). A refill is valued at the fee the fee engine charges after it, which it then keeps until
+        the refilled sats have routed out; its payment can't pay more than that check allows. The autopilot runs the
+        profitable ones when <strong>Auto-rebalance</strong> is on; you can also run one now — checked and held the
+        same way.
+        {canWrite ? null : <> Running is disabled (read-only macaroon).</>}
       </div>
+      {budgetLine(data?.budget) ? <p className="muted small">{budgetLine(data?.budget)}</p> : null}
 
       {demand && demandSum?.kind === "sorting" ? (
         <p className="muted small">
@@ -185,15 +218,9 @@ export function RebalanceRecommendations() {
       {error ? <p className="banner error">{error}</p> : null}
       {!data && !error ? <p className="muted">Probing routes…</p> : null}
 
-      {data?.inbound && data.inbound.cheapest !== "none" ? (
-        <div className={`magma-crosslink ${data.inbound.cheapest === "magma" ? "" : ""}`}>
-          💡 <strong>Cheapest inbound:</strong> {data.inbound.note}
-          {data.inbound.rebalanceTypicalPpm != null || data.inbound.magmaCheapestPpm != null ? (
-            <span className="muted">
-              {" "}
-              · raising the fee + waiting is always free (just slower).
-            </span>
-          ) : null}
+      {data?.refill ? (
+        <div className="magma-crosslink">
+          💡 <strong>Refilling outbound:</strong> {data.refill.note}
         </div>
       ) : null}
 
@@ -243,6 +270,11 @@ export function RebalanceRecommendations() {
                       <td className="num">{pct(r.localRatio)}</td>
                       <td>
                         <span className={`feerec-state ${STATE_CLASS[r.state]}`}>{STATE_LABEL[r.state]}</span>
+                        {budgetBlocked(r, data.budget) ? (
+                          <span className="feerec-state s-cost" title="Today's fee budget can't pay for it now — it waits for the reset (00:00 UTC)">
+                            {" "}budget-blocked
+                          </span>
+                        ) : null}
                       </td>
                       <td className="num">{r.recommendedAmount ? satsCompact(r.recommendedAmount) : "—"}</td>
                       <td className="num">
@@ -275,9 +307,19 @@ export function RebalanceRecommendations() {
                               <span>earned 30d <b>{satsCompact(r.revenue30d)} sat</b>{r.revenuePpm30d != null ? ` · ${r.revenuePpm30d} ppm` : ""}{r.expectedRevenuePpm != null ? ` · expected ${r.expectedRevenuePpm} ppm` : ""}</span>
                               <span>amount: demand-sized <b>{satsCompact(r.demandSizedAmount)}</b> · to target {satsCompact(r.amountToReachTargetLocalRatio)}</span>
                               {r.selectedSourceChannel ? (
-                                <span>source <b>{r.sourceCandidates[0]?.alias ?? r.selectedSourceChannel}</b>{r.estimatedRouteFeeSats != null ? ` · route ${sats(r.estimatedRouteFeeSats)} sat` : ""}</span>
+                                <span>source <b>{r.sourceCandidates[0]?.alias ?? r.selectedSourceChannel}</b>{r.estimatedRouteFeeSats != null ? ` · route ${sats(r.estimatedRouteFeeSats)} sat` : ""}{r.sourceCandidates[0]?.spareSats ? ` · ${satsCompact(r.sourceCandidates[0].spareSats)} to spare` : ""}</span>
                               ) : null}
-                              <span>max cost <b>{r.maxCostPpm != null ? `${r.maxCostPpm} ppm` : "—"}</b> · payback limit {r.maxPaybackDays}d</span>
+                              {r.sourceCandidates.length > 1 ? (
+                                <span>
+                                  then:{" "}
+                                  {r.sourceCandidates
+                                    .slice(1)
+                                    .map((c) => `${c.alias}${c.rejected ? ` (out: ${c.rejectedReason ?? "no route"})` : ""}`)
+                                    .join(", ")}
+                                </span>
+                              ) : null}
+                              <span>max cost <b>{r.maxCostPpm != null ? `${r.maxCostPpm} ppm` : "—"}</b>{r.maxFeeSats != null ? ` · pays at most ${sats(r.maxFeeSats)} sat` : ""} · payback limit {r.maxPaybackDays}d</span>
+                              {afterRefillText(r) ? <span>{afterRefillText(r)}</span> : null}
                             </div>
                             <div className="ov-control">
                               <span className="ov-label">Autopilot:</span>
@@ -295,20 +337,7 @@ export function RebalanceRecommendations() {
                               </button>
                             </div>
                             {r.wouldRebalance && canWrite ? (
-                              <div className="apply-row">
-                                <button
-                                  className="primary-btn"
-                                  disabled={running === r.channelId}
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    void execute(r);
-                                  }}
-                                >
-                                  {running === r.channelId
-                                    ? "Running…"
-                                    : `Run rebalance — move ${satsCompact(r.recommendedAmount ?? 0)}`}
-                                </button>
-                              </div>
+                              <RefillAction r={r} inFlight={data.inFlight} running={running === r.channelId} onRun={() => void execute(r)} />
                             ) : null}
                           </div>
                         </td>

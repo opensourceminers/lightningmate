@@ -24,7 +24,7 @@ import {
   telemetryAgeDays,
 } from "../src/services/htlcTelemetry.js";
 import { FakeLnd, type FakeChannel } from "./helpers/fakeLnd.js";
-import { getFeeRecommendations } from "../src/services/feeRecommend.js";
+import { FEE_REC_DEFAULTS, buildRecommendation, getFeeRecommendations } from "../src/services/feeRecommend.js";
 import { feeNode } from "./helpers/feeNode.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { makeTempDir, type AfterHook } from "./helpers/tmp.js";
@@ -201,4 +201,44 @@ test("a refusal on a channel whose size isn't known yet has the channel sizes re
   assert.equal(reads(), 2);
   const d = getUnservedDemand(7).find((x) => x.outChannel === "850000x2x0");
   assert.deepEqual([d?.unclassifiedCount, d?.demandCount], [2, 1], "sorted once its size is known");
+});
+
+test("F02: a day counts toward 'days with demand' only if it had a demand attempt — a probe the next day adds none, and three attempts on one day leave the channel not in demand", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-20T10:00:00.000Z") });
+  telemetry(t, [["A", 2_000_000]]);
+  // Day 1: three distinct attempts under half the channel.
+  refuse("A", 100_000);
+  refuse("A", 200_000);
+  refuse("A", 300_000);
+  // Day 2: one capacity probe (≥ 90 % of the channel) — not demand.
+  t.mock.timers.tick(24 * 3_600_000);
+  refuse("A", 1_900_000);
+  const a = servableDemand(14).get("A");
+  assert.deepEqual([a?.attempts, a?.days], [3, 1], "the probe's day is not a day with demand");
+  // The fee engine reads it the same way: 3 attempts on ONE day are not
+  // "in demand" (it needs two days) — the idle channel is lowered.
+  const r = buildRecommendation(
+    { id: "840000x1x0", peerAlias: "p", capacity: 2_000_000, localRatio: 0.4, role: "router", active: true },
+    {
+      cfg: FEE_REC_DEFAULTS,
+      rate: { fee_rate: 300, base_fee_mtokens: "0", transaction_id: "aa".repeat(32), transaction_vout: 0 },
+      override: undefined,
+      f14: { out: 0, inn: 0, revenue: 0, forwards: 0 },
+      f30: { out: 0, inn: 0, revenue: 0, forwards: 0 },
+      currentBlock: 860_000,
+      records: [],
+      bench: { activeChannelCount: 1, topGrossFlow14d: 0, medianGrossFlow14d: 0, topRevenue30d: 0, medianRevenue30d: 0, topRevenuePpm30d: 0, medianRevenuePpm30d: 0 },
+      enoughChannels: false,
+      earnerCutoff: 0,
+      cooldown: null,
+      elasticityMod: 1,
+      flowAnchor: undefined,
+      leaseCap: null,
+      demand: a,
+      market: undefined,
+      nowMs: Date.now(),
+    },
+  );
+  assert.equal(r.metrics.inDemand, false);
+  assert.equal(r.noFlowLowering, true, r.reasons.join(" | "));
 });

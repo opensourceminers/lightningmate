@@ -32,12 +32,15 @@ export interface AutopilotConfig {
   maxRebalancesPerRun: number;
   /** Per-target minimum time between rebalances. */
   rebalanceCooldownMinutes: number;
-  /** Only auto-rebalance within this hour window (container clock, 0–24). Equal
-   *  start/end = any time. e.g. 0→6 = only overnight, when routes are cheaper. */
+  /** Only auto-rebalance within this hour window (UTC, 0–24 — the daily
+   *  budget's day is UTC too). Equal start/end = any time. e.g. 0→6 = only
+   *  overnight, when routes are cheaper. */
   rebalanceHourStart: number;
   rebalanceHourEnd: number;
-  /** Cap on total rebalance fees spent per day (sats). null = explicitly no
-   *  cap; there is no implicit "0 means unlimited" any more. */
+  /** Cap on total rebalance fees spent per UTC day (sats) — the autopilot's
+   *  and manual runs together, payments still in flight at their maximum
+   *  fee. null = explicitly no cap; there is no implicit "0 means unlimited"
+   *  any more. */
   rebalanceDailyBudgetSats: number | null;
   /** Channel autopilot: open a channel to the top suggestion when funds allow. */
   channelEnabled: boolean;
@@ -190,14 +193,17 @@ export const POLICY_BOUNDS: Record<keyof FeePolicy, NumberBounds> = {
   minChangePpm: int(0, 10_000),
 };
 
+/** The settings the rebalance gate really reads (review a2: "Amount",
+ *  "Target ≤ local" and "Source ≥ local" reached nothing — they are gone;
+ *  stored values of them are dropped on load). */
 export const REBALANCE_POLICY_BOUNDS: Record<keyof RebalancePolicy, NumberBounds> = {
   econRatio: real(0.05, 1),
-  maxLocalRatioTarget: real(0, 1),
-  minLocalRatioSource: real(0, 1),
-  amountSats: int(1_000, 100_000_000),
-  minDemandSats: int(0, MAX_SATS),
-  flowWindowDays: int(1, 90),
-  maxCandidates: int(1, 50),
+  // ≥ 1: a refill must be expected to earn something (0 would pay for refills
+  // that only break even on their estimate).
+  minNetProfitSats: int(1, 1_000_000),
+  maxPaybackDays: int(1, 365),
+  // From the smallest refill the recommender sizes (50k) to 1 BTC.
+  maxAmountSats: int(50_000, 100_000_000),
 };
 
 const BOOLEAN_KEYS = [
@@ -354,9 +360,9 @@ const isAboveMaximumSize = (v: unknown): v is number =>
   typeof v === "number" && Number.isFinite(v) && v > CONFIG_BOUNDS.channelSizeSats.max;
 
 /**
- * Whether the rebalance hour window is open at `hour` (0–23, container
- * clock). Equal ends mean any time; start > end wraps past midnight (22→6).
- * The one rule both the autopilot and the load-time repair apply.
+ * Whether the rebalance hour window is open at `hour` (0–23, UTC). Equal ends
+ * mean any time; start > end wraps past midnight (22→6). The one rule both
+ * the autopilot and the load-time repair apply.
  */
 export function rebalanceWindowOpen(start: number, end: number, hour: number): boolean {
   if (start === end) return true;

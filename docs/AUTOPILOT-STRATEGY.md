@@ -138,10 +138,18 @@ idle).
 **Per-channel derivation order (`buildRecommendation`):**
 
 1. **Metrics** — routed-out/in over 14d & 30d, revenue, net drain, channel age (from the
-   channel-id block height), and a **cost basis** = average ppm the *autopilot's* refills into
-   this channel cost over the last **30 days** (refills run by hand chose their own price and
-   set none). `profitFloorPpm = costBasis × safetyMargin`, capped at `maxPpm` unless the
-   operator opted in. Plus two outside signals:
+   channel-id block height), and the **refills still in the channel**: the refills of the last
+   **30 days** that passed the profit gate (the autopilot's, and those run by hand from a
+   recommended row on the Rebalancing tab — the gate goes with them, capping their payment at
+   every size, and its value is booked as their hold; a refill run by hand without the gate
+   chose its own price and sets none), each retired first in, first out as its sats route
+   out (LND's lifetime "sent" counter of the channel, recorded before each refill). Only
+   those sats set a **profit floor**: a refill
+   holds the price the profit gate valued it at (never less than its cost × `safetyMargin`;
+   refills recorded before that hold read as cost × `safetyMargin`) until its sats have routed
+   out — 30 days at most, and **released under low flow** (a week after the refill, fewer than 3
+   forwards out in 14 days at ≥ 40 % local). Capped at `maxPpm` unless the operator opted in.
+   Plus two outside signals:
    - the **market** (public graph, nothing paid or sent): the capacity-weighted median fee
      other nodes charge to forward into the same peer, and the peer's own fee back to us — a
      refill costs at least both (**replacement cost**). The graph is read at most every 30
@@ -153,8 +161,10 @@ idle).
      reference keeps its last one for 7 days (above);
    - **refused demand** (failed-HTLC telemetry, de-noised: probes ≥ 90% of a channel,
      retries of the same amount within 10 minutes and HTLCs over half the channel are
-     counted apart). A channel that turned away ≥ 3 real attempts on ≥ 2 days in 14 days is
-     **in demand**, even without a successful forward.
+     counted apart). A channel with ≥ 3 de-noised refused HTLCs (possible demand) on ≥ 2 days
+     in 14 days is **in demand**, even without a successful forward. The de-noising is a
+     heuristic: these are refused HTLCs a refilled channel could have carried, not proven
+     payments.
 
 2. **Role → target ratio.** Each channel is classified from lifetime flow:
    `source` (mostly receives) → target localRatio 0.45; `sink` (mostly sends) → 0.55;
@@ -166,7 +176,7 @@ idle).
      fee, or well below the node's flow) the curve's balanced level is lowered to ~0.9 × the
      market into the peer when that is cheaper — never on a top earner, a channel whose
      velocity says draining, steady outbound demand or active and balanced, a draining
-     channel or one turning payments away (a top earner routing 2.4M a month at 80 ppm was
+     channel or one with possible demand (a top earner routing 2.4M a month at 80 ppm was
      cut toward 27 ppm). Never raised — volume-first stays the default
    - more local than target (excess outbound) → interpolate **down toward `minPpm`**
    - drained below target → interpolate **up toward `maxPpm`**
@@ -210,12 +220,13 @@ idle).
 
 9. **Floors:**
    - new channel (<3 days, <3 forwards) → at least `newChannelMinPpm`
-   - profit floor → ramped toward `costBasis × safetyMargin` (4 steps a move)
-   - **protect**: drained (<10% local) **but still in demand** (forwards, or refused real
-     payments) → ramped toward `protectPpm` (4 steps a move, at the operator's cooldown)
+   - profit floor (the refills still in the channel, see 1) → ramped toward it (4 steps a move)
+   - **protect**: drained (<10% local) **but still in demand** (forwards, or refused HTLCs a
+     refill could have carried — possible demand) → ramped toward `protectPpm` (4 steps a
+     move, at the operator's cooldown)
 
 10. **No-flow rule (core volume lever):** if the channel routed **0 forwards in 30 days**,
-    has ≥10% local, isn't brand-new and isn't turning real payments away → **lower the fee**
+    has ≥10% local, isn't brand-new and isn't refusing possible demand → **lower the fee**
     to win flow back (overrides the curve and floors, except new-channel protection):
     - with a **flow-won anchor** (the ppm at which routing last returned here, remembered
       per channel for 60 days): jump straight to that price — best evidence beats stepping;
@@ -283,13 +294,17 @@ how fast idle channels get cheaper, how aggressive the explore-lower cut is) AND
 
 | Preset | min/neutral/max | protect | safety­Margin | ratchet steps | explore mod | Rebalance: econRatio / max·run / daily budget | Channels | Magma |
 |---|---|---|---|---|---|---|---|---|
-| **Max routing** | 25 / 60 / 1000 | 250 | 1.05 | 4 | 0.75 | 0.9 / 4 / 25k sat | on | untouched |
+| **Max routing** | 25 / 60 / 1000 | 250 | 1.05 | 4 | 0.75 | 0.9 / 4 / 25k sat (refills rarely pass at these fees) | on | untouched |
 | **Balanced** (default) | 25 / 80 / 1000 | 350 | 1.15 | 3 | 0.85 | 0.8 / 2 / 10k sat | on | untouched |
 | **Max profit** | 80 / 150 / 1500 | 600 | 1.35 | 1 | 0.90 | 0.6 / 1 / 5k sat | untouched | untouched |
 
-Rationale: "Max routing" = cheapest fees + zero base + fast ratchet down + loose (still
-profitable) rebalancing → win the most forwards (*lots of forwards for few sats*). "Max
-profit" = higher fees, slow ratchet, strict rebalancing → fewer, richer forwards.
+Rationale: "Max routing" = cheapest fees + zero base + fast ratchet down → win the most
+forwards (*lots of forwards for few sats*). Its rebalance settings are the loosest, but the
+profit check decides: a refill must net at least 100 sat on a move of at most a quarter of the
+channel, which at fees this low needs a route far cheaper than the channel earns — so on a
+small low-fee node refills rarely run, and the preset says so instead of promising "loose
+rebalancing". "Max profit" = higher fees, slow ratchet, a strict profit check → fewer,
+richer forwards.
 "Balanced" competes for flow at sensible fees. ("untouched" = the preset leaves that switch as
 it is; Max profit no longer switches channel opens off.)
 
@@ -305,8 +320,9 @@ object (`minPpm`, `neutralPpm`, `maxPpm`, `baseFeeMsat`, `protectPpm`, `safetyMa
 `noFlowRatchetSteps`, `exploreLowerModifier`), the `rebalancePolicy.econRatio` +
 `maxRebalancesPerRun` + `rebalanceDailyBudgetSats`, and the on/off flags. On each run,
 `feeV2Overrides()` maps `policy` → the fee engine's config, and `rebalanceRecOverrides()`
-maps `econRatio` → the rebalance recommender's `profitShare` gate (so the strategy loosens
-or tightens which rebalances *qualify*, not just the execution budget). Still fixed across
+maps every rebalance setting onto the recommender's gate — `econRatio` → `profitShare`,
+`minNetProfitSats`, `maxPaybackDays`, `maxAmountSats` (so the strategy loosens or tightens
+which rebalances *qualify*, not just the execution budget). Still fixed across
 strategies (not yet cascaded): `cooldownHours`, the flow windows, and the exact
 velocity/benchmark tiers and the no-flow *trigger* (0 forwards / 30d) — only its *speed*
 is cascaded.
@@ -315,11 +331,43 @@ is cascaded.
 
 ## 4. The other three sub-autopilots
 
-**Rebalancing** (`runRebalances`): a recommender finds channels worth refilling and only
-returns moves where the rebalance cost is economically justified vs the fee it would let us
-earn (a `route_found_profitable` gate; `econRatio` is the cost/benefit knob). Runs at most
-`maxRebalancesPerRun`, respects a per-target cooldown and an optional hour window. Each
-attempt (success or fail) marks the target so we don't hammer dead routes.
+**Rebalancing** (`runRebalances`): a recommender finds drained channels worth refilling and
+only returns moves where the route cost is justified by what the refilled sats earn (a
+`route_found_profitable` gate). The gate values the moved sats at the lowest of what the
+channel earned, charges and is heading to — and of the fee the fee engine charges **after**
+the refill (asked of the engine itself, `feeAfterRefill`); the engine then **holds** that
+price while the refilled sats are in the channel (see the profit floor above), so the gate's
+estimate and the engine agree. A move passes only if its route costs at most `econRatio` of
+the expected earnings, it nets at least `minNetProfitSats` and pays back within
+`maxPaybackDays` — and **the payment's max fee is that same limit at every size it tries**
+(the halved fallbacks too), never more than is left of today's budget.
+Sources: never a channel younger than 14 days, a private one, one sold through Magma or LSPS1
+in its lease, one with any net outflow in 14 days, a top earner or the node's single best
+earner; each gives at most its balance above its own target share + 5 %, and the moves
+planned from it shrink what it can give the next target. Up to three sources are tried per
+target, the next one when no route pays from the one before; a failed source backs off for
+that target only (cooldown × 2^fails, at most ×8). A refill of ≥ 500k may split over 3 paths
+(the payment carries the invoice's feature bits — without them LND never splits).
+Runs at most `maxRebalancesPerRun` (the best moves that fit the budget left — a pricey best
+move no longer blocks a cheaper one), respects a per-target cooldown and an hour window in
+**UTC**. **The daily fee budget** covers the autopilot's and manual refills alike and is read
+from the rebalance log (payments still in flight count at their maximum fee): a restart or a
+crash can't reset it, and it starts afresh at 00:00 UTC. Every payment attempt is written to
+disk **before** it is sent, so a restart or a crash mid-payment (an update's shutdown waits
+37 s, a payment up to 150 s) loses nothing: the restarted process counts it at its maximum
+fee, leaves its two channels alone, and books it — fee, hold, sent counter, on the day it was
+sent — once LND says how it ended. An attempt whose wait broke off without LND saying how it
+ended counts as still in flight (no smaller size or other source is tried meanwhile). After the
+shutdown signal no new attempt starts — no smaller size, no other source: only the payment
+already under way is awaited, and the refill counts as skipped, not failed. A manual
+refill is capped at what is left and refused when nothing is; it never pays beside the
+autopilot's rebalance stage (one refill at a time), nor into or out of a channel whose earlier
+payment may still land (the tab shows that payment instead of a Run button), but no longer
+holds up the rest of a run (fees, lease promises, channel opens, Magma). Run from a
+recommended row, it carries the profit gate and its price is held like an autopilot refill's. Moves the budget or the per-run limit leave for
+later are **not** failed runs: they go into the rebalance decision ("last decision" on the
+tab), never into the run history. A drained channel the gate turns down says what a refill would need
+(earnings per sat, outflow, net drain).
 
 **Channels** (`runChannels`): opens a channel to the top-scored peer suggestion when
 on-chain funds exceed the reserve. **Capital gate (`leaveForMagma`, D10):** a routing open
@@ -360,9 +408,9 @@ service fee applies to completed sales.
 ```
 enabled, intervalMinutes, cooldownMinutes, maxChangesPerRun
 policy: { minPpm, neutralPpm, maxPpm, baseFeeMsat, step, minChangePpm }
-rebalanceEnabled, rebalancePolicy{econRatio, amountSats, maxLocalRatioTarget,
-  minLocalRatioSource}, maxRebalancesPerRun, rebalanceCooldownMinutes,
-  rebalanceHourStart, rebalanceHourEnd
+rebalanceEnabled, rebalancePolicy{econRatio, minNetProfitSats, maxPaybackDays,
+  maxAmountSats}, maxRebalancesPerRun, rebalanceCooldownMinutes,
+  rebalanceHourStart, rebalanceHourEnd (UTC), rebalanceDailyBudgetSats (null = no limit)
 channelEnabled, channelReserveSats, channelSizeSats, channelCooldownMinutes
 sellEnabled, sellMaxDeploySats, sellReserveSats, sellMaxChannelSats,
   sellAutoClose, sellAutoRelist, sellAutoReprice, sellPricingMode

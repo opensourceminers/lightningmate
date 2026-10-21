@@ -16,6 +16,7 @@ import { runProgress } from "../statusNotes";
 import { buildPresets, matchesPreset as presetMatches } from "../presets";
 import { NEUTRAL_PPM_HINT, historyFeeLine } from "../feeView";
 import { OFFER_AUTOMATION_HINT, PRICING_MODES } from "../magmaView";
+import { REBALANCE_POLICY_FIELDS, REMOVED_SETTINGS_NOTE, budgetLine, decisionLine } from "../rebalanceView";
 import { RunState, Switch } from "./Switch";
 import { useUi } from "./Overlay";
 import { goTo } from "../nav";
@@ -41,7 +42,7 @@ type NumKey =
   | "sellMaxDeploySats"
   | "sellReserveSats"
   | "sellMaxChannelSats";
-type RebKey = "econRatio" | "amountSats" | "maxLocalRatioTarget" | "minLocalRatioSource";
+type RebKey = keyof AutopilotConfig["rebalancePolicy"];
 
 const FEE_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "intervalMinutes", label: "Run every (min)" },
@@ -59,17 +60,13 @@ const POLICY_FIELDS: { key: keyof AutopilotConfig["policy"]; label: string; hint
 ];
 const REB_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "maxRebalancesPerRun", label: "Max rebalances / run" },
-  { key: "rebalanceDailyBudgetSats", label: "Daily fee budget (sat)" },
+  { key: "rebalanceDailyBudgetSats", label: "Daily fee budget (sat, manual runs included)" },
   { key: "rebalanceCooldownMinutes", label: "Rebalance cooldown (min)" },
-  { key: "rebalanceHourStart", label: "Run from hour (0–24)" },
-  { key: "rebalanceHourEnd", label: "Run to hour (0–24)" },
+  { key: "rebalanceHourStart", label: "Run from hour (UTC, 0–24)" },
+  { key: "rebalanceHourEnd", label: "Run to hour (UTC, 0–24)" },
 ];
-const REB_POLICY_FIELDS: { key: RebKey; label: string; step: number }[] = [
-  { key: "econRatio", label: "Econ ratio", step: 0.05 },
-  { key: "amountSats", label: "Amount (sat)", step: 10_000 },
-  { key: "maxLocalRatioTarget", label: "Target ≤ local", step: 0.05 },
-  { key: "minLocalRatioSource", label: "Source ≥ local", step: 0.05 },
-];
+// Every rebalance setting shown binds the profit gate (rebalanceView.ts).
+const REB_POLICY_FIELDS = REBALANCE_POLICY_FIELDS;
 const CHANNEL_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "channelSizeSats", label: "Channel size (sat, 0=auto)" },
   { key: "channelReserveSats", label: "Keep on-chain reserve (sat)" },
@@ -438,14 +435,25 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
         </>
       ) : sub === "rebalancing" ? (
         <>
-          {toggleRow("rebalanceEnabled", "Auto-rebalance", "Run the profitable rebalances below automatically (cost ≤ budget)")}
+          {toggleRow(
+            "rebalanceEnabled",
+            "Auto-rebalance",
+            "Run the refills below that pass the profit check, within the daily fee budget — on a small node with low fees, that is rarely",
+          )}
+          {budgetLine(server.rebalanceBudget) ? <p className="muted ap-hint">{budgetLine(server.rebalanceBudget)}</p> : null}
+          {decisionLine(server.decisions?.rebalance) ? <p className="muted ap-hint">{decisionLine(server.decisions?.rebalance)}</p> : null}
           <details className="ap-customize">
             <summary>Customize rebalance policy</summary>
             <div className="policy-controls">
               {numFields(REB_NUM_FIELDS)}
-              {REB_POLICY_FIELDS.map((f) => numInput(`rebalancePolicy.${f.key}`, f.label, f.step))}
+              {REB_POLICY_FIELDS.map((f) => numInput(`rebalancePolicy.${f.key}`, f.label, f.step, f.hint))}
             </div>
             <div className="ap-checks">{noBudgetLimit}</div>
+            <p className="muted ap-hint">
+              A refill runs only when its route costs at most your share of what the refilled sats are expected to earn,
+              it nets at least the minimum, and pays back in time — its payment can't pay more than that, nor more than is
+              left of today's budget. The hours and the budget's day are UTC. {REMOVED_SETTINGS_NOTE}
+            </p>
             {saveRow}
           </details>
           <RebalanceRecommendations />

@@ -11,12 +11,14 @@
 import "./helpers/browserGlobals";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   MIN_DEMAND_DAYS,
   NEUTRAL_PPM_HINT,
   applyChannelIds,
   baseChange,
+  demandHeadline,
   demandSummary,
   feeText,
   feeTuningKpi,
@@ -27,7 +29,7 @@ import {
   pinSeed,
 } from "../src/feeView";
 import { FeeOverrideControl } from "../src/components/FeeOverrideControl";
-import { ApplyResult } from "../src/components/FeeRecommendations";
+import { ApplyResult, FeeRecommendations, IN_DEMAND_CHIP_TITLE, InDemandChip } from "../src/components/FeeRecommendations";
 import type { AutopilotChange, OutcomesReport, UnservedDemandReport } from "../src/types";
 
 test("choosing 'fixed' saves nothing yet and starts from the channel's current fee (it pinned 100 ppm at once); auto and excluded save at once", () => {
@@ -213,4 +215,25 @@ test("a remembered market reference says when it was last seen", () => {
   const seen = new Date(Date.now() - 3 * 3_600_000).toISOString();
   assert.equal(marketRefText({ marketPpm: 200, marketSamples: 3, marketSeenAt: seen }), "~200 ppm (3 channels, last seen 3h ago)");
   assert.equal(marketRefText({ marketPpm: null, marketSamples: 0, marketSeenAt: null }), "—");
+});
+
+test("D20 on the Fees tab: refused HTLCs are possible demand — the chip and the banner no longer say 'real payments' / 'real demand' (P2 final review)", () => {
+  const chip = renderToStaticMarkup(<InDemandChip count={2} />);
+  assert.match(chip, /title="Possible demand: refused HTLCs a refilled channel could have carried \(probes, retries of the same amount and HTLCs over half the channel excluded\)"/);
+  assert.match(chip, />2 with possible demand</);
+  assert.doesNotMatch(chip, /real payments|turning payments away/);
+  assert.equal(renderToStaticMarkup(<InDemandChip count={0} />), "");
+  assert.match(IN_DEMAND_CHIP_TITLE, /^Possible demand:/);
+  const page = renderToStaticMarkup(<FeeRecommendations />);
+  assert.match(page, /react to possible demand \(refused HTLCs, de-noised\)\./);
+  assert.doesNotMatch(page, /real demand|real payments/);
+});
+
+test("the Forwards tab's demand banner speaks of refused HTLCs a refilled channel could have carried — not payments turned away (D20; P3 review)", () => {
+  const d = demandSummary(demandReport())!;
+  assert.equal(demandHeadline(d), "4 refused HTLCs in the last 7 days that a refilled channel could have carried");
+  assert.equal(demandHeadline({ attempts: 1, window: "the last 3.5 days" }), "1 refused HTLC in the last 3.5 days that a refilled channel could have carried");
+  const panel = readFileSync(new URL("../src/components/ForwardsPanel.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(panel, /turned away for lack of outbound/, "the headline read '4 payments turned away for lack of outbound'");
+  assert.match(panel, /<strong>\{demandHeadline\(d\)\}<\/strong> — possible demand of/);
 });

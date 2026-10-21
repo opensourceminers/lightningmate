@@ -15,7 +15,7 @@ const doc = readFileSync(new URL("../../docs/AUTOPILOT-STRATEGY.md", import.meta
 const readme = readFileSync(new URL("../../README.md", import.meta.url), "utf8");
 
 const policy = { minPpm: 1, neutralPpm: 50, maxPpm: 500, protectPpm: 300, baseFeeMsat: 1000, step: 5, minChangePpm: 5 } as unknown as AutopilotConfig["policy"];
-const rebalancePolicy = { econRatio: 0.5, amountSats: 100_000, maxLocalRatioTarget: 0.3, minLocalRatioSource: 0.6 } as unknown as AutopilotConfig["rebalancePolicy"];
+const rebalancePolicy: AutopilotConfig["rebalancePolicy"] = { econRatio: 0.5, minNetProfitSats: 100, maxPaybackDays: 21, maxAmountSats: 2_000_000 };
 
 test("the strategy doc's preset table matches the presets: fee curve, channel opens, and Magma untouched by every one", () => {
   for (const p of buildPresets({ policy, rebalancePolicy })) {
@@ -47,4 +47,10 @@ test("the strategy doc says what the fee engine does now (review 3): Neutral ppm
   assert.match(doc, /can learn per-channel\s+elasticity — only from strong evidence \(most nodes: none\)/);
   assert.match(doc, /\*\*A missing market reference never lowers a draining channel\.\*\*/);
   assert.match(doc, /A read that never answers is given up after 10 minutes/);
+});
+
+test("the strategy doc calls refused HTLCs possible demand (D20) — not 'real attempts' or payments 'turned away' (P3 review)", () => {
+  assert.doesNotMatch(doc, /real attempts/);
+  assert.doesNotMatch(doc, /turned away[^.]*payments|turning payments away/);
+  assert.match(doc, /≥ 3 de-noised refused HTLCs \(possible demand\) on ≥ 2 days\s+in 14 days is \*\*in demand\*\*/);
 });

@@ -8,78 +8,44 @@ import {
   type AuthenticatedLnd,
 } from "lightning";
 import { getChannelsView, type ChannelView } from "./channels.js";
-import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
 
 /**
- * Rebalancing economics. The golden rule: a rebalance is only worth doing when
- * the route cost (ppm) is below the fee (ppm) you'll earn deploying that
- * liquidity again. So per target channel:
+ * Rebalancing: circular payments that move our own liquidity from an idle
+ * channel (the source) into a drained one (the target). The golden rule: a
+ * refill is only worth paying for when what the refilled liquidity earns
+ * covers its route cost with a margin — the profit gate in
+ * rebalanceRecommend.ts. This file probes route costs and executes a refill
+ * under a fee cap no looser than that gate (feeCapAt).
  *
- *   budget_ppm = target_outbound_fee_ppm × econRatio   (econRatio < 1 = margin)
- *
- * We only consider depleted targets that have *proven outbound demand* (they've
- * actually routed out recently), and pull from the fullest source channels.
+ * (The first engine — a target ≤ local / source ≥ local / fixed amount picker
+ * behind GET /rebalance/candidates — is gone: nothing called it, and its
+ * three settings on the Autopilot tab never reached the autopilot.)
  */
 export interface RebalancePolicy {
+  /** The most a refill's route may cost, as a share of what the refilled
+   *  liquidity is expected to earn (0.05–1) — the gate's cost cap. */
   econRatio: number;
-  maxLocalRatioTarget: number;
-  minLocalRatioSource: number;
-  amountSats: number;
-  minDemandSats: number;
-  flowWindowDays: number;
-  maxCandidates: number;
+  /** A refill must be expected to net at least this much (sat). */
+  minNetProfitSats: number;
+  /** A refill's fee must be earned back within this many days of the
+   *  target's routing revenue. */
+  maxPaybackDays: number;
+  /** The most one refill moves (sat). */
+  maxAmountSats: number;
 }
 
 export const DEFAULT_REBALANCE_POLICY: RebalancePolicy = {
   econRatio: 0.8,
-  maxLocalRatioTarget: 0.35,
-  minLocalRatioSource: 0.65,
-  amountSats: 1_000_000,
-  minDemandSats: 1,
-  flowWindowDays: 30,
-  maxCandidates: 8,
+  minNetProfitSats: 100,
+  maxPaybackDays: 21,
+  maxAmountSats: 2_000_000,
 };
-
-// Search routes up to this cost so we can report an honest number even when a
-// candidate turns out to be unprofitable.
-const PROBE_CEILING_PPM = 3000;
-
-export interface RebalanceCandidate {
-  targetId: string;
-  targetAlias: string;
-  targetLocalRatio: number;
-  targetOutboundPpm: number;
-  /** Sats this channel routed OUT over the window — why it's worth refilling. */
-  demandSats: number;
-  sourceId: string;
-  sourceAlias: string;
-  sourceLocalRatio: number;
-  amountSats: number;
-  /** Profit budget: most we should pay to rebalance, in ppm. */
-  maxFeePpm: number;
-  /** Cheapest route cost found (ppm), or null if none. */
-  estCostPpm: number | null;
-  estFeeSats: number | null;
-  /** What you net per sat once refilled liquidity routes out: earn − cost (ppm). */
-  netMarginPpm: number | null;
-  /** Rough net profit (sats) of this refill, accounting for demand (the channel
-   *  only earns on what it can actually route out). Negative = over-refilling. */
-  expectedProfitSats: number | null;
-  routeFound: boolean;
-  profitable: boolean;
-  verdict: string;
-}
-
-export interface RebalanceAnalysis {
-  policy: RebalancePolicy;
-  candidates: RebalanceCandidate[];
-}
 
 /**
  * Fast cost estimate from the graph (no payment, no probe HTLCs). Optimistic —
  * the real cost and whether liquidity is actually there is only known when you
- * run the rebalance. Shown as guidance; the user decides (Thunderhub-style).
+ * run the rebalance.
  */
 export async function estimateCost(
   lnd: AuthenticatedLnd,
@@ -107,11 +73,50 @@ export async function estimateCost(
   }
 }
 
+/** The smallest refill worth trying (the recommender's minRebalanceAmount). */
+export const MIN_REFILL_SATS = 50_000;
+
 /** Amounts to attempt, largest first, down to a floor — for adaptive rebalancing. */
-function adaptiveAmounts(target: number): number[] {
-  const floor = 50_000;
+export function adaptiveAmounts(target: number): number[] {
   const raw = [target, Math.round(target / 2), Math.round(target / 4)];
-  return [...new Set(raw.filter((a) => a >= floor))];
+  return [...new Set(raw.filter((a) => a >= MIN_REFILL_SATS))];
+}
+
+/** A refill at least this big may be split over several paths (MPP): one
+ *  path rarely has the liquidity for it, and a payment that can't be split
+ *  fails where its parts would route (review a2: 6 of 14 attempts timed out
+ *  — ln-service sends single-path unless told otherwise). */
+export const MULTI_PATH_MIN_SATS = 500_000;
+export const MULTI_PATH_MAX_PATHS = 3;
+
+/**
+ * What one refill may pay in routing fees — the profit gate's limits, as a
+ * payment's max_fee (review a2: the payment was capped at amount × the
+ * gate's ppm alone, looser than the gate itself; a 750k refill earning 200
+ * sat could pay 240 and lose 40 "within budget").
+ */
+export interface RefillFeeCap {
+  /** The most the route may cost per sat moved (ppm). */
+  maxCostPpm: number;
+  /** The most the refill may cost at all (sat): the payback limit, the
+   *  daily budget left. */
+  maxFeeSats?: number | null;
+  /** The gate's earnings side: an attempt of A sat earns min(A, demandSats)
+   *  × revenuePpm and must keep at least minNetSats of it. */
+  earnings?: { revenuePpm: number; demandSats: number; minNetSats: number } | null;
+}
+
+/** The max fee (sat) a refill of `amountSats` may pay and still pass the
+ *  gate; below 1, the attempt is not worth sending. */
+export function feeCapAt(cap: RefillFeeCap, amountSats: number): number {
+  let sats = Math.floor((amountSats * cap.maxCostPpm) / 1_000_000);
+  if (cap.maxFeeSats != null) sats = Math.min(sats, Math.floor(cap.maxFeeSats));
+  if (cap.earnings) {
+    const e = cap.earnings;
+    const earned = (Math.min(amountSats, Math.max(0, e.demandSats)) * e.revenuePpm) / 1_000_000;
+    sats = Math.min(sats, Math.floor(earned - e.minNetSats));
+  }
+  return Math.max(0, sats);
 }
 
 // Pathfinding budget per attempt. Generous because over a dev SSH tunnel each
@@ -119,13 +124,13 @@ function adaptiveAmounts(target: number): number[] {
 const PATHFINDING_TIMEOUT_MS = 45_000;
 
 /**
- * Hard wall-clock limit for one rebalance, all amounts together. LND's
- * pathfinding timeout only stops NEW attempts: a payment with an HTLC stuck
- * at a downstream hop stays in flight until that HTLC resolves — hours or
- * days — and the autopilot run awaiting it stood still all that time. Past
- * this limit we stop WAITING (the payment may still land) and report it as
- * in flight; the autopilot charges its maximum fee to the daily budget and
- * learns the real outcome on a later run (getPayment).
+ * Hard wall-clock limit for one rebalance, all sources and amounts together.
+ * LND's pathfinding timeout only stops NEW attempts: a payment with an HTLC
+ * stuck at a downstream hop stays in flight until that HTLC resolves — hours
+ * or days — and the autopilot run awaiting it stood still all that time.
+ * Past this limit we stop WAITING (the payment may still land) and report it
+ * as in flight; the autopilot charges its maximum fee to the daily budget
+ * and learns the real outcome on a later run (getPayment).
  */
 export const REBALANCE_HARD_TIMEOUT_MS = 150_000;
 
@@ -151,123 +156,44 @@ function waitAtMost<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_O
   return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
 }
 
-function verdictFor(outboundPpm: number, costPpm: number | null, profitable: boolean): string {
-  if (costPpm === null) return "no cheap route — try a smaller amount or run it manually";
-  if (outboundPpm <= 0) return `est. ${costPpm} ppm cost — target earns 0 ppm (set a fee or your call)`;
-  const margin = outboundPpm - costPpm;
-  if (profitable) return `profitable: earns ${outboundPpm} − costs ${costPpm} = +${margin} ppm margin`;
-  if (margin > 0) return `thin margin: earns ${outboundPpm} − costs ${costPpm} = +${margin} ppm (under target)`;
-  return `unprofitable: costs ${costPpm} ≥ earns ${outboundPpm} ppm`;
-}
-
-export async function getRebalanceCandidates(
-  lnd: AuthenticatedLnd,
-  overrides: Partial<RebalancePolicy> = {},
-): Promise<RebalanceAnalysis> {
-  const policy = { ...DEFAULT_REBALANCE_POLICY, ...overrides };
-
-  const [channels, rates, flows, ownKey] = await Promise.all([
-    getChannelsView(lnd),
-    getFeeRates({ lnd }),
-    getFlowSummary(lnd, policy.flowWindowDays),
-    getOwnPubkey(lnd),
-  ]);
-
-  const ppmById = new Map(rates.channels.map((c) => [c.id, c.fee_rate]));
-  const demandById = new Map(flows.perChannel.map((f) => [f.channelId, f.routedOut]));
-
-  const active = channels.filter((c) => c.active);
-
-  // Sources: full channels we can pull liquidity from, fullest first.
-  const sources = active
-    .filter((c) => c.localRatio >= policy.minLocalRatioSource)
-    .sort((a, b) => b.localRatio - a.localRatio);
-  if (sources.length === 0) return { policy, candidates: [] };
-
-  // Targets: depleted channels with proven outbound demand, neediest first.
-  const targets = active
-    .filter(
-      (c) =>
-        c.localRatio <= policy.maxLocalRatioTarget &&
-        (demandById.get(c.id) ?? 0) >= policy.minDemandSats,
-    )
-    .sort((a, b) => (demandById.get(b.id) ?? 0) - (demandById.get(a.id) ?? 0))
-    .slice(0, policy.maxCandidates);
-
-  // Pair each target with the fullest available source, then probe them all in
-  // parallel — real probes are slow, so don't serialise.
-  const pairs = targets
-    .map((target) => ({ target, source: sources.find((s) => s.id !== target.id) }))
-    .filter((p): p is { target: ChannelView; source: ChannelView } => !!p.source);
-
-  const candidates: RebalanceCandidate[] = await Promise.all(
-    pairs.map(async ({ target, source }) => {
-      const outboundPpm = ppmById.get(target.id) ?? 0;
-      const demand = demandById.get(target.id) ?? 0;
-      const maxFeePpm = Math.floor(outboundPpm * policy.econRatio);
-      const probe = await estimateCost(lnd, ownKey, source, target, policy.amountSats, PROBE_CEILING_PPM);
-      const profitable = probe.costPpm !== null && maxFeePpm > 0 && probe.costPpm <= maxFeePpm;
-
-      // Profit view: you pay the rebalance cost on the full amount, but only earn
-      // on what the channel can actually route out (capped by recent demand).
-      const netMarginPpm = probe.costPpm === null ? null : outboundPpm - probe.costPpm;
-      const expectedProfitSats =
-        probe.costPpm === null
-          ? null
-          : Math.round(
-              (Math.min(policy.amountSats, demand) * outboundPpm - policy.amountSats * probe.costPpm) /
-                1_000_000,
-            );
-
-      return {
-        targetId: target.id,
-        targetAlias: target.peerAlias,
-        targetLocalRatio: target.localRatio,
-        targetOutboundPpm: outboundPpm,
-        demandSats: demand,
-        sourceId: source.id,
-        sourceAlias: source.peerAlias,
-        sourceLocalRatio: source.localRatio,
-        amountSats: policy.amountSats,
-        maxFeePpm,
-        estCostPpm: probe.costPpm,
-        estFeeSats: probe.feeSats,
-        netMarginPpm,
-        expectedProfitSats,
-        routeFound: probe.costPpm !== null,
-        profitable,
-        verdict: verdictFor(outboundPpm, probe.costPpm, profitable),
-      };
-    }),
-  );
-
-  // Rank by what actually matters: profitable first, then by expected net
-  // profit (sats), then demand as a tiebreaker.
-  candidates.sort(
-    (a, b) =>
-      Number(b.profitable) - Number(a.profitable) ||
-      (b.expectedProfitSats ?? -Infinity) - (a.expectedProfitSats ?? -Infinity) ||
-      b.demandSats - a.demandSats,
-  );
-  return { policy, candidates };
-}
-
 // ── Executing a rebalance (writes) ────────────────────────────────────────────
+
+/** A channel to pull from, and the share of its balance to leave on our side. */
+export interface RebalanceSource {
+  id: string;
+  /** Never take it below this local ratio (its own target + a margin): a
+   *  move is capped at the source's spare balance, not sized by the target
+   *  alone (review a2). Absent: anything it has. */
+  keepRatio?: number;
+}
 
 export interface RebalanceExecParams {
   targetId: string;
+  /** The source to pull from (the first of `sources` when that is given). */
   sourceId: string;
+  /** The sources to try, in order: the next one only when no route paid
+   *  from the ones before (review a2: one source per target, no fallback).
+   *  Absent: `sourceId` alone. */
+  sources?: RebalanceSource[];
   amountSats: number;
-  /** Safety margin; budget = target outbound fee ppm × econRatio. */
+  /** Fallback cost cap: the target's fee × econRatio (ppm). */
   econRatio: number;
-  /** Manual override: explicit fee budget (ppm). Bypasses the profit gate. */
+  /** The cost cap per sat moved (ppm). A manual run may set its own. */
   maxFeePpm?: number;
+  /** The most the whole refill may pay in fees (sat): the payback limit,
+   *  the daily budget left, what the confirm dialog promised. */
+  maxFeeSats?: number;
+  /** The profit gate's earnings side (feeCapAt): an attempt of A sat pays
+   *  at most what it is expected to earn minus the minimum net profit — at
+   *  the halved fallback sizes too. Absent for a manual run without it. */
+  gate?: { revenuePpm: number; demandSats: number; minNetSats: number };
 }
 
 export interface RebalanceExecResult {
   ok: boolean;
   targetId: string;
   targetAlias: string;
+  /** The source that paid — or, when none did, the first one. */
   sourceId: string;
   sourceAlias: string;
   amountSats: number;
@@ -275,15 +201,94 @@ export interface RebalanceExecResult {
   feeSats: number | null;
   costPpm: number | null;
   error?: string;
-  /** We stopped waiting (REBALANCE_HARD_TIMEOUT_MS) while the payment was
-   *  still in flight: it may still succeed. Its hash lets a later run learn
-   *  the outcome; until then its maximum fee counts as spent. */
+  /** The payment that paid (its hash) — the attempt onSend announced. */
+  paymentId?: string;
+  /** We stopped waiting while the payment was still in flight — at the hard
+   *  limit (REBALANCE_HARD_TIMEOUT_MS), or because the wait for it broke off
+   *  without LND saying how it ended: it may still succeed. Its hash lets a
+   *  later run learn the outcome; until then its maximum fee counts as spent. */
   inFlight?: { paymentId: string; maxFeeSats: number };
+  /** The target's lifetime "sent" counter (LND) before the refill: the fee
+   *  engine retires the refilled sats against it (refill lots). */
+  targetSentBefore?: number;
+  /** Sources that were tried and paid nothing (no route within the cap) —
+   *  each pair backs off on its own. */
+  failedSourceIds?: string[];
+  /** The refill stopped before its next attempt because the process is
+   *  shutting down (opts.shouldStop): a skip, not a failure — nothing more was
+   *  sent. A source whose attempts failed before it is in failedSourceIds. */
+  stopped?: boolean;
 }
 
-export interface RebalanceExecOptions {
+/** One payment attempt of a refill, as it is about to be sent. */
+export interface RefillAttempt {
+  /** The payment's hash — LND's id for it (getPayment). */
+  paymentId: string;
+  sourceId: string;
+  /** The source's peer alias (for the books, and to name a payment still in
+   *  flight out of it). */
+  sourceAlias?: string;
+  /** The target's peer alias (for the books). */
+  targetAlias: string;
+  amountSats: number;
+  /** The most it may pay in routing fees (its fee limit, sat). */
+  maxFeeSats: number;
+  /** The target's lifetime "sent" counter before the refill. */
+  targetSentBefore?: number;
+}
+
+/**
+ * How an attempt that was sent ended, as far as this process knows: paid;
+ * failed (LND says so — nothing was paid); or still in flight — the hard limit
+ * passed, or the wait for it broke off (the stream to LND dropped) without LND
+ * saying how it ended. One still in flight may land later.
+ */
+export type RefillAttemptEnd = "paid" | "failed" | "in_flight";
+
+/**
+ * The caller's books, kept attempt by attempt (write-ahead, the rule the Magma
+ * journal follows): a payment that may move money is recorded BEFORE it is
+ * sent, so a restart or a crash while it is under way — a shutdown waits 37 s
+ * (shutdown.ts), a payment up to REBALANCE_HARD_TIMEOUT_MS — can't lose it.
+ */
+export interface RefillHooks {
+  /** Right before an attempt is sent. It must record the attempt durably; if
+   *  it throws, the attempt is not sent and the refill stops there. */
+  onSend?(attempt: RefillAttempt): void;
+  /** Once per attempt that was sent, when this process stops waiting on it. */
+  onEnd?(paymentId: string, outcome: RefillAttemptEnd): void;
+}
+
+export interface RebalanceExecOptions extends RefillHooks {
   /** Wall-clock limit for the whole rebalance (default REBALANCE_HARD_TIMEOUT_MS). */
   hardTimeoutMs?: number;
+  /** Asked right before each attempt is sent: true (the process is shutting
+   *  down) stops the refill there — no smaller size, no other source. One
+   *  refill may try up to 3 sources × 3 sizes, and the caller can only check
+   *  between refills: without this, an update's shutdown window saw new
+   *  payments start (review of P3). */
+  shouldStop?: () => boolean;
+}
+
+/**
+ * The ways LND says a payment FAILED — it ended, nothing was paid (ln-service
+ * finished_payment.js) — and the library's own refusals before anything is
+ * sent (400). Any other error — the stream to LND broke (LND restarted, the
+ * connection dropped), LND answered something unexpected — leaves the
+ * payment's outcome unknown: it may still be in flight, so no other amount or
+ * source may be tried for this refill now (it could move twice what was
+ * planned).
+ */
+const PAYMENT_FAILED = new Set([
+  "PaymentExecutionCanceled",
+  "InsufficientBalanceToAttemptPayment",
+  "PaymentRejectedByDestination",
+  "PaymentAttemptsTimedOut",
+  "PaymentPathfindingFailedToFindPossibleRoute",
+  "FailedToFindPayableRouteToDestination",
+]);
+function paymentFailed(err: unknown): boolean {
+  return Array.isArray(err) && (err[0] === 400 || PAYMENT_FAILED.has(String(err[1])));
 }
 
 /** ln-service throws errors as [code, name, { ... }] arrays — surface the cause. */
@@ -301,11 +306,14 @@ function describePayError(err: unknown, budgetPpm: number): string {
 }
 
 /**
- * Execute one circular rebalance: pay a self-invoice out via the source channel
- * and back in via the target's peer. The profit budget is computed server-side
- * from the target's own outbound fee and enforced as the route's max_fee, so the
- * payment can NEVER exceed what the rebalance is worth — if no route fits the
- * budget, nothing is paid.
+ * Execute one circular rebalance: pay a self-invoice out via a source channel
+ * and back in via the target's peer. Every attempt's max_fee is the profit
+ * gate's own limit at that size (feeCapAt), so a refill can never pay more
+ * than it is worth — and never more than `maxFeeSats` (the daily budget left)
+ * — at any of the fallback sizes. If no route fits, nothing is paid. Each
+ * attempt goes through the caller's books (opts.onSend / onEnd) before it is
+ * sent and when it ends, and none starts once opts.shouldStop says the
+ * process is shutting down.
  */
 export async function executeRebalance(
   readLnd: AuthenticatedLnd,
@@ -316,24 +324,28 @@ export async function executeRebalance(
   const deadline = Date.now() + (opts.hardTimeoutMs ?? REBALANCE_HARD_TIMEOUT_MS);
   const channels = await getChannelsView(readLnd);
   const target = channels.find((c) => c.id === params.targetId);
-  const source = channels.find((c) => c.id === params.sourceId);
+  const sources: RebalanceSource[] = (params.sources?.length ? params.sources : [{ id: params.sourceId }]).filter(
+    (s, i, all) => all.findIndex((x) => x.id === s.id) === i,
+  );
+  // (A source closed since the plan is skipped; the next one may still pay.)
+  const first = sources.map((s) => channels.find((c) => c.id === s.id)).find((c) => c !== undefined);
 
   const base = {
     ok: false,
     targetId: params.targetId,
     targetAlias: target?.peerAlias ?? params.targetId,
-    sourceId: params.sourceId,
-    sourceAlias: source?.peerAlias ?? params.sourceId,
+    sourceId: first?.id ?? sources[0]?.id ?? params.sourceId,
+    sourceAlias: first?.peerAlias ?? sources[0]?.id ?? params.sourceId,
     amountSats: params.amountSats,
     budgetPpm: 0,
     feeSats: null,
     costPpm: null,
   };
 
-  if (!target || !source) {
+  if (!target || !first) {
     return { ...base, error: "unknown source or target channel" };
   }
-  if (source.id === target.id) {
+  if (sources.some((s) => s.id === target.id)) {
     return { ...base, error: "source and target must differ" };
   }
 
@@ -348,6 +360,7 @@ export async function executeRebalance(
   if (budgetPpm <= 0) {
     return { ...base, error: "target earns 0 ppm — set an outbound fee or a max fee (ppm)" };
   }
+  const cap: RefillFeeCap = { maxCostPpm: budgetPpm, maxFeeSats: params.maxFeeSats ?? null, earnings: params.gate ?? null };
 
   const ownKey = await getOwnPubkey(readLnd);
   // The CLTV ceiling is relative to the tip; without a height, LND's default applies.
@@ -355,57 +368,139 @@ export async function executeRebalance(
     .then((w) => w.current_block_height)
     .catch(() => null);
 
-  // Adaptive: try the requested amount, then progressively smaller, paying the
-  // first that actually routes. LND's multi-path payment retries across many
-  // routes (skipping hops that fail), constrained to leave via the source and
-  // return via the target's peer, never exceeding the per-amount fee budget.
+  const withTarget = { ...base, budgetPpm, targetSentBefore: target.totalSent };
+  const failedSourceIds: string[] = [];
   let lastErr: unknown = null;
-  for (const amount of adaptiveAmounts(params.amountSats)) {
-    const left = deadline - Date.now();
-    if (left <= 0) {
-      lastErr ??= new Error("rebalance time limit reached");
-      break;
+  let tried = false;
+  // Source by source; per source the requested amount, then smaller ones,
+  // paying the first that routes. A route that pays from no size of one
+  // source sends the next source's attempts — within one deadline.
+  for (const spec of sources) {
+    const source = channels.find((c) => c.id === spec.id);
+    if (!source) {
+      failedSourceIds.push(spec.id);
+      lastErr ??= new Error(`source ${spec.id} is not an open channel`);
+      continue;
     }
-    const maxFeeSats = Math.max(1, Math.floor((amount * budgetPpm) / 1_000_000));
-    try {
-      const invoice = await createInvoice({ lnd: writeLnd, tokens: amount });
-      const decoded = await decodePaymentRequest({ lnd: readLnd, request: invoice.request });
-      const paying = payViaPaymentDetails({
-        lnd: writeLnd,
-        id: invoice.id,
-        destination: ownKey,
-        tokens: amount,
-        max_fee: maxFeeSats,
-        outgoing_channel: source.id,
-        incoming_peer: target.peerPubkey,
-        payment: decoded.payment,
-        mtokens: decoded.mtokens,
-        pathfinding_timeout: Math.min(PATHFINDING_TIMEOUT_MS, left),
-        ...(tip ? { max_timeout_height: tip + REBALANCE_MAX_TIMEOUT_BLOCKS } : {}),
-      });
-      const paid = await waitAtMost(paying, left);
-      if (paid === TIMED_OUT) {
-        // Never try the next amount now: this one may still go through.
-        return {
-          ...base,
-          budgetPpm,
-          amountSats: amount,
-          inFlight: { paymentId: invoice.id, maxFeeSats },
-          error: `payment still in flight after ${Math.round((opts.hardTimeoutMs ?? REBALANCE_HARD_TIMEOUT_MS) / 1000)}s — it may still land; LightningMate keeps checking and logs how it ends`,
-        };
+    // Never more than the source can spare above the share it keeps.
+    const settled = source.localBalance + source.remoteBalance;
+    const spare = source.localBalance - Math.round((spec.keepRatio ?? 0) * settled);
+    let triedHere = false;
+    // A payment from this source was sent and failed (what a stop reports).
+    let sentAndFailedHere = false;
+    // Shutting down: no new payment starts — only the one already under way
+    // was awaited. A source one of whose payments failed is reported (it
+    // backs off); the sources not tried yet are not.
+    const stop = (): RebalanceExecResult => {
+      if (sentAndFailedHere) failedSourceIds.push(spec.id);
+      return { ...withTarget, failedSourceIds, stopped: true, error: "skipped: shutting down — no further attempt was sent" };
+    };
+    for (const amount of adaptiveAmounts(Math.min(params.amountSats, spare))) {
+      const left = deadline - Date.now();
+      if (left <= 0) {
+        lastErr ??= new Error("rebalance time limit reached");
+        break;
       }
-      const feeSats = paid.safe_fee ?? paid.fee;
-      return {
-        ...base,
-        ok: true,
-        amountSats: amount,
-        budgetPpm,
-        feeSats,
-        costPpm: Math.round((feeSats / amount) * 1_000_000),
-      };
-    } catch (err) {
-      lastErr = err;
+      const maxFeeSats = feeCapAt(cap, amount);
+      if (maxFeeSats < 1) {
+        // The gate leaves no fee at this size (or the budget is spent).
+        lastErr ??= new Error(`no fee room at ${Math.round(amount / 1000)}k: the profit check or the daily budget leaves less than 1 sat`);
+        continue;
+      }
+      if (opts.shouldStop?.()) return stop();
+      triedHere = true;
+      tried = true;
+      let sent: string | null = null;
+      const attemptedHere = { ...withTarget, sourceId: source.id, sourceAlias: source.peerAlias, amountSats: amount, failedSourceIds };
+      try {
+        const invoice = await createInvoice({ lnd: writeLnd, tokens: amount });
+        const decoded = await decodePaymentRequest({ lnd: readLnd, request: invoice.request });
+        // Asked again right before it goes out: the signal may have come
+        // while the invoice was made (it stays unpaid and expires).
+        if (opts.shouldStop?.()) return stop();
+        // On the caller's books before it is sent (write-ahead). If it can't
+        // be recorded, it is not sent — nor is anything else of this refill.
+        try {
+          opts.onSend?.({
+            paymentId: invoice.id,
+            sourceId: source.id,
+            sourceAlias: source.peerAlias,
+            targetAlias: withTarget.targetAlias,
+            amountSats: amount,
+            maxFeeSats,
+            targetSentBefore: target.totalSent,
+          });
+        } catch (err) {
+          return {
+            ...attemptedHere,
+            error: `not sent: the payment couldn't be recorded before sending it (${err instanceof Error ? err.message : String(err)}) — nothing was paid`,
+          };
+        }
+        sent = invoice.id;
+        const paying = payViaPaymentDetails({
+          lnd: writeLnd,
+          id: invoice.id,
+          destination: ownKey,
+          tokens: amount,
+          max_fee: maxFeeSats,
+          outgoing_channel: source.id,
+          incoming_peer: target.peerPubkey,
+          payment: decoded.payment,
+          mtokens: decoded.mtokens,
+          // A big refill may split; the cap is for the whole payment. LND
+          // splits only for a destination that declares multi-path payments:
+          // without the invoice's features it has none to go by (DestFeatures
+          // nil — "not splitting") and max_paths changes nothing.
+          features: decoded.features,
+          max_paths: amount >= MULTI_PATH_MIN_SATS ? MULTI_PATH_MAX_PATHS : 1,
+          pathfinding_timeout: Math.min(PATHFINDING_TIMEOUT_MS, left),
+          ...(tip ? { max_timeout_height: tip + REBALANCE_MAX_TIMEOUT_BLOCKS } : {}),
+        });
+        const paid = await waitAtMost(paying, left);
+        if (paid === TIMED_OUT) {
+          // Never try another amount or source now: this one may still go through.
+          opts.onEnd?.(invoice.id, "in_flight");
+          return {
+            ...attemptedHere,
+            inFlight: { paymentId: invoice.id, maxFeeSats },
+            error: `payment still in flight after ${Math.round((opts.hardTimeoutMs ?? REBALANCE_HARD_TIMEOUT_MS) / 1000)}s — it may still land; LightningMate keeps checking and logs how it ends`,
+          };
+        }
+        opts.onEnd?.(invoice.id, "paid");
+        const feeSats = paid.safe_fee ?? paid.fee;
+        return {
+          ...attemptedHere,
+          ok: true,
+          feeSats,
+          costPpm: Math.round((feeSats / amount) * 1_000_000),
+          paymentId: invoice.id,
+        };
+      } catch (err) {
+        lastErr = err;
+        if (sent !== null && !paymentFailed(err)) {
+          // The wait broke off and LND hasn't said how the payment ended: it
+          // may still land. Not a failure — and no smaller amount or other
+          // source now (that could move twice what was planned).
+          opts.onEnd?.(sent, "in_flight");
+          return {
+            ...attemptedHere,
+            inFlight: { paymentId: sent, maxFeeSats },
+            error: `LND hasn't said how the payment ended (${describePayError(err, budgetPpm)}) — it may still land; LightningMate keeps checking and logs how it ends`,
+          };
+        }
+        if (sent !== null) {
+          opts.onEnd?.(sent, "failed");
+          sentAndFailedHere = true;
+        }
+      }
     }
+    if (triedHere) failedSourceIds.push(spec.id);
+    else if (spare < MIN_REFILL_SATS) lastErr ??= new Error(`source ${source.peerAlias || source.id} has too little spare balance`);
+    if (Date.now() >= deadline) break;
   }
-  return { ...base, budgetPpm, error: describePayError(lastErr, budgetPpm) };
+  return {
+    ...withTarget,
+    failedSourceIds,
+    error: tried ? describePayError(lastErr, budgetPpm) : lastErr instanceof Error ? lastErr.message : "nothing to try",
+  };
 }

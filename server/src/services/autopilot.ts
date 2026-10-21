@@ -29,12 +29,25 @@ import { getMagmaRecommendations, type MagmaV2Report } from "./magmaRecommend.js
 import { onchainCosts } from "./nodeEconomics.js";
 import { getFeeElasticity } from "./outcomes.js";
 import { DEFAULT_POLICY, applyFees, type FeeApplyItem, type FeeApplyResult } from "./fees.js";
-import { MARKET_RUN_WAIT_MS, getFeeRecommendations, type CooldownInput, type FeeRecConfig, type FeeRecommendation } from "./feeRecommend.js";
+import {
+  MARKET_RUN_WAIT_MS,
+  floorWindowStart,
+  getFeeRecommendations,
+  type CooldownInput,
+  type FeeRecConfig,
+  type FeeRecommendation,
+} from "./feeRecommend.js";
 import { FeeChangeLog, type FeeChangeRecord } from "./feeChangeLog.js";
 import { getAlias } from "./aliases.js";
-import { executeRebalance, type RebalanceExecParams, type RebalanceExecResult } from "./rebalance.js";
-import { getRebalanceRecommendations, selectRebalanceRuns } from "./rebalanceRecommend.js";
-import type { RebalanceLog } from "./rebalanceLog.js";
+import { executeRebalance, type RebalanceExecOptions, type RebalanceExecParams, type RebalanceExecResult, type RefillHooks } from "./rebalance.js";
+import {
+  getRebalanceRecommendations,
+  selectRebalanceRuns,
+  type RebalanceRecConfig,
+  type RebalanceRecReport,
+  type RebalanceRecommendation,
+} from "./rebalanceRecommend.js";
+import { budgetDayOf, type RebalanceLog, type RebalanceRecord } from "./rebalanceLog.js";
 import type { OverridesStore } from "./overrides.js";
 import type { EarningsLog } from "./earningsLog.js";
 import { getChannelsView } from "./channels.js";
@@ -56,6 +69,64 @@ import {
 
 export type { AutopilotConfig } from "./autopilotConfig.js";
 export { ConfigValidationError } from "./autopilotConfig.js";
+
+/** A manual rebalance with nothing left of today's fee budget: refused
+ *  before anything is paid (the API answers 409). */
+export class RebalanceBudgetError extends Error {
+  constructor(readonly budget: RebalanceBudget) {
+    super(
+      `today's rebalance fee budget is used up (${budget.spentSats.toLocaleString("en-US")} of ${(budget.budgetSats ?? 0).toLocaleString("en-US")} sat, ` +
+        `manual runs included) — raise the daily budget on Autopilot → Rebalancing, or wait until 00:00 UTC`,
+    );
+    this.name = "RebalanceBudgetError";
+  }
+}
+
+/** A rebalance payment that may still land, as the Rebalancing tab shows it:
+ *  its two channels are left alone until LND says how it ended. */
+export interface RefillInFlight {
+  targetId: string;
+  /** The target's peer alias. */
+  alias: string;
+  /** The channel it drains (absent on records from before this was kept). */
+  sourceId?: string;
+  sourceAlias?: string;
+  amountSats: number;
+  /** Charged to the budget of the day it was sent until it ends. */
+  maxFeeSats: number;
+  /** When it was sent. */
+  at: string;
+  via: "autopilot" | "manual";
+}
+
+/** A manual refill into or out of a channel whose earlier payment may still
+ *  land: refused before anything is sent — the API answers 409. A second
+ *  refill through that channel could move twice what was planned; the
+ *  rebalance stage never sends one (payRefills), and a click on "Run it" no
+ *  longer does either (review of P3). */
+export class RefillInFlightError extends Error {
+  constructor(
+    readonly channelId: string,
+    readonly payment: RefillInFlight,
+  ) {
+    const what =
+      channelId === payment.targetId ? `A payment into ${payment.alias || channelId}` : `A payment out of ${payment.sourceAlias || channelId}`;
+    super(
+      `${what} is still in flight — LightningMate is waiting to learn how it ended (checked every ${INFLIGHT_REBALANCE_CHECK_MS / 60_000} minutes). ` +
+        `Until then no other refill moves through that channel.`,
+    );
+    this.name = "RefillInFlightError";
+  }
+}
+
+/** A fee item for a channel LND doesn't have at that outpoint (applyByHand):
+ *  refused before anything is written — the API answers 400. */
+export class FeeItemError extends Error {
+  constructor(readonly problems: string[]) {
+    super(`fee items don't match the node's channels: ${problems.join("; ")}`);
+    this.name = "FeeItemError";
+  }
+}
 
 export interface AutopilotChange {
   id: string;
@@ -246,22 +317,37 @@ interface OfferCut {
   at: string;
 }
 
-/** A rebalance payment we stopped waiting for: it may still land. */
+/**
+ * A rebalance payment that may still land: recorded (and saved) BEFORE it is
+ * sent — so a restart or a crash while it is under way can't lose it — and
+ * kept until LND says how it ended (reconcilePendingRebalances), or until it
+ * ends while this process is still waiting on it.
+ */
 interface PendingRebalance {
   id: string;
   targetId: string;
   /** The channel it drains (absent on records from before this was kept). */
   sourceId?: string;
+  /** The target's peer alias … */
   alias: string;
+  /** … and the source's (absent on records from before this was kept). */
+  sourceAlias?: string;
   amountSats: number;
   maxFeeSats: number;
-  /** The budget day its maximum fee was charged to (autopilot payments). */
+  /** The budget day its maximum fee was charged to: the day it was sent. */
   day: string;
+  /** When it was sent (its log record's startedAt). */
   at: string;
   /** Who started it. A manual one (Rebalance tab) is tracked the same way,
-   *  so the log shows how it really ended — but never charged to the
-   *  autopilot's daily budget. Absent = autopilot (older records). */
+   *  so the log shows how it really ended; both count toward the daily
+   *  budget at their maximum fee until then. Absent = autopilot (older
+   *  records). */
   via?: "autopilot" | "manual";
+  /** The target's "sent" counter before it, and what the gate valued it at
+   *  (a refill that passed the gate — the autopilot's, or one run by hand
+   *  with it): the log record gets them once it lands. */
+  targetSentBefore?: number;
+  holdPpm?: number;
 }
 
 interface PersistedState {
@@ -290,13 +376,17 @@ interface PersistedState {
   /** One-time flag: pins stored outside the policy's min/max were rewritten
    *  to the fee the engine really gave them (see migrateOutOfRangePins). */
   pinRangeMigrated?: boolean;
-  /** Rebalance fees spent today (resets on date change) — enforces the daily cap. */
-  perDayRebalanceSpend?: { day: string; sats: number };
   /** Flow-won price memory per channel: an open no-flow lowering episode
    *  (episodeAt) and/or the ppm at which routing last returned (anchor). */
   perChannelFlowAnchor?: Record<string, { episodeAt?: string; anchorPpm?: number; anchorAt?: string }>;
-  /** Consecutive failed rebalance attempts per target — drives the backoff. */
+  /** Consecutive failed rebalances per target, from before the back-off was
+   *  kept per source and target (P3): still honoured until the target's next
+   *  success, never added to. */
   perTargetRebalanceFails?: Record<string, number>;
+  /** Failed refills per source → target pair ("src>tgt"): that pair backs
+   *  off (cooldown × 2^fails, at most ×8); the target's other sources don't
+   *  (review a2: one dead route blocked the target for days). */
+  perPairRebalanceFails?: Record<string, { fails: number; at: string }>;
   /** Rebalance payments still in flight when we stopped waiting. */
   pendingRebalances?: PendingRebalance[];
   /** Offer sync status (engine's wishes vs Amboss), see OfferSyncStatus. */
@@ -306,8 +396,26 @@ interface PersistedState {
   /** Per offer: who owns its terms (see OfferControl). */
   offerControl?: Record<string, OfferControl>;
   /** Per area: the latest decision not to act, and why (decisionNote). */
-  decisions?: Partial<Record<"magma" | "channels", { at: string; text: string }>>;
+  decisions?: Partial<Record<DecisionArea, { at: string; text: string }>>;
   history: AutopilotRun[];
+}
+
+/** The areas with a "last decision" status (D16; the full status is P7's). */
+type DecisionArea = "magma" | "channels" | "rebalance";
+
+/** Today's rebalance fee budget (UTC day): what was spent — every fee paid,
+ *  the autopilot's and manual refills alike, and the maximum fee of every
+ *  payment still in flight — and what is left. */
+export interface RebalanceBudget {
+  day: string;
+  /** null: the operator chose no daily limit. */
+  budgetSats: number | null;
+  spentSats: number;
+  /** The part of spentSats that is payments still in flight (at their max fee). */
+  inFlightSats: number;
+  leftSats: number | null;
+  /** When the next day's budget starts (00:00 UTC). */
+  resetsAt: string;
 }
 
 const HISTORY_LIMIT = 50;
@@ -534,6 +642,15 @@ export class Autopilot {
   /** The reconciliation of in-flight rebalances under way, if any: the timer
    *  and a main run share it instead of booking the same payment twice. */
   private reconciling: Promise<void> | null = null;
+  /** A refill's payments are under way — the rebalance stage's or a manual
+   *  one. Its own lock, not the main run's: a manual refill (up to the
+   *  150 s hard limit) no longer holds back fees, lease promises, channel
+   *  opens or Magma upkeep, and the two can't both pass the budget check. */
+  private refilling = false;
+  /** Refill payments this process is waiting on right now (their
+   *  pendingRebalances entries are write-ahead records, not yet the
+   *  reconciliation's to book). */
+  private readonly sendingRefills = new Set<string>();
   /** One-shot "run soon after enabling" kicks — tracked so stop() clears them. */
   private readonly kickTimers = new Set<NodeJS.Timeout>();
   /** Per order, the last failed lane action written to the run history —
@@ -658,6 +775,9 @@ export class Autopilot {
     );
     this.state.perChannelLastApplied ??= {};
     this.state.perTargetLastRebalanced ??= {};
+    // Today's rebalance spend is read from the rebalance log now
+    // (rebalanceBudget) — the separate counter is gone.
+    delete (this.state as { perDayRebalanceSpend?: unknown }).perDayRebalanceSpend;
     // Sizing used to ride along with auto-pricing. Upgrading must keep exactly
     // the behaviour an install had, so one-shot:
     //   - config from before the switch existed: inherit auto-pricing's value;
@@ -744,13 +864,18 @@ export class Autopilot {
     return out;
   }
 
-  /** Map the user's rebalance economics onto the v2 recommender. The user-facing
-   *  knob is econRatio ("spend up to this share of what refilled liquidity earns");
-   *  the recommender implements exactly that as profitShare — wire it through so
-   *  the Strategy presets actually loosen/tighten the GATE, not just the
-   *  execution-budget fallback. */
-  rebalanceRecOverrides(): { profitShare: number } {
-    return { profitShare: this.state.config.rebalancePolicy.econRatio };
+  /** Map the user's rebalance settings onto the recommender's gate: every
+   *  one of them binds (review a2: three settings on the tab reached
+   *  nothing). econRatio is "spend up to this share of what refilled
+   *  liquidity earns" — the gate's profitShare. */
+  rebalanceRecOverrides(): Pick<RebalanceRecConfig, "profitShare" | "minExpectedNetProfitSats" | "maxPaybackDays" | "maxRebalanceAmountPerChannel"> {
+    const p = this.state.config.rebalancePolicy;
+    return {
+      profitShare: p.econRatio,
+      minExpectedNetProfitSats: p.minNetProfitSats,
+      maxPaybackDays: p.maxPaybackDays,
+      maxRebalanceAmountPerChannel: p.maxAmountSats,
+    };
   }
 
   /** Magma pricing the recommendations should reflect — the configured mode + the
@@ -860,6 +985,8 @@ export class Autopilot {
       magmaLane: this.magma.laneStatus(),
       /** Per area, the latest decision not to act and why. */
       decisions: this.state.decisions ?? {},
+      /** Today's rebalance fee budget — autopilot and manual runs together. */
+      rebalanceBudget: this.rebalanceBudget(),
       // Only surface runs that did something; hide any older "0 applied" no-ops.
       // Normalise older persisted runs that predate newer arrays.
       history: this.state.history
@@ -984,12 +1111,13 @@ export class Autopilot {
     return this.running;
   }
 
-  /** Resolves once nothing is in progress — no main run, no order-lane pass or
-   *  manual Magma action, nobody holding the on-chain mutex — or after
-   *  `timeoutMs` (false). Every step under way has a recorded state by then. */
+  /** Resolves once nothing is in progress — no main run, no refill (a manual
+   *  one included), no order-lane pass or manual Magma action, nobody holding
+   *  the on-chain mutex — or after `timeoutMs` (false). Every step under way
+   *  has a recorded state by then (a refill payment from before it was sent). */
   async waitIdle(timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
-    while (this.running || this.magma.isBusy() || this.capital.mutex.busy || this.reconciling) {
+    while (this.running || this.refilling || this.magma.isBusy() || this.capital.mutex.busy || this.reconciling) {
       if (Date.now() >= deadline) return false;
       await new Promise((r) => setTimeout(r, 100));
     }
@@ -1044,15 +1172,72 @@ export class Autopilot {
     if (sellEnabled) this.kick(() => this.pollSellOrders(), 5_000);
   }
 
+  /** A target is refilled at most once per cooldown, whatever the outcome
+   *  (no hammering a dead route) — longer while a count from before the
+   *  per-pair back-off still stands. */
   private rebalanceCooldownOk(targetId: string, cooldownMin: number): boolean {
     const last = this.state.perTargetLastRebalanced[targetId];
     if (!last) return true;
-    // Exponential backoff on consecutive failures (1× → 2× → 4× → 8× the
-    // cooldown): a target with no viable route isn't re-probed forever on the
-    // base cadence. A success resets the counter.
     const fails = this.state.perTargetRebalanceFails?.[targetId] ?? 0;
     const mult = Math.min(8, 2 ** fails);
     return (Date.now() - new Date(last).getTime()) / 60_000 >= cooldownMin * mult;
+  }
+
+  /** A source → target pair whose refills failed waits cooldown × 2^fails
+   *  (1× → 2× → 4× → 8×) — that pair only: the target's other sources are
+   *  tried meanwhile. A success clears it. */
+  private pairBackingOff(sourceId: string, targetId: string, cooldownMin: number): boolean {
+    const p = this.state.perPairRebalanceFails?.[`${sourceId}>${targetId}`];
+    if (!p) return false;
+    const mult = Math.min(8, 2 ** p.fails);
+    return (Date.now() - Date.parse(p.at)) / 60_000 < cooldownMin * mult;
+  }
+
+  /** The books after a refill attempt (the autopilot's or a manual one):
+   *  every failed pair backs off, the paying pair (and the target's old
+   *  count) is cleared. */
+  private notePairs(targetId: string, res: Pick<RebalanceExecResult, "ok" | "sourceId" | "failedSourceIds" | "inFlight">): void {
+    const pairs = (this.state.perPairRebalanceFails ??= {});
+    const nowIso = new Date().toISOString();
+    // (A failure that names no source failed from the one it reports; a
+    // payment still in flight is no failure — not yet. A refill the shutdown
+    // stopped names the sources that failed before it: only those.)
+    for (const src of res.failedSourceIds ?? (res.ok || res.inFlight ? [] : [res.sourceId])) {
+      const key = `${src}>${targetId}`;
+      pairs[key] = { fails: Math.min(3, (pairs[key]?.fails ?? 0) + 1), at: nowIso };
+    }
+    if (res.ok) {
+      delete pairs[`${res.sourceId}>${targetId}`];
+      delete this.state.perTargetRebalanceFails?.[targetId];
+    }
+  }
+
+  /**
+   * Today's rebalance fee budget, read from the books themselves: every fee
+   * the rebalance log holds for today (UTC — the autopilot's refills and
+   * manual ones), plus the maximum fee of every payment still in flight that
+   * was sent today. Before, a separate counter carried it: it was lost when
+   * a later stage threw or the process restarted before the next save, and a
+   * manual run never counted (review a2).
+   */
+  rebalanceBudget(nowMs = Date.now()): RebalanceBudget {
+    const day = new Date(nowMs).toISOString().slice(0, 10);
+    const dayStart = Date.parse(`${day}T00:00:00.000Z`);
+    const paid = this.rebalanceLog
+      .successes(dayStart)
+      .filter((r) => budgetDayOf(r) === day)
+      .reduce((sum, r) => sum + (r.feeSats ?? 0), 0);
+    const inFlightSats = (this.state.pendingRebalances ?? []).filter((p) => p.day === day).reduce((sum, p) => sum + p.maxFeeSats, 0);
+    const spentSats = paid + inFlightSats;
+    const budgetSats = this.state.config.rebalanceDailyBudgetSats;
+    return {
+      day,
+      budgetSats,
+      spentSats,
+      inFlightSats,
+      leftSats: budgetSats === null ? null : Math.max(0, budgetSats - spentSats),
+      resetsAt: new Date(dayStart + 86_400_000).toISOString(),
+    };
   }
 
   /** Compute and apply eligible fee changes. */
@@ -1314,6 +1499,14 @@ export class Autopilot {
    * A fee set by hand (POST /fees/apply): written as asked — clamped to a
    * sold channel's promise — and kept on the books like every other write.
    * Null when the main run holds the lock.
+   *
+   * Every item's channel is resolved from LND by its funding outpoint first,
+   * and an item whose id is not the channel at that outpoint is refused
+   * (FeeItemError, the API answers 400) before anything is written. The
+   * client's id is what the books key on — the lease clamp's funding height,
+   * the cooldown, the fee-change log, the retry back-off — so a sold
+   * channel's outpoint sent with an older channel's id was written past its
+   * lease promise and booked on the wrong channel (P2 final review).
    */
   async applyByHand(items: FeeApplyItem[]): Promise<{ changes: AutopilotChange[]; results: FeeApplyResult[] } | null> {
     if (!this.writeLnd) throw new Error("writing is disabled");
@@ -1321,11 +1514,20 @@ export class Autopilot {
     this.running = true;
     try {
       // What each channel charges now (the "from" of the record) and whose
-      // it is — read once.
+      // it is — read once. The channel list must be read: it is how each
+      // item is checked (no list, no write).
       const [rates, chans] = await Promise.all([
         getFeeRates({ lnd: this.readLnd }).catch(() => ({ channels: [] as { id: string; fee_rate: number; base_fee_mtokens: string }[] })),
-        getChannels({ lnd: this.readLnd }).catch(() => ({ channels: [] as { id: string; partner_public_key: string }[] })),
+        getChannels({ lnd: this.readLnd }),
       ]);
+      const atOutpoint = new Map(chans.channels.map((c) => [`${c.transaction_id}:${c.transaction_vout}`, c.id]));
+      const mismatched = items.flatMap((it) => {
+        const outpoint = `${it.transactionId}:${it.transactionVout}`;
+        const id = atOutpoint.get(outpoint);
+        if (id === undefined) return [`${outpoint}: no open channel has this funding outpoint`];
+        return id === it.id ? [] : [`${it.id}: the channel at ${outpoint} is ${id}`];
+      });
+      if (mismatched.length) throw new FeeItemError(mismatched);
       const now = new Map(rates.channels.map((c) => [c.id, c]));
       const peerOf = new Map(chans.channels.map((c) => [c.id, c.partner_public_key]));
       const writes: FeeWrite[] = [];
@@ -1374,137 +1576,156 @@ export class Autopilot {
     this.persist();
   }
 
-  /** Within the configured rebalance hour window (node local time)? */
+  /** Within the configured rebalance hour window (UTC — the budget's day is
+   *  UTC too; the container's clock is UTC unless TZ is set)? */
   private inRebalanceWindow(): boolean {
     const { rebalanceHourStart: s, rebalanceHourEnd: e } = this.state.config;
-    return rebalanceWindowOpen(s, e, new Date().getHours());
+    return rebalanceWindowOpen(s, e, new Date().getUTCHours());
   }
 
-  /** Execute eligible (profitable, off-cooldown) rebalances. */
+  /** The sources a planned refill may pull from, in order: those whose route
+   *  didn't fail the probe, not busy with a payment in flight, and whose pair
+   *  with this target isn't backing off. */
+  private refillSources(r: RebalanceRecommendation, inFlight: Set<string>, cooldownMin: number): { id: string; keepRatio?: number }[] {
+    const listed = r.sourceCandidates?.length
+      ? r.sourceCandidates.filter((c) => !c.rejected).map((c) => ({ id: c.channelId, keepRatio: c.keepRatio }))
+      : r.selectedSourceChannel
+        ? [{ id: r.selectedSourceChannel }]
+        : [];
+    return listed.filter((s) => !inFlight.has(s.id) && !this.pairBackingOff(s.id, r.channelId, cooldownMin));
+  }
+
+  /**
+   * Execute eligible (profitable, off-cooldown) refills, best first, within
+   * today's fee budget. Each payment's max fee is the profit gate's own cap
+   * at its size and never more than the budget left (review a2: the payment
+   * could pay more than the gate allowed and overshoot the budget by its
+   * whole cap). Moves the budget or the per-run limit leave for later are
+   * NOT failed runs (D15): they go into the rebalance decision note, not the
+   * run history — before, each was a red "✗" every 30 minutes until the day
+   * rolled over, flushing the 50-run history. It holds the refill lock: a
+   * manual refill and this stage never pay side by side (both would pass the
+   * budget check); while a manual one is under way, the stage waits for the
+   * next run and the rest of the run goes on.
+   */
   private async runRebalances(writeLnd: AuthenticatedLnd): Promise<AutopilotRebalance[]> {
-    if (!this.inRebalanceWindow()) return [];
-    const { rebalancePolicy, maxRebalancesPerRun, rebalanceCooldownMinutes, rebalanceDailyBudgetSats } =
-      this.state.config;
-    // Daily rebalance-fee budget — reset the counter when the day rolls over.
-    const today = new Date().toISOString().slice(0, 10);
-    if (!this.state.perDayRebalanceSpend || this.state.perDayRebalanceSpend.day !== today) {
-      this.state.perDayRebalanceSpend = { day: today, sats: 0 };
+    const { rebalanceHourStart, rebalanceHourEnd } = this.state.config;
+    if (!this.inRebalanceWindow()) {
+      this.decisionNote("rebalance", `outside the rebalance hours (${rebalanceHourStart}–${rebalanceHourEnd} UTC) — no refills now`);
+      return [];
     }
-    // null = the operator explicitly chose "no limit" (validated settings can
-    // no longer reach 0 by accident). Infinity keeps every budget check inert.
-    const dailyBudget = rebalanceDailyBudgetSats === null ? Number.POSITIVE_INFINITY : rebalanceDailyBudgetSats;
+    if (this.refilling) {
+      this.decisionNote("rebalance", "a manual refill is under way — the autopilot's refills wait for the next run");
+      return [];
+    }
+    this.refilling = true;
+    try {
+      return await this.payRefills(writeLnd);
+    } finally {
+      this.refilling = false;
+    }
+  }
+
+  /** The rebalance stage's planning and payments (runRebalances holds the
+   *  refill lock around it). */
+  private async payRefills(writeLnd: AuthenticatedLnd): Promise<AutopilotRebalance[]> {
+    const { rebalancePolicy, maxRebalancesPerRun, rebalanceCooldownMinutes } = this.state.config;
     // (Payments we stopped waiting for were reconciled at the start of the
     // run, so the budget below already counts what they really cost.)
+    const budget = this.rebalanceBudget();
+    const dailyBudget = budget.budgetSats === null ? Number.POSITIVE_INFINITY : budget.budgetSats;
     // A channel with a payment still in flight is left alone, target or
     // source: once its cooldown is over, a second rebalance of it could start
     // while the first may still land — moving twice what was planned.
     const inFlight = new Set((this.state.pendingRebalances ?? []).flatMap((p) => [p.targetId, ...(p.sourceId ? [p.sourceId] : [])]));
-    // v1 recommender — only acts on route_found_profitable (wouldRebalance), with
-    // the fee-adjust-first / payback / profit gating already applied.
     const report = await this.rebalanceReport();
-    const eligible = report.recommendations.filter(
-      (r) =>
-        r.wouldRebalance &&
-        r.selectedSourceChannel &&
-        r.recommendedAmount &&
-        !inFlight.has(r.channelId) &&
-        !inFlight.has(r.selectedSourceChannel) &&
-        this.rebalanceCooldownOk(r.channelId, rebalanceCooldownMinutes),
+    const profitable = report.recommendations.filter((r) => r.wouldRebalance && r.recommendedAmount);
+    const waiting: string[] = [];
+    const eligible: { r: RebalanceRecommendation; sources: { id: string; keepRatio?: number }[] }[] = [];
+    for (const r of profitable) {
+      if (inFlight.has(r.channelId)) {
+        waiting.push(`${r.alias}: a payment into it is still in flight`);
+        continue;
+      }
+      if (!this.rebalanceCooldownOk(r.channelId, rebalanceCooldownMinutes)) {
+        waiting.push(`${r.alias}: refilled or tried within its cooldown`);
+        continue;
+      }
+      const sources = this.refillSources(r, inFlight, rebalanceCooldownMinutes);
+      if (sources.length === 0) {
+        waiting.push(`${r.alias}: every source is busy or backing off after failed attempts`);
+        continue;
+      }
+      eligible.push({ r, sources });
+    }
+    const sourcesOf = new Map(eligible.map((e) => [e.r, e.sources]));
+    // Pure planner: order by profitability, then walk the list until the
+    // per-run limit is filled with moves that fit the budget left.
+    const plan = selectRebalanceRuns(
+      eligible.map((e) => e.r),
+      { dailyBudgetSats: dailyBudget, alreadySpentSats: budget.spentSats, maxPerRun: maxRebalancesPerRun },
     );
-    // Pure planner: order by profitability, cap to maxPerRun, and pre-skip moves
-    // that can't fit the remaining daily budget (without abandoning cheaper ones).
-    const plan = selectRebalanceRuns(eligible, {
-      dailyBudgetSats: dailyBudget,
-      alreadySpentSats: this.state.perDayRebalanceSpend.sats,
-      maxPerRun: maxRebalancesPerRun,
-    });
-
-    const out: AutopilotRebalance[] = plan.skipped.map((s) => ({
-      alias: s.rec.alias,
-      amountSats: s.rec.recommendedAmount as number,
-      feeSats: null,
-      costPpm: null,
-      ok: false,
-      error: s.reason,
-    }));
+    const budgetSkips = plan.skipped.map((s) => `${s.rec.alias} (~${s.rec.estimatedRouteFeeSats ?? 0} sat)`);
+    const out: AutopilotRebalance[] = [];
 
     for (const r of plan.run) {
       // Shutdown: the payment already under way finishes (it is being awaited
       // right here); none of the moves planned after it starts.
       if (this.shuttingDown) {
-        out.push({
-          alias: r.alias,
-          amountSats: r.recommendedAmount as number,
-          feeSats: null,
-          costPpm: null,
-          ok: false,
-          error: "skipped: shutting down",
-        });
+        waiting.push(`${r.alias}: skipped, shutting down`);
         continue;
       }
-      // Actual-spend backstop: an earlier move's real fee may exceed its estimate,
-      // so re-check the live budget before each execution — never overshoot.
-      if (dailyBudget > 0 && this.state.perDayRebalanceSpend.sats >= dailyBudget) {
-        out.push({
-          alias: r.alias,
-          amountSats: r.recommendedAmount as number,
-          feeSats: null,
-          costPpm: null,
-          ok: false,
-          error: `skipped: daily rebalance budget reached (${this.state.perDayRebalanceSpend.sats}/${dailyBudget} sat)`,
-        });
+      // Actual-spend backstop: an earlier move's real fee may exceed its
+      // estimate. A move whose estimate no longer fits what is left waits
+      // for tomorrow — it is not sent with a starved fee cap (which would
+      // fail, and back the pair off for a budget reason).
+      const live = this.rebalanceBudget();
+      if (live.leftSats !== null && (live.leftSats <= 0 || live.leftSats < (r.estimatedRouteFeeSats ?? 0))) {
+        budgetSkips.push(`${r.alias} (~${r.estimatedRouteFeeSats ?? 0} sat)`);
         continue;
       }
-      const res = await this.rebalanceExec(writeLnd, {
-        targetId: r.channelId,
-        sourceId: r.selectedSourceChannel as string,
-        amountSats: r.recommendedAmount as number,
-        econRatio: rebalancePolicy.econRatio,
-        maxFeePpm: r.maxCostPpm ?? undefined, // the v1 economic ceiling
-      });
-      // Mark the target on every attempt (success or fail) so the cooldown also
-      // backs off failing targets — no more hammering the same dead route.
-      this.state.perTargetLastRebalanced[r.channelId] = new Date().toISOString();
+      // (A payment of this run left in flight takes its channels out too.)
+      const sources = (sourcesOf.get(r) ?? []).filter((s) => !inFlight.has(s.id));
+      if (inFlight.has(r.channelId) || sources.length === 0) {
+        waiting.push(`${r.alias}: its channels are busy with a payment still in flight`);
+        continue;
+      }
+      // (The books start the target's cooldown — refillBooks.)
+      const res = await this.refillBooks({ targetId: r.channelId, via: "autopilot", holdPpm: r.expectedRevenuePpm }).settle((hooks) =>
+        this.rebalanceExec(
+          writeLnd,
+          {
+            targetId: r.channelId,
+            sourceId: sources[0].id,
+            sources,
+            amountSats: r.recommendedAmount as number,
+            econRatio: rebalancePolicy.econRatio,
+            maxFeePpm: r.maxCostPpm ?? undefined,
+            // The gate's limits at every size — and never more than is left today.
+            maxFeeSats: Math.min(r.maxCostSatsByPayback ?? Infinity, live.leftSats ?? Infinity),
+            ...(r.expectedRevenuePpm != null
+              ? { gate: { revenuePpm: r.expectedRevenuePpm, demandSats: r.earningDemandSats, minNetSats: r.minNetProfitSats } }
+              : {}),
+          },
+          // Inside the refill too, no attempt starts after the shutdown signal.
+          { ...hooks, shouldStop: () => this.shuttingDown },
+        ),
+      );
+      if (res.stopped) {
+        // A deliberate skip (D15), like the moves planned after it: a source
+        // whose attempt failed before the signal backs off (refillBooks).
+        const failed = res.failedSourceIds?.length ?? 0;
+        waiting.push(`${r.alias}: skipped, shutting down${failed ? ` (after ${failed === 1 ? "a source" : `${failed} sources`} found no route)` : ""}`);
+        continue;
+      }
       if (res.inFlight) {
-        // We stopped waiting; the payment may still land. Count its maximum
-        // fee as spent now (the budget can never be overshot) and settle the
-        // books when a later run learns how it ended.
-        this.state.perDayRebalanceSpend.sats += res.inFlight.maxFeeSats;
-        (this.state.pendingRebalances ??= []).push({
-          id: res.inFlight.paymentId,
-          targetId: res.targetId,
-          sourceId: res.sourceId,
-          alias: res.targetAlias,
-          amountSats: res.amountSats,
-          maxFeeSats: res.inFlight.maxFeeSats,
-          day: today,
-          at: new Date().toISOString(),
-        });
-        this.persist();
+        // We stopped waiting; the payment may still land. Its maximum fee
+        // counts as spent (pendingRebalances), and the books are settled when
+        // a later run learns how it ended.
+        inFlight.add(res.targetId).add(res.sourceId);
         out.push({ alias: res.targetAlias, amountSats: res.amountSats, feeSats: null, costPpm: null, ok: false, error: res.error });
         continue;
       }
-      const fails = (this.state.perTargetRebalanceFails ??= {});
-      if (res.ok) delete fails[r.channelId];
-      else fails[r.channelId] = Math.min(3, (fails[r.channelId] ?? 0) + 1);
-      this.rebalanceLog.append({
-        at: new Date().toISOString(),
-        via: "autopilot",
-        targetId: res.targetId,
-        targetAlias: res.targetAlias,
-        sourceId: res.sourceId,
-        sourceAlias: res.sourceAlias,
-        amountSats: res.amountSats,
-        budgetPpm: res.budgetPpm,
-        feeSats: res.feeSats,
-        costPpm: res.costPpm,
-        ok: res.ok,
-        error: res.error,
-      });
-      if (res.ok && res.feeSats) this.state.perDayRebalanceSpend.sats += res.feeSats;
-      // Spent sats and the backoff must not be forgotten if a later stage of
-      // this run throws or the process restarts: save after every payment.
-      this.persist();
       out.push({
         alias: res.targetAlias,
         amountSats: res.amountSats,
@@ -1514,13 +1735,208 @@ export class Autopilot {
         error: res.error,
       });
     }
+
+    this.decisionNote("rebalance", this.rebalanceDecision(report.recommendations, out, plan.later, budgetSkips, waiting));
     return out;
   }
 
+  /** The rebalance stage's decision, said plainly (D16): what ran, what waits
+   *  and why — or why nothing qualifies. */
+  private rebalanceDecision(
+    recs: Pick<RebalanceRecommendation, "state">[],
+    ran: AutopilotRebalance[],
+    later: RebalanceRecommendation[],
+    budgetSkips: string[],
+    waiting: string[],
+  ): string {
+    const parts: string[] = [];
+    if (ran.length) parts.push(`${ran.filter((r) => r.ok).length} of ${ran.length} refill${ran.length === 1 ? "" : "s"} paid`);
+    if (budgetSkips.length) {
+      const b = this.rebalanceBudget();
+      parts.push(
+        `${budgetSkips.length} profitable refill${budgetSkips.length === 1 ? " waits" : "s wait"} for the daily budget — ` +
+          `${b.spentSats.toLocaleString("en-US")} of ${(b.budgetSats ?? 0).toLocaleString("en-US")} sat spent today, resets 00:00 UTC: ${budgetSkips.join(", ")}`,
+      );
+    }
+    if (later.length) parts.push(`${later.length} more wait${later.length === 1 ? "s" : ""} for the next run (at most ${this.state.config.maxRebalancesPerRun} per run)`);
+    if (waiting.length) parts.push(waiting.join("; "));
+    if (parts.length) return parts.join(" · ");
+    const drained = recs.filter((r) => r.state !== "not_needed").length;
+    return drained
+      ? `no refill clears the profit check right now (${drained} drained channel${drained === 1 ? "" : "s"} watched — see what each would need on the Rebalancing tab)`
+      : "no channel needs a refill";
+  }
+
+  /** A finished rebalance as the log keeps it. A refill that passed the
+   *  profit gate — the autopilot's, or one run by hand from a recommended row
+   *  (the gate went with it) — carries the price the gate valued it at: the
+   *  fee engine holds it while the refilled sats are in the channel. One run
+   *  by hand without the gate chose its own price and sets no floor. */
+  private rebalanceRecord(res: RebalanceExecResult, via: "autopilot" | "manual", holdPpm?: number | null): RebalanceRecord {
+    return {
+      at: new Date().toISOString(),
+      via,
+      targetId: res.targetId,
+      targetAlias: res.targetAlias,
+      sourceId: res.sourceId,
+      sourceAlias: res.sourceAlias,
+      amountSats: res.amountSats,
+      budgetPpm: res.budgetPpm,
+      feeSats: res.feeSats,
+      costPpm: res.costPpm,
+      ok: res.ok,
+      error: res.error,
+      ...(res.paymentId ? { paymentId: res.paymentId } : {}),
+      ...(res.targetSentBefore !== undefined ? { targetSentBefore: res.targetSentBefore } : {}),
+      ...(res.ok && holdPpm != null ? { holdPpm } : {}),
+    };
+  }
+
+  /**
+   * The books of one refill — the autopilot's or a manual one — attempt by
+   * attempt, write-ahead (review P3): each payment attempt is a
+   * pendingRebalances entry ON DISK before it is sent. A shutdown waits at
+   * most 37 s (shutdown.ts) and a crash not at all, while a payment can take
+   * up to the 150 s hard limit; before, the record was written only once the
+   * payment returned or hit that limit, so a restart mid-payment left nothing:
+   * today's budget didn't count it, the restarted autopilot refilled the same
+   * channel again while the first payment could still land, and if it landed
+   * its fee and the gate's hold were never booked. Now the restarted process
+   * counts it at its maximum fee, leaves its two channels alone, and books it
+   * — fee, hold, sent counter, the day it was sent — once LND says how it
+   * ended (reconcilePendingRebalances). An attempt that can't be saved first
+   * is not sent.
+   *
+   * settle() runs the executor with these hooks and books what it returns —
+   * the pair back-off, the log record, the record of a payment left in
+   * flight — before the attempts are released to the reconciliation, in one
+   * synchronous step (the reconciliation can't book a payment twice).
+   *
+   * `holdPpm`: what the profit gate valued the refill at — given for one
+   * that passed the gate (the autopilot's, or one run by hand with it); the
+   * fee engine holds that price while the refilled sats are in the channel.
+   */
+  private refillBooks(meta: { targetId: string; via: "autopilot" | "manual"; holdPpm?: number | null }) {
+    const sent = new Map<string, PendingRebalance>();
+    // The target's cooldown starts with the refill, whatever its outcome —
+    // no hammering a dead route. Set before anything is sent: the first
+    // attempt's record saves it. (A refill the shutdown stopped before it
+    // sent anything was no attempt: settle() puts the cooldown back.)
+    const cooldownBefore = this.state.perTargetLastRebalanced[meta.targetId];
+    this.state.perTargetLastRebalanced[meta.targetId] = new Date().toISOString();
+    // The record of an attempt, sent now: its fee is today's budget's.
+    const record = (p: {
+      id: string;
+      sourceId: string;
+      sourceAlias?: string;
+      alias: string;
+      amountSats: number;
+      maxFeeSats: number;
+      targetSentBefore?: number;
+    }): PendingRebalance => {
+      const at = new Date().toISOString();
+      return {
+        id: p.id,
+        targetId: meta.targetId,
+        sourceId: p.sourceId,
+        alias: p.alias,
+        ...(p.sourceAlias ? { sourceAlias: p.sourceAlias } : {}),
+        amountSats: p.amountSats,
+        maxFeeSats: p.maxFeeSats,
+        day: at.slice(0, 10),
+        at,
+        via: meta.via,
+        ...(p.targetSentBefore !== undefined ? { targetSentBefore: p.targetSentBefore } : {}),
+        ...(meta.holdPpm != null ? { holdPpm: meta.holdPpm } : {}),
+      };
+    };
+    const hooks: RefillHooks = {
+      onSend: (a) => {
+        const entry = record({
+          id: a.paymentId,
+          sourceId: a.sourceId,
+          sourceAlias: a.sourceAlias,
+          alias: a.targetAlias,
+          amountSats: a.amountSats,
+          maxFeeSats: a.maxFeeSats,
+          targetSentBefore: a.targetSentBefore,
+        });
+        (this.state.pendingRebalances ??= []).push(entry);
+        try {
+          this.store.writeOrThrow(this.state);
+        } catch (err) {
+          this.dropPending(entry.id);
+          throw err;
+        }
+        sent.set(entry.id, entry);
+        this.sendingRefills.add(entry.id);
+      },
+      onEnd: (paymentId, outcome) => {
+        // Paid: settle() books it the moment the executor returns. Still in
+        // flight: it stays pending — the reconciliation learns how it ends.
+        if (outcome !== "failed") return;
+        this.dropPending(paymentId);
+        this.sendingRefills.delete(paymentId);
+        this.persist();
+      },
+    };
+    const settle = async (exec: (hooks: RefillHooks) => Promise<RebalanceExecResult>): Promise<RebalanceExecResult> => {
+      try {
+        const res = await exec(hooks);
+        this.notePairs(meta.targetId, res);
+        if (res.inFlight) {
+          const { paymentId, maxFeeSats } = res.inFlight;
+          // (An executor that announced nothing: recorded now.)
+          if (!(this.state.pendingRebalances ?? []).some((p) => p.id === paymentId)) {
+            (this.state.pendingRebalances ??= []).push(
+              record({
+                id: paymentId,
+                sourceId: res.sourceId,
+                sourceAlias: res.sourceAlias,
+                alias: res.targetAlias,
+                amountSats: res.amountSats,
+                maxFeeSats,
+                targetSentBefore: res.targetSentBefore,
+              }),
+            );
+          }
+        } else if (res.stopped) {
+          // Stopped by the shutdown before its next attempt: a skip (D15),
+          // nothing for the log — nothing was paid, and what failed before
+          // it backs off (notePairs above). Nothing sent at all: no attempt,
+          // no cooldown.
+          if (sent.size === 0) {
+            if (cooldownBefore === undefined) delete this.state.perTargetLastRebalanced[meta.targetId];
+            else this.state.perTargetLastRebalanced[meta.targetId] = cooldownBefore;
+          }
+        } else {
+          // Its fee belongs to the budget day it was sent on, like a payment
+          // that ends after a restart.
+          const entry = res.paymentId ? sent.get(res.paymentId) : undefined;
+          this.rebalanceLog.append({ ...this.rebalanceRecord(res, meta.via, meta.holdPpm), ...(entry ? { startedAt: entry.at } : {}) });
+          if (entry) this.dropPending(entry.id);
+        }
+        // Spent sats and the back-off must not be forgotten if a later stage
+        // of the run throws or the process restarts: saved after every refill.
+        this.persist();
+        return res;
+      } finally {
+        for (const id of sent.keys()) this.sendingRefills.delete(id);
+      }
+    };
+    return { hooks, settle };
+  }
+
+  /** Forget a pending rebalance (it ended, or was booked). */
+  private dropPending(id: string): void {
+    this.state.pendingRebalances = (this.state.pendingRebalances ?? []).filter((p) => p.id !== id);
+  }
+
   /** Rebalance payments that were still in flight when we stopped waiting —
-   *  the autopilot's and manual ones: ask LND how each ended, and correct
-   *  today's spend (autopilot payments only) and the log. One at a time: a
-   *  main run and the timer share the reconciliation under way. */
+   *  the autopilot's and manual ones, from this process or one before it: ask
+   *  LND how each ended, and write the log (today's spend follows from it).
+   *  One at a time: a main run and the timer share the reconciliation under
+   *  way. */
   private reconcilePendingRebalances(): Promise<void> {
     this.reconciling ??= this.reconcileNow().finally(() => {
       this.reconciling = null;
@@ -1529,7 +1945,8 @@ export class Autopilot {
   }
 
   /** The timer's share (every INFLIGHT_REBALANCE_CHECK_MS): only when a
-   *  payment is pending, and never next to a main run (it reconciles first). */
+   *  payment is pending, and never next to a main run (it reconciles first).
+   *  Beside a manual refill it leaves that refill's own payments alone. */
   async checkInFlightRebalances(): Promise<void> {
     if (this.shuttingDown || this.running || (this.state.pendingRebalances ?? []).length === 0) return;
     try {
@@ -1544,6 +1961,18 @@ export class Autopilot {
     if (pending.length === 0) return;
     const done = new Set<PendingRebalance>();
     for (const p of pending) {
+      // Still this one's to book? Not while this process waits on it (a
+      // manual refill under way: its entry is a write-ahead record, and LND
+      // may not even know the payment yet), nor once its own refill dropped
+      // it while this one asked LND about an earlier entry. (An entry no
+      // refill waits on any more is left to this reconciliation alone.)
+      if (this.sendingRefills.has(p.id) || !(this.state.pendingRebalances ?? []).includes(p)) continue;
+      // Booked already — the process stopped between the log record and
+      // saving its state: nothing to book twice.
+      if (this.rebalanceLog.hasPayment(p.id)) {
+        done.add(p);
+        continue;
+      }
       let st: { state: "confirmed"; feeSats: number } | { state: "failed" | "pending" };
       try {
         st = await this.rebalancePaymentStatus(p.id);
@@ -1552,31 +1981,32 @@ export class Autopilot {
       }
       if (st.state === "pending") continue;
       const manual = p.via === "manual";
-      const spend = this.state.perDayRebalanceSpend;
-      // A manual payment was never charged to the autopilot's budget.
-      const sameDay = !manual && spend?.day === p.day;
-      if (st.state === "confirmed") {
-        if (sameDay && spend) spend.sats = Math.max(0, spend.sats - p.maxFeeSats + st.feeSats);
-        if (!manual) delete this.state.perTargetRebalanceFails?.[p.targetId];
-      } else if (sameDay && spend) {
-        spend.sats = Math.max(0, spend.sats - p.maxFeeSats);
-      }
+      const ok = st.state === "confirmed";
+      if (p.sourceId) this.notePairs(p.targetId, { ok, sourceId: p.sourceId, failedSourceIds: ok ? [] : [p.sourceId] });
+      // Written with the time it was sent: its fee belongs to that day's
+      // budget (the maximum fee was charged there meanwhile).
       this.rebalanceLog.append({
         at: new Date().toISOString(),
+        startedAt: p.at,
         via: manual ? "manual" : "autopilot",
         targetId: p.targetId,
         targetAlias: p.alias,
         sourceId: p.sourceId ?? "",
-        sourceAlias: "",
+        sourceAlias: p.sourceAlias ?? "",
         amountSats: p.amountSats,
         budgetPpm: 0,
-        feeSats: st.state === "confirmed" ? st.feeSats : null,
-        costPpm: st.state === "confirmed" && p.amountSats > 0 ? Math.round((st.feeSats / p.amountSats) * 1_000_000) : null,
-        ok: st.state === "confirmed",
-        error: st.state === "confirmed" ? undefined : "the payment that was still in flight failed",
+        feeSats: ok ? (st as { feeSats: number }).feeSats : null,
+        costPpm: ok && p.amountSats > 0 ? Math.round(((st as { feeSats: number }).feeSats / p.amountSats) * 1_000_000) : null,
+        ok,
+        error: ok ? undefined : "the payment that was still in flight failed",
+        paymentId: p.id,
+        ...(p.targetSentBefore !== undefined ? { targetSentBefore: p.targetSentBefore } : {}),
+        // (Only a refill that passed the gate carries a hold — a manual one
+        // run with it too; see refillBooks.)
+        ...(ok && p.holdPpm != null ? { holdPpm: p.holdPpm } : {}),
       });
       done.add(p);
-      console.log(`[autopilot] in-flight rebalance ${p.id.slice(0, 12)}… ended ${st.state}${st.state === "confirmed" ? ` (fee ${st.feeSats} sat)` : ""}`);
+      console.log(`[autopilot] in-flight rebalance ${p.id.slice(0, 12)}… ended ${st.state}${ok ? ` (fee ${(st as { feeSats: number }).feeSats} sat)` : ""}`);
     }
     // Payments tracked while this ran (a manual one) stay pending.
     this.state.pendingRebalances = (this.state.pendingRebalances ?? []).filter((p) => !done.has(p));
@@ -1584,47 +2014,90 @@ export class Autopilot {
   }
 
   /**
-   * A rebalance by hand (Rebalance tab): run, and logged as manual. A payment
-   * still in flight at the hard limit is not a failure — it may land later.
-   * It is tracked like the autopilot's own (pendingRebalances, which also
-   * keeps the autopilot off its two channels meanwhile), but not charged to
-   * the autopilot's daily budget, and the log gets its real outcome once LND
-   * knows it. Before, it was logged as failed and never looked at again: a
-   * payment that landed later stayed "failed", its fee missing from P&L.
+   * A rebalance by hand (Rebalance tab). It counts toward the same daily fee
+   * budget as the autopilot's refills (review a2: manual runs bypassed it):
+   * its fee is capped at what is left — and at `maxFeeSats`, what the confirm
+   * dialog promised — and with nothing left it is refused before anything is
+   * paid (RebalanceBudgetError). It starts the target's cooldown and books the
+   * source → target pair like the autopilot's own attempts; it is not held
+   * back by them — an explicit run, and the dialog says so. It never pays
+   * beside the autopilot's rebalance stage or another manual refill (null:
+   * busy — the refill lock), so two payments can't both pass the budget
+   * check; the rest of a main run (fees, lease promises, channel opens,
+   * Magma) goes on meanwhile. Each attempt is on disk before it is sent
+   * (refillBooks); a payment still in flight at the hard limit is not a
+   * failure — it may land later: it is tracked like the autopilot's own
+   * (pendingRebalances, which also keeps the autopilot off its two channels
+   * meanwhile), and the log gets its real outcome once LND knows it.
+   *
+   * Like the rebalance stage, it never moves liquidity into or out of a
+   * channel whose earlier payment may still land (RefillInFlightError) — a
+   * second move could double what was planned — and no attempt starts after
+   * the shutdown signal. A refill run from a recommended row carries the
+   * gate: it passed the same check as the autopilot's refills (its payment
+   * capped by it at every size), so it holds the price the gate valued it at
+   * the same way (refillLots), as the Rebalancing tab says (review of P3: it
+   * got no hold, and the engine could cut the fee right after it). One run
+   * without the gate chose its own price and sets no floor.
    */
-  async rebalanceByHand(params: RebalanceExecParams): Promise<RebalanceExecResult> {
-    if (!this.writeLnd) throw new Error("writing is disabled");
-    const res = await this.rebalanceExec(this.writeLnd, params);
-    if (res.inFlight) {
-      (this.state.pendingRebalances ??= []).push({
-        id: res.inFlight.paymentId,
-        targetId: res.targetId,
-        sourceId: res.sourceId,
-        alias: res.targetAlias,
-        amountSats: res.amountSats,
-        maxFeeSats: res.inFlight.maxFeeSats,
-        day: new Date().toISOString().slice(0, 10),
-        at: new Date().toISOString(),
-        via: "manual",
-      });
+  async rebalanceByHand(params: RebalanceExecParams): Promise<RebalanceExecResult | null> {
+    const writeLnd = this.writeLnd;
+    if (!writeLnd) throw new Error("writing is disabled");
+    if (this.refilling || this.shuttingDown) return null;
+    const busy = this.inFlightThrough([params.targetId, params.sourceId, ...(params.sources ?? []).map((s) => s.id)]);
+    if (busy) throw new RefillInFlightError(busy.channelId, busy.payment);
+    const budget = this.rebalanceBudget();
+    if (budget.leftSats !== null && budget.leftSats <= 0) throw new RebalanceBudgetError(budget);
+    this.refilling = true;
+    try {
+      const maxFeeSats = Math.min(params.maxFeeSats ?? Infinity, budget.leftSats ?? Infinity);
+      return await this.refillBooks({ targetId: params.targetId, via: "manual", holdPpm: params.gate?.revenuePpm ?? null }).settle((hooks) =>
+        this.rebalanceExec(
+          writeLnd,
+          { ...params, ...(Number.isFinite(maxFeeSats) ? { maxFeeSats } : {}) },
+          { ...hooks, shouldStop: () => this.shuttingDown },
+        ),
+      );
+    } finally {
+      this.refilling = false;
       this.persist();
-      return res;
     }
-    this.rebalanceLog.append({
-      at: new Date().toISOString(),
-      via: "manual",
-      targetId: res.targetId,
-      targetAlias: res.targetAlias,
-      sourceId: res.sourceId,
-      sourceAlias: res.sourceAlias,
-      amountSats: res.amountSats,
-      budgetPpm: res.budgetPpm,
-      feeSats: res.feeSats,
-      costPpm: res.costPpm,
-      ok: res.ok,
-      error: res.error,
-    });
-    return res;
+  }
+
+  /** Rebalance payments that may still land (pendingRebalances), as the
+   *  Rebalancing tab shows them. */
+  refillsInFlight(): RefillInFlight[] {
+    return (this.state.pendingRebalances ?? []).map((p) => ({
+      targetId: p.targetId,
+      alias: p.alias,
+      ...(p.sourceId ? { sourceId: p.sourceId } : {}),
+      ...(p.sourceAlias ? { sourceAlias: p.sourceAlias } : {}),
+      amountSats: p.amountSats,
+      maxFeeSats: p.maxFeeSats,
+      at: p.at,
+      via: p.via ?? "autopilot",
+    }));
+  }
+
+  /** The first payment still in flight into or out of any of `channelIds`,
+   *  and which of them it goes through. */
+  private inFlightThrough(channelIds: string[]): { channelId: string; payment: RefillInFlight } | null {
+    for (const payment of this.refillsInFlight()) {
+      const channelId = channelIds.find((id) => id === payment.targetId || id === payment.sourceId);
+      if (channelId) return { channelId, payment };
+    }
+    return null;
+  }
+
+  /**
+   * The rebalance report the Rebalancing tab shows — exactly the plan the
+   * rebalance stage works from (rebalanceReport), with today's fee budget
+   * and the payments still in flight: a row whose channels one goes through
+   * shows that instead of a Run button (a manual refill there is refused).
+   */
+  async rebalanceRecommendations(): Promise<RebalanceRecReport & { budget: RebalanceBudget; inFlight: RefillInFlight[] }> {
+    const report = (await this.rebalanceReport()) as RebalanceRecReport;
+    return { ...report, budget: this.rebalanceBudget(), inFlight: this.refillsInFlight() };
   }
 
   /** Open a channel to the top suggestion when on-chain funds allow. */
@@ -2569,7 +3042,7 @@ export class Autopilot {
 
   /** The latest decision NOT to act, per area, with its reason (D16; the
    *  full per-area status is a later package's — this is its seed). */
-  private decisionNote(area: "magma" | "channels", text: string): void {
+  private decisionNote(area: DecisionArea, text: string): void {
     (this.state.decisions ??= {})[area] = { at: new Date().toISOString(), text };
   }
 
@@ -2861,7 +3334,9 @@ export class Autopilot {
   private feeReport(elasticity: Map<string, number>, marketWaitMs?: number) {
     return getFeeRecommendations(
       this.readLnd,
-      this.rebalanceLog.recent(200),
+      // The refills the profit floor can stand on — all of them, however
+      // many failed attempts the log holds.
+      this.rebalanceLog.successes(floorWindowStart()),
       this.feeCooldown(),
       this.feeV2Overrides(),
       this.overrides.all(),
@@ -2875,18 +3350,28 @@ export class Autopilot {
     // The last gate: a sold channel's fee never leaves its lease promise.
     return applyFees(this.readLnd, writeLnd, items, this.capital.leaseCaps());
   }
-  private rebalanceReport() {
+  /** The rebalance plan, from the same fee-engine inputs the fee stage
+   *  uses — so the fee the gate expects after a refill is the one the
+   *  autopilot will charge — and from every channel sold through Magma or
+   *  LSPS1 (never a source). The one place its inputs are built: the
+   *  Rebalancing tab (rebalanceRecommendations) and the stage share it. */
+  private async rebalanceReport(): Promise<Pick<RebalanceRecReport, "recommendations"> & Partial<RebalanceRecReport>> {
     return getRebalanceRecommendations(
       this.readLnd,
-      this.rebalanceLog.recent(200),
-      this.feeCooldown(),
-      this.feeV2Overrides(),
-      this.overrides.all(),
-      this.rebalanceRecOverrides(),
+      {
+        rebalanceRecords: this.rebalanceLog.successes(floorWindowStart()),
+        cooldown: this.feeCooldown(),
+        configOverrides: this.feeV2Overrides(),
+        channelOverrides: this.overrides.all(),
+        elasticity: await this.feeElasticityModifiers(),
+        flowAnchors: this.flowAnchors(),
+        leaseCaps: this.capital.leaseCaps(),
+      },
+      { recOverrides: this.rebalanceRecOverrides(), soldLeases: this.capital.soldLeases() },
     );
   }
-  private rebalanceExec(writeLnd: AuthenticatedLnd, params: RebalanceExecParams) {
-    return executeRebalance(this.readLnd, writeLnd, params);
+  private rebalanceExec(writeLnd: AuthenticatedLnd, params: RebalanceExecParams, opts: RebalanceExecOptions = {}) {
+    return executeRebalance(this.readLnd, writeLnd, params, opts);
   }
   /** How a rebalance payment we stopped waiting for has ended. */
   private async rebalancePaymentStatus(

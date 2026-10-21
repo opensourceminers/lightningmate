@@ -11,7 +11,7 @@ import { FakeMagma } from "./magma.js";
 import { FakeMarket } from "./market.js";
 import type { FeeApplyItem, FeeApplyResult } from "../../src/services/fees.js";
 import type { FeeRecommendation, FeeRecReport } from "../../src/services/feeRecommend.js";
-import type { RebalanceExecParams, RebalanceExecResult } from "../../src/services/rebalance.js";
+import type { RebalanceExecOptions, RebalanceExecParams, RebalanceExecResult } from "../../src/services/rebalance.js";
 import type { RebalanceRecommendation, RebalanceRecReport } from "../../src/services/rebalanceRecommend.js";
 import type { SuggestionV2, SuggestV2Report } from "../../src/services/suggestRecommend.js";
 import { FakeLnd } from "./fakeLnd.js";
@@ -37,7 +37,10 @@ export interface AutopilotSeams {
   feeReport: () => Promise<Pick<FeeRecReport, "recommendations">>;
   feeApply: (writeLnd: unknown, items: FeeApplyItem[]) => Promise<FeeApplyResult[]>;
   rebalanceReport: () => Promise<Pick<RebalanceRecReport, "recommendations">>;
-  rebalanceExec: (writeLnd: unknown, p: RebalanceExecParams) => Promise<RebalanceExecResult>;
+  /** The executor; the real one gets the books' write-ahead hooks and the
+   *  shutdown check (a stub may ignore them — the books then record a
+   *  payment left in flight when the stub returns it). */
+  rebalanceExec: (writeLnd: unknown, p: RebalanceExecParams, opts?: RebalanceExecOptions) => Promise<RebalanceExecResult>;
   channelSuggestions: () => Promise<Pick<SuggestV2Report, "suggestions">>;
   /** The Magma stage — the one that always runs after the fee, rebalance and
    *  channel stages; a test replaces it to look at the disk mid-run. */
@@ -48,17 +51,25 @@ export interface AutopilotSeams {
  * An Autopilot on a fake node, with `config` stored as its settings (and
  * `stored` as the rest of autopilot.json), and no way to reach a real service
  * (every run also refreshes Amboss's public sale history in the background —
- * answered here with an empty one).
+ * answered here with an empty one). `files`: other state files of the data
+ * dir as a previous process left them (e.g. "rebalances.json"). `node`: the
+ * fake LND to run on (default: an empty one with 20M on chain).
  */
-export function autopilotWith(t: AfterHook, config: Record<string, unknown>, stored: Record<string, unknown> = {}) {
+export function autopilotWith(
+  t: AfterHook,
+  config: Record<string, unknown>,
+  stored: Record<string, unknown> = {},
+  files: Record<string, unknown> = {},
+  node: FakeLnd = new FakeLnd({ chainBalance: 20_000_000 }),
+) {
   const http = installFetchMock(t);
   http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
-  const node = new FakeLnd({ chainBalance: 20_000_000 });
   const dir = makeTempDir(t);
   writeFileSync(
     join(dir, "autopilot.json"),
     JSON.stringify({ config, history: [], sellAutoSizeMigrated: true, ...stored }),
   );
+  for (const [name, content] of Object.entries(files)) writeFileSync(join(dir, name), JSON.stringify(content));
   const amboss = new AmbossStore(dir);
   amboss.setKey("test-key");
   const autopilot = new Autopilot(
@@ -75,6 +86,28 @@ export function autopilotWith(t: AfterHook, config: Record<string, unknown>, sto
   t.after(() => autopilot.shutdown());
   const seams = autopilot as unknown as AutopilotSeams;
   return { autopilot, node, seams, http, dir };
+}
+
+/**
+ * A NEW process on a data dir another one left behind — what a restart (or a
+ * crash) finds: the disk and LND, nothing from memory. Its own stores, no
+ * scheduler kicks; the fetch mock of the test stays in place.
+ */
+export function autopilotAt(t: AfterHook, dir: string, node: FakeLnd) {
+  const amboss = new AmbossStore(dir);
+  const autopilot = new Autopilot(
+    dir,
+    node.lnd,
+    node.lnd,
+    new RebalanceLog(dir),
+    new OverridesStore(dir),
+    amboss,
+    new EarningsLog(dir),
+    new ServiceFeeLedger(dir, null),
+  );
+  suppressSchedulerKicks(autopilot);
+  t.after(() => autopilot.shutdown());
+  return { autopilot, seams: autopilot as unknown as AutopilotSeams };
 }
 
 /** A buyer's node id (any valid 33-byte key works with the fake LND). */

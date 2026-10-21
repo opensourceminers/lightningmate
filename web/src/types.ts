@@ -197,7 +197,8 @@ export interface AutopilotConfig {
   rebalanceCooldownMinutes: number;
   rebalanceHourStart: number;
   rebalanceHourEnd: number;
-  /** null = explicitly no daily cap. */
+  /** Rebalance fees per UTC day, the autopilot's and manual runs together.
+   *  null = explicitly no daily cap. */
   rebalanceDailyBudgetSats: number | null;
   channelEnabled: boolean;
   channelReserveSats: number;
@@ -382,48 +383,41 @@ export interface AutopilotState {
   runningSince?: string | null;
   magmaLane?: MagmaLaneStatus;
   /** Per area, the latest decision not to act and why. */
-  decisions?: Partial<Record<"magma" | "channels", { at: string; text: string }>>;
+  decisions?: Partial<Record<"magma" | "channels" | "rebalance", { at: string; text: string }>>;
+  /** Today's rebalance fee budget (UTC day) — autopilot and manual runs together. */
+  rebalanceBudget?: RebalanceBudget;
 }
 
+/** Today's rebalance fee budget: what was spent (fees paid, and the maximum
+ *  fee of payments still in flight) and what is left. */
+export interface RebalanceBudget {
+  day: string;
+  /** null: no daily limit. */
+  budgetSats: number | null;
+  spentSats: number;
+  inFlightSats: number;
+  leftSats: number | null;
+  /** When the next day's budget starts (00:00 UTC). */
+  resetsAt: string;
+}
+
+/** The rebalance settings — each one binds the profit gate. */
 export interface RebalancePolicy {
+  /** The most a refill's route may cost, as a share of what it is expected to earn (0.05–1). */
   econRatio: number;
-  maxLocalRatioTarget: number;
-  minLocalRatioSource: number;
-  amountSats: number;
-  minDemandSats: number;
-  flowWindowDays: number;
-  maxCandidates: number;
-}
-
-export interface RebalanceCandidate {
-  targetId: string;
-  targetAlias: string;
-  targetLocalRatio: number;
-  targetOutboundPpm: number;
-  demandSats: number;
-  sourceId: string;
-  sourceAlias: string;
-  sourceLocalRatio: number;
-  amountSats: number;
-  maxFeePpm: number;
-  estCostPpm: number | null;
-  estFeeSats: number | null;
-  netMarginPpm: number | null;
-  expectedProfitSats: number | null;
-  routeFound: boolean;
-  profitable: boolean;
-  verdict: string;
-}
-
-export interface RebalanceAnalysis {
-  policy: RebalancePolicy;
-  candidates: RebalanceCandidate[];
+  /** A refill must be expected to net at least this much (sat). */
+  minNetProfitSats: number;
+  /** Its fee must be earned back within this many days. */
+  maxPaybackDays: number;
+  /** The most one refill moves (sat). */
+  maxAmountSats: number;
 }
 
 export interface RebalanceExecResult {
   ok: boolean;
   targetId: string;
   targetAlias: string;
+  /** The source that paid (or, when none did, the first). */
   sourceId: string;
   sourceAlias: string;
   amountSats: number;
@@ -431,9 +425,49 @@ export interface RebalanceExecResult {
   feeSats: number | null;
   costPpm: number | null;
   error?: string;
-  /** Stopped waiting at the hard limit while the payment was still in
-   *  flight: it may still land. Tracked, and logged once LND knows. */
+  /** The payment that paid (its hash). */
+  paymentId?: string;
+  /** Stopped waiting while the payment was still in flight (the hard limit,
+   *  or LND didn't say how it ended): it may still land. Tracked, and logged
+   *  once LND knows. */
   inFlight?: { paymentId: string; maxFeeSats: number };
+  targetSentBefore?: number;
+  failedSourceIds?: string[];
+  /** Stopped before its next attempt because LightningMate is shutting down:
+   *  a skip, not a failure — nothing more was sent. */
+  stopped?: boolean;
+}
+
+/** A refill by hand (POST /rebalance/execute). */
+export interface RebalanceExecRequest {
+  targetId: string;
+  sourceId: string;
+  amountSats: number;
+  /** Fallback cost cap (× the target's fee) when no maxFeePpm is given. */
+  econRatio: number;
+  maxFeePpm?: number;
+  /** The most the refill may pay (sat) — what the confirm dialog promised. */
+  maxFeeSats?: number;
+  /** The profit gate's earnings side: every size tried pays at most what
+   *  it earns above the minimum net profit. A refill run with it passed the
+   *  same check as the autopilot's, and its price is held the same way. */
+  gate?: { revenuePpm: number; demandSats: number; minNetSats: number };
+}
+
+/** A rebalance payment that may still land: its two channels are left alone
+ *  (no refill through them, by hand or by the autopilot) until LND says how
+ *  it ended. */
+export interface RefillInFlight {
+  targetId: string;
+  /** The target's peer alias. */
+  alias: string;
+  sourceId?: string;
+  sourceAlias?: string;
+  amountSats: number;
+  maxFeeSats: number;
+  /** When it was sent. */
+  at: string;
+  via: "autopilot" | "manual";
 }
 
 export interface RebalanceRecord {
@@ -449,6 +483,13 @@ export interface RebalanceRecord {
   costPpm: number | null;
   ok: boolean;
   error?: string;
+  /** When it was sent: its fee counts on that day's budget. */
+  startedAt?: string;
+  /** The payment's hash (booked once, whatever restarts in between). */
+  paymentId?: string;
+  targetSentBefore?: number;
+  /** What the profit gate valued the refill at (ppm): the fee engine holds it. */
+  holdPpm?: number;
 }
 
 export interface RebalanceLogSummary {
@@ -870,11 +911,17 @@ export interface FeeRecMetrics {
   revenue30d: number;
   revenuePpm14d: number | null;
   revenuePpm30d: number | null;
-  /** What the autopilot's refills into it cost (last 30 days). */
+  /** What the refilled sats still in it cost (the autopilot's refills of the last 30 days). */
   costBasisPpm: number | null;
   costBasisSource: "rebalance_avg" | "unknown";
   costBasisRefills: number;
   costBasisLatestAt: string | null;
+  /** Refilled sats still in the channel (not routed out yet). */
+  refillRemainingSats: number;
+  /** The price a refill's floor holds (what the profit gate valued it at). */
+  refillHoldPpm: number | null;
+  /** The floor was released under low flow. */
+  profitFloorReleased: boolean;
   /** The floor in force (capped at maxPpm unless opted in). */
   profitFloorPpm: number | null;
   profitFloorCapped: boolean;
@@ -895,7 +942,8 @@ export interface FeeRecMetrics {
   belowReplacement: boolean;
   marketComparison: "above" | "in_line" | "below" | null;
   draining: boolean;
-  /** De-noised payments turned away for lack of outbound, 14 days. */
+  /** Possible demand, 14 days: de-noised HTLCs refused for lack of outbound
+   *  that a refilled channel could have carried. */
   refusedAttempts14d: number;
   refusedSats14d: number;
   refusedDays14d: number;
@@ -965,7 +1013,12 @@ export interface RebalanceSourceCandidate {
   channelId: string;
   alias: string;
   localRatio: number;
+  /** What it can give and still keep its own share (sat). */
+  spareSats: number;
+  /** The local ratio it keeps. */
+  keepRatio: number;
   reason: string;
+  /** Probed and no route passed the gate from it. */
   rejected?: boolean;
   rejectedReason?: string;
 }
@@ -994,15 +1047,29 @@ export interface RebalanceRecommendation {
   routedIn30d: number;
   netDrain14d: number;
   grossFlow14d: number;
+  /** De-noised refused HTLCs (possible demand), 14 days. */
+  refusedSats14d: number;
+  inDemand: boolean;
   revenue14d: number;
   revenue30d: number;
   revenuePpm14d: number | null;
   revenuePpm30d: number | null;
+  /** The estimate before the refill (ppm). */
+  preRefillPpm: number | null;
+  /** What the gate values the refilled sats at (ppm): the estimate before
+   *  the refill, or the lower fee the engine charges after it. */
   expectedRevenuePpm: number | null;
+  /** Where the fee engine takes the fee after the refill (its hold included). */
+  postRefillPpm: number | null;
   avgDailyRevenueSats: number;
   maxCostPpm: number | null;
   maxCostSatsByPayback: number | null;
   maxPaybackDays: number;
+  /** The gate's earnings are capped at this 14-day outflow (sat). */
+  earningDemandSats: number;
+  minNetProfitSats: number;
+  /** The most this move may pay in routing fees (sat) — the payment's cap. */
+  maxFeeSats: number | null;
   recommendedAmount: number | null;
   amountToReachTargetLocalRatio: number;
   demandSizedAmount: number;
@@ -1024,18 +1091,45 @@ export interface RebalanceRecSummary {
   expectedTotalNetProfitSats: number;
 }
 
-export interface InboundOptions {
-  magmaCheapestPpm: number | null;
-  rebalanceTypicalPpm: number | null;
-  cheapest: "rebalance" | "magma" | "fee_first" | "none";
+/** Refilling outbound: what a rebalance's route costs now vs raising the fee. */
+export interface RefillNote {
+  routeTypicalPpm: number | null;
+  feeFirstCount: number;
   note: string;
+}
+
+/** The rebalance gate's settings as the plan used them. */
+export interface RebalanceRecConfig {
+  /** The most a refill's route may cost, as a share of what it is expected to earn (the autopilot's econRatio). */
+  profitShare: number;
+  maxPaybackDays: number;
+  minExpectedNetProfitSats: number;
+  demandCoverageMultiplier: number;
+  maxCapacityRefillRatio: number;
+  minRebalanceAmount: number;
+  maxRebalanceAmountPerChannel: number;
+  targetDeficitThreshold: number;
+  sourceExcessThreshold: number;
+  minRevenuePpm: number;
+  newChannelProtectionDays: number;
+  sourceMinAgeDays: number;
+  sourceKeepMargin: number;
+  maxSourcesPerTarget: number;
+  maxCandidates: number;
+  probeCeilingPpm: number;
 }
 
 export interface RebalanceRecReport {
   generatedAt: string;
+  config?: RebalanceRecConfig;
   summary: RebalanceRecSummary;
-  inbound: InboundOptions;
+  refill: RefillNote;
   recommendations: RebalanceRecommendation[];
+  /** Today's fee budget (what the autopilot plans within). */
+  budget?: RebalanceBudget;
+  /** Rebalance payments that may still land: a row whose channels one goes
+   *  through shows it instead of a Run button. */
+  inFlight?: RefillInFlight[];
 }
 
 export interface LiveForward {

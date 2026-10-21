@@ -6,7 +6,6 @@ import { getNodeSummary, getOwnPubkey } from "../services/node.js";
 import { getChannelsView } from "../services/channels.js";
 import { getFlowSummary, getForwardsReport } from "../services/forwards.js";
 import { getFeePreview, type FeeApplyItem, type FeePolicy } from "../services/fees.js";
-import { getRebalanceCandidates, type RebalancePolicy } from "../services/rebalance.js";
 import { type SuggestionPolicy } from "../services/suggestions.js";
 import { getChannelSuggestionsV2, getCloseSuggestionsV2 } from "../services/suggestRecommend.js";
 import type { LnPlusStore } from "../services/lnplusStore.js";
@@ -31,8 +30,7 @@ import {
 import { closeChannelByOutpoint, connectForOpen, fundChannel, MIN_CHANNEL_SATS } from "../services/channelOps.js";
 import { promisedSpendRefusal, type PromisedSpendRefusal } from "../services/capital.js";
 import { saleFeeConfig, type ServiceFeeLedger } from "../services/serviceFee.js";
-import { getFeeRecommendations } from "../services/feeRecommend.js";
-import { getRebalanceRecommendations } from "../services/rebalanceRecommend.js";
+import { floorWindowStart, getFeeRecommendations } from "../services/feeRecommend.js";
 import { getBtcPrice } from "../services/price.js";
 import type { SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
@@ -57,7 +55,7 @@ import {
 } from "../services/magmaApi.js";
 import type { DeskResult } from "../services/magmaDesk.js";
 import type { AmbossStore } from "../services/ambossStore.js";
-import { ambossFields, termsMatch, type Autopilot, type OfferWrite } from "../services/autopilot.js";
+import { FeeItemError, RebalanceBudgetError, RefillInFlightError, ambossFields, termsMatch, type Autopilot, type OfferWrite } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 import { BackupStore, exportScb, getBackupStatus } from "../services/backup.js";
 import type { EarningsLog } from "../services/earningsLog.js";
@@ -320,7 +318,9 @@ export function createApiRouter(
       res.json(
         await getFeeRecommendations(
           lnd,
-          rebalanceLog.recent(200),
+          // The refills the profit floor can stand on (not 200 records of
+          // failures and successes mixed).
+          rebalanceLog.successes(floorWindowStart()),
           autopilot.feeCooldown(),
           autopilot.feeV2Overrides(),
           overrides.all(),
@@ -475,8 +475,19 @@ export function createApiRouter(
       }
       // A manual apply is clamped to a sold channel's lease promise too (D7):
       // the result says where it was. It goes through the autopilot's books
-      // (cooldown, run history, fee-change log), like its own changes.
-      const done = await autopilot.applyByHand(items);
+      // (cooldown, run history, fee-change log), like its own changes. An
+      // item whose id isn't the channel at its outpoint is refused (400)
+      // before anything is written.
+      let done: Awaited<ReturnType<Autopilot["applyByHand"]>>;
+      try {
+        done = await autopilot.applyByHand(items);
+      } catch (err) {
+        if (err instanceof FeeItemError) {
+          res.status(400).json({ error: "bad_request", message: err.message, problems: err.problems });
+          return;
+        }
+        throw err;
+      }
       if (!done) {
         res.status(409).json({ error: "busy", message: "The autopilot is running right now — try again in a moment." });
         return;
@@ -542,39 +553,15 @@ export function createApiRouter(
     }),
   );
 
-  // Profit-aware rebalance candidates — read-only analysis, probes route costs
-  // without paying. Each candidate is gated on cost ppm ≤ profit budget.
-  router.get(
-    "/rebalance/candidates",
-    wrap(async (req, res) => {
-      const overrides = numericOverrides<RebalancePolicy>(req.query, [
-        "econRatio",
-        "maxLocalRatioTarget",
-        "minLocalRatioSource",
-        "amountSats",
-        "minDemandSats",
-        "flowWindowDays",
-        "maxCandidates",
-      ]);
-      res.json(await getRebalanceCandidates(lnd, overrides));
-    }),
-  );
-
-  // Rebalance Autopilot v1 — recommendation engine (dry-run only, no payments).
-  // Consumes Fee v2 per channel; fee-adjust-first + payback/profit gating.
+  // Rebalance recommendations — dry-run only, no payments: exactly what the
+  // autopilot's rebalance stage would plan (the same fee-engine inputs and
+  // settings), with today's fee budget and the payments still in flight.
+  // (The older "candidates" engine behind GET /rebalance/candidates is gone:
+  // nothing called it.)
   router.get(
     "/rebalance/recommendations",
     wrap(async (_req, res) => {
-      res.json(
-        await getRebalanceRecommendations(
-          lnd,
-          rebalanceLog.recent(200),
-          autopilot.feeCooldown(),
-          autopilot.feeV2Overrides(),
-          overrides.all(),
-          autopilot.rebalanceRecOverrides(),
-        ),
-      );
+      res.json(await autopilot.rebalanceRecommendations());
     }),
   );
 
@@ -586,34 +573,75 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { targetId, sourceId, amountSats, econRatio, maxFeePpm } = req.body ?? {};
+      const { targetId, sourceId, amountSats, econRatio, maxFeePpm, maxFeeSats, gate } = req.body ?? {};
       const amount = intIn(amountSats, 1000, MAX_REBALANCE_SATS);
       const ratio = econRatio === undefined ? 0.8 : numIn(econRatio, 0.05, 1);
       const maxFee = maxFeePpm === undefined ? undefined : intIn(maxFeePpm, 1, MAX_FEE_PPM);
+      const maxSats = maxFeeSats === undefined ? undefined : intIn(maxFeeSats, 1, MAX_REBALANCE_SATS);
+      // The profit gate's earnings side (a recommended row sends it): each
+      // size it tries may pay at most what it earns above the minimum.
+      const g =
+        gate === undefined
+          ? undefined
+          : {
+              revenuePpm: intIn(gate?.revenuePpm, 1, MAX_FEE_PPM),
+              demandSats: intIn(gate?.demandSats, 0, MAX_REBALANCE_SATS * 1000),
+              minNetSats: intIn(gate?.minNetSats, 0, MAX_REBALANCE_SATS),
+            };
       if (
         !isChannelId(targetId) ||
         !isChannelId(sourceId) ||
         amount === null ||
         ratio === null ||
-        (maxFeePpm !== undefined && maxFee === null)
+        (maxFeePpm !== undefined && maxFee === null) ||
+        (maxFeeSats !== undefined && maxSats === null) ||
+        (g !== undefined && (g.revenuePpm === null || g.demandSats === null || g.minNetSats === null))
       ) {
         res.status(400).json({
           error: "bad_request",
-          message: "valid targetId/sourceId, amountSats (1k–1 BTC), econRatio (0.05–1) and optional maxFeePpm required.",
+          message:
+            "valid targetId/sourceId, amountSats (1k–1 BTC), econRatio (0.05–1) and optional maxFeePpm, maxFeeSats (the most the refill may pay, sat) and gate {revenuePpm, demandSats, minNetSats} required.",
         });
         return;
       }
       // Logged as manual. A payment still in flight at the hard limit is
       // tracked until LND knows how it ended, and logged then (autopilot.ts).
-      res.json(
-        await autopilot.rebalanceByHand({
+      // It counts toward the daily rebalance budget like the autopilot's own
+      // refills: its fee is capped at what is left, and with nothing left it
+      // is refused (409) before anything is paid. So is a refill into or out
+      // of a channel whose earlier payment may still land (409, in_flight).
+      let done: Awaited<ReturnType<Autopilot["rebalanceByHand"]>>;
+      try {
+        done = await autopilot.rebalanceByHand({
           targetId,
           sourceId,
           amountSats: amount,
           econRatio: ratio,
           ...(maxFee !== null && maxFee !== undefined ? { maxFeePpm: maxFee } : {}),
-        }),
-      );
+          ...(maxSats !== null && maxSats !== undefined ? { maxFeeSats: maxSats } : {}),
+          ...(g ? { gate: { revenuePpm: g.revenuePpm as number, demandSats: g.demandSats as number, minNetSats: g.minNetSats as number } } : {}),
+        });
+      } catch (err) {
+        if (err instanceof RebalanceBudgetError) {
+          res.status(409).json({ error: "budget_exhausted", message: err.message, budget: err.budget });
+          return;
+        }
+        if (err instanceof RefillInFlightError) {
+          res.status(409).json({ error: "in_flight", message: err.message, channelId: err.channelId, payment: err.payment });
+          return;
+        }
+        throw err;
+      }
+      if (!done) {
+        // (The refill lock: the autopilot's refills or another manual one
+        // are paying — never two side by side, or both could pass the budget.)
+        res.status(409).json({
+          error: "busy",
+          message: "A refill is already under way (the autopilot's or another manual one) — try again in a few minutes.",
+        });
+        return;
+      }
+      res.json(done);
     }),
   );
 
@@ -667,10 +695,7 @@ export function createApiRouter(
       // This node's own capital in its channels (pending ones earn nothing yet).
       const ownCapitalSats = channels.filter((c) => c.status === "open").reduce((s, c) => s + c.localBalance, 0);
       const since = Date.now() - report.windowDays * 86_400_000;
-      const rebalanceFeesSats = rebalanceLog
-        .recent(200)
-        .filter((r) => r.ok && r.feeSats && Date.parse(r.at) >= since)
-        .reduce((s, r) => s + (r.feeSats ?? 0), 0);
+      const rebalanceFeesSats = rebalanceLog.successes(since).reduce((s, r) => s + (r.feeSats ?? 0), 0);
       res.json(
         buildDashboard(report, ln, onchain, rebalanceLog.summary(), autopilot.getState(), totalCapacitySats, {
           ownCapitalSats,
@@ -707,7 +732,7 @@ export function createApiRouter(
       res.json(
         await getCloseSuggestionsV2(
           lnd,
-          rebalanceLog.recent(200),
+          rebalanceLog.successes(),
           autopilot.feeV2Overrides(),
           overrides.all(),
         ),

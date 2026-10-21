@@ -46,6 +46,24 @@ export function ApplyResult({ applied }: { applied: AutopilotChange[] }) {
   );
 }
 
+/**
+ * Channels that keep refusing HTLCs for lack of outbound (D20). The signal is
+ * de-noised but still a heuristic — probes of varying sizes under half the
+ * channel, or a payment re-split into parts, count as attempts — so it is
+ * POSSIBLE demand, never "real payments" (P2 final review).
+ */
+export const IN_DEMAND_CHIP_TITLE =
+  "Possible demand: refused HTLCs a refilled channel could have carried (probes, retries of the same amount and HTLCs over half the channel excluded)";
+export const POSSIBLE_DEMAND_BANNER = "possible demand (refused HTLCs, de-noised)";
+
+export function InDemandChip({ count }: { count: number }) {
+  return count ? (
+    <span className="feerec-chip s-protect" title={IN_DEMAND_CHIP_TITLE}>
+      {count} with possible demand
+    </span>
+  ) : null;
+}
+
 export function FeeRecommendations() {
   const [data, setData] = useState<FeeRecReport | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -124,7 +142,7 @@ export function FeeRecommendations() {
       <div className="dryrun-banner">
         The fees the autopilot applies when <strong>Fee automation</strong> is on — protect nearly-drained
         channels, price draining channels toward what refilling them costs, keep a price that wins flow, react to
-        real demand. Each update moves a fee by a small, bounded step toward its aim (protecting a drained channel
+        {" "}{POSSIBLE_DEMAND_BANNER}. Each update moves a fee by a small, bounded step toward its aim (protecting a drained channel
         ramps faster). A fee goes up only when something says the channel drains, or a floor or your min needs it —
         never just back toward your balanced level. Only these move in one update: an idle channel dropping to the
         price that last won it flow or to what the market charges into its peer, a fee you pinned, a new
@@ -155,14 +173,7 @@ export function FeeRecommendations() {
                 </span>
               ) : null;
             })()}
-            {(() => {
-              const refusing = data.recommendations.filter((r) => r.metrics.inDemand).length;
-              return refusing ? (
-                <span className="feerec-chip s-protect" title="Turned real payments away for lack of outbound (probes and retries excluded)">
-                  {refusing} turning payments away
-                </span>
-              ) : null;
-            })()}
+            <InDemandChip count={data.recommendations.filter((r) => r.metrics.inDemand).length} />
             <span className="feerec-bench muted">
               node median {data.nodeBenchmarks.medianGrossFlow14d.toFixed(2)}× flow/14d ·{" "}
               {Math.round(data.nodeBenchmarks.medianRevenuePpm30d)} ppm earned (median)
@@ -269,15 +280,19 @@ export function FeeRecommendations() {
                                   {m.belowReplacement ? " · sold below it" : ""}
                                 </span>
                                 <span>
-                                  cost basis <b>{m.costBasisPpm != null ? `${m.costBasisPpm} ppm` : "—"}</b>
+                                  refills still here <b>{m.costBasisPpm != null ? `${satsCompact(m.refillRemainingSats)} at ${m.costBasisPpm} ppm` : "—"}</b>
                                   {m.costBasisPpm != null
-                                    ? ` (${m.costBasisRefills} autopilot refill${m.costBasisRefills === 1 ? "" : "s"}, 30 d${m.costBasisLatestAt ? `, latest ${timeAgo(m.costBasisLatestAt)}` : ""})`
+                                    ? ` (${m.costBasisRefills} autopilot refill${m.costBasisRefills === 1 ? "" : "s"}${m.costBasisLatestAt ? `, latest ${timeAgo(m.costBasisLatestAt)}` : ""})`
                                     : ""}
-                                  {m.profitFloorPpm != null ? ` · floor ${m.profitFloorPpm}${m.profitFloorCapped ? " (capped at max)" : ""}` : ""}
+                                  {m.profitFloorPpm != null
+                                    ? ` · floor ${m.profitFloorPpm}${m.refillHoldPpm != null ? " (the refill's value, until its sats have routed out)" : ""}${m.profitFloorCapped ? " (capped at max)" : ""}`
+                                    : m.profitFloorReleased
+                                      ? " · floor released (low flow)"
+                                      : ""}
                                 </span>
                                 {m.refusedAttempts14d ? (
                                   <span>
-                                    turned away <b>{m.refusedAttempts14d} payments</b> ({satsCompact(m.refusedSats14d)} sat, {m.refusedDays14d} d) in 14 d
+                                    possible demand <b>{m.refusedAttempts14d} refused HTLCs</b> ({satsCompact(m.refusedSats14d)} sat, {m.refusedDays14d} d) in 14 d
                                   </span>
                                 ) : null}
                                 {m.elasticityMod !== 1 ? <span>elasticity <b>×{m.elasticityMod}</b> (measured)</span> : null}

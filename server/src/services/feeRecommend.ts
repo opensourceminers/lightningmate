@@ -134,6 +134,8 @@ export const RAMP_STEPS = 4;
 const MAX_ELASTIC_STEP = 1.5;
 /** The profit floor comes from the autopilot's own refills of this window. */
 export const FLOOR_WINDOW_DAYS = 30;
+/** Where the refills the profit floor can stand on start (ms). */
+export const floorWindowStart = (nowMs = Date.now()): number => nowMs - FLOOR_WINDOW_DAYS * 86_400_000;
 /** De-noised refusals (D20) that make a channel "in demand": at least this
  *  many distinct attempts, on at least this many days, in the window. */
 export const DEMAND_MIN_ATTEMPTS = 3;
@@ -251,6 +253,14 @@ export interface FeeRecMetrics {
   /** How many refills that is, and when the latest was. */
   costBasisRefills: number;
   costBasisLatestAt: string | null;
+  /** Refilled sats still in the channel (not routed out yet). */
+  refillRemainingSats: number;
+  /** The price a refill's floor holds — what the profit gate valued it at
+   *  (null: no hold in force). */
+  refillHoldPpm: number | null;
+  /** The floor was released: the refilled sats sat a week on a channel
+   *  routing next to nothing (LOW_FLOW_*). */
+  profitFloorReleased: boolean;
   /** The floor in force (capped at maxPpm unless the operator opted in). */
   profitFloorPpm: number | null;
   profitFloorCapped: boolean;
@@ -275,7 +285,9 @@ export interface FeeRecMetrics {
   /** This fee next to the market into the peer. */
   marketComparison: "above" | "in_line" | "below" | null;
   draining: boolean;
-  /** De-noised payments turned away for lack of outbound (D20), 14 days. */
+  /** Possible demand (D20), 14 days: HTLCs refused for lack of outbound that
+   *  a refilled channel could have carried — de-noised (no probes, same-amount
+   *  retries or HTLCs over half the channel). Not proven payments. */
   refusedAttempts14d: number;
   refusedSats14d: number;
   refusedDays14d: number;
@@ -421,35 +433,182 @@ function channelAgeDays(channelId: string, currentBlock: number): number | null 
   return Math.round(((currentBlock - block) / 144) * 10) / 10; // ~144 blocks/day
 }
 
-// ── §7 profit floor from rebalance cost basis ─────────────────────────────────
+// ── §7 profit floor from the refills still in the channel ────────────────────
 /**
- * What refilling this channel cost: the autopilot's own successful refills of
- * the last FLOOR_WINDOW_DAYS (review a1: a lifetime average, manual refills
- * at any price included, pinned a channel's fee for months after a single
- * 614 ppm refill). A refill the operator ran by hand chose its own price and
- * skipped the profit gate: it sets no floor.
+ * One refill into a channel that passed the profit gate (refillLots), as far
+ * as its sats are still there.
+ *
+ * The floor is about liquidity that was PAID for and has not routed out yet
+ * (review a2, sunk-cost-profit-floor): once a refill's sats have left the
+ * channel, what they cost is spent and history — it must not price the
+ * channel's other liquidity out. Before, every refill of the window counted
+ * in full until it aged out, so one pricey refill whose sats were long gone
+ * kept the channel above its market for a month.
  */
-export function costBasisFor(
-  channelId: string,
-  records: RebalanceRecord[],
-  nowMs: number,
-): { ppm: number; refills: number; latestAt: string } | null {
+export interface RefillLot {
+  /** When the refill was sent. */
+  at: string;
+  amountSats: number;
+  feeSats: number;
+  costPpm: number;
+  /** What the profit gate valued it at (refills before P3 carry none). */
+  holdPpm: number | null;
+  /** Its sats not yet routed out (first in, first out) — the whole amount
+   *  for a refill recorded without the channel's sent counter. */
+  remainingSats: number;
+}
+
+/** A refill whose sats haven't moved for this long … */
+export const LOW_FLOW_GRACE_DAYS = 7;
+/** … on a channel with fewer forwards out than this in 14 days … */
+export const LOW_FLOW_FORWARDS = 3;
+/** … at this local ratio or more no longer floors the fee: its price is not
+ *  what moves the liquidity (review a2: one forward a month kept a floor). */
+export const LOW_FLOW_LOCAL_RATIO = 0.4;
+
+/**
+ * The successful refills into a channel that passed the profit gate, in the
+ * last FLOOR_WINDOW_DAYS (review a1: a lifetime average, manual refills at
+ * any price included, pinned a channel's fee for months after one 614 ppm
+ * refill), oldest first, each with the sats of it still in the channel: the
+ * autopilot's, and those run by hand from a recommended row — the gate went
+ * with them (their payment was capped by it at every size), and they carry
+ * its value (holdPpm). The Rebalancing tab promises the refilled fee is kept
+ * until the sats have routed out, whoever pressed Run (review of P3: a
+ * manual run from the tab got no hold, and the engine could cut the fee
+ * right after it). A refill run by hand without the gate chose its own price
+ * and skipped the check: it sets no floor.
+ *
+ * Retirement is first in, first out on LND's lifetime "sent" counter of the
+ * channel: each refill records the counter just before it was paid
+ * (targetSentBefore), so what left the channel between two refills — and
+ * since the last one — is exact, whatever carried it out (a forward, a
+ * payment). A refill recorded without the counter (before P3) retires only
+ * by age, or by outflow measured from a later refill.
+ */
+export function refillLots(channelId: string, records: RebalanceRecord[], sentNow: number | null | undefined, nowMs: number): RefillLot[] {
   const cutoff = nowMs - FLOOR_WINDOW_DAYS * DAY_MS;
-  let fee = 0;
-  let amount = 0;
-  let refills = 0;
-  let latestAt = "";
-  for (const r of records) {
-    if (!r.ok || r.targetId !== channelId || r.feeSats == null || r.amountSats <= 0) continue;
-    if (r.via === "manual") continue;
-    const at = Date.parse(r.at);
-    if (!Number.isFinite(at) || at < cutoff) continue;
-    fee += r.feeSats;
-    amount += r.amountSats;
-    refills += 1;
-    if (r.at > latestAt) latestAt = r.at;
+  const gated = (r: RebalanceRecord) => r.via !== "manual" || (typeof r.holdPpm === "number" && r.holdPpm > 0);
+  const refills = records
+    .filter((r) => r.ok && gated(r) && r.targetId === channelId && r.feeSats != null && r.amountSats > 0)
+    .map((r) => ({ r, t: Date.parse(r.startedAt ?? r.at) }))
+    .filter(({ t }) => Number.isFinite(t) && t >= cutoff)
+    .sort((a, b) => a.t - b.t);
+  const lots: RefillLot[] = refills.map(({ r }) => ({
+    at: r.startedAt ?? r.at,
+    amountSats: r.amountSats,
+    feeSats: r.feeSats as number,
+    costPpm: Math.round(((r.feeSats as number) / r.amountSats) * 1_000_000),
+    holdPpm: typeof r.holdPpm === "number" && r.holdPpm > 0 ? Math.round(r.holdPpm) : null,
+    remainingSats: r.amountSats,
+  }));
+  if (typeof sentNow !== "number" || !Number.isFinite(sentNow)) return lots;
+  const baseline = (i: number): number | null => {
+    const b = refills[i].r.targetSentBefore;
+    return typeof b === "number" && Number.isFinite(b) ? b : null;
+  };
+  for (let i = 0; i < lots.length; i++) {
+    const from = baseline(i);
+    if (from === null) continue;
+    // What left the channel from this refill until the next measured one
+    // (or now) is taken from the refills it had by then, oldest first.
+    let until = sentNow;
+    for (let j = i + 1; j < lots.length; j++) {
+      const b = baseline(j);
+      if (b !== null) {
+        until = b;
+        break;
+      }
+    }
+    let out = Math.max(0, until - from);
+    for (let k = 0; k <= i && out > 0; k++) {
+      const take = Math.min(lots[k].remainingSats, out);
+      lots[k].remainingSats -= take;
+      out -= take;
+    }
   }
-  return amount > 0 ? { ppm: Math.round((fee / amount) * 1_000_000), refills, latestAt } : null;
+  return lots;
+}
+
+/** The floor the refills still in a channel set (null: none left). */
+export interface RefillFloor {
+  /** max of: what the pre-P3 refills cost on average × safetyMargin, and
+   *  each newer refill's max(gate value, cost × safetyMargin). */
+  ppm: number;
+  /** The refill that sets it. */
+  binding: RefillLot;
+  /** Its floor comes from the profit gate's value (a hold), not its cost. */
+  held: boolean;
+  /** The refills still (partly) in the channel, and their sats. */
+  lots: RefillLot[];
+  remainingSats: number;
+  /** What the sats still here cost, on average (ppm). */
+  costPpm: number;
+  /** The refills from before the gate recorded its value, still here: how
+   *  many, their average cost (ppm) and the latest (null: none). */
+  legacy: { refills: number; costPpm: number; latestAt: string } | null;
+}
+
+export function refillFloor(lots: RefillLot[], safetyMargin: number): RefillFloor | null {
+  const left = lots.filter((l) => l.remainingSats > 0);
+  if (left.length === 0) return null;
+  const share = (l: RefillLot) => l.remainingSats / l.amountSats;
+  const remainingSats = left.reduce((s, l) => s + l.remainingSats, 0);
+  const costPpm = Math.round((left.reduce((s, l) => s + l.feeSats * share(l), 0) / remainingSats) * 1_000_000);
+  // Refills from before the profit gate recorded its value: their average
+  // cost × the margin (P2's floor, unchanged for them).
+  const old = left.filter((l) => l.holdPpm === null);
+  let ppm = 0;
+  let binding = left[left.length - 1];
+  let held = false;
+  let legacy: RefillFloor["legacy"] = null;
+  if (old.length) {
+    const sats = old.reduce((s, l) => s + l.remainingSats, 0);
+    const avg = Math.round((old.reduce((s, l) => s + l.feeSats * share(l), 0) / sats) * 1_000_000);
+    legacy = { refills: old.length, costPpm: avg, latestAt: old[old.length - 1].at };
+    ppm = Math.round(avg * safetyMargin);
+    binding = old[old.length - 1];
+  }
+  // A newer refill holds the price the gate valued it at while its sats are
+  // here — and never less than its cost × the margin.
+  for (const l of left) {
+    if (l.holdPpm === null) continue;
+    const byCost = Math.round(l.costPpm * safetyMargin);
+    const own = Math.max(l.holdPpm, byCost);
+    if (own > ppm) {
+      ppm = own;
+      binding = l;
+      held = l.holdPpm >= byCost;
+    }
+  }
+  return { ppm, binding, held, lots: left, remainingSats, costPpm, legacy };
+}
+
+/** "750k", "1.25M" — a refill's size in a reason line. */
+const satsShort = (n: number): string =>
+  n >= 1_000_000 ? `${Math.round(n / 10_000) / 100}M` : n >= 1_000 ? `${Math.round(n / 1_000)}k` : `${n} sat`;
+
+/**
+ * What the profit floor stands on, as the reason line states it (without a
+ * cap or ramp). Refills from before the gate recorded its value read as
+ * before: their average cost × the margin. A newer one says when it was
+ * paid, what the profit gate valued it at (the price it is held at) or what
+ * it cost, and how much of it is still in the channel — the floor ends when
+ * that has routed out.
+ */
+function floorFact(f: RefillFloor, cfg: Pick<FeeRecConfig, "safetyMargin">, nowMs: number): string {
+  const l = f.binding;
+  if (l.holdPpm === null && f.legacy) {
+    return (
+      `profit floor: the autopilot's refills into it cost ${f.legacy.costPpm} ppm (${f.legacy.refills} in ${FLOOR_WINDOW_DAYS} d, latest ${ago(f.legacy.latestAt, nowMs)})` +
+      ` × ${cfg.safetyMargin} = ${f.ppm} ppm`
+    );
+  }
+  const when = `a refill ${ago(l.at, nowMs)} (${l.at.slice(0, 10)})`;
+  const still = `${satsShort(l.remainingSats)} of its ${satsShort(l.amountSats)} still here — the floor ends when that has routed out (at most ${FLOOR_WINDOW_DAYS} d)`;
+  return f.held
+    ? `profit floor: ${when} was worth paying for at ${l.holdPpm} ppm (it cost ${l.costPpm} ppm) = ${f.ppm} ppm; ${still}`
+    : `profit floor: ${when} cost ${l.costPpm} ppm × ${cfg.safetyMargin} = ${f.ppm} ppm; ${still}`;
 }
 
 export interface CooldownInput {
@@ -479,7 +638,55 @@ export async function getFeeRecommendations(
   /** Market references and de-noised refused demand (read here when absent). */
   signals: FeeSignals = {},
 ): Promise<FeeRecReport> {
-  const cfg = { ...FEE_REC_DEFAULTS, ...configOverrides };
+  const run = await runFeeEngine(lnd, {
+    rebalanceRecords,
+    cooldown,
+    configOverrides,
+    channelOverrides,
+    elasticity,
+    flowAnchors,
+    leaseCaps,
+    signals,
+  });
+  return run.report;
+}
+
+/** Everything the fee engine runs on (getFeeRecommendations' arguments). */
+export interface FeeEngineInputs {
+  rebalanceRecords: RebalanceRecord[];
+  cooldown: CooldownInput | null;
+  configOverrides?: Partial<FeeRecConfig>;
+  channelOverrides?: OverrideMap;
+  elasticity?: Map<string, number>;
+  flowAnchors?: Map<string, number>;
+  leaseCaps?: readonly LeaseCap[];
+  signals?: FeeSignals;
+}
+
+/**
+ * One run of the fee engine, with what it saw: the report, the channels, and
+ * each channel's build context — so the rebalancer can ask the SAME engine
+ * what it would do with a channel after a refill (feeAfterRefill) instead of
+ * guessing at it with a copy of its rules (review a2: the profit gate valued
+ * a refill at the drained channel's fee, then the engine cut the fee).
+ */
+export interface FeeEngineRun {
+  report: FeeRecReport;
+  channels: ChannelView[];
+  /** The chain tip the run read (leases are measured by it). */
+  currentBlock: number;
+  /** The channel's context as this run built its recommendation. */
+  contextOf(channelId: string): BuildCtx | undefined;
+}
+
+export async function runFeeEngine(lnd: AuthenticatedLnd, inputs: FeeEngineInputs): Promise<FeeEngineRun> {
+  const { rebalanceRecords, cooldown } = inputs;
+  const channelOverrides = inputs.channelOverrides ?? {};
+  const elasticity = inputs.elasticity ?? new Map<string, number>();
+  const flowAnchors = inputs.flowAnchors ?? new Map<string, number>();
+  const leaseCaps = inputs.leaseCaps ?? [];
+  const signals = inputs.signals ?? {};
+  const cfg = { ...FEE_REC_DEFAULTS, ...(inputs.configOverrides ?? {}) };
   const [channels, rates, fw14, fw30, wallet] = await Promise.all([
     getChannelsView(lnd),
     getFeeRates({ lnd }),
@@ -524,28 +731,32 @@ export async function getFeeRecommendations(
 
   const enoughChannels = active.length >= 5;
 
-  const recommendations = channels.map((ch) =>
-    buildRecommendation(ch, {
-      cfg,
-      rate: rateById.get(ch.id),
-      override: channelOverrides[ch.id],
-      f14: flowOf(f14, ch.id),
-      f30: flowOf(f30, ch.id),
-      currentBlock,
-      records: rebalanceRecords,
-      bench: nodeBenchmarks,
-      enoughChannels,
-      earnerCutoff,
-      cooldown,
-      elasticityMod: elasticity.get(ch.id) ?? 1,
-      flowAnchor: flowAnchors.get(ch.id),
-      leaseCap: activeCap(leaseCaps, { outpoint: `${ch.transactionId}:${ch.transactionVout}`, channelId: ch.id }, currentBlock),
-      demand: demand.get(ch.id),
-      market: market.get(ch.id)?.ref,
-      marketSeenAt: market.get(ch.id)?.seenAt ?? null,
-      nowMs,
-    }),
+  const contexts = new Map<string, BuildCtx>(
+    channels.map((ch) => [
+      ch.id,
+      {
+        cfg,
+        rate: rateById.get(ch.id),
+        override: channelOverrides[ch.id],
+        f14: flowOf(f14, ch.id),
+        f30: flowOf(f30, ch.id),
+        currentBlock,
+        records: rebalanceRecords,
+        bench: nodeBenchmarks,
+        enoughChannels,
+        earnerCutoff,
+        cooldown,
+        elasticityMod: elasticity.get(ch.id) ?? 1,
+        flowAnchor: flowAnchors.get(ch.id),
+        leaseCap: activeCap(leaseCaps, { outpoint: `${ch.transactionId}:${ch.transactionVout}`, channelId: ch.id }, currentBlock),
+        demand: demand.get(ch.id),
+        market: market.get(ch.id)?.ref,
+        marketSeenAt: market.get(ch.id)?.seenAt ?? null,
+        nowMs,
+      },
+    ]),
   );
+  const recommendations = channels.map((ch) => buildRecommendation(ch, contexts.get(ch.id) as BuildCtx));
 
   // §11 max-changes-per-run: every fee that breaks a lease promise first
   // (those are fixed first), then the operator's own pins, then the
@@ -564,13 +775,59 @@ export async function getFeeRecommendations(
   });
 
   return {
-    generatedAt: new Date(nowMs).toISOString(),
-    config: cfg,
-    nodeBenchmarks,
-    marketReferenced: recommendations.filter((r) => r.metrics.marketPpm !== null).length,
-    elasticityLearned: recommendations.filter((r) => r.metrics.elasticityMod !== 1).length,
-    recommendations,
+    report: {
+      generatedAt: new Date(nowMs).toISOString(),
+      config: cfg,
+      nodeBenchmarks,
+      marketReferenced: recommendations.filter((r) => r.metrics.marketPpm !== null).length,
+      elasticityLearned: recommendations.filter((r) => r.metrics.elasticityMod !== 1).length,
+      recommendations,
+    },
+    channels,
+    currentBlock,
+    contextOf: (channelId) => contexts.get(channelId),
   };
+}
+
+/**
+ * What the fee engine does with a channel after a refill — its own rules, on
+ * the refilled balance, with the refill on its books as the autopilot will
+ * record it: a lot of `amountSats` that cost `feeSats`, held at `holdPpm`
+ * while its sats are in the channel (refillLots). The profit gate values a
+ * refill at the fee this says the channel will charge (review a2: it valued
+ * it at the drained channel's fee, and the engine then cut the fee at the
+ * next update — "+167 sat expected" netted ~+35).
+ */
+export function feeAfterRefill(
+  ch: ChannelView,
+  ctx: BuildCtx,
+  refill: { amountSats: number; feeSats: number; holdPpm: number | null },
+): FeeRecommendation {
+  const settled = ch.localBalance + ch.remoteBalance;
+  const local = Math.min(settled, ch.localBalance + refill.amountSats);
+  const after: ChannelView = {
+    ...ch,
+    localBalance: local,
+    remoteBalance: settled - local,
+    localRatio: settled > 0 ? local / settled : 0,
+  };
+  const lot: RebalanceRecord = {
+    at: new Date(ctx.nowMs).toISOString(),
+    via: "autopilot",
+    targetId: ch.id,
+    targetAlias: ch.peerAlias,
+    sourceId: "",
+    sourceAlias: "",
+    amountSats: refill.amountSats,
+    budgetPpm: 0,
+    feeSats: refill.feeSats,
+    costPpm: refill.amountSats > 0 ? Math.round((refill.feeSats / refill.amountSats) * 1_000_000) : null,
+    ok: true,
+    targetSentBefore: ch.totalSent,
+    ...(refill.holdPpm !== null ? { holdPpm: refill.holdPpm } : {}),
+  };
+  // (No cooldown: where the fee goes, not whether this update may move it.)
+  return buildRecommendation(after, { ...ctx, records: [lot, ...ctx.records], cooldown: null });
 }
 
 export interface RateInfo {
@@ -581,7 +838,11 @@ export interface RateInfo {
 }
 
 /** What buildRecommendation needs of a channel. */
-export type FeeChannel = Pick<ChannelView, "id" | "peerAlias" | "capacity" | "localRatio" | "role" | "active">;
+export type FeeChannel = Pick<ChannelView, "id" | "peerAlias" | "capacity" | "localRatio" | "role" | "active"> & {
+  /** LND's lifetime "sent" counter of the channel — retires refilled sats as
+   *  they route out (refillLots). Unknown: refills retire only by age. */
+  totalSent?: number;
+};
 
 export interface BuildCtx {
   cfg: FeeRecConfig;
@@ -662,18 +923,29 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const revenuePpm30d = f30.out > 0 ? Math.round((f30.revenue / f30.out) * 1_000_000) : null;
   const ageDays = channelAgeDays(ch.id, ctx.currentBlock);
   const isNewChan = ageDays != null && ageDays < cfg.newChannelProtectionDays;
-  const basis = costBasisFor(ch.id, records, ctx.nowMs);
-  const costBasisPpm = basis?.ppm ?? null;
-  const rawFloor = costBasisPpm != null ? Math.round(costBasisPpm * cfg.safetyMargin) : null;
+  // The refills still in the channel set the profit floor (refillLots).
+  const refill = refillFloor(refillLots(ch.id, records, ch.totalSent, ctx.nowMs), cfg.safetyMargin);
+  const costBasisPpm = refill?.costPpm ?? null;
+  // Released under low flow (review a2): refilled sats that sat a week on a
+  // channel routing next to nothing, at a healthy local ratio, are not moved
+  // by holding their price — before, one forward a month kept a floor.
+  const newestRefillMs = refill ? Math.max(...refill.lots.map((l) => Date.parse(l.at))) : NaN;
+  const floorReleased =
+    !!refill &&
+    ctx.nowMs - newestRefillMs >= LOW_FLOW_GRACE_DAYS * DAY_MS &&
+    f14.forwards < LOW_FLOW_FORWARDS &&
+    ch.localRatio >= LOW_FLOW_LOCAL_RATIO;
+  const rawFloor = refill && !floorReleased ? refill.ppm : null;
   // A floor above the operator's own ceiling only with their opt-in: one
   // pricey refill used to lift a channel past maxPpm in a single move.
   const profitFloorCapped = rawFloor != null && !cfg.floorAboveMax && rawFloor > cfg.maxPpm;
   const profitFloorPpm = rawFloor == null ? null : profitFloorCapped ? cfg.maxPpm : rawFloor;
   const isTopEarner = enoughChannels && f30.revenue > 0 && f30.revenue >= earnerCutoff;
 
-  // D20 — payments turned away for lack of outbound, de-noised (no probes,
-  // retries or HTLCs no refill could carry). Repeated ones mean the channel
-  // has demand even without a successful forward: it is not "idle".
+  // D20 — possible demand: HTLCs refused for lack of outbound, de-noised (no
+  // probes, retries or HTLCs no refill could carry). Repeated ones mean the
+  // channel likely has demand even without a successful forward: it is not
+  // "idle".
   const demand = ctx.demand;
   const inDemand = !!demand && demand.attempts >= DEMAND_MIN_ATTEMPTS && demand.days >= DEMAND_MIN_DAYS;
   // Nobody routed through it in 30 days (and it isn't new, and it isn't
@@ -899,11 +1171,22 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const from = currentPpm;
   const elasticStep = ctx.elasticityMod > 1 ? Math.min(MAX_ELASTIC_STEP, ctx.elasticityMod) : 1;
   const raiseStep = RAISE_STEPS * step * elasticStep;
+  // The most any channel is lowered in one move: its ratchet's steps (at
+  // least one).
+  const lowerStep = Math.max(1, cfg.noFlowRatchetSteps) * step;
   if (target > from + raiseStep) {
     target = from + raiseStep;
     kind = "raise_step";
     hiLimit = from + raiseStep;
   }
+  // A move the step rules set never ends past its own bound or its aim —
+  // also one within a single step ("free"), which the rounding below could
+  // otherwise stretch by up to half a step (P2 final review: 95 → 120 under
+  // "pricing toward 115 ppm", 246 → 175 under "lowering toward 178 ppm, not
+  // below"). The floors, the no-flow rule and the range rule below set their
+  // own limits where they take over.
+  if (target > currentPpm) hiLimit = Math.min(hiLimit, from + raiseStep, aim);
+  else if (target < currentPpm) loLimit = Math.max(loLimit, currentPpm - lowerStep, aim);
   // A drained channel nobody routes through is never raised: there is no
   // flow to slow, and it would sit at a high fee once it refills (review a1:
   // 80 → 900 ppm in one update, then stuck at 590 after a refill).
@@ -955,7 +1238,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const liftTo = (floor: number): number =>
     floor > currentPpm ? Math.min(floor, currentPpm < cfg.minPpm ? cfg.minPpm : currentPpm + RAMP_STEPS * step) : floor;
   // (An idle channel's floor would be overridden by the no-flow rule below.)
-  if (profitFloorPpm != null && basis && profitFloorPpm > target && !idle) {
+  if (profitFloorPpm != null && refill && profitFloorPpm > target && !idle) {
     const ramped = liftTo(profitFloorPpm);
     // It leads when its ramp IS this move. One below the current fee only
     // stops a lowering short of it — that lowering's own rule leads; one that
@@ -974,12 +1257,16 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     hardFloor = Math.max(hardFloor, ramped);
     aimCeiling = Math.max(aimCeiling, profitFloorPpm);
     floored = "recovering_cost";
-    const fact =
-      `profit floor: the autopilot's refills into it cost ${costBasisPpm} ppm (${basis.refills} in ${FLOOR_WINDOW_DAYS} d, latest ${ago(basis.latestAt, ctx.nowMs)})` +
-      ` × ${cfg.safetyMargin} = ${rawFloor} ppm${profitFloorCapped ? ` — capped at your max ${cfg.maxPpm} ppm` : ""}`;
+    const fact = floorFact(refill, cfg, ctx.nowMs) + (profitFloorCapped ? ` — capped at your max ${cfg.maxPpm} ppm` : "");
     const line = fact + (lifts && ramped < profitFloorPpm ? ` — ramping ${currentPpm}→${ramped}` : "");
     if (lifts) dominant(claim(line, fact, line === fact ? 0 : 1));
     else reasons.push(profitFloorPpm <= currentPpm ? claim(`${line} — not lowered below it`, fact) : line);
+  }
+  if (floorReleased && refill && !idle) {
+    reasons.push(
+      `profit floor released: ${satsShort(refill.remainingSats)} of refills still here, but under ${LOW_FLOW_FORWARDS} forwards out in ` +
+        `${cfg.flowWindowDays} d at ${Math.round(ch.localRatio * 100)}% local — holding their price (${refill.ppm} ppm) isn't moving them`,
+    );
   }
   // Protect only a drained channel that is STILL in demand — a modest bump to
   // slow the bleed, never a flat ceiling. In demand: it forwarded in the
@@ -1012,10 +1299,6 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     if (lifts) dominant(claim(ramped < cfg.protectPpm ? toward : `${fact} — modest bump`, fact, 1));
     else reasons.push(ramped < cfg.protectPpm ? claim(toward, fact, 1) : claim(`${fact} — kept at ${cfg.protectPpm} ppm or more`, fact));
   }
-
-  // The most any channel is lowered in one move: its ratchet's steps (at
-  // least one).
-  const lowerStep = Math.max(1, cfg.noFlowRatchetSteps) * step;
 
   // No routing → lower (the core volume-first safety): a channel that hasn't
   // routed in the benchmark window gets cheaper, toward minPpm, to win flow
@@ -1160,7 +1443,11 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   }
 
   if (inDemand && demand) {
-    const line = `demand: turned away ${demand.attempts} payments (${demand.sats.toLocaleString("en-US")} sat, ${demand.days} days) in ${DEMAND_WINDOW_DAYS} d for lack of outbound — probes and retries excluded`;
+    // Possible demand, not proven payments (D20; P3 review): refused HTLCs a
+    // refilled channel could have carried, after the de-noising.
+    const line =
+      `possible demand: ${demand.attempts} refused HTLCs (${demand.sats.toLocaleString("en-US")} sat, ${demand.days} days) in ${DEMAND_WINDOW_DAYS} d ` +
+      `a refilled channel could have carried — probes, same-amount retries and HTLCs over half the channel excluded`;
     // First only when it is what kept the fee where it is — it kept the
     // channel from being lowered as idle. A fee that moves all the same moves
     // for its own rule, which leads (a bounded step down the curve; the curve
@@ -1422,8 +1709,11 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
       revenuePpm30d,
       costBasisPpm,
       costBasisSource: costBasisPpm != null ? "rebalance_avg" : "unknown",
-      costBasisRefills: basis?.refills ?? 0,
-      costBasisLatestAt: basis?.latestAt ?? null,
+      costBasisRefills: refill?.lots.length ?? 0,
+      costBasisLatestAt: refill ? refill.lots[refill.lots.length - 1].at : null,
+      refillRemainingSats: refill?.remainingSats ?? 0,
+      refillHoldPpm: refill && refill.held && !floorReleased ? refill.binding.holdPpm : null,
+      profitFloorReleased: floorReleased,
       profitFloorPpm,
       profitFloorCapped,
       peerGate,

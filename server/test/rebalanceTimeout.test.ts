@@ -82,15 +82,17 @@ test("an in-flight rebalance counts its maximum fee against today's budget at on
   });
   const saved = () =>
     JSON.parse(readFileSync(join(dir, "autopilot.json"), "utf8")) as {
-      perDayRebalanceSpend?: { sats: number };
       pendingRebalances?: unknown[];
       perTargetRebalanceFails?: Record<string, number>;
+      perPairRebalanceFails?: Record<string, unknown>;
     };
   const run = await autopilot.runOnce();
   assert.match(run.rebalances[0]?.error ?? "", /in flight/);
-  assert.equal(saved().perDayRebalanceSpend?.sats, 40, "the most it can cost is spent until we know better");
+  assert.equal(autopilot.rebalanceBudget().spentSats, 40, "the most it can cost is spent until we know better");
+  assert.equal(autopilot.rebalanceBudget().inFlightSats, 40);
   assert.equal(saved().pendingRebalances?.length, 1);
   assert.equal(saved().perTargetRebalanceFails?.["800001x1x0"], undefined, "not a failure (yet)");
+  assert.deepEqual(saved().perPairRebalanceFails ?? {}, {}, "no pair backs off for it either");
 
   const status = autopilot as unknown as { rebalancePaymentStatus: (id: string) => Promise<unknown> };
   status.rebalancePaymentStatus = async () => ({ state: "pending" });
@@ -100,11 +102,11 @@ test("an in-flight rebalance counts its maximum fee against today's budget at on
 
   status.rebalancePaymentStatus = async () => ({ state: "confirmed", feeSats: 12 });
   await autopilot.runOnce();
-  assert.equal(saved().perDayRebalanceSpend?.sats, 12, "corrected to the real fee");
+  assert.equal(autopilot.rebalanceBudget().spentSats, 12, "corrected to the real fee");
   assert.equal(saved().pendingRebalances?.length, 0);
 });
 
-test("a failed in-flight rebalance gives its fee back to today's budget", async (t) => {
+test("a failed in-flight rebalance gives its fee back to today's budget — and backs off its source → target pair, as a failure there does", async (t) => {
   const { autopilot, seams, dir } = autopilotWith(t, { rebalanceEnabled: true, rebalanceDailyBudgetSats: 1_000 });
   seams.rebalanceReport = async () => ({ recommendations: [plannedRebalance("800001x1x0", 500)] });
   seams.rebalanceExec = async (_w, p) => ({ ...failedRebalance(p), inFlight: { paymentId: "cd".repeat(32), maxFeeSats: 40 } });
@@ -112,8 +114,13 @@ test("a failed in-flight rebalance gives its fee back to today's budget", async 
   (autopilot as unknown as { rebalancePaymentStatus: () => Promise<unknown> }).rebalancePaymentStatus = async () => ({ state: "failed" });
   seams.rebalanceReport = async () => ({ recommendations: [] });
   await autopilot.runOnce();
-  const s = JSON.parse(readFileSync(join(dir, "autopilot.json"), "utf8")) as { perDayRebalanceSpend?: { sats: number } };
-  assert.equal(s.perDayRebalanceSpend?.sats, 0);
+  assert.equal(autopilot.rebalanceBudget().spentSats, 0);
+  const s = JSON.parse(readFileSync(join(dir, "autopilot.json"), "utf8")) as {
+    pendingRebalances?: unknown[];
+    perPairRebalanceFails?: Record<string, { fails: number }>;
+  };
+  assert.deepEqual(s.pendingRebalances, []);
+  assert.equal(s.perPairRebalanceFails?.["800000x1x0>800001x1x0"]?.fails, 1, "the pair whose payment failed backs off");
 });
 
 test("a slow rebalance payment doesn't hold up the Magma order lane", async (t) => {
@@ -156,14 +163,11 @@ test("a payment left in flight is reconciled on the next run even with rebalanci
   autopilot.setConfig({ rebalanceEnabled: false });
   (autopilot as unknown as { rebalancePaymentStatus: () => Promise<unknown> }).rebalancePaymentStatus = async () => ({ state: "confirmed", feeSats: 9 });
   await autopilot.runOnce(); // a fee run; rebalancing is off
-  const s = JSON.parse(readFileSync(join(dir, "autopilot.json"), "utf8")) as {
-    pendingRebalances?: unknown[];
-    perDayRebalanceSpend?: { sats: number };
-  };
+  const s = JSON.parse(readFileSync(join(dir, "autopilot.json"), "utf8")) as { pendingRebalances?: unknown[] };
   // Before: reconciled only inside the rebalance stage — with rebalancing
   // off, the 40 sat stayed charged and the payment pending, indefinitely.
   assert.equal(s.pendingRebalances?.length, 0);
-  assert.equal(s.perDayRebalanceSpend?.sats, 9, "the real fee, not the maximum");
+  assert.equal(autopilot.rebalanceBudget().spentSats, 9, "the real fee, not the maximum");
 });
 
 test("a channel with a payment still in flight is not rebalanced again — target or source — even after its cooldown", async (t) => {
@@ -196,7 +200,7 @@ test("a channel with a payment still in flight is not rebalanced again — targe
   assert.equal(paid.length, 2);
 });
 
-test("a manual rebalance still in flight is tracked: logged as it really ended (not as a failure), and never charged to the autopilot's budget", async (t) => {
+test("a manual rebalance still in flight is tracked: logged as it really ended (not as a failure), and counted in the daily budget at its maximum fee until then", async (t) => {
   t.mock.method(console, "log", () => undefined);
   // A main run refreshes Amboss's public sale history in the background.
   installFetchMock(t).onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
@@ -221,16 +225,16 @@ test("a manual rebalance still in flight is tracked: logged as it really ended (
   const saved = () =>
     JSON.parse(readFileSync(join(api.dir, "autopilot.json"), "utf8")) as {
       pendingRebalances?: { via?: string }[];
-      perDayRebalanceSpend?: { sats: number };
     };
   // Before: logged ok:false at once and never looked at again — a payment
   // that landed later stayed "failed", its fee missing from P&L.
   assert.deepEqual(await records(), [], "not logged as failed: it may still land");
   assert.deepEqual(saved().pendingRebalances?.map((p) => p.via), ["manual"]);
-  assert.equal(saved().perDayRebalanceSpend?.sats ?? 0, 0, "the autopilot's daily budget is the autopilot's");
+  // One daily budget for every refill (review a2: manual runs bypassed it).
+  assert.equal(api.autopilot.rebalanceBudget().spentSats, 40, "its maximum fee counts until LND knows");
 
   // Meanwhile the autopilot leaves both of its channels alone — and pays
-  // for a move elsewhere (7 sat) out of its own daily budget.
+  // for a move elsewhere (7 sat) out of the same daily budget.
   api.autopilot.setConfig({ rebalanceEnabled: true, rebalanceDailyBudgetSats: 1_000 });
   ap.rebalanceReport = async () => ({ recommendations: [plannedRebalance("800001x1x0", 500), plannedRebalance("800003x1x0", 400)] });
   const autopilotPayments: string[] = [];
@@ -241,7 +245,7 @@ test("a manual rebalance still in flight is tracked: logged as it really ended (
   ap.rebalancePaymentStatus = async () => ({ state: "pending" });
   await api.autopilot.runOnce();
   assert.deepEqual(autopilotPayments, ["800003x1x0"], "no second move on a channel whose payment may still land");
-  assert.equal(saved().perDayRebalanceSpend?.sats, 7);
+  assert.equal(api.autopilot.rebalanceBudget().spentSats, 47);
 
   // With every automation off there is no main run: the in-flight check
   // (every few minutes, whenever writing is possible) asks LND instead.
@@ -258,5 +262,5 @@ test("a manual rebalance still in flight is tracked: logged as it really ended (
   assert.equal(rec?.feeSats, 12, "with its real fee (P&L)");
   assert.equal(rec?.sourceId, "800002x1x0");
   assert.deepEqual(saved().pendingRebalances, []);
-  assert.equal(saved().perDayRebalanceSpend?.sats, 7, "the autopilot's budget holds the autopilot's 7 sat — nothing of the manual one");
+  assert.equal(api.autopilot.rebalanceBudget().spentSats, 19, "the manual refill's real 12 sat and the autopilot's 7");
 });

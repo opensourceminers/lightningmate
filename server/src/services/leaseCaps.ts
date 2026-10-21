@@ -134,6 +134,29 @@ export function activeCap(
   return found;
 }
 
+/**
+ * A channel this node sold (Magma, LSPS1) — with or without a routing-fee
+ * promise. Its liquidity is the inbound the buyer paid for until the lease
+ * ends: the rebalancer never pulls from it (review a2 — pushing our balance
+ * out through it hands the buyer's inbound back to them, unpaid).
+ */
+export interface SoldLease {
+  /** "txid:vout" of the sold channel. */
+  fundingOutpoint: string;
+  source: LeaseCap["source"];
+  orderId: string;
+  /** Blocks after funding the lease runs (absent on record: 4,320). */
+  leaseBlocks: number;
+}
+
+/** Whether a sold channel is still inside its lease — measured as the fee
+ *  promise is (leaseEndHeight); one not confirmed yet always is. */
+export function leaseRunning(lease: Pick<SoldLease, "source" | "leaseBlocks">, channelId: string | null | undefined, currentHeight: number): boolean {
+  const funded = fundingHeight(channelId);
+  if (funded === null || currentHeight <= 0) return true;
+  return currentHeight < leaseEndHeight(lease, funded);
+}
+
 /** A fee within a promise: never above its caps. */
 export function clampToCap(
   fee: { feeRatePpm: number; baseFeeMsat: number },

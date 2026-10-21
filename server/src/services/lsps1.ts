@@ -30,7 +30,7 @@ import { saleFeeConfig, type ServiceFeeLedger } from "./serviceFee.js";
 import { couldNotConnect, ensureConnected, fundChannel, isPendingChannelsLimit, isPreBroadcastRefusal } from "./channelOps.js";
 import { cancelHodl, createHodl, newHodlSecret, settleHodl } from "./hodl.js";
 import { CapitalLedger, channelsWith, findOpenedChannel, spendableOnchain, type Reservation } from "./capital.js";
-import { leaseCapFrom, type LeaseCap, type OfferFeeCaps } from "./leaseCaps.js";
+import { leaseCapFrom, type LeaseCap, type OfferFeeCaps, type SoldLease } from "./leaseCaps.js";
 
 /**
  * LSP mode — LSPS1 (bLIP-51) channel selling over LSPS0 (bLIP-50) transport.
@@ -313,7 +313,21 @@ export class Lsps1Service {
       deployedSat: () => this.deployedSat(),
       claimedOutpoints: () => this.orders.map((o) => o.channel?.fundingOutpoint ?? ""),
       leaseCaps: () => this.leaseCaps(),
+      soldLeases: () => this.soldLeases(),
     });
+  }
+
+  /** Every channel this service sold whose lease may still run, promise or
+   *  not (the rebalancer never pulls from them). */
+  soldLeases(): SoldLease[] {
+    return this.orders
+      .filter((o) => o.orderState !== "FAILED" && !!o.channel?.fundingOutpoint)
+      .map((o) => ({
+        fundingOutpoint: o.channel?.fundingOutpoint as string,
+        source: "lsps1" as const,
+        orderId: o.orderId,
+        leaseBlocks: o.channelExpiryBlocks > 0 ? o.channelExpiryBlocks : 4_320,
+      }));
   }
 
   /** The routing-fee promises of the channels this service sold (a failed

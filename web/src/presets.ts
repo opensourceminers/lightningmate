@@ -7,6 +7,13 @@ import type { AutopilotConfig, AutopilotConfigPatch } from "./types";
  * rebalance economics and which autopilots run — so nothing pulls against the
  * chosen goal. The per-subtab controls still override anything afterwards.
  *
+ * Rebalancing (review a2): a preset sets how much of a refill's expected
+ * earnings its route may cost (econRatio), the per-run limit and the daily fee
+ * budget — the profit check itself decides whether anything runs. At the low
+ * fees "Max routing" sets, a refill rarely clears it (a 100-sat net needs
+ * hundreds of ppm of margin on a typical small-node channel), and its copy
+ * says so instead of promising "loose rebalancing".
+ *
  * No preset touches Magma selling (D9): selling stays off unless the operator
  * switches Liquidity provision on themselves, after seeing whether their node
  * can realistically sell. ("Balanced — Recommended" used to switch selling on,
@@ -28,7 +35,7 @@ export function buildPresets(config: Pick<AutopilotConfig, "policy" | "rebalance
     {
       id: "routing",
       label: "Max routing",
-      desc: "Cheapest fees, zero base, loose rebalancing — win the most forwards.",
+      desc: "Cheapest fees, zero base — win the most forwards. Refills run only when the profit check passes, which is rare at fees this low.",
       cfg: {
         enabled: true,
         rebalanceEnabled: true,
@@ -52,7 +59,7 @@ export function buildPresets(config: Pick<AutopilotConfig, "policy" | "rebalance
     {
       id: "balanced",
       label: "Balanced",
-      desc: "Compete for flow at sensible fees, rebalance when it pays, open channels as funds allow. Recommended.",
+      desc: "Compete for flow at sensible fees, refill a drained channel when the profit check passes, open channels as funds allow. Recommended.",
       cfg: {
         enabled: true,
         rebalanceEnabled: true,
@@ -76,7 +83,7 @@ export function buildPresets(config: Pick<AutopilotConfig, "policy" | "rebalance
     {
       id: "profit",
       label: "Max profit",
-      desc: "Higher fees, strict rebalancing — fewer, richer forwards.",
+      desc: "Higher fees, a strict profit check on refills — fewer, richer forwards.",
       cfg: {
         enabled: true,
         rebalanceEnabled: true,

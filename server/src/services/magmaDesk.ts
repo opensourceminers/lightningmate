@@ -387,6 +387,7 @@ export class MagmaDesk {
       deployedSat: () => this.deployed.sats,
       claimedOutpoints: () => this.journal.claimedOutpoints(),
       leaseCaps: () => this.journal.leaseCaps(),
+      soldLeases: () => this.journal.soldLeases(),
     });
   }
 

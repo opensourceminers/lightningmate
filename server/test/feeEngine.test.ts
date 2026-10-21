@@ -218,7 +218,7 @@ const refill = (o: Partial<RebalanceRecord>): RebalanceRecord => ({
 });
 const routingAt70 = { f14: flow(100_000, 80_000, 6, 8), f30: flow(200_000, 160_000, 12, 16) } as const;
 
-test("the profit floor counts only the autopilot's refills of the last 30 days — a refill 40 days old, or one run by hand at any price, sets none", () => {
+test("the profit floor counts only the refills of the last 30 days that passed the gate — a refill 40 days old, or one run by hand at its own price (without the gate), sets none", () => {
   const ch = chan({ localRatio: 0.7 });
   const old = buildRecommendation(ch, ctx({ ...routingAt70, records: [refill({ at: new Date(NOW - 40 * DAY).toISOString() })] }));
   assert.equal(old.metrics.profitFloorPpm, null, "a 40-day-old refill no longer floors the fee for good");
@@ -279,7 +279,7 @@ test("a pin applies exactly as set — past the threshold, the policy range, the
 
 const demand = (attempts: number, days: number) => ({ attempts, days, sats: attempts * 150_000, medianSats: 150_000 });
 
-test("a channel that keeps turning real payments away is not 'idle': not lowered, not a close candidate — and the Why column says so", () => {
+test("a channel with possible demand — it keeps refusing HTLCs a refill could carry — is not 'idle': not lowered, not a close candidate — and the Why column says so", () => {
   const ch = chan({ localRatio: 0.2 });
   const idle = buildRecommendation(ch, ctx({ ppm: 300 }));
   assert.equal(idle.noFlowLowering, true, "without the signal: lowered as idle");
@@ -294,15 +294,23 @@ test("a channel that keeps turning real payments away is not 'idle': not lowered
   // it led the raise).
   assert.ok(refusing.targetPpm > 300);
   assert.match(refusing.reasons[0], /^balance: low local ratio \(20%\) — higher fee slows the drain/, refusing.reasons.join(" | "));
+  // Possible demand, said as such (D20; P3 review): refused HTLCs, not
+  // "turned away payments" — the de-noising is a heuristic.
   assert.ok(
-    refusing.reasons.includes("demand: turned away 4 payments (600,000 sat, 3 days) in 14 d for lack of outbound — probes and retries excluded; not treated as idle"),
+    refusing.reasons.includes(
+      "possible demand: 4 refused HTLCs (600,000 sat, 3 days) in 14 d a refilled channel could have carried — probes, same-amount retries and HTLCs over half the channel excluded; not treated as idle",
+    ),
     refusing.reasons.join(" | "),
   );
+  assert.ok(!refusing.reasons.some((x) => /turned away|payments/.test(x)), refusing.reasons.join(" | "));
   // At its target ratio, under the balanced level, it is held — the demand is
   // what kept it from the idle channel's step down.
   const kept = buildRecommendation(chan({ localRatio: 0.5 }), ctx({ ppm: 50, demand: demand(4, 3) }));
   assert.deepEqual([kept.targetPpm, kept.noFlowLowering], [50, false]);
-  assert.match(kept.reasons[0], /^demand: turned away 4 payments \(600,000 sat, 3 days\) in 14 d for lack of outbound — probes and retries excluded; not treated as idle/);
+  assert.match(
+    kept.reasons[0],
+    /^possible demand: 4 refused HTLCs \(600,000 sat, 3 days\) in 14 d a refilled channel could have carried — probes, same-amount retries and HTLCs over half the channel excluded; not treated as idle/,
+  );
   // One refusal (a probe that got through the filter) changes nothing.
   assert.equal(buildRecommendation(ch, ctx({ ppm: 300, demand: demand(1, 1) })).noFlowLowering, true);
   // Nor do three on one day.
@@ -533,7 +541,7 @@ test("below its flow-won price an idle channel steps down slowly again — the m
   assert.match(r.reasons[0], /^no flow: nothing routed here recently — lowering toward min/);
 });
 
-test("a channel turning real payments away with no forward in 30 days is lowered only by bounded steps of the curve — never the idle jump or the explore cut — and the curve says why", () => {
+test("a channel with possible demand and no forward in 30 days is lowered only by bounded steps of the curve — never the idle jump or the explore cut — and the curve says why", () => {
   // 60% local at 400 ppm: the curve wants ~70 ppm.
   const r = buildRecommendation(chan({ localRatio: 0.6 }), ctx({ ppm: 400, demand: demand(4, 3), market: market(40) }));
   assert.equal(r.targetPpm, 400 - 3 * STEP, `a bounded step, not the curve's 70 or the market's 36: ${r.reasons.join(" | ")}`);
@@ -541,7 +549,7 @@ test("a channel turning real payments away with no forward in 30 days is lowered
   assert.equal(r.noFlowLowering, false);
   assert.notEqual(r.state, "exploring_lower_fee");
   assert.match(r.reasons[0], /^balance: high local ratio \(60%\) — lower fee invites flow/);
-  assert.ok(r.reasons.some((x) => /^demand: turned away 4 payments .*; not treated as idle$/.test(x)), r.reasons.join(" | "));
+  assert.ok(r.reasons.some((x) => /^possible demand: 4 refused HTLCs .*; not treated as idle$/.test(x)), r.reasons.join(" | "));
   assert.ok(!r.reasons.some((x) => x.startsWith("market:")), "a channel turning payments away keeps the operator's balanced level");
   // 80% local: an idle channel there gets the explore test (×0.85); one
   // turning payments away does not — the curve's own aim, ~49 → 50.
@@ -986,20 +994,20 @@ function assertNoContradiction(r: FeeRecommendation, what: string): void {
   }
 }
 
-test("(a) a new channel turning payments away, lifted by its protected fee: the new-channel floor leads — not 'demand: … not treated as idle' (a new channel is never idle)", () => {
+test("(a) a new channel with possible demand, lifted by its protected fee: the new-channel floor leads — not 'possible demand: … not treated as idle' (a new channel is never idle)", () => {
   const r = buildRecommendation(chan({ id: `${HEIGHT - 12}x1x0`, localRatio: 0.55 }), ctx({ ppm: 45, demand: { attempts: 3, days: 2, sats: 300_000, medianSats: 100_000 } }));
   assert.equal(r.targetPpm, 80);
   assert.match(r.reasons[0], /^new channel: only 0\.1d old with little history — keeping a protected fee/, r.reasons.join(" | "));
-  const line = r.reasons.find((x) => x.startsWith("demand:"));
+  const line = r.reasons.find((x) => x.startsWith("possible demand:"));
   assert.ok(line && !line.includes("not treated as idle"), r.reasons.join(" | "));
   assertNoContradiction(r, "new + demand");
 });
 
-test("(b) a channel turning payments away, raised by the curve below its target ratio: the curve leads — the demand line is a note", () => {
+test("(b) a channel with possible demand, raised by the curve below its target ratio: the curve leads — the demand line is a note", () => {
   const r = buildRecommendation(chan({ localRatio: 0.3 }), ctx({ ppm: 80, demand: demand(4, 3) }));
   assert.equal(r.targetPpm, 80 + RAISE_STEPS * STEP);
   assert.match(r.reasons[0], /^balance: low local ratio \(30%\) — higher fee slows the drain/, r.reasons.join(" | "));
-  assert.ok(r.reasons.some((x) => /^demand: .*; not treated as idle$/.test(x)));
+  assert.ok(r.reasons.some((x) => /^possible demand: .*; not treated as idle$/.test(x)));
   assertNoContradiction(r, "demand, raised by the curve");
 });
 
@@ -1139,4 +1147,74 @@ test("a fee at a floor lands on it exactly — on a 25-ppm grid a new channel's 
   // A ramp's own lift lands exactly too, off the grid (a profit floor of 1,035 opted in above the max).
   const ramp = buildRecommendation(chan({ localRatio: 0.7 }), ctx({ cfg: cfgOf(PRESETS.Balanced, { stepPpm: 25, floorAboveMax: true, maxPpm: 900 }), ppm: 1000, ...routingAt70, records: [refill({})] }));
   assert.deepEqual([ramp.targetPpm, ramp.aimPpm], [1035, 1035], ramp.reasons.join(" | "));
+});
+
+// ── P2 final review carry-overs (package P3) ────────────────────────────────
+
+/** A draining channel priced against a market reference (P2's replacement cost). */
+const drainingAt55 = (cfg: FeeRecConfig, ppm: number, into: number, back: number | null) =>
+  buildRecommendation(
+    chan({ id: `${HEIGHT - 20_000}x1x0`, localRatio: 0.55 }),
+    ctx({ cfg, ppm, market: market(into, back), f14: flow(300_000, 50_000, 10, 24), f30: flow(600_000, 100_000, 20, 48) }),
+  );
+
+test("a move within one step bound ('free') is rounded no further than its own aim — 95 → 115 under 'pricing toward 115 ppm', not 120", () => {
+  // Step 10: a refill costs ~100 ppm × 1.15 = 115, 20 ppm above the fee —
+  // exactly the raise bound. Rounded to the grid it read 120: past both.
+  const r = drainingAt55(cfgOf(PRESETS.Balanced), 95, 100, 0);
+  assert.match(r.reasons[0], /— pricing toward 115 ppm$/, r.reasons.join(" | "));
+  assert.equal(r.targetPpm, 115);
+  assert.ok(r.targetPpm - 95 <= RAISE_STEPS * STEP);
+});
+
+test("a raise on a 25-ppm grid stops at its aim and its two steps — 189 → 239, not 250", () => {
+  const r = drainingAt55(cfgOf(PRESETS.Balanced, { stepPpm: 25 }), 189, 208, null);
+  assert.match(r.reasons[0], /— pricing toward 239 ppm$/, r.reasons.join(" | "));
+  assert.ok(r.targetPpm <= 239, `${r.targetPpm}`);
+  assert.ok(r.targetPpm - 189 <= RAISE_STEPS * 25);
+  assert.equal(r.targetPpm, 239);
+});
+
+test("a lowering toward the replacement cost lands on it, not below — 246 → 178 under 'not below 178 ppm', not 175", () => {
+  const r = drainingAt55(cfgOf(PRESETS.Balanced, { stepPpm: 25 }), 246, 155, null);
+  assert.match(r.reasons[0], /lowering toward 178 ppm, not below$/, r.reasons.join(" | "));
+  assert.equal(r.targetPpm, 178);
+});
+
+test("F20: rounding never turns a held fee into a raise — an off-grid fee keeps its rate and only the base fee is written", () => {
+  // Draining, but a measured elasticity below 1 holds it at 39 ppm (step
+  // 25): rounded to the grid that was a raise to 50.
+  const held = buildRecommendation(
+    { id: "840000x1x0", peerAlias: "p", capacity: 2_000_000, localRatio: 0.5, role: "router", active: true },
+    ctx({
+      cfg: cfgOf(PRESETS.Balanced, { stepPpm: 25, baseFeeMsat: 0 }),
+      ppm: 39,
+      baseMsat: 1000,
+      f14: flow(500_000, 0, 10, 10),
+      f30: flow(500_000, 0, 10, 10),
+      elasticityMod: 0.8,
+      market: market(30, null),
+    }),
+  );
+  assert.deepEqual([held.targetPpm, held.wouldApply, held.recommendedBaseMsat], [39, true, 0], held.reasons.join(" | "));
+  assert.match(held.reasons[0], /^base fee: lowering 1000→0 msat to win routes/);
+  // A balanced channel routing at 37 ppm (step 10) is held there — not
+  // written as 40 "the balance curve puts it at ~80 ppm".
+  const routing = buildRecommendation(
+    { id: "840000x1x0", peerAlias: "p", capacity: 2_000_000, localRatio: 0.5, role: "router", active: true },
+    ctx({ cfg: cfgOf(PRESETS.Balanced, { baseFeeMsat: 0 }), ppm: 37, baseMsat: 1000, f14: flow(50_000, 50_000, 4, 2), f30: flow(50_000, 50_000, 4, 2) }),
+  );
+  assert.deepEqual([routing.targetPpm, routing.wouldApply, routing.recommendedBaseMsat], [37, true, 0], routing.reasons.join(" | "));
+  assert.match(routing.reasons[0], /^base fee: lowering 1000→0 msat to win routes/);
+});
+
+test("F04: two refused attempts (on two days) don't make an idle channel 'in demand' — the no-flow rule still lowers it; the third does", () => {
+  const ch = chan({ localRatio: 0.4 });
+  const two = buildRecommendation(ch, ctx({ ppm: 300, demand: demand(2, 2) }));
+  assert.equal(two.metrics.inDemand, false);
+  assert.equal(two.noFlowLowering, true, two.reasons.join(" | "));
+  assert.ok(two.targetPpm < 300);
+  const three = buildRecommendation(ch, ctx({ ppm: 300, demand: demand(3, 2) }));
+  assert.equal(three.metrics.inDemand, true);
+  assert.equal(three.noFlowLowering, false);
 });
