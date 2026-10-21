@@ -3,13 +3,26 @@ import { JsonStore, recordStoreIncident } from "../store.js";
 import { connectForOpen, fundChannel } from "./channelOps.js";
 import { isAuthError } from "./amboss.js";
 import { createOffer, getMyOffer, getMyOffers, toggleOffer, updateOffer, type MyOffer, type OfferTerms } from "./magmaApi.js";
-import { MagmaDesk, type MagmaSellAction } from "./magmaDesk.js";
+import { MagmaDesk, type MagmaSellAction, type SellActionKind } from "./magmaDesk.js";
 import { CapitalLedger, listableSat, spendableOnchain, type Spendable } from "./capital.js";
-import { initMagmaHistory, refreshMagmaHistory } from "./magmaHistory.js";
+import {
+  BLOCKS_PER_YEAR,
+  DEFAULT_LEASE_BLOCKS,
+  clearingFor,
+  initMagmaHistory,
+  priceFitsLease,
+  refreshMagmaHistory,
+  standardLeaseBlocks,
+} from "./magmaHistory.js";
+import { assessEligibility, cachedPublicBook, publicBook, publicBookFailure, type Eligibility } from "./magmaEligibility.js";
+import type { LeaseBenchmark } from "./dashboard.js";
+import { MagmaPurchases, type PaymentReport } from "./magmaPurchases.js";
+import { getOrder } from "./amboss.js";
 import { runMaxHtlcPass, type MaxHtlcChange } from "./maxHtlc.js";
-import type { ServiceFeeLedger } from "./serviceFee.js";
+import { saleFeeConfig, type ServiceFeeLedger } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { errorText } from "./errorText.js";
+import { getOwnPubkey } from "./node.js";
 import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
 import type { LnPlusStore } from "./lnplusStore.js";
 import { getMagmaRecommendations, type MagmaV2Report } from "./magmaRecommend.js";
@@ -24,6 +37,7 @@ import type { OverridesStore } from "./overrides.js";
 import type { EarningsLog } from "./earningsLog.js";
 import { getChannelsView } from "./channels.js";
 import { getForwardsReport } from "./forwards.js";
+import { offerFeeCaps, type OfferFeeCaps } from "./leaseCaps.js";
 import { routingYieldStats } from "./capitalAllocator.js";
 import {
   AUTOPILOT_CONFIG_BOUNDS,
@@ -96,6 +110,40 @@ export interface OfferFields {
   feeRatePpm: number;
   baseFeeSats: number;
   minBlockLength: number;
+  /** The routing-fee promise for the lease (null: none). */
+  feeRateCapPpm: number | null;
+  baseFeeCapSats: number | null;
+}
+
+/**
+ * Who decides what about an offer (a6-ux: manual controls were silently
+ * undone — a manual "disable" re-enabled within half an hour, a manual edit
+ * repriced or resized at the next run). Two separate things:
+ *  - its TERMS: an offer the operator created or edited on Market → Sell (or
+ *    took over) is theirs — the autopilot changes none of its terms until the
+ *    operator hands it back ("Let the autopilot manage it");
+ *  - whether it is LISTED: the operator's last click decides. One they
+ *    disabled stays disabled; one they enabled is listed. The only status
+ *    the autopilot changes is capital safety's: an offer whose smallest
+ *    channel can't be funded is disabled — whoever owns its terms — and
+ *    listed again once it can be, since listing it was the last thing the
+ *    operator chose. A status click never takes the terms over: before, a
+ *    manual ENABLE made the offer "yours", so the autopilot stopped fixing its
+ *    lease and promise — and never listed it again after a capital dip.
+ * The cut capital safety makes is given back up to the owner's own terms.
+ */
+export interface OfferControl {
+  /** The operator took the offer's terms over: when, and by doing what. */
+  manual?: { since: string; why: string };
+  /** The autopilot disabled it because its smallest channel couldn't be
+   *  funded — the only disabled offer it enables again once it can be. */
+  autoDisabledAt?: string;
+  /** The autopilot sent that disable, and Amboss's answer hasn't told yet
+   *  whether it landed (written before the flip): the next read of the
+   *  offer decides — DISABLED, and it was the autopilot's (autoDisabledAt). */
+  autoDisablingAt?: string;
+  /** The operator disabled it by hand: it stays disabled until they enable it. */
+  disabledByHandAt?: string;
 }
 
 /** The last write to an offer (autopilot or manual) and what came of it. */
@@ -123,6 +171,9 @@ export interface OfferSyncEntry {
   inSync: boolean;
   differences: string[];
   lastWrite: OfferWrite | null;
+  /** Who owns the offer's terms (OfferControl): the operator took it over
+   *  (manual), and/or the autopilot disabled it for lack of capital. */
+  control?: OfferControl;
 }
 
 export interface OfferSyncStatus {
@@ -205,6 +256,10 @@ interface PersistedState {
   offerSync?: OfferSyncStatus;
   /** Per offer: what a capital cut took, to give back (see OfferCut). */
   offerCuts?: Record<string, OfferCut>;
+  /** Per offer: who owns its terms (see OfferControl). */
+  offerControl?: Record<string, OfferControl>;
+  /** Per area: the latest decision not to act, and why (decisionNote). */
+  decisions?: Partial<Record<"magma" | "channels", { at: string; text: string }>>;
   history: AutopilotRun[];
 }
 
@@ -217,6 +272,50 @@ export const INFLIGHT_REBALANCE_CHECK_MS = 2 * 60_000;
 const floor10k = (n: number): number => Math.max(0, Math.floor(n / 10_000) * 10_000);
 /** Readable for LND's array errors too: stage errors reach the run history. */
 const errText = errorText;
+/** How long the Overview's lease benchmark looks at a public-book fetch it
+ *  had to start (nothing cached yet) before it answers "being read". */
+export const BENCHMARK_WAIT_MS = 750;
+/** How many purchase reads run at once. (No cap per pass: every purchase
+ *  still followed converges to an end — LND confirms or never knew the
+ *  payment, Amboss ends the order — so the set empties; a cap only starved
+ *  the oldest ones.) */
+const PURCHASE_FOLLOW_PARALLEL = 3;
+
+/** `fn` over `items`, at most `parallel` at a time; one that throws is
+ *  skipped (asked again next pass), and none starts once `stop()` says so. */
+async function eachBounded<T>(items: T[], parallel: number, stop: () => boolean, fn: (item: T) => Promise<void>): Promise<void> {
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length && !stop()) {
+      const item = items[next++];
+      try {
+        await fn(item);
+      } catch {
+        // can't say right now: the next pass asks again
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(parallel, items.length) }, worker));
+}
+
+/** `p`'s value if it settles within `ms`, else null (p keeps running). The
+ *  timer is unref'd: waiting never keeps the process alive on its own. */
+function withinMs<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    timer.unref?.();
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      },
+    );
+  });
+}
 
 /** What one offer-upkeep pass may advertise, and the engine's wishes. */
 interface OfferCtx {
@@ -227,14 +326,41 @@ interface OfferCtx {
    *  out, each one's open (with its own fee and anchor-reserve step) can be
    *  funded (capital.ts listableSat), within the deploy cap's headroom. */
   listable: (minSizeSats: number) => number;
-  target: (off: MyOffer) => { fee: number; base: number; moved: boolean } | null;
-  reshape: (off: MyOffer) => { minSizeSats: number; maxSizeSats: number; minBlockLength: number } | null;
+  /** The engine's price for the offer, and the lease that price is for
+   *  (magmaRecommend.ts prices each offer for the lease it carries after the
+   *  autopilot's next write). */
+  target: (off: MyOffer) => { fee: number; base: number; moved: boolean; lease: number } | null;
+  /** A sane size window (auto-size): null when the current one is fine. */
+  reshape: (off: MyOffer) => { minSizeSats: number; maxSizeSats: number } | null;
+  /** The standard lease the offer should promise (auto-size), or null. */
+  lease: (off: MyOffer) => number | null;
+  /** The routing-fee promise (D7): every offer the autopilot creates carries
+   *  it, and auto-size gives it to every offer it manages. */
+  caps: { feeRateCapPpm: number; baseFeeCapSats: number };
 }
 
 /** The capital side of OfferCtx, from one spendable reading. */
 function sellable(sp: Spendable, headroomSat: number, maxChannelSats: number): Pick<OfferCtx, "maxOrder" | "listable"> {
   const listable = (minSizeSats: number) => floor10k(Math.min(listableSat(sp, minSizeSats), headroomSat));
   return { listable, maxOrder: (minSizeSats: number) => floor10k(Math.min(listable(minSizeSats), maxChannelSats)) };
+}
+
+const fmtSat = (n: number): string => Math.round(n).toLocaleString("en-US");
+
+/**
+ * The status capital safety wants for an offer now, or null for none:
+ *  - disabled while its smallest channel can't be funded — whoever owns its
+ *    terms (an order it couldn't serve would end in a reject, or worse, a
+ *    failed open);
+ *  - enabled again once it can be, only when the autopilot itself disabled it
+ *    for that reason (it restores the listing the operator chose) — never one
+ *    the operator disabled. (Before, every DISABLED offer was re-enabled within
+ *    the half hour, a manual "disable" included.)
+ */
+function capitalStatus(status: string, fundable: boolean, control: OfferControl): "ENABLED" | "DISABLED" | null {
+  if (status === "ENABLED" && !fundable) return "DISABLED";
+  if (status === "DISABLED" && fundable && !!control.autoDisabledAt && !control.disabledByHandAt) return "ENABLED";
+  return null;
 }
 
 const fieldsOf = (o: MyOffer): OfferFields => ({
@@ -246,6 +372,8 @@ const fieldsOf = (o: MyOffer): OfferFields => ({
   feeRatePpm: o.feeRatePpm,
   baseFeeSats: o.baseFeeSats,
   minBlockLength: o.minBlockLength,
+  feeRateCapPpm: o.feeRateCapPpm,
+  baseFeeCapSats: o.baseFeeCapSats,
 });
 
 const emptyFields = (): OfferFields => ({
@@ -257,6 +385,8 @@ const emptyFields = (): OfferFields => ({
   feeRatePpm: 0,
   baseFeeSats: 0,
   minBlockLength: 0,
+  feeRateCapPpm: null,
+  baseFeeCapSats: null,
 });
 
 const FIELD_LABEL: Record<Exclude<keyof OfferFields, "totalSizeSats">, string> = {
@@ -267,6 +397,8 @@ const FIELD_LABEL: Record<Exclude<keyof OfferFields, "totalSizeSats">, string> =
   feeRatePpm: "fee rate (ppm)",
   baseFeeSats: "base fee (sat)",
   minBlockLength: "min lease (blocks)",
+  feeRateCapPpm: "routing fee-rate cap (ppm)",
+  baseFeeCapSats: "routing base-fee cap (sat)",
 };
 
 /** Human-readable mismatches between what Amboss has and what is wanted.
@@ -287,18 +419,22 @@ function termsUpdate(have: MyOffer, want: OfferFields): Partial<OfferTerms> | nu
   if (want.maxSizeSats !== have.maxSizeSats) p.maxSizeSats = want.maxSizeSats;
   if (want.minBlockLength !== have.minBlockLength) p.minBlockLength = want.minBlockLength;
   if (want.totalSizeSats !== have.totalSizeSats) p.totalSizeSats = want.totalSizeSats;
+  if (want.feeRateCapPpm !== null && want.feeRateCapPpm !== have.feeRateCapPpm) p.feeRateCapPpm = want.feeRateCapPpm;
+  if (want.baseFeeCapSats !== null && want.baseFeeCapSats !== have.baseFeeCapSats) p.baseFeeCapSats = want.baseFeeCapSats;
   return Object.keys(p).length > 0 ? p : null;
 }
 
 /** Did Amboss store every field that was sent? */
-function termsMatch(read: MyOffer, sent: Partial<OfferTerms>): boolean {
+export function termsMatch(read: MyOffer, sent: Partial<OfferTerms>): boolean {
   return (
     (sent.feeRatePpm === undefined || read.feeRatePpm === sent.feeRatePpm) &&
     (sent.baseFeeSats === undefined || read.baseFeeSats === sent.baseFeeSats) &&
     (sent.minSizeSats === undefined || read.minSizeSats === sent.minSizeSats) &&
     (sent.maxSizeSats === undefined || read.maxSizeSats === sent.maxSizeSats) &&
     (sent.minBlockLength === undefined || read.minBlockLength === sent.minBlockLength) &&
-    (sent.totalSizeSats === undefined || read.totalSizeSats === sent.totalSizeSats)
+    (sent.totalSizeSats === undefined || read.totalSizeSats === sent.totalSizeSats) &&
+    (sent.feeRateCapPpm === undefined || read.feeRateCapPpm === sent.feeRateCapPpm) &&
+    (sent.baseFeeCapSats === undefined || read.baseFeeCapSats === sent.baseFeeCapSats)
   );
 }
 
@@ -311,6 +447,8 @@ export function ambossFields(p: Partial<OfferTerms>): Record<string, number> {
   if (p.feeRatePpm !== undefined) out.fee_rate = p.feeRatePpm;
   if (p.baseFeeSats !== undefined) out.base_fee = p.baseFeeSats;
   if (p.minBlockLength !== undefined) out.min_block_length = p.minBlockLength;
+  if (p.feeRateCapPpm !== undefined) out.fee_rate_cap = p.feeRateCapPpm;
+  if (p.baseFeeCapSats !== undefined) out.base_fee_cap = p.baseFeeCapSats;
   return out;
 }
 
@@ -345,6 +483,13 @@ export class Autopilot {
   readonly capital: CapitalLedger;
   /** Magma selling: order journal, lane and manual actions (magmaDesk.ts). */
   readonly magma: MagmaDesk;
+  /** Inbound bought on Magma (magmaPurchases.ts): followed after each order
+   *  lane pass (followPurchases). */
+  readonly purchases: MagmaPurchases;
+  /** A purchase follow-up is under way (its own flag, not the lane's). */
+  private followingPurchases = false;
+  /** Per offer: the status change under way (withOffer). */
+  private readonly offerChains = new Map<string, Promise<void>>();
   /** Whether the stored fee policy carried a balanced level of its own. Policies
    *  saved before that setting existed get the default from the volume
    *  migration in start() — after sanitizing, a filled-in default can no longer
@@ -389,6 +534,7 @@ export class Autopilot {
       },
     });
     initMagmaHistory(dataDir);
+    this.purchases = new MagmaPurchases(dataDir);
     this.state = this.store.read({
       config: DEFAULT_CONFIG,
       lastRunAt: null,
@@ -518,11 +664,22 @@ export class Autopilot {
    *  level AND the capital caps, so the recommended size window can never exceed
    *  what the autopilot would really be willing to serve. Without the caps the
    *  Market page would advertise a size the autopilot then silently refuses. */
+  /**
+   * The ONE place the Magma engine's inputs are built — the Market page, the
+   * autopilot's own offer upkeep and LSPS1 pricing all call the engine with
+   * exactly these. (The autopilot used to pass only the pricing level: it
+   * priced and sized with the engine's defaults — a 250k reserve, a 10M max —
+   * while the page used the operator's caps, so it could refuse to list an
+   * offer the page recommended.)
+   */
   magmaOverrides(): {
     sellPricingMode: "fast" | "balanced" | "premium" | "auto";
     adaptiveLevel: number;
     maxSellSizeSat: number;
     onchainReserveSat: number;
+    offerFeeCaps: OfferFeeCaps;
+    autoSizeLease: boolean;
+    operatorOfferIds: string[];
   } {
     const c = this.state.config;
     return {
@@ -532,7 +689,23 @@ export class Autopilot {
       // effective ceiling is the smaller of the two.
       maxSellSizeSat: Math.max(0, Math.min(c.sellMaxChannelSats, c.sellMaxDeploySats)),
       onchainReserveSat: c.sellReserveSats,
+      offerFeeCaps: this.offerFeeCaps(),
+      // Which lease each offer is priced for: the one it carries after the
+      // offer upkeep's next write. With auto-size (and Liquidity provision)
+      // that is the standard lease for every offer whose terms aren't the
+      // operator's; otherwise the lease the offer keeps.
+      autoSizeLease: c.sellEnabled && c.sellAutoSize,
+      operatorOfferIds: Object.entries(this.state.offerControl ?? {})
+        .filter(([, control]) => !!control.manual)
+        .map(([id]) => id),
     };
+  }
+
+  /** The routing-fee promise every offer of this node carries (D7, see
+   *  leaseCaps.ts) — from the fee policy, so the fee autopilot never has to
+   *  break it in normal operation. */
+  offerFeeCaps(): OfferFeeCaps {
+    return offerFeeCaps(this.state.config.policy);
   }
 
   /** Sell caps shared with LSP mode — one capital budget across both demand sources. */
@@ -583,6 +756,8 @@ export class Autopilot {
       runningSince: this.runningSince,
       /** The Magma order lane: when it last ran, and whether that worked. */
       magmaLane: this.magma.laneStatus(),
+      /** Per area, the latest decision not to act and why. */
+      decisions: this.state.decisions ?? {},
       // Only surface runs that did something; hide any older "0 applied" no-ops.
       // Normalise older persisted runs that predate newer arrays.
       history: this.state.history
@@ -826,6 +1001,36 @@ export class Autopilot {
     // later stage of this run — record them now, not at the end.
     if (changes.length) this.persist();
     return changes;
+  }
+
+  /**
+   * Fee automation off: lower the fees that break a sold channel's promise to
+   * the cap its order locked — nothing else (the engine's report says which
+   * channels a promise binds and which carry a fee above it).
+   */
+  private async keepLeasePromises(writeLnd: AuthenticatedLnd): Promise<AutopilotChange[]> {
+    const report = await this.feeReport(new Map());
+    const breaches = report.recommendations.filter(
+      (r) => r.leaseCapBreach && r.leaseCap && r.transactionId !== null && r.transactionVout !== null,
+    );
+    if (breaches.length === 0) return [];
+    const items: FeeApplyItem[] = breaches.map((r) => ({
+      id: r.channelId,
+      transactionId: r.transactionId as string,
+      transactionVout: r.transactionVout as number,
+      feeRatePpm: Math.min(r.currentPpm, r.leaseCap!.feeRateCapPpm),
+      baseFeeMsat: Math.min(r.currentBaseMsat, r.leaseCap!.baseFeeCapMsat),
+    }));
+    const results = await this.feeApply(writeLnd, items);
+    const byId = new Map(breaches.map((r) => [r.channelId, r]));
+    return results.map((res) => ({
+      id: res.id,
+      alias: byId.get(res.id)?.alias ?? res.id,
+      fromPpm: byId.get(res.id)?.currentPpm ?? 0,
+      toPpm: res.feeRatePpm,
+      ok: res.ok,
+      error: res.ok ? undefined : res.error,
+    }));
   }
 
   /** Within the configured rebalance hour window (node local time)? */
@@ -1108,31 +1313,21 @@ export class Autopilot {
     const size = cfg.channelSizeSats > 0 ? cfg.channelSizeSats : top.recommendedSizeSats;
     if (pre.spendableSat < size) return []; // not enough on-chain to fund it + keep the reserve
 
-    // Capital engine: when Magma selling is also on, only open a routing channel
-    // if a new channel is expected to out-earn leasing this capital (routing
-    // median yield vs the lease floor). Otherwise leave the sats for Magma. This
-    // is the unified capital decision driving the autopilot — not just a panel.
+    // Capital engine (D10): with Liquidity provision on, a routing open waits
+    // — the coins left for Magma — only when Magma can actually take them and
+    // is expected to earn more on them (leaveForMagma). Before, the deferral
+    // read no lease data at all: it compared the median routing yield with
+    // 1.2 × the lower-quartile one — a dispersion test that deferred whenever
+    // channels earned alike (a node with ONE channel could never open a
+    // second) — and parked capital for an offer that wasn't selling.
     if (cfg.sellEnabled) {
+      let deferral: string | null = null;
       try {
-        const [chans, report] = await Promise.all([
-          getChannelsView(this.readLnd),
-          getForwardsReport(this.readLnd, 30),
-        ]);
-        const revByChan = new Map(report.perChannel.map((c) => [c.channelId, c.feesEarnedSats]));
-        const stats = routingYieldStats(chans.filter((c) => c.active), revByChan);
-        if (stats.medianPpmYear < stats.leaseThresholdPpmYear) {
-          return [
-            {
-              alias: top.alias,
-              sizeSats: size,
-              ok: false,
-              error: `deferred: leasing beats routing for this capital (routing ~${stats.medianPpmYear} vs lease floor ${stats.leaseThresholdPpmYear} ppm/yr) — left for Magma`,
-            },
-          ];
-        }
+        deferral = await this.leaveForMagma();
       } catch {
-        // couldn't compute the capital decision — fall through and open as before
+        // No answer: no deferral — the open goes ahead.
       }
+      if (deferral) return [{ alias: top.alias, sizeSats: size, ok: false, error: deferral }];
     }
 
     // On-chain fee awareness: don't open when the funding fee eats >1% of the
@@ -1238,15 +1433,29 @@ export class Autopilot {
       await this.magma.refreshDeployed(true);
       const sp = await spendableOnchain(this.readLnd, this.capital, cfg.sellReserveSats);
       const headroom = Math.max(0, cfg.sellMaxDeploySats - this.capital.deployedSat() - this.capital.reservedSat());
-      ctx = { ...sellable(sp, headroom, cfg.sellMaxChannelSats), target: () => null, reshape: () => null };
+      ctx = {
+        ...sellable(sp, headroom, cfg.sellMaxChannelSats),
+        target: () => null,
+        reshape: () => null,
+        lease: () => null,
+        caps: this.offerFeeCaps(),
+      };
     } catch (err) {
       if (isAuthError(err)) await this.amboss.recheckAfterRefusal();
       return failed(`could not work out the sellable capital: ${errText(err)}`);
     }
 
     let offers: MyOffer[];
+    // When the listing below was asked for: an operator's click recorded
+    // since then is newer than what it shows (see settleStatusRecords).
+    let readAt = Date.now();
     try {
-      offers = await getMyOffers(key);
+      // This node's offers only: one Amboss account can list offers for
+      // several nodes, and another node's are not ours to reprice, resize,
+      // enable or disable.
+      const own = await getOwnPubkey(this.readLnd);
+      readAt = Date.now();
+      offers = await getMyOffers(key, own);
       this.amboss.markValid();
     } catch (err) {
       if (isAuthError(err)) await this.amboss.recheckAfterRefusal();
@@ -1277,10 +1486,8 @@ export class Autopilot {
     let rec: MagmaV2Report | null = null;
     if (cfg.sellAutoReprice || cfg.sellAutoSize) {
       try {
-        rec = await getMagmaRecommendations(this.readLnd, key, {
-          sellPricingMode: cfg.sellPricingMode,
-          adaptiveLevel: this.state.sellAdaptiveLevel,
-        });
+        // The same inputs the Market page uses (one builder, magmaOverrides).
+        rec = await this.magmaReport(key);
       } catch (err) {
         // No recommendation: prices and shapes stay; the capital limits below
         // still apply. Not silent: the sync status says why.
@@ -1299,12 +1506,24 @@ export class Autopilot {
       if (!cfg.sellAutoReprice) return null;
       const r = recByOffer.get(off.id);
       if (!r) return null;
-      return { fee: r.recommended.feeRatePpm, base: r.recommended.baseFeeSat, moved: r.shouldReprice };
+      return { fee: r.recommended.feeRatePpm, base: r.recommended.baseFeeSat, moved: r.shouldReprice, lease: r.recommended.minBlockLength };
     };
 
-    // What the offer's SHAPE should be — size window and lease length — when
-    // the current one is materially worse than what the market asks for.
-    // Returns null when the offer is already fine, so we don't churn updates.
+    // Auto-size is offer-shape hygiene (D19): a standard lease and a sane
+    // size window — not a lever that makes an offer fill (it isn't one below
+    // Amboss's score/depth gate).
+    //
+    // The lease first, on its own: it needs no market recommendation and no
+    // capital, so it is corrected on a capital-limited node too. Before, it
+    // sat inside the window logic below — behind its "no recommendation" and
+    // "not enough room" exits — and only ever moved a lease DOWN: the live
+    // 4032-block offer (a length no order had used since 2022) was never
+    // raised to the standard 4320.
+    ctx.lease = () => (cfg.sellAutoSize ? standardLeaseBlocks() : null);
+
+    // The size window: from the smallest channel that still pays for itself
+    // up to what can be funded. Null when the current one is fine, so we
+    // don't churn updates.
     ctx.reshape = (off) => {
       if (!rec || !cfg.sellAutoSize) return null;
       const sell = rec.sell;
@@ -1326,18 +1545,15 @@ export class Autopilot {
         : Math.max(sell.recommendedMinSizeSat, floorAtOwnPrice());
       const room = ctx.maxOrder(Math.min(wantMin, off.minSizeSats));
       const wantMax = Math.max(wantMin, Math.min(sell.recommendedMaxSizeSat, room));
-      const wantBlocks = Math.min(off.minBlockLength || sell.popularLeaseBlocks, sell.popularLeaseBlocks);
       if (wantMax < wantMin || room < wantMin) return null;
-      // Only act on a MEANINGFUL difference: >20% more reach, a lease length
-      // that locks buyers out, or a floor above what is economic.
+      // Only act on a MEANINGFUL difference: a window much narrower than
+      // what can be funded, or a floor above what is economic.
       const widens = wantMax > off.maxSizeSats * 1.2;
       const lowersFloor = wantMin < off.minSizeSats * 0.8;
-      const fixesTerm = off.minBlockLength > wantBlocks;
-      if (!widens && !lowersFloor && !fixesTerm) return null;
+      if (!widens && !lowersFloor) return null;
       return {
         minSizeSats: Math.min(wantMin, off.minSizeSats),
         maxSizeSats: Math.max(wantMax, off.maxSizeSats),
-        minBlockLength: wantBlocks,
       };
     };
 
@@ -1349,18 +1565,31 @@ export class Autopilot {
         entries.push(this.syncEntry(off, null));
         continue;
       }
-      entries.push(await this.upkeepOffer(key, off, ctx, out));
+      entries.push(await this.upkeepOffer(key, off, ctx, out, readAt));
     }
-    // Cut memories of offers that are gone have nothing left to give back.
+    // Cut memories of offers that are gone have nothing left to give back,
+    // and their ownership records nothing left to own.
     for (const id of Object.keys(this.state.offerCuts ?? {})) {
       if (!offers.some((o) => o.id === id)) delete this.state.offerCuts?.[id];
+    }
+    for (const id of Object.keys(this.state.offerControl ?? {})) {
+      if (!offers.some((o) => o.id === id)) delete this.state.offerControl?.[id];
     }
 
     // Auto-list idle capital: no offer at all, leasing beats routing, and
     // auto-pricing on (listing means choosing a price, which only that switch
     // may do). Sized to what can be funded now — never the old flat 1M floor.
+    // And only where selling is realistic at all (D8/m4: no automatic offer
+    // for a node whose comparable offers don't sell — it would only park
+    // capital and invite orders it may then have to turn down).
     const createRec = rec?.sell.recommendations.find((r) => r.mode === "create");
-    if (!this.shuttingDown && cfg.sellAutoReprice && offers.length === 0 && rec?.sell.state === "good_to_sell" && createRec) {
+    const canCreate =
+      !this.shuttingDown && cfg.sellAutoReprice && offers.length === 0 && rec?.sell.state === "good_to_sell" && !!createRec;
+    const realistic = canCreate ? await this.sellingRealistic() : null;
+    if (canCreate && realistic && !realistic.ok) {
+      this.decisionNote("magma", `no offer listed automatically: ${realistic.why}`);
+    }
+    if (canCreate && rec && createRec && realistic?.ok) {
       const viable = rec.sell.minViableSizeSat ?? 1_000_000;
       const minCh = Math.min(viable, ctx.maxOrder(viable));
       const maxCh = ctx.maxOrder(minCh);
@@ -1372,7 +1601,10 @@ export class Autopilot {
           maxSizeSats: maxCh,
           feeRatePpm: createRec.recommended.feeRatePpm,
           baseFeeSats: createRec.recommended.baseFeeSat,
-          minBlockLength: createRec.recommended.minBlockLength,
+          minBlockLength: standardLeaseBlocks(),
+          // The routing-fee promise, always (D7) — kept by the fee autopilot.
+          feeRateCapPpm: ctx.caps.feeRateCapPpm,
+          baseFeeCapSats: ctx.caps.baseFeeCapSats,
         };
         const write: OfferWrite = {
           at: new Date().toISOString(),
@@ -1412,53 +1644,54 @@ export class Autopilot {
   }
 
   /** One offer's upkeep: listed only while fundable, then its terms. */
-  private async upkeepOffer(key: string, off: MyOffer, ctx: OfferCtx, out: AutopilotSell[]): Promise<OfferSyncEntry> {
+  private async upkeepOffer(key: string, off: MyOffer, ctx: OfferCtx, out: AutopilotSell[], readAt: number): Promise<OfferSyncEntry> {
     if (off.status === "ADMIN_DISABLED") {
       return this.syncEntry(off, null, undefined, "disabled by Amboss support — only Amboss can enable it again");
     }
+    let control = this.settleStatusRecords(off, readAt);
     const sellableNow = ctx.maxOrder(off.minSizeSats);
     const fundable = sellableNow >= Math.max(1, off.minSizeSats);
-    if ((off.status === "DISABLED" && fundable) || (off.status === "ENABLED" && !fundable)) {
-      const want = fundable ? "ENABLED" : "DISABLED";
-      const reason = fundable
-        ? "Liquidity provision is on and the offer can be funded"
-        : `its smallest channel (${off.minSizeSats} sat) can't be funded: ${sellableNow} sat sellable after the reserve, promised orders and the deploy cap`;
-      const write: OfferWrite = {
-        at: new Date().toISOString(),
-        by: "autopilot",
-        action: fundable ? "enable" : "disable",
-        fields: { offer_id: off.id },
-        ok: false,
-        reason,
-      };
-      let status = off.status;
-      try {
-        status = await toggleOffer(key, off.id);
-        write.ok = status === want;
-        write.verified = write.ok;
-        if (!write.ok) write.error = `Amboss reports the offer ${status}, not ${want}`;
-      } catch (err) {
-        write.error = errText(err);
+    const lackOfCapital = () =>
+      `disabled by the autopilot for lack of capital: its smallest channel (${fmtSat(off.minSizeSats)} sat) can't be funded — ` +
+      `${fmtSat(sellableNow)} sat sellable after the reserve, promised orders and the deploy cap; it is listed again once it can be`;
+    const unanswered =
+      "the autopilot disabled it for lack of capital, and Amboss's answer never came — the next read of the offer tells whether the disable landed";
+    const disabledWhy = (status: string): string =>
+      control.disabledByHandAt
+        ? "disabled by you — the autopilot leaves it disabled; enable it on Market → Sell to list it again"
+        : control.autoDisabledAt
+          ? lackOfCapital()
+          : control.autoDisablingAt
+            ? unanswered
+            : `offer is ${status} — the autopilot doesn't enable an offer it didn't disable; enable it on Market → Sell to list it`;
+    // Capital safety, for every offer (the operator's own too): see
+    // capitalStatus and capitalToggle.
+    const wantStatus = capitalStatus(off.status, fundable, control);
+    if (wantStatus) {
+      const r = await this.capitalToggle(key, off, wantStatus, { fundable, sellableNow }, out);
+      control = this.offerControlOf(off.id);
+      const wanted = r.write ? { ...fieldsOf(r.offer), status: wantStatus } : null;
+      if (r.unresolved) {
+        // How the status change ended isn't known: nothing else is changed on
+        // this offer until a read says what Amboss has.
+        const why =
+          wantStatus === "DISABLED" && control.autoDisablingAt
+            ? unanswered
+            : `${wantStatus === "DISABLED" ? "not disabled" : "not listed again"} yet: ${r.write?.error ?? "Amboss did not answer"} — tried again next run`;
+        return this.syncEntry(r.offer, wanted, r.write ?? undefined, why);
       }
-      out.push({
-        orderId: off.id,
-        action: fundable ? "enable" : "disable",
-        sizeSats: off.totalSizeSats,
-        ok: write.ok,
-        error: write.ok ? (fundable ? undefined : reason) : write.error,
-      });
-      const now = { ...off, status };
-      if (status !== "ENABLED") return this.syncEntry(now, { ...fieldsOf(now), status: want }, write);
-      off = now;
+      if (r.offer.status !== "ENABLED") return this.syncEntry(r.offer, wanted, r.write ?? undefined, disabledWhy(r.offer.status));
+      off = r.offer;
     }
-    if (off.status !== "ENABLED") return this.syncEntry(off, null, undefined, `offer is ${off.status}`);
+    if (off.status !== "ENABLED") return this.syncEntry(off, null, undefined, disabledWhy(off.status));
 
-    const want = this.wantedTerms(off, ctx);
+    const want = this.wantedTerms(off, ctx, !!control.manual);
+    if (want.notes.length) this.decisionNote("magma", `offer ${off.id.slice(0, 8)}…: ${want.notes.join("; ")}`);
     const update = termsUpdate(off, want.fields);
     if (!update) {
       // Amboss already has exactly this: the cut memory matches it as is.
       this.keepCut(off.id, want.cut);
-      return this.syncEntry(off, want.fields);
+      return this.syncEntry(off, want.fields, undefined, want.notes);
     }
     const write: OfferWrite = {
       at: new Date().toISOString(),
@@ -1494,33 +1727,205 @@ export class Autopilot {
     } else {
       console.warn(`[autopilot] offer ${off.id} update failed: ${write.error}`);
     }
-    return this.syncEntry(after, want.fields, write);
+    return this.syncEntry(after, want.fields, write, want.notes);
   }
 
-  /** The terms the autopilot wants for an enabled offer, and what a capital
-   *  cut among them would have to give back later (OfferCut). */
+  /**
+   * The offer's status records, settled against the listing this run read
+   * (`readAt`: when it was asked for):
+   *  - a disable the autopilot sent whose answer never came: the offer reads
+   *    DISABLED now, so it landed — the autopilot's (listed again once
+   *    capital returns), unless the operator has disabled it by hand since;
+   *  - a record describes a DISABLED offer: once the listing shows it listed
+   *    again (a click here or on amboss.tech), it is history — but only a
+   *    record from BEFORE that read. A click recorded since (the operator
+   *    disabled it while this run priced other offers) is newer than what the
+   *    listing shows; it used to be cleared on the strength of the older
+   *    read, and the click was lost.
+   */
+  private settleStatusRecords(off: MyOffer, readAt: number): OfferControl {
+    const control = this.offerControlOf(off.id);
+    const older = (at: string | undefined) => !!at && Date.parse(at) < readAt;
+    const next: OfferControl = { ...control };
+    if (older(control.autoDisablingAt)) {
+      if (off.status === "DISABLED" && !control.disabledByHandAt) next.autoDisabledAt = control.autoDisablingAt;
+      next.autoDisablingAt = undefined;
+    }
+    if (off.status === "ENABLED") {
+      if (older(next.autoDisabledAt)) next.autoDisabledAt = undefined;
+      if (older(next.disabledByHandAt)) next.disabledByHandAt = undefined;
+    }
+    const changed =
+      next.autoDisabledAt !== control.autoDisabledAt ||
+      next.disabledByHandAt !== control.disabledByHandAt ||
+      next.autoDisablingAt !== control.autoDisablingAt;
+    if (changed) this.setOfferControl(off.id, next);
+    return this.offerControlOf(off.id);
+  }
+
+  /**
+   * Capital safety's status change, safe against everyone else who changes
+   * the status. Amboss's toggle FLIPS whatever the status is, so a flip sent
+   * on a status that changed since it was read does the opposite of what was
+   * decided. Before, the flip went by the listing read at the start of the
+   * run (the engine call and other offers' upkeep came in between): an
+   * operator's disable landing in that window was ENABLED again by the
+   * autopilot's "disable" — an unfundable offer listed, the click lost — and
+   * a disable Amboss applied without answering in time left no record that
+   * the autopilot had made it, so the offer was never listed again. Now:
+   *  - one status change per offer at a time (withOffer): a click on Market
+   *    → Sell waits for this one, and reads the offer afresh;
+   *  - the offer and its record are read afresh, and the flip is sent only
+   *    while they still call for it;
+   *  - a disable is recorded as the autopilot's intent before it is sent: an
+   *    answer that never comes is settled by the next read of the offer;
+   *  - an answer that isn't the wanted status means another flip crossed this
+   *    one (on amboss.tech, another tool) — wanting the same status, as there
+   *    are only two: read again, and flipped once more while Amboss still
+   *    shows the other;
+   *  - the result is merged into the record as it is NOW: a click recorded
+   *    meanwhile stands (the operator's disable wins over the autopilot's).
+   */
+  private capitalToggle(
+    key: string,
+    off: MyOffer,
+    want: "ENABLED" | "DISABLED",
+    cap: { fundable: boolean; sellableNow: number },
+    out: AutopilotSell[],
+  ): Promise<{ offer: MyOffer; write: OfferWrite | null; unresolved?: boolean }> {
+    return this.withOffer(off.id, async () => {
+      const action = want === "ENABLED" ? "enable" : "disable";
+      const reason =
+        want === "ENABLED"
+          ? "its smallest channel can be funded again (the autopilot had disabled it for lack of capital)"
+          : `its smallest channel (${off.minSizeSats} sat) can't be funded: ${cap.sellableNow} sat sellable after the reserve, promised orders and the deploy cap`;
+      const write: OfferWrite = { at: new Date().toISOString(), by: "autopilot", action, fields: { offer_id: off.id }, ok: false, reason };
+      const report = (ok: boolean) =>
+        out.push({ orderId: off.id, action, sizeSats: off.totalSizeSats, ok, error: ok ? (want === "ENABLED" ? undefined : reason) : write.error });
+      const read = (): Promise<MyOffer | null> => getMyOffer(key, off.id).catch(() => null);
+      const fresh = await read();
+      if (!fresh) {
+        write.error = "could not read the offer from Amboss before changing its status — tried again next run";
+        report(false);
+        return { offer: off, write, unresolved: true };
+      }
+      // Changed since the listing was read (a click, amboss.tech): decided
+      // afresh at the next run, on what Amboss shows then.
+      if (capitalStatus(fresh.status, cap.fundable, this.offerControlOf(off.id)) !== want) return { offer: fresh, write: null };
+      if (want === "DISABLED") {
+        this.setOfferControl(off.id, { ...this.offerControlOf(off.id), autoDisablingAt: write.at });
+        this.persist();
+      }
+      const flip = async (): Promise<string | null> => {
+        try {
+          const answered = await toggleOffer(key, off.id);
+          if (answered === want) return answered;
+          // Another flip crossed this one: what does Amboss show now?
+          const now = await read();
+          if (!now || now.status === want) return now?.status ?? null;
+          write.reason = `${reason} — the offer was flipped by someone else meanwhile, so it was flipped once more`;
+          return await toggleOffer(key, off.id);
+        } catch (err) {
+          write.error = errText(err);
+          // It may have landed without its answer: the offer says.
+          return (await read())?.status ?? null;
+        }
+      };
+      const status = await flip();
+      // Merged into the record as it is now: a click recorded meanwhile — the
+      // operator's disable — wins over the autopilot's.
+      const current = this.offerControlOf(off.id);
+      const next: OfferControl = { ...current };
+      if (status === want) {
+        next.autoDisabledAt = want === "DISABLED" && !current.disabledByHandAt ? write.at : undefined;
+        next.autoDisablingAt = undefined;
+      } else if (status !== null) {
+        next.autoDisablingAt = undefined; // it didn't land
+      }
+      // (Status unknown — no answer, and the offer can't be read: the intent
+      // stays, and the next read of the offer settles it.)
+      this.setOfferControl(off.id, next);
+      write.ok = status === want;
+      write.verified = status === null ? undefined : write.ok;
+      if (write.ok) write.error = undefined;
+      else if (!write.error) write.error = `Amboss reports the offer ${status}, not ${want}`;
+      report(write.ok);
+      return status === null ? { offer: fresh, write, unresolved: true } : { offer: { ...fresh, status }, write };
+    });
+  }
+
+  /**
+   * The terms the autopilot wants for an enabled offer, and what a capital
+   * cut among them would have to give back later (OfferCut). An offer the
+   * operator took over (`manual`) keeps every term of theirs — only the
+   * capital cut (and giving it back) applies to it. `notes`: what it would
+   * have changed but didn't, and why (for the sync status).
+   */
   private wantedTerms(
     off: MyOffer,
     ctx: OfferCtx,
-  ): { fields: OfferFields; kind: "reprice" | "resize" | "relist"; reasons: string[]; cut: OfferCut | null } {
+    manual: boolean,
+  ): { fields: OfferFields; kind: SellActionKind; reasons: string[]; notes: string[]; cut: OfferCut | null } {
     const cfg = this.state.config;
     const w = fieldsOf(off);
     const reasons: string[] = [];
-    let kind: "reprice" | "resize" | "relist" = "reprice";
-    const t = ctx.target(off);
-    if (t?.moved) {
-      w.feeRatePpm = t.fee;
-      w.baseFeeSats = t.base;
-      reasons.push("market price moved");
-    }
-    const shape = ctx.reshape(off);
-    if (shape) {
-      w.minSizeSats = shape.minSizeSats;
-      w.maxSizeSats = shape.maxSizeSats;
-      w.minBlockLength = shape.minBlockLength;
-      w.availableSats = Math.max(w.availableSats, shape.maxSizeSats);
-      kind = "resize";
-      reasons.push("size window or lease length out of step with the market");
+    const notes: string[] = [];
+    let kind: SellActionKind = "reprice";
+    let repriced = false;
+    const shape = manual ? null : ctx.reshape(off);
+    if (!manual) {
+      // The lease first: a price holds only for the lease it is for. The
+      // engine prices each offer for the lease it carries after this write
+      // (magmaRecommend.ts) — the standard one with auto-size, else the one
+      // it keeps; a price meant for another lease goes on only where it
+      // can't undercharge (priceFitsLease: the old 4,032-block offer takes
+      // the 4,320-block price; a 5,000-block one never the 4,320 one).
+      const lease = ctx.lease(off);
+      const leaseAfter = lease ?? w.minBlockLength;
+      const t = ctx.target(off);
+      if (t?.moved) {
+        if (priceFitsLease(t.lease, leaseAfter)) {
+          w.feeRatePpm = t.fee;
+          w.baseFeeSats = t.base;
+          repriced = true;
+          reasons.push(
+            t.lease === leaseAfter
+              ? "market price moved"
+              : `market price moved (priced for the standard ${fmtSat(t.lease)}-block lease; with auto-size off the offer keeps its ${fmtSat(leaseAfter)} blocks)`,
+          );
+        } else {
+          notes.push(
+            `not repriced: the market price is for a ${fmtSat(t.lease)}-block lease, and this offer promises ${fmtSat(leaseAfter)} blocks — ` +
+              (t.lease < leaseAfter ? "that price would undercharge for its own, longer lease" : "that price is for a much longer lease than its own") +
+              ". With auto-size off its lease stays: turn on auto-size (it gives the offer the standard lease, priced for it), or edit the offer on Market → Sell",
+          );
+        }
+      }
+      if (shape) {
+        w.minSizeSats = shape.minSizeSats;
+        w.maxSizeSats = shape.maxSizeSats;
+        w.availableSats = Math.max(w.availableSats, shape.maxSizeSats);
+        kind = "resize";
+        reasons.push("size window set from the smallest channel that pays for itself up to what can be funded");
+      }
+      // Standard offer terms (D7, with auto-size): the lease buyers use, and
+      // the routing-fee promise the fee autopilot keeps for every sold
+      // channel. With every offer-automation switch off, an offer's terms are
+      // the operator's — its promise too (one set on amboss.tech stays) — and
+      // only the capital limits below apply. (Before, the promise was written
+      // with every switch off, while the diagnostics said "only the capital
+      // limits apply".)
+      if (lease !== null && lease !== w.minBlockLength) {
+        reasons.push(`lease set to the standard ${lease} blocks (was ${w.minBlockLength})`);
+        w.minBlockLength = lease;
+        if (kind === "reprice" && !repriced) kind = "terms";
+      }
+      if (cfg.sellAutoSize && (w.feeRateCapPpm !== ctx.caps.feeRateCapPpm || w.baseFeeCapSats !== ctx.caps.baseFeeCapSats)) {
+        reasons.push(`routing-fee promise set to ${ctx.caps.feeRateCapPpm} ppm + ${ctx.caps.baseFeeCapSats} sat base for the lease`);
+        w.feeRateCapPpm = ctx.caps.feeRateCapPpm;
+        w.baseFeeCapSats = ctx.caps.baseFeeCapSats;
+        if (kind === "reprice" && !repriced) kind = "terms";
+      }
     }
     // What an earlier capital cut took goes back in — up to what it was, and
     // no further than what can be funded now (the clamp below). Auto-sizing
@@ -1529,7 +1934,7 @@ export class Autopilot {
     if (earlier?.max && !shape && earlier.max.wish > w.maxSizeSats) w.maxSizeSats = earlier.max.wish;
     if (earlier?.listed) w.availableSats += earlier.listed.cutSats;
     const listable = ctx.listable(w.minSizeSats);
-    if (cfg.sellAutoRelist && w.availableSats < w.maxSizeSats && w.maxSizeSats <= listable) {
+    if (!manual && cfg.sellAutoRelist && w.availableSats < w.maxSizeSats && w.maxSizeSats <= listable) {
       w.availableSats = w.maxSizeSats;
       kind = "relist";
       reasons.push("sold out — topped back up");
@@ -1557,7 +1962,7 @@ export class Autopilot {
     const cut: OfferCut = { at: new Date().toISOString() };
     if (w.maxSizeSats < wantMax) cut.max = { wish: wantMax, set: w.maxSizeSats };
     if (w.availableSats < wantListed) cut.listed = { cutSats: wantListed - w.availableSats, setTotal: w.totalSizeSats };
-    return { fields: w, kind, reasons, cut: cut.max || cut.listed ? cut : null };
+    return { fields: w, kind, reasons, notes, cut: cut.max || cut.listed ? cut : null };
   }
 
   /** The memory of an earlier capital cut on this offer — only the parts
@@ -1578,17 +1983,268 @@ export class Autopilot {
     else if (this.state.offerCuts) delete this.state.offerCuts[offerId];
   }
 
+  // ── who owns an offer's terms (OfferControl) ────────────────────────────────
+
+  private offerControlOf(offerId: string): OfferControl {
+    return this.state.offerControl?.[offerId] ?? {};
+  }
+
+  private setOfferControl(offerId: string, control: OfferControl): void {
+    const clean: OfferControl = {
+      ...(control.manual ? { manual: control.manual } : {}),
+      ...(control.autoDisabledAt ? { autoDisabledAt: control.autoDisabledAt } : {}),
+      ...(control.autoDisablingAt ? { autoDisablingAt: control.autoDisablingAt } : {}),
+      ...(control.disabledByHandAt ? { disabledByHandAt: control.disabledByHandAt } : {}),
+    };
+    if (Object.keys(clean).length) (this.state.offerControl ??= {})[offerId] = clean;
+    else if (this.state.offerControl) delete this.state.offerControl[offerId];
+  }
+
+  /** The operator created or edited the offer by hand (or took it over): its
+   *  terms are theirs until they hand it back (resumeOfferAutomation). Who
+   *  disabled it, if anyone, is unchanged — an edit is not a status click. */
+  pauseOfferAutomation(offerId: string, why: string): void {
+    this.setOfferControl(offerId, { ...this.offerControlOf(offerId), manual: { since: new Date().toISOString(), why } });
+    this.persist();
+  }
+
+  /** "Let the autopilot manage it": the offer's terms are the autopilot's
+   *  again (with Liquidity provision on), from the next run. A disable by
+   *  hand still stands. */
+  resumeOfferAutomation(offerId: string): void {
+    this.setOfferControl(offerId, { ...this.offerControlOf(offerId), manual: undefined });
+    this.persist();
+  }
+
+  /** The operator enabled or disabled the offer by hand (Market → Sell, or
+   *  turning Liquidity provision off): the listing is theirs — a disable
+   *  sticks, an enable lists it — and the terms stay with whoever had them. */
+  offerStatusSetByHand(offerId: string, status: string): void {
+    const control = this.offerControlOf(offerId);
+    this.setOfferControl(offerId, {
+      ...control,
+      // Whatever the autopilot had disabled (or was disabling) is superseded
+      // by the click.
+      autoDisabledAt: undefined,
+      autoDisablingAt: undefined,
+      disabledByHandAt: status === "DISABLED" ? new Date().toISOString() : undefined,
+    });
+    this.persist();
+  }
+
+  /**
+   * One status change per offer at a time, whoever makes it — the offer
+   * upkeep's capital safety, or a click on Market → Sell (the toggle route).
+   * Amboss's toggle flips whatever the status is, so two flips that cross
+   * undo each other; each reads the offer afresh inside this, never by a
+   * status the other just changed.
+   */
+  async withOffer<T>(offerId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.offerChains.get(offerId) ?? Promise.resolve();
+    let release!: () => void;
+    const mine = new Promise<void>((r) => (release = r));
+    const chain = prev.then(() => mine);
+    this.offerChains.set(offerId, chain);
+    try {
+      await prev;
+      return await fn();
+    } finally {
+      release();
+      if (this.offerChains.get(offerId) === chain) this.offerChains.delete(offerId);
+    }
+  }
+
+  // ── the Magma engine, eligibility and sellable capital ──────────────────────
+
+  /** The Magma engine's report with THIS autopilot's inputs — the one call the
+   *  Market page and the offer upkeep share (a8: they used to differ). */
+  magmaReport(key: string = this.amboss.getKey()): Promise<MagmaV2Report> {
+    return getMagmaRecommendations(this.readLnd, key, this.magmaOverrides());
+  }
+
+  /** What this node could list on Magma now: the coins after the effective
+   *  reserve (D5) and every promised order, within the deploy cap's headroom;
+   *  and the largest single channel of that (the max-channel cap).
+   *  `refreshDeployed: false` takes the deploy cap's share as the ledger last
+   *  knew it (the order lane and the main run keep it current) instead of
+   *  asking Amboss — for callers that must not wait on Amboss (the Overview). */
+  async sellCapital(opts: { refreshDeployed?: boolean } = {}): Promise<{ listableSat: number; maxChannelSat: number }> {
+    const cfg = this.state.config;
+    // The deploy cap's share of channels sold and still leased (Amboss).
+    if (opts.refreshDeployed !== false && this.amboss.hasKey()) await this.magma.refreshDeployed().catch(() => undefined);
+    const sp = await spendableOnchain(this.readLnd, this.capital, cfg.sellReserveSats);
+    const headroom = Math.max(0, cfg.sellMaxDeploySats - this.capital.deployedSat() - this.capital.reservedSat());
+    const listableSat = floor10k(Math.min(sp.spendableSat, headroom));
+    return { listableSat, maxChannelSat: floor10k(Math.min(listableSat, cfg.sellMaxChannelSats)) };
+  }
+
+  /** Can this node realistically sell on Magma (D8)? From Amboss's public
+   *  book (cached a day) and the capital it could list now. */
+  async magmaEligibility(force = false): Promise<Eligibility> {
+    const own = await getOwnPubkey(this.readLnd);
+    const [capital, book] = await Promise.all([this.sellCapital(), publicBook(own, force).catch(() => null)]);
+    const result = assessEligibility(book, capital);
+    this.lastEligibility = result;
+    return result;
+  }
+
+  /** Better than "not realistic"? (D8/D10) Unknown counts as no: nothing is
+   *  listed, and no capital held back, on evidence that isn't there. */
+  private async sellingRealistic(): Promise<{ ok: boolean; why: string; eligibility: Eligibility | null }> {
+    let e: Eligibility | null = null;
+    try {
+      e = await this.magmaEligibility();
+    } catch (err) {
+      return { ok: false, why: `the selling check could not be made (${errText(err)})`, eligibility: null };
+    }
+    if (e.verdict === "possible_but_slow" || e.verdict === "realistic") return { ok: true, why: e.reasons[0] ?? "", eligibility: e };
+    return {
+      ok: false,
+      why:
+        e.verdict === "unknown"
+          ? `the selling check has no answer (${e.reasons[0] ?? "no public data"})`
+          : `selling is not realistic for this node yet — ${e.reasons[0] ?? ""}`,
+      eligibility: e,
+    };
+  }
+
+  /**
+   * Leave this capital for Magma instead of a routing open? A reason when
+   * yes, null when no (D10, a3-channels). Only when ALL hold:
+   *  - Magma can take it: a key Amboss accepts, and an offer of this node
+   *    listed (enabled) as of the last upkeep;
+   *  - selling is better than "not realistic" (the eligibility check, D8);
+   *  - the lease income this capital can expect — offers like this node's
+   *    fill ~N times a year, each netting the clearing price of comparable
+   *    leases minus the on-chain costs and the service fee — beats what a new
+   *    routing channel is expected to earn (the median yield of this node's
+   *    channels older than 30 days).
+   * No data, no deferral: without a routing history (no channel older than
+   * 30 days) or a clearing price, the open goes ahead — a node can always
+   * open its first channels.
+   */
+  private async leaveForMagma(): Promise<string | null> {
+    if (!this.amboss.hasKey() || this.amboss.getValidity() === false) return null;
+    const listed = (this.state.offerSync?.offers ?? []).some((e) => e.amboss.status === "ENABLED");
+    if (!listed) return null;
+    const realistic = await this.sellingRealistic();
+    const e = realistic.eligibility;
+    if (!realistic.ok || !e?.comparable || e.own.listableSat <= 0) return null;
+    const fillsPerYear = e.comparable.fillsPerMonth * 12;
+    const clearing = clearingFor({ minSizeSat: 0, maxSizeSat: Math.max(1, e.own.maxChannelSat || e.own.listableSat) });
+    if (!clearing || fillsPerYear <= 0) return null;
+    const fillSize = Math.min(e.own.maxChannelSat || e.own.listableSat, clearing.medianSizeSat);
+    const costs = await onchainCosts(this.readLnd);
+    const netPerFill =
+      clearing.medianApr * fillSize * (DEFAULT_LEASE_BLOCKS / BLOCKS_PER_YEAR) * (1 - saleFeeConfig().bps / 10_000) -
+      costs.openCostSat -
+      costs.closeCostSat;
+    if (netPerFill <= 0) return null;
+    const leasePpmYear = Math.round(((fillsPerYear * netPerFill) / e.own.listableSat) * 1_000_000);
+    const [chans, report, info] = await Promise.all([
+      getChannelsView(this.readLnd),
+      getForwardsReport(this.readLnd, 30),
+      getWalletInfo({ lnd: this.readLnd }),
+    ]);
+    // Channels with a month of history (≈ 4320 blocks) say what a channel earns.
+    const aged = chans.filter((c) => {
+      const funded = Number(c.id.split("x")[0]);
+      return c.active && c.status === "open" && Number.isFinite(funded) && funded > 0 && info.current_block_height - funded >= 4_320;
+    });
+    if (aged.length === 0) return null;
+    const revByChan = new Map(report.perChannel.map((c) => [c.channelId, c.feesEarnedSats]));
+    const routing = routingYieldStats(aged, revByChan).medianPpmYear;
+    if (leasePpmYear <= routing) return null;
+    return (
+      `deferred: selling on Magma is expected to earn more on this capital (~${leasePpmYear} ppm/yr: offers like yours ` +
+      `fill ~${fillsPerYear.toFixed(1)} times a year) than a new routing channel (~${routing} ppm/yr) — left for Magma`
+    );
+  }
+
+  /**
+   * The Overview's lease benchmark (D12): the clearing rate of comparable
+   * sales where this node can sell, else that it can't yet. Never throws —
+   * and never waits for Amboss: the Overview loads on LND alone. Before, every
+   * Overview load (each minute, for every user, Magma user or not) asked
+   * Amboss for this node's sold capital and, with no answer cached, for the
+   * public book — so while Amboss was slow or down the KPIs, activity and
+   * autopilot tiles waited out its query deadline (15 s) on every load.
+   *
+   * Now it is judged from what is cached: the public book (a day; a missing or
+   * old copy is fetched in the background for the next load, and a failed
+   * fetch is not repeated for 15 minutes) and the capital as the ledger knows
+   * it (no sold-capital listing is fetched here). Only a cold cache gets a
+   * short look — BENCHMARK_WAIT_MS — at the fetch it starts.
+   */
+  async leaseBenchmark(): Promise<LeaseBenchmark> {
+    let e: Eligibility | null = null;
+    let failed = false;
+    try {
+      const own = await getOwnPubkey(this.readLnd);
+      const cached = cachedPublicBook(own);
+      let book = cached?.book ?? null;
+      if (!cached?.fresh) {
+        // Deduplicated with any fetch under way; never rejects.
+        const fetching = publicBook(own).catch(() => null);
+        if (!book) book = await withinMs(fetching, BENCHMARK_WAIT_MS);
+      }
+      failed = !book && publicBookFailure(own) !== null;
+      if (book) e = assessEligibility(book, await this.sellCapital({ refreshDeployed: false }));
+    } catch {
+      e = null; // LND could not say (the rest of the Overview shows that)
+    }
+    if (!e || e.verdict === "unknown") {
+      return {
+        status: "unknown",
+        grossAprPct: null,
+        sales: null,
+        windowDays: null,
+        text: failed ? "the Magma market could not be read — asked again in a few minutes" : "the Magma market is being read",
+      };
+    }
+    if (e.verdict === "not_realistic") {
+      return {
+        status: "not_realistic",
+        grossAprPct: null,
+        sales: null,
+        windowDays: null,
+        text: "Magma selling is not realistic for this node yet — offers like yours don't sell",
+      };
+    }
+    const clearing = clearingFor({ minSizeSat: 0, maxSizeSat: Math.max(1, e.own.maxChannelSat || e.own.listableSat) });
+    if (!clearing) return { status: "no_data", grossAprPct: null, sales: null, windowDays: null, text: "no completed Magma leases of your size to compare with" };
+    const pct = Math.round(clearing.medianApr * 10_000) / 100;
+    return {
+      status: "eligible",
+      grossAprPct: pct,
+      sales: clearing.count,
+      windowDays: clearing.windowDays,
+      text: `comparable Magma leases cleared at ~${pct}%/yr (gross, what buyers paid — ${clearing.count} sales in ${clearing.windowDays} days)`,
+    };
+  }
+
+  /** The latest eligibility the autopilot computed (null until it has). */
+  lastEligibility: Eligibility | null = null;
+
+  /** The latest decision NOT to act, per area, with its reason (D16; the
+   *  full per-area status is a later package's — this is its seed). */
+  private decisionNote(area: "magma" | "channels", text: string): void {
+    (this.state.decisions ??= {})[area] = { at: new Date().toISOString(), text };
+  }
+
   private syncState(): OfferSyncStatus {
     this.state.offerSync ??= { at: null, managed: this.state.config.sellEnabled, offers: [], lastError: null };
     return this.state.offerSync;
   }
 
-  /** One offer's sync record: what Amboss has, what is wanted, the last write. */
-  private syncEntry(off: MyOffer, wanted: OfferFields | null, write?: OfferWrite, note?: string): OfferSyncEntry {
+  /** One offer's sync record: what Amboss has, what is wanted, the last write
+   *  — and notes on what the autopilot left as it is, and why. */
+  private syncEntry(off: MyOffer, wanted: OfferFields | null, write?: OfferWrite, note?: string | string[]): OfferSyncEntry {
     const have = fieldsOf(off);
     const prev = this.state.offerSync?.offers.find((e) => e.offerId === off.id);
     const differences = offerDifferences(have, wanted);
-    if (note) differences.push(note);
+    if (note) differences.push(...[note].flat());
+    const control = this.offerControlOf(off.id);
     return {
       offerId: off.id,
       checkedAt: new Date().toISOString(),
@@ -1597,13 +2253,25 @@ export class Autopilot {
       inSync: wanted !== null && differences.length === 0,
       differences,
       lastWrite: write ?? prev?.lastWrite ?? null,
+      ...(Object.keys(control).length ? { control } : {}),
     };
   }
 
-  /** What the autopilot wants for each offer vs what Amboss has (for the UI). */
+  /** What the autopilot wants for each offer vs what Amboss has (for the UI),
+   *  with who owns each offer's terms as of now. */
   offerSyncStatus(): OfferSyncStatus {
     const s = this.state.offerSync ?? { at: null, managed: false, offers: [], lastError: null };
-    return { ...s, managed: this.state.config.sellEnabled && this.amboss.hasKey() };
+    const offers = s.offers.map((e) => {
+      const control = this.offerControlOf(e.offerId);
+      const { control: _old, ...rest } = e;
+      return Object.keys(control).length ? { ...rest, control } : rest;
+    });
+    return { ...s, offers, managed: this.state.config.sellEnabled && this.amboss.hasKey() };
+  }
+
+  /** Who owns each offer's terms (for offers the sync status hasn't seen yet). */
+  offerControls(): Record<string, OfferControl> {
+    return { ...(this.state.offerControl ?? {}) };
   }
 
   /** A manual offer write (Market → Sell): kept with the sync status, so the
@@ -1625,18 +2293,24 @@ export class Autopilot {
 
   /** The Magma order lane (every 45 s, see startOrderLane): accept, open,
    *  report, settle, cancel and reject — through the order journal, never
-   *  through the main run's lock. */
+   *  through the main run's lock. Then, apart from it, the purchases. */
   async pollSellOrders(): Promise<void> {
     if (this.shuttingDown || !this.writeLnd) return;
-    let sells: AutopilotSell[];
+    let sells: AutopilotSell[] | null = null;
     try {
       sells = await this.magma.tick();
     } catch (err) {
       console.error("[autopilot] order lane failed:", err);
-      return;
     }
-    // Skips are explained on each order (journal), not in the run history —
-    // and so is a failure that only repeats (see laneNews).
+    if (sells) this.recordLanePass(sells);
+    // After the pass is on record, never inside it (see followPurchases).
+    await this.followPurchases();
+  }
+
+  /** The lane pass's line in the run history. Skips are explained on each
+   *  order (journal), not in the run history — and so is a failure that only
+   *  repeats (see laneNews). */
+  private recordLanePass(sells: AutopilotSell[]): void {
     const acted = this.laneNews(sells.filter((s) => s.action !== "skip"));
     if (!acted.length) return;
     const run: AutopilotRun = {
@@ -1654,6 +2328,55 @@ export class Autopilot {
     this.state.history.unshift(run);
     this.state.history = this.state.history.slice(0, HISTORY_LIMIT);
     this.persist();
+  }
+
+  /**
+   * Inbound bought here, followed to its end even with the Buy tab closed or
+   * after a restart: LND is asked by payment hash how each payment that
+   * hasn't told its end stands (no Amboss key needed), and Amboss how each
+   * paid order stands — until the record matches what both report.
+   *
+   * Apart from the order lane's critical path (P1b review): it runs after the
+   * lane's pass is on record, has its own busy flag (a slow Amboss can't
+   * stack follow-ups on the 45 s timer), reads a few at a time in parallel,
+   * starts no read once shutdown began and drops answers that arrive after
+   * it (nothing is lost: the next start asks again). Before, up to five
+   * sequential Amboss reads ran inside the lane's pass — up to 75 s with
+   * Amboss slow — before its run history was written, outside any busy flag.
+   */
+  async followPurchases(): Promise<void> {
+    if (this.followingPurchases || this.shuttingDown) return;
+    this.followingPurchases = true;
+    try {
+      const { payments } = this.purchases.followUps();
+      await eachBounded(payments, PURCHASE_FOLLOW_PARALLEL, () => this.shuttingDown, async (p) => {
+        const report = await this.purchasePaymentReport(p.paymentHash);
+        if (!this.shuttingDown) this.purchases.paymentOutcome(p.orderId, report);
+      });
+      if (!this.amboss.hasKey()) return;
+      const key = this.amboss.getKey();
+      const { orders } = this.purchases.followUps();
+      await eachBounded(orders, PURCHASE_FOLLOW_PARALLEL, () => this.shuttingDown, async (p) => {
+        const order = await getOrder(key, p.orderId);
+        if (!this.shuttingDown) this.purchases.fromOrder(p.orderId, order);
+      });
+    } finally {
+      this.followingPurchases = false;
+    }
+  }
+
+  /** How a purchase's payment stands in LND (by payment hash). */
+  private async purchasePaymentReport(id: string): Promise<PaymentReport> {
+    try {
+      const p = await getPayment({ lnd: this.writeLnd ?? this.readLnd, id });
+      if (p.is_confirmed && p.payment) return { status: "succeeded", feeSats: p.payment.safe_fee ?? p.payment.fee, at: p.payment.confirmed_at };
+      if (p.is_failed) return { status: "failed", error: "LND reports the payment failed", confirmed: true };
+      return { status: "in_flight" };
+    } catch (err) {
+      // 404 SentPaymentNotFound: LND has no payment with this hash.
+      if (Array.isArray(err) && err[0] === 404) return { status: "not_found" };
+      throw err;
+    }
   }
 
   /**
@@ -1728,7 +2451,16 @@ export class Autopilot {
         await this.reconcilePendingRebalances();
         return [];
       });
-      const changes = await stage("fees", this.state.config.enabled, () => this.runFees(writeLnd));
+      const changes = [
+        ...(await stage("fees", this.state.config.enabled, () => this.runFees(writeLnd))),
+        // D7 with fee automation off: the routing-fee promises of sold
+        // channels are still kept — LND's default fee or a change made with
+        // another tool can sit above a cap. Only a breach is touched, and only
+        // lowered to the cap; every other fee stays the operator's.
+        ...(await stage("lease promises", !this.state.config.enabled && this.capital.leaseCaps().length > 0, () =>
+          this.keepLeasePromises(writeLnd),
+        )),
+      ];
       const rebalances = await stage("rebalancing", this.state.config.rebalanceEnabled, () => this.runRebalances(writeLnd));
       const channels = await stage("channels", this.state.config.channelEnabled, () => this.runChannels(writeLnd));
       const sells = await stage("magma", true, () => this.runSell());
@@ -1794,10 +2526,12 @@ export class Autopilot {
       this.overrides.all(),
       elasticity,
       this.flowAnchors(),
+      this.capital.leaseCaps(),
     );
   }
   private feeApply(writeLnd: AuthenticatedLnd, items: FeeApplyItem[]) {
-    return applyFees(this.readLnd, writeLnd, items);
+    // The last gate: a sold channel's fee never leaves its lease promise.
+    return applyFees(this.readLnd, writeLnd, items, this.capital.leaseCaps());
   }
   private rebalanceReport() {
     return getRebalanceRecommendations(

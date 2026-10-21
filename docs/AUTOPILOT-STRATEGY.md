@@ -32,14 +32,17 @@ if enabled, it runs four independent sub-autopilots in order:
 1. **Fees** — recompute and apply each channel's outbound `fee_rate` + `base_fee`.
 2. **Rebalancing** — run profitable circular rebalances to refill channels.
 3. **Channels** — open a channel to a well-scored peer if on-chain funds allow.
-4. **Magma** — fulfil sell orders, reprice/relist our offer, optionally auto-close.
+4. **Magma** — keep our offer fundable and well-formed, reprice/relist it if asked, optionally
+   auto-close finished leases. (Orders themselves are fulfilled by a separate 45-second order
+   lane, never by this loop.) Off by default: selling is opt-in (Liquidity provision).
 
 Each sub-autopilot has its own on/off switch and detailed settings. Every action is a
 **dry-run recommendation** first (shown in the UI), and only applied when its autopilot is
 on and the change passes safety guards.
 
 On top of the four sub-autopilots sits **Strategy** — three one-click presets that
-configure everything coherently (Section 3).
+configure fees, rebalancing and channel opening coherently (Section 3). No preset touches
+Magma selling.
 
 ---
 
@@ -139,8 +142,8 @@ Applying uses LND `updateRoutingFees`, preserving `cltv_delta` and HTLC limits.
 ## 3. Strategy — one goal, cascaded (`AutopilotPanel.tsx`)
 
 At the top of the Autopilot tab are three one-click presets. Picking one **writes the whole
-fee curve AND which sub-autopilots run**, so the parts pull the same way. The detailed
-per-subtab controls below still override anything afterwards.
+fee curve AND which of the routing sub-autopilots run**, so the parts pull the same way. The
+detailed per-subtab controls below still override anything afterwards.
 
 Each preset sets the full fee curve, its **behaviour** (protect floor, profit-floor margin,
 how fast idle channels get cheaper, how aggressive the explore-lower cut is) AND the
@@ -148,14 +151,22 @@ how fast idle channels get cheaper, how aggressive the explore-lower cut is) AND
 
 | Preset | min/neutral/max | protect | safety­Margin | ratchet steps | explore mod | Rebalance: econRatio / max·run / daily budget | Channels | Magma |
 |---|---|---|---|---|---|---|---|---|
-| **Max routing** | 25 / 60 / 1000 | 250 | 1.05 | 4 | 0.75 | 0.9 / 4 / 25k sat | on | **off** |
-| **Balanced** (default) | 25 / 80 / 1000 | 350 | 1.15 | 3 | 0.85 | 0.8 / 2 / 10k sat | on | on, auto |
-| **Max profit** | 80 / 150 / 1500 | 600 | 1.35 | 1 | 0.90 | 0.6 / 1 / 5k sat | **off** | on, premium |
+| **Max routing** | 25 / 60 / 1000 | 250 | 1.05 | 4 | 0.75 | 0.9 / 4 / 25k sat | on | untouched |
+| **Balanced** (default) | 25 / 80 / 1000 | 350 | 1.15 | 3 | 0.85 | 0.8 / 2 / 10k sat | on | untouched |
+| **Max profit** | 80 / 150 / 1500 | 600 | 1.35 | 1 | 0.90 | 0.6 / 1 / 5k sat | untouched | untouched |
 
 Rationale: "Max routing" = cheapest fees + zero base + fast ratchet down + loose (still
 profitable) rebalancing → win the most forwards (*lots of forwards for few sats*). "Max
-profit" = higher fees, slow ratchet, strict rebalancing, lease idle capital rather than
-route it. "Balanced" competes for flow while leasing idle capital.
+profit" = higher fees, slow ratchet, strict rebalancing → fewer, richer forwards.
+"Balanced" competes for flow at sensible fees. ("untouched" = the preset leaves that switch as
+it is; Max profit no longer switches channel opens off.)
+
+**No preset touches Magma selling** (no `sell*` key at all). Selling stays off unless the
+operator switches **Liquidity provision** on themselves — after a confirmation that shows a
+live check of whether the node can realistically sell (offers like its would-be offer, by
+Amboss fee tier and seller score, and how often they fill). Earlier versions had "Balanced"
+switch selling on and "Max profit" switch channel opens *off* to "lease idle capital rather
+than route it" — for nodes whose offers, measured on Amboss's public book, never sold.
 
 **How the cascade reaches the engine:** the preset writes the persisted config's `policy`
 object (`minPpm`, `neutralPpm`, `maxPpm`, `baseFeeMsat`, `protectPpm`, `safetyMargin`,
@@ -179,16 +190,36 @@ earn (a `route_found_profitable` gate; `econRatio` is the cost/benefit knob). Ru
 attempt (success or fail) marks the target so we don't hammer dead routes.
 
 **Channels** (`runChannels`): opens a channel to the top-scored peer suggestion when
-on-chain funds exceed the reserve. **Capital gate:** if Magma selling is also on, it only
-opens a routing channel when routing is expected to out-earn leasing that capital
-(`routingYieldStats.medianPpmYear` vs a `leaseThresholdPpmYear` floor). Otherwise it leaves
-the sats for Magma. This is the one place capital allocation is unified across routing vs
-leasing.
+on-chain funds exceed the reserve. **Capital gate (`leaveForMagma`, D10):** a routing open
+waits for Magma only when ALL of these hold — Amboss accepts the key and an offer of this node
+is listed (enabled); the selling check says better than "not realistic" (offers like this
+node's sell at least about once a year); and the lease income this capital can expect
+(how often offers like it fill × what one fill nets at the clearing price of comparable
+leases, after on-chain costs and the service fee, over the capital it could list) beats the
+median routing yield of this node's channels at least ~30 days (4,320 blocks) old. Without
+routing history or clearing data, the open goes ahead — a node can always open its first
+channels. This is the one place capital allocation is unified across routing vs leasing.
 
-**Magma** (`runMagma`): fulfils incoming sell orders by opening channels to buyers within
-capital/size/reserve caps; reprices/relists our own offer per `sellPricingMode`
-(`fast`/`balanced`/`premium`/`auto`, where auto adapts toward the income-maximising lease
-price); optional auto-close/auto-relist. A 1% service fee applies to completed sales.
+**Magma** — two parts. The **order lane** (every 45 s, its own busy flag, never the main
+run's lock) accepts orders with a hold invoice, opens the channel, reports it, settles once
+Amboss confirms it and rejects at once what it can't serve — every step recorded in a
+per-order journal first. The **offer upkeep** (`runSell`, in the main run, only with
+Liquidity provision on) keeps each offer fundable (cut, disabled while its smallest channel
+can't be funded, listed again once it can), gives it the standard 4,320-block lease and the
+routing-fee promise (with auto-size), and prices it per `sellPricingMode` (with
+auto-price): `fast` = the 25th percentile of what buyers actually paid, `balanced` = their
+median, `premium` = their 75th percentile, `auto` = between the 25th and 75th percentile,
+starting in the middle and stepping up after each sale (it never steps down on its own, but
+follows the market when what buyers pay moves) — never below the profit floor. Each offer
+is priced for the lease it carries after the write: the standard one with auto-size, else
+the one it keeps — a longer lease buyers use (60, 90, 180 days) is priced as such, and a
+price for a shorter lease than the offer promises is never applied to it. With every
+offer-automation switch off, capital safety is all the autopilot does to an offer (its
+lease and routing-fee promise stay as they are). An offer the operator created or edited
+by hand is theirs: the autopilot changes none of its terms; enabling or disabling it by
+hand decides only whether it is listed. A new offer is listed automatically only where the
+selling check is better than "not realistic". Optional auto-close/auto-relist. A 1%
+service fee applies to completed sales.
 
 ---
 
@@ -205,8 +236,10 @@ sellEnabled, sellMaxDeploySats, sellReserveSats, sellMaxChannelSats,
   sellAutoClose, sellAutoRelist, sellAutoReprice, sellPricingMode
 ```
 
-The Strategy presets only currently write: the four `*Enabled` flags, `policy` (min/neutral/
-max/base), and `sellAutoReprice` + `sellPricingMode`.
+The Strategy presets write: `enabled`, `rebalanceEnabled` and (except Max profit)
+`channelEnabled`, the `policy` curve and behaviour, and the rebalance economics
+(`rebalancePolicy.econRatio`, `maxRebalancesPerRun`, `rebalanceDailyBudgetSats`). They never
+write any `sell*` key.
 
 ---
 
@@ -228,9 +261,9 @@ max/base), and `sellAutoReprice` + `sellPricingMode`.
 2. ~~Rebalance economics aren't strategy-linked.~~ **DONE** — presets set `econRatio`,
    `maxRebalancesPerRun` and a new `rebalanceDailyBudgetSats` (daily rebalance-fee cap).
 
-3. **The three presets conflate two axes:** *where to earn* (route vs lease) and *how
-   aggressive on price* (volume vs margin). Would a 2-D model (goal × placement) be clearer,
-   or does bundling keep it simple enough? Is three the right number?
+3. ~~**The three presets conflate two axes:** *where to earn* (route vs lease) and *how
+   aggressive on price* (volume vs margin).~~ **RESOLVED** — presets decide only the routing
+   side; leasing is a separate, opt-in decision behind the live selling check (D9/D10).
 
 4. ~~`minPpm` 10 on Max routing is near-zero.~~ **DONE** — Max routing now floors at 25 ppm
    (10 is left for a possible future "experimental / ultra-volume" mode).

@@ -61,8 +61,12 @@ export interface AutopilotConfig {
   /** Keep the offer's size window and lease length in a sane, standard shape,
    *  up to sellMaxChannelSats. Separate from pricing on purpose. */
   sellAutoSize: boolean;
-  /** Pricing level when auto-pricing: fast (undercut to sell quickly), balanced
-   *  (market median), premium (top of the market), or auto (adapt to fill speed). */
+  /** Pricing level when auto-pricing, on what buyers actually paid: fast (their
+   *  25th percentile — the "Low" mode; never below the profit floor), balanced
+   *  (the median), premium (the 75th percentile), or auto (between their 25th
+   *  and 75th percentile: starts in the middle and steps up that range after
+   *  each sale; it never steps down on its own, but it follows the market —
+   *  when buyers pay less, the price comes down with it). */
   sellPricingMode: "fast" | "balanced" | "premium" | "auto";
   /** Advertise routable size: keep each channel's max_htlc just under its
    *  spendable balance (power-of-2 buckets) so senders skip depleted channels. */
@@ -89,7 +93,11 @@ export const DEFAULT_CONFIG: AutopilotConfig = {
   sellEnabled: false,
   sellMaxDeploySats: 2_000_000,
   sellReserveSats: 50_000,
-  sellMaxChannelSats: 5_000_000,
+  // No bigger than the deploy cap: a 5M channel cap above a 2M deploy cap
+  // advertised (on the manual form's 1M–5M default) orders the autopilot then
+  // turned down as "deploy cap reached". Lowering a default only ever lets
+  // the autopilot do less.
+  sellMaxChannelSats: 2_000_000,
   sellAutoClose: false,
   sellAutoRelist: false,
   sellAutoReprice: true,

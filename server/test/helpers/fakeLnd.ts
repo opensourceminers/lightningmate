@@ -399,6 +399,14 @@ export class FakeLnd {
     for (const s of this.invoiceStreams.get(inv.id) ?? []) s.emit("data", this.invoiceRpc(inv));
   }
 
+  /** The gRPC streams following a payment break (LND restarted, the
+   *  connection dropped): whoever waited on them gets an error, while the
+   *  payment itself stays as it is in LND. */
+  dropPaymentStreams(id: string, details = "Connection dropped"): void {
+    for (const s of this.paymentStreams.get(id) ?? []) s.emit("error", { details });
+    this.paymentStreams.delete(id);
+  }
+
   /** Finish a payment left IN_FLIGHT by payOutcome "hang". */
   resolvePayment(id: string, outcome: "succeed" | "fail"): void {
     const p = this.payments.get(id);

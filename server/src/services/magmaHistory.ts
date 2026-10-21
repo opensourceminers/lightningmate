@@ -287,6 +287,49 @@ export function popularLeaseBlocks(days = 90): number {
   return best;
 }
 
+/**
+ * The lease an offer should promise (D7): the standard length buyers ask for
+ * most often — one of the lengths the market trades (4320 / 8640 / 12960 /
+ * 25920 blocks), never shorter than 30 days. min_block_length is a MINIMUM
+ * the seller commits to, so 4320 also serves the longer leases. Before, an
+ * offer listed at 4032 blocks (an old default no order had used since 2022)
+ * was never corrected: auto-size only ever SHORTENED a lease.
+ */
+export function standardLeaseBlocks(days = 90): number {
+  const popular = popularLeaseBlocks(days);
+  return COMMON_LEASE_BLOCKS.includes(popular) ? Math.max(DEFAULT_LEASE_BLOCKS, popular) : DEFAULT_LEASE_BLOCKS;
+}
+
+/**
+ * The lease an offer keeps when it is priced as it stands (and when a price
+ * button on Market → Sell rewrites its terms): one buyers order, at least as
+ * long as the standard — a longer minimum chosen on purpose (60, 90, 180
+ * days) still serves its buyers. Anything else — the old 4,032-block default,
+ * a shorter or an odd one — becomes the standard. The Sell tab's leaseToKeep
+ * (web/src/magmaView.ts) is the same rule.
+ */
+export function keptLeaseBlocks(blocks: number, standard: number = standardLeaseBlocks()): number {
+  return COMMON_LEASE_BLOCKS.includes(blocks) && blocks >= standard ? blocks : standard;
+}
+
+/** How much longer than an offer's own lease the lease its price was worked
+ *  out for may be (priceFitsLease). */
+const MAX_LEASE_OVERCHARGE = 1.25;
+
+/**
+ * May a price worked out for a `priceLease`-block lease go onto an offer that
+ * keeps `offerLease` blocks? Yes for the same lease. Yes for a slightly longer
+ * one — the old 4,032-block offer priced for the standard 4,320: that price
+ * clears the shorter lease's profit floor too, dearer by the length ratio (7%
+ * here, at most a quarter). Never for a SHORTER lease: it would sell the
+ * longer one at the shorter one's price, below its profit floor — a 90-day
+ * offer at the 30-day price. Nor for a much longer one (a 4,320-block offer
+ * at a 60-day price: twice what its lease is worth).
+ */
+export function priceFitsLease(priceLease: number, offerLease: number): boolean {
+  return priceLease >= offerLease && priceLease <= offerLease * MAX_LEASE_OVERCHARGE;
+}
+
 /** Market-wide activity, for the "is anything selling at all" line in the UI. */
 export function marketActivity(days = 90): { orders: number; perDay: number; windowDays: number } | null {
   if (!state?.orders.length) return null;

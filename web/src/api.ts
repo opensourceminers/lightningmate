@@ -34,6 +34,10 @@ import type {
   NodeSummary,
   OpenChannelResult,
   BuyQuote,
+  BuyOffersResponse,
+  Eligibility,
+  MagmaPurchase,
+  SellDiagnostics,
   MagmaV2Report,
   MarketView,
   OutcomesReport,
@@ -237,8 +241,23 @@ export const api = {
       private: isPrivate,
       ...(target ?? {}),
     }),
-  ambossBuyPay: (orderId: string, paymentRequest: string, maxSats: number) =>
-    post<{ ok: boolean; sats: number }>("/amboss/buy/pay", { orderId, paymentRequest, maxSats }),
+  /** Pays only the invoice recorded with the quote, for the confirmed amount. */
+  ambossBuyPay: (orderId: string, maxSats: number) =>
+    post<{ ok: boolean; sats: number }>("/amboss/buy/pay", { orderId, maxSats }),
+  /** The buyer declined the quote: cancel the order on Amboss. */
+  ambossBuyCancel: (orderId: string) =>
+    post<{ ok: boolean; cancelled: boolean; message: string }>("/amboss/buy/cancel", { orderId }),
+  /** The book ranked for this node at `sizeSats` (lease, conditions, Amboss fee, caps). */
+  ambossBuyOffers: (sizeSats: number) => get<BuyOffersResponse>(`/amboss/buy-offers?size=${Math.round(sizeSats)}`),
+  /** Inbound bought here: quotes, cancels, payments, channels. */
+  ambossPurchases: () => get<{ purchases: MagmaPurchase[] }>("/amboss/purchases"),
+  /** Can this node realistically sell on Magma? (live, indicative) */
+  magmaEligibility: (refresh = false) => get<Eligibility>(`/amboss/eligibility${refresh ? "?refresh=1" : ""}`),
+  /** "Why don't I sell?" — the checklist from the live state. */
+  sellDiagnostics: () => get<SellDiagnostics>("/amboss/sell-diagnostics"),
+  /** Hand an offer to the autopilot (true) or take it over (false). */
+  ambossOfferAutomation: (id: string, managed: boolean) =>
+    post<{ ok: boolean; sync: OfferSyncStatus }>("/amboss/offer/automation", { id, managed }),
   ambossOrder: (id: string) => get<OrderState>(`/amboss/order?id=${encodeURIComponent(id)}`),
   signMessage: (message: string) => post<{ signature: string }>("/sign", { message }),
   ambossMyOffers: () => get<MyOffersResponse>("/amboss/my-offers"),
@@ -265,7 +284,10 @@ export const api = {
       minBlockLength: number;
     },
   ) => post<{ ok: boolean; verified: boolean | null; offer: MyOffer | null }>("/amboss/offer/update", { id, ...p }),
-  ambossToggleOffer: (id: string) => post<{ status: string }>("/amboss/offer/toggle", { id }),
+  /** Flip an offer — or, with `want`, put it in that state (read first,
+   *  flipped only if needed; an answer that isn't `want` throws). */
+  ambossToggleOffer: (id: string, want?: "ENABLED" | "DISABLED") =>
+    post<{ status: string; changed?: boolean }>("/amboss/offer/toggle", want ? { id, want } : { id }),
   // Manual order actions go through the same order journal as the autopilot;
   // a failure answers with an error status (thrown here), never 200 + ok:false.
   ambossAcceptOrder: (id: string) => post<DeskResult>("/amboss/order/accept", { id }),

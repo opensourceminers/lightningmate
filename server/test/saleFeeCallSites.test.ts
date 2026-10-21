@@ -188,6 +188,7 @@ test("the manual 'open channel' route answers without waiting for a fee; the sal
   const node = new FakeLnd({ chainBalance: 20_000_000 });
   node.payOutcome = "hang";
   const api = await startApi(t, { node });
+  magma.sellerPubkey = api.node.publicKey; // this node's sales and offers
   api.amboss.setKey("test-key");
   const sale = magma.addSale({ buyerPubkey: BUYER });
 
@@ -214,6 +215,7 @@ test("the manual 'open channel' route books no sale and owes no fee while Amboss
   magma.behave.AddTransaction = "false";
   const node = new FakeLnd({ chainBalance: 20_000_000 });
   const api = await startApi(t, { node });
+  magma.sellerPubkey = api.node.publicKey; // this node's sales and offers
   api.amboss.setKey("test-key");
   const sale = magma.addSale({ buyerPubkey: BUYER });
   await api.request("POST", "/amboss/order/accept", { id: sale.id });

@@ -36,12 +36,14 @@ import { getRebalanceRecommendations } from "../services/rebalanceRecommend.js";
 import { getBtcPrice } from "../services/price.js";
 import type { SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
-import { getAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
+import { getAlerts, magmaRefusalAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
 import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
 import { SlidingWindowLimiter } from "../services/rateLimit.js";
 import { acknowledgeStoreIncident } from "../store.js";
 import { ConfigValidationError } from "../services/autopilotConfig.js";
-import { buyFromOffer, buyLiquidity, getMarket, getOrder, isAuthError } from "../services/amboss.js";
+import { buyFromOffer, buyLiquidity, cancelPurchase, getMarket, getOffers, getOrder, isAuthError } from "../services/amboss.js";
+import { rankBuyOffers, type BuyerFacts } from "../services/magmaBuy.js";
+import { feeTiers, publicBook } from "../services/magmaEligibility.js";
 import {
   checkKey,
   createOffer,
@@ -50,16 +52,18 @@ import {
   getMyOrders,
   toggleOffer,
   updateOffer,
+  type MyOffer,
   type OfferTerms,
 } from "../services/magmaApi.js";
 import type { DeskResult } from "../services/magmaDesk.js";
 import type { AmbossStore } from "../services/ambossStore.js";
-import { ambossFields, type Autopilot, type OfferWrite } from "../services/autopilot.js";
+import { ambossFields, termsMatch, type Autopilot, type OfferWrite } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 import { BackupStore, exportScb, getBackupStatus } from "../services/backup.js";
 import type { EarningsLog } from "../services/earningsLog.js";
 import type { Lsps1Service } from "../services/lsps1.js";
 import { getUnservedDemand, telemetryAgeDays } from "../services/htlcTelemetry.js";
+import { buildSellDiagnostics } from "../services/sellDiagnostics.js";
 
 // Pull the numeric keys of a policy object out of the query string.
 function numericOverrides<T>(query: Request["query"], keys: (keyof T)[]): Partial<T> {
@@ -313,6 +317,7 @@ export function createApiRouter(
           overrides.all(),
           await autopilot.feeElasticityModifiers(),
           autopilot.flowAnchors(),
+          autopilot.capital.leaseCaps(),
         ),
       );
     }),
@@ -378,7 +383,9 @@ export function createApiRouter(
   router.get(
     "/alerts",
     wrap(async (_req, res) => {
-      res.json(await getAlerts(lnd, [...stateAlerts(config.dataDir), ...serviceFeeAlerts(serviceFees)]));
+      res.json(
+        await getAlerts(lnd, [...stateAlerts(config.dataDir), ...serviceFeeAlerts(serviceFees), ...magmaRefusalAlerts(autopilot.magma)]),
+      );
     }),
   );
 
@@ -389,7 +396,9 @@ export function createApiRouter(
       ? acknowledgeStoreIncident(config.dataDir, id.slice("state:".length))
       : id.startsWith("fee:")
         ? serviceFees.acknowledge(id.slice("fee:".length))
-        : false;
+        : id.startsWith("magma:")
+          ? autopilot.magma.acknowledgeRefusal(id.slice("magma:".length))
+          : false;
     if (!ok) {
       res.status(404).json({ error: "not_found", message: "No such alert." });
       return;
@@ -455,7 +464,9 @@ export function createApiRouter(
         }
         items.push({ id: it.id, transactionId: it.transactionId, transactionVout: vout, feeRatePpm, baseFeeMsat });
       }
-      res.json({ results: await applyFees(lnd, writeLnd, items) });
+      // A manual apply is clamped to a sold channel's lease promise too (D7):
+      // the result says where it was.
+      res.json({ results: await applyFees(lnd, writeLnd, items, autopilot.capital.leaseCaps()) });
     }),
   );
 
@@ -604,14 +615,29 @@ export function createApiRouter(
   router.get(
     "/dashboard",
     wrap(async (_req, res) => {
-      const [report, ln, onchain, channels] = await Promise.all([
+      const [report, ln, onchain, channels, leaseBenchmark] = await Promise.all([
         getForwardsReport(lnd, 30),
         getLnActivity(lnd, 10),
         getOnchainTxs(lnd, 10),
         getChannelsView(lnd),
+        autopilot.leaseBenchmark(),
       ]);
       const totalCapacitySats = channels.reduce((s, c) => s + c.capacity, 0);
-      res.json(buildDashboard(report, ln, onchain, rebalanceLog.summary(), autopilot.getState(), totalCapacitySats));
+      // This node's own capital in its channels (pending ones earn nothing yet).
+      const ownCapitalSats = channels.filter((c) => c.status === "open").reduce((s, c) => s + c.localBalance, 0);
+      const since = Date.now() - report.windowDays * 86_400_000;
+      const rebalanceFeesSats = rebalanceLog
+        .recent(200)
+        .filter((r) => r.ok && r.feeSats && Date.parse(r.at) >= since)
+        .reduce((s, r) => s + (r.feeSats ?? 0), 0);
+      res.json(
+        buildDashboard(report, ln, onchain, rebalanceLog.summary(), autopilot.getState(), totalCapacitySats, {
+          ownCapitalSats,
+          rebalanceFeesSats,
+          leaseBenchmark,
+          magmaRefusals: autopilot.magma.refusals(),
+        }),
+      );
     }),
   );
 
@@ -1130,12 +1156,42 @@ export function createApiRouter(
     res.json({ ok: true, connected: false });
   });
 
-  // In-flight Magma payments (HODL invoices settle only once the seller opens the
-  // channel — minutes later — so we pay in the background and never await it in the
-  // request). Amboss' get_order is the source of truth for status; this is a hint.
-  const magmaPays = new Map<string, { state: "paying" | "paid" | "failed"; error?: string; feeSats?: number }>();
+  /** This node, as an offer's buyer conditions see it. */
+  const buyerFacts = async (): Promise<BuyerFacts> => {
+    const [channels, info] = await Promise.all([getChannelsView(lnd), getWalletInfo({ lnd })]);
+    const open = channels.filter((c) => c.status === "open");
+    const sockets = new Set<"TOR" | "CLEARNET">();
+    for (const uri of info.uris ?? []) sockets.add(/\.onion(:\d+)?$/i.test(uri.split("@")[1] ?? "") ? "TOR" : "CLEARNET");
+    return {
+      capacitySat: open.reduce((s, c) => s + c.capacity, 0),
+      channelCount: open.length,
+      sockets,
+      channelsWith: (pubkey) => channels.filter((c) => c.peerPubkey === pubkey && c.status !== "pending_close").length,
+    };
+  };
 
-  // Step 1 — create an order and return the HODL invoice + EXACT sats. No payment.
+  // The offers ranked for THIS node at the size it wants (a4: lease length,
+  // buyer conditions, Amboss's fee by order size, fee caps). Public data; no key.
+  router.get(
+    "/amboss/buy-offers",
+    wrap(async (req, res) => {
+      const sizeSats = intIn(req.query.size, MIN_CHANNEL_SATS, MAX_CHANNEL_SATS) ?? 2_000_000;
+      const own = await getOwnPubkey(lnd);
+      const [market, me, book] = await Promise.all([getMarket(), buyerFacts(), publicBook(own).catch(() => null)]);
+      const tiers = book ? feeTiers(book.offers) : [];
+      res.json({
+        sizeSats,
+        offers: rankBuyOffers(market.offers.filter((o) => o.sellerPubkey !== own), tiers, me, sizeSats),
+        ambossFeeTiers: tiers.map((t) => ({ ambossFeePpm: t.ambossFee, upToSats: t.upTo })),
+        inboundSatsPerUsd: market.inboundSatsPerUsd,
+        satsPerUsd: market.satsPerUsd,
+      });
+    }),
+  );
+
+  // Step 1 — create an order and return the HODL invoice + EXACT sats. No
+  // payment. The quote is recorded (magmaPurchases.ts): paying pays only this
+  // invoice, declining cancels the order on Amboss.
   router.post(
     "/amboss/buy/quote",
     wrap(async (req, res) => {
@@ -1171,20 +1227,68 @@ export function createApiRouter(
           res.status(400).json({ error: "bad_size", message: "Choose a channel size within the offer's range." });
           return;
         }
+        // The size the buyer chose must be one the offer sells now.
+        const offer = (await getOffers()).find((o) => o.id === offerId);
+        if (!offer) {
+          res.status(409).json({ error: "offer_gone", message: "That offer is no longer listed — reload the market." });
+          return;
+        }
+        const top = Math.min(offer.maxSizeSats, offer.availableSats);
+        if (sizeSats < offer.minSizeSats || sizeSats > top) {
+          res.status(400).json({
+            error: "bad_size",
+            message: `This offer sells channels of ${offer.minSizeSats.toLocaleString("en-US")}–${top.toLocaleString("en-US")} sat right now.`,
+          });
+          return;
+        }
         const targeted = await withAmboss(() => buyFromOffer(amboss.getKey(), offerId, info.public_key, sizeSats, isPrivate));
         const dec = await decodeRequest(lnd, targeted.paymentRequest);
+        const purchase = autopilot.purchases.recordQuote({
+          orderId: targeted.orderId,
+          offerId,
+          sellerPubkey: offer.sellerPubkey,
+          sizeSats: targeted.channelSizeSats,
+          feeSats: dec.tokens,
+          paymentRequest: targeted.paymentRequest,
+          paymentHash: dec.id,
+          payee: dec.destination,
+          expiresAt: dec.expiresAt,
+          leaseBlocks: targeted.leaseBlocks ?? offer.minBlockLength ?? null,
+          feeRateCapPpm: targeted.feeRateCapPpm ?? offer.feeRateCapPpm,
+          baseFeeCapSats: targeted.baseFeeCapSats ?? offer.baseFeeCapSats,
+          usdCents: null,
+        });
         res.json({
           orderId: targeted.orderId,
           paymentRequest: targeted.paymentRequest,
           sats: dec.tokens,
           channelSizeSats: targeted.channelSizeSats,
           sellerChosen: true,
+          leaseBlocks: purchase.leaseBlocks,
+          feeRateCapPpm: purchase.feeRateCapPpm,
+          baseFeeCapSats: purchase.baseFeeCapSats,
+          ambossFeeSats: targeted.ambossFeeSats ?? null,
         });
         return;
       }
       const quote = await withAmboss(() => buyLiquidity(amboss.getKey(), uri, usdCents, isPrivate));
       // Decode the invoice ourselves — authoritative amount for the confirm + cap.
       const decoded = await decodeRequest(lnd, quote.paymentRequest);
+      autopilot.purchases.recordQuote({
+        orderId: quote.orderId,
+        offerId: null,
+        sellerPubkey: null,
+        sizeSats: quote.channelSizeSats,
+        feeSats: decoded.tokens,
+        paymentRequest: quote.paymentRequest,
+        paymentHash: decoded.id,
+        payee: decoded.destination,
+        expiresAt: decoded.expiresAt,
+        leaseBlocks: null,
+        feeRateCapPpm: null,
+        baseFeeCapSats: null,
+        usdCents,
+      });
       res.json({
         orderId: quote.orderId,
         paymentRequest: quote.paymentRequest,
@@ -1194,7 +1298,43 @@ export function createApiRouter(
     }),
   );
 
-  // Step 2 — pay the quoted invoice from our node (background; capped at maxSats).
+  // The buyer declined the quote: cancel the order on Amboss, so it doesn't
+  // stay live (before, declining just closed the dialog).
+  router.post(
+    "/amboss/buy/cancel",
+    wrap(async (req, res) => {
+      if (!needKey(res)) return;
+      const orderId = typeof req.body?.orderId === "string" ? req.body.orderId : "";
+      const p = autopilot.purchases.get(orderId);
+      if (!p) {
+        res.status(404).json({ error: "not_found", message: "No quote on record for this order." });
+        return;
+      }
+      if (p.state !== "quoted" && p.state !== "pay_failed") {
+        res.status(409).json({ error: "bad_state", message: `This order is ${p.state} — it can't be cancelled from here.` });
+        return;
+      }
+      let cancelled = false;
+      let error: string | undefined;
+      try {
+        // Amboss wants a reason; the closest for "I won't pay this" is UNABLE_TO_PAY.
+        cancelled = await withAmboss(() => cancelPurchase(amboss.getKey(), orderId, "UNABLE_TO_PAY"));
+        if (!cancelled) error = "Amboss did not confirm the cancel";
+      } catch (err) {
+        error = describeError(err);
+      }
+      autopilot.purchases.update(orderId, { state: cancelled ? "declined" : "cancel_failed", ...(error ? { error } : {}) });
+      res.json({
+        ok: true,
+        cancelled,
+        message: cancelled ? "Order cancelled on Amboss." : `Not paid; Amboss didn't confirm the cancel (${error}) — the unpaid order expires on its own.`,
+      });
+    }),
+  );
+
+  // Step 2 — pay the quoted invoice from our node (background). Only the
+  // invoice recorded with the quote is paid: unexpired, to the payee it named,
+  // for exactly the amount the buyer confirmed.
   router.post(
     "/amboss/buy/pay",
     wrap(async (req, res) => {
@@ -1203,35 +1343,77 @@ export function createApiRouter(
         return;
       }
       const orderId = typeof req.body?.orderId === "string" ? req.body.orderId : "";
-      const request = typeof req.body?.paymentRequest === "string" ? req.body.paymentRequest.trim() : "";
       const maxSats = Math.floor(Number(req.body?.maxSats));
-      if (!orderId || !request || !Number.isFinite(maxSats) || maxSats <= 0) {
-        res.status(400).json({ error: "bad_request", message: "Missing order, invoice or cap." });
+      if (!orderId || !Number.isFinite(maxSats) || maxSats <= 0) {
+        res.status(400).json({ error: "bad_request", message: "Missing order or confirmed amount." });
         return;
       }
-      const decoded = await decodeRequest(lnd, request);
-      if (decoded.tokens > maxSats) {
+      const p = autopilot.purchases.get(orderId);
+      if (!p) {
+        res.status(404).json({ error: "not_found", message: "No quote on record for this order — get a new quote." });
+        return;
+      }
+      if (p.state !== "quoted" && p.state !== "pay_failed") {
+        res.status(409).json({ error: "bad_state", message: `This order is ${p.state} — not paying it again.` });
+        return;
+      }
+      const sent = typeof req.body?.paymentRequest === "string" ? req.body.paymentRequest.trim() : "";
+      if (sent && sent !== p.paymentRequest) {
+        res.status(400).json({ error: "wrong_invoice", message: "That is not the invoice of this quote. Aborted." });
+        return;
+      }
+      if (Date.parse(p.expiresAt) <= Date.now()) {
+        res.status(409).json({ error: "expired", message: "The quote's invoice has expired — get a new quote." });
+        return;
+      }
+      const decoded = await decodeRequest(lnd, p.paymentRequest);
+      if (decoded.tokens > maxSats || decoded.tokens !== p.feeSats) {
         res.status(400).json({
           error: "amount_mismatch",
-          message: `Invoice is ${decoded.tokens} sat, above the confirmed ${maxSats} sat. Aborted.`,
+          message: `Invoice is ${decoded.tokens} sat, not the confirmed ${maxSats} sat. Aborted.`,
         });
+        return;
+      }
+      if (decoded.destination !== p.payee || decoded.destination === (await getOwnPubkey(lnd))) {
+        res.status(400).json({ error: "wrong_payee", message: "The invoice's payee doesn't match the quote. Aborted." });
         return;
       }
       // Routing-fee cap for paying the (small) fee invoice: 1% + 25 sat floor.
       const maxFeeSats = Math.max(25, Math.ceil(decoded.tokens * 0.01));
-      // Bound the in-memory hint map over a long-running process.
-      if (magmaPays.size > 200) magmaPays.delete(magmaPays.keys().next().value as string);
-      magmaPays.set(orderId, { state: "paying" });
-      void payRequest(writeLnd, { request, maxFeeSats })
-        .then((r) => magmaPays.set(orderId, { state: r.ok ? "paid" : "failed", feeSats: r.feeSats }))
-        .catch((e) =>
-          magmaPays.set(orderId, { state: "failed", error: e instanceof Error ? e.message : String(e) }),
-        );
+      autopilot.purchases.startPayment(orderId);
+      // A hold invoice: the payment stays in flight until the seller's channel
+      // is confirmed. This call's answer is one report among others — the
+      // order lane also asks LND by payment hash (after a restart, or when
+      // this stream drops while LND keeps the HTLC in flight), and no report
+      // moves the record backwards. A failure said here is only the stream's
+      // word until LND confirms it.
+      void payRequest(writeLnd, { request: p.paymentRequest, maxFeeSats })
+        .then((r) =>
+          autopilot.purchases.paymentOutcome(
+            orderId,
+            r.ok ? { status: "succeeded", feeSats: r.feeSats } : { status: "failed", error: "payment failed", confirmed: false },
+          ),
+        )
+        .catch((e) => autopilot.purchases.paymentOutcome(orderId, { status: "failed", error: describeError(e), confirmed: false }));
       res.json({ ok: true, sats: decoded.tokens });
     }),
   );
 
-  // Poll order status (Amboss truth) + our local payment hint.
+  /** The payment hint for an order, from the purchase ledger. */
+  const paymentHint = (orderId: string) => {
+    const p = autopilot.purchases.get(orderId);
+    if (!p) return null;
+    if (p.state === "paying") return { state: "paying" as const };
+    // Only the pay call said "failed" (a dropped stream, a restart): the order
+    // lane asks LND how it really ended — not a failure yet.
+    if (p.state === "pay_failed" && !p.failureConfirmed) return { state: "unclear" as const, error: p.error };
+    if (p.state === "pay_failed") return { state: "failed" as const, error: p.error };
+    if (p.state === "paid" || p.state === "channel_open") return { state: "paid" as const, feeSats: p.routingFeeSats ?? undefined };
+    return null;
+  };
+
+  // Poll order status (Amboss truth) + our payment record; the purchase
+  // ledger follows it.
   router.get(
     "/amboss/order",
     wrap(async (req, res) => {
@@ -1245,9 +1427,15 @@ export function createApiRouter(
         return;
       }
       const order = await withAmboss(() => getOrder(amboss.getKey(), id));
-      res.json({ ...order, payment: magmaPays.get(id) ?? null });
+      autopilot.purchases.fromOrder(id, order);
+      res.json({ ...order, payment: paymentHint(id) });
     }),
   );
+
+  // Inbound bought here (newest first): quotes, cancels, payments, channels.
+  router.get("/amboss/purchases", (_req, res) => {
+    res.json({ purchases: autopilot.purchases.list() });
+  });
 
   // ── Magma selling (offers + orders, on the Magma API) ───────────────────────
   const needKey = (res: Response): boolean => {
@@ -1267,7 +1455,19 @@ export function createApiRouter(
       // one whose key expired and whose offer therefore stopped selling, saw an
       // empty page instead. The engine already tolerates a missing key: your own
       // offers and orders simply come back empty.
-      res.json(await getMagmaRecommendations(lnd, amboss.getKey(), autopilot.magmaOverrides()));
+      // The autopilot's own call, with its inputs (a8: one builder for both).
+      res.json(await autopilot.magmaReport(amboss.getKey()));
+    }),
+  );
+
+  // Can this node realistically SELL on Magma (D8)? Comparable live offers,
+  // how many ever sold, the fills per offer-month — from Amboss's public book
+  // (cached a day; ?refresh=1 asks again) and the capital listable now.
+  // Needs no key: the user deciding whether to sell at all is who needs it.
+  router.get(
+    "/amboss/eligibility",
+    wrap(async (req, res) => {
+      res.json(await autopilot.magmaEligibility(req.query.refresh === "1"));
     }),
   );
 
@@ -1277,8 +1477,9 @@ export function createApiRouter(
     "/amboss/my-offers",
     wrap(async (_req, res) => {
       if (!needKey(res)) return;
-      const offers = await withAmboss(() => getMyOffers(amboss.getKey()));
-      res.json({ offers, sync: autopilot.offerSyncStatus() });
+      const own = await getOwnPubkey(lnd);
+      const offers = await withAmboss(() => getMyOffers(amboss.getKey(), own));
+      res.json({ offers, sync: autopilot.offerSyncStatus(), controls: autopilot.offerControls(), feeCaps: autopilot.offerFeeCaps() });
     }),
   );
 
@@ -1286,13 +1487,64 @@ export function createApiRouter(
     res.json(autopilot.offerSyncStatus());
   });
 
+  // "Why don't I sell?" — the diagnosis checklist answered from the live
+  // state: version, write mode, key, Liquidity provision and the automation
+  // switches, the order lane, the offer vs the engine's target (price,
+  // window, lease, fee promise), the last offer write, recent orders and
+  // how they ended, and whether this node can realistically sell at all.
+  // Every part that can't be read says so (never a silent "ok").
+  router.get(
+    "/amboss/sell-diagnostics",
+    wrap(async (_req, res) => {
+      const st = autopilot.getState();
+      const keyed = amboss.hasKey();
+      if (keyed) await amboss.checkValidity();
+      const own = await getOwnPubkey(lnd);
+      const settle = <T>(p: Promise<T>): Promise<{ ok: T } | { err: string }> =>
+        p.then(
+          (ok) => ({ ok }),
+          (err: unknown) => ({ err: describeError(err) }),
+        );
+      const [offers, rec, sales, eligibility, channels] = await Promise.all([
+        keyed ? settle(withAmboss(() => getMyOffers(amboss.getKey(), own))) : Promise.resolve({ err: "no Amboss key" } as const),
+        settle(autopilot.magmaReport(amboss.getKey())),
+        keyed ? getMyOrders(amboss.getKey(), own).then((v) => v.orders, () => null) : Promise.resolve(null),
+        autopilot.magmaEligibility().catch(() => autopilot.lastEligibility),
+        getChannelsView(lnd).catch(() => null),
+      ]);
+      const publicOpen = channels?.filter((c) => c.status === "open" && !c.private) ?? null;
+      const key = amboss.status();
+      res.json(
+        buildSellDiagnostics({
+          version: process.env.APP_VERSION ?? "dev",
+          canWrite: st.canWrite,
+          key: { connected: key.connected, valid: key.keyValid, check: key.keyCheck, lastError: key.lastError },
+          config: st.config,
+          lane: st.magmaLane,
+          sync: autopilot.offerSyncStatus(),
+          controls: autopilot.offerControls(),
+          offers: "ok" in offers ? offers.ok : null,
+          offersError: "err" in offers ? offers.err : null,
+          rec: "ok" in rec ? rec.ok : null,
+          recError: "err" in rec ? rec.err : null,
+          feeCaps: autopilot.offerFeeCaps(),
+          recentOrders: autopilot.magma.recentOrders(10),
+          sales,
+          eligibility,
+          node: publicOpen ? { publicChannels: publicOpen.length, capacitySat: publicOpen.reduce((t, c) => t + c.capacity, 0) } : null,
+        }),
+      );
+    }),
+  );
+
   // Your sales, with this node's own record of each (order journal: phase,
   // why it was rejected or skipped, the funding outpoint) and the order lane.
   router.get(
     "/amboss/my-orders",
     wrap(async (_req, res) => {
       if (!needKey(res)) return;
-      const view = await withAmboss(() => getMyOrders(amboss.getKey()));
+      // This node's sales only (one Amboss account can sell for several nodes).
+      const view = await withAmboss(async () => getMyOrders(amboss.getKey(), await getOwnPubkey(lnd)));
       res.json({
         pendingSeller: view.pendingSeller,
         lane: autopilot.magma.laneStatus(),
@@ -1303,6 +1555,22 @@ export function createApiRouter(
       });
     }),
   );
+
+  /**
+   * A manual write to an offer: only to one of THIS node's offers. One Amboss
+   * account can list offers for several nodes; the ids are all in the same
+   * account, so without this check a click could reprice, resize or disable
+   * another node's offer. Null (and a 409 sent) when it isn't this node's.
+   */
+  const ownOffer = async (id: string, res: Response): Promise<MyOffer | null> => {
+    const [offer, own] = await Promise.all([withAmboss(() => getMyOffer(amboss.getKey(), id)), getOwnPubkey(lnd)]);
+    if (offer.nodePubkey === own) return offer;
+    res.status(409).json({
+      error: "other_node",
+      message: "This offer belongs to another node of your Amboss account — LightningMate only manages this node's offers.",
+    });
+    return null;
+  };
 
   /** Offer terms from a request body (sizes in sats, rate in ppm, lease in blocks). */
   const parseOfferTerms = (b: Record<string, unknown>, res: Response): OfferTerms | null => {
@@ -1340,8 +1608,11 @@ export function createApiRouter(
     "/amboss/offer",
     wrap(async (req, res) => {
       if (!needKey(res)) return;
-      const terms = parseOfferTerms(req.body ?? {}, res);
-      if (!terms) return;
+      const parsed = parseOfferTerms(req.body ?? {}, res);
+      if (!parsed) return;
+      // Every offer carries the routing-fee promise (D7) — kept by the fee
+      // autopilot for each channel sold.
+      const terms: OfferTerms = { ...parsed, ...autopilot.offerFeeCaps() };
       const write: OfferWrite = { at: new Date().toISOString(), by: "manual", action: "create", fields: ambossFields(terms), ok: false };
       let offerId: string;
       try {
@@ -1354,6 +1625,9 @@ export function createApiRouter(
         return;
       }
       write.ok = true;
+      // Created by hand with the operator's terms: theirs until they hand it
+      // to the autopilot (no repricing of it behind their back).
+      autopilot.pauseOfferAutomation(offerId, "you created this offer by hand");
       const created = await getMyOffer(amboss.getKey(), offerId).catch(() => null);
       autopilot.recordOfferWrite(created, offerId, { ...write, verified: created ? created.id === offerId : undefined });
       res.json({ ok: true, offerId });
@@ -1370,8 +1644,10 @@ export function createApiRouter(
         res.status(400).json({ error: "bad_request", message: "Missing offer id." });
         return;
       }
-      const terms = parseOfferTerms(b, res);
-      if (!terms) return;
+      const parsed = parseOfferTerms(b, res);
+      if (!parsed) return;
+      if (!(await ownOffer(id, res))) return;
+      const terms: OfferTerms = { ...parsed, ...autopilot.offerFeeCaps() };
       const write: OfferWrite = { at: new Date().toISOString(), by: "manual", action: "update", fields: ambossFields(terms), ok: false };
       try {
         write.ok = await withAmboss(() => updateOffer(amboss.getKey(), id, terms));
@@ -1384,21 +1660,24 @@ export function createApiRouter(
         res.status(502).json({ error: "amboss_refused", message: `Offer not updated: ${write.error}` });
         return;
       }
+      // Edited by hand: the operator's terms now — the autopilot leaves them
+      // alone until handed back (it used to overwrite them at its next run).
+      autopilot.pauseOfferAutomation(id, "you edited this offer");
       // "success" is Amboss's word; reading the offer back is the proof.
       const read = await getMyOffer(amboss.getKey(), id).catch(() => null);
-      write.verified = read
-        ? read.totalSizeSats === terms.totalSizeSats &&
-          read.minSizeSats === terms.minSizeSats &&
-          read.maxSizeSats === terms.maxSizeSats &&
-          read.feeRatePpm === terms.feeRatePpm &&
-          read.baseFeeSats === terms.baseFeeSats &&
-          read.minBlockLength === terms.minBlockLength
-        : undefined;
+      write.verified = read ? termsMatch(read, terms) : undefined;
       autopilot.recordOfferWrite(read, id, write);
       res.json({ ok: true, verified: write.verified ?? null, offer: read });
     }),
   );
 
+  // Enable or disable an offer. Amboss's toggle flips whatever the status is
+  // — it is not idempotent — so a caller that wants a STATE says so (`want`):
+  // the offer is read right before, flipped only when it isn't in that state
+  // already, and an answer that isn't the wanted state is an error. (Turning
+  // Liquidity provision off flipped every offer it had listed a moment
+  // before: one the autopilot had disabled in between was ENABLED again, and
+  // a failed flip was swallowed while the dialog said "disabled".)
   router.post(
     "/amboss/offer/toggle",
     wrap(async (req, res) => {
@@ -1408,19 +1687,74 @@ export function createApiRouter(
         res.status(400).json({ error: "bad_request", message: "Missing offer id." });
         return;
       }
-      const write: OfferWrite = { at: new Date().toISOString(), by: "manual", action: "update", fields: { offer_id: id }, ok: false };
-      let status: string;
-      try {
-        status = await withAmboss(() => toggleOffer(amboss.getKey(), id));
-      } catch (err) {
-        write.error = describeError(err);
-        autopilot.recordOfferWrite(null, id, write);
-        throw err;
+      const wantRaw = req.body?.want;
+      if (wantRaw !== undefined && wantRaw !== "ENABLED" && wantRaw !== "DISABLED") {
+        res.status(400).json({ error: "bad_request", message: "want must be ENABLED or DISABLED." });
+        return;
       }
-      write.ok = true;
-      write.action = status === "ENABLED" ? "enable" : "disable";
-      autopilot.recordOfferWrite(await getMyOffer(amboss.getKey(), id).catch(() => null), id, write);
-      res.json({ status });
+      const want: "ENABLED" | "DISABLED" | null = wantRaw ?? null;
+      // One status change per offer at a time: a capital-safety flip of the
+      // autopilot's under way is waited for, and the offer read afresh after
+      // it — never flipped by a status that just changed.
+      await autopilot.withOffer(id, async () => {
+        const offer = await ownOffer(id, res);
+        if (!offer) return;
+        // Already as wanted — or not flippable from here (ADMIN_DISABLED is
+        // Amboss support's): nothing to toggle. The click still counts: "keep
+        // it disabled" on an offer the autopilot had just disabled for lack of
+        // capital is the operator's decision now — it is not listed again
+        // when capital returns.
+        if (want && offer.status !== (want === "ENABLED" ? "DISABLED" : "ENABLED")) {
+          if (offer.status === want) autopilot.offerStatusSetByHand(id, want);
+          res.json({ status: offer.status, changed: false });
+          return;
+        }
+        const write: OfferWrite = { at: new Date().toISOString(), by: "manual", action: "update", fields: { offer_id: id }, ok: false };
+        let status: string;
+        try {
+          status = await withAmboss(() => toggleOffer(amboss.getKey(), id));
+        } catch (err) {
+          write.error = describeError(err);
+          autopilot.recordOfferWrite(null, id, write);
+          throw err;
+        }
+        write.ok = !want || status === want;
+        write.action = status === "ENABLED" ? "enable" : "disable";
+        if (!write.ok) write.error = `Amboss reports the offer ${status}, not ${want}`;
+        // The listing is the operator's now: a manual disable sticks (the
+        // autopilot used to re-enable it within half an hour), a manual enable
+        // lists it. Neither takes the offer's terms over. A status Amboss
+        // reports AGAINST the click is not the operator's choice: recording it
+        // as theirs made "enable" on an offer the autopilot had disabled for
+        // lack of capital — answered DISABLED — a disable by hand, never
+        // listed again.
+        if (write.ok) autopilot.offerStatusSetByHand(id, status);
+        autopilot.recordOfferWrite(await getMyOffer(amboss.getKey(), id).catch(() => null), id, write);
+        if (!write.ok) {
+          res.status(502).json({ error: "not_toggled", status, message: `Offer not ${want === "DISABLED" ? "disabled" : "enabled"}: ${write.error}.` });
+          return;
+        }
+        res.json({ status, changed: true });
+      });
+    }),
+  );
+
+  // Hand an offer back to the autopilot ("Let the autopilot manage it"), or
+  // take it over without changing it. Only this node's offers.
+  router.post(
+    "/amboss/offer/automation",
+    wrap(async (req, res) => {
+      if (!needKey(res)) return;
+      const id = typeof req.body?.id === "string" ? req.body.id : "";
+      const managed = req.body?.managed;
+      if (!id || typeof managed !== "boolean") {
+        res.status(400).json({ error: "bad_request", message: "Offer id and managed (true/false) required." });
+        return;
+      }
+      if (!(await ownOffer(id, res))) return;
+      if (managed) autopilot.resumeOfferAutomation(id);
+      else autopilot.pauseOfferAutomation(id, "you took it over");
+      res.json({ ok: true, sync: autopilot.offerSyncStatus(), controls: autopilot.offerControls() });
     }),
   );
 

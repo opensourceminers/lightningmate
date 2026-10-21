@@ -9,7 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
-    "test": "node --import tsx --test --test-timeout=60000 \"test/**/*.test.ts\""
+    "test": "node --import tsx --import ./test/setup.ts --test --test-timeout=60000 \"test/**/*.test.ts\""
   },
   "dependencies": {
     "dotenv": "^16.4.7",

@@ -7,6 +7,11 @@ services:
       APP_PORT: 3001
 
   web:
+    # Pinned to the image of the last Umbrel store SUBMISSION (tag + digest).
+    # The release pipeline sets this line when it publishes a release to the
+    # community store; it is not the version a running install has — that is
+    # shown in the app's footer, in Settings and on Market → Sell's selling
+    # diagnostics (and served at /api/health).
     image: ghcr.io/opensourceminers/lightningmate:v0.6.10@sha256:199a9df7855714d3b2fe2bc011ebdda88bd58fee2653f283111b35094ca61c1a
     user: "1000:1000"
     restart: on-failure

@@ -8,6 +8,7 @@ import { EarningsLog } from "../../src/services/earningsLog.js";
 import { ServiceFeeLedger, lndFeeLightning } from "../../src/services/serviceFee.js";
 import { CapitalLedger } from "../../src/services/capital.js";
 import { FakeMagma } from "./magma.js";
+import { FakeMarket } from "./market.js";
 import type { FeeApplyItem, FeeApplyResult } from "../../src/services/fees.js";
 import type { FeeRecommendation, FeeRecReport } from "../../src/services/feeRecommend.js";
 import type { RebalanceExecParams, RebalanceExecResult } from "../../src/services/rebalance.js";
@@ -17,6 +18,18 @@ import { FakeLnd } from "./fakeLnd.js";
 import { installFetchMock } from "./fetchMock.js";
 import { AMBOSS_API } from "./amboss.js";
 import { makeTempDir, type AfterHook } from "./tmp.js";
+
+/**
+ * No "run soon after a settings change" kicks (setConfig → reschedule: a main
+ * run after 2 s, an order-lane pass after 5 s, on real timers). A test drives
+ * runOnce/pollSellOrders itself; a kick firing into the next step — or, on a
+ * slow CI runner, after the test, into its fetch mock's after-hook ("unexpected
+ * outbound request(s)") — only made tests flaky. The scheduler's own tests
+ * build an Autopilot without this.
+ */
+export function suppressSchedulerKicks(autopilot: Autopilot): void {
+  (autopilot as unknown as { kick: (fn: () => Promise<unknown>, delayMs: number) => void }).kick = () => undefined;
+}
 
 /** The autopilot's planning reads, node writes and later stages, replaceable
  *  by a test (see "node seams" in autopilot.ts). */
@@ -58,6 +71,7 @@ export function autopilotWith(t: AfterHook, config: Record<string, unknown>, sto
     new EarningsLog(dir),
     new ServiceFeeLedger(dir, null),
   );
+  suppressSchedulerKicks(autopilot);
   t.after(() => autopilot.shutdown());
   const seams = autopilot as unknown as AutopilotSeams;
   return { autopilot, node, seams, http, dir };
@@ -79,7 +93,12 @@ export function sellerSetup(
   const http = installFetchMock(t);
   http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
   const magma = new FakeMagma(http, t);
+  // Amboss's public market data (offer book, node stats, dollar rate): empty
+  // unless a test fills it — the engine and the selling check stay offline.
+  const market = new FakeMarket(http, t);
   const node = new FakeLnd({ chainBalance: opts.chainBalance ?? 20_000_000 });
+  // Sales and offers are this node's unless a test says otherwise.
+  magma.sellerPubkey = node.publicKey;
   const dir = makeTempDir(t);
   writeFileSync(
     join(dir, "autopilot.json"),
@@ -117,6 +136,7 @@ export function sellerSetup(
       undefined,
       new CapitalLedger(),
     );
+    suppressSchedulerKicks(ap);
     started.push(ap);
     return ap;
   };
@@ -133,6 +153,7 @@ export function sellerSetup(
     undefined,
     capital,
   );
+  suppressSchedulerKicks(autopilot);
   started.push(autopilot);
   t.after(() => {
     for (const ap of started) ap.shutdown();
@@ -144,6 +165,7 @@ export function sellerSetup(
     node,
     http,
     magma,
+    market,
     dir,
     amboss,
     earnings,

@@ -18,7 +18,7 @@
  * earns — the amount of the HODL invoice the buyer pays.
  */
 
-import { AmbossError, MAGMA_URL, ambossGql } from "./amboss.js";
+import { AmbossError, MAGMA_URL, ambossGql, collectPages } from "./amboss.js";
 
 // ── amounts ───────────────────────────────────────────────────────────────────
 
@@ -49,6 +49,9 @@ export type OfferStatus = "ENABLED" | "DISABLED" | "ADMIN_DISABLED";
 
 export interface MyOffer {
   id: string;
+  /** The node the offer sells for. One Amboss account can list offers for
+   *  several nodes: only this node's are LightningMate's to manage. */
+  nodePubkey: string;
   status: string;
   minSizeSats: number;
   maxSizeSats: number;
@@ -72,12 +75,13 @@ export interface MyOffer {
 }
 
 export const MY_OFFER_IDS_QUERY = `query MyOfferIds($page: PageInput) {
-  user { market { offers { offers(page: $page) { list { id } total } } } }
+  user { market { offers { offers(page: $page) { list { id node { pubkey } } total } } } }
 }`;
 
 export const MY_OFFER_QUERY = `query MyOffer($id: String!) {
   user { market { offers { get_offer(offer_id: $id) {
     id status created_at filled_orders
+    node { pubkey }
     min_amount { satoshi { sats } }
     max_amount { satoshi { sats } }
     total_amount { satoshi { sats } }
@@ -90,6 +94,7 @@ export const MY_OFFER_QUERY = `query MyOffer($id: String!) {
 type Sats = { satoshi: { sats: string } | null } | null;
 interface RawMyOffer {
   id: string;
+  node: { pubkey: string } | null;
   status: string;
   created_at: string;
   filled_orders: number;
@@ -106,6 +111,7 @@ function toMyOffer(o: RawMyOffer): MyOffer {
   const locked = satsOf(o.locked_amount?.satoshi?.sats);
   return {
     id: o.id,
+    nodePubkey: o.node?.pubkey ?? "",
     status: o.status,
     minSizeSats: satsOf(o.min_amount?.satoshi?.sats),
     maxSizeSats: satsOf(o.max_amount?.satoshi?.sats),
@@ -136,18 +142,32 @@ export async function getMyOffer(apiKey: string, offerId: string): Promise<MyOff
 const PAGE = 50;
 const MAX_PAGES = 20;
 
-/** All your offers (the list carries no size window, so each is read in full). */
-export async function getMyOffers(apiKey: string): Promise<MyOffer[]> {
-  const ids: string[] = [];
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const data = await ambossGql<{
-      user: { market: { offers: { offers: { list: { id: string }[]; total: number } } } };
-    }>(MAGMA_URL, MY_OFFER_IDS_QUERY, apiKey, { page: { limit: PAGE, offset: page * PAGE } });
-    const { list, total } = data.user.market.offers.offers;
-    ids.push(...list.map((o) => o.id));
-    if (list.length === 0 || ids.length >= total) break;
-  }
-  return Promise.all(ids.map((id) => getMyOffer(apiKey, id)));
+/**
+ * Your offers for the node `ownPubkey` (the list carries no size window, so
+ * each is read in full). One Amboss account can hold offers for several
+ * nodes: without `ownPubkey` every offer of the account is returned — callers
+ * that act on offers must pass it, so another node's offer is never repriced,
+ * resized, enabled or disabled from here.
+ */
+export async function getMyOffers(apiKey: string, ownPubkey?: string): Promise<MyOffer[]> {
+  // Each offer once, however Amboss pages the list (collectPages). Before,
+  // pages were counted against `total`: had this listing ignored the page
+  // like the public one does, an account with more than 50 offers would have
+  // had each read — and upkept — twice a run.
+  const { items } = await collectPages(
+    async (page) => {
+      const data = await ambossGql<{
+        user: { market: { offers: { offers: { list: { id: string; node: { pubkey: string } | null }[]; total: number } } } };
+      }>(MAGMA_URL, MY_OFFER_IDS_QUERY, apiKey, { page });
+      return data.user.market.offers.offers;
+    },
+    (o) => o.id,
+    { pageSize: PAGE, maxPages: MAX_PAGES },
+  );
+  const ids = items.filter((o) => ownPubkey === undefined || o.node?.pubkey === ownPubkey).map((o) => o.id);
+  const offers = await Promise.all(ids.map((id) => getMyOffer(apiKey, id)));
+  // The full read says it again (a listing without the node would let one through).
+  return ownPubkey === undefined ? offers : offers.filter((o) => o.nodePubkey === ownPubkey);
 }
 
 /** The offer fields this app sets. Sizes in sats, fee rate in ppm, base fee
@@ -271,6 +291,9 @@ export interface SaleOrder {
   fees: { seller: string; fixed: string; variable: string };
   buyerPubkey: string;
   buyerAlias: string | null;
+  /** The node that sells (opens the channel): one Amboss account can sell
+   *  for several nodes — only this node's orders are LightningMate's. */
+  sellerPubkey: string;
   isPrivate: boolean;
 }
 
@@ -289,7 +312,8 @@ const SALE_FIELDS = `id status timeout created_at payment_status channel_id
       amount { satoshi { sats } }
       asset { type }
       fees { seller { sats } fixed { sats } variable { sats } }
-      options { is_private }`;
+      options { is_private }
+      source { pubkey }`;
 
 export const SALES_QUERY = `query Sales($input: OrderInput, $page: PageInput) {
   user { market { orders { sales(input: $input, page: $page) {
@@ -322,6 +346,7 @@ interface RawSale {
   asset: { type: string } | null;
   fees: { seller: { sats: string }; fixed: { sats: string }; variable: { sats: string } };
   options: { is_private: boolean } | null;
+  source: { pubkey: string } | null;
   destination: { pubkey: string; alias: string | null; sockets?: string[] };
 }
 
@@ -350,6 +375,7 @@ function toSale(o: RawSale): SaleOrder {
     fees: { seller: o.fees.seller.sats, fixed: o.fees.fixed.sats, variable: o.fees.variable.sats },
     buyerPubkey: o.destination.pubkey,
     buyerAlias: o.destination.alias ?? null,
+    sellerPubkey: o.source?.pubkey ?? "",
     isPrivate: o.options?.is_private === true,
   };
 }
@@ -360,23 +386,23 @@ export interface SalesFilter {
   status?: readonly string[];
 }
 
-/** Your sales, newest first, all pages (bounded). */
+/** Your sales, newest first, all pages (bounded), each order once — however
+ *  Amboss pages the list (collectPages). */
 export async function listSales(apiKey: string, filter: SalesFilter = {}): Promise<{ orders: SaleOrder[]; total: number }> {
   const input: Record<string, unknown> = {};
   if (filter.actionNeeded !== undefined) input.action_needed = filter.actionNeeded;
   if (filter.status) input.status = [...filter.status];
-  const orders: SaleOrder[] = [];
-  let total = 0;
-  for (let page = 0; page < MAX_PAGES; page++) {
-    const data = await ambossGql<{
-      user: { market: { orders: { sales: { list: RawSale[]; total: number } } } };
-    }>(MAGMA_URL, SALES_QUERY, apiKey, { input, page: { limit: PAGE, offset: page * PAGE } });
-    const res = data.user.market.orders.sales;
-    total = Number(res.total) || 0;
-    orders.push(...res.list.map(toSale));
-    if (res.list.length === 0 || orders.length >= total) break;
-  }
-  return { orders, total };
+  const { items, total } = await collectPages(
+    async (page) => {
+      const data = await ambossGql<{
+        user: { market: { orders: { sales: { list: RawSale[]; total: number } } } };
+      }>(MAGMA_URL, SALES_QUERY, apiKey, { input, page });
+      return data.user.market.orders.sales;
+    },
+    (o) => o.id,
+    { pageSize: PAGE, maxPages: MAX_PAGES },
+  );
+  return { orders: items.map(toSale), total };
 }
 
 /** One of your sales with everything needed to fulfil it. */
@@ -458,10 +484,12 @@ export function toMyOrder(o: SaleOrder, transactionId: string | null = null): My
   };
 }
 
-/** All your sales (seller side), newest first, plus how many wait on you. */
-export async function getMyOrders(apiKey: string): Promise<MyOrdersView> {
+/** All your sales (seller side) for the node `ownPubkey`, newest first, plus
+ *  how many wait on you. Without `ownPubkey`, every sale of the account (one
+ *  account can sell for several nodes). */
+export async function getMyOrders(apiKey: string, ownPubkey?: string): Promise<MyOrdersView> {
   const { orders } = await listSales(apiKey);
-  const views = orders.map((o) => toMyOrder(o));
+  const views = orders.filter((o) => ownPubkey === undefined || o.sellerPubkey === ownPubkey).map((o) => toMyOrder(o));
   return {
     orders: views,
     pendingSeller: views.filter((o) => o.status === "WAITING_FOR_SELLER_APPROVAL" || o.status === "WAITING_FOR_CHANNEL_OPEN").length,

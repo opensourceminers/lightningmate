@@ -66,11 +66,18 @@ test("a body that stalls after the headers times out too", async (t) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.write('{"partial": '); // …and never finishes
   });
-  const res = await httpRequest(url, {}, 300);
+  // A deadline the headers make even on a loaded runner (they are sent at
+  // once): 300 ms ran out before them under six parallel suites, failing
+  // the test before it reached the body it is about.
+  const started = Date.now();
+  const res = await httpRequest(url, {}, 2_000);
   assert.equal(res.status, 200);
-  const { ms, err } = await elapsed(res.json());
+  const { err } = await elapsed(res.json());
+  const ms = Date.now() - started;
   assert.ok(err instanceof HttpTimeoutError, String(err));
-  assert.ok(ms < 3_000, `took ${ms} ms`);
+  // The one deadline covers the whole exchange, body included — not a fresh
+  // one per stage, and not undici's own five minutes.
+  assert.ok(ms >= 1_900 && ms < 10_000, `took ${ms} ms`);
 });
 
 test("Amboss calls carry a deadline (they used to wait up to 10 minutes)", async (t) => {

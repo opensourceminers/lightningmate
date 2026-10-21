@@ -29,13 +29,19 @@ export interface NodeSummary {
   };
 }
 
-let cachedPubkey: string | undefined;
+/** Per LND connection: a node's key never changes while it is connected. (One
+ *  value for the whole process answered with the FIRST node's key for every
+ *  later one — the Magma lane filters orders by this key, so that would have
+ *  meant acting on another node's orders, or on none.) */
+const cachedPubkeys = new WeakMap<AuthenticatedLnd, string>();
 
-/** Our node's own public key (cached for the process lifetime). */
+/** Our node's own public key (cached for the life of the LND connection). */
 export async function getOwnPubkey(lnd: AuthenticatedLnd): Promise<string> {
-  if (cachedPubkey) return cachedPubkey;
-  cachedPubkey = (await getWalletInfo({ lnd })).public_key;
-  return cachedPubkey;
+  const cached = cachedPubkeys.get(lnd);
+  if (cached) return cached;
+  const pubkey = (await getWalletInfo({ lnd })).public_key;
+  cachedPubkeys.set(lnd, pubkey);
+  return pubkey;
 }
 
 export async function getNodeSummary(lnd: AuthenticatedLnd): Promise<NodeSummary> {

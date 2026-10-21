@@ -124,6 +124,7 @@ test("manual offer writes: a refused update is an error status, a create returns
   const http = installFetchMock(t);
   const magma = new FakeMagma(http, t);
   const api = await startApi(t);
+  magma.sellerPubkey = api.node.publicKey; // this node's sales and offers
   api.amboss.setKey("test-key");
   const offer = magma.addOffer();
   const terms = { totalSizeSats: 4_000_000, minSizeSats: 1_000_000, maxSizeSats: 4_000_000, feeRatePpm: 2971, baseFeeSats: 852, minBlockLength: 4320 };

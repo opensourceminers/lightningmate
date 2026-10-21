@@ -267,9 +267,9 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
 
       <h3 className="sub">Amboss Magma</h3>
       <div className="dryrun-banner">
-        Connect your Amboss account to buy (and later sell) channel liquidity on the Magma
-        marketplace, from the <strong>Channels → Market</strong> tab. Browsing the market needs
-        no key; buying does. Get a key at{" "}
+        Connect your Amboss account to buy channel liquidity on the Magma marketplace — and, as an
+        advanced option, to sell it — from the <strong>Market</strong> tab. Browsing the market needs
+        no key; buying and selling do. Get a key at{" "}
         <a href="https://account.amboss.tech/settings/api-keys" target="_blank" rel="noreferrer">
           account.amboss.tech
         </a>
@@ -349,7 +349,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
               Orders: {lsp.ordersPending} pending · {lsp.ordersCompleted} completed
               {lsp.ordersFailed > 0 ? ` · ${lsp.ordersFailed} failed` : ""}
               {lsp.earnedSat > 0 ? ` · ${lsp.earnedSat.toLocaleString()} sat earned` : ""} — details
-              in Channels → Market → Orders
+              in Market → Orders
             </p>
           ) : null}
           {lsp.serviceFeeBps > 0 ? (

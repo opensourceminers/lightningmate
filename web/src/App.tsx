@@ -37,10 +37,15 @@ export function App() {
   const [tab, setTab] = useState<Tab>("overview");
   // Sub-tab to open when navigating from an Overview tile (e.g. Channels → suggestions).
   const [pendingSub, setPendingSub] = useState<string | undefined>(undefined);
+  // Bumped on every requested jump, so the target panel remounts on its sub-tab
+  // even when the same link is followed twice.
+  const [navSeq, setNavSeq] = useState(0);
   const navigate = (t: string, sub?: string) => {
     setTab(t as Tab);
     setPendingSub(sub);
+    setNavSeq((n) => n + 1);
   };
+  const subKey = `${pendingSub ?? ""}:${navSeq}`;
 
   // Let any component request a tab jump (e.g. "go to Autopilot" links).
   useEffect(() => {
@@ -125,10 +130,13 @@ export function App() {
           )
         ) : null}
 
-        {tab === "market" ? <MarketPanel /> : null}
+        {/* Keyed by the requested jump: a link to Market → Orders (or
+            Autopilot → Magma) from a panel already on that tab must still
+            land there — the panels read initialSub only when they mount. */}
+        {tab === "market" ? <MarketPanel key={subKey} initialSub={pendingSub} /> : null}
         {tab === "wallet" ? <WalletPanel price={price.data} /> : null}
-        {tab === "analytics" ? <AnalyticsPanel initialSub={pendingSub} /> : null}
-        {tab === "autopilot" ? <AutopilotPanel initialSub={pendingSub} /> : null}
+        {tab === "analytics" ? <AnalyticsPanel key={subKey} initialSub={pendingSub} /> : null}
+        {tab === "autopilot" ? <AutopilotPanel key={subKey} initialSub={pendingSub} /> : null}
         {tab === "settings" ? <SettingsPanel onChange={price.refresh} version={version} /> : null}
       </div>
 

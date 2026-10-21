@@ -131,6 +131,7 @@ test("a Magma accept counts what LSPS1 has promised, and LSPS1 counts what Magma
   const magma = new FakeMagma(http, t);
   const node = new FakeLnd({ chainBalance: 3_000_000 });
   const api = await startApi(t, { node });
+  magma.sellerPubkey = api.node.publicKey; // this node's sales and offers
   api.amboss.setKey("test-key");
   api.autopilot.setConfig({ sellEnabled: true, sellMaxDeploySats: 50_000_000, sellMaxChannelSats: 10_000_000 });
   const lsp = api.lsps1 as unknown as { orders: Lsps1Order[]; quotableSat(fresh: boolean): Promise<number> };
@@ -341,6 +342,7 @@ async function lspSetup(t: TestContext, chainBalance: number) {
   const magma = new FakeMagma(http, t);
   const node = new FakeLnd({ chainBalance });
   const api = await startApi(t, { node });
+  magma.sellerPubkey = api.node.publicKey; // this node's sales and offers
   api.amboss.setKey("test-key");
   api.autopilot.setConfig({ sellEnabled: true, sellMaxDeploySats: 50_000_000, sellMaxChannelSats: 10_000_000 });
   const lsp = api.lsps1 as unknown as LspCreate;
@@ -558,6 +560,7 @@ async function sellingApi(t: TestContext, node: FakeLnd) {
   const http = installFetchMock(t);
   const magma = new FakeMagma(http, t);
   const api = await startApi(t, { node });
+  magma.sellerPubkey = api.node.publicKey; // this node's sales and offers
   api.amboss.setKey("test-key");
   api.autopilot.setConfig({ sellEnabled: true, sellMaxDeploySats: 50_000_000, sellMaxChannelSats: 10_000_000 });
   return { api, magma };

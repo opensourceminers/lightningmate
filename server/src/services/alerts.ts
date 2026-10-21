@@ -22,6 +22,8 @@ const RESET_CONSEQUENCE: Record<string, string> = {
   "overrides.json": "Per-channel fee overrides (incl. exclusions) are gone — re-check them on the Channels tab.",
   "settings.json": "Check your Settings (LSP mode, currency).",
   "service-fees.json": "Pending service-fee records were lost.",
+  "magma-purchases.json":
+    "The record of inbound you bought on Magma was lost — the channels are not affected; P&L no longer shows those purchases.",
   "magma-orders.json":
     "Magma orders in progress lost their record, and with it what claims their held payments. No channel is opened " +
     "for such an order: when Amboss asks for one, its held payment is released back to the buyer instead (LND releases " +
@@ -64,6 +66,18 @@ export function stateAlerts(dataDir: string): Alert[] {
     level: "warn" as const,
     message: incidentMessage(i),
     id: `state:${i.id}`,
+  }));
+}
+
+/** Magma orders the order lane turned down (cap, capital, an unreachable
+ *  buyer …), until dismissed — each one a sale this node didn't make. */
+export function magmaRefusalAlerts(desk: { refusals(): { orderId: string; sizeSats: number; reason: string }[] }): Alert[] {
+  return desk.refusals().map((r) => ({
+    level: "warn" as const,
+    message:
+      `A ${Math.round(r.sizeSats).toLocaleString("en-US")} sat Magma order was turned down: ${r.reason}. ` +
+      "If you want orders like it, raise the caps or fund the wallet (Autopilot → Magma); see Market → Orders.",
+    id: `magma:${r.orderId}`,
   }));
 }
 

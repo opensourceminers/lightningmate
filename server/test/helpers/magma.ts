@@ -1,6 +1,6 @@
 import type { FetchMock, RecordedRequest } from "./fetchMock.js";
 import { hang } from "./fetchMock.js";
-import { parsePaymentRequest } from "./bolt11.js";
+import { makeNodeKey, makePaymentRequest, parsePaymentRequest } from "./bolt11.js";
 import { checkDocument, checkVariables, magmaSchema, parseOperation } from "./graphqlSchema.js";
 import type { FakeLnd } from "./fakeLnd.js";
 import type { AfterHook } from "./tmp.js";
@@ -35,6 +35,9 @@ export interface FakeSale {
   feeVariable: string;
   buyerPubkey: string;
   buyerAlias: string | null;
+  /** The node that sells (MarketOrder.source). Unset: the fake's
+   *  `sellerPubkey` — the node under test, once the test says which. */
+  sellerPubkey?: string;
   sockets: string[];
   isPrivate: boolean;
   assetType: "BASE_ASSET" | "TAPROOT_ASSET";
@@ -48,7 +51,8 @@ export interface FakeSale {
 
 export interface FakeOfferState {
   id: string;
-  pubkey: string;
+  /** The node the offer sells for. Unset: the fake's `sellerPubkey`. */
+  pubkey?: string;
   status: string;
   createdAt: string;
   filledOrders: number;
@@ -117,7 +121,24 @@ export function makeSale(o: Partial<FakeSale> & { buyerPubkey: string }): FakeSa
 
 const ACTION_NEEDED = new Set(["WAITING_FOR_SELLER_APPROVAL", "WAITING_FOR_CHANNEL_OPEN", "SELLER_SENT_TRANSACTION"]);
 
-const OPS = /^\s*(query|mutation)\s+(Sales|Sale|AcceptOrder|AddTransaction|RejectOrder|MyOfferIds|MyOffer|CreateOffer|UpdateOffer|ToggleOffer|KeyCheck)\b/;
+const OPS = /^\s*(query|mutation)\s+(Sales|Sale|AcceptOrder|AddTransaction|RejectOrder|MyOfferIds|MyOffer|CreateOffer|UpdateOffer|ToggleOffer|KeyCheck|Order|Buy|CancelOrder|GetOrder)\b/;
+
+/** An order this node placed as a BUYER (market.order.create — or
+ *  liquidity.buy, where Amboss picks the seller: no offer id). */
+export interface FakePurchase {
+  id: string;
+  offerId: string | null;
+  pubkey: string;
+  sizeSats: number;
+  status: string;
+  paymentRequest: string;
+  channelId: string | null;
+  /** The seller (MarketOrder.source). */
+  sellerPubkey: string;
+  /** The terms the order locked (MarketOrder.promises). */
+  promises: { minBlockLength: number; feeRateCap: string; baseFeeCap: string };
+  cancelled?: string;
+}
 
 const sats = (n: number | string) => ({ sats: String(n) });
 const size = (n: number) => ({ satoshi: sats(n) });
@@ -130,10 +151,29 @@ export class FakeMagma {
   /** Every mutation by operation name, with its variables. */
   readonly calls: { op: string; variables: Record<string, unknown> }[] = [];
   keyValid = true;
+  /** The node this account sells for unless a sale or offer names another —
+   *  set it to the node under test (sellerSetup does). One Amboss account
+   *  can sell for several nodes: a sale or offer with another `sellerPubkey`
+   *  / `pubkey` belongs to another node of the same account. */
+  sellerPubkey = "02" + "11".repeat(32);
   /** Scripted outcomes, per operation (default "ok"). A function decides per call. */
-  behave: Partial<Record<"AcceptOrder" | "AddTransaction" | "RejectOrder" | "UpdateOffer" | "CreateOffer" | "ToggleOffer", Behaviour | ((n: number) => Behaviour)>> = {};
+  behave: Partial<
+    Record<
+      "AcceptOrder" | "AddTransaction" | "RejectOrder" | "UpdateOffer" | "CreateOffer" | "ToggleOffer" | "Order" | "Buy" | "CancelOrder",
+      Behaviour | ((n: number) => Behaviour)
+    >
+  > = {};
   /** Answers to the read queries: "throw" (HTTP 502) or "hang". */
   readBehaviour: Behaviour = "ok";
+  /** How the offer and sales listings answer their `page` argument.
+   *  "whole-list": every page is the whole list, `total` its length — what
+   *  magma.amboss.tech's public offer list does (checked 2026-10-21; the
+   *  keyed listings could not be checked without a key, so LightningMate
+   *  reads them as if they did the same). "pages": offset/limit honoured. */
+  paging: "whole-list" | "pages" = "whole-list";
+  /** Answers to a BUYER's order read (get_order of a purchase) only — the
+   *  seller's reads go on as `readBehaviour` says. */
+  orderReadBehaviour: Behaviour = "ok";
   /** Scripted answers to one order's read (get_order), e.g. `gqlError(…)`:
    *  return the answer to send instead of the order, or null to answer as
    *  usual. `n` is the zero-based index of the read of that order. */
@@ -142,6 +182,18 @@ export class FakeMagma {
   /** Scripted answers to the sales listing, by its filter (action_needed,
    *  status): the answer to send instead, or null to answer as usual. */
   salesList: ((filter: { action_needed?: boolean; status?: string[] }) => Response | Record<string, unknown> | null) | null = null;
+  /** Orders placed as a buyer, by id. */
+  readonly purchases = new Map<string, FakePurchase>();
+  /** The node Amboss's buyer invoices are issued by. */
+  readonly ambossNode = makeNodeKey();
+  /** What a targeted buy costs the buyer (fees.buyer), and Amboss's part of it. */
+  buyerFeeSats = 5_068;
+  buyerAmbossFeeSats = 1_500;
+  /** The terms a buy locks (promises). */
+  buyPromises = { minBlockLength: 4320, feeRateCap: "2200", baseFeeCap: "1" };
+  /** A dollar buy (liquidity.buy): the channel Amboss matched, and its seller. */
+  usdBuySizeSats = 2_500_000;
+  matchedSeller = "03" + "5e".repeat(32);
   /** Runs as each mutation arrives, before Amboss acts on it (e.g. SIGTERM
    *  arriving while Amboss is answering). */
   onMutation: ((op: string, variables: Record<string, unknown>) => void) | null = null;
@@ -165,7 +217,6 @@ export class FakeMagma {
   addOffer(o: Partial<FakeOfferState> = {}): FakeOfferState {
     const offer: FakeOfferState = {
       id: o.id ?? `offer-${nextId++}`,
-      pubkey: "02" + "11".repeat(32),
       status: "ENABLED",
       createdAt: new Date().toISOString(),
       filledOrders: 0,
@@ -263,8 +314,9 @@ export class FakeMagma {
             .filter((s) => (filter.action_needed ? ACTION_NEEDED.has(s.status) : true))
             .filter((s) => (filter.status ? filter.status.includes(s.status) : true))
             .reverse();
+          const answered = this.paging === "pages" ? all.slice(page.offset, page.offset + page.limit) : all;
           return {
-            user: { market: { orders: { sales: { list: all.slice(page.offset, page.offset + page.limit).map((s) => this.simple(s)), total: all.length } } } },
+            user: { market: { orders: { sales: { list: answered.map((s) => this.simple(s)), total: all.length } } } },
           };
         });
       }
@@ -315,9 +367,23 @@ export class FakeMagma {
           (ok) => ({ market: { order: { seller: { reject: { success: ok } } } } }),
         );
       case "MyOfferIds":
-        return read(() => ({
-          user: { market: { offers: { offers: { list: [...this.offers.values()].map((o) => ({ id: o.id })), total: this.offers.size } } } },
-        }));
+        return read(() => {
+          const page = (variables.page ?? { limit: 50, offset: 0 }) as { limit: number; offset: number };
+          const all = [...this.offers.values()];
+          const answered = this.paging === "pages" ? all.slice(page.offset, page.offset + page.limit) : all;
+          return {
+            user: {
+              market: {
+                offers: {
+                  offers: {
+                    list: answered.map((o) => ({ id: o.id, node: { pubkey: o.pubkey ?? this.sellerPubkey } })),
+                    total: all.length,
+                  },
+                },
+              },
+            },
+          };
+        });
       case "MyOffer": {
         const o = this.offers.get(String(variables.id));
         if (!o) return { errors: [{ message: "Offer not found" }], data: null };
@@ -335,6 +401,8 @@ export class FakeMagma {
               feeRatePpm: Number(input.fee_rate ?? 0),
               baseFeeSats: Number(input.base_fee ?? 0),
               minBlockLength: Number(input.min_block_length),
+              feeRateCap: input.fee_rate_cap === undefined ? null : String(input.fee_rate_cap),
+              baseFeeCap: input.base_fee_cap === undefined ? null : String(input.base_fee_cap),
             });
             this.lastCreated = created.id;
             return true;
@@ -353,6 +421,8 @@ export class FakeMagma {
             if (input.fee_rate !== undefined) o.feeRatePpm = Number(input.fee_rate);
             if (input.base_fee !== undefined) o.baseFeeSats = Number(input.base_fee);
             if (input.min_block_length !== undefined) o.minBlockLength = Number(input.min_block_length);
+            if (input.fee_rate_cap !== undefined) o.feeRateCap = String(input.fee_rate_cap);
+            if (input.base_fee_cap !== undefined) o.baseFeeCap = String(input.base_fee_cap);
             return true;
           },
           (ok) => ({ market: { offer: { update: { success: ok } } } }),
@@ -368,6 +438,125 @@ export class FakeMagma {
           },
           () => ({ market: { offer: { toggle: { status: this.offers.get(String(input.offer_id))?.status ?? "DISABLED" } } } }),
         );
+      case "Order": {
+        let created: FakePurchase | null = null;
+        return mutate(
+          "Order",
+          () => {
+            const id = `00000000-0000-4000-9000-${String(nextId++).padStart(12, "0")}`;
+            const invoice = makePaymentRequest({ key: this.ambossNode, tokens: this.buyerFeeSats, description: `Magma order ${id}` });
+            created = {
+              id,
+              offerId: String(input.offer_id),
+              pubkey: String(input.pubkey),
+              sizeSats: Number(input.size),
+              status: "WAITING_FOR_SELLER_APPROVAL",
+              paymentRequest: invoice.request,
+              channelId: null,
+              sellerPubkey: this.matchedSeller,
+              promises: { ...this.buyPromises },
+            };
+            this.purchases.set(id, created);
+            return true;
+          },
+          (ok) => {
+            const p = created as FakePurchase | null;
+            if (!ok || !p) return { market: { order: { create: null } } };
+            return {
+              market: {
+                order: {
+                  create: {
+                    id: p.id,
+                    amount: size(p.sizeSats),
+                    fees: { buyer: sats(this.buyerFeeSats), amboss: sats(this.buyerAmbossFeeSats) },
+                    promises: {
+                      locked_min_block_length: this.buyPromises.minBlockLength,
+                      locked_fee_rate_cap: sats(this.buyPromises.feeRateCap),
+                      locked_base_fee_cap: sats(this.buyPromises.baseFeeCap),
+                    },
+                    payment: { lightning: { invoice: p.paymentRequest } },
+                  },
+                },
+              },
+            };
+          },
+        );
+      }
+      case "Buy": {
+        // liquidity.buy: dollars in, Amboss matches the seller; the answer
+        // names no size, lease or seller — the order does, once read.
+        let created: FakePurchase | null = null;
+        return mutate(
+          "Buy",
+          () => {
+            const id = `00000000-0000-4000-a000-${String(nextId++).padStart(12, "0")}`;
+            const invoice = makePaymentRequest({ key: this.ambossNode, tokens: this.buyerFeeSats, description: `Magma order ${id}` });
+            created = {
+              id,
+              offerId: null,
+              pubkey: "",
+              sizeSats: this.usdBuySizeSats,
+              status: "WAITING_FOR_SELLER_APPROVAL",
+              paymentRequest: invoice.request,
+              channelId: null,
+              sellerPubkey: this.matchedSeller,
+              promises: { ...this.buyPromises },
+            };
+            this.purchases.set(id, created);
+            return true;
+          },
+          (ok) => {
+            const p = created as FakePurchase | null;
+            if (!ok || !p) return { liquidity: { buy: null } };
+            return {
+              liquidity: {
+                buy: {
+                  order: { transaction_id: p.id, usd_cents: String(input.usd_cents) },
+                  payment: { lightning_invoice: p.paymentRequest, amount: sats(this.buyerFeeSats) },
+                },
+              },
+            };
+          },
+        );
+      }
+      case "CancelOrder":
+        return mutate(
+          "CancelOrder",
+          () => {
+            const p = this.purchases.get(String(input.order_id));
+            if (!p) return false;
+            p.cancelled = String(input.cancellation_reason);
+            p.status = "BUYER_REJECTED";
+            return true;
+          },
+          (ok) => ({ market: { order: { cancel: { success: ok } } } }),
+        );
+      case "GetOrder": {
+        if (this.orderReadBehaviour === "hang") return hang(req);
+        if (this.orderReadBehaviour === "throw") return new Response("upstream error", { status: 502 });
+        const p = this.purchases.get(String(variables.id));
+        if (!p) return orderNotFound();
+        return read(() => ({
+          user: {
+            market: {
+              orders: {
+                get_order: {
+                  status: p.status,
+                  payment_status: null,
+                  channel_id: p.channelId,
+                  amount: size(p.sizeSats),
+                  promises: {
+                    locked_min_block_length: p.promises.minBlockLength,
+                    locked_fee_rate_cap: sats(p.promises.feeRateCap),
+                    locked_base_fee_cap: sats(p.promises.baseFeeCap),
+                  },
+                  source: { pubkey: p.sellerPubkey },
+                },
+              },
+            },
+          },
+        }));
+      }
     }
     return { errors: [{ message: `fake Magma: unhandled ${op}` }] };
   }
@@ -386,6 +575,7 @@ export class FakeMagma {
       asset: { type: s.assetType },
       fees: { seller: sats(s.feeSeller), fixed: sats(s.feeFixed), variable: sats(s.feeVariable) },
       options: { is_private: s.isPrivate },
+      source: { pubkey: s.sellerPubkey ?? this.sellerPubkey },
       destination: { pubkey: s.buyerPubkey, alias: s.buyerAlias },
     };
   }
@@ -409,6 +599,7 @@ export class FakeMagma {
   private offer(o: FakeOfferState) {
     return {
       id: o.id,
+      node: { pubkey: o.pubkey ?? this.sellerPubkey },
       status: o.status,
       created_at: o.createdAt,
       filled_orders: o.filledOrders,

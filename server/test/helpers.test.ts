@@ -116,3 +116,17 @@ test("fetch mock routes GraphQL by query text, records mutations, and fails on s
   // because provoking it was the point.
   http.unmatched.length = 0;
 });
+
+test("the API harness's autopilot kicks off nothing after a settings change: tests drive runs themselves (no stray run firing into the next test step or the fetch mock's after-hook)", async (t) => {
+  const { startApi } = await import("./helpers/apiHarness.js");
+  const api = await startApi(t);
+  const started: string[] = [];
+  t.mock.method(api.autopilot, "runOnce", async () => void started.push("run"));
+  t.mock.method(api.autopilot, "pollSellOrders", async () => void started.push("poll"));
+  // Only the timers armed from here on are mocked (the server is listening).
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  api.autopilot.setConfig({ enabled: true, sellEnabled: true });
+  // Before: a main run 2 s and an order-lane pass 5 s later, on real timers.
+  t.mock.timers.tick(10_000);
+  assert.deepEqual(started, []);
+});

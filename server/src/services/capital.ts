@@ -1,5 +1,6 @@
 import { getChainBalance, getChannels, getPendingChannels, type AuthenticatedLnd } from "lightning";
 import { onchainCosts } from "./nodeEconomics.js";
+import type { LeaseCap } from "./leaseCaps.js";
 
 /**
  * One on-chain budget for every demand on the wallet's coins: Magma sales,
@@ -96,6 +97,9 @@ export interface CapitalSource {
   deployedSat(): number;
   /** Funding outpoints this source has tied to one of its sales. */
   claimedOutpoints(): Iterable<string>;
+  /** The routing-fee promises of the channels it sold (leaseCaps.ts) — the
+   *  fee autopilot and manual fee applies keep those channels within them. */
+  leaseCaps?(): LeaseCap[];
 }
 
 export class CapitalLedger {
@@ -139,6 +143,11 @@ export class CapitalLedger {
     const out = new Set<string>();
     for (const src of this.sources.values()) for (const o of src.claimedOutpoints()) if (o) out.add(o);
     return out;
+  }
+
+  /** Every routing-fee promise of a sold channel, Magma's and LSPS1's. */
+  leaseCaps(): LeaseCap[] {
+    return [...this.sources.values()].flatMap((s) => s.leaseCaps?.() ?? []);
   }
 }
 

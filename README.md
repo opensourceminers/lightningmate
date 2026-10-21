@@ -19,9 +19,16 @@ standalone via Docker.
   peer suggestions, and close candidates. Closing opens a dialog to pick the
   on-chain fee (fast / economy / custom) or force-close, and the channel stays
   visible as "pending close" until it confirms.
-- **Market (Amboss Magma)** — **buy** inbound liquidity (USD-priced) and **sell**
-  your own: create / edit offers and fulfil orders (accept + open a channel to
-  the buyer), manually or via the autopilot. Selling runs on Amboss's Magma API:
+- **Market (Amboss Magma)** — **buy** inbound liquidity (offers ranked by what
+  they really cost per year of lease, Amboss's fee included; purchases are
+  recorded and followed to their channel) and, as an advanced opt-in feature,
+  **sell** your own: create / edit offers and fulfil orders (accept + open a
+  channel to the buyer), manually or via the autopilot. Selling is off by
+  default; before you switch **Liquidity provision** on, a live check of
+  Amboss's public offer book shows whether offers like yours sell at all
+  (Amboss picks sellers mostly by track record — price and size are not the
+  lever below that), and a diagnostics card answers "why don't I sell?".
+  Selling runs on Amboss's Magma API:
   an order is accepted with a **hold invoice** that settles only once Amboss
   confirms the channel (any failure refunds the buyer automatically), every
   step is recorded in a per-order journal before it happens (a crash or a lost
@@ -38,11 +45,14 @@ standalone via Docker.
 - **Wallet** — Lightning + on-chain: receive, send, decode and pay invoices.
 - **Routing** — a full forwards report (per-channel, daily, recent events).
 - **Autopilot** — a one-click **Strategy** (Max routing / Balanced / Max profit)
-  tunes fees, rebalancing, channel-opening and Magma together. Fees are
-  volume-first (competitive, zero base fee) with profit floors so a channel never
-  routes below its refill cost; rebalances run only when profitable (within a
-  daily budget); channels open to top peers; Magma sell orders are fulfilled — all
-  on recommended settings with safe caps, per-channel cooldowns and an on-chain
+  tunes fees, rebalancing and channel opening together; no preset ever touches
+  Magma selling, which stays your own explicit decision. Fees are volume-first
+  (competitive, zero base fee) with profit floors so a channel never routes
+  below its refill cost — and every channel sold through Magma or LSPS1 is kept
+  within the routing-fee cap its buyer was promised, for the lease; rebalances
+  run only when profitable (within a daily budget); channels open to top peers;
+  with Liquidity provision on, Magma sell orders are fulfilled — all on
+  recommended settings with safe caps, per-channel cooldowns and an on-chain
   reserve. Off until you enable it, and every fund-moving action is gated behind
   write access.
 - **More forwards** — the optional **Advertise routable size** pass keeps each

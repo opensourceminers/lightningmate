@@ -7,9 +7,12 @@ interface Toast {
   message: string;
 }
 
-interface ConfirmOpts {
+export interface ConfirmOpts {
   title?: string;
-  message: string;
+  message?: string;
+  /** Content that renders (and updates) inside the dialog — e.g. a check
+   *  that is still running when the dialog opens. Shown after `message`. */
+  body?: ReactNode;
   confirmLabel?: string;
   danger?: boolean;
 }
@@ -67,7 +70,8 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
         <div className="modal-overlay" onClick={() => settle(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
             {pending.opts.title ? <h3 className="modal-title">{pending.opts.title}</h3> : null}
-            <p className="modal-msg">{pending.opts.message}</p>
+            {pending.opts.message ? <p className="modal-msg">{pending.opts.message}</p> : null}
+            {pending.opts.body ?? null}
             <div className="modal-actions">
               <button className="reset" onClick={() => settle(false)}>Cancel</button>
               <button

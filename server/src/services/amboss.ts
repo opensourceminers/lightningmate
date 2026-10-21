@@ -240,7 +240,56 @@ export async function ambossGql<T>(
   return json.data;
 }
 
+/** One page of an Amboss list (`page: PageInput`), as asked for. */
+export interface PageRequest {
+  limit: number;
+  offset: number;
+}
+
+/**
+ * Every item of a paged Amboss list, each exactly once (in the order first
+ * seen), and the `total` Amboss reported.
+ *
+ * The Magma lists take a `page: PageInput`, but magma.amboss.tech does not
+ * honour it: on 2026-10-21 the public offer list answered all 98 offers, with
+ * total 98, for every page asked (offsets 0, 50, 100 and 150; limit 10 at
+ * offsets 20 and 50 too), in an order that can differ between requests. Counting pages
+ * against `total` — stop once (page + 1) × limit ≥ total — therefore read a
+ * list of 51–100 entries twice and one of 101–150 three times: every count of
+ * the eligibility check doubled. So the walk keeps items by id and stops when
+ * a page brings no id it hasn't seen, once `total` distinct ids are in, or
+ * after `maxPages`. Should Amboss start honouring the page, the same walk
+ * pages through the list properly.
+ */
+export async function collectPages<T>(
+  fetchPage: (page: PageRequest) => Promise<{ list: T[]; total: number }>,
+  idOf: (item: T) => string,
+  opts: { pageSize: number; maxPages: number },
+): Promise<{ items: T[]; total: number }> {
+  const byId = new Map<string, T>();
+  let total = 0;
+  for (let page = 0; page < opts.maxPages; page++) {
+    const res = await fetchPage({ limit: opts.pageSize, offset: page * opts.pageSize });
+    total = Number(res.total) || 0;
+    const before = byId.size;
+    for (const item of res.list) {
+      const id = idOf(item);
+      if (!byId.has(id)) byId.set(id, item);
+    }
+    if (byId.size === before || byId.size >= total) break;
+  }
+  return { items: [...byId.values()], total };
+}
+
 // ── public market data (no key) ───────────────────────────────────────────────
+
+/** A buyer condition an offer sets (legacy OfferType.conditions): who may
+ *  buy from it — e.g. NODE_CAPACITY GREATER_THAN_OR_EQUAL_TO "10000000". */
+export interface OfferCondition {
+  condition: string;
+  operator: string;
+  value: string;
+}
 
 export interface MagmaOffer {
   id: string;
@@ -256,11 +305,21 @@ export interface MagmaOffer {
   totalSizeSats: number;
   lockedSats: number;
   minBlockLength: number;
+  /** The routing fees the seller promises to keep for the lease (null: none). */
+  feeRateCapPpm: number | null;
+  baseFeeCapSats: number | null;
+  /** Who may buy (none: anyone). */
+  conditions: OfferCondition[];
 }
 
 export interface MarketView {
   offers: MagmaOffer[];
+  /** The bitcoin price: sats per US dollar (liquidity_per_usd.sats ÷ .usd). */
   satsPerUsd: number | null;
+  /** Inbound capacity one US dollar buys at today's market rate
+   *  (liquidity_per_usd.sats, Amboss: "satoshis of inbound capacity per USD
+   *  spent"). A liquidity.buy order is at least $5 — this × 5 sat of channel. */
+  inboundSatsPerUsd: number | null;
 }
 
 interface RawOffer {
@@ -275,6 +334,9 @@ interface RawOffer {
   side: string;
   total_size: string;
   min_block_length?: number | string | null;
+  fee_rate_cap?: number | null;
+  base_fee_cap?: number | null;
+  conditions?: OfferCondition[] | null;
   orders?: { locked_size: string | null } | null;
 }
 
@@ -282,7 +344,8 @@ interface RawOffer {
 export const OFFER_BOOK_QUERY = `query {
     getOffers { list {
       id account min_size max_size base_fee fee_rate seller_score status side total_size
-      min_block_length
+      min_block_length fee_rate_cap base_fee_cap
+      conditions { condition operator value }
       orders { locked_size }
     } }
   }`;
@@ -310,30 +373,151 @@ export async function getOffers(): Promise<MagmaOffer[]> {
         totalSizeSats: total,
         lockedSats: locked,
         minBlockLength: Number(o.min_block_length ?? 0) || 0,
+        feeRateCapPpm: numberOrNull(o.fee_rate_cap),
+        baseFeeCapSats: numberOrNull(o.base_fee_cap),
+        conditions: Array.isArray(o.conditions)
+          ? o.conditions.filter((c) => c && typeof c.condition === "string").map((c) => ({ condition: c.condition, operator: c.operator, value: String(c.value) }))
+          : [],
       };
     })
     .sort((a, b) => b.sellerScore - a.sellerScore);
 }
 
+const numberOrNull = (v: unknown): number | null => {
+  if (v === null || v === undefined || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+};
+
 export const PRICE_QUERY = `query { market { liquidity { liquidity_per_usd { sats usd } } } }`;
 
-/** sats of inbound you get per 1 USD spent (no key required). */
-export async function satsPerUsd(): Promise<number | null> {
+/**
+ * Amboss's dollar rates (no key required): `liquidity_per_usd.sats` is the
+ * inbound capacity one US dollar buys at today's market rate, `.usd` what
+ * those sats are worth in dollars — so sats ÷ usd is the bitcoin price in
+ * sats per dollar. (The two were conflated: what the Buy tab showed as
+ * "inbound per $" was the bitcoin price.) Null when Amboss can't be asked.
+ */
+export async function dollarRates(): Promise<{ satsPerUsd: number | null; inboundSatsPerUsd: number | null }> {
   try {
     const data = await ambossGql<{
       market: { liquidity: { liquidity_per_usd: { sats: string; usd: string } } };
     }>(MAGMA_URL, PRICE_QUERY);
     const l = data.market.liquidity.liquidity_per_usd;
+    const sats = Number(l.sats);
     const usd = Number(l.usd);
-    return usd > 0 ? Number(l.sats) / usd : null;
+    return {
+      satsPerUsd: usd > 0 && sats > 0 ? sats / usd : null,
+      inboundSatsPerUsd: Number.isFinite(sats) && sats > 0 ? sats : null,
+    };
   } catch {
-    return null; // price is a nice-to-have; never fail the whole market view on it
+    return { satsPerUsd: null, inboundSatsPerUsd: null }; // a nice-to-have; never fail the market view on it
   }
 }
 
+/** The bitcoin price in sats per US dollar (see dollarRates). */
+export async function satsPerUsd(): Promise<number | null> {
+  return (await dollarRates()).satsPerUsd;
+}
+
 export async function getMarket(): Promise<MarketView> {
-  const [offers, perUsd] = await Promise.all([getOffers(), satsPerUsd()]);
-  return { offers, satsPerUsd: perUsd };
+  const [offers, rates] = await Promise.all([getOffers(), dollarRates()]);
+  return { offers, ...rates };
+}
+
+/**
+ * The public Magma offer list (magma.amboss.tech, no key): what the legacy
+ * book lacks — how many orders each offer has filled, since when it is
+ * listed, and the platform fee Amboss charges its buyers (`fees.amboss`, a
+ * step function of the listed total). Joined with the legacy book's seller
+ * scores, it is what the sell-eligibility check compares a node against.
+ */
+export const PUBLIC_OFFERS_QUERY = `query PublicOffers($page: PageInput) {
+  market { offer { offers(page: $page) {
+    list {
+      id status created_at filled_orders
+      node { pubkey }
+      asset { type }
+      total_amount { satoshi { sats } }
+      fees { amboss { sats } }
+    }
+    total
+  } } }
+}`;
+
+export interface PublicOffer {
+  id: string;
+  status: string;
+  sellerPubkey: string;
+  createdAt: string;
+  filledOrders: number;
+  /** 0 when the offer has no satoshi total (an offer of another asset). */
+  totalSizeSats: number;
+  /** fees.amboss: what Amboss adds for the buyer (the tier of the listed total). */
+  ambossFee: number;
+  /** BASE_ASSET (bitcoin) or TAPROOT_ASSET (e.g. a USDT channel); null when
+   *  Amboss doesn't say. */
+  assetType: string | null;
+}
+
+const PUBLIC_PAGE = 50;
+const PUBLIC_MAX_PAGES = 20;
+
+interface RawPublicOffer {
+  id: string;
+  status: string;
+  created_at: string;
+  filled_orders: number;
+  node: { pubkey: string } | null;
+  asset: { type: string | null } | null;
+  total_amount: { satoshi: { sats: string } | null } | null;
+  fees: { amboss: { sats: string } | null } | null;
+}
+
+/** The public Magma offer list, each offer once (see collectPages: the
+ *  endpoint answers the whole list for every page). */
+export async function getPublicOffers(): Promise<PublicOffer[]> {
+  const { items } = await collectPages(
+    async (page) => {
+      const data = await ambossGql<{ market: { offer: { offers: { list: RawPublicOffer[]; total: number } } } }>(
+        MAGMA_URL,
+        PUBLIC_OFFERS_QUERY,
+        undefined,
+        { page },
+      );
+      return data.market.offer.offers;
+    },
+    (o) => o.id,
+    { pageSize: PUBLIC_PAGE, maxPages: PUBLIC_MAX_PAGES },
+  );
+  return items.map((o) => ({
+    id: o.id,
+    status: o.status,
+    sellerPubkey: o.node?.pubkey ?? "",
+    createdAt: o.created_at,
+    filledOrders: Number(o.filled_orders) || 0,
+    totalSizeSats: Number(o.total_amount?.satoshi?.sats ?? 0) || 0,
+    ambossFee: Number(o.fees?.amboss?.sats ?? 0) || 0,
+    assetType: o.asset?.type ?? null,
+  }));
+}
+
+/** A node's public Magma record (legacy endpoint, no key). */
+export const NODE_MARKET_QUERY = `query NodeMarket($pubkey: String!) {
+  getNode(pubkey: $pubkey) { amboss { market { seller_score stats { sell { confirmed_orders } } } } }
+}`;
+
+/** The seller score Amboss shows for a node, and its completed sales. Null
+ *  fields when Amboss has none for it. */
+export async function getNodeMarket(pubkey: string): Promise<{ sellerScore: number | null; confirmedSells: number | null }> {
+  const data = await ambossGql<{
+    getNode: { amboss: { market: { seller_score: string | null; stats: { sell: { confirmed_orders: number | null } | null } | null } | null } | null } | null;
+  }>(AMBOSS_URL, NODE_MARKET_QUERY, undefined, { pubkey });
+  const m = data.getNode?.amboss?.market;
+  return {
+    sellerScore: numberOrNull(m?.seller_score),
+    confirmedSells: numberOrNull(m?.stats?.sell?.confirmed_orders),
+  };
 }
 
 export interface RawMarketOrder {
@@ -377,6 +561,13 @@ export interface BuyQuote {
   /** Channel size Amboss committed to, or 0 when the answer doesn't say
    *  (liquidity.buy is priced in dollars; the size comes with the order). */
   channelSizeSats: number;
+  /** The terms the order locked (a targeted buy; null when not told): the
+   *  lease, and the seller's routing-fee promise for it. */
+  leaseBlocks?: number | null;
+  feeRateCapPpm?: number | null;
+  baseFeeCapSats?: number | null;
+  /** Amboss's own fee in this order. */
+  ambossFeeSats?: number | null;
 }
 
 /** Failure states of an order — shared with the seller side (magmaApi.ts). */
@@ -401,6 +592,13 @@ export interface OrderState {
   channelSizeSats: number;
   done: boolean;
   failed: boolean;
+  /** The terms the order locked (promises) and who sells (source) — what a
+   *  dollar buy's quote can't say: Amboss names them once it matched a
+   *  seller. Null (or absent): not told. A 0 fee-rate cap promises nothing. */
+  leaseBlocks?: number | null;
+  feeRateCapPpm?: number | null;
+  baseFeeCapSats?: number | null;
+  sellerPubkey?: string | null;
 }
 
 // `order` carries only transaction_id and usd_cents: the `amount` this used to
@@ -448,9 +646,13 @@ export async function buyLiquidity(
 }
 
 // `amount` is a SizeValue object, not a number: selecting it bare was invalid.
+// promises and source: what a dollar buy (liquidity.buy) learns only from the
+// order — its lease, the seller's fee promise and the seller.
 export const BUYER_ORDER_QUERY = `query GetOrder($id: String!) {
     user { market { orders { get_order(order_id: $id) {
       status payment_status channel_id amount { satoshi { sats } }
+      promises { locked_min_block_length locked_fee_rate_cap { sats } locked_base_fee_cap { sats } }
+      source { pubkey }
     } } } }
   }`;
 
@@ -465,18 +667,33 @@ export async function getOrder(apiKey: string, orderId: string): Promise<OrderSt
             payment_status: string | null;
             channel_id: string | null;
             amount: { satoshi: { sats: string } | null } | null;
+            promises?: {
+              locked_min_block_length: number | null;
+              locked_fee_rate_cap: { sats: string | null } | null;
+              locked_base_fee_cap: { sats: string | null } | null;
+            } | null;
+            source?: { pubkey: string | null } | null;
           };
         };
       };
     };
   }>(MAGMA_URL, BUYER_ORDER_QUERY, apiKey, { id: orderId });
   const o = data.user.market.orders.get_order;
+  const cap = numberOrNull(o.promises?.locked_fee_rate_cap?.sats);
   return {
     status: o.status,
     paymentStatus: o.payment_status ?? null,
     channelId: o.channel_id ?? null,
     channelSizeSats: Number(o.amount?.satoshi?.sats ?? 0),
-    done: o.status === "VALID_CHANNEL_OPENING",
+    leaseBlocks: numberOrNull(o.promises?.locked_min_block_length) || null,
+    // 0 locked = the offer promised nothing.
+    feeRateCapPpm: cap !== null && cap > 0 ? cap : null,
+    baseFeeCapSats: cap !== null && cap > 0 ? numberOrNull(o.promises?.locked_base_fee_cap?.sats) : null,
+    sellerPubkey: o.source?.pubkey || null,
+    // CHANNEL_MONITORING_FINISHED is a success too (the lease ran out): a
+    // purchase first followed that late — after a long restart — is done,
+    // not "paying" for good.
+    done: ORDER_SUCCEEDED.has(o.status),
     failed: ORDER_FAILED.has(o.status),
   };
 }
@@ -485,7 +702,8 @@ export const BUY_FROM_OFFER_MUTATION = `mutation Order($input: CreateManualOrder
     market { order { create(input: $input) {
       id
       amount { satoshi { sats } }
-      fees { buyer { sats } }
+      fees { buyer { sats } amboss { sats } }
+      promises { locked_min_block_length locked_fee_rate_cap { sats } locked_base_fee_cap { sats } }
       payment { lightning { invoice } }
     } } }
   }`;
@@ -519,7 +737,12 @@ export async function buyFromOffer(
         create: {
           id: string;
           amount: { satoshi: { sats: string | null } | null } | null;
-          fees: { buyer: { sats: string | null } | null } | null;
+          fees: { buyer: { sats: string | null } | null; amboss?: { sats: string | null } | null } | null;
+          promises?: {
+            locked_min_block_length: number | null;
+            locked_fee_rate_cap: { sats: string | null } | null;
+            locked_base_fee_cap: { sats: string | null } | null;
+          } | null;
           payment: { lightning: { invoice: string | null } | null } | null;
         };
       };
@@ -528,11 +751,17 @@ export async function buyFromOffer(
   const o = data.market.order.create;
   const invoice = o.payment?.lightning?.invoice ?? "";
   if (!invoice) throw new AmbossError("no_data", "Amboss returned no invoice for the order");
+  const cap = numberOrNull(o.promises?.locked_fee_rate_cap?.sats);
   return {
     orderId: o.id,
     paymentRequest: invoice,
     sats: Number(o.fees?.buyer?.sats ?? 0),
     channelSizeSats: Number(o.amount?.satoshi?.sats ?? sizeSats),
+    leaseBlocks: numberOrNull(o.promises?.locked_min_block_length),
+    // 0 locked = the offer promised nothing.
+    feeRateCapPpm: cap !== null && cap > 0 ? cap : null,
+    baseFeeCapSats: cap !== null && cap > 0 ? numberOrNull(o.promises?.locked_base_fee_cap?.sats) : null,
+    ambossFeeSats: numberOrNull(o.fees?.amboss?.sats),
   };
 }
 

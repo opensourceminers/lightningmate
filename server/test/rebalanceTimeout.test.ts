@@ -56,7 +56,10 @@ test("a rebalance payment that never resolves is reported in flight at the hard 
     node.lnd,
     node.lnd,
     { targetId: "800001x1x0", sourceId: "800002x1x0", amountSats: 400_000, econRatio: 0.8 },
-    { hardTimeoutMs: 300 },
+    // The limit counts from the start of the rebalance, so it must leave room
+    // for the reads and the invoice before the payment is sent: at 300 ms a
+    // loaded machine (six suites at once) sometimes reached it before paying.
+    { hardTimeoutMs: 1_500 },
   );
   assert.ok(Date.now() - started < 5_000, `returned after ${Date.now() - started} ms`);
   assert.equal(res.ok, false);

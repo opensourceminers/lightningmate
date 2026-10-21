@@ -158,6 +158,7 @@ test("a seller route that Amboss refuses for the key marks it revoked — an out
   const http = installFetchMock(t);
   const magma = new FakeMagma(http, t);
   const api = await startApi(t);
+  magma.sellerPubkey = api.node.publicKey; // this node's sales and offers
   api.amboss.setKey("test-key");
   magma.readBehaviour = "throw";
   const down = await api.request("GET", "/amboss/my-orders");

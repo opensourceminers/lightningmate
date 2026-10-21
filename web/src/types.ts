@@ -174,7 +174,11 @@ export interface FeeApplyItem {
 export interface FeeApplyResult {
   id: string;
   ok: boolean;
+  /** The fee rate applied (after a sold channel's lease promise, if one bound it). */
   feeRatePpm: number;
+  baseFeeMsat?: number;
+  /** Set when a sold channel's lease promise lowered what was asked for. */
+  clampedBy?: string;
   error?: string;
 }
 
@@ -270,6 +274,7 @@ export interface AutopilotSell {
     | "relist"
     | "reprice"
     | "resize"
+    | "terms"
     | "enable"
     | "disable"
     | "create"
@@ -341,6 +346,8 @@ export interface AutopilotState {
   /** The main run in progress, if any: since when. */
   runningSince?: string | null;
   magmaLane?: MagmaLaneStatus;
+  /** Per area, the latest decision not to act and why. */
+  decisions?: Partial<Record<"magma" | "channels", { at: string; text: string }>>;
 }
 
 export interface RebalancePolicy {
@@ -742,8 +749,17 @@ export interface DashboardData {
   routedSpark: number[];
   rebalancedCount: number;
   rebalancedSats: number;
+  /** Every channel's capacity, peers' sides and pending channels included. */
   totalCapacitySats: number;
+  /** This node's own capital in its open channels (their local balance). */
+  ownCapitalSats?: number;
+  /** Routing fees on that capital, annualised — gross (ppm/year). */
   yieldPpmYear: number;
+  /** The same after the window's rebalancing fees. */
+  netYieldPpmYear?: number;
+  rebalanceFeesSats?: number;
+  /** What leasing out on Magma would earn this node — live (D12). */
+  leaseBenchmark?: LeaseBenchmark;
   activity: ActivityItem[];
   autopilot: {
     fees: boolean;
@@ -758,7 +774,19 @@ export interface DashboardData {
     lastRebalances: number;
     lastSells: number;
     lastOpens: number;
+    /** Magma orders the lane turned down in the last two days (not dismissed). */
+    magmaRefusals?: number;
+    magmaRefusalReason?: string | null;
   };
+}
+
+export interface LeaseBenchmark {
+  status: "eligible" | "not_realistic" | "no_data" | "unknown";
+  /** Median annual rate buyers paid for comparable leases (gross), in %. */
+  grossAprPct: number | null;
+  sales: number | null;
+  windowDays: number | null;
+  text: string;
 }
 
 export interface NetworkRank {
@@ -825,6 +853,10 @@ export interface FeeRecommendation {
   transactionId: string | null;
   transactionVout: number | null;
   currentBaseMsat: number;
+  /** A channel this node sold whose order locked a routing-fee promise. */
+  leaseCap?: { source: "magma" | "lsps1"; orderId: string; feeRateCapPpm: number; baseFeeCapMsat: number; untilHeight: number | null } | null;
+  /** Its current fee breaks that promise (lowered at once). */
+  leaseCapBreach?: boolean;
   wouldApply: boolean;
   blockedByGuards: string[];
   state: FeeRecState;
@@ -956,6 +988,12 @@ export interface PnlSummary {
   netProfitSats: number;
 }
 
+export interface OfferCondition {
+  condition: string;
+  operator: string;
+  value: string;
+}
+
 export interface MagmaOffer {
   id: string;
   sellerPubkey: string;
@@ -965,11 +1003,19 @@ export interface MagmaOffer {
   feeRatePpm: number;
   sellerScore: number;
   availableSats: number;
+  totalSizeSats?: number;
+  minBlockLength?: number;
+  feeRateCapPpm?: number | null;
+  baseFeeCapSats?: number | null;
+  conditions?: OfferCondition[];
 }
 
 export interface MarketView {
   offers: MagmaOffer[];
+  /** The bitcoin price: sats per US dollar. */
   satsPerUsd: number | null;
+  /** Inbound capacity one US dollar buys at today's market rate. */
+  inboundSatsPerUsd?: number | null;
 }
 
 export interface BuyQuote {
@@ -977,6 +1023,82 @@ export interface BuyQuote {
   paymentRequest: string;
   sats: number;
   channelSizeSats: number;
+  /** The terms a targeted buy locked: lease and the seller's fee promise. */
+  leaseBlocks?: number | null;
+  feeRateCapPpm?: number | null;
+  baseFeeCapSats?: number | null;
+  ambossFeeSats?: number | null;
+}
+
+/** One buyer condition, checked against this node. */
+export interface ConditionCheck {
+  condition: string;
+  /** null: can't be checked from here. */
+  pass: boolean | null;
+  text: string;
+}
+
+/** An offer ranked for buying, evaluated at the chosen size (server: magmaBuy.ts). */
+export interface BuyOffer {
+  offerId: string;
+  sellerPubkey: string;
+  sellerScore: number;
+  minSizeSats: number;
+  maxSizeSats: number;
+  availableSats: number;
+  sizeSats: number;
+  fits: boolean;
+  leaseBlocks: number;
+  leaseDays: number;
+  feeRatePpm: number;
+  baseFeeSats: number;
+  sellerFeeSats: number;
+  ambossFeeSats: number | null;
+  totalFeeSats: number;
+  costPpmPerYear: number;
+  feeRateCapPpm: number | null;
+  baseFeeCapSats: number | null;
+  eligible: boolean | null;
+  conditions: ConditionCheck[];
+}
+
+export interface BuyOffersResponse {
+  sizeSats: number;
+  offers: BuyOffer[];
+  ambossFeeTiers: { ambossFeePpm: number; upToSats: number | null }[];
+  inboundSatsPerUsd: number | null;
+  satsPerUsd: number | null;
+}
+
+export type PurchaseState = "quoted" | "declined" | "cancel_failed" | "paying" | "paid" | "pay_failed" | "channel_open" | "order_failed";
+
+/** Inbound bought on Magma (server: magmaPurchases.ts). */
+export interface MagmaPurchase {
+  orderId: string;
+  createdAt: string;
+  updatedAt: string;
+  offerId: string | null;
+  sellerPubkey: string | null;
+  sizeSats: number;
+  feeSats: number;
+  paymentHash: string;
+  expiresAt: string;
+  leaseBlocks: number | null;
+  feeRateCapPpm: number | null;
+  baseFeeCapSats: number | null;
+  usdCents: number | null;
+  state: PurchaseState;
+  routingFeeSats: number | null;
+  paidAt?: string;
+  payStartedAt?: string;
+  /** LND confirmed the failure (or never saw the payment); unset on a
+   *  failure only the pay call reported — the order lane checks with LND. */
+  failureConfirmed?: boolean;
+  /** LND has no record of the payment though the channel opened. */
+  paymentNotFound?: boolean;
+  orderStatus: string | null;
+  channelId: string | null;
+  error?: string;
 }
 
 export interface OrderState {
@@ -986,11 +1108,20 @@ export interface OrderState {
   channelSizeSats: number;
   done: boolean;
   failed: boolean;
-  payment: { state: "paying" | "paid" | "failed"; error?: string; feeSats?: number } | null;
+  /** The terms the order locked and who sells — named once Amboss matched a
+   *  seller (a dollar buy's quote can't say them). Null: not told. */
+  leaseBlocks?: number | null;
+  feeRateCapPpm?: number | null;
+  baseFeeCapSats?: number | null;
+  sellerPubkey?: string | null;
+  /** "unclear": only the pay call reported a failure — LND is being asked. */
+  payment: { state: "paying" | "paid" | "failed" | "unclear"; error?: string; feeSats?: number } | null;
 }
 
 export interface MyOffer {
   id: string;
+  /** The node the offer sells for (only this node's are listed here). */
+  nodePubkey?: string;
   status: string;
   minSizeSats: number;
   maxSizeSats: number;
@@ -1032,6 +1163,10 @@ export interface MagmaOrderLocal {
   /** The order lane's latest decision (accept / reject / skip / wait) and why. */
   decision: { at: string; action: string; reason: string } | null;
   lastError: string | null;
+  /** For a settled order: was it booked as a sale (a payment of ours)? */
+  booked?: boolean | null;
+  /** Ended here without LightningMate taking it on. */
+  external?: "accepted_elsewhere" | "other_node" | null;
 }
 
 export interface MyOrder {
@@ -1072,6 +1207,21 @@ export interface OfferFields {
   feeRatePpm: number;
   baseFeeSats: number;
   minBlockLength: number;
+  feeRateCapPpm?: number | null;
+  baseFeeCapSats?: number | null;
+}
+
+/** Who decides what about an offer (server: autopilot.ts OfferControl):
+ *  its terms (yours after a manual create/edit), and whether it is listed. */
+export interface OfferControl {
+  /** You took the offer's terms over: when, and by doing what. */
+  manual?: { since: string; why: string };
+  /** The autopilot disabled it for lack of capital (it lists it again once it can be funded). */
+  autoDisabledAt?: string;
+  /** The autopilot sent that disable without an answer yet: the next read of the offer settles it. */
+  autoDisablingAt?: string;
+  /** You disabled it by hand: it stays disabled until you enable it. */
+  disabledByHandAt?: string;
 }
 
 export interface OfferWrite {
@@ -1093,6 +1243,7 @@ export interface OfferSyncEntry {
   inSync: boolean;
   differences: string[];
   lastWrite: OfferWrite | null;
+  control?: OfferControl;
 }
 
 /** What the autopilot wants for your offers vs what Amboss has. */
@@ -1106,6 +1257,83 @@ export interface OfferSyncStatus {
 export interface MyOffersResponse {
   offers: MyOffer[];
   sync: OfferSyncStatus;
+  /** Who owns each offer's terms. */
+  controls?: Record<string, OfferControl>;
+  /** The routing-fee promise every offer carries (D7). */
+  feeCaps?: { feeRateCapPpm: number; baseFeeCapSats: number };
+}
+
+export type EligibilityVerdict = "not_realistic" | "possible_but_slow" | "realistic" | "unknown";
+
+export interface EligibilityCell {
+  offers: number;
+  sold: number;
+  fills: number;
+  offerMonths: number;
+  fillsPerMonth: number;
+  upperBoundPerMonth: number | null;
+}
+
+/** Can this node realistically sell on Magma? (server: magmaEligibility.ts) */
+export interface Eligibility {
+  verdict: EligibilityVerdict;
+  indicative: true;
+  computedAt: string;
+  bookFetchedAt: string | null;
+  own: { sellerScore: number | null; confirmedSells: number | null; listableSat: number; maxChannelSat: number };
+  tier: { ambossFee: number; fromSat: number; toSat: number | null } | null;
+  /** Every Amboss fee tier of the live book: ppm, up to which order size (null: above). */
+  feeTiers: { ambossFeePpm: number; upToSats: number | null }[];
+  scoreSplit: { median: number; side: "at_or_below" | "above" } | null;
+  comparable: EligibilityCell | null;
+  widened: boolean;
+  otherSide: EligibilityCell | null;
+  expectedSalesPerYear: number | null;
+  /** liquidity.buy orders start at $5: that order's channel at the market
+   *  rate and at this node's own price (null: no offer of its own listed). */
+  usdOrders: { minOrderSat: number; atOwnPriceSat: number | null; fits: boolean } | null;
+  reasons: string[];
+}
+
+export type CheckStatus = "ok" | "problem" | "info" | "unknown";
+
+export interface DiagnosticCheck {
+  id: string;
+  status: CheckStatus;
+  label: string;
+  detail: string;
+  fix?: { tab: string; sub?: string; label: string };
+}
+
+export interface OfferTermsView {
+  status: string;
+  feeRatePpm: number;
+  baseFeeSats: number;
+  minSizeSats: number;
+  maxSizeSats: number;
+  minBlockLength: number;
+  feeRateCapPpm: number | null;
+  baseFeeCapSats: number | null;
+}
+
+/** "Why don't I sell?" (server: sellDiagnostics.ts) */
+export interface SellDiagnostics {
+  generatedAt: string;
+  checks: DiagnosticCheck[];
+  offers: {
+    offerId: string;
+    owner: "autopilot" | "you" | "nobody";
+    amboss: OfferTermsView;
+    target: Omit<OfferTermsView, "status"> | null;
+    differences: string[];
+    lastWrite: OfferWrite | null;
+  }[];
+  orders: {
+    recent: { orderId: string; sizeSats: number; phase: string; seenAt: string; at: string; action: string; reason: string | null }[];
+    failedOnAmboss: Record<string, number> | null;
+  };
+  lane: MagmaLaneStatus;
+  eligibility: Eligibility | null;
 }
 
 /** valid / rejected (Amboss refused it) / unreachable (no answer — the last
@@ -1154,6 +1382,20 @@ export interface PricePoint {
   leaseApy: number;
 }
 
+/** What buyers paid for comparable leases (Amboss's completed orders),
+ *  expressed for one lease length (`blocks`). */
+export interface ClearingStats {
+  count: number;
+  windowDays: number;
+  ordersPerMonth: number;
+  p25Ppm: number;
+  medianPpm: number;
+  p75Ppm: number;
+  medianApr: number;
+  medianSizeSat: number;
+  blocks: number;
+}
+
 export interface MagmaSellRecommendation {
   offerId: string | null;
   mode: "create" | "update" | "hold";
@@ -1161,7 +1403,14 @@ export interface MagmaSellRecommendation {
   shouldReprice: boolean;
   repriceDirection: "up" | "down" | "none";
   current: { feeRatePpm: number; baseFeeSat: number; effectiveFeePpm: number } | null;
-  recommended: PricePoint & { minBlockLength: number; sizeSat: number };
+  /** The terms the offer should carry; every price here (and in `pricing`)
+   *  is for `minBlockLength` — the lease it carries after the next write. */
+  recommended: PricePoint & {
+    minBlockLength: number;
+    sizeSat: number;
+    feeRateCapPpm: number | null;
+    baseFeeCapSats: number | null;
+  };
   market: {
     sizeBand: string;
     segmentCount: number;
@@ -1172,7 +1421,6 @@ export interface MagmaSellRecommendation {
     p75: number;
     mySellerScore: number | null;
     segmentMedianScore: number;
-    scorePremium: number;
     myRank: number | null;
   };
   economics: {
@@ -1191,6 +1439,8 @@ export interface MagmaSellRecommendation {
     beatsRouting: boolean;
   };
   pricing: { fast: PricePoint; balanced: PricePoint; premium: PricePoint; profitFloor: PricePoint };
+  /** What buyers paid for comparable leases, for this offer's lease. */
+  clearing: ClearingStats | null;
   reasons: string[];
   warnings: string[];
 }
@@ -1281,48 +1531,26 @@ export interface MagmaV2Report {
     recommendedMinLeasePpmPerYear: number;
     pricingMode: "fast" | "balanced" | "premium" | "auto";
     adaptiveLevel: number;
-    optimalSizeSat: number;
-    optimalLeaseBlocks: number;
+    /** The lease an offer should promise (the standard one buyers use). */
+    standardLeaseBlocks: number;
+    /** The median size of real orders (90 days) — a fact, not a target. */
+    medianOrderSat: number | null;
     recommendedMinSizeSat: number;
     recommendedMaxSizeSat: number;
     minViableSizeSat: number;
     minNetLeaseProfitSat: number;
     serviceFeeRate: number;
     effectiveMaxOrderSat: number;
-    capReach: {
-      sharePctNow: number;
-      sharePctAtCap: number;
-      capSat: number;
-      capitalLimited: boolean;
-    } | null;
+    /** That ceiling is set by the coins on chain, not by the caps. */
+    capitalLimited: boolean;
     projectedMonthlySat: number;
     onchainOpenCostSat: number;
     onchainCloseCostSat: number;
     onchainFeePerVbyte: number | null;
     pendingSellerOrders: number;
-    /** Real completed Magma orders in our size band, straight from Amboss. */
-    clearing: {
-      count: number;
-      windowDays: number;
-      ordersPerMonth: number;
-      p25Ppm: number;
-      medianPpm: number;
-      p75Ppm: number;
-      medianApr: number;
-      medianSizeSat: number;
-      blocks: number;
-    } | null;
-    /** How much of the real order flow our size window can serve. */
-    demandFit: {
-      windowDays: number;
-      totalOrders: number;
-      matchingOrders: number;
-      sharePct: number;
-      reachableOrdersPerMonth: number;
-      medianOrderSat: number;
-      maxSizeForHalfMarket: number | null;
-      ladder: { maxSizeSat: number; sharePct: number; ordersPerMonth: number }[];
-    } | null;
+    /** Real completed Magma orders in our size band, straight from Amboss
+     *  (for the standard lease). */
+    clearing: ClearingStats | null;
     marketActivity: { orders: number; perDay: number; windowDays: number } | null;
     historyAgeHours: number | null;
     popularLeaseBlocks: number;

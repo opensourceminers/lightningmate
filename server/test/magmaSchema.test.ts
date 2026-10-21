@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as amboss from "../src/services/amboss.js";
 import * as magmaApi from "../src/services/magmaApi.js";
-import { checkDocument, checkVariables, magmaSchema } from "./helpers/graphqlSchema.js";
+import { ambossSpaceSchema, checkDocument, checkVariables, magmaSchema } from "./helpers/graphqlSchema.js";
 
 const schema = magmaSchema();
 
@@ -19,6 +19,7 @@ const schema = magmaSchema();
  *  endpoint and is checked separately below). */
 const MAGMA_DOCUMENTS: Record<string, string> = {
   PRICE_QUERY: amboss.PRICE_QUERY,
+  PUBLIC_OFFERS_QUERY: amboss.PUBLIC_OFFERS_QUERY,
   BUY_LIQUIDITY_MUTATION: amboss.BUY_LIQUIDITY_MUTATION,
   BUYER_ORDER_QUERY: amboss.BUYER_ORDER_QUERY,
   BUY_FROM_OFFER_MUTATION: amboss.BUY_FROM_OFFER_MUTATION,
@@ -121,6 +122,23 @@ test("every order status the code compares is a real MarketOrderStatus", () => {
   for (const s of ["SELLER_REJECTED", "SELLER_FAILED_TO_REACT", "SELLER_FAILED_TO_OPEN_CHANNEL", "SELLER_FAILED_TO_SEND_SWAP", "BUYER_FAILED_TO_PAY", "BUYER_REJECTED", "INVALID_CHANNEL_OPENING", "ADMIN_CLOSED"]) {
     assert.ok(amboss.ORDER_FAILED.has(s), s);
   }
+});
+
+/** The documents sent to the legacy endpoint (public market data only). */
+const SPACE_DOCUMENTS: Record<string, string> = {
+  OFFER_BOOK_QUERY: amboss.OFFER_BOOK_QUERY,
+  NODE_MARKET_QUERY: amboss.NODE_MARKET_QUERY,
+};
+
+for (const [name, doc] of Object.entries(SPACE_DOCUMENTS)) {
+  test(`${name} matches the api.amboss.space schema (no deprecated field)`, () => {
+    assert.deepEqual(checkDocument(ambossSpaceSchema(), doc), []);
+  });
+}
+
+test("the public Magma queries fit their variables", () => {
+  assert.deepEqual(checkVariables(schema, amboss.PUBLIC_OFFERS_QUERY, { page: { limit: 50, offset: 0 } }), []);
+  assert.deepEqual(checkVariables(ambossSpaceSchema(), amboss.NODE_MARKET_QUERY, { pubkey: "02" + "11".repeat(32) }), []);
 });
 
 test("the offer book read from the legacy endpoint asks only for fields it still has", () => {

@@ -1,5 +1,6 @@
 import { JsonStore } from "../store.js";
 import type { Reservation } from "./capital.js";
+import { leaseCapFrom, type LeaseCap } from "./leaseCaps.js";
 
 /**
  * The per-order journal of Magma sales: what this node has done for each order,
@@ -90,6 +91,16 @@ export interface MagmaJournalEntry {
   settledAt?: string;
   /** Earnings booked + service fee enqueued (exactly once). */
   bookedAt?: string;
+  /** Settled without a booking: no invoice of ours held or settled the
+   *  payment (accepted with another tool's invoice) — nothing to book as
+   *  income, no service fee. The Orders tab says "not booked", never
+   *  "payment settled". */
+  unbooked?: boolean;
+  /** Ended here without LightningMate taking it on: accepted outside
+   *  LightningMate (no invoice of ours — Amboss showed it past approval
+   *  while this node had only seen it), or an order of another node of the
+   *  same Amboss account. Nothing of it is booked, charged or opened here. */
+  external?: "accepted_elsewhere" | "other_node";
   cancelledAt?: string;
   /** Why the order ended the way it did (reject/cancel/fail), or why the lane
    *  is not acting on it (skip). Shown in the UI. */
@@ -116,6 +127,8 @@ export interface MagmaJournalEntry {
    *  settled, that paid for it — what makes it a sale to book. null: LND has
    *  no paid invoice of ours for it (it is fulfilled, but not booked). */
   paidInvoiceId?: string | null;
+  /** The operator dismissed the alert about this order being turned down. */
+  alertAckAt?: string;
   /** Lease over and channel closed by the autopilot (sellAutoClose). */
   closedAt?: string;
   closeTxid?: string;
@@ -210,15 +223,62 @@ export class MagmaJournal {
     return this.entries.filter((e) => !TERMINAL_PHASES.has(e.phase) && e.phase !== "seen");
   }
 
+  /** The routing-fee promises of channels this node sold and opened: what the
+   *  order locked (promises.locked_*), for its lease. A channel whose order
+   *  ended without a sale (cancelled, failed) or whose lease channel was
+   *  closed carries none. */
+  leaseCaps(): LeaseCap[] {
+    return this.entries
+      .filter((e) => (e.phase === "funded" || e.phase === "reported" || e.phase === "settled") && !e.closedAt)
+      .map((e) =>
+        leaseCapFrom({
+          fundingOutpoint: e.fundingOutpoint,
+          source: "magma",
+          orderId: e.orderId,
+          feeRateCapPpm: e.feeRateCapPpm,
+          baseFeeCapSats: e.baseFeeCapSats,
+          leaseBlocks: e.leaseBlocks,
+        }),
+      )
+      .filter((c): c is LeaseCap => c !== null);
+  }
+
   /** Funding outpoints already tied to an order — never adopt one twice. */
   claimedOutpoints(): Set<string> {
     return new Set(this.entries.map((e) => e.fundingOutpoint).filter((o): o is string => !!o));
   }
 
-  private trim(): void {
-    const terminal = this.entries.filter((e) => TERMINAL_PHASES.has(e.phase));
+  /**
+   * The oldest ended orders beyond TERMINAL_KEPT are dropped — never a sale
+   * whose lease may still be running: its entry is what binds the channel's
+   * routing-fee promise (leaseCaps) and claims its outpoint
+   * (claimedOutpoints). Before, any terminal entry could go, and on a busy
+   * seller (every turned-down order is terminal too) a sold channel's
+   * promise could vanish mid-lease — and the fee autopilot then raise its fee
+   * past the cap.
+   */
+  private trim(nowMs = Date.now()): void {
+    const terminal = this.entries.filter((e) => TERMINAL_PHASES.has(e.phase) && !leaseMayRun(e, nowMs));
     if (terminal.length <= TERMINAL_KEPT) return;
     const drop = new Set(terminal.slice(TERMINAL_KEPT));
     this.entries = this.entries.filter((e) => !drop.has(e));
   }
+}
+
+/** Blocks come every ~10 minutes; a lease's end is estimated with half again
+ *  as long, so a run of slow blocks never ends it early. */
+const LEASE_MS_PER_BLOCK = 10 * 60_000 * 1.5;
+
+/**
+ * A sale whose channel may still be inside its lease: funded, not closed,
+ * and not yet past the lease measured generously from the latest moment the
+ * funding can have confirmed (the sale settles only once it has). The fee
+ * autopilot itself tells the lease's end by block height (leaseCaps.ts);
+ * this only decides what may be forgotten.
+ */
+function leaseMayRun(e: MagmaJournalEntry, nowMs: number): boolean {
+  if (e.phase !== "settled" || !e.fundingOutpoint || e.closedAt) return false;
+  const blocks = e.leaseBlocks && e.leaseBlocks > 0 ? e.leaseBlocks : 4_320;
+  const from = Date.parse(e.settledAt ?? e.reportedAt ?? e.fundedAt ?? e.updatedAt);
+  return !Number.isFinite(from) || nowMs < from + blocks * LEASE_MS_PER_BLOCK;
 }

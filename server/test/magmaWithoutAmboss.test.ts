@@ -293,6 +293,7 @@ test("Settings is told how many Magma orders are in flight before the key is rem
   const http = installFetchMock(t);
   const magma = new FakeMagma(http, t);
   const api = await startApi(t, { node: new FakeLnd({ chainBalance: 20_000_000 }) });
+  magma.sellerPubkey = api.node.publicKey; // this node's sales and offers
   api.amboss.setKey("test-key");
   const sale = magma.addSale({ buyerPubkey: BUYER });
   let status = await api.request("GET", "/amboss/status");

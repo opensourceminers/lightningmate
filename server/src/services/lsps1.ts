@@ -30,6 +30,7 @@ import { saleFeeConfig, type ServiceFeeLedger } from "./serviceFee.js";
 import { couldNotConnect, ensureConnected, fundChannel, isPendingChannelsLimit, isPreBroadcastRefusal } from "./channelOps.js";
 import { cancelHodl, createHodl, newHodlSecret, settleHodl } from "./hodl.js";
 import { CapitalLedger, channelsWith, findOpenedChannel, spendableOnchain, type Reservation } from "./capital.js";
+import { leaseCapFrom, type LeaseCap, type OfferFeeCaps } from "./leaseCaps.js";
 
 /**
  * LSP mode — LSPS1 (bLIP-51) channel selling over LSPS0 (bLIP-50) transport.
@@ -86,7 +87,11 @@ const MAX_PENDING_TOTAL = 10;
 /** Peer-offline retry budget when opening after payment (1 min apart). */
 const OPEN_RETRY_ATTEMPTS = 10;
 const OPEN_RETRY_DELAY_MS = 60_000;
+/** Ended orders kept beyond the ones that still matter (trimOrders). */
 const ORDERS_KEPT = 200;
+/** Blocks come every ~10 minutes; a lease's end is estimated with half again
+ *  as long, so a run of slow blocks never ends it early (as magmaJournal.ts). */
+const LEASE_MS_PER_BLOCK = 10 * 60_000 * 1.5;
 const BLOCKS_PER_YEAR = MAGMA_V2_DEFAULTS.blocksPerYear;
 
 type JsonRpcId = string | number | null;
@@ -117,6 +122,21 @@ function lndErrorDetail(err: unknown): string {
 }
 
 // ── orders ────────────────────────────────────────────────────────────────────
+
+/**
+ * A channel this service opened that may still be inside its lease: funded,
+ * and not yet past the lease measured generously from its funding. Whatever
+ * the order's end: a sold channel carries its routing-fee promise and its
+ * share of the deploy cap; one whose order failed after the open (the buyer
+ * refunded) still claims its channel, so no other order's open adopts it.
+ * The fee autopilot tells the lease's end by block height (leaseCaps.ts);
+ * this only decides what may be forgotten.
+ */
+function lsps1ChannelMayRun(o: Lsps1Order, nowMs: number): boolean {
+  if (!o.channel) return false;
+  const from = Date.parse(o.channel.fundedAt);
+  return !Number.isFinite(from) || nowMs < from + o.channelExpiryBlocks * LEASE_MS_PER_BLOCK;
+}
 
 export type Lsps1OrderState = "CREATED" | "COMPLETED" | "FAILED";
 export type Lsps1PaymentState = "EXPECT_PAYMENT" | "HOLD" | "PAID" | "REFUNDED";
@@ -156,6 +176,12 @@ export interface Lsps1Order {
   /** LEGACY: fee paid inline by older versions. The service-fee ledger is the
    *  source of truth for orders completed since. */
   serviceFeePaidSat: number;
+  /** The routing-fee promise this sale carries for its lease — the same one
+   *  this node's Magma offers make (leaseCaps.ts), locked when the order is
+   *  created. The fee autopilot keeps the sold channel within it. Absent on
+   *  orders created before the promise existed: nothing was promised then. */
+  feeRateCapPpm?: number;
+  baseFeeCapSats?: number;
   error?: string;
 }
 
@@ -261,8 +287,14 @@ export class Lsps1Service {
     /** Live sell caps (shared with Magma): max channel size, on-chain reserve,
      *  aggregate deploy cap. */
     private readonly caps: () => { maxChannelSats: number; reserveSats: number; maxDeploySats: number },
-    /** Magma pricing mode + adaptive level, so both demand sources price alike. */
-    private readonly pricingMode: () => { sellPricingMode: "fast" | "balanced" | "premium" | "auto"; adaptiveLevel: number },
+    /** The Magma engine's inputs (pricing mode, adaptive level, capital caps,
+     *  the routing-fee promise), so both demand sources price — and promise —
+     *  alike. */
+    private readonly pricingMode: () => {
+      sellPricingMode: "fast" | "balanced" | "premium" | "auto";
+      adaptiveLevel: number;
+      offerFeeCaps?: OfferFeeCaps | null;
+    },
     private readonly ambossKey: () => string,
     private readonly earnings: EarningsLog,
     /** Completed sales enqueue their service fee here (paid in the background). */
@@ -280,7 +312,26 @@ export class Lsps1Service {
       reservations: () => this.reservations(),
       deployedSat: () => this.deployedSat(),
       claimedOutpoints: () => this.orders.map((o) => o.channel?.fundingOutpoint ?? ""),
+      leaseCaps: () => this.leaseCaps(),
     });
+  }
+
+  /** The routing-fee promises of the channels this service sold (a failed
+   *  order sold nothing, so it promised nothing). */
+  leaseCaps(): LeaseCap[] {
+    return this.orders
+      .filter((o) => o.orderState !== "FAILED" && o.channel)
+      .map((o) =>
+        leaseCapFrom({
+          fundingOutpoint: o.channel?.fundingOutpoint,
+          source: "lsps1",
+          orderId: o.orderId,
+          feeRateCapPpm: o.feeRateCapPpm,
+          baseFeeCapSats: o.baseFeeCapSats,
+          leaseBlocks: o.channelExpiryBlocks,
+        }),
+      )
+      .filter((c): c is LeaseCap => c !== null);
   }
 
   start(): void {
@@ -951,6 +1002,8 @@ export class Lsps1Service {
     // Pricing may ask Amboss for the market — never while holding the mutex.
     const { feeTotalSat } = await this.quote(lspBalanceSat, expiryBlocks);
     const announceChannel = p.announce_channel;
+    // The routing-fee promise of this sale, locked now (leaseCaps.ts).
+    const caps = this.pricingMode().offerFeeCaps ?? null;
 
     // The coins must exist NOW, net of every promise: checked with a fresh
     // balance inside the on-chain mutex, and the order recorded in the same
@@ -1001,6 +1054,7 @@ export class Lsps1Service {
         invoiceExpiresAt: expiresAt,
         channel: null,
         serviceFeePaidSat: 0,
+        ...(caps ? { feeRateCapPpm: caps.feeRateCapPpm, baseFeeCapSats: caps.baseFeeCapSats } : {}),
       };
       this.orders.unshift(order);
       this.spendableCache = undefined; // this quote now counts against the next
@@ -1044,8 +1098,23 @@ export class Lsps1Service {
   }
 
   private persistOrders(): void {
-    this.orders = this.orders.slice(0, ORDERS_KEPT);
+    this.trimOrders();
     this.ordersStore.write(this.orders);
+  }
+
+  /**
+   * Keep the newest ORDERS_KEPT orders, and beyond them every order that
+   * still matters: one in progress (its held payment, reservation and
+   * invoice watch live here), and one whose channel's lease may still run —
+   * its routing-fee promise (leaseCaps), its claimed outpoint and its share
+   * of the deploy cap must outlive the trim. Before, a plain slice dropped
+   * them: any peer can leave ~10 abandoned orders an hour (MAX_PENDING_TOTAL,
+   * one-hour expiry), so a 30-day sale lost its promise about 20 hours in,
+   * and the fee autopilot stopped keeping its channel within the cap.
+   */
+  private trimOrders(nowMs = Date.now()): void {
+    let others = 0;
+    this.orders = this.orders.filter((o) => o.orderState === "CREATED" || lsps1ChannelMayRun(o, nowMs) || ++others <= ORDERS_KEPT);
   }
 
   // ── payment → channel-open state machine ────────────────────────────────────
@@ -1340,7 +1409,7 @@ export class Lsps1Service {
     order.channel = { fundedAt: new Date().toISOString(), fundingOutpoint, expiresAt };
     order.opening = undefined;
     try {
-      this.orders = this.orders.slice(0, ORDERS_KEPT);
+      this.trimOrders();
       this.ordersStore.writeOrThrow(this.orders);
     } catch (err) {
       const detail =

@@ -1363,16 +1363,48 @@ tr.pending td { opacity: 0.9; }
 .lnp-ok { color: var(--green); font-weight: 600; }
 .pad { padding: 10px 2px; }
 
-/* Magma: the size-window banner. Size, not price, is usually what blocks fills. */
-.magma-reach {
-  margin: 12px 0; padding: 12px 14px; border-radius: 8px;
-  background: rgba(247, 147, 26, 0.06); border: 1px solid rgba(247, 147, 26, 0.22);
-}
-.magma-reach-head { font-size: 14px; margin-bottom: 4px; }
-.magma-reach .table { margin-top: 10px; }
 .table.compact th, .table.compact td { padding: 4px 8px; font-size: 12px; }
 
-/* Autopilot: what a cap actually reaches on the real market. */
+/* Market → Sell: can this node sell (live eligibility), why it doesn't
+   (diagnostics checklist) and how Amboss picks sellers. */
+.elig-card, .diag-card, .how-card {
+  margin: 12px 0; padding: 12px 14px; border-radius: 8px;
+  background: var(--panel-2); border: 1px solid var(--line);
+}
+.elig-card.tone-bad { border-color: rgba(248, 113, 113, 0.35); }
+.elig-card.tone-slow { border-color: rgba(247, 147, 26, 0.35); }
+.elig-card.tone-good { border-color: rgba(52, 211, 153, 0.35); }
+.elig-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 10px; margin-bottom: 6px; }
+.elig-title, .diag-title { font-weight: 600; }
+.elig-verdict { font-weight: 600; padding: 1px 8px; border-radius: 999px; background: var(--panel-3); }
+.elig-verdict.tone-bad { color: var(--red); }
+.elig-verdict.tone-slow { color: var(--accent-2); }
+.elig-verdict.tone-good { color: var(--green); }
+.elig-verdict.tone-unknown { color: var(--muted); }
+.elig-reasons, .how-list { margin: 6px 0; padding-left: 18px; display: grid; gap: 4px; font-size: 13px; }
+.elig-expect { margin: 6px 0; }
+.elig-note { font-size: 12px; }
+.diag-card summary, .how-card summary { cursor: pointer; font-weight: 600; }
+.diag-count { font-weight: 600; font-size: 12.5px; }
+.diag-count.bad { color: var(--red); }
+.diag-count.ok { color: var(--green); }
+.diag-list { list-style: none; margin: 8px 0 4px; padding: 0; display: grid; gap: 4px; }
+.diag-row { display: grid; grid-template-columns: 18px minmax(140px, 220px) 1fr auto; gap: 8px; align-items: baseline; font-size: 13px; }
+.diag-row.s-ok .diag-mark { color: var(--green); }
+.diag-row.s-problem .diag-mark { color: var(--red); }
+.diag-row.s-info .diag-mark { color: var(--blue); }
+.diag-row.s-unknown .diag-mark { color: var(--muted); }
+.diag-label { color: var(--text); }
+.diag-detail { color: var(--muted); }
+.diag-sub { margin-top: 10px; font-weight: 600; font-size: 12.5px; }
+.diag-terms { margin-top: 4px; font-size: 12.5px; }
+.diag-terms tr.diag-differs td:last-child { color: var(--accent); font-weight: 600; }
+@media (max-width: 640px) {
+  .diag-row { grid-template-columns: 18px 1fr; }
+  .diag-detail, .diag-row .linklike { grid-column: 2; }
+}
+
+/* Autopilot → Magma: the funding limit under the caps. */
 .ap-reach {
   margin: 10px 0 4px; padding: 10px 12px; border-radius: 8px;
   background: var(--panel-3); font-size: 12.5px; display: grid; gap: 8px;

@@ -8,6 +8,8 @@ import { PnlOverview } from "./PnlOverview";
 import { LiquidityMap } from "./LiquidityMap";
 import { Sparkline } from "./Sparkline";
 import { TopChannelsTile } from "./TopChannelsTile";
+import { leaseBenchmarkLine, refusalDigest } from "../magmaView";
+import { pctFromPpm } from "../yieldView";
 import { SuggestedPeersTile } from "./SuggestedPeersTile";
 
 const KIND_LABEL: Record<ActivityItem["kind"], string> = {
@@ -24,6 +26,9 @@ function signed(value: number): string {
 
 function KpiRow({ d, price }: { d: DashboardData; price?: PriceInfo | null }) {
   const earnedFiat = price ? fiat(d.earnedSats, price.btcPrice, price.currency) : null;
+  // D12: what leasing on Magma would earn THIS node, live — or that it can't
+  // sell there yet. Never a constant.
+  const bench = leaseBenchmarkLine(d.leaseBenchmark);
   // Routing-alive signal: a collapse shows up immediately as 24h/7d going to zero.
   const last24h = d.forwardsSpark.length ? d.forwardsSpark[d.forwardsSpark.length - 1] : 0;
   const last7d = d.forwardsSpark.slice(-7).reduce((s, v) => s + v, 0);
@@ -49,14 +54,18 @@ function KpiRow({ d, price }: { d: DashboardData; price?: PriceInfo | null }) {
       </div>
       <div className="kpi">
         <div className="kpi-label">Yield · {d.windowDays}d</div>
-        <div className="kpi-value">{d.yieldPpmYear.toLocaleString()} <span className="kpi-unit">ppm/yr</span></div>
-        <div className="kpi-sub">on capital</div>
-        <div
-          className="kpi-sub kpi-bench"
-          title="Median market rate for leasing capital on Magma (~2.6% APR) — a reference for what this capital could earn leased out instead"
-        >
-          market lease ≈ 26k ppm/yr
+        <div className="kpi-value" title={`${d.yieldPpmYear.toLocaleString()} ppm/yr`}>
+          {pctFromPpm(d.yieldPpmYear)} <span className="kpi-unit">%/yr (gross)</span>
         </div>
+        <div className="kpi-sub">
+          {d.ownCapitalSats !== undefined ? `on your ${satsCompact(d.ownCapitalSats)} sat in channels` : "on capital"}
+          {d.netYieldPpmYear !== undefined && d.rebalanceFeesSats ? ` · ${pctFromPpm(d.netYieldPpmYear)}% after rebalancing` : ""}
+        </div>
+        {bench ? (
+          <div className="kpi-sub kpi-bench" title={d.leaseBenchmark?.text}>
+            {bench}
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -140,6 +149,10 @@ function DigestStrip({
       sub: "fees",
     });
   }
+  // Magma orders the lane turned down (caps, capital, unreachable buyer):
+  // each is a lease fee not earned — say so where it is seen first.
+  const refusals = refusalDigest(a.magmaRefusals, a.magmaRefusalReason);
+  if (refusals) items.push({ key: "magma-refusals", text: refusals, warn: true, tab: "market", sub: "orders" });
   if (pendingOpen > 0) {
     items.push({
       key: "popen",

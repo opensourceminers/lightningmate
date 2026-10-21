@@ -1,25 +1,11 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { LspOrder, MagmaV2Report, MyOrder, MyOrdersView } from "../types";
+import type { LspOrder, MagmaPurchase, MagmaV2Report, MyOrder, MyOrdersView } from "../types";
 import { sats, satsCompact } from "../format";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
 import { awaitsYourDecision, laneBanner } from "../statusNotes";
-
-/** This node's own record of a Magma order, in a few words (journal phase). */
-const LOCAL_LABEL: Record<string, string> = {
-  seen: "seen",
-  accepting: "accepting…",
-  accepted: "accepted · awaiting payment",
-  held: "paid (held) · channel to open",
-  opening: "opening channel…",
-  funded: "channel opened · reporting to Amboss",
-  reported: "channel reported · awaiting confirmation",
-  settled: "completed · payment settled",
-  cancelled: "cancelled · buyer refunded",
-  rejected: "rejected",
-  failed: "failed",
-};
+import { localLabel, purchaseLabel } from "../magmaView";
 
 /** Why the order is where it is: the reason, the lane's last decision, or the
  *  last error — whichever applies (shown on hover). */
@@ -46,11 +32,14 @@ export function MarketOrders() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [rec, setRec] = useState<MagmaV2Report | null>(null);
   const [lspOrders, setLspOrders] = useState<LspOrder[]>([]);
+  const [purchases, setPurchases] = useState<MagmaPurchase[]>([]);
   const [ordersInFlight, setOrdersInFlight] = useState(0);
 
   const load = async () => {
-    // Direct LSPS1 sales are local — shown regardless of the Amboss connection.
+    // Direct LSPS1 sales and Magma purchases are on this node — shown
+    // regardless of the Amboss connection.
     api.lspOrders().then((r) => setLspOrders(r.orders)).catch(() => {});
+    api.ambossPurchases().then((r) => setPurchases(r.purchases)).catch(() => {});
     let conn = false;
     try {
       const s = await api.ambossStatus();
@@ -145,6 +134,39 @@ export function MarketOrders() {
     }
   };
 
+  // Inbound bought on Magma — recorded on the node, followed to its channel.
+  const purchaseBlock = purchases.length ? (
+    <>
+      <h3 className="sub">Purchases · inbound you bought</h3>
+      <table className="fee-table">
+        <thead>
+          <tr>
+            <th>When</th>
+            <th className="num">Size</th>
+            <th className="num">Fee paid</th>
+            <th className="num">Lease</th>
+            <th>Status</th>
+            <th>Channel</th>
+          </tr>
+        </thead>
+        <tbody>
+          {purchases.map((p) => (
+            <tr key={p.orderId}>
+              <td className="muted">{new Date(p.createdAt).toLocaleString()}</td>
+              <td className="num">{p.sizeSats > 0 ? satsCompact(p.sizeSats) : "—"}</td>
+              <td className="num" title={p.routingFeeSats ? `+ ${p.routingFeeSats} sat routing fee` : undefined}>
+                {p.feeSats.toLocaleString()}
+              </td>
+              <td className="num">{p.leaseBlocks ? `${Math.round(p.leaseBlocks / 144)}d` : "—"}</td>
+              <td title={p.error ?? p.orderStatus ?? undefined}>{purchaseLabel(p)}</td>
+              <td className="muted">{p.channelId ?? "—"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </>
+  ) : null;
+
   // Direct LSPS1 sales — rendered below the Magma orders, and even when Amboss
   // isn't connected (they don't involve the marketplace at all).
   const lspBlock = lspOrders.length ? (
@@ -195,6 +217,7 @@ export function MarketOrders() {
             buyers before they expire. Connect a key to finish {ordersInFlight === 1 ? "it" : "them"}.
           </p>
         ) : null}
+        {purchaseBlock}
         {lspBlock}
       </section>
     );
@@ -260,7 +283,7 @@ export function MarketOrders() {
                 <td className="num">{o.feeSats > 0 ? o.feeSats.toLocaleString() : "—"}</td>
                 <td title={localDetail(o)}>
                   {o.status}
-                  {o.local ? <span className="muted"> · {LOCAL_LABEL[o.local.phase] ?? o.local.phase}</span> : null}
+                  {o.local ? <span className="muted"> · {localLabel(o.local)}</span> : null}
                 </td>
                 <td className="muted">{o.channelId ? `${o.channelId.slice(0, 12)}…` : "—"}</td>
                 <td>
@@ -285,6 +308,7 @@ export function MarketOrders() {
         </table>
       )}
 
+      {purchaseBlock}
       {lspBlock}
     </section>
   );

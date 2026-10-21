@@ -51,22 +51,37 @@ export interface GraphqlSchema {
 }
 
 const FIXTURE = fileURLToPath(new URL("../fixtures/magma-schema.json", import.meta.url));
+/** api.amboss.space — public market data only (getOffers, getNode,
+ *  getMarketMetrics), introspected 2026-10-20. */
+const SPACE_FIXTURE = fileURLToPath(new URL("../fixtures/amboss-space-schema.json", import.meta.url));
 
-let cached: GraphqlSchema | undefined;
+const cached = new Map<string, GraphqlSchema>();
 
-/** The Magma API schema (magma.amboss.tech), from the repo fixture. */
-export function magmaSchema(): GraphqlSchema {
-  if (cached) return cached;
-  const raw = JSON.parse(readFileSync(FIXTURE, "utf8")) as {
+function loadSchema(file: string): GraphqlSchema {
+  const hit = cached.get(file);
+  if (hit) return hit;
+  const raw = JSON.parse(readFileSync(file, "utf8")) as {
     data: { __schema: { queryType: { name: string }; mutationType: { name: string }; types: SchemaType[] } };
   };
   const s = raw.data.__schema;
-  cached = {
+  const schema = {
     queryType: s.queryType.name,
     mutationType: s.mutationType.name,
     types: new Map(s.types.map((t) => [t.name, t])),
   };
-  return cached;
+  cached.set(file, schema);
+  return schema;
+}
+
+/** The Magma API schema (magma.amboss.tech), from the repo fixture. */
+export function magmaSchema(): GraphqlSchema {
+  return loadSchema(FIXTURE);
+}
+
+/** The legacy api.amboss.space schema, from the repo fixture: the public
+ *  market data this app still reads there. */
+export function ambossSpaceSchema(): GraphqlSchema {
+  return loadSchema(SPACE_FIXTURE);
 }
 
 // ── parsing ───────────────────────────────────────────────────────────────────

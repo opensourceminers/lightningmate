@@ -20,6 +20,25 @@ export interface ActivityItem {
   feeSats?: number;
 }
 
+/**
+ * What leasing capital out on Magma would earn this node (D12) — live, never a
+ * constant. The Overview showed "market lease ≈ 26k ppm/yr" for every node
+ * (stale: buyers paid ~50k at the time) as what its capital "could earn
+ * leased out instead" — for nodes that, like most small ones, don't sell at
+ * all. Now: for a node whose comparable offers do sell, the median rate
+ * buyers actually paid for leases of its size (gross — a seller nets less:
+ * Amboss's fee is on top, the on-chain costs and the 1% service fee come
+ * off); for any other node, plainly that selling isn't realistic for it yet.
+ */
+export interface LeaseBenchmark {
+  status: "eligible" | "not_realistic" | "no_data" | "unknown";
+  /** Median annual rate buyers paid for comparable leases (gross), in %. */
+  grossAprPct: number | null;
+  sales: number | null;
+  windowDays: number | null;
+  text: string;
+}
+
 export interface DashboardData {
   windowDays: number;
   earnedSats: number;
@@ -30,10 +49,16 @@ export interface DashboardData {
   routedSpark: number[];
   rebalancedCount: number;
   rebalancedSats: number;
-  /** Total channel capacity (sats) — the capital base for the yield figure. */
+  /** Total channel capacity (sats), peers' sides and pending channels included. */
   totalCapacitySats: number;
-  /** Routing earnings yield on capital, annualised (ppm/year). */
+  /** This node's own capital in its open channels: their local balance. */
+  ownCapitalSats: number;
+  /** Routing fees earned on that capital, annualised — gross (ppm/year). */
   yieldPpmYear: number;
+  /** The same after the rebalancing fees paid in the window (ppm/year). */
+  netYieldPpmYear: number;
+  rebalanceFeesSats: number;
+  leaseBenchmark: LeaseBenchmark;
   activity: ActivityItem[];
   autopilot: {
     fees: boolean;
@@ -50,6 +75,9 @@ export interface DashboardData {
     lastRebalances: number;
     lastSells: number;
     lastOpens: number;
+    /** Magma orders the lane turned down in the last two days (not dismissed). */
+    magmaRefusals: number;
+    magmaRefusalReason: string | null;
   };
 }
 
@@ -84,6 +112,12 @@ export function buildDashboard(
   rebalance: RebalanceSummary,
   autopilot: AutopilotState,
   totalCapacitySats: number,
+  extra: {
+    ownCapitalSats: number;
+    rebalanceFeesSats: number;
+    leaseBenchmark: LeaseBenchmark;
+    magmaRefusals: { reason: string }[];
+  } = { ownCapitalSats: totalCapacitySats, rebalanceFeesSats: 0, leaseBenchmark: { status: "unknown", grossAprPct: null, sales: null, windowDays: null, text: "" }, magmaRefusals: [] },
 ): DashboardData {
   const activity: ActivityItem[] = [];
 
@@ -128,6 +162,10 @@ export function buildDashboard(
 
   const last = autopilot.history[0];
   const okCount = (xs?: { ok: boolean }[]) => (xs ?? []).filter((x) => x.ok).length;
+  // On THIS node's capital (its side of the open channels): the peers'
+  // balances and channels still opening earn this node nothing.
+  const perYear = (sats: number) =>
+    extra.ownCapitalSats > 0 ? Math.round((sats / extra.ownCapitalSats) * (365 / Math.max(1, report.windowDays)) * 1_000_000) : 0;
   return {
     windowDays: report.windowDays,
     earnedSats: report.totalFeesEarnedSats,
@@ -139,10 +177,11 @@ export function buildDashboard(
     rebalancedCount: rebalance.count,
     rebalancedSats: rebalance.totalAmountSats,
     totalCapacitySats,
-    yieldPpmYear:
-      totalCapacitySats > 0
-        ? Math.round((report.totalFeesEarnedSats / totalCapacitySats) * (365 / Math.max(1, report.windowDays)) * 1_000_000)
-        : 0,
+    ownCapitalSats: extra.ownCapitalSats,
+    yieldPpmYear: perYear(report.totalFeesEarnedSats),
+    netYieldPpmYear: perYear(report.totalFeesEarnedSats - extra.rebalanceFeesSats),
+    rebalanceFeesSats: extra.rebalanceFeesSats,
+    leaseBenchmark: extra.leaseBenchmark,
     activity: activity.slice(0, 14),
     autopilot: {
       fees: autopilot.config.enabled,
@@ -157,6 +196,8 @@ export function buildDashboard(
       lastRebalances: okCount(last?.rebalances),
       lastSells: okCount(last?.sells),
       lastOpens: okCount(last?.channels),
+      magmaRefusals: extra.magmaRefusals.length,
+      magmaRefusalReason: extra.magmaRefusals[0]?.reason ?? null,
     },
   };
 }

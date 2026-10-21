@@ -18,6 +18,7 @@ import { ServiceFeeLedger, lndFeeLightning } from "../../src/services/serviceFee
 import { CapitalLedger } from "../../src/services/capital.js";
 import { FakeLnd } from "./fakeLnd.js";
 import { makeTempDir, type AfterHook } from "./tmp.js";
+import { suppressSchedulerKicks } from "./autopilot.js";
 
 /**
  * The whole API — every store, the autopilot, LSPS1, the service-fee ledger and
@@ -60,7 +61,18 @@ export interface ApiHarness {
 
 export async function startApi(
   t: AfterHook,
-  opts: { node?: FakeLnd; readOnly?: boolean; dir?: string; payTimeoutMs?: number } = {},
+  opts: {
+    node?: FakeLnd;
+    readOnly?: boolean;
+    dir?: string;
+    payTimeoutMs?: number;
+    /** Keep the autopilot's "run soon after a settings change" kicks (a main
+     *  run 2 s, an order-lane pass 5 s after POST /autopilot). Off by
+     *  default: on real timers they fired into whatever the test did next —
+     *  on a slow runner after it, failing its fetch mock with "unexpected
+     *  outbound request(s)". A test that wants them says so. */
+    schedulerKicks?: boolean;
+  } = {},
 ): Promise<ApiHarness> {
   const dir = opts.dir ?? makeTempDir(t);
   const node = opts.node ?? new FakeLnd();
@@ -78,6 +90,7 @@ export async function startApi(
   // One on-chain budget for Magma, LSPS1 and the autopilot — as in index.ts.
   const capital = new CapitalLedger();
   const autopilot = new Autopilot(dir, node.lnd, writeLnd, rebalanceLog, overrides, amboss, earnings, serviceFees, lnplus, capital);
+  if (!opts.schedulerKicks) suppressSchedulerKicks(autopilot);
   const lsps1 = new Lsps1Service(
     dir,
     node.lnd,

@@ -26,6 +26,7 @@ export function FeeRecommendations() {
   const [canWrite, setCanWrite] = useState(false);
   const [applying, setApplying] = useState(false);
   const [applied, setApplied] = useState<number | null>(null);
+  const [clamped, setClamped] = useState(0);
   const [overrides, setOverrides] = useState<OverrideMap>({});
   const [showAll, setShowAll] = useState(false);
   const [open, setOpen] = useState<Set<string>>(new Set());
@@ -76,6 +77,8 @@ export function FeeRecommendations() {
     try {
       const res = await api.feesApply(items);
       setApplied(res.results.filter((r) => r.ok).length);
+      // A sold channel's fee is kept within its lease promise (D7) — say so.
+      setClamped(res.results.filter((r) => r.ok && r.clampedBy).length);
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -97,7 +100,11 @@ export function FeeRecommendations() {
               {applying ? "Applying…" : `Apply ${wouldApply.length}`}
             </button>
           ) : null}
-          {applied != null ? <span className="apply-result">✓ {applied} applied</span> : null}
+          {applied != null ? (
+            <span className="apply-result">
+              ✓ {applied} applied{clamped ? ` (${clamped} kept within a lease's fee promise)` : ""}
+            </span>
+          ) : null}
           <button className="reset" onClick={() => setShowAll((v) => !v)}>
             {showAll ? "only changes" : "show all"}
           </button>

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
 import type { ChannelView, ForwardsReport, MagmaV2Report, OutcomesReport, RebalanceRecord } from "../types";
 import { sats, satsCompact } from "../format";
+import { routingYield } from "../yieldView";
 import { SkeletonPanel } from "./Skeleton";
 import { ForwardsPanel } from "./ForwardsPanel";
 import { Sparkline } from "./Sparkline";
@@ -153,8 +154,8 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
     const rebalCost = inWindow.reduce((s, r) => s + (r.feeSats ?? 0), 0);
     const revenue = fr.totalFeesEarnedSats;
     const net = revenue - rebalCost;
-    const totalCap = channels.reduce((s, c) => s + c.capacity, 0);
-    const nodeYield = totalCap > 0 ? (revenue / totalCap) * (365 / days) * 100 : 0;
+    // On the node's own capital in open channels, gross and net (a5).
+    const nodeYield = routingYield(channels, revenue, rebalCost, days);
     const magmaNet = magma?.analytics.netProfitSat ?? 0;
     const magmaSold = magma?.analytics.filledOrdersAllTime ?? 0;
     return { revenue, rebalCost, net, rebalCount: inWindow.length, nodeYield, magmaNet, magmaSold };
@@ -199,7 +200,16 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
             />
             <Kpi label="Routing revenue" value={sats(kpis.revenue)} unit="sat" tone="green" sub={`${fr.totalForwards} forwards`} />
             <Kpi label="Routed volume" value={satsCompact(fr.totalRoutedSats)} unit="sat" sub={`avg ${fr.avgFeePpm} ppm earned`} />
-            <Kpi label="Node yield" value={kpis.nodeYield.toFixed(2)} unit="% APY" sub="on deployed capital" />
+            <Kpi
+              label="Node yield"
+              value={kpis.nodeYield.grossPctYear !== null ? kpis.nodeYield.grossPctYear.toFixed(2) : "—"}
+              unit="%/yr (gross)"
+              sub={
+                kpis.nodeYield.netPctYear !== null
+                  ? `on your ${satsCompact(kpis.nodeYield.ownCapitalSats)} sat in channels · ${kpis.nodeYield.netPctYear.toFixed(2)}%/yr after rebalancing`
+                  : "no capital in open channels"
+              }
+            />
             <Kpi
               label="Rebalancing"
               value={kpis.rebalCost ? `−${sats(kpis.rebalCost)}` : "0"}

@@ -8,12 +8,18 @@ import type {
   FeePolicy,
   MagmaV2Report,
   NumberBounds,
+  SellDiagnostics,
 } from "../types";
 import { satsCompact, timeAgo } from "../format";
 import { parseNumField } from "../numField";
 import { runProgress } from "../statusNotes";
+import { buildPresets, matchesPreset as presetMatches } from "../presets";
+import { OFFER_AUTOMATION_HINT, PRICING_MODES } from "../magmaView";
 import { RunState, Switch } from "./Switch";
 import { useUi } from "./Overlay";
+import { goTo } from "../nav";
+import { SellDiagnosticsCard } from "./MagmaSellInfo";
+import { turnSellingOff, turnSellingOn } from "./SellingSwitch";
 import { FeeRecommendations } from "./FeeRecommendations";
 import { RebalanceRecommendations } from "./RebalanceRecommendations";
 import { SuggestionsPanel } from "./SuggestionsPanel";
@@ -114,7 +120,8 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   // Market reality for the caps section. Needs no Amboss key.
   const [magma, setMagma] = useState<MagmaV2Report | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const { toast } = useUi();
+  const ui = useUi();
+  const { toast } = ui;
   const [openItems, setOpenItems] = useState<Set<string>>(new Set());
   const toggleItem = (key: string) =>
     setOpenItems((s) => {
@@ -127,6 +134,14 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   useEffect(() => {
     api.magmaRecommendations().then(setMagma).catch(() => setMagma(null));
   }, []);
+
+  // The same "why don't I sell?" checklist as Market → Sell, on the Magma
+  // settings — read when that sub-tab is opened.
+  const [diag, setDiag] = useState<SellDiagnostics | null>(null);
+  useEffect(() => {
+    if (sub !== "magma") return;
+    api.sellDiagnostics().then(setDiag).catch(() => setDiag(null));
+  }, [sub]);
 
   useEffect(() => {
     let cancelled = false;
@@ -213,21 +228,41 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   };
 
   type BoolKey = "enabled" | "rebalanceEnabled" | "channelEnabled" | "sellEnabled" | "maxHtlcEnabled";
-  const toggleRow = (field: BoolKey, title: string, subtitle: string) => (
+  const toggleRow = (field: BoolKey, title: string, subtitle: string, onChange?: (v: boolean) => void) => (
     <div className="ap-master">
       <Switch
         checked={config[field]}
         disabled={busy || writeOff}
-        onChange={(v) => void save({ [field]: v })}
+        onChange={(v) => (onChange ? onChange(v) : void save({ [field]: v }))}
         label={title}
       />
       <div className="ap-master-text">
         <div className="ap-master-title">{title}</div>
         <div className="ap-master-sub">{subtitle}</div>
       </div>
-      <RunState on={config[field]} />
+      <RunState on={config[field]} blocked={writeOff ? "write mode is off — nothing can run" : undefined} />
     </div>
   );
+
+  /**
+   * Liquidity provision is an explicit decision (D9): switching it on shows
+   * whether this node can realistically sell (live, from Amboss's public
+   * book — the dialog opens at once and the verdict follows); switching it
+   * off while offers are still listed offers to disable them too — otherwise
+   * their orders wait for a decision nobody makes, and time out against the
+   * seller score. The decisions live in SellingSwitch.tsx.
+   */
+  const setSelling = async (on: boolean) => {
+    const deps = {
+      confirm: ui.confirm,
+      eligibility: () => api.magmaEligibility(),
+      offers: () => api.ambossMyOffers().then((r) => r.offers),
+      disableOffer: (id: string) => api.ambossToggleOffer(id, "DISABLED"),
+      save,
+      toast,
+    };
+    await (on ? turnSellingOn(deps) : turnSellingOff(deps));
+  };
 
   const numInput = (path: NumPath, label: string, step?: number) => {
     const b = boundsFor(server, path);
@@ -300,69 +335,9 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     { id: "history", label: "History" },
   ];
 
-  // One goal, cascaded: each preset sets the fee curve (floor + balanced level +
-  // base fee) AND which autopilots run, so the parts never pull against each other.
-  // The per-subtab controls below still override anything a power user wants.
-  // Each preset sets the full fee curve AND its behaviour (how fast idle channels
-  // get cheaper, how hard drained ones are protected, the profit-floor margin) AND
-  // the rebalance economics (strictness + daily budget) — so nothing pulls against
-  // the chosen goal. Per-subtab controls still override afterwards.
-  const PRESETS: { id: string; label: string; desc: string; cfg: AutopilotConfigPatch }[] = [
-    {
-      id: "routing",
-      label: "Max routing",
-      desc: "Cheapest fees, zero base, loose rebalancing — win the most forwards. Magma off.",
-      cfg: {
-        enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: false,
-        policy: {
-          ...config.policy, minPpm: 25, neutralPpm: 60, maxPpm: 1000, baseFeeMsat: 0,
-          protectPpm: 250, safetyMargin: 1.05, noFlowRatchetSteps: 4, exploreLowerModifier: 0.75,
-        },
-        rebalancePolicy: { ...config.rebalancePolicy, econRatio: 0.9 },
-        maxRebalancesPerRun: 4, rebalanceDailyBudgetSats: 25_000,
-      },
-    },
-    {
-      id: "balanced",
-      label: "Balanced",
-      desc: "Compete for flow and lease idle capital. Recommended.",
-      cfg: {
-        enabled: true, rebalanceEnabled: true, channelEnabled: true, sellEnabled: true,
-        sellAutoReprice: true, sellAutoSize: true, sellPricingMode: "auto",
-        policy: {
-          ...config.policy, minPpm: 25, neutralPpm: 80, maxPpm: 1000, baseFeeMsat: 0,
-          protectPpm: 350, safetyMargin: 1.15, noFlowRatchetSteps: 3, exploreLowerModifier: 0.85,
-        },
-        rebalancePolicy: { ...config.rebalancePolicy, econRatio: 0.8 },
-        maxRebalancesPerRun: 2, rebalanceDailyBudgetSats: 10_000,
-      },
-    },
-    {
-      id: "profit",
-      label: "Max profit",
-      desc: "Higher fees, strict rebalancing, lease over routing — fewer, richer forwards.",
-      cfg: {
-        enabled: true, rebalanceEnabled: true, channelEnabled: false, sellEnabled: true,
-        sellAutoReprice: true, sellAutoSize: true, sellPricingMode: "premium",
-        policy: {
-          ...config.policy, minPpm: 80, neutralPpm: 150, maxPpm: 1500, baseFeeMsat: 0,
-          protectPpm: 600, safetyMargin: 1.35, noFlowRatchetSteps: 1, exploreLowerModifier: 0.9,
-        },
-        rebalancePolicy: { ...config.rebalancePolicy, econRatio: 0.6 },
-        maxRebalancesPerRun: 1, rebalanceDailyBudgetSats: 5_000,
-      },
-    },
-  ];
-  // Compare nested objects (policy, rebalancePolicy) field-by-field, not by reference.
-  const matchesPreset = (p: AutopilotConfigPatch) =>
-    (Object.keys(p) as (keyof AutopilotConfig)[]).every((k) => {
-      const pv = p[k];
-      if (pv && typeof pv === "object") {
-        const dv = config[k] as unknown as Record<string, unknown>;
-        return Object.entries(pv as unknown as Record<string, unknown>).every(([sk, sv]) => dv?.[sk] === sv);
-      }
-      return config[k] === pv;
-    });
+  // The Strategy presets (presets.ts) — none of them touches Magma selling.
+  const PRESETS = buildPresets(config);
+  const matchesPreset = (p: AutopilotConfigPatch) => presetMatches(config, p);
 
   return (
     <div>
@@ -464,22 +439,26 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
         </>
       ) : sub === "magma" ? (
         <section className="panel">
-          {toggleRow("sellEnabled", "Liquidity provision (Magma)", "Auto-fulfils your sell orders — opens channels to buyers, earns lease fees, within caps")}
+          <SellDiagnosticsCard d={diag} onFix={(tab, s) => goTo(tab, s)} />
+          {toggleRow(
+            "sellEnabled",
+            "Liquidity provision (Magma)",
+            "Advanced: sells inbound on Amboss Magma — accepts orders with a hold invoice, opens channels to buyers, rejects what it can't serve, within your caps. Amboss decides who gets orders.",
+            (v) => void setSelling(v),
+          )}
+          {server.decisions?.magma ? (
+            <p className="muted ap-hint">
+              Last decision ({timeAgo(server.decisions.magma.at)}): {server.decisions.magma.text}
+            </p>
+          ) : null}
 
           <h3 className="sub">Offer pricing</h3>
           <p className="muted ap-hint">
-            With auto-pricing on, your enabled offer is kept continuously priced to the live market at this level —
-            never below your profit floor.
+            With auto-pricing on, your enabled offer is priced from what buyers actually paid for comparable leases, at the level
+            below — never below your profit floor. (Price is not what gets a seller picked; it decides what a sale earns.)
           </p>
           <div className="mode-select">
-            {(
-              [
-                ["auto", "Auto", "adapts to demand — raises when it sells, lowers when it doesn't"],
-                ["fast", "Low", "undercut — sell fast"],
-                ["balanced", "Median", "match the market middle"],
-                ["premium", "Premium", "top of the market — earn more"],
-              ] as ["auto" | "fast" | "balanced" | "premium", string, string][]
-            ).map(([id, label, desc]) => (
+            {PRICING_MODES.map(({ id, label, desc }) => (
               <button
                 key={id}
                 className={`mode-opt ${config.sellPricingMode === id ? "active" : ""}`}
@@ -496,68 +475,34 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
           <div className="ap-checks">
             <label className="check ap-check">
               <input type="checkbox" checked={config.sellAutoReprice} disabled={busy || writeOff} onChange={(e) => void save({ sellAutoReprice: e.target.checked })} />
-              Auto-price the enabled offer to the live market (at the level above, floor-protected)
+              Auto-price the enabled offer from what buyers actually paid (at the level above, floor-protected)
             </label>
             <label className="check ap-check">
               <input type="checkbox" checked={config.sellAutoSize} disabled={busy || writeOff} onChange={(e) => void save({ sellAutoSize: e.target.checked })} />
-              Auto-size the offer: keep its size range and lease length in step with the market, up to your cap below
+              Auto-size the offer: the standard 30-day lease, the routing-fee promise, and a window from the smallest channel that pays for itself up to what can be funded
             </label>
             <label className="check ap-check">
               <input type="checkbox" checked={config.sellAutoRelist} disabled={busy || writeOff} onChange={(e) => void save({ sellAutoRelist: e.target.checked })} />
-              Auto-relist a depleted offer (top it back up within your caps so it keeps selling)
+              Auto-relist a depleted offer (top it back up within your caps)
             </label>
             <label className="check ap-check">
               <input type="checkbox" checked={config.sellAutoClose} disabled={busy || writeOff} onChange={(e) => void save({ sellAutoClose: e.target.checked })} />
               Auto-close channels after the lease ends (reclaim the capital on-chain)
             </label>
           </div>
+          <p className="muted ap-hint">{OFFER_AUTOMATION_HINT}</p>
 
           <h3 className="sub">Caps</h3>
           <p className="muted ap-hint">
-            The max order size is the setting that decides whether buyers can be matched with you at all. An offer whose
-            size range misses the orders people actually place cannot fill at any price.
+            The most capital the autopilot may sell, the largest channel per order, and the on-chain reserve it never touches.
+            Orders above these are rejected at once, with the reason on Market → Orders — never left to time out. Raising them
+            doesn't make Amboss send orders: it only lets the node serve bigger ones.
           </p>
           <div className="policy-controls">{numFields(SELL_NUM_FIELDS)}</div>
-          {magma?.sell.capReach ? (
+          {magma?.sell.capitalLimited ? (
             <div className="ap-reach">
-              <div>
-                At your current cap you can serve <b>{magma.sell.capReach.sharePctNow}%</b> of real Magma orders
-                {magma.sell.capReach.capitalLimited ? (
-                  <>
-                    {" "}
-                    — your cap would allow {satsCompact(magma.sell.capReach.capSat)} (
-                    {magma.sell.capReach.sharePctAtCap}%) but only{" "}
-                    {satsCompact(magma.sell.effectiveMaxOrderSat)} is funded on-chain, so this is a capital limit, not a
-                    settings one.
-                  </>
-                ) : (
-                  "."
-                )}
-              </div>
-              {magma.sell.demandFit?.ladder.length ? (
-                <table className="table compact">
-                  <thead>
-                    <tr>
-                      <th>If max order size were</th>
-                      <th className="num">You could serve</th>
-                      <th className="num">Orders/month</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {magma.sell.demandFit.ladder.map((l) => (
-                      <tr key={l.maxSizeSat}>
-                        <td>{satsCompact(l.maxSizeSat)}</td>
-                        <td className="num strong">{l.sharePct}%</td>
-                        <td className="num">{l.ordersPerMonth}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              ) : null}
-              <div className="muted">
-                Raising the max order size also needs the capital cap and your on-chain balance to allow it — the
-                effective ceiling is the smallest of the three.
-              </div>
+              Right now only {satsCompact(magma.sell.effectiveMaxOrderSat)} can be funded on-chain (after the reserve and the coins
+              promised to other orders) — a capital limit, not a settings one.
             </div>
           ) : null}
           {(shownNum("sellMaxChannelSats") ?? 0) > (shownNum("sellMaxDeploySats") ?? 0) ? (

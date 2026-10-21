@@ -1,12 +1,14 @@
 import {
   getChannel,
   getFeeRates,
+  getWalletInfo,
   updateRoutingFees,
   type AuthenticatedLnd,
 } from "lightning";
 import { getChannelsView } from "./channels.js";
 import { getOwnPubkey } from "./node.js";
 import type { OverrideMap } from "./overrides.js";
+import { activeCap, capText, clampToCap, type LeaseCap } from "./leaseCaps.js";
 
 /**
  * A fee policy maps each channel's *current local balance ratio* to a target
@@ -172,7 +174,12 @@ export interface FeeApplyItem {
 export interface FeeApplyResult {
   id: string;
   ok: boolean;
+  /** The fee rate applied (after a lease promise's clamp, if one bound it). */
   feeRatePpm: number;
+  /** The base fee applied, msat. */
+  baseFeeMsat?: number;
+  /** Set when a sold channel's lease promise lowered what was asked for. */
+  clampedBy?: string;
   error?: string;
 }
 
@@ -181,16 +188,31 @@ export interface FeeApplyResult {
  * (to preserve cltv_delta + HTLC limits, which LND would otherwise reset to
  * defaults), `writeLnd` performs the update. Channels whose current policy can't
  * be read are skipped rather than risk clobbering their timelock settings.
+ *
+ * `leaseCaps`: the routing-fee promises of sold channels (D7). Every write —
+ * the autopilot's and a manual apply alike — is clamped to the promise of the
+ * channel it targets while its lease runs; the result says so. This is the
+ * last gate before LND, so no path can raise a sold channel past its promise.
  */
 export async function applyFees(
   readLnd: AuthenticatedLnd,
   writeLnd: AuthenticatedLnd,
   items: FeeApplyItem[],
+  leaseCaps: readonly LeaseCap[] = [],
 ): Promise<FeeApplyResult[]> {
   const mine = await getOwnPubkey(readLnd);
   const results: FeeApplyResult[] = [];
+  // The lease of a confirmed channel runs from its funding block: the tip
+  // tells whether it is still on. (Only asked when a promise exists.)
+  const height = leaseCaps.length ? (await getWalletInfo({ lnd: readLnd })).current_block_height : 0;
 
-  for (const item of items) {
+  for (const asked of items) {
+    const cap = leaseCaps.length
+      ? activeCap(leaseCaps, { outpoint: `${asked.transactionId}:${asked.transactionVout}`, channelId: asked.id }, height)
+      : null;
+    const kept = cap ? clampToCap({ feeRatePpm: asked.feeRatePpm, baseFeeMsat: asked.baseFeeMsat }, cap) : null;
+    const item: FeeApplyItem = kept ? { ...asked, feeRatePpm: kept.feeRatePpm, baseFeeMsat: kept.baseFeeMsat } : asked;
+    const clampedBy = cap && kept?.clamped ? `${capText(cap)} — applied ${item.feeRatePpm} ppm, not ${asked.feeRatePpm}` : undefined;
     try {
       let current;
       try {
@@ -209,6 +231,7 @@ export async function applyFees(
           id: item.id,
           ok: false,
           feeRatePpm: item.feeRatePpm,
+          ...(clampedBy ? { clampedBy } : {}),
           error: "skipped: current policy (cltv) unreadable — won't risk a reset",
         });
         continue;
@@ -229,12 +252,13 @@ export async function applyFees(
           : {}),
       });
 
-      results.push({ id: item.id, ok: true, feeRatePpm: item.feeRatePpm });
+      results.push({ id: item.id, ok: true, feeRatePpm: item.feeRatePpm, baseFeeMsat: item.baseFeeMsat, ...(clampedBy ? { clampedBy } : {}) });
     } catch (err) {
       results.push({
         id: item.id,
         ok: false,
         feeRatePpm: item.feeRatePpm,
+        ...(clampedBy ? { clampedBy } : {}),
         error: err instanceof Error ? err.message : String(err),
       });
     }

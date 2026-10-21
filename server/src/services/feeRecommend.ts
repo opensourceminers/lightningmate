@@ -3,6 +3,7 @@ import { getChannelsView, type ChannelRole } from "./channels.js";
 import { getForwardsReport } from "./forwards.js";
 import type { RebalanceRecord } from "./rebalanceLog.js";
 import type { ChannelOverride, OverrideMap } from "./overrides.js";
+import { activeCap, capText, clampToCap, type LeaseCap } from "./leaseCaps.js";
 
 /**
  * Fee Autopilot v2 — recommendation engine (dry-run only; never writes fees).
@@ -121,6 +122,12 @@ export interface FeeRecommendation {
   /** True when the no-flow rule set this target — the autopilot uses it to track
    *  the episode and record the price at which flow eventually returns. */
   noFlowLowering: boolean;
+  /** A channel this node sold (Magma, LSPS1) whose order locked a routing-fee
+   *  promise for the lease: the target never exceeds it (leaseCaps.ts). */
+  leaseCap: { source: LeaseCap["source"]; orderId: string; feeRateCapPpm: number; baseFeeCapMsat: number; untilHeight: number | null } | null;
+  /** Its current fee breaks that promise: lowered at once, past the anti-churn
+   *  guards (and ahead of other changes in the per-run limit). */
+  leaseCapBreach: boolean;
   wouldApply: boolean;
   blockedByGuards: string[];
   state: FeeRecState;
@@ -235,6 +242,8 @@ export async function getFeeRecommendations(
   /** Per-channel "flow-won price" (channelId → ppm at which routing last returned
    *  after a no-flow lowering) — jump straight there instead of blind stepping. */
   flowAnchors: Map<string, number> = new Map(),
+  /** Routing-fee promises of sold channels (capital.leaseCaps()). */
+  leaseCaps: readonly LeaseCap[] = [],
 ): Promise<FeeRecReport> {
   const cfg = { ...FEE_REC_DEFAULTS, ...configOverrides };
   const [channels, rates, fw14, fw30, wallet] = await Promise.all([
@@ -288,13 +297,19 @@ export async function getFeeRecommendations(
       cooldown,
       elasticityMod: elasticity.get(ch.id) ?? 1,
       flowAnchor: flowAnchors.get(ch.id),
+      leaseCap: activeCap(leaseCaps, { outpoint: `${ch.transactionId}:${ch.transactionVout}`, channelId: ch.id }, currentBlock),
     }),
   );
 
-  // §11 max-changes-per-run: only the biggest moves would actually apply
+  // §11 max-changes-per-run: only the biggest moves would actually apply —
+  // after every fee that breaks a lease promise (those are fixed first).
   const applyOrder = recommendations
     .filter((r) => r.wouldApply)
-    .sort((a, b) => Math.abs(b.targetPpm - b.currentPpm) - Math.abs(a.targetPpm - a.currentPpm));
+    .sort(
+      (a, b) =>
+        Number(b.leaseCapBreach) - Number(a.leaseCapBreach) ||
+        Math.abs(b.targetPpm - b.currentPpm) - Math.abs(a.targetPpm - a.currentPpm),
+    );
   applyOrder.slice(cfg.maxChangesPerRun).forEach((r) => {
     r.wouldApply = false;
     r.blockedByGuards.push("max changes per run reached");
@@ -324,6 +339,7 @@ interface BuildCtx {
   cooldown: CooldownInput | null;
   elasticityMod: number;
   flowAnchor: number | undefined;
+  leaseCap: (LeaseCap & { untilHeight: number | null }) | null;
 }
 
 function buildRecommendation(
@@ -510,9 +526,29 @@ function buildRecommendation(
   // Base fee: volume-first drops it to cfg.baseFeeMsat (0) to win routes; an
   // excluded channel keeps whatever it has.
   const currentBaseMsat = rate ? Number(rate.base_fee_mtokens) : 0;
-  const recommendedBaseMsat = override?.mode === "exclude" ? currentBaseMsat : cfg.baseFeeMsat;
+  let recommendedBaseMsat = override?.mode === "exclude" ? currentBaseMsat : cfg.baseFeeMsat;
   if (recommendedBaseMsat < currentBaseMsat) {
     reasons.push(`base fee: lowering ${currentBaseMsat}→${recommendedBaseMsat} msat to win routes`);
+  }
+
+  // Lease promise (D7) — LAST, after every rule that can raise a fee: the
+  // profit floor, the protect ramp, elasticity, a fixed override. A channel
+  // this node sold stays within the caps its order locked, for the lease.
+  // Lowering is always allowed. An excluded channel is left alone — unless
+  // the fee it carries breaks the promise.
+  const lease = ctx.leaseCap;
+  const leaseCapBreach = !!lease && (currentPpm > lease.feeRateCapPpm || currentBaseMsat > lease.baseFeeCapMsat);
+  if (lease && (override?.mode !== "exclude" || leaseCapBreach)) {
+    const kept = clampToCap({ feeRatePpm: targetPpm, baseFeeMsat: recommendedBaseMsat }, lease);
+    if (kept.clamped || leaseCapBreach) {
+      targetPpm = kept.feeRatePpm;
+      recommendedBaseMsat = kept.baseFeeMsat;
+      reasons.unshift(
+        leaseCapBreach
+          ? `lease promise: ${capText(lease)} — its fee (${currentPpm} ppm, ${currentBaseMsat} msat base) is above that; lowering at once`
+          : `lease promise: ${capText(lease)} — fee kept at or below it`,
+      );
+    }
   }
 
   // §1/§8 base balance reason if nothing more specific fired
@@ -536,16 +572,17 @@ function buildRecommendation(
   const minDelta = Math.max(cfg.minChangePpm, Math.round(currentPpm * cfg.relativeChangeThreshold));
   const baseFeeChanged = recommendedBaseMsat !== currentBaseMsat;
   const isRaise = targetPpm > currentPpm;
-  if (override?.mode === "exclude") blockedByGuards.push("excluded (manual)");
+  if (override?.mode === "exclude" && !leaseCapBreach) blockedByGuards.push("excluded (manual)");
   if (!ch.active) blockedByGuards.push("channel inactive");
-  // A base-fee drop is worth applying even when the ppm move is tiny.
-  if (Math.abs(targetPpm - currentPpm) < minDelta && !baseFeeChanged) blockedByGuards.push("change below threshold");
+  // A base-fee drop is worth applying even when the ppm move is tiny — and a
+  // broken lease promise is fixed whatever the size of the move.
+  if (Math.abs(targetPpm - currentPpm) < minDelta && !baseFeeChanged && !leaseCapBreach) blockedByGuards.push("change below threshold");
   // Asymmetric pacing so the market can respond and outcomes stay measurable:
   // raises wait the LONG raise-cooldown (never thrash a working channel up — the
   // user's generic cooldown is often just hours, which would allow big daily
   // creep), lowers step at most once a day. A channel with no prior change
   // applies immediately either way.
-  if (ctx.cooldown) {
+  if (ctx.cooldown && !leaseCapBreach) {
     const last = ctx.cooldown.lastApplied[ch.id];
     if (last) {
       const elapsedH = (Date.now() - new Date(last).getTime()) / 3_600_000;
@@ -572,6 +609,10 @@ function buildRecommendation(
     currentBaseMsat,
     recommendedBaseMsat,
     noFlowLowering,
+    leaseCap: lease
+      ? { source: lease.source, orderId: lease.orderId, feeRateCapPpm: lease.feeRateCapPpm, baseFeeCapMsat: lease.baseFeeCapMsat, untilHeight: lease.untilHeight }
+      : null,
+    leaseCapBreach,
     wouldApply,
     blockedByGuards,
     state,

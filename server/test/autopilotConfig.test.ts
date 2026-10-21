@@ -49,6 +49,13 @@ test("the Strategy presets and the defaults are valid", () => {
   for (const p of presets) assert.deepEqual(errorsOf(p), []);
 });
 
+test("the default selling caps don't contradict each other: no channel per order bigger than the capital the autopilot may deploy (a6)", () => {
+  // Before: a 5M channel cap under a 2M deploy cap — the manual form's 1M–5M
+  // default invited orders the autopilot then turned down as "deploy cap reached".
+  assert.ok(DEFAULT_CONFIG.sellMaxChannelSats <= DEFAULT_CONFIG.sellMaxDeploySats, `${DEFAULT_CONFIG.sellMaxChannelSats} > ${DEFAULT_CONFIG.sellMaxDeploySats}`);
+  assert.equal(DEFAULT_CONFIG.sellEnabled, false, "selling stays off by default (D9)");
+});
+
 test("rejects every value the old endpoint silently stored", () => {
   const cases: [unknown, RegExp][] = [
     [{ intervalMinutes: 40_000 }, /intervalMinutes must be a whole number between 5 and 35791/],
