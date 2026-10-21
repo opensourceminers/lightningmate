@@ -1,4 +1,4 @@
-import { getPayment, getWalletInfo, type AuthenticatedLnd } from "lightning";
+import { getChannels, getFeeRates, getPayment, getWalletInfo, type AuthenticatedLnd } from "lightning";
 import { JsonStore, recordStoreIncident } from "../store.js";
 import { connectForOpen, fundChannel } from "./channelOps.js";
 import { isAuthError } from "./amboss.js";
@@ -28,8 +28,10 @@ import type { LnPlusStore } from "./lnplusStore.js";
 import { getMagmaRecommendations, type MagmaV2Report } from "./magmaRecommend.js";
 import { onchainCosts } from "./nodeEconomics.js";
 import { getFeeElasticity } from "./outcomes.js";
-import { DEFAULT_POLICY, applyFees, type FeeApplyItem } from "./fees.js";
-import { getFeeRecommendations, type FeeRecConfig } from "./feeRecommend.js";
+import { DEFAULT_POLICY, applyFees, type FeeApplyItem, type FeeApplyResult } from "./fees.js";
+import { MARKET_RUN_WAIT_MS, getFeeRecommendations, type CooldownInput, type FeeRecConfig, type FeeRecommendation } from "./feeRecommend.js";
+import { FeeChangeLog, type FeeChangeRecord } from "./feeChangeLog.js";
+import { getAlias } from "./aliases.js";
 import { executeRebalance, type RebalanceExecParams, type RebalanceExecResult } from "./rebalance.js";
 import { getRebalanceRecommendations, selectRebalanceRuns } from "./rebalanceRecommend.js";
 import type { RebalanceLog } from "./rebalanceLog.js";
@@ -37,7 +39,7 @@ import type { OverridesStore } from "./overrides.js";
 import type { EarningsLog } from "./earningsLog.js";
 import { getChannelsView } from "./channels.js";
 import { getForwardsReport } from "./forwards.js";
-import { offerFeeCaps, type OfferFeeCaps } from "./leaseCaps.js";
+import { activeCap, capText, offerFeeCaps, type OfferFeeCaps } from "./leaseCaps.js";
 import { routingYieldStats } from "./capitalAllocator.js";
 import {
   AUTOPILOT_CONFIG_BOUNDS,
@@ -60,8 +62,50 @@ export interface AutopilotChange {
   alias: string;
   fromPpm: number;
   toPpm: number;
+  /** Base fee before and after (msat), when the write set it. */
+  fromBaseMsat?: number;
+  toBaseMsat?: number;
+  /** Why: the engine's main reason (every change is explained in the run
+   *  history), or the lease promise kept, or "set by hand". */
+  why?: string;
+  /** Who wrote it (absent: the fee autopilot, on older runs too). */
+  via?: "autopilot" | "lease" | "manual";
+  /** A sold channel's lease promise lowered what was asked for. */
+  clampedBy?: string;
   ok: boolean;
   error?: string;
+}
+
+/** A fee write with what the books need about it (writeFees). */
+type FeeWrite = FeeApplyItem & {
+  alias: string;
+  fromPpm: number;
+  fromBaseMsat: number | null;
+  why?: string;
+  /** A no-flow lowering: opens the flow-won episode (flowAnchors). */
+  noFlowLowering?: boolean;
+  /** It fixes a broken lease promise: retried at every chance, whatever
+   *  failed before. */
+  leaseBreach?: boolean;
+};
+
+/** What the engine recommends for a channel, as a write. Its "why" is the
+ *  engine's leading reason — the rule that set the move. */
+function recommendationWrite(r: FeeRecommendation): FeeWrite {
+  return {
+    id: r.channelId,
+    transactionId: r.transactionId as string,
+    transactionVout: r.transactionVout as number,
+    feeRatePpm: r.targetPpm,
+    // The engine's base fee (volume-first: 0), never the current one.
+    baseFeeMsat: r.recommendedBaseMsat,
+    alias: r.alias,
+    fromPpm: r.currentPpm,
+    fromBaseMsat: typeof r.currentBaseMsat === "number" ? r.currentBaseMsat : null,
+    ...(r.reasons?.[0] ? { why: r.reasons[0] } : {}),
+    noFlowLowering: r.noFlowLowering,
+    leaseBreach: r.leaseCapBreach === true,
+  };
 }
 
 export interface AutopilotRebalance {
@@ -243,6 +287,9 @@ interface PersistedState {
   feePolicyMigrated?: boolean;
   /** One-time flag: volume-first nudge — competitive floor + zero base fee. */
   feeVolumeMigrated?: boolean;
+  /** One-time flag: pins stored outside the policy's min/max were rewritten
+   *  to the fee the engine really gave them (see migrateOutOfRangePins). */
+  pinRangeMigrated?: boolean;
   /** Rebalance fees spent today (resets on date change) — enforces the daily cap. */
   perDayRebalanceSpend?: { day: string; sats: number };
   /** Flow-won price memory per channel: an open no-flow lowering episode
@@ -266,6 +313,13 @@ interface PersistedState {
 const HISTORY_LIMIT = 50;
 /** The Magma order lane's cadence (D4): independent of the main run. */
 export const ORDER_LANE_INTERVAL_MS = 45_000;
+/** How often the routing-fee promises of sold channels are checked (D7) —
+ *  whatever the autopilot switches say (keepLeasePromisesNow). */
+export const LEASE_PROMISE_CHECK_MS = 10 * 60_000;
+/** After a fee update on a channel failed (LND refused it, or it couldn't be
+ *  sent), the autopilot leaves that channel's fee alone this long — a broken
+ *  lease promise excepted (writeFees). */
+export const FEE_RETRY_BACKOFF_MS = 6 * 3_600_000;
 /** How often rebalance payments still in flight are asked about between
  *  runs — also with every automation off (a manual one must end on record). */
 export const INFLIGHT_REBALANCE_CHECK_MS = 2 * 60_000;
@@ -464,6 +518,19 @@ export class Autopilot {
   /** Asks about rebalance payments still in flight between runs (see
    *  checkInFlightRebalances) — runs whenever writing is possible. */
   private inflightTimer: NodeJS.Timeout | undefined;
+  /** Keeps sold channels within their routing-fee promise (D7) every
+   *  LEASE_PROMISE_CHECK_MS, whatever the switches say. */
+  private leaseTimer: NodeJS.Timeout | undefined;
+  /** max_htlc updates LND refused, per channel (runMaxHtlcPass backs off). */
+  private readonly maxHtlcBackoff = new Map<string, number>();
+  /** Fee updates that failed, per channel: not retried before `until` (the
+   *  engine's guard, via feeCooldown), and the failure — the same one again
+   *  is not news for the run history (writeFees). In memory: a restart
+   *  tries once more. */
+  private readonly feeRetry = new Map<string, { until: number; error: string }>();
+  /** Every applied fee change (D15) — what fee outcomes and the elasticity
+   *  learner measure; never the run history. */
+  readonly feeLog: FeeChangeLog;
   /** The reconciliation of in-flight rebalances under way, if any: the timer
    *  and a main run share it instead of booking the same payment twice. */
   private reconciling: Promise<void> | null = null;
@@ -535,6 +602,7 @@ export class Autopilot {
     });
     initMagmaHistory(dataDir);
     this.purchases = new MagmaPurchases(dataDir);
+    this.feeLog = new FeeChangeLog(dataDir);
     this.state = this.store.read({
       config: DEFAULT_CONFIG,
       lastRunAt: null,
@@ -567,6 +635,27 @@ export class Autopilot {
     this.state.config = config;
     this.reportRepairs(repairs);
     this.state.history = Array.isArray(this.state.history) ? this.state.history : [];
+    // Upgrading to the fee-change log: the fee changes still in the run
+    // history move into it (once), so what was measurable stays measurable.
+    this.feeLog.seed(
+      this.state.history.flatMap((run) =>
+        (run.changes ?? [])
+          .filter((c) => c.ok && typeof c.fromPpm === "number" && typeof c.toPpm === "number")
+          .map(
+            (c): FeeChangeRecord => ({
+              at: run.at,
+              channelId: c.id,
+              alias: c.alias,
+              fromPpm: c.fromPpm,
+              toPpm: c.toPpm,
+              fromBaseMsat: c.fromBaseMsat ?? null,
+              toBaseMsat: c.toBaseMsat ?? null,
+              via: c.via ?? "autopilot",
+              ...(c.why ? { why: c.why } : {}),
+            }),
+          ),
+      ),
+    );
     this.state.perChannelLastApplied ??= {};
     this.state.perTargetLastRebalanced ??= {};
     // Sizing used to ride along with auto-pricing. Upgrading must keep exactly
@@ -606,11 +695,16 @@ export class Autopilot {
     return !!this.writeLnd;
   }
 
-  /** Cooldown view for the fee-recommendation dry-run (read-only). */
-  feeCooldown(): { lastApplied: Record<string, string>; cooldownHours: number } {
+  /** Cooldown view for the fee-recommendation dry-run (read-only) — with the
+   *  channels whose last fee update failed and when they are tried again. */
+  feeCooldown(): CooldownInput {
+    const now = Date.now();
+    const retryAfter: Record<string, string> = {};
+    for (const [id, r] of this.feeRetry) if (r.until > now) retryAfter[id] = new Date(r.until).toISOString();
     return {
       lastApplied: this.state.perChannelLastApplied,
       cooldownHours: this.state.config.cooldownMinutes / 60,
+      retryAfter,
     };
   }
 
@@ -632,6 +726,7 @@ export class Autopilot {
       stepPpm: p.step,
       minChangePpm: p.minChangePpm,
       maxChangesPerRun: this.state.config.maxChangesPerRun,
+      floorAboveMax: this.state.config.feeFloorAboveMax === true,
     };
   }
 
@@ -734,14 +829,21 @@ export class Autopilot {
     this.persist();
   }
 
-  /** Per-channel learned fee elasticity modifiers (from measured outcomes). */
+  /** Per-channel learned fee elasticity modifiers — measured from the
+   *  fee-change log (D15), never the run history; only channels whose
+   *  evidence passes the learner's gate (outcomes.ts) get one. */
   async feeElasticityModifiers(): Promise<Map<string, number>> {
     try {
-      const el = await getFeeElasticity(this.readLnd, this.state.history);
+      const el = await getFeeElasticity(this.readLnd, this.feeLog.all());
       return new Map([...el].map(([id, e]) => [id, e.modifier]));
     } catch {
       return new Map();
     }
+  }
+
+  /** Every applied fee change (for the outcomes report). */
+  feeChanges(): FeeChangeRecord[] {
+    return this.feeLog.all();
   }
 
   /** Public, serializable view for the API. */
@@ -813,6 +915,9 @@ export class Autopilot {
     const repairs = repairCrossFields(this.state.config);
     this.reportRepairs(repairs);
     if (repairs.length > 0) this.persist();
+    // After the policy's own migrations: a pin is checked against the range
+    // the engine would have clamped it to.
+    this.migrateOutOfRangePins();
     this.reschedule();
     this.startOrderLane();
   }
@@ -833,6 +938,13 @@ export class Autopilot {
     // never comes. Idle checks cost nothing (no payment pending: no call).
     this.inflightTimer = setInterval(() => void this.checkInFlightRebalances(), INFLIGHT_REBALANCE_CHECK_MS);
     this.inflightTimer.unref?.();
+    // The routing-fee promises of sold channels (D7) are kept whatever the
+    // switches say: with every automation off no main run is scheduled at
+    // all, and a sale's channel (LSPS1, a Magma order accepted by hand or
+    // before selling was switched off) kept a fee above its promise for the
+    // whole lease. Idle checks cost nothing (no promise: no call).
+    this.leaseTimer = setInterval(() => void this.keepLeasePromisesNow(), LEASE_PROMISE_CHECK_MS);
+    this.leaseTimer.unref?.();
   }
 
   /** Settings adjusted on load are logged AND raised as an alert that stays
@@ -862,6 +974,8 @@ export class Autopilot {
     this.laneTimer = undefined;
     if (this.inflightTimer) clearInterval(this.inflightTimer);
     this.inflightTimer = undefined;
+    if (this.leaseTimer) clearInterval(this.leaseTimer);
+    this.leaseTimer = undefined;
     this.stop();
   }
 
@@ -943,19 +1057,62 @@ export class Autopilot {
 
   /** Compute and apply eligible fee changes. */
   private async runFees(writeLnd: AuthenticatedLnd): Promise<AutopilotChange[]> {
+    this.migrateOutOfRangePins();
     // v2 engine — wouldApply already folds in the relative/absolute threshold,
-    // cooldown and max-changes-per-run, so we just apply the eligible ones.
+    // cooldown, the retry back-off and max-changes-per-run, so we just apply
+    // the eligible ones.
     const elasticity = await this.feeElasticityModifiers();
-    const report = await this.feeReport(elasticity);
+    // (The scheduled run may wait for the first graph read after a restart;
+    // a manual Apply waits no longer than a page does.)
+    const report = await this.feeReport(elasticity, MARKET_RUN_WAIT_MS);
+    this.noteFlowReturns(report.recommendations);
+    const eligible = report.recommendations.filter(
+      (r) => r.wouldApply && r.transactionId !== null && r.transactionVout !== null,
+    );
+    return this.writeFees(writeLnd, eligible.map((r) => recommendationWrite(r)), "autopilot", { quietRepeats: true });
+  }
 
-    // Flow-anchor bookkeeping: a channel in an open no-flow episode that routed
-    // out again did so at its CURRENT fee — remember that price as its anchor
-    // (the next no-flow episode jumps straight there instead of blind stepping).
-    // Episodes with no outbound flow for 45 days are abandoned (peer is dead —
-    // the close-candidate path handles it, an anchor would be meaningless).
+  /**
+   * One-shot, on upgrading to pins that apply exactly as set (P2). Before,
+   * the engine rounded a pin to the policy's step and clamped it to its
+   * min/max — and the old pin inputs saved a blank field as 0. A pin stored
+   * outside that range would now be written as stored, at once: a 0-ppm pin
+   * would let the channel forward for free, one of 2,000 jump past the max.
+   * Each such pin is rewritten to the fee the engine really gave it, and the
+   * operator is told (an alert that stays until acknowledged). Pins inside
+   * the range, and every pin saved after the upgrade, are left exactly as set.
+   */
+  private migrateOutOfRangePins(): void {
+    if (this.state.pinRangeMigrated) return;
+    const p = this.state.config.policy;
+    const step = Math.max(1, p.step);
+    const adjusted: string[] = [];
+    for (const [id, ov] of Object.entries(this.overrides.all())) {
+      if (ov.mode !== "fixed" || typeof ov.fixedPpm !== "number" || !Number.isFinite(ov.fixedPpm)) continue;
+      if (ov.fixedPpm >= p.minPpm && ov.fixedPpm <= p.maxPpm) continue;
+      // Exactly what the engine applied for it so far.
+      const applied = Math.min(p.maxPpm, Math.max(p.minPpm, Math.round(ov.fixedPpm / step) * step));
+      this.overrides.set(id, { mode: "fixed", fixedPpm: applied });
+      adjusted.push(`${id} pinned at ${ov.fixedPpm} ppm is now pinned at ${applied} ppm, the fee it was given so far (pins now apply exactly as set)`);
+    }
+    this.state.pinRangeMigrated = true;
+    this.persist();
+    if (adjusted.length === 0) return;
+    for (const a of adjusted) console.warn(`[autopilot] fee pin adjusted — ${a}`);
+    recordStoreIncident(this.dataDir, { file: "overrides.json", kind: "adjusted", detail: adjusted.join("; ") });
+  }
+
+  /**
+   * Flow-anchor bookkeeping: a channel in an open no-flow episode that routed
+   * out again did so at its CURRENT fee — remember that price as its anchor
+   * (the next no-flow episode jumps straight there instead of blind stepping).
+   * Episodes with no outbound flow for 45 days are abandoned (peer is dead —
+   * the close-candidate path handles it, an anchor would be meaningless).
+   */
+  private noteFlowReturns(recs: Pick<FeeRecommendation, "channelId" | "currentPpm" | "metrics">[]): void {
     const fa = (this.state.perChannelFlowAnchor ??= {});
     const nowIso = new Date().toISOString();
-    for (const r of report.recommendations) {
+    for (const r of recs) {
       const s = fa[r.channelId];
       if (!s?.episodeAt) continue;
       if (r.metrics.routedOut14d > 0) {
@@ -966,71 +1123,255 @@ export class Autopilot {
         delete s.episodeAt;
       }
     }
+  }
 
-    const eligible = report.recommendations.filter(
-      (r) => r.wouldApply && r.transactionId !== null && r.transactionVout !== null,
+  /**
+   * Every fee write goes through here — the autopilot's, the lease-promise
+   * keeper's and a manual apply alike — so the books always match what LND
+   * has (review a1: a manual Apply stamped no cooldown and wrote no history,
+   * so the autopilot stepped the same channel again on its next run and the
+   * outcome tracker never saw the change). Clamped to sold channels' lease
+   * promises at the last gate (feeApply). Only what LND took counts: the
+   * cooldown, the no-flow episode, the fee-change log. Saved at once:
+   * cooldowns protect against gossip spam only if a crash in a later stage
+   * can't lose them.
+   *
+   * A write that failed (LND refused it, or it couldn't be sent) is not
+   * retried for FEE_RETRY_BACKOFF_MS — the engine's guard holds the channel —
+   * and says so; a broken lease promise is retried at every chance. Before,
+   * an update LND kept refusing was resent every run, each a failed line in
+   * the run history (~48 a day: the 50-line history held one day). With
+   * `quietRepeats` (the autopilot's own passes) the same failure again on a
+   * channel is left out of the result, i.e. the run history: the first one
+   * is on record, and the Fees tab shows the channel held.
+   */
+  private async writeFees(
+    writeLnd: AuthenticatedLnd,
+    writes: FeeWrite[],
+    via: NonNullable<AutopilotChange["via"]>,
+    opts: { quietRepeats?: boolean } = {},
+  ): Promise<AutopilotChange[]> {
+    if (writes.length === 0) return [];
+    const results = await this.feeApply(
+      writeLnd,
+      writes.map(({ id, transactionId, transactionVout, feeRatePpm, baseFeeMsat }) => ({ id, transactionId, transactionVout, feeRatePpm, baseFeeMsat })),
     );
-
-    const items: FeeApplyItem[] = eligible.map((r) => ({
-      id: r.channelId,
-      transactionId: r.transactionId as string,
-      transactionVout: r.transactionVout as number,
-      feeRatePpm: r.targetPpm,
-      baseFeeMsat: r.recommendedBaseMsat, // volume-first: drop base fee to win routes
-    }));
-
-    const results = items.length ? await this.feeApply(writeLnd, items) : [];
-    const byId = new Map(eligible.map((r) => [r.channelId, r]));
-    const changes = results.map((res) => {
-      const r = byId.get(res.id);
+    const byId = new Map(writes.map((w) => [w.id, w]));
+    const fa = (this.state.perChannelFlowAnchor ??= {});
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const logged: FeeChangeRecord[] = [];
+    const changes: AutopilotChange[] = [];
+    for (const res of results as FeeApplyResult[]) {
+      const w = byId.get(res.id);
+      const toBaseMsat = res.baseFeeMsat ?? w?.baseFeeMsat;
+      const why = w?.why;
+      let error = res.error;
       if (res.ok) {
-        this.state.perChannelLastApplied[res.id] = new Date().toISOString();
+        this.feeRetry.delete(res.id);
+        this.state.perChannelLastApplied[res.id] = nowIso;
         // Applied a no-flow lowering → open (or refresh) the flow-won episode.
-        if (r?.noFlowLowering) fa[res.id] = { ...fa[res.id], episodeAt: new Date().toISOString() };
+        if (w?.noFlowLowering) fa[res.id] = { ...fa[res.id], episodeAt: nowIso };
+        logged.push({
+          at: nowIso,
+          channelId: res.id,
+          alias: w?.alias ?? res.id,
+          fromPpm: w?.fromPpm ?? 0,
+          toPpm: res.feeRatePpm,
+          fromBaseMsat: w?.fromBaseMsat ?? null,
+          toBaseMsat: toBaseMsat ?? null,
+          via,
+          ...(why || res.clampedBy ? { why: [why, res.clampedBy].filter(Boolean).join("; ") } : {}),
+        });
+      } else {
+        const raw = res.error ?? "failed";
+        const repeat = this.feeRetry.get(res.id)?.error === raw;
+        this.feeRetry.set(res.id, { until: nowMs + FEE_RETRY_BACKOFF_MS, error: raw });
+        if (repeat && opts.quietRepeats) continue;
+        if (!w?.leaseBreach) error = `${raw} — not retried for ${Math.round(FEE_RETRY_BACKOFF_MS / 3_600_000)} h`;
       }
-      return {
+      changes.push({
         id: res.id,
-        alias: r?.alias ?? res.id,
-        fromPpm: r?.currentPpm ?? 0,
+        alias: w?.alias ?? res.id,
+        fromPpm: w?.fromPpm ?? 0,
         toPpm: res.feeRatePpm,
+        ...(w?.fromBaseMsat != null ? { fromBaseMsat: w.fromBaseMsat } : {}),
+        ...(toBaseMsat != null ? { toBaseMsat } : {}),
+        ...(why ? { why } : {}),
+        via,
+        ...(res.clampedBy ? { clampedBy: res.clampedBy } : {}),
         ok: res.ok,
-        error: res.error,
-      };
-    });
-    // Cooldowns protect against gossip spam only if they survive a crash in a
-    // later stage of this run — record them now, not at the end.
-    if (changes.length) this.persist();
+        ...(res.ok ? {} : { error }),
+      });
+    }
+    this.feeLog.append(logged);
+    this.persist();
     return changes;
   }
 
   /**
-   * Fee automation off: lower the fees that break a sold channel's promise to
-   * the cap its order locked — nothing else (the engine's report says which
-   * channels a promise binds and which carry a fee above it).
+   * The fees that break a sold channel's routing-fee promise (D7), read
+   * straight from LND — what to write to keep it: each lowered to the cap its
+   * order locked, nothing else. Cheap (no forwards, no graph), so it can run
+   * every LEASE_PROMISE_CHECK_MS.
+   */
+  private async leaseBreaches(): Promise<FeeWrite[]> {
+    const caps = this.capital.leaseCaps();
+    if (caps.length === 0) return [];
+    const [{ channels }, rates, wallet] = await Promise.all([
+      getChannels({ lnd: this.readLnd }),
+      getFeeRates({ lnd: this.readLnd }),
+      getWalletInfo({ lnd: this.readLnd }),
+    ]);
+    const peerOf = new Map(channels.map((c) => [c.id, c.partner_public_key]));
+    const out: FeeWrite[] = [];
+    for (const r of rates.channels) {
+      const cap = activeCap(caps, { outpoint: `${r.transaction_id}:${r.transaction_vout}`, channelId: r.id }, wallet.current_block_height);
+      if (!cap) continue;
+      const base = Number(r.base_fee_mtokens);
+      if (r.fee_rate <= cap.feeRateCapPpm && base <= cap.baseFeeCapMsat) continue;
+      const peer = peerOf.get(r.id);
+      out.push({
+        id: r.id,
+        transactionId: r.transaction_id,
+        transactionVout: r.transaction_vout,
+        // Only ever lowered: a channel whose base fee alone breaks the
+        // promise keeps its rate (min), it is not raised to the cap.
+        feeRatePpm: Math.min(r.fee_rate, cap.feeRateCapPpm),
+        baseFeeMsat: Math.min(base, cap.baseFeeCapMsat),
+        alias: peer ? await getAlias(this.readLnd, peer) : r.id,
+        fromPpm: r.fee_rate,
+        fromBaseMsat: base,
+        why: `lease promise: ${capText(cap)} — its fee (${r.fee_rate} ppm, ${base} msat base) was above that`,
+        leaseBreach: true,
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Fee automation off (or every switch off): lower the fees that break a
+   * sold channel's promise to the cap its order locked — nothing else.
    */
   private async keepLeasePromises(writeLnd: AuthenticatedLnd): Promise<AutopilotChange[]> {
-    const report = await this.feeReport(new Map());
-    const breaches = report.recommendations.filter(
-      (r) => r.leaseCapBreach && r.leaseCap && r.transactionId !== null && r.transactionVout !== null,
-    );
-    if (breaches.length === 0) return [];
-    const items: FeeApplyItem[] = breaches.map((r) => ({
-      id: r.channelId,
-      transactionId: r.transactionId as string,
-      transactionVout: r.transactionVout as number,
-      feeRatePpm: Math.min(r.currentPpm, r.leaseCap!.feeRateCapPpm),
-      baseFeeMsat: Math.min(r.currentBaseMsat, r.leaseCap!.baseFeeCapMsat),
-    }));
-    const results = await this.feeApply(writeLnd, items);
-    const byId = new Map(breaches.map((r) => [r.channelId, r]));
-    return results.map((res) => ({
-      id: res.id,
-      alias: byId.get(res.id)?.alias ?? res.id,
-      fromPpm: byId.get(res.id)?.currentPpm ?? 0,
-      toPpm: res.feeRatePpm,
-      ok: res.ok,
-      error: res.ok ? undefined : res.error,
-    }));
+    return this.writeFees(writeLnd, await this.leaseBreaches(), "lease", { quietRepeats: true });
+  }
+
+  /**
+   * The lease-promise check of the timer (every LEASE_PROMISE_CHECK_MS, from
+   * start-up, whatever the switches say): skipped while the main run holds
+   * its lock (its own stages keep the promises), and holding it while it
+   * writes. Only ever lowers a breaching fee to its cap; a write is recorded
+   * in the run history like any other.
+   */
+  async keepLeasePromisesNow(): Promise<AutopilotChange[]> {
+    if (this.shuttingDown || this.running || !this.writeLnd) return [];
+    if (this.capital.leaseCaps().length === 0) return [];
+    this.running = true;
+    try {
+      const changes = await this.keepLeasePromises(this.writeLnd);
+      if (changes.length) this.recordRun({ changes });
+      return changes;
+    } catch (err) {
+      console.warn(`[autopilot] keeping lease promises: ${errText(err)}`);
+      return [];
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /**
+   * "Apply" on the Fees tab: what the engine recommends, through the same
+   * path as the autopilot's own changes — the recommended target AND base
+   * fee (the page sent the CURRENT base fee, so a base-fee-only row never
+   * changed), the cooldown stamped, the run history and the fee-change log
+   * written. Recomputed here, so a stale page applies nothing the engine no
+   * longer wants. `channelIds`: the rows the operator saw (all when absent).
+   * Null when the main run holds the lock (the caller says "try again").
+   */
+  async applyRecommended(channelIds?: string[]): Promise<AutopilotChange[] | null> {
+    if (!this.writeLnd) throw new Error("writing is disabled");
+    if (this.running || this.shuttingDown) return null;
+    this.running = true;
+    try {
+      this.migrateOutOfRangePins();
+      const report = await this.feeReport(await this.feeElasticityModifiers());
+      this.noteFlowReturns(report.recommendations);
+      const wanted = channelIds ? new Set(channelIds) : null;
+      const eligible = report.recommendations.filter(
+        (r) => r.wouldApply && r.transactionId !== null && r.transactionVout !== null && (!wanted || wanted.has(r.channelId)),
+      );
+      const changes = await this.writeFees(this.writeLnd, eligible.map((r) => recommendationWrite(r)), "manual");
+      if (changes.length) this.recordRun({ changes });
+      return changes;
+    } finally {
+      this.running = false;
+      this.persist();
+    }
+  }
+
+  /**
+   * A fee set by hand (POST /fees/apply): written as asked — clamped to a
+   * sold channel's promise — and kept on the books like every other write.
+   * Null when the main run holds the lock.
+   */
+  async applyByHand(items: FeeApplyItem[]): Promise<{ changes: AutopilotChange[]; results: FeeApplyResult[] } | null> {
+    if (!this.writeLnd) throw new Error("writing is disabled");
+    if (this.running || this.shuttingDown) return null;
+    this.running = true;
+    try {
+      // What each channel charges now (the "from" of the record) and whose
+      // it is — read once.
+      const [rates, chans] = await Promise.all([
+        getFeeRates({ lnd: this.readLnd }).catch(() => ({ channels: [] as { id: string; fee_rate: number; base_fee_mtokens: string }[] })),
+        getChannels({ lnd: this.readLnd }).catch(() => ({ channels: [] as { id: string; partner_public_key: string }[] })),
+      ]);
+      const now = new Map(rates.channels.map((c) => [c.id, c]));
+      const peerOf = new Map(chans.channels.map((c) => [c.id, c.partner_public_key]));
+      const writes: FeeWrite[] = [];
+      for (const it of items) {
+        const peer = peerOf.get(it.id);
+        const rate = now.get(it.id);
+        writes.push({
+          ...it,
+          alias: peer ? await getAlias(this.readLnd, peer) : it.id,
+          fromPpm: rate?.fee_rate ?? 0,
+          fromBaseMsat: rate ? Number(rate.base_fee_mtokens) : null,
+          why: "set by hand",
+        });
+      }
+      const changes = await this.writeFees(this.writeLnd, writes, "manual");
+      if (changes.length) this.recordRun({ changes });
+      const results: FeeApplyResult[] = changes.map((c) => ({
+        id: c.id,
+        ok: c.ok,
+        feeRatePpm: c.toPpm,
+        ...(c.toBaseMsat != null ? { baseFeeMsat: c.toBaseMsat } : {}),
+        ...(c.clampedBy ? { clampedBy: c.clampedBy } : {}),
+        ...(c.error ? { error: c.error } : {}),
+      }));
+      return { changes, results };
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /** A run-history line for work done outside the main run (lease keeper,
+   *  manual applies). Not lastRunAt: that is the main run's. */
+  private recordRun(part: Partial<Pick<AutopilotRun, "changes">>): void {
+    const changes = part.changes ?? [];
+    this.state.history.unshift({
+      at: new Date().toISOString(),
+      attempted: changes.length,
+      applied: changes.filter((c) => c.ok).length,
+      failed: changes.filter((c) => !c.ok).length,
+      changes,
+      rebalances: [],
+      channels: [],
+      sells: [],
+    });
+    this.state.history = this.state.history.slice(0, HISTORY_LIMIT);
+    this.persist();
   }
 
   /** Within the configured rebalance hour window (node local time)? */
@@ -2466,7 +2807,7 @@ export class Autopilot {
       const sells = await stage("magma", true, () => this.runSell());
       // Advertised-size upkeep: only gossips when a channel's bucket moved.
       const maxHtlc = await stage("max_htlc", this.state.config.maxHtlcEnabled, () =>
-        runMaxHtlcPass(this.readLnd, writeLnd).catch(() => [] as MaxHtlcChange[]),
+        runMaxHtlcPass(this.readLnd, writeLnd, this.maxHtlcBackoff).catch(() => [] as MaxHtlcChange[]),
       );
       // "skip" entries are non-actions (cap/reserve) — don't count them as attempts.
       const acted = sells.filter((s) => s.action !== "skip");
@@ -2517,7 +2858,7 @@ export class Autopilot {
   // through these one-liners (as LSPS1's LND seams do), so a test can drive a
   // whole run without building a routing node with history and a network graph.
 
-  private feeReport(elasticity: Map<string, number>) {
+  private feeReport(elasticity: Map<string, number>, marketWaitMs?: number) {
     return getFeeRecommendations(
       this.readLnd,
       this.rebalanceLog.recent(200),
@@ -2527,6 +2868,7 @@ export class Autopilot {
       elasticity,
       this.flowAnchors(),
       this.capital.leaseCaps(),
+      marketWaitMs !== undefined ? { marketWaitMs } : {},
     );
   }
   private feeApply(writeLnd: AuthenticatedLnd, items: FeeApplyItem[]) {

@@ -1,6 +1,6 @@
 import { JsonStore } from "../store.js";
 import type { Reservation } from "./capital.js";
-import { leaseCapFrom, type LeaseCap } from "./leaseCaps.js";
+import { MAGMA_LEASE_MARGIN_BLOCKS, leaseCapFrom, type LeaseCap } from "./leaseCaps.js";
 
 /**
  * The per-order journal of Magma sales: what this node has done for each order,
@@ -278,7 +278,7 @@ const LEASE_MS_PER_BLOCK = 10 * 60_000 * 1.5;
  */
 function leaseMayRun(e: MagmaJournalEntry, nowMs: number): boolean {
   if (e.phase !== "settled" || !e.fundingOutpoint || e.closedAt) return false;
-  const blocks = e.leaseBlocks && e.leaseBlocks > 0 ? e.leaseBlocks : 4_320;
+  const blocks = (e.leaseBlocks && e.leaseBlocks > 0 ? e.leaseBlocks : 4_320) + MAGMA_LEASE_MARGIN_BLOCKS;
   const from = Date.parse(e.settledAt ?? e.reportedAt ?? e.fundedAt ?? e.updatedAt);
   return !Number.isFinite(from) || nowMs < from + blocks * LEASE_MS_PER_BLOCK;
 }

@@ -2,6 +2,7 @@ import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
 import type { FeeMode, OverrideMap, RebalanceLogResponse, RebalanceRecReport, RebalanceRecState, UnservedDemandReport } from "../types";
 import { sats, satsCompact, timeAgo } from "../format";
+import { demandSummary } from "../feeView";
 import { useUi } from "./Overlay";
 
 const STATE_LABEL: Record<RebalanceRecState, string> = {
@@ -109,6 +110,9 @@ export function RebalanceRecommendations() {
     .filter((r) => r.state !== "not_needed")
     .sort((a, b) => Number(b.wouldRebalance) - Number(a.wouldRebalance));
   const s = data?.summary;
+  // The table only once refusals have been sorted long enough: before, its
+  // "possible demand" column would read 0 for refusals not sorted yet.
+  const demandSum = demandSummary(demand);
 
   return (
     <section className="panel feerec">
@@ -125,23 +129,35 @@ export function RebalanceRecommendations() {
         you can also run one now.{canWrite ? null : <> Running is disabled (read-only macaroon).</>}
       </div>
 
-      {demand && demand.channels.some((d) => d.liquidityCount > 0) ? (
+      {demand && demandSum?.kind === "sorting" ? (
+        <p className="muted small">
+          Unserved demand: refused forwards are being sorted into probes, retries and possible demand
+          {demandSum.classifiedSince ? ` (sorting began ${timeAgo(demandSum.classifiedSince)})` : ""} — shown after 3 days of it.
+        </p>
+      ) : demand && demandSum ? (
         <>
           <h3 className="sub">
-            Unserved demand <span className="muted">· refused forwards, last {Math.max(1, Math.min(demand.days, demand.trackedDays || demand.days))}d</span>
+            Unserved demand <span className="muted">· refused forwards, {demandSum.window}</span>
           </h3>
           <div className="dryrun-banner">
             Payments that wanted to route through these channels but were <strong>refused for lack of
-            outbound liquidity</strong> — demand you didn&apos;t earn on. This is where a rebalance (or a
-            bigger channel) pays for itself.
+            outbound liquidity</strong>. Most refused HTLCs are not demand: probes (≥ 90% of the channel), retries of
+            the same amount and HTLCs bigger than half the channel are counted apart, and only the rest — attempts a
+            refilled channel could have carried — is <em>possible</em> demand. A refill still has to pass the profit
+            check below.
           </div>
           <table className="fee-table">
             <thead>
               <tr>
                 <th>Out channel</th>
-                <th className="num">Refused</th>
+                <th className="num" title="distinct attempts a refilled channel could have carried">Possible demand</th>
                 <th className="num">Volume (sat)</th>
-                <th className="num">Other fails</th>
+                <th className="num" title="median size of those attempts">Median</th>
+                <th className="num" title="at the channel's current fee">Fees missed</th>
+                <th className="num muted" title={`every refusal LND reported in ${demandSum.rawWindow}, probes and retries included`}>
+                  Raw refused
+                </th>
+                <th className="num muted">Probes · retries · too big</th>
               </tr>
             </thead>
             <tbody>
@@ -151,9 +167,14 @@ export function RebalanceRecommendations() {
                 .map((d) => (
                   <tr key={d.outChannel}>
                     <td>{d.alias}</td>
-                    <td className="num">{d.liquidityCount}</td>
-                    <td className="num">{sats(d.liquiditySats)}</td>
-                    <td className="num muted">{d.otherCount}</td>
+                    <td className="num">{d.demandCount}</td>
+                    <td className="num">{d.demandCount ? sats(d.demandSats) : "—"}</td>
+                    <td className="num">{d.demandMedianSats != null ? satsCompact(d.demandMedianSats) : "—"}</td>
+                    <td className="num">{d.missedFeesSats ? `${sats(d.missedFeesSats)} sat` : "—"}</td>
+                    <td className="num muted">{d.liquidityCount}</td>
+                    <td className="num muted">
+                      {d.probeCount} · {d.retryCount} · {d.oversizedCount}
+                    </td>
                   </tr>
                 ))}
             </tbody>
@@ -249,7 +270,7 @@ export function RebalanceRecommendations() {
                               ))}
                             </div>
                             <div className="feerec-metrics">
-                              <span>fee <b>{r.currentPpm} ppm</b>{r.feeV2TargetPpm != null ? ` → v2 target ${r.feeV2TargetPpm}` : ""}{r.profitFloorPpm != null ? ` · floor ${r.profitFloorPpm}` : ""}{r.feeV2State ? ` · ${r.feeV2State}` : ""}</span>
+                              <span>fee <b>{r.currentPpm} ppm</b>{r.feeV2TargetPpm != null ? ` → next ${r.feeV2TargetPpm}` : ""}{r.feeV2AimPpm != null && r.feeV2AimPpm !== r.feeV2TargetPpm ? ` (heading to ${r.feeV2AimPpm})` : ""}{r.profitFloorPpm != null ? ` · floor ${r.profitFloorPpm}` : ""}{r.feeV2State ? ` · ${r.feeV2State}` : ""}</span>
                               <span>14d flow <b>{satsCompact(r.routedOut14d)}↑ / {satsCompact(r.routedIn14d)}↓</b> · net drain {pct(r.netDrain14d)}</span>
                               <span>earned 30d <b>{satsCompact(r.revenue30d)} sat</b>{r.revenuePpm30d != null ? ` · ${r.revenuePpm30d} ppm` : ""}{r.expectedRevenuePpm != null ? ` · expected ${r.expectedRevenuePpm} ppm` : ""}</span>
                               <span>amount: demand-sized <b>{satsCompact(r.demandSizedAmount)}</b> · to target {satsCompact(r.amountToReachTargetLocalRatio)}</span>

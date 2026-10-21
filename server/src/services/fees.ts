@@ -1,9 +1,11 @@
 import {
   getChannel,
+  getChannels,
   getFeeRates,
   getWalletInfo,
   updateRoutingFees,
   type AuthenticatedLnd,
+  type UpdateRoutingFeesResult,
 } from "lightning";
 import { getChannelsView } from "./channels.js";
 import { getOwnPubkey } from "./node.js";
@@ -184,6 +186,47 @@ export interface FeeApplyResult {
 }
 
 /**
+ * LND answers a policy update with a list of per-channel failures instead of
+ * an error (review a1: they were ignored — an update LND refused was recorded
+ * as applied, its cooldown stamped, its outcome measured). The one for this
+ * channel, as text; null when LND took it.
+ */
+export function updateRefusal(res: UpdateRoutingFeesResult | undefined, transactionId: string, transactionVout: number): string | null {
+  const failures = res?.failures ?? [];
+  if (failures.length === 0) return null;
+  const f = failures.find((x) => x.transaction_id === transactionId && x.transaction_vout === transactionVout) ?? failures[0];
+  const why = f.is_pending_channel ? " (channel still pending)" : f.is_unknown_channel ? " (unknown channel)" : f.is_invalid_policy ? " (invalid policy)" : "";
+  return `LND refused the update: ${f.failure || "no reason given"}${why}`;
+}
+
+/** The most a single HTLC may be on a channel (msat): the smaller of its two
+ *  max pending amounts — LND checks a policy's max_htlc against its own, and
+ *  a lower bound is always safe. Null when neither is known. */
+export function channelMaxPendingMsat(c: { local_max_pending_mtokens?: string; remote_max_pending_mtokens?: string }): number | null {
+  const limits = [c.local_max_pending_mtokens, c.remote_max_pending_mtokens]
+    .map((v) => Number(v))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  return limits.length ? Math.min(...limits) : null;
+}
+
+/** Each channel's max pending amount (channelMaxPendingMsat), by funding
+ *  outpoint. Empty when it can't be read — the policy is then echoed as
+ *  before. */
+export async function maxPendingByOutpoint(lnd: AuthenticatedLnd): Promise<Map<string, number>> {
+  try {
+    const { channels } = await getChannels({ lnd });
+    const out = new Map<string, number>();
+    for (const c of channels) {
+      const max = channelMaxPendingMsat(c);
+      if (max !== null) out.set(`${c.transaction_id}:${c.transaction_vout}`, max);
+    }
+    return out;
+  } catch {
+    return new Map();
+  }
+}
+
+/**
  * Apply fee updates to the node. `readLnd` reads each channel's current policy
  * (to preserve cltv_delta + HTLC limits, which LND would otherwise reset to
  * defaults), `writeLnd` performs the update. Channels whose current policy can't
@@ -205,6 +248,10 @@ export async function applyFees(
   // The lease of a confirmed channel runs from its funding block: the tip
   // tells whether it is still on. (Only asked when a promise exists.)
   const height = leaseCaps.length ? (await getWalletInfo({ lnd: readLnd })).current_block_height : 0;
+  // A max_htlc above the channel's max pending amount makes LND refuse the
+  // whole update ("max htlc size … is above max pending amount"): such a
+  // legacy value is not echoed — left out, LND keeps or corrects it itself.
+  const maxPending = await maxPendingByOutpoint(readLnd);
 
   for (const asked of items) {
     const cap = leaseCaps.length
@@ -237,20 +284,25 @@ export async function applyFees(
         continue;
       }
 
-      await updateRoutingFees({
+      const limit = maxPending.get(`${item.transactionId}:${item.transactionVout}`);
+      const echoMaxHtlc = !!current.max_htlc_mtokens && (limit === undefined || Number(current.max_htlc_mtokens) <= limit);
+      const res = await updateRoutingFees({
         lnd: writeLnd,
         transaction_id: item.transactionId,
         transaction_vout: item.transactionVout,
         fee_rate: item.feeRatePpm,
         base_fee_mtokens: String(item.baseFeeMsat),
         cltv_delta: current.cltv_delta,
-        ...(current.max_htlc_mtokens
-          ? { max_htlc_mtokens: current.max_htlc_mtokens }
-          : {}),
+        ...(echoMaxHtlc ? { max_htlc_mtokens: current.max_htlc_mtokens } : {}),
         ...(current.min_htlc_mtokens
           ? { min_htlc_mtokens: current.min_htlc_mtokens }
           : {}),
       });
+      const refused = updateRefusal(res, item.transactionId, item.transactionVout);
+      if (refused) {
+        results.push({ id: item.id, ok: false, feeRatePpm: item.feeRatePpm, ...(clampedBy ? { clampedBy } : {}), error: refused });
+        continue;
+      }
 
       results.push({ id: item.id, ok: true, feeRatePpm: item.feeRatePpm, baseFeeMsat: item.baseFeeMsat, ...(clampedBy ? { clampedBy } : {}) });
     } catch (err) {

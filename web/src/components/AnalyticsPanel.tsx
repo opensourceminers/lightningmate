@@ -3,6 +3,7 @@ import { api } from "../api";
 import type { ChannelView, ForwardsReport, MagmaV2Report, OutcomesReport, RebalanceRecord } from "../types";
 import { sats, satsCompact } from "../format";
 import { routingYield } from "../yieldView";
+import { feeTuningKpi } from "../feeView";
 import { SkeletonPanel } from "./Skeleton";
 import { ForwardsPanel } from "./ForwardsPanel";
 import { Sparkline } from "./Sparkline";
@@ -224,13 +225,11 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
               tone={outcomes?.rebalances.avgEarnedBackPct != null ? (outcomes.rebalances.avgEarnedBackPct >= 100 ? "green" : "cost") : undefined}
               sub={outcomes && outcomes.rebalances.measured > 0 ? `${outcomes.rebalances.paidBackCount}/${outcomes.rebalances.measured} paid back` : "no data yet"}
             />
-            <Kpi
-              label="Fee tuning"
-              value={outcomes?.fees.avgRevenueDeltaPct != null ? `${outcomes.fees.avgRevenueDeltaPct >= 0 ? "+" : ""}${Math.round(outcomes.fees.avgRevenueDeltaPct * 100)}` : "—"}
-              unit={outcomes?.fees.avgRevenueDeltaPct != null ? "% rev" : undefined}
-              tone={outcomes?.fees.avgRevenueDeltaPct != null ? (outcomes.fees.avgRevenueDeltaPct >= 0 ? "green" : "cost") : undefined}
-              sub={outcomes && outcomes.fees.measured > 0 ? `${outcomes.fees.measured} change${outcomes.fees.measured === 1 ? "" : "s"} · ${outcomes.fees.raises}↑ ${outcomes.fees.cuts}↓` : "no data yet"}
-            />
+            {(() => {
+              // Revenue-weighted, and only over enough changes (review a5).
+              const k = feeTuningKpi(outcomes);
+              return <Kpi label="Fee tuning" value={k.value} unit={k.unit} tone={k.tone} sub={k.sub} />;
+            })()}
             <Kpi
               label="Magma leases"
               value={kpis.magmaSold > 0 || kpis.magmaNet !== 0 ? `${kpis.magmaNet >= 0 ? "+" : "−"}${sats(Math.abs(kpis.magmaNet))}` : "—"}
@@ -290,14 +289,21 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
           {outcomes && outcomes.fees.items.length > 0 ? (
             <section className="panel">
               <div className="panel-head">
-                <h2>Fee changes <span className="muted">· measured revenue impact vs the prior week</span></h2>
+                <h2>
+                  Fee changes{" "}
+                  <span className="muted">
+                    · revenue per day until the next change (≤ {outcomes.fees.windowDays} d) vs before it, net of the rest of the node
+                  </span>
+                </h2>
               </div>
+              <p className="muted small">{outcomes.fees.note}</p>
               <table className="fee-table">
                 <thead>
                   <tr>
                     <th>Channel</th>
                     <th className="num">Fee</th>
                     <th className="num">Daily rev before → after</th>
+                    <th className="num">Forwards</th>
                     <th className="num">Δ</th>
                   </tr>
                 </thead>
@@ -308,10 +314,16 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
                       <td className="num">
                         {f.fromPpm} <span className={f.raised ? "delta-up" : "delta-down"}>→ {f.toPpm}</span>
                       </td>
-                      <td className="num muted">
+                      <td className="num muted" title={`${f.beforeDays} d before, ${f.afterDays} d after`}>
                         {f.beforeDailyAvgSat} → {f.afterDailyAvgSat} sat
                       </td>
-                      <td className={`num net ${f.deltaPct == null ? "" : f.deltaPct >= 0 ? "green" : "cost"}`}>
+                      <td className="num muted">
+                        {f.forwardsBefore} → {f.forwardsAfter}
+                      </td>
+                      <td
+                        className={`num net ${f.deltaPct == null || !f.measurable ? "muted" : f.deltaPct >= 0 ? "green" : "cost"}`}
+                        title={f.measurable ? undefined : "too little revenue before the change to judge it"}
+                      >
                         {f.deltaPct == null ? "—" : `${f.deltaPct >= 0 ? "+" : ""}${Math.round(f.deltaPct * 100)}%`}
                       </td>
                     </tr>

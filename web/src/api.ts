@@ -3,6 +3,7 @@ import type {
   AppSettings,
   CloseCandidatesResponse,
   CloseChannelResult,
+  AutopilotChange,
   AutopilotConfigPatch,
   AutopilotRun,
   AutopilotState,
@@ -150,6 +151,10 @@ export const api = {
   },
   feesApply: (items: FeeApplyItem[]) =>
     post<{ results: FeeApplyResult[] }>("/fees/apply", { items }),
+  /** Apply what the engine recommends for these channels (target AND base
+   *  fee, recomputed server-side), on the autopilot's books. */
+  feesApplyRecommended: (channelIds: string[]) =>
+    post<{ changes: AutopilotChange[] }>("/fees/apply-recommended", { channelIds }),
   feesRecommendations: () => get<FeeRecReport>("/fees/recommendations"),
   autopilotGet: () => get<AutopilotState>("/autopilot"),
   autopilotSet: (patch: AutopilotConfigPatch) => post<AutopilotState>("/autopilot", patch),

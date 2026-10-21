@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { ChannelOverride, ChannelRole, ChannelView, FeeMode, OverrideMap } from "../types";
+import type { ChannelRole, ChannelView, FeeMode, OverrideMap } from "../types";
 import { satsCompact } from "../format";
+import { feeText } from "../feeView";
 import { CloseChannelDialog } from "./CloseChannelDialog";
+import { FeeOverrideControl } from "./FeeOverrideControl";
 import { EmptyState } from "./Skeleton";
 
 const ROLE_LABEL: Record<ChannelRole, string> = {
@@ -21,43 +23,6 @@ function BalanceBar({ ratio }: { ratio: number }) {
   );
 }
 
-function OverrideControl({
-  ov,
-  onSet,
-}: {
-  ov?: ChannelOverride;
-  onSet: (mode: FeeMode, fixedPpm?: number) => void;
-}) {
-  const mode = ov?.mode ?? "auto";
-  const [ppm, setPpm] = useState(ov?.fixedPpm ?? 100);
-  return (
-    <div className="ov">
-      <select
-        value={mode}
-        onChange={(e) => {
-          const m = e.target.value as FeeMode;
-          onSet(m, m === "fixed" ? ppm : undefined);
-        }}
-      >
-        <option value="auto">auto</option>
-        <option value="fixed">fixed</option>
-        <option value="exclude">exclude</option>
-      </select>
-      {mode === "fixed" ? (
-        <input
-          type="number"
-          className="ov-ppm"
-          min={0}
-          value={ppm}
-          onChange={(e) => setPpm(Math.max(0, Number(e.target.value) || 0))}
-          onBlur={() => onSet("fixed", ppm)}
-          title="fixed ppm"
-        />
-      ) : null}
-    </div>
-  );
-}
-
 type SortKey = "capacity" | "localRatio" | "totalSent" | "totalReceived";
 
 export function ChannelTable({ channels }: { channels: ChannelView[] }) {
@@ -72,8 +37,9 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
     api.autopilotGet().then((s) => setCanWrite(s.canWrite)).catch(() => {});
   }, []);
 
-  const applyOverride = (id: string, mode: FeeMode, fixedPpm?: number) => {
-    api.setOverride(id, mode, fixedPpm).then(setOverrides).catch(() => {});
+  // A refused save rejects: the control shows why (it used to be swallowed).
+  const applyOverride = async (id: string, mode: FeeMode, fixedPpm?: number) => {
+    setOverrides(await api.setOverride(id, mode, fixedPpm));
   };
 
   const rows = channels
@@ -108,6 +74,7 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
             <th className="bal-col">Local ⟷ Remote</th>
             <th className="num">Sent</th>
             <th className="num">Received</th>
+            <th className="num">Fee now</th>
             <th>Autopilot fee</th>
             <th></th>
           </tr>
@@ -137,13 +104,17 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
               <td className="bal-col"><BalanceBar ratio={c.localRatio} /></td>
               <td className="num">{satsCompact(c.totalSent)}</td>
               <td className="num">{satsCompact(c.totalReceived)}</td>
+              <td className="num" title="what this channel charges to forward out now">
+                {pending ? <span className="muted">—</span> : feeText(c.feeRatePpm, c.baseFeeMsat)}
+              </td>
               <td>
                 {pending ? (
                   <span className="muted">—</span>
                 ) : (
-                  <OverrideControl
+                  <FeeOverrideControl
                     ov={overrides[c.id]}
-                    onSet={(mode, ppm) => applyOverride(c.id, mode, ppm)}
+                    currentPpm={c.feeRatePpm}
+                    onSave={(mode, ppm) => applyOverride(c.id, mode, ppm)}
                   />
                 )}
               </td>
@@ -170,8 +141,11 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
       {rows.length === 0 ? <EmptyState icon="⚡">No channels to show.</EmptyState> : null}
       <p className="hint">
         <strong>Roles</strong>: <em>source</em> mostly receives, <em>sink</em> mostly sends,
-        <em> router</em> is balanced. <strong>Autopilot fee</strong>: <code>auto</code> follows the
-        policy, <code>fixed</code> pins a ppm, <code>exclude</code> keeps the autopilot off this channel.
+        <em> router</em> is balanced. <strong>Fee now</strong>: what the channel charges to forward out.{" "}
+        <strong>Autopilot fee</strong>: <code>auto</code> follows the policy, <code>fixed</code> pins a fee (it
+        starts at the current one; confirm with Enter or Pin — fee automation then sets it, or Apply on the Fees
+        tab; saving it changes nothing on the node by itself), <code>excluded</code> keeps the autopilot off this
+        channel.
       </p>
 
       {closeTarget ? (

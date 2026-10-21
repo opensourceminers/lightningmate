@@ -22,6 +22,10 @@ export interface AutopilotConfig {
   /** Max channels changed in a single run — caps blast radius. */
   maxChangesPerRun: number;
   policy: FeePolicy;
+  /** Let a channel's profit floor (its refill cost × safety margin) lift its
+   *  fee above policy.maxPpm. Off: the floor stops at maxPpm (review a1: one
+   *  pricey refill lifted a fee past the ceiling in a single move). */
+  feeFloorAboveMax: boolean;
   /** Auto-rebalancing — independent of fee automation, also default off. */
   rebalanceEnabled: boolean;
   rebalancePolicy: RebalancePolicy;
@@ -79,6 +83,7 @@ export const DEFAULT_CONFIG: AutopilotConfig = {
   cooldownMinutes: 360,
   maxChangesPerRun: 5,
   policy: DEFAULT_POLICY,
+  feeFloorAboveMax: false,
   rebalanceEnabled: false,
   rebalancePolicy: DEFAULT_REBALANCE_POLICY,
   maxRebalancesPerRun: 2,
@@ -197,6 +202,7 @@ export const REBALANCE_POLICY_BOUNDS: Record<keyof RebalancePolicy, NumberBounds
 
 const BOOLEAN_KEYS = [
   "enabled",
+  "feeFloorAboveMax",
   "rebalanceEnabled",
   "channelEnabled",
   "sellEnabled",

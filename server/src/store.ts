@@ -308,6 +308,9 @@ export interface JsonStoreOptions {
    *  without the parser's message: JSON.parse quotes the bytes around the
    *  error, and that text goes to the log and the incident list. */
   secret?: boolean;
+  /** Written without indentation: for long logs (thousands of records),
+   *  where pretty-printing would multiply the size of every save. */
+  compact?: boolean;
 }
 
 export class JsonStore<T> {
@@ -315,6 +318,7 @@ export class JsonStore<T> {
   private readonly dataDir: string;
   readonly name: string;
   private readonly secret: boolean;
+  private readonly compact: boolean;
   /** The file on disk is known damaged and could not be moved aside: the next
    *  save must not turn it into the `.bak` (that would replace a good backup). */
   private damagedInPlace = false;
@@ -325,6 +329,7 @@ export class JsonStore<T> {
     this.name = name;
     this.file = join(dataDir, name);
     this.secret = opts.secret === true;
+    this.compact = opts.compact === true;
     this.removeStaleTempFiles();
   }
 
@@ -542,7 +547,7 @@ export class JsonStore<T> {
   writeOrThrow(value: T, opts: { keepBackup?: boolean } = {}): void {
     const registry = registryFor(this.dataDir);
     try {
-      this.replaceFile(JSON.stringify(value, null, 2), opts.keepBackup !== false && !this.damagedInPlace);
+      this.replaceFile(this.compact ? JSON.stringify(value) : JSON.stringify(value, null, 2), opts.keepBackup !== false && !this.damagedInPlace);
       this.damagedInPlace = false;
     } catch (err) {
       registry.record({

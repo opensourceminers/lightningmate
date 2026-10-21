@@ -41,6 +41,9 @@ export interface ChannelView {
   /** Force-close in progress: blocks until time-locked funds are spendable. */
   timelockBlocks?: number;
   role: ChannelRole;
+  /** What it charges now (GET /channels; null: not known, e.g. pending). */
+  feeRatePpm?: number | null;
+  baseFeeMsat?: number | null;
 }
 
 export interface FeeEstimates {
@@ -210,19 +213,43 @@ export interface AutopilotConfig {
   sellAutoSize: boolean;
   sellPricingMode: "fast" | "balanced" | "premium" | "auto";
   maxHtlcEnabled: boolean;
+  /** Let a profit floor lift a fee above policy.maxPpm (off: capped). */
+  feeFloorAboveMax: boolean;
 }
 
-/** Failed-HTLC telemetry: routing demand we refused for lack of liquidity. */
+/** Failed-HTLC telemetry: forwards refused for lack of liquidity, raw and
+ *  de-noised (D20: probes, retries and HTLCs no refill could carry apart). */
 export interface UnservedDemandReport {
   days: number;
+  /** How long events have been collected (days, one decimal). */
   trackedDays: number;
-  channels: {
-    outChannel: string;
-    alias: string;
-    liquidityCount: number;
-    liquiditySats: number;
-    otherCount: number;
-  }[];
+  /** Since when refusals are classified (older ones are raw only). */
+  classifiedSince?: string | null;
+  channels: UnservedDemandChannel[];
+}
+
+export interface UnservedDemandChannel {
+  outChannel: string;
+  alias: string;
+  /** Raw: every refusal for lack of liquidity (probes and retries included). */
+  liquidityCount: number;
+  liquiditySats: number;
+  otherCount: number;
+  probeCount: number;
+  probeSats: number;
+  retryCount: number;
+  retrySats: number;
+  oversizedCount: number;
+  oversizedSats: number;
+  unclassifiedCount: number;
+  unclassifiedSats: number;
+  /** De-noised: distinct attempts a refilled channel could have carried. */
+  demandCount: number;
+  demandSats: number;
+  demandDays: number;
+  demandMedianSats: number | null;
+  /** Those attempts × the channel's current fee. */
+  missedFeesSats: number;
 }
 
 export interface MaxHtlcChange {
@@ -239,6 +266,14 @@ export interface AutopilotChange {
   alias: string;
   fromPpm: number;
   toPpm: number;
+  /** Base fee before and after (msat), when the write set it. */
+  fromBaseMsat?: number;
+  toBaseMsat?: number;
+  /** Why: the engine's main reason, the lease promise kept, or "set by hand". */
+  why?: string;
+  via?: "autopilot" | "lease" | "manual";
+  /** A sold channel's lease promise lowered what was asked for. */
+  clampedBy?: string;
   ok: boolean;
   error?: string;
 }
@@ -835,13 +870,37 @@ export interface FeeRecMetrics {
   revenue30d: number;
   revenuePpm14d: number | null;
   revenuePpm30d: number | null;
+  /** What the autopilot's refills into it cost (last 30 days). */
   costBasisPpm: number | null;
   costBasisSource: "rebalance_avg" | "unknown";
+  costBasisRefills: number;
+  costBasisLatestAt: string | null;
+  /** The floor in force (capped at maxPpm unless opted in). */
   profitFloorPpm: number | null;
+  profitFloorCapped: boolean;
   peerGate: "ok" | "weak";
   role: string;
   isTopEarner: boolean;
   benchmarkComparison: "above" | "median" | "below";
+  /** What other nodes charge to forward into this peer (public graph). */
+  marketPpm: number | null;
+  marketSamples: number;
+  /** A remembered reference — this report's graph had none for the peer
+   *  (kept up to 7 days): when it was last seen. Null: this report's own. */
+  marketSeenAt: string | null;
+  peerFeeToUsPpm: number | null;
+  /** The least a refill costs on the market (into the peer + its hop back). */
+  replacementCostPpm: number | null;
+  /** Draining, and priced below what replacing its outbound costs. */
+  belowReplacement: boolean;
+  marketComparison: "above" | "in_line" | "below" | null;
+  draining: boolean;
+  /** De-noised payments turned away for lack of outbound, 14 days. */
+  refusedAttempts14d: number;
+  refusedSats14d: number;
+  refusedDays14d: number;
+  inDemand: boolean;
+  elasticityMod: number;
 }
 
 export interface FeeRecommendation {
@@ -849,14 +908,22 @@ export interface FeeRecommendation {
   alias: string;
   capacity: number;
   currentPpm: number;
+  /** This update's move. */
   targetPpm: number;
+  /** Where the engine wants the fee to end up (moves are bounded steps). */
+  aimPpm: number;
   transactionId: string | null;
   transactionVout: number | null;
   currentBaseMsat: number;
+  /** The base fee the engine sets (applied with the rate). */
+  recommendedBaseMsat: number;
+  noFlowLowering: boolean;
+  /** Pinned by hand: applied exactly as set. */
+  pinned: boolean;
   /** A channel this node sold whose order locked a routing-fee promise. */
-  leaseCap?: { source: "magma" | "lsps1"; orderId: string; feeRateCapPpm: number; baseFeeCapMsat: number; untilHeight: number | null } | null;
+  leaseCap: { source: "magma" | "lsps1"; orderId: string; feeRateCapPpm: number; baseFeeCapMsat: number; untilHeight: number | null } | null;
   /** Its current fee breaks that promise (lowered at once). */
-  leaseCapBreach?: boolean;
+  leaseCapBreach: boolean;
   wouldApply: boolean;
   blockedByGuards: string[];
   state: FeeRecState;
@@ -877,6 +944,10 @@ export interface NodeBenchmarks {
 export interface FeeRecReport {
   generatedAt: string;
   nodeBenchmarks: NodeBenchmarks;
+  /** How many channels have a market reference from the public graph. */
+  marketReferenced: number;
+  /** How many channels the elasticity learner has enough evidence for. */
+  elasticityLearned: number;
   recommendations: FeeRecommendation[];
 }
 
@@ -911,7 +982,10 @@ export interface RebalanceRecommendation {
   targetLocalRatio: number;
   capacity: number;
   currentPpm: number;
+  /** The fee engine's next move … */
   feeV2TargetPpm: number | null;
+  /** … and where it is heading. */
+  feeV2AimPpm: number | null;
   feeV2State: string | null;
   profitFloorPpm: number | null;
   routedOut14d: number;
@@ -1484,9 +1558,18 @@ export interface FeeOutcome {
   fromPpm: number;
   toPpm: number;
   raised: boolean;
+  via: "autopilot" | "lease" | "manual";
+  /** The intervals compared (days): until the neighbouring changes, ≤ 14. */
+  beforeDays: number;
+  afterDays: number;
   beforeDailyAvgSat: number;
   afterDailyAvgSat: number;
+  forwardsBefore: number;
+  forwardsAfter: number;
+  /** Market-adjusted revenue change (null: nothing earned before). */
   deltaPct: number | null;
+  /** Enough revenue before to count in the headline. */
+  measurable: boolean;
 }
 export interface RebalanceOutcome {
   targetId: string;
@@ -1500,7 +1583,22 @@ export interface RebalanceOutcome {
 }
 export interface OutcomesReport {
   measureWindowDays: number;
-  fees: { measured: number; raises: number; cuts: number; avgRevenueDeltaPct: number | null; items: FeeOutcome[] };
+  fees: {
+    windowDays: number;
+    measured: number;
+    /** Counted in the headline (enough revenue before). */
+    measurable: number;
+    pending: number;
+    tooClose: number;
+    raises: number;
+    cuts: number;
+    /** Revenue-weighted; null below minMeasured changes. */
+    avgRevenueDeltaPct: number | null;
+    minMeasured: number;
+    confidence: "none" | "low" | "medium";
+    note: string;
+    items: FeeOutcome[];
+  };
   rebalances: {
     measured: number;
     totalCostSats: number;

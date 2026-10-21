@@ -1,6 +1,7 @@
 import { getChannel, getChannels, updateRoutingFees, type AuthenticatedLnd } from "lightning";
 import { getOwnPubkey } from "./node.js";
 import { getAlias } from "./aliases.js";
+import { channelMaxPendingMsat, updateRefusal } from "./fees.js";
 
 /**
  * Dynamic max_htlc — advertise only what a channel can actually forward.
@@ -37,6 +38,9 @@ export interface MaxHtlcChange {
 const MIN_BUCKET_SAT = 1_024;
 /** Spendable must clear the target bucket by this factor before we raise. */
 const RAISE_HEADROOM = 1.1;
+/** After LND refused a channel's update, leave it alone this long (it was
+ *  retried — and recorded as applied — every 30-minute run). */
+export const MAX_HTLC_BACKOFF_MS = 6 * 3_600_000;
 
 /** Largest power of two ≤ spendable (floored to the minimum bucket). */
 export function maxHtlcBucketSat(spendableSat: number): number {
@@ -62,17 +66,32 @@ export function decideMaxHtlc(
  * One pass over all active channels: read the current policy, compute the
  * bucket from the spendable balance, and update where the bucket moved.
  * Fee rate / base fee / CLTV / min_htlc are always echoed back unchanged.
+ *
+ * The bucket never exceeds the channel's max pending amount: LND refuses a
+ * policy whose max_htlc is above it (review a1) — and LND's refusals come
+ * back as `failures`, not as an error: each is recorded as failed, and the
+ * channel is left alone for MAX_HTLC_BACKOFF_MS (`backoff`: channel id →
+ * when it was refused, kept by the caller).
  */
 export async function runMaxHtlcPass(
   readLnd: AuthenticatedLnd,
   writeLnd: AuthenticatedLnd,
+  backoff: Map<string, number> = new Map(),
 ): Promise<MaxHtlcChange[]> {
   const [{ channels }, mine] = await Promise.all([getChannels({ lnd: readLnd }), getOwnPubkey(readLnd)]);
   const out: MaxHtlcChange[] = [];
+  const now = Date.now();
 
   for (const c of channels.filter((ch) => ch.is_active)) {
-    // What this channel could actually forward right now.
-    const spendable = Math.max(0, c.local_balance - (c.local_reserve ?? 0));
+    const refusedAt = backoff.get(c.id);
+    if (refusedAt !== undefined && now - refusedAt < MAX_HTLC_BACKOFF_MS) continue;
+    // What this channel could actually forward right now — and never more
+    // than LND lets a single HTLC be on it.
+    const maxPendingMsat = channelMaxPendingMsat(c);
+    const spendable = Math.min(
+      Math.max(0, c.local_balance - (c.local_reserve ?? 0)),
+      maxPendingMsat !== null ? Math.floor(maxPendingMsat / 1000) : Infinity,
+    );
 
     let current;
     try {
@@ -89,7 +108,7 @@ export async function runMaxHtlcPass(
     if (!change) continue;
 
     try {
-      await updateRoutingFees({
+      const res = await updateRoutingFees({
         lnd: writeLnd,
         transaction_id: c.transaction_id,
         transaction_vout: c.transaction_vout,
@@ -99,6 +118,20 @@ export async function runMaxHtlcPass(
         max_htlc_mtokens: String(toSat * 1000),
         ...(current.min_htlc_mtokens ? { min_htlc_mtokens: current.min_htlc_mtokens } : {}),
       });
+      const refused = updateRefusal(res, c.transaction_id, c.transaction_vout);
+      if (refused) {
+        backoff.set(c.id, now);
+        out.push({
+          id: c.id,
+          alias: await getAlias(readLnd, c.partner_public_key),
+          fromSat: currentMaxSat,
+          toSat,
+          ok: false,
+          error: `${refused} — not retried for ${MAX_HTLC_BACKOFF_MS / 3_600_000} h`,
+        });
+        continue;
+      }
+      backoff.delete(c.id);
       out.push({
         id: c.id,
         alias: await getAlias(readLnd, c.partner_public_key),
@@ -107,6 +140,7 @@ export async function runMaxHtlcPass(
         ok: true,
       });
     } catch (err) {
+      backoff.set(c.id, now);
       out.push({
         id: c.id,
         alias: await getAlias(readLnd, c.partner_public_key),

@@ -11,17 +11,17 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { activeCap, clampToCap, leaseCapFrom, offerFeeCaps, type LeaseCap } from "../src/services/leaseCaps.js";
+import { MAGMA_LEASE_MARGIN_BLOCKS, activeCap, clampToCap, leaseCapFrom, offerFeeCaps, type LeaseCap } from "../src/services/leaseCaps.js";
 import { getFeeRecommendations } from "../src/services/feeRecommend.js";
 import { applyFees } from "../src/services/fees.js";
-import { Autopilot } from "../src/services/autopilot.js";
+import { Autopilot, LEASE_PROMISE_CHECK_MS } from "../src/services/autopilot.js";
 import { RebalanceLog, type RebalanceRecord } from "../src/services/rebalanceLog.js";
 import { OverridesStore } from "../src/services/overrides.js";
 import { AmbossStore } from "../src/services/ambossStore.js";
 import { EarningsLog } from "../src/services/earningsLog.js";
 import { ServiceFeeLedger } from "../src/services/serviceFee.js";
 import { MagmaJournal } from "../src/services/magmaJournal.js";
-import { feeNode } from "./helpers/feeNode.js";
+import { feeNode, forwardsOut } from "./helpers/feeNode.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
 import { AMBOSS_API } from "./helpers/amboss.js";
@@ -67,21 +67,25 @@ test("a promise binds from the order's locked terms for the lease: none when not
   assert.deepEqual(clampToCap({ feeRatePpm: 100, baseFeeMsat: 500 }, c!), { feeRatePpm: 100, baseFeeMsat: 500, clamped: false });
 });
 
-/** Channels for the engine: each with a different rule pushing its fee up. */
-function engineSetup() {
+/** Channels for the engine: each with a different rule pushing its fee up.
+ *  `floorPpm`: what the profit-floor channels (1 and 4) charge now. */
+function engineSetup(opts: { floorPpm?: number } = {}) {
   const node = feeNode({
     blockHeight: HEIGHT,
     channels: [
       // Drained, with an expensive refill on record: the profit floor (basis
       // 5,000 ppm × 1.15) lifts its fee far above the policy's max.
-      { id: "859000x1x0", partnerPublicKey: PEER(1), capacity: 2_000_000, localBalance: 100_000, transactionId: TX(1), transactionVout: 0, feeRatePpm: 900 },
+      { id: "859000x1x0", partnerPublicKey: PEER(1), capacity: 2_000_000, localBalance: 100_000, transactionId: TX(1), transactionVout: 0, feeRatePpm: opts.floorPpm ?? 900 },
       // Pinned by hand at 5,000 ppm.
       { id: "859000x2x0", partnerPublicKey: PEER(2), capacity: 2_000_000, localBalance: 1_000_000, transactionId: TX(2), transactionVout: 0, feeRatePpm: 900 },
       // Excluded from the autopilot — carrying 3,000 ppm.
       { id: "859000x3x0", partnerPublicKey: PEER(3), capacity: 2_000_000, localBalance: 1_000_000, transactionId: TX(3), transactionVout: 0, feeRatePpm: 3000 },
       // Same as the first, but its lease is over.
-      { id: "850000x4x0", partnerPublicKey: PEER(4), capacity: 2_000_000, localBalance: 100_000, transactionId: TX(4), transactionVout: 0, feeRatePpm: 900 },
+      { id: "850000x4x0", partnerPublicKey: PEER(4), capacity: 2_000_000, localBalance: 100_000, transactionId: TX(4), transactionVout: 0, feeRatePpm: opts.floorPpm ?? 900 },
     ],
+    // Both floor channels still route (a drained channel nobody routes
+    // through is held, never raised — by a floor or anything else).
+    forwards: [...forwardsOut("859000x1x0", "859000x2x0", 5), ...forwardsOut("850000x4x0", "859000x2x0", 5)],
   });
   const refill = (targetId: string): RebalanceRecord => ({
     at: new Date().toISOString(),
@@ -101,16 +105,20 @@ function engineSetup() {
 }
 
 test("the fee engine keeps a sold channel within its promise — over the profit floor and a fixed pin; lowering a broken promise skips the anti-churn guards", async () => {
-  const { node, records, caps } = engineSetup();
+  // The profit-floor channels charge 2,150 ppm: the floor's next ramp step
+  // (+4 steps) would cross the 2,200 ppm promise. (Since P2 a floor lifts a
+  // fee above maxPpm only with the operator's opt-in, and in ramp steps.)
+  const { node, records, caps } = engineSetup({ floorPpm: 2150 });
   const overrides = { "859000x2x0": { mode: "fixed" as const, fixedPpm: 5000 }, "859000x3x0": { mode: "exclude" as const } };
   // Fees were changed on every channel just now: the cooldowns are on.
   const cooldown = { lastApplied: Object.fromEntries(["859000x1x0", "859000x2x0", "859000x3x0", "850000x4x0"].map((id) => [id, new Date().toISOString()])), cooldownHours: 6 };
-  const without = await getFeeRecommendations(node.lnd, records, cooldown, { maxPpm: 1000 }, overrides);
+  const policy = { maxPpm: 1000, floorAboveMax: true };
+  const without = await getFeeRecommendations(node.lnd, records, cooldown, policy, overrides);
   const floor = without.recommendations.find((r) => r.channelId === "859000x1x0")!;
   assert.ok(floor.targetPpm > 2200, `the profit floor alone: ${floor.targetPpm} ppm`);
-  assert.equal(without.recommendations.find((r) => r.channelId === "859000x2x0")?.targetPpm, 1000, "pinned (clamped to the policy max only)");
+  assert.equal(without.recommendations.find((r) => r.channelId === "859000x2x0")?.targetPpm, 5000, "pinned: exactly as set");
 
-  const report = await getFeeRecommendations(node.lnd, records, cooldown, { maxPpm: 1000 }, overrides, new Map(), new Map(), caps);
+  const report = await getFeeRecommendations(node.lnd, records, cooldown, policy, overrides, new Map(), new Map(), caps);
   const by = (id: string) => report.recommendations.find((r) => r.channelId === id)!;
   assert.ok(by("859000x1x0").targetPpm <= 2200, `profit floor clamped: ${by("859000x1x0").targetPpm}`);
   assert.match(by("859000x1x0").reasons[0], /lease promise: Magma order order-1… promised at most 2200 ppm/);
@@ -458,4 +466,222 @@ test("an LSPS1 sale's promise outlives the order list's trim: 250 newer abandone
   assert.equal(fee.status, 200);
   assert.deepEqual(fee.body.results.map((r: { feeRatePpm: number }) => r.feeRatePpm), [1500]);
   assert.deepEqual(node.policyWrites, [{ outpoint: `${TX(2)}:0`, feeRatePpm: 1500, baseFeeMsat: 0 }]);
+});
+
+// ── P1b carry-overs (package P2) ────────────────────────────────────────────
+
+/** A sale in the Magma journal with a channel, as the order desk saves it. */
+const journalSale = (orderId: string, tx: string, o: Record<string, unknown> = {}) => {
+  const now = new Date().toISOString();
+  return {
+    orderId, phase: "settled", via: "autopilot", createdAt: now, updatedAt: now, buyerPubkey: PEER(9),
+    sizeSats: 2_000_000, isPrivate: false, feeMsat: "12345000", leaseBlocks: 4320, feeRateCapPpm: 2200, baseFeeCapSats: 1,
+    invoice: null, acceptAttempts: 1, openAttempts: 1, reportAttempts: 1, fundingOutpoint: `${tx}:0`, settledAt: now, events: [],
+    ...o,
+  };
+};
+
+test("K1: fee automation off — a sold channel whose BASE fee alone breaks its promise keeps its rate: exactly one write {500 ppm, 1,000 msat}, never raised to the 2,200 cap", async (t) => {
+  const node = feeNode({
+    blockHeight: HEIGHT,
+    channels: [{ id: "859000x7x0", partnerPublicKey: PEER(7), capacity: 2_000_000, localBalance: 1_000_000, transactionId: TX(7), transactionVout: 0, feeRatePpm: 500, baseFeeMsat: 5000 }],
+  });
+  const http = installFetchMock(t);
+  http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, "magma-orders.json"), JSON.stringify([journalSale("magma-7", TX(7), { phase: "reported" })]));
+  writeFileSync(join(dir, "autopilot.json"), JSON.stringify({ config: { enabled: false }, history: [], sellAutoSizeMigrated: true }));
+  const autopilot = new Autopilot(dir, node.lnd, node.lnd, new RebalanceLog(dir), new OverridesStore(dir), new AmbossStore(dir), new EarningsLog(dir), new ServiceFeeLedger(dir, null));
+  suppressSchedulerKicks(autopilot);
+  t.after(() => autopilot.shutdown());
+  await autopilot.runOnce();
+  assert.deepEqual(node.policyWrites, [{ outpoint: `${TX(7)}:0`, feeRatePpm: 500, baseFeeMsat: 1000 }]);
+});
+
+/** Let the lease keeper's LND reads and its write finish (real setImmediate
+ *  under mocked timers). */
+async function settled(done: () => boolean): Promise<void> {
+  for (let i = 0; i < 200 && !done(); i++) await new Promise((r) => setImmediate(r));
+}
+
+test("every autopilot switch off: the lease promise is still kept — within one cadence of the keeper's own timer a sold Magma channel above its cap is lowered to it, and no other fee is written", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const { node } = engineSetup();
+  const http = installFetchMock(t);
+  http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
+  const dir = makeTempDir(t);
+  // Channel 3 carries 3,000 ppm against a 2,200 promise; channel 1 is sold
+  // too, within its promise.
+  writeFileSync(join(dir, "magma-orders.json"), JSON.stringify([journalSale("magma-3", TX(3)), journalSale("magma-1", TX(1))]));
+  writeFileSync(join(dir, "autopilot.json"), JSON.stringify({ config: {}, history: [], sellAutoSizeMigrated: true }));
+  const autopilot = new Autopilot(dir, node.lnd, node.lnd, new RebalanceLog(dir), new OverridesStore(dir), new AmbossStore(dir), new EarningsLog(dir), new ServiceFeeLedger(dir, null));
+  suppressSchedulerKicks(autopilot);
+  t.after(() => autopilot.shutdown());
+  autopilot.start();
+  // Before: with every switch off, reschedule() scheduled no run at all —
+  // the 'lease promises' stage never ran, the 3,000 ppm stayed for the lease.
+  t.mock.timers.tick(LEASE_PROMISE_CHECK_MS);
+  await settled(() => node.policyWrites.length > 0);
+  assert.deepEqual(node.policyWrites, [{ outpoint: `${TX(3)}:0`, feeRatePpm: 2200, baseFeeMsat: 1000 }]);
+  const [line] = autopilot.getState().history;
+  assert.deepEqual(line.changes.map((c) => [c.id, c.fromPpm, c.toPpm, c.via]), [["859000x3x0", 3000, 2200, "lease"]]);
+  assert.match(line.changes[0].why ?? "", /lease promise: Magma order magma-3… promised at most 2200 ppm/);
+  // Kept: the next cadence has nothing to do.
+  t.mock.timers.tick(LEASE_PROMISE_CHECK_MS);
+  await settled(() => false);
+  assert.equal(node.policyWrites.length, 1);
+});
+
+test("…and an LSPS1 sale's channel the same way (the shared capital ledger)", async (t) => {
+  const { node } = engineSetup();
+  const http = installFetchMock(t);
+  http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
+  const dir = makeTempDir(t);
+  const now = new Date().toISOString();
+  writeFileSync(
+    join(dir, "lsps1-orders.json"),
+    JSON.stringify([
+      {
+        orderId: "lsps-3", peer: PEER(3), createdAt: now, lspBalanceSat: 2_000_000, clientBalanceSat: 0,
+        requiredChannelConfirmations: 1, fundingConfirmsWithinBlocks: 6, channelExpiryBlocks: 12_960, token: "",
+        announceChannel: true, orderState: "COMPLETED", paymentState: "PAID", feeTotalSat: 20_000, orderTotalSat: 20_000,
+        invoice: "", invoiceId: "ab".repeat(32), invoiceSecret: "cd".repeat(32), invoiceExpiresAt: now,
+        channel: { fundedAt: now, fundingOutpoint: `${TX(3)}:0`, expiresAt: new Date(Date.now() + 90 * 86_400_000).toISOString() },
+        serviceFeePaidSat: 0, feeRateCapPpm: 1500, baseFeeCapSats: 0,
+      },
+    ]),
+  );
+  const api = await startApi(t, { node, dir });
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  api.autopilot.start();
+  t.mock.timers.tick(LEASE_PROMISE_CHECK_MS);
+  await settled(() => node.policyWrites.length > 0);
+  assert.deepEqual(node.policyWrites, [{ outpoint: `${TX(3)}:0`, feeRatePpm: 1500, baseFeeMsat: 0 }]);
+});
+
+test("the lease keeper never runs into the main run: while it holds its lock the check is skipped", async (t) => {
+  const { node } = engineSetup();
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, "magma-orders.json"), JSON.stringify([journalSale("magma-3", TX(3))]));
+  const autopilot = new Autopilot(dir, node.lnd, node.lnd, new RebalanceLog(dir), new OverridesStore(dir), new AmbossStore(dir), new EarningsLog(dir), new ServiceFeeLedger(dir, null));
+  suppressSchedulerKicks(autopilot);
+  t.after(() => autopilot.shutdown());
+  (autopilot as unknown as { running: boolean }).running = true;
+  assert.deepEqual(await autopilot.keepLeasePromisesNow(), []);
+  assert.equal(node.policyWrites.length, 0);
+  (autopilot as unknown as { running: boolean }).running = false;
+  assert.equal((await autopilot.keepLeasePromisesNow()).length, 1);
+});
+
+test("a Magma sale's promise is kept 144 blocks past funding + lease — Amboss counts the lease from its own confirmation; an LSPS1 lease (our own count) ends on the block", () => {
+  const magma = cap("aa:0", { source: "magma", leaseBlocks: 4320 });
+  const lsp = cap("bb:0", { source: "lsps1", leaseBlocks: 4320 });
+  const at = (c: LeaseCap, height: number) => activeCap([c], { outpoint: c.fundingOutpoint, channelId: "855000x1x0" }, height);
+  // Funded at 855,000: funding + lease = 859,320.
+  assert.ok(at(magma, 859_320), "Amboss's lease may still be running");
+  assert.equal(at(magma, 859_320)?.untilHeight, 859_320 + MAGMA_LEASE_MARGIN_BLOCKS);
+  assert.ok(at(magma, 859_320 + MAGMA_LEASE_MARGIN_BLOCKS - 1));
+  assert.equal(at(magma, 859_320 + MAGMA_LEASE_MARGIN_BLOCKS), null, "a day later: over");
+  assert.equal(at(lsp, 859_320), null);
+  assert.ok(at(lsp, 859_319));
+});
+
+test("…and the engine keeps clamping a sold channel in that margin", async () => {
+  const funded = HEIGHT - 4320 - 100; // the lease ended 100 blocks ago by our count
+  const node = feeNode({
+    blockHeight: HEIGHT,
+    // Drained and idle: the engine holds its fee — only the promise lowers it.
+    channels: [{ id: `${funded}x1x0`, partnerPublicKey: PEER(1), capacity: 2_000_000, localBalance: 50_000, transactionId: TX(1), transactionVout: 0, feeRatePpm: 3000 }],
+  });
+  const report = await getFeeRecommendations(node.lnd, [], null, { maxPpm: 6000 }, {}, new Map(), new Map(), [cap(`${TX(1)}:0`)], { demand: new Map(), market: new Map() });
+  const [r] = report.recommendations;
+  assert.equal(r.leaseCapBreach, true, "still bound: Amboss may count 144 blocks longer");
+  assert.equal(r.leaseCap?.untilHeight, funded + 4320 + MAGMA_LEASE_MARGIN_BLOCKS);
+  assert.equal(r.targetPpm, 2200);
+  assert.equal(r.wouldApply, true);
+});
+
+// ── review repair ───────────────────────────────────────────────────────────
+
+/** An autopilot on `node` with a Magma sale of channel 3 in its journal. */
+function keeperSetup(t: Parameters<typeof makeTempDir>[0], node: ReturnType<typeof feeNode>, config: Record<string, unknown>) {
+  const http = installFetchMock(t);
+  http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, "magma-orders.json"), JSON.stringify([journalSale("magma-3", TX(3))]));
+  writeFileSync(join(dir, "autopilot.json"), JSON.stringify({ config, history: [], sellAutoSizeMigrated: true }));
+  const autopilot = new Autopilot(dir, node.lnd, node.lnd, new RebalanceLog(dir), new OverridesStore(dir), new AmbossStore(dir), new EarningsLog(dir), new ServiceFeeLedger(dir, null));
+  suppressSchedulerKicks(autopilot);
+  t.after(() => autopilot.shutdown());
+  return autopilot;
+}
+
+test("a main run started while the lease keeper writes is skipped — the keeper holds the lock until its write is booked", async (t) => {
+  const { node } = engineSetup();
+  const autopilot = keeperSetup(t, node, { enabled: true });
+  // The keeper takes the lock at once, then reads LND and writes.
+  const keeping = autopilot.keepLeasePromisesNow();
+  const run = await autopilot.runOnce();
+  assert.equal(run.attempted, 0, "skipped: before, both wrote fees at the same time");
+  assert.equal((await keeping).length, 1);
+  assert.deepEqual(node.policyWrites, [{ outpoint: `${TX(3)}:0`, feeRatePpm: 2200, baseFeeMsat: 1000 }]);
+  // Done: the next run goes ahead.
+  assert.ok((await autopilot.runOnce()).attempted > 0);
+});
+
+test("a broken promise LND refuses to fix is tried again at every check — no back-off holds it — but is on record once", async (t) => {
+  const { node } = engineSetup();
+  node.refusals.set(`${TX(3)}:0`, "refused for the test");
+  const autopilot = keeperSetup(t, node, {});
+  for (let i = 0; i < 3; i++) await autopilot.keepLeasePromisesNow();
+  const toChannel3 = () => node.policyRequests.filter((r) => (r.chan_point as { funding_txid_str: string }).funding_txid_str === TX(3)).length;
+  assert.equal(toChannel3(), 3, "retried at each check");
+  const failed = autopilot.getState().history.flatMap((r) => r.changes).filter((c) => !c.ok);
+  assert.equal(failed.length, 1, "the same refusal is not news");
+  assert.match(failed[0].error ?? "", /^LND refused the update: refused for the test/);
+  assert.doesNotMatch(failed[0].error ?? "", /not retried/);
+  // With fee automation on, the engine's own fix of the breach is not held either.
+  autopilot.setConfig({ enabled: true });
+  await autopilot.runOnce();
+  assert.equal(toChannel3(), 4);
+});
+
+test("shutdown stops the lease keeper's timer — no check runs after it", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout", "setInterval"] });
+  const { node } = engineSetup();
+  const autopilot = keeperSetup(t, node, {});
+  let checks = 0;
+  const real = autopilot.keepLeasePromisesNow.bind(autopilot);
+  (autopilot as unknown as { keepLeasePromisesNow: () => Promise<unknown> }).keepLeasePromisesNow = async () => {
+    checks += 1;
+    return real();
+  };
+  autopilot.start();
+  t.mock.timers.tick(LEASE_PROMISE_CHECK_MS);
+  await settled(() => node.policyWrites.length > 0);
+  assert.equal(checks, 1);
+  autopilot.shutdown();
+  t.mock.timers.tick(3 * LEASE_PROMISE_CHECK_MS);
+  assert.equal(checks, 1, "the interval is cleared, not left firing into a closed autopilot");
+});
+
+// ── review 2: the keeper's guards, each with a test ─────────────────────────
+
+test("the lease keeper only ever lowers: a sale whose RATE alone breaks its promise (3,000 ppm, 0 msat base, against 2,200 ppm / 1,000 msat) is written {2,200 ppm, 0 msat} — its base fee is not raised to the cap", async (t) => {
+  const node = feeNode({
+    blockHeight: HEIGHT,
+    channels: [{ id: "859000x3x0", partnerPublicKey: PEER(3), capacity: 2_000_000, localBalance: 1_000_000, transactionId: TX(3), transactionVout: 0, feeRatePpm: 3000, baseFeeMsat: 0 }],
+  });
+  const autopilot = keeperSetup(t, node, {});
+  const changes = await autopilot.keepLeasePromisesNow();
+  assert.deepEqual(node.policyWrites, [{ outpoint: `${TX(3)}:0`, feeRatePpm: 2200, baseFeeMsat: 0 }]);
+  assert.deepEqual(changes.map((c) => [c.fromPpm, c.toPpm, c.fromBaseMsat, c.toBaseMsat, c.via]), [[3000, 2200, 0, 0, "lease"]]);
+});
+
+test("after shutdown the lease keeper writes nothing — a check that fires as the process stops starts no fee update", async (t) => {
+  const { node } = engineSetup();
+  const autopilot = keeperSetup(t, node, {});
+  autopilot.shutdown();
+  assert.deepEqual(await autopilot.keepLeasePromisesNow(), []);
+  assert.equal(node.policyRequests.length, 0);
 });

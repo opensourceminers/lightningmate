@@ -66,20 +66,107 @@ export interface GraphCache {
   at: number;
   stats: Map<string, NodeStat>;
   meta: Map<string, NodeMeta>;
+  /** Per node P: what OTHER nodes charge to forward into P, as interleaved
+   *  [fee ppm, channel capacity, …] pairs (this node's own policies left
+   *  out) — the market price of reaching P (peerMarketFees). */
+  into: Map<string, number[]>;
+  /** Per channel of this node: the peer's own fee for forwarding to us over
+   *  it (ppm) — the last hop of any refill of that channel. */
+  peerFeeToUs: Map<string, number>;
 }
 
-const GRAPH_TTL_MS = 30 * 60_000;
-let cache: GraphCache | undefined;
+/** A graph younger than this is served as it is. */
+export const GRAPH_TTL_MS = 30 * 60_000;
+/**
+ * An older one is still served — at once — while a fresh read runs in the
+ * background, up to this age (stale-while-revalidate). Before, a cache past
+ * its 30 minutes was dropped and the caller waited for a new read: on a small
+ * machine that takes longer than the fee engine's MARKET_WAIT_MS, and the
+ * autopilot runs every 30 minutes — so every other run priced without the
+ * market, and market-priced fees flapped (80→50→70→40…, 28 updates in 60
+ * days). The graph moves slowly; a few hours old is still today's market.
+ */
+export const GRAPH_STALE_MAX_MS = 12 * 3_600_000;
+/**
+ * The longest one graph read is waited for (review 3). LND's DescribeGraph
+ * has no deadline of its own, and every caller shares the read under way: a
+ * call that never answered stayed "under way" for good — no fresh read was
+ * ever started again, every caller after the 12 h of stale serving waited on
+ * it, and the autopilot's channel stage (which waits for the graph with no
+ * bound of its own) held the run's lock: no fee runs, the lease keeper
+ * skipped, a manual Apply answered 409 until a restart. Past this, the read
+ * is given up — its waiters get an error, the next caller starts a new one,
+ * and a graph younger than GRAPH_STALE_MAX_MS keeps being served meanwhile.
+ * (A read that answers after all still fills the cache.)
+ */
+export const GRAPH_READ_DEADLINE_MS = 10 * 60_000;
+/** A policy nobody refreshed for this long says little about today's price. */
+const MARKET_FRESH_MS = 30 * 86_400_000;
+/** Per LND connection (tests run several fake nodes in one process). */
+const caches = new WeakMap<AuthenticatedLnd, GraphCache>();
+/** The graph read under way, per connection: the fee engine, the rebalance
+ *  recommender and the peer suggestions ask at once — one read serves all. */
+const building = new WeakMap<AuthenticatedLnd, Promise<GraphCache>>();
 
 function isClearnet(socket: string): boolean {
   return !socket.includes(".onion");
 }
 
-/** Pull + aggregate the network graph (cached — it's a heavy call). */
-export async function buildGraphCache(lnd: AuthenticatedLnd): Promise<GraphCache> {
-  if (cache && Date.now() - cache.at < GRAPH_TTL_MS) return cache;
+/** The graph read under way for `lnd`, or a new one — given up after
+ *  GRAPH_READ_DEADLINE_MS. */
+function readOnce(lnd: AuthenticatedLnd): Promise<GraphCache> {
+  const running = building.get(lnd);
+  if (running) return running;
+  const read: Promise<GraphCache> = new Promise<GraphCache>((resolve, reject) => {
+    // No longer "under way" from the moment it settles or is given up — no
+    // caller after that is handed it. (Only its own entry: a read given up
+    // must not end the one started after it.)
+    const done = () => {
+      clearTimeout(timer);
+      if (building.get(lnd) === read) building.delete(lnd);
+    };
+    const timer = setTimeout(() => {
+      done();
+      reject(new Error(`the network graph read took longer than ${GRAPH_READ_DEADLINE_MS / 60_000} minutes`));
+    }, GRAPH_READ_DEADLINE_MS);
+    timer.unref?.();
+    readGraph(lnd).then(
+      (graph) => {
+        done();
+        resolve(graph);
+      },
+      (err: unknown) => {
+        done();
+        reject(err);
+      },
+    );
+  });
+  building.set(lnd, read);
+  return read;
+}
 
-  const graph = await getNetworkGraph({ lnd });
+/**
+ * Pull + aggregate the network graph (cached — it's a heavy call). Fresh
+ * (under GRAPH_TTL_MS): served. Older, up to GRAPH_STALE_MAX_MS: served at
+ * once while a new read runs in the background (a failed one leaves the old
+ * graph in place). Older still, or none yet: the caller waits for the read.
+ */
+export async function buildGraphCache(lnd: AuthenticatedLnd): Promise<GraphCache> {
+  const cache = caches.get(lnd);
+  const age = cache ? Date.now() - cache.at : Infinity;
+  if (cache && age < GRAPH_TTL_MS) return cache;
+  const read = readOnce(lnd);
+  if (cache && age < GRAPH_STALE_MAX_MS) {
+    // Nobody awaits this read: its failure must not surface as an unhandled
+    // rejection (the next caller simply starts another one).
+    read.catch(() => undefined);
+    return cache;
+  }
+  return read;
+}
+
+async function readGraph(lnd: AuthenticatedLnd): Promise<GraphCache> {
+  const [graph, own] = await Promise.all([getNetworkGraph({ lnd }), getOwnPubkey(lnd).catch(() => "")]);
 
   const stats = new Map<string, NodeStat>();
   const freshAfter = Date.now() - 14 * 86_400_000; // "actively maintained" window
@@ -92,7 +179,28 @@ export async function buildGraphCache(lnd: AuthenticatedLnd): Promise<GraphCache
     return s;
   };
 
+  const into = new Map<string, number[]>();
+  const peerFeeToUs = new Map<string, number>();
+  const marketAfter = Date.now() - MARKET_FRESH_MS;
   for (const ch of graph.channels) {
+    // The market into each endpoint: the OTHER endpoint's policy is what it
+    // charges to forward into this one. Disabled and long-stale policies
+    // aren't a price anyone pays; this node's own aren't "the market".
+    if (ch.policies.length === 2) {
+      for (const [from, to] of [ch.policies, [...ch.policies].reverse()]) {
+        if (from.public_key === own) continue;
+        if (to.public_key === own) {
+          // The peer's fee toward us on our own channel.
+          if (from.fee_rate !== undefined) peerFeeToUs.set(ch.id, from.fee_rate);
+          continue;
+        }
+        if (from.fee_rate === undefined || from.is_disabled === true) continue;
+        if (!from.updated_at || new Date(from.updated_at).getTime() < marketAfter) continue;
+        let list = into.get(to.public_key);
+        if (!list) into.set(to.public_key, (list = []));
+        list.push(Math.min(from.fee_rate, 50_000), ch.capacity);
+      }
+    }
     const endpoints = [...new Set(ch.policies.map((p) => p.public_key))];
     for (const pk of endpoints) {
       const s = ensureStat(pk);
@@ -123,8 +231,67 @@ export async function buildGraphCache(lnd: AuthenticatedLnd): Promise<GraphCache
     });
   }
 
-  cache = { at: Date.now(), stats, meta };
-  return cache;
+  const built: GraphCache = { at: Date.now(), stats, meta, into, peerFeeToUs };
+  caches.set(lnd, built);
+  return built;
+}
+
+/** What reaching a peer costs on the network (blind-price-discovery). */
+export interface MarketRef {
+  /** Capacity-weighted median fee other nodes charge to forward into the
+   *  peer (ppm). */
+  intoPeerPpm: number;
+  /** How many channels into the peer that is the median of. */
+  samples: number;
+  /** The peer's own fee for forwarding back to us on this channel, ppm
+   *  (null: not in the graph). */
+  peerFeeToUsPpm: number | null;
+}
+
+/** Fewer channels into a peer than this: no market reference (too thin). */
+export const MARKET_MIN_CHANNELS = 3;
+
+/** Capacity-weighted median of interleaved [fee, capacity] pairs. */
+export function weightedMedianFee(pairs: number[]): number | null {
+  const rows: { fee: number; cap: number }[] = [];
+  for (let i = 0; i + 1 < pairs.length; i += 2) rows.push({ fee: pairs[i], cap: Math.max(1, pairs[i + 1]) });
+  if (!rows.length) return null;
+  rows.sort((a, b) => a.fee - b.fee);
+  const half = rows.reduce((s, r) => s + r.cap, 0) / 2;
+  let acc = 0;
+  for (const r of rows) {
+    acc += r.cap;
+    if (acc >= half) return r.fee;
+  }
+  return rows[rows.length - 1].fee;
+}
+
+/**
+ * The market reference for each of this node's channels, from the public
+ * graph (no paid service, nothing sent anywhere): what other nodes charge to
+ * forward into the same peer, and what the peer charges to forward back to
+ * us. Empty when the graph can't be read — the fee engine then prices as it
+ * did without one.
+ */
+export async function peerMarketFees(
+  lnd: AuthenticatedLnd,
+  channels: { id: string; peerPubkey: string }[],
+): Promise<Map<string, MarketRef>> {
+  const out = new Map<string, MarketRef>();
+  let graph: GraphCache;
+  try {
+    graph = await buildGraphCache(lnd);
+  } catch {
+    return out;
+  }
+  for (const ch of channels) {
+    const pairs = graph.into.get(ch.peerPubkey) ?? [];
+    if (pairs.length / 2 < MARKET_MIN_CHANNELS) continue;
+    const median = weightedMedianFee(pairs);
+    if (median === null) continue;
+    out.set(ch.id, { intoPeerPpm: median, samples: pairs.length / 2, peerFeeToUsPpm: graph.peerFeeToUs.get(ch.id) ?? null });
+  }
+  return out;
 }
 
 export interface NetworkRank {

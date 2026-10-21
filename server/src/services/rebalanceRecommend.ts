@@ -143,7 +143,10 @@ export interface RebalanceRecommendation {
   targetLocalRatio: number;
   capacity: number;
   currentPpm: number;
+  /** The fee engine's next move for this channel … */
   feeV2TargetPpm: number | null;
+  /** … and where it is heading (the target is one bounded step toward it). */
+  feeV2AimPpm: number | null;
   feeV2State: FeeRecState | null;
   profitFloorPpm: number | null;
 
@@ -298,7 +301,8 @@ export async function getRebalanceRecommendations(
   return { generatedAt: new Date().toISOString(), config: cfg, summary, inbound, recommendations: recs };
 }
 
-function classify(
+/** One channel's refill decision — pure (exported for tests). */
+export function classify(
   ch: ChannelView,
   fee: FeeRecommendation | undefined,
   sourcePool: ChannelView[],
@@ -336,6 +340,7 @@ function classify(
     capacity: ch.capacity,
     currentPpm: fee?.currentPpm ?? 0,
     feeV2TargetPpm: fee?.targetPpm ?? null,
+    feeV2AimPpm: fee?.aimPpm ?? null,
     feeV2State: fee?.state ?? null,
     profitFloorPpm: m?.profitFloorPpm ?? null,
     routedOut14d,
@@ -423,8 +428,13 @@ function classify(
     rec.reasons.push("missing / low revenue history — can't prove a profitable rebalance yet");
     return rec;
   }
+  // Conservative: the lowest of what it earned, what it charges, and where
+  // the fee engine is taking it. The engine's target is only this update's
+  // bounded step (P2): on the way from 900 to 400 ppm it reads 870 — the
+  // refill would be budgeted on a fee the channel is leaving. The aim is
+  // where it ends up.
   const expectedRevenuePpm = Math.round(
-    Math.min(rec.revenuePpm30d, rec.currentPpm || rec.revenuePpm30d, fee?.targetPpm ?? Infinity),
+    Math.min(rec.revenuePpm30d, rec.currentPpm || rec.revenuePpm30d, fee?.targetPpm ?? Infinity, fee?.aimPpm ?? Infinity),
   );
   rec.expectedRevenuePpm = expectedRevenuePpm;
   rec.maxCostPpm = Math.round(expectedRevenuePpm * cfg.profitShare);

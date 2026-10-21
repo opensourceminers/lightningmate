@@ -1,9 +1,11 @@
 import { getFeeRates, getWalletInfo, type AuthenticatedLnd } from "lightning";
-import { getChannelsView, type ChannelRole } from "./channels.js";
+import { getChannelsView, type ChannelRole, type ChannelView } from "./channels.js";
 import { getForwardsReport } from "./forwards.js";
 import type { RebalanceRecord } from "./rebalanceLog.js";
 import type { ChannelOverride, OverrideMap } from "./overrides.js";
 import { activeCap, capText, clampToCap, type LeaseCap } from "./leaseCaps.js";
+import { servableDemand, type DemandSignal } from "./htlcTelemetry.js";
+import { peerMarketFees, type MarketRef } from "./suggestions.js";
 
 /**
  * Fee Autopilot v2 — recommendation engine (dry-run only; never writes fees).
@@ -11,10 +13,53 @@ import { activeCap, capText, clampToCap, type LeaseCap } from "./leaseCaps.js";
  * Product goal: stop the node from routing liquidity at a loss. Each channel's
  * recommended outbound fee is derived in a fixed order so the signals don't
  * fight (see buildRecommendation): a balance curve around a per-channel target
- * ratio, a velocity modifier from real demand, a conservative node-benchmark
- * nudge, then hard floors (profit / protect / new-channel) that always win,
- * clamp, round, and finally apply-guards that only decide *whether* it would be
- * applied — never the target itself. Every decision is explained in `reasons`.
+ * ratio (its balanced level lowered toward a cheaper market), a velocity
+ * modifier from real demand, a conservative node-benchmark nudge, the cost of
+ * replacing the outbound of a draining channel, then floors (profit / protect
+ * / new-channel), clamp, round, and finally apply-guards that only decide
+ * *whether* it would be applied — never the target itself. Every decision is
+ * explained in `reasons`.
+ *
+ * Two numbers per channel: the AIM (where the engine wants the fee to end up)
+ * and the TARGET (this update's move toward it). Moves are small and bounded
+ * (review a1, "stay conservative for small nodes"):
+ *   - a raise moves at most RAISE_STEPS steps (elasticity can widen the step a
+ *     little, never remove the bound) — on every channel, routing or not; a
+ *     fee below the policy's min is brought up to the min first (the range
+ *     rule), and raised from there by steps;
+ *   - the protect and profit-floor ramps move at most RAMP_STEPS steps;
+ *   - a lowering moves at most the idle ratchet's steps — on every channel,
+ *     idle or routing (the balance curve or an explore price no longer cut an
+ *     idle channel from 1,500 to 900 ppm in one update);
+ *   - a drained channel nobody routes through is never raised at all;
+ *   - raise only on a drain signal: a channel that isn't below its target
+ *     ratio and that nothing says drains is not raised by the balance curve —
+ *     routing at its fee, that is the price that wins flow (a price that had
+ *     just won two-way flow was raised straight back out of it, 50 → 70
+ *     toward the balanced level of 80, and sat there, priced out). Only drain
+ *     velocity, a draining channel's replacement cost, a floor or the policy's
+ *     min raise it;
+ *   - a missing market reference never lowers a draining channel: a report
+ *     whose graph lacks one uses the channel's last (MARKET_MEMORY_MS), and
+ *     with none at all the channel is held where the curve would lower it
+ *     (its refill cost is unknown — review 3: a peer back from an outage
+ *     still had its inbound channels disabled in the graph, and that one run
+ *     lowered a channel priced at its refill cost; gaps every few days walked
+ *     it down for good).
+ * What moves at once, each for a reason of its own: an idle channel dropping
+ * to the price that last won flow back or to what the market charges into
+ * its peer (evidence, not a guess — and nothing is at stake on a channel
+ * nobody routes through), a pin (the operator's value), the new-channel
+ * floor, a broken lease promise, and a fee outside the policy's min/max.
+ * The anti-churn threshold judges the gap between the current fee and the
+ * AIM, not the size of one deliberate step: it used to veto the engine's own
+ * steps (+20 raise, −30 ratchet, +40 protect at step 10 were all below its
+ * 25 ppm / 20 % bar), freezing draining channels low and idle ones high. The
+ * no-flow rule's own moves (a ratchet step, a jump to the flow-won or the
+ * market price) and any move from a fee outside the policy range are not
+ * judged by it at all: they are bounded and paced already, and at the low
+ * fees small nodes charge the threshold vetoed them within 25 ppm of their
+ * destination.
  */
 
 export interface FeeRecConfig {
@@ -26,7 +71,9 @@ export interface FeeRecConfig {
   /** Flat base fee (msat) to set on managed channels. 0 = volume-first: base fee
    *  deters LND path-finding (esp. small + multi-hop), so drop it to win forwards. */
   baseFeeMsat: number;
-  /** How many `stepPpm` steps the no-flow rule drops an idle channel per run.
+  /** How many `stepPpm` steps the no-flow rule drops an idle channel per run
+   *  — the most any channel is lowered in one move (at least one step), bar
+   *  an idle channel's jump to its flow-won or market price.
    *  Higher = wins routing back faster (volume); lower = eases down gently (profit). */
   noFlowRatchetSteps: number;
   /** Velocity "explore lower" multiplier for idle, over-local channels (<1).
@@ -37,6 +84,9 @@ export interface FeeRecConfig {
   stepPpm: number;
   cooldownHours: number;
   safetyMargin: number;
+  /** The operator's opt-in: a profit floor may lift a fee above maxPpm.
+   *  Off by default — the floor is then capped at maxPpm. */
+  floorAboveMax: boolean;
   flowWindowDays: number;
   peerGateWindowDays: number;
   benchmarkWindowDays: number;
@@ -63,6 +113,7 @@ export const FEE_REC_DEFAULTS: FeeRecConfig = {
   stepPpm: 25,
   cooldownHours: 72,
   safetyMargin: 1.15,
+  floorAboveMax: false,
   flowWindowDays: 14,
   peerGateWindowDays: 30,
   benchmarkWindowDays: 30,
@@ -74,6 +125,102 @@ export const FEE_REC_DEFAULTS: FeeRecConfig = {
   routerTargetLocalRatio: 0.5,
   neutralTargetLocalRatio: 0.5,
 };
+
+/** An ordinary raise moves at most this many steps (×elasticity, bounded). */
+export const RAISE_STEPS = 2;
+/** The protect and profit-floor ramps move at most this many steps. */
+export const RAMP_STEPS = 4;
+/** Elasticity may widen a raise step by at most this factor. */
+const MAX_ELASTIC_STEP = 1.5;
+/** The profit floor comes from the autopilot's own refills of this window. */
+export const FLOOR_WINDOW_DAYS = 30;
+/** De-noised refusals (D20) that make a channel "in demand": at least this
+ *  many distinct attempts, on at least this many days, in the window. */
+export const DEMAND_MIN_ATTEMPTS = 3;
+export const DEMAND_MIN_DAYS = 2;
+export const DEMAND_WINDOW_DAYS = 14;
+/** Draining: net outflow of at least this share of capacity in 30 days,
+ *  with at least DRAIN_MIN_FORWARDS forwards. */
+const DRAIN_NET_SHARE = 0.1;
+const DRAIN_MIN_FORWARDS = 3;
+/** Priced against the market at this share of what others charge into the
+ *  same peer — just under, to compete. */
+const MARKET_SHARE = 0.9;
+/** The longest the fee engine waits for the network graph (a big graph on a
+ *  small machine takes a while to read): past it, this report prices without
+ *  the market — the read goes on and is cached for the next one. Only a cold
+ *  start waits at all: once read, the graph is served at once, a stale one
+ *  while a fresh read runs (suggestions.ts, buildGraphCache). */
+export const MARKET_WAIT_MS = 15_000;
+/** The autopilot's scheduled fee stage waits longer for the FIRST read after
+ *  a restart: priced without the market, that one run lowered a draining
+ *  channel the replacement cost had priced up, and the raise back then waited
+ *  the 72 h raise cooldown. (A page waits MARKET_WAIT_MS.) */
+export const MARKET_RUN_WAIT_MS = 120_000;
+/**
+ * How long a channel's market reference is remembered (review 3). A report
+ * whose graph has no reference for a channel's peer uses the last one seen,
+ * up to this old. Routine gaps: a peer that was offline for a while comes
+ * back with the other nodes' channels into it still disabled (LND re-enables
+ * them ~20 minutes after it is back, then gossip, then this node's graph
+ * cache), so it drops under MARKET_MIN_CHANNELS; a thin peer straddles that
+ * count; a cold start's graph read outlasts the wait. Priced without it, a
+ * draining channel at its refill cost was lowered toward the balance curve
+ * (340 → 310), the cooldown restarted, and the raise back waited 72 h — a gap
+ * every few days walked it down to ~100 ppm for good. What others charge
+ * into a peer doesn't change because the peer was offline for an hour.
+ */
+export const MARKET_MEMORY_MS = 7 * 86_400_000;
+
+/** Per LND connection (tests run several fake nodes in one process): each
+ *  channel's last market reference, and when a report last had it — shared
+ *  by every report (the Fees tab, the autopilot, the rebalancer), as the
+ *  graph cache is. */
+const marketMemory = new WeakMap<AuthenticatedLnd, Map<string, { ref: MarketRef; seenAt: number }>>();
+
+/** A channel's market reference for this report: `seenAt` is set when it is
+ *  a remembered one (this report's graph had none for the peer). */
+interface MarketFor {
+  ref: MarketRef;
+  seenAt: number | null;
+}
+
+/**
+ * This report's market references, completed from memory: a channel the
+ * graph has no reference for now keeps its last one for MARKET_MEMORY_MS.
+ */
+function recallMarket(lnd: AuthenticatedLnd, fresh: Map<string, MarketRef>, nowMs: number): Map<string, MarketFor> {
+  let memory = marketMemory.get(lnd);
+  if (!memory) marketMemory.set(lnd, (memory = new Map()));
+  for (const [id, ref] of fresh) memory.set(id, { ref, seenAt: nowMs });
+  const out = new Map<string, MarketFor>();
+  for (const [id, m] of memory) {
+    if (nowMs - m.seenAt > MARKET_MEMORY_MS) {
+      memory.delete(id);
+      continue;
+    }
+    out.set(id, { ref: m.ref, seenAt: fresh.has(id) ? null : m.seenAt });
+  }
+  return out;
+}
+
+/** The market references, or none if the graph isn't read within `ms`. */
+function marketWithin(lnd: AuthenticatedLnd, channels: ChannelView[], ms: number): Promise<Map<string, MarketRef>> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(new Map()), ms);
+    timer.unref?.();
+    peerMarketFees(lnd, channels).then(
+      (m) => {
+        clearTimeout(timer);
+        resolve(m);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(new Map());
+      },
+    );
+  });
+}
 
 export type FeeRecState =
   | "normal"
@@ -98,13 +245,43 @@ export interface FeeRecMetrics {
   revenue30d: number;
   revenuePpm14d: number | null;
   revenuePpm30d: number | null;
+  /** What the autopilot's refills into this channel cost (FLOOR_WINDOW_DAYS). */
   costBasisPpm: number | null;
   costBasisSource: "rebalance_avg" | "unknown";
+  /** How many refills that is, and when the latest was. */
+  costBasisRefills: number;
+  costBasisLatestAt: string | null;
+  /** The floor in force (capped at maxPpm unless the operator opted in). */
   profitFloorPpm: number | null;
+  profitFloorCapped: boolean;
   peerGate: "ok" | "weak";
   role: ChannelRole;
   isTopEarner: boolean;
   benchmarkComparison: "above" | "median" | "below";
+  /** What other nodes charge to forward into this peer (graph median, ppm). */
+  marketPpm: number | null;
+  marketSamples: number;
+  /** The reference is a remembered one — this report's graph had none for
+   *  the peer (MARKET_MEMORY_MS): when it was last seen. Null: this
+   *  report's own, or none. */
+  marketSeenAt: string | null;
+  /** The peer's own fee back to us on this channel (ppm). */
+  peerFeeToUsPpm: number | null;
+  /** The least a refill of this channel costs on the market: one hop into
+   *  the peer plus the peer's hop back to us (ppm). */
+  replacementCostPpm: number | null;
+  /** Draining, and its fee is below what replacing its outbound costs. */
+  belowReplacement: boolean;
+  /** This fee next to the market into the peer. */
+  marketComparison: "above" | "in_line" | "below" | null;
+  draining: boolean;
+  /** De-noised payments turned away for lack of outbound (D20), 14 days. */
+  refusedAttempts14d: number;
+  refusedSats14d: number;
+  refusedDays14d: number;
+  inDemand: boolean;
+  /** The learned elasticity modifier applied (1 = none). */
+  elasticityMod: number;
 }
 
 export interface FeeRecommendation {
@@ -112,7 +289,10 @@ export interface FeeRecommendation {
   alias: string;
   capacity: number;
   currentPpm: number;
+  /** This update's fee: the next bounded move toward `aimPpm`. */
   targetPpm: number;
+  /** Where the engine wants the fee to end up. */
+  aimPpm: number;
   /** Funding outpoint + current base fee — needed to apply without clobbering base. */
   transactionId: string | null;
   transactionVout: number | null;
@@ -122,6 +302,8 @@ export interface FeeRecommendation {
   /** True when the no-flow rule set this target — the autopilot uses it to track
    *  the episode and record the price at which flow eventually returns. */
   noFlowLowering: boolean;
+  /** Pinned by hand (override "fixed"): applied as set, once. */
+  pinned: boolean;
   /** A channel this node sold (Magma, LSPS1) whose order locked a routing-fee
    *  promise for the lease: the target never exceeds it (leaseCaps.ts). */
   leaseCap: { source: LeaseCap["source"]; orderId: string; feeRateCapPpm: number; baseFeeCapMsat: number; untilHeight: number | null } | null;
@@ -149,13 +331,31 @@ export interface FeeRecReport {
   generatedAt: string;
   config: FeeRecConfig;
   nodeBenchmarks: NodeBenchmarks;
+  /** How many channels have a market reference from the public graph. */
+  marketReferenced: number;
+  /** How many channels the elasticity learner has enough evidence for (its
+   *  gate is strict: most small nodes have none — said so, not implied). */
+  elasticityLearned: number;
   recommendations: FeeRecommendation[];
+}
+
+/** Market and demand signals; read from the graph and the HTLC telemetry
+ *  when not given (tests pass their own). */
+export interface FeeSignals {
+  demand?: Map<string, DemandSignal>;
+  /** Used exactly as given — a channel missing from it has no reference
+   *  (only a market the engine reads itself is completed from memory). */
+  market?: Map<string, MarketRef>;
+  /** How long to wait for the graph when it has to be read (default
+   *  MARKET_WAIT_MS). */
+  marketWaitMs?: number;
 }
 
 /** Lowers step at most once a day — price discovery, not a race to the floor.
  *  (The autopilot loop runs every ~30 min; without pacing an idle channel would
  *  ratchet from any fee to minPpm within hours, before the market can react.) */
 const LOWER_PACING_HOURS = 24;
+const DAY_MS = 86_400_000;
 
 // ── small helpers ─────────────────────────────────────────────────────────────
 const clamp = (n: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, n));
@@ -165,9 +365,18 @@ const median = (xs: number[]): number => {
   const m = Math.floor(s.length / 2);
   return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
 };
+const ago = (iso: string, nowMs: number): string => {
+  const d = Math.max(0, Math.round((nowMs - Date.parse(iso)) / DAY_MS));
+  return d === 0 ? "today" : `${d} d ago`;
+};
+/** "40 min ago", "3 h ago", "2 d ago". */
+const since = (ms: number, nowMs: number): string => {
+  const min = Math.max(0, Math.round((nowMs - ms) / 60_000));
+  return min < 90 ? `${min} min ago` : min < 36 * 60 ? `${Math.round(min / 60)} h ago` : `${Math.round(min / 1440)} d ago`;
+};
 
 /** Per-channel flow + revenue over a window, keyed by channel id. */
-interface Flow {
+export interface Flow {
   out: number;
   inn: number;
   revenue: number;
@@ -213,21 +422,44 @@ function channelAgeDays(channelId: string, currentBlock: number): number | null 
 }
 
 // ── §7 profit floor from rebalance cost basis ─────────────────────────────────
-function costBasisPpmFor(channelId: string, records: RebalanceRecord[]): number | null {
+/**
+ * What refilling this channel cost: the autopilot's own successful refills of
+ * the last FLOOR_WINDOW_DAYS (review a1: a lifetime average, manual refills
+ * at any price included, pinned a channel's fee for months after a single
+ * 614 ppm refill). A refill the operator ran by hand chose its own price and
+ * skipped the profit gate: it sets no floor.
+ */
+export function costBasisFor(
+  channelId: string,
+  records: RebalanceRecord[],
+  nowMs: number,
+): { ppm: number; refills: number; latestAt: string } | null {
+  const cutoff = nowMs - FLOOR_WINDOW_DAYS * DAY_MS;
   let fee = 0;
   let amount = 0;
+  let refills = 0;
+  let latestAt = "";
   for (const r of records) {
-    if (r.ok && r.targetId === channelId && r.feeSats != null && r.amountSats > 0) {
-      fee += r.feeSats;
-      amount += r.amountSats;
-    }
+    if (!r.ok || r.targetId !== channelId || r.feeSats == null || r.amountSats <= 0) continue;
+    if (r.via === "manual") continue;
+    const at = Date.parse(r.at);
+    if (!Number.isFinite(at) || at < cutoff) continue;
+    fee += r.feeSats;
+    amount += r.amountSats;
+    refills += 1;
+    if (r.at > latestAt) latestAt = r.at;
   }
-  return amount > 0 ? Math.round((fee / amount) * 1_000_000) : null;
+  return amount > 0 ? { ppm: Math.round((fee / amount) * 1_000_000), refills, latestAt } : null;
 }
 
 export interface CooldownInput {
   lastApplied: Record<string, string>;
   cooldownHours: number;
+  /** Channels whose last fee update failed (LND refused it, or it couldn't
+   *  be sent): not updated again before this time (ISO) — a broken lease
+   *  promise excepted. Without it, an update LND keeps refusing was resent
+   *  every run, each a failed line in the run history. */
+  retryAfter?: Record<string, string>;
 }
 
 // ── main builder ──────────────────────────────────────────────────────────────
@@ -237,13 +469,15 @@ export async function getFeeRecommendations(
   cooldown: CooldownInput | null,
   configOverrides: Partial<FeeRecConfig> = {},
   channelOverrides: OverrideMap = {},
-  /** Per-channel learned fee elasticity modifier (channelId → ~0.85..1.2). */
+  /** Per-channel learned fee elasticity modifier (channelId → ~0.8..1.25). */
   elasticity: Map<string, number> = new Map(),
   /** Per-channel "flow-won price" (channelId → ppm at which routing last returned
    *  after a no-flow lowering) — jump straight there instead of blind stepping. */
   flowAnchors: Map<string, number> = new Map(),
   /** Routing-fee promises of sold channels (capital.leaseCaps()). */
   leaseCaps: readonly LeaseCap[] = [],
+  /** Market references and de-noised refused demand (read here when absent). */
+  signals: FeeSignals = {},
 ): Promise<FeeRecReport> {
   const cfg = { ...FEE_REC_DEFAULTS, ...configOverrides };
   const [channels, rates, fw14, fw30, wallet] = await Promise.all([
@@ -253,6 +487,14 @@ export async function getFeeRecommendations(
     getForwardsReport(lnd, cfg.benchmarkWindowDays),
     getWalletInfo({ lnd }),
   ]);
+  const demand = signals.demand ?? servableDemand(DEMAND_WINDOW_DAYS);
+  const fresh = signals.market ?? (await marketWithin(lnd, channels, signals.marketWaitMs ?? MARKET_WAIT_MS));
+  const nowMs = Date.now();
+  // A reference this report's graph lacks is the channel's last one, for a
+  // while (MARKET_MEMORY_MS) — for the market the engine reads itself.
+  const market: Map<string, MarketFor> = signals.market
+    ? new Map([...fresh].map(([id, ref]) => [id, { ref, seenAt: null }]))
+    : recallMarket(lnd, fresh, nowMs);
   const rateById = new Map(rates.channels.map((c) => [c.id, c]));
   const f14 = flowMap(fw14.perChannel);
   const f30 = flowMap(fw30.perChannel);
@@ -298,16 +540,22 @@ export async function getFeeRecommendations(
       elasticityMod: elasticity.get(ch.id) ?? 1,
       flowAnchor: flowAnchors.get(ch.id),
       leaseCap: activeCap(leaseCaps, { outpoint: `${ch.transactionId}:${ch.transactionVout}`, channelId: ch.id }, currentBlock),
+      demand: demand.get(ch.id),
+      market: market.get(ch.id)?.ref,
+      marketSeenAt: market.get(ch.id)?.seenAt ?? null,
+      nowMs,
     }),
   );
 
-  // §11 max-changes-per-run: only the biggest moves would actually apply —
-  // after every fee that breaks a lease promise (those are fixed first).
+  // §11 max-changes-per-run: every fee that breaks a lease promise first
+  // (those are fixed first), then the operator's own pins, then the
+  // biggest moves.
   const applyOrder = recommendations
     .filter((r) => r.wouldApply)
     .sort(
       (a, b) =>
         Number(b.leaseCapBreach) - Number(a.leaseCapBreach) ||
+        Number(b.pinned) - Number(a.pinned) ||
         Math.abs(b.targetPpm - b.currentPpm) - Math.abs(a.targetPpm - a.currentPpm),
     );
   applyOrder.slice(cfg.maxChangesPerRun).forEach((r) => {
@@ -315,17 +563,27 @@ export async function getFeeRecommendations(
     r.blockedByGuards.push("max changes per run reached");
   });
 
-  return { generatedAt: new Date().toISOString(), config: cfg, nodeBenchmarks, recommendations };
+  return {
+    generatedAt: new Date(nowMs).toISOString(),
+    config: cfg,
+    nodeBenchmarks,
+    marketReferenced: recommendations.filter((r) => r.metrics.marketPpm !== null).length,
+    elasticityLearned: recommendations.filter((r) => r.metrics.elasticityMod !== 1).length,
+    recommendations,
+  };
 }
 
-interface RateInfo {
+export interface RateInfo {
   fee_rate: number;
   base_fee_mtokens: string;
   transaction_id: string;
   transaction_vout: number;
 }
 
-interface BuildCtx {
+/** What buildRecommendation needs of a channel. */
+export type FeeChannel = Pick<ChannelView, "id" | "peerAlias" | "capacity" | "localRatio" | "role" | "active">;
+
+export interface BuildCtx {
   cfg: FeeRecConfig;
   rate: RateInfo | undefined;
   override: ChannelOverride | undefined;
@@ -340,16 +598,60 @@ interface BuildCtx {
   elasticityMod: number;
   flowAnchor: number | undefined;
   leaseCap: (LeaseCap & { untilHeight: number | null }) | null;
+  /** De-noised refusals on this channel (D20), DEMAND_WINDOW_DAYS. */
+  demand: DemandSignal | undefined;
+  /** What the market charges into this channel's peer. */
+  market: MarketRef | undefined;
+  /** `market` is a remembered reference (this report's graph had none for
+   *  the peer): when it was last seen, ms. Null or absent: this report's. */
+  marketSeenAt?: number | null;
+  nowMs: number;
 }
 
-function buildRecommendation(
-  ch: Awaited<ReturnType<typeof getChannelsView>>[number],
-  ctx: BuildCtx,
-): FeeRecommendation {
+/** Which rule set this update's move — it decides the pacing and which
+ *  reason leads. "range": the policy's min/max moved it (a fee outside them
+ *  is brought into them in one move). */
+type MoveKind = "free" | "raise_step" | "lower_step" | "ramp" | "ratchet" | "jump" | "floor" | "hold" | "range";
+
+/** One channel's recommendation — pure (exported for the engine's own
+ *  simulation tests). */
+export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommendation {
   const { cfg, rate, f14, f30, records, bench, enoughChannels, earnerCutoff } = ctx;
   const currentPpm = rate?.fee_rate ?? 0;
   const cap = Math.max(1, ch.capacity);
+  const step = Math.max(1, cfg.stepPpm);
+  // The reason that leads is the one shown in the Why column and recorded
+  // as the run history's "why" (reasons[0]), so it must be the rule that set
+  // the move — review: a raise toward the replacement cost read "market: …
+  // balanced level 80→36 ppm to compete". Rules that set the target outright
+  // (a hold, a floor, the no-flow rule, a pin, a lease promise) go in front
+  // as they apply (`dominant`); the other lines are notes, and the note that
+  // set the aim is moved up behind them once the move is known (`lead`).
   const reasons: string[] = [];
+  let dominantCount = 0;
+  const dominant = (line: string): void => {
+    reasons.unshift(line);
+    dominantCount += 1;
+  };
+  /** Take back a line whose rule did not set the move after all. */
+  const dropLine = (line: string | null): void => {
+    const at = line == null ? -1 : reasons.indexOf(line);
+    if (at < 0) return;
+    reasons.splice(at, 1);
+    if (at < dominantCount) dominantCount -= 1;
+  };
+  // Lines that say what the engine's own move does ("ramping 80→120", "kept
+  // at 350 ppm or more", "brought down to it at once"), each with the fact it
+  // states without that claim (null: nothing left to say) and the direction
+  // it claims (0: none, a bound). When a pin, an exclusion or a lease promise
+  // sets another move, only the facts stay — a pinned 25 ppm read "profit
+  // floor: … — ramping 80→84" beside it; so do they when the fee moves the
+  // other way all the same ("lowering toward 95 ppm" under a floor's raise).
+  const claims = new Map<string, { fact: string | null; dir: -1 | 0 | 1 }>();
+  const claim = (line: string, fact: string | null, dir: -1 | 0 | 1 = 0): string => {
+    claims.set(line, { fact, dir });
+    return line;
+  };
 
   // 1. metrics
   const grossFlow14d = (f14.out + f14.inn) / cap;
@@ -359,58 +661,116 @@ function buildRecommendation(
   const revenuePpm14d = f14.out > 0 ? Math.round((f14.revenue / f14.out) * 1_000_000) : null;
   const revenuePpm30d = f30.out > 0 ? Math.round((f30.revenue / f30.out) * 1_000_000) : null;
   const ageDays = channelAgeDays(ch.id, ctx.currentBlock);
-  const costBasisPpm = costBasisPpmFor(ch.id, records);
-  const profitFloorPpm = costBasisPpm != null ? Math.round(costBasisPpm * cfg.safetyMargin) : null;
+  const isNewChan = ageDays != null && ageDays < cfg.newChannelProtectionDays;
+  const basis = costBasisFor(ch.id, records, ctx.nowMs);
+  const costBasisPpm = basis?.ppm ?? null;
+  const rawFloor = costBasisPpm != null ? Math.round(costBasisPpm * cfg.safetyMargin) : null;
+  // A floor above the operator's own ceiling only with their opt-in: one
+  // pricey refill used to lift a channel past maxPpm in a single move.
+  const profitFloorCapped = rawFloor != null && !cfg.floorAboveMax && rawFloor > cfg.maxPpm;
+  const profitFloorPpm = rawFloor == null ? null : profitFloorCapped ? cfg.maxPpm : rawFloor;
   const isTopEarner = enoughChannels && f30.revenue > 0 && f30.revenue >= earnerCutoff;
+
+  // D20 — payments turned away for lack of outbound, de-noised (no probes,
+  // retries or HTLCs no refill could carry). Repeated ones mean the channel
+  // has demand even without a successful forward: it is not "idle".
+  const demand = ctx.demand;
+  const inDemand = !!demand && demand.attempts >= DEMAND_MIN_ATTEMPTS && demand.days >= DEMAND_MIN_DAYS;
+  // Nobody routed through it in 30 days (and it isn't new, and it isn't
+  // turning payments away): drained, it is held; otherwise lowered by the
+  // no-flow rule.
+  const idle = f30.forwards === 0 && !isNewChan && !inDemand;
 
   // §6 peer gate — has it routed out (or seen flow) in the gate window?
   // On active routing paths in either direction? A fully-drained channel can't
-  // route out, so also count inbound flow (it's being naturally refilled) — else
-  // we'd wrongly flag a busy, just-drained channel as a dead peer.
-  const peerGate: "ok" | "weak" = f30.out > 0 || f30.inn > 0 || f30.forwards > 0 ? "ok" : "weak";
+  // route out, so also count inbound flow (it's being naturally refilled) and
+  // payments it turned away — else we'd wrongly flag a busy, just-drained
+  // channel as a dead peer.
+  const peerGate: "ok" | "weak" = f30.out > 0 || f30.inn > 0 || f30.forwards > 0 || inDemand ? "ok" : "weak";
 
-  // §2 target ratio + §1 balance base
+  // Market reference (public graph): what others charge into the same peer
+  // — this report's, or the last one seen (MARKET_MEMORY_MS), which says so.
+  const market = ctx.market;
+  const seen = market && ctx.marketSeenAt != null ? ` (last seen ${since(ctx.marketSeenAt, ctx.nowMs)})` : "";
+  const marketPpm = market?.intoPeerPpm ?? null;
+  const replacementCostPpm = market ? market.intoPeerPpm + (market.peerFeeToUsPpm ?? 0) : null;
+  const draining = f30.forwards >= DRAIN_MIN_FORWARDS && netDrain30d >= DRAIN_NET_SHARE;
+  const competitivePpm = marketPpm != null ? Math.max(cfg.minPpm, Math.round(marketPpm * MARKET_SHARE)) : null;
+
+  // §2 target ratio
   const targetLocalRatio = targetLocalRatioFor(ch.role, cfg);
-  const base = balanceTargetPpm(ch.localRatio, targetLocalRatio, cfg);
 
   // §3 velocity modifier — volume-first: gentle on raises (never slam a working
-  // channel up), and lower idle outbound liquidity to win flow.
+  // channel up), and lower idle outbound liquidity to win flow. The first
+  // three branches say the channel wins flow at its price (`winsFlow`).
   let velocityMod = 1;
   let exploring = false;
+  let winsFlow = false;
+  let velocityLine: string | null = null;
   if (grossFlow14d >= 0.2 && netDrain14d >= 0.1) {
     velocityMod = 1.1;
-    reasons.push(`velocity: draining fast (${Math.round(netDrain14d * 100)}% net in ${cfg.flowWindowDays}d) — small nudge up`);
+    winsFlow = true;
+    velocityLine = `velocity: draining fast (${Math.round(netDrain14d * 100)}% net in ${cfg.flowWindowDays}d) — small nudge up`;
   } else if (grossFlow14d >= 0.05 && netDrain14d >= 0.03) {
     velocityMod = 1.05;
-    reasons.push("velocity: steady outbound demand — small nudge up");
+    winsFlow = true;
+    velocityLine = "velocity: steady outbound demand — small nudge up";
   } else if (grossFlow14d >= 0.2 && Math.abs(netDrain14d) < 0.05) {
-    velocityMod = 1;
-    reasons.push("velocity: active and balanced — holding");
-  } else if (grossFlow14d < 0.01 && ch.localRatio > targetLocalRatio + 0.2) {
+    winsFlow = true;
+    velocityLine = "velocity: active and balanced — holding";
+  } else if (grossFlow14d < 0.01 && ch.localRatio > targetLocalRatio + 0.2 && !inDemand && !isNewChan) {
+    // (Never on a brand-new channel: it has had no time to route.)
     velocityMod = cfg.exploreLowerModifier;
     exploring = true;
-    reasons.push("idle test: idle outbound liquidity — testing a lower fee");
+    velocityLine = "idle test: idle outbound liquidity — testing a lower fee";
   }
 
   // §4 conservative node-benchmark nudge
   let benchMod = 1;
   let benchmarkComparison: "above" | "median" | "below" = "median";
+  let benchLine: string | null = null;
   if (enoughChannels && bench.medianGrossFlow14d > 0) {
     if (grossFlow14d >= bench.medianGrossFlow14d * 1.5) benchmarkComparison = "above";
     else if (grossFlow14d <= bench.medianGrossFlow14d * 0.5) benchmarkComparison = "below";
     if (benchmarkComparison === "above" && netDrain14d > 0.05) {
       benchMod = 1.05;
-      reasons.push("benchmark: outperforms node average and draining — raising fee");
+      benchLine = "benchmark: outperforms node average and draining — raising fee";
     } else if (isTopEarner) {
-      benchMod = Math.max(benchMod, 1); // never let a top earner be pushed cheaper
+      // never let a top earner be pushed cheaper (by this rule, the explore
+      // test or the market below)
       if (velocityMod < 1) velocityMod = 1;
-      reasons.push("benchmark: top-earning channel — preserving fee level");
-    } else if (benchmarkComparison === "below" && ch.localRatio > targetLocalRatio + 0.15 && peerGate === "ok") {
+      benchLine = "benchmark: top-earning channel — preserving fee level";
+    } else if (benchmarkComparison === "below" && ch.localRatio > targetLocalRatio + 0.15 && peerGate === "ok" && !inDemand) {
       benchMod = 0.95;
       exploring = exploring || velocityMod <= 1;
-      reasons.push("benchmark: below node flow average — testing a lower fee");
+      benchLine = "benchmark: below node flow average — testing a lower fee";
     }
   }
+
+  // The balanced level: the operator's — lowered toward a cheaper market only
+  // on a channel that is NOT winning flow at its own price: nothing forwarded
+  // in the flow window, testing a lower fee, or well below the node's flow.
+  // A channel that routes at its price keeps it: a top earner, one whose
+  // velocity says draining, steady outbound demand or active and balanced, a
+  // draining channel (its replacement cost decides) and one turning payments
+  // away (review: a top earner routing 2.4M a month at 80 ppm was cut toward
+  // 27 ppm while its own reasons said "holding"). The operator's level stays
+  // the ceiling — raising toward the market is what the replacement cost
+  // below does, and only for draining channels.
+  const notWinningFlow = f14.forwards === 0 || exploring || benchmarkComparison === "below";
+  const keepsItsPrice = winsFlow || isTopEarner || draining || inDemand;
+  let neutral = cfg.neutralPpm;
+  let marketLine: string | null = null;
+  if (competitivePpm != null && competitivePpm < neutral && notWinningFlow && !keepsItsPrice) {
+    neutral = competitivePpm;
+    marketLine = `market: other nodes charge ~${marketPpm} ppm into this peer${seen} — balanced level ${cfg.neutralPpm}→${neutral} ppm to compete`;
+    reasons.push(marketLine);
+  }
+  if (velocityLine) reasons.push(velocityLine);
+  if (benchLine) reasons.push(benchLine);
+
+  // §1 balance base on the (possibly market-lowered) balanced level
+  const base = balanceTargetPpm(ch.localRatio, targetLocalRatio, { ...cfg, neutralPpm: neutral });
 
   // §3.5 elasticity gate: don't raise on drain if raising measurably lost flow
   // here before. Only bites when there's real evidence (elasticityMod < 1);
@@ -424,111 +784,477 @@ function buildRecommendation(
   // learned signal can steer the price toward the revenue peak but never blow
   // past the combined envelope.
   const combinedMod = clamp(velocityMod * benchMod * ctx.elasticityMod, 0.7, 1.5);
-  let target = base * combinedMod;
+  let aim = base * combinedMod;
+  let elasticityLine: string | null = null;
   if (ctx.elasticityMod !== 1) {
-    reasons.push(
+    const without = Math.round(base * clamp(velocityMod * benchMod, 0.7, 1.5));
+    elasticityLine =
       ctx.elasticityMod > 1
-        ? `elasticity: raising fees lifted revenue here before — pricing ~${Math.round((ctx.elasticityMod - 1) * 100)}% higher`
-        : `elasticity: higher fees cost flow here before — easing ~${Math.round((1 - ctx.elasticityMod) * 100)}% lower`,
-    );
+        ? `elasticity ×${ctx.elasticityMod}: measured changes here say charging more lifted revenue — aim ${without}→${Math.round(aim)} ppm, raise step widened`
+        : `elasticity ×${ctx.elasticityMod}: measured changes here say higher fees cost flow — aim ${without}→${Math.round(aim)} ppm`;
+    reasons.push(elasticityLine);
   }
 
-  // Volume-first guard: never slam an actively-routing channel up in one move —
-  // raise gently and let measured elasticity justify bigger moves. This is what
-  // prevents pricing a working channel out of the market (the failure that killed
-  // routing). Floors below can still apply for real cost recovery.
-  if (f30.forwards > 0 && ctx.elasticityMod <= 1) {
-    const gentleCap = (currentPpm || cfg.neutralPpm) + 2 * cfg.stepPpm;
-    if (target > gentleCap) {
-      target = gentleCap;
-      reasons.push("guard: channel is routing — capping the rise to a small step");
+  // Raise only on a drain signal (review 2). Once a lower fee (the market's,
+  // or one the no-flow rule found) won a channel two-way flow, the balance
+  // curve raised it straight back out of that price — 50 → 70 on the way to
+  // the balanced level of 80 — and with nothing routed for two weeks the
+  // market lowered it again, and so on: over 120 simulated days such a
+  // channel sat priced out 80–90 % of the time. A channel that isn't below
+  // its target ratio (the curve raising a drained channel IS a drain signal)
+  // and that nothing says drains — no drain velocity, not draining (its
+  // replacement cost decides) — is held at its fee: routing at it, it is the
+  // price that wins flow; routing nothing, a higher fee wins nothing back
+  // either (and a run that missed the market reference raised a market-priced
+  // channel back toward the operator's level). Only a floor (protect, profit
+  // floor, new channel, below) or the policy's min lifts it then. A lower
+  // aim — the curve over the target ratio, the market, a measured elasticity
+  // below 1 — still applies. Where a measured elasticity below 1 has switched
+  // the drain reflex off ("not raising on drain"), draining raises nothing
+  // either: the channel is held — before, its reasons said "not raising
+  // toward the replacement cost" while the curve raised it all the same. (The
+  // benchmark's draining nudge needs a 14-day net drain over 5 %, which is
+  // drain velocity too.)
+  const noDrainSignal =
+    ch.localRatio >= targetLocalRatio - cfg.deadband && velocityMod <= 1 && (!draining || ctx.elasticityMod < 1);
+  // (A fee below the policy's min is lifted to the min by the range rule.)
+  let heldLine: string | null = null;
+  const curveAt = (): string => `the balance curve's ~${Math.round(aim / step) * step} ppm`;
+  if (noDrainSignal && aim > currentPpm) {
+    heldLine = draining
+      ? `hold: draining, but higher fees cost flow here before — not raised toward ${curveAt()}`
+      : f14.forwards > 0
+        ? `hold: it routes at ${currentPpm} ppm (${f14.forwards} forward${f14.forwards === 1 ? "" : "s"} in ${cfg.flowWindowDays} d) and nothing says it drains — not raised toward ${curveAt()}`
+        : `hold: not below its target ratio and nothing says it drains — not raised toward ${curveAt()} (a higher fee wins no flow back)`;
+    aim = currentPpm;
+    reasons.push(heldLine);
+  } else if (draining && !market && aim < currentPpm) {
+    // A draining channel with no market reference — none in this report and
+    // none remembered (a thin peer, a cold start, a graph that can't be
+    // read): what refilling it costs is unknown, so its outbound is not sold
+    // cheaper on the balance curve's word either — held (review 3: one run
+    // without the reference lowered a channel priced at its refill cost
+    // 340 → 310 toward the balanced level; with every lowering restarting the
+    // 72 h raise wait, gaps every few days walked it down to ~100 for good).
+    // A higher aim still raises it; the range rule and a lease promise still
+    // lower it.
+    heldLine = `hold: draining — no market reference for its refill cost this run, so it is not lowered toward ${curveAt()}`;
+    aim = currentPpm;
+    reasons.push(heldLine);
+  }
+
+  // Replacement cost (review a1): a draining channel's outbound is sold once —
+  // getting it back costs at least one hop into the peer and the peer's hop
+  // back to us. Price toward that (gently, through the raise step below)
+  // instead of selling it below what it costs to replace. Two-way channels
+  // keep their volume-first price.
+  const belowReplacement = draining && replacementCostPpm != null && currentPpm < replacementCostPpm;
+  // Set only when it raised the aim (it then leads the reasons).
+  let replacementLine: string | null = null;
+  if (draining && replacementCostPpm != null && market) {
+    const refill = Math.min(cfg.maxPpm, Math.round(replacementCostPpm * cfg.safetyMargin));
+    if (refill > aim) {
+      const cost =
+        `a refill costs at least ~${replacementCostPpm} ppm (others charge ~${market.intoPeerPpm} into the peer` +
+        `${market.peerFeeToUsPpm != null ? `, it charges ${market.peerFeeToUsPpm} back to you` : ""})${seen}`;
+      if (ctx.elasticityMod < 1) {
+        // Measured here: higher fees cost flow. The replacement cost doesn't
+        // raise the fee then (review: "raising lost revenue here before — not
+        // raising on drain", and the aim still went 80 → 350) — but the
+        // outbound isn't sold cheaper still either: held at the current fee
+        // (or the curve's aim, if that is higher — only on a channel below its
+        // target ratio; anywhere else the hold above already kept the fee).
+        aim = Math.max(aim, Math.min(refill, currentPpm));
+        reasons.push(
+          currentPpm < refill
+            ? `replacement: draining, and ${cost} — but higher fees cost flow here before: not raising toward ${refill} ppm, nor selling cheaper`
+            : `replacement: draining, and ${cost} — not sold below ${refill} ppm`,
+        );
+      } else {
+        aim = refill;
+        // (Priced above it, the channel is lowered toward it — and no
+        // further: the curve's level below it is not where it is going.)
+        replacementLine =
+          currentPpm > refill
+            ? claim(`replacement: draining, and ${cost} — priced above that: lowering toward ${refill} ppm, not below`, `replacement: draining, and ${cost}`, -1)
+            : claim(`replacement: draining, and ${cost} — pricing toward ${refill} ppm`, `replacement: draining, and ${cost}`, 1);
+        reasons.push(replacementLine);
+      }
     }
   }
 
-  // §10 hard floors (always win). The binding floor's reason is unshifted to the
-  // front so the *dominant* reason is shown first. Floors are safety/economics
-  // limits, so they may exceed maxPpm — otherwise a low maxPpm would defeat
-  // protect mode and let the node route below its own refill cost.
+  // ── the move: bounded steps toward the aim ─────────────────────────────
+  let target = aim;
+  let kind: MoveKind = "free";
+  // The move's bounds (for rounding below, which must not stretch them).
+  let hiLimit = Infinity;
+  let loLimit = -Infinity;
+  // Every raise that isn't a floor moves at most RAISE_STEPS steps, routing
+  // or not — the gentle-raise philosophy (never slam a channel up: that is
+  // what once priced the node out of the market) on every channel. Measured
+  // elasticity may widen the step, never remove the bound. Counted from the
+  // fee itself (it was counted from the balanced level for a fee of 0: "0 →
+  // 100" in one update); a fee below the policy's min is brought up to the
+  // min first, by the range rule below.
+  const from = currentPpm;
+  const elasticStep = ctx.elasticityMod > 1 ? Math.min(MAX_ELASTIC_STEP, ctx.elasticityMod) : 1;
+  const raiseStep = RAISE_STEPS * step * elasticStep;
+  if (target > from + raiseStep) {
+    target = from + raiseStep;
+    kind = "raise_step";
+    hiLimit = from + raiseStep;
+  }
+  // A drained channel nobody routes through is never raised: there is no
+  // flow to slow, and it would sit at a high fee once it refills (review a1:
+  // 80 → 900 ppm in one update, then stuck at 590 after a refill).
+  const drainedIdle = idle && ch.localRatio < 0.1;
+  let drainedIdleLine: string | null = null;
+  if (drainedIdle && target > currentPpm) {
+    target = currentPpm;
+    aim = Math.min(aim, currentPpm);
+    kind = "hold";
+    drainedIdleLine = `hold: drained (${Math.round(ch.localRatio * 100)}% local) and idle for 30 days — an idle channel is never raised`;
+    dominant(drainedIdleLine);
+  }
+
+  // §10 floors. The binding floor's reason is unshifted to the front so the
+  // *dominant* reason is shown first. The protect and profit-floor ramps move
+  // at most RAMP_STEPS steps per update; only the new-channel floor jumps.
   let floored: FeeRecState | null = null;
   let hardFloor = 0;
+  // The highest floor the aim keeps (rounding never takes the aim under it).
+  let aimFloor = 0;
+  let aimCeiling = cfg.maxPpm;
   if (ageDays != null && ageDays < cfg.newChannelProtectionDays && f30.forwards < 3) {
+    // Its protected fee holds whether or not it binds this move: rounding
+    // never takes a new channel under it (an aim of exactly 80 rounded to 75
+    // on a 25-ppm grid).
+    aimFloor = Math.max(aimFloor, cfg.newChannelMinPpm);
+    hardFloor = Math.max(hardFloor, cfg.newChannelMinPpm);
     if (cfg.newChannelMinPpm > target) {
+      const fact = `new channel: only ${ageDays}d old with little history — its protected fee is ${cfg.newChannelMinPpm} ppm`;
+      const line = `new channel: only ${ageDays}d old with little history — keeping a protected fee`;
       target = cfg.newChannelMinPpm;
-      hardFloor = Math.max(hardFloor, cfg.newChannelMinPpm);
-      reasons.unshift(`new channel: only ${ageDays}d old with little history — keeping a protected fee`);
+      aim = Math.max(aim, cfg.newChannelMinPpm);
+      aimCeiling = Math.max(aimCeiling, cfg.newChannelMinPpm);
+      if (cfg.newChannelMinPpm > currentPpm) {
+        // It lifts the fee: at once, and it is why.
+        kind = "floor";
+        hiLimit = Infinity;
+        dominant(claim(line, fact));
+      } else {
+        // A fee above it is only stopped short of it (lowered by steps).
+        reasons.push(claim(`${line} (not below ${cfg.newChannelMinPpm} ppm)`, fact));
+      }
     }
     exploring = false; // never explore-lower a brand-new channel
   }
-  if (profitFloorPpm != null && profitFloorPpm > target) {
-    target = profitFloorPpm;
-    hardFloor = Math.max(hardFloor, profitFloorPpm);
+  // How far a floor lifts this move: upward by at most RAMP_STEPS steps (a
+  // floor below the current fee only stops a lowering short of it). A fee
+  // below the policy's min goes to the min first (the range rule below).
+  const liftTo = (floor: number): number =>
+    floor > currentPpm ? Math.min(floor, currentPpm < cfg.minPpm ? cfg.minPpm : currentPpm + RAMP_STEPS * step) : floor;
+  // (An idle channel's floor would be overridden by the no-flow rule below.)
+  if (profitFloorPpm != null && basis && profitFloorPpm > target && !idle) {
+    const ramped = liftTo(profitFloorPpm);
+    // It leads when its ramp IS this move. One below the current fee only
+    // stops a lowering short of it — that lowering's own rule leads; one that
+    // a bigger lift outdoes (the new-channel floor) is a note (it led with
+    // "ramping 45→49" while the new-channel floor took the fee 45 → 80).
+    const lifts = ramped > currentPpm && ramped > target;
+    if (ramped > target) {
+      target = ramped;
+      if (lifts) {
+        kind = "ramp";
+        hiLimit = ramped;
+      }
+    }
+    aim = Math.max(aim, profitFloorPpm);
+    aimFloor = Math.max(aimFloor, profitFloorPpm);
+    hardFloor = Math.max(hardFloor, ramped);
+    aimCeiling = Math.max(aimCeiling, profitFloorPpm);
     floored = "recovering_cost";
-    reasons.unshift(`profit floor: raised above refill cost (basis ${costBasisPpm} ppm × ${cfg.safetyMargin})`);
+    const fact =
+      `profit floor: the autopilot's refills into it cost ${costBasisPpm} ppm (${basis.refills} in ${FLOOR_WINDOW_DAYS} d, latest ${ago(basis.latestAt, ctx.nowMs)})` +
+      ` × ${cfg.safetyMargin} = ${rawFloor} ppm${profitFloorCapped ? ` — capped at your max ${cfg.maxPpm} ppm` : ""}`;
+    const line = fact + (lifts && ramped < profitFloorPpm ? ` — ramping ${currentPpm}→${ramped}` : "");
+    if (lifts) dominant(claim(line, fact, line === fact ? 0 : 1));
+    else reasons.push(profitFloorPpm <= currentPpm ? claim(`${line} — not lowered below it`, fact) : line);
   }
   // Protect only a drained channel that is STILL in demand — a modest bump to
-  // slow the bleed, never a flat ceiling. A drained + idle channel is handled by
-  // the no-flow rule below (lowered), never slammed to a high fee.
-  if (ch.localRatio < 0.1 && f30.forwards > 0) {
-    // Ramp, don't slam: step toward protectPpm by at most 4 steps per change —
-    // the gentle-raise philosophy applies to safety bumps too (the old one-shot
-    // jump to protectPpm was the outage mechanic in miniature).
-    const ramped = Math.min(cfg.protectPpm, (currentPpm || cfg.neutralPpm) + 4 * cfg.stepPpm);
-    if (ramped > target) target = ramped;
+  // slow the bleed, never a flat ceiling. In demand: it forwarded in the
+  // window, or it keeps turning payments away for lack of outbound.
+  if (ch.localRatio < 0.1 && (f30.forwards > 0 || inDemand)) {
+    // Ramp, don't slam: step toward protectPpm by at most RAMP_STEPS steps
+    // per change (the old one-shot jump to protectPpm was the outage
+    // mechanic in miniature).
+    const ramped = liftTo(cfg.protectPpm);
+    // It leads only when it lifts the fee (a fee above protectPpm walking
+    // down the curve, or stopped at protectPpm on the way, is not "bumped").
+    const lifts = ramped > target && ramped > currentPpm;
+    if (ramped > target) {
+      target = ramped;
+      if (lifts) {
+        kind = "ramp";
+        hiLimit = ramped;
+      }
+    }
+    aim = Math.max(aim, cfg.protectPpm);
+    aimFloor = Math.max(aimFloor, cfg.protectPpm);
     hardFloor = Math.max(hardFloor, ramped);
+    aimCeiling = Math.max(aimCeiling, cfg.protectPpm);
     floored = "protecting_liquidity";
-    reasons.unshift(
-      ramped < cfg.protectPpm
-        ? `protect: drained (${Math.round(ch.localRatio * 100)}% local) but still in demand — ramping toward ${cfg.protectPpm} ppm`
-        : `protect: drained (${Math.round(ch.localRatio * 100)}% local) but still in demand — modest bump`,
-    );
+    const fact = `protect: drained (${Math.round(ch.localRatio * 100)}% local) but still in demand`;
+    // (Short of protectPpm this move, it is "ramping toward" it — also when
+    // another floor's lift set the move: "kept at 350 ppm or more" was false
+    // there.)
+    const toward = `${fact} — ramping toward ${cfg.protectPpm} ppm`;
+    if (lifts) dominant(claim(ramped < cfg.protectPpm ? toward : `${fact} — modest bump`, fact, 1));
+    else reasons.push(ramped < cfg.protectPpm ? claim(toward, fact, 1) : claim(`${fact} — kept at ${cfg.protectPpm} ppm or more`, fact));
   }
 
+  // The most any channel is lowered in one move: its ratchet's steps (at
+  // least one).
+  const lowerStep = Math.max(1, cfg.noFlowRatchetSteps) * step;
+
   // No routing → lower (the core volume-first safety): a channel that hasn't
-  // routed in the benchmark window gets cheaper each run, toward minPpm, to win
-  // flow back. Overrides the curve + floors (except new-channel protection) — the
-  // opposite of a drain reflex. We never price-kill an idle channel.
-  const isNewChan = ageDays != null && ageDays < cfg.newChannelProtectionDays;
+  // routed in the benchmark window gets cheaper, toward minPpm, to win flow
+  // back. Overrides the curve + floors (except new-channel protection) — the
+  // opposite of a drain reflex. We never price-kill an idle channel. A channel
+  // that keeps turning payments away is not idle (D20): no lowering.
   let noFlowLowering = false;
-  if (f30.forwards === 0 && ch.localRatio >= 0.1 && !isNewChan) {
-    const stepped = currentPpm > 0 ? currentPpm - cfg.noFlowRatchetSteps * cfg.stepPpm : cfg.neutralPpm;
-    // Flow-won anchor: if routing last returned here at a known price, jump
-    // straight to it (best evidence beats blind stepping — a lower can't hurt a
-    // channel that routed nothing for 30d). Only below the anchor do we resume
-    // slow stepping — demand may have moved.
+  let noFlowLine: string | null = null;
+  const exploringBeforeNoFlow = exploring;
+  if (idle && ch.localRatio >= 0.1) {
     const anchor = ctx.flowAnchor;
-    const lowered = anchor != null && currentPpm > anchor ? anchor : stepped;
-    target = Math.max(cfg.minPpm, Math.min(target, lowered));
+    // The market's price on the "Round to" grid: an idle channel already
+    // there (40 ppm against 0.9 × 40 = 36) is AT the market — before, the
+    // jump to 36 rounded back to 40 every day, and the channel never stepped
+    // on below it.
+    const marketDest = competitivePpm != null ? Math.max(cfg.minPpm, Math.round(competitivePpm / step) * step) : null;
+    let lowered: number;
+    let dest: number;
+    let why: string;
+    if (anchor != null && currentPpm > anchor) {
+      // Flow-won anchor: routing last returned here at a known price — jump
+      // straight to it (best evidence beats blind stepping; a lower can't
+      // hurt a channel that routed nothing for 30 d).
+      lowered = anchor;
+      dest = anchor;
+      kind = "jump";
+      why = `no flow: dropping to ${Math.max(cfg.minPpm, anchor)} ppm — the last price that won routing back here`;
+    } else if (anchor == null && marketDest != null && currentPpm > marketDest) {
+      // No anchor yet: the market's price into this peer is the next best
+      // evidence — a Tor-only small node can't afford a month per blind
+      // price test (review a1: blind-price-discovery).
+      lowered = marketDest;
+      dest = marketDest;
+      kind = "jump";
+      why = `no flow: other nodes charge ~${marketPpm} ppm into this peer${seen} — dropping to ${marketDest} ppm instead of stepping down blind`;
+    } else {
+      // Below the anchor or the market (or no reference): slow stepping —
+      // demand may have moved. (A fee below the min — 0, say — is brought up
+      // to the min by the range rule, not to the balanced level.)
+      lowered = currentPpm - lowerStep;
+      dest = cfg.minPpm;
+      kind = "ratchet";
+      why = "no flow: nothing routed here recently — lowering toward min to win routing back";
+    }
+    // Exactly the evidence's price, or exactly one ratchet step: the curve or
+    // an explore price no longer cut an idle channel further in one move
+    // (review: 1,500 → 900 ppm at 20% local; and a "dropping to 200 ppm" jump
+    // that landed on the curve's 40).
+    target = Math.max(cfg.minPpm, lowered);
+    aim = Math.max(cfg.minPpm, Math.min(aim, dest));
+    // Rounding must not stretch the one step, nor move a jump off the price
+    // it jumps to.
+    loLimit = target;
+    hiLimit = kind === "jump" ? target : Infinity;
     hardFloor = 0;
+    aimFloor = 0;
+    aimCeiling = cfg.maxPpm;
     floored = null;
     exploring = true;
     noFlowLowering = true;
-    reasons.unshift(
-      anchor != null && currentPpm > anchor
-        ? `no flow: dropping to ${anchor} ppm — the last price that won routing back here`
-        : "no flow: nothing routed here recently — lowering toward min to win routing back",
-    );
+    noFlowLine = claim(why, "no flow: nothing routed here recently", -1);
+    dominant(why);
   }
 
-  // §10 clamp + round — floors may push the ceiling above maxPpm
-  target = clamp(target, cfg.minPpm, Math.max(cfg.maxPpm, hardFloor));
-  let targetPpm = Math.round(target / cfg.stepPpm) * cfg.stepPpm;
+  // Every other lowering moves at most the ratchet's steps, too — routing,
+  // turning payments away, brand new or drained: a refill or a curve swing
+  // must not cut a channel's price to a fraction overnight. (Only the policy
+  // range below can move it further.)
+  if (!noFlowLowering && target < currentPpm - lowerStep) {
+    target = currentPpm - lowerStep;
+    kind = "lower_step";
+    loLimit = currentPpm - lowerStep;
+  }
 
+  // §10 clamp + round — floors may push the ceiling above maxPpm. Rounding
+  // never stretches a bounded move past its bound.
+  const ceiling = Math.max(cfg.maxPpm, hardFloor);
+  target = clamp(target, cfg.minPpm, ceiling);
+  aim = clamp(aim, cfg.minPpm, aimCeiling);
+  // The policy range wins over a step bound (an operator who lowers maxPpm
+  // means it now): a fee above the max is brought down to it in one move. A
+  // fee below the min is brought up to the min — and only to it, raises step
+  // on from there (before, a fee of 0 went "0 → 100" in one update, under a
+  // "raising at most 20 ppm per move" guard); only the new-channel floor
+  // lifts it further at once. Either way the range is the reason.
+  // (Above the max: whether the clamp brought it to the max or another rule
+  // already had — a profit floor stopping a lowering at the max; a rule that
+  // takes it lower still decides, and leads.)
+  const aboveMax = currentPpm > ceiling && target >= ceiling;
+  const belowMin = currentPpm < cfg.minPpm && target > currentPpm && kind !== "floor";
+  if (belowMin) {
+    target = cfg.minPpm;
+    // The range lifts it — not the rule that held or lowered it: an idle
+    // channel at 0 read "no flow: … lowering toward min" under "brought up to
+    // it", counted as a no-flow lowering (opening a flow-won episode for a
+    // raise) and as testing a lower fee; a drained idle one kept "an idle
+    // channel is never raised". (Their lines go at the end, with every line
+    // that denies the final move; the episode flag is a lowering's only.)
+    if (noFlowLowering) exploring = exploringBeforeNoFlow;
+  }
+  if (aboveMax || belowMin) {
+    kind = "range";
+    // (A pin or an exclusion below decides instead — and says so.)
+    const manual = ctx.override?.mode === "exclude" || (ctx.override?.mode === "fixed" && Number.isFinite(ctx.override.fixedPpm));
+    if (!manual) {
+      const max = target > cfg.maxPpm ? `${Math.round(target)} ppm (your max, lifted to its floor)` : `your max of ${cfg.maxPpm} ppm`;
+      const fact = aboveMax ? `range: ${currentPpm} ppm is above ${max}` : `range: ${currentPpm} ppm is below your min of ${cfg.minPpm} ppm`;
+      dominant(
+        aboveMax ? claim(`${fact} — brought down to it at once`, fact, -1) : claim(`${fact} — brought up to it at once, raised from there by steps`, fact, 1),
+      );
+    }
+  }
+  if (target < loLimit) loLimit = -Infinity;
+  if (target > hiLimit) hiLimit = Infinity;
+  // On the "Round to" grid — but a fee at the policy's min or max lands
+  // there exactly: rounding 25 up to 30 (Math.round(2.5)) stopped every walk
+  // down 5 ppm short of a min of 25, and rounding could cross either bound.
+  const onGrid = (p: number, hi: number): number =>
+    p <= cfg.minPpm ? cfg.minPpm : p >= hi ? hi : clamp(Math.round(p / step) * step, cfg.minPpm, hi);
+  let targetPpm = onGrid(target, ceiling);
+  if (targetPpm > hiLimit) targetPpm = Math.floor(hiLimit);
+  if (targetPpm < loLimit) targetPpm = Math.ceil(loLimit);
+  // Nor under a floor this move keeps (the new channel's fee, a protect or
+  // profit-floor ramp): it lands on it exactly — on a 25-ppm grid a new
+  // channel's 80 rounded to 75 while its line said "not below 80 ppm".
+  if (targetPpm < hardFloor && target >= hardFloor) targetPpm = hardFloor;
+  // A hold holds, and rounding never turns a move around or makes one up: a
+  // fee off the step's grid (set by hand, or before the step changed) is not
+  // "dropped to 90 ppm" by a write of 100, nor raised 25 → 30 by rounding.
+  if (kind === "hold" || Math.sign(targetPpm - currentPpm) !== Math.sign(target - currentPpm)) targetPpm = currentPpm;
+  let aimPpm = onGrid(aim, aimCeiling);
+  if (aimPpm < aimFloor && aim >= aimFloor) aimPpm = aimFloor;
+  // A bounded move says so — with the move itself, in ppm (review a1: the
+  // reason said "pricing ~5% higher" while the fee went 80 → 450).
+  // Only when the step is what stops the move short of the aim: a fee held
+  // at the max read "raising at most 22 ppm per move — 1000→1000 on the way
+  // to 1000 ppm". (Taken back if a pin or a lease promise sets another move.)
+  if (kind === "raise_step" && targetPpm > currentPpm && targetPpm < aimPpm) {
+    reasons.push(claim(`guard: raising at most ${Math.round(raiseStep)} ppm per move — ${currentPpm}→${targetPpm} on the way to ${aimPpm} ppm`, null, 1));
+  } else if (kind === "lower_step" && targetPpm < currentPpm && targetPpm > aimPpm) {
+    reasons.push(claim(`guard: lowering at most ${lowerStep} ppm per move — ${currentPpm}→${targetPpm} on the way to ${aimPpm} ppm`, null, -1));
+  }
+
+  if (inDemand && demand) {
+    const line = `demand: turned away ${demand.attempts} payments (${demand.sats.toLocaleString("en-US")} sat, ${demand.days} days) in ${DEMAND_WINDOW_DAYS} d for lack of outbound — probes and retries excluded`;
+    // First only when it is what kept the fee where it is — it kept the
+    // channel from being lowered as idle. A fee that moves all the same moves
+    // for its own rule, which leads (a bounded step down the curve; the curve
+    // raising a channel below its target ratio — review 3: that read
+    // "demand: … not treated as idle"), and a binding floor (protect) stays
+    // the dominant reason. A new channel is never idle (its floor leads).
+    const keptFromIdle = f30.forwards === 0 && !isNewChan && floored === null;
+    if (keptFromIdle && targetPpm === currentPpm) dominant(`${line}; not treated as idle`);
+    else reasons.push(keptFromIdle ? `${line}; not treated as idle` : line);
+  }
+
+  // The note that set the aim leads — right behind the rules that set the
+  // target outright: a move toward the replacement cost reads
+  // "replacement: …" (up, or down from above it), a lowering toward a
+  // cheaper market "market: …", a draining channel at or above its target
+  // ratio raised "draining: …", a move by the balance curve alone says so; a
+  // fee that stays, the hold that kept it.
+  if (kind === "free" || kind === "raise_step" || kind === "lower_step") {
+    const dir = Math.sign(targetPpm - currentPpm);
+    const pct = Math.round(ch.localRatio * 100);
+    const over = ch.localRatio - targetLocalRatio > cfg.deadband;
+    const under = targetLocalRatio - ch.localRatio > cfg.deadband;
+    const curveLine =
+      dir < 0 && over
+        ? `balance: high local ratio (${pct}%) — lower fee invites flow`
+        : dir > 0 && under
+          ? `balance: low local ratio (${pct}%) — higher fee slows the drain`
+          : `balance: ${pct}% local (target ${Math.round(targetLocalRatio * 100)}%) — the balance curve puts it at ~${Math.round(base / step) * step} ppm`;
+    // A draining channel that isn't below its target ratio goes up because
+    // it drains — the curve's level alone raises nothing there — and the
+    // lead says so (review 3: it read "balance: 50% local (target 50%) — the
+    // balance curve puts it at ~80 ppm", the raise the Fees tab says never
+    // happens, with its actual reason unnamed).
+    const drained = `draining: ${Math.round(netDrain30d * 100)}% of its capacity net out in 30 d`;
+    const drainingLine =
+      dir > 0 && draining && !under
+        ? replacementCostPpm == null
+          ? claim(`${drained} (no market reference for its refill cost) — raised toward ~${aimPpm} ppm`, drained, 1)
+          : claim(`${drained} — raised toward ~${aimPpm} ppm (a refill costs ~${replacementCostPpm} ppm${seen})`, drained, 1)
+        : null;
+    const lead =
+      dir > 0
+        ? (replacementLine ??
+          (velocityMod > 1 ? velocityLine : null) ??
+          (benchMod > 1 ? benchLine : null) ??
+          drainingLine ??
+          (ctx.elasticityMod > 1 ? elasticityLine : null) ??
+          curveLine)
+        : dir < 0
+          ? // (Priced above its refill cost, a draining channel is lowered
+            // toward that cost — not toward the curve's level below it.)
+            (replacementLine ??
+            marketLine ??
+            (velocityMod < 1 ? velocityLine : null) ??
+            (benchMod < 1 ? benchLine : null) ??
+            (ctx.elasticityMod < 1 ? elasticityLine : null) ??
+            curveLine)
+          : heldLine;
+    if (lead) {
+      const at = reasons.indexOf(lead);
+      if (at >= 0) reasons.splice(at, 1);
+      reasons.splice(dominantCount, 0, lead);
+    }
+  }
   // manual per-channel overrides win over the algorithm
+  const engineTargetPpm = targetPpm;
   const { override } = ctx;
+  const pinned = override?.mode === "fixed" && override.fixedPpm != null && Number.isFinite(override.fixedPpm);
   if (override?.mode === "exclude") {
     targetPpm = currentPpm;
-    reasons.unshift("excluded (manual) — not managed by the autopilot");
-  } else if (override?.mode === "fixed" && override.fixedPpm != null) {
-    targetPpm = clamp(Math.round(override.fixedPpm / cfg.stepPpm) * cfg.stepPpm, cfg.minPpm, cfg.maxPpm);
-    reasons.unshift(`pinned to ${targetPpm} ppm (manual)`);
+    aimPpm = currentPpm;
+    dominant("excluded (manual) — not managed by the autopilot");
+  } else if (pinned) {
+    // Exactly as set — outside the policy range, the rounding, the threshold
+    // and the pacing (review a1: a pin of 290 on a 300 ppm channel never
+    // applied, a pin of 0 became 25, one of 2,000 became the policy max),
+    // applied once and then held. Only a lease promise (below) binds it.
+    targetPpm = clamp(Math.round(override.fixedPpm as number), 0, 50_000);
+    aimPpm = targetPpm;
+    dominant(`pinned to ${targetPpm} ppm (manual)`);
   }
 
   // Base fee: volume-first drops it to cfg.baseFeeMsat (0) to win routes; an
   // excluded channel keeps whatever it has.
   const currentBaseMsat = rate ? Number(rate.base_fee_mtokens) : 0;
   let recommendedBaseMsat = override?.mode === "exclude" ? currentBaseMsat : cfg.baseFeeMsat;
-  if (recommendedBaseMsat < currentBaseMsat) {
-    reasons.push(`base fee: lowering ${currentBaseMsat}→${recommendedBaseMsat} msat to win routes`);
+  if (recommendedBaseMsat !== currentBaseMsat) {
+    const baseLine =
+      recommendedBaseMsat < currentBaseMsat
+        ? `base fee: lowering ${currentBaseMsat}→${recommendedBaseMsat} msat to win routes`
+        : `base fee: ${currentBaseMsat}→${recommendedBaseMsat} msat — your policy's base fee`;
+    // When only the base fee moves, it is what the write is about.
+    if (targetPpm === currentPpm) reasons.unshift(baseLine);
+    else reasons.push(baseLine);
   }
 
   // Lease promise (D7) — LAST, after every rule that can raise a fee: the
@@ -540,15 +1266,43 @@ function buildRecommendation(
   const leaseCapBreach = !!lease && (currentPpm > lease.feeRateCapPpm || currentBaseMsat > lease.baseFeeCapMsat);
   if (lease && (override?.mode !== "exclude" || leaseCapBreach)) {
     const kept = clampToCap({ feeRatePpm: targetPpm, baseFeeMsat: recommendedBaseMsat }, lease);
+    aimPpm = Math.min(aimPpm, lease.feeRateCapPpm);
     if (kept.clamped || leaseCapBreach) {
       targetPpm = kept.feeRatePpm;
       recommendedBaseMsat = kept.baseFeeMsat;
+      // (What breaks it, exactly: a base fee alone above the promise read
+      // "its fee (150 ppm, 1000 msat base) is above that; lowering at once"
+      // while a floor took the rate up.)
+      const above =
+        currentPpm > lease.feeRateCapPpm && currentBaseMsat > lease.baseFeeCapMsat
+          ? `its fee (${currentPpm} ppm, ${currentBaseMsat} msat base) is above that`
+          : currentPpm > lease.feeRateCapPpm
+            ? `its fee (${currentPpm} ppm) is above that`
+            : `its base fee (${currentBaseMsat} msat) is above that`;
       reasons.unshift(
-        leaseCapBreach
-          ? `lease promise: ${capText(lease)} — its fee (${currentPpm} ppm, ${currentBaseMsat} msat base) is above that; lowering at once`
-          : `lease promise: ${capText(lease)} — fee kept at or below it`,
+        leaseCapBreach ? `lease promise: ${capText(lease)} — ${above}; lowered at once` : `lease promise: ${capText(lease)} — fee kept at or below it`,
       );
     }
+  }
+
+  // A line that denies the final move is taken back — a floor, the range, a
+  // pin or a lease promise moved the fee after all: a hold that didn't hold,
+  // a no-flow lowering under a fee that goes up.
+  if (targetPpm !== currentPpm) {
+    dropLine(heldLine);
+    dropLine(drainedIdleLine);
+  }
+  if (targetPpm > currentPpm) dropLine(noFlowLine);
+  // What the engine's rules claimed for their move no longer holds when a
+  // pin, an exclusion or a lease promise set another one — nor a claimed
+  // direction the fee doesn't take: only the facts stay.
+  const moved = Math.sign(targetPpm - currentPpm);
+  const replaced = targetPpm !== engineTargetPpm;
+  for (let i = reasons.length - 1; i >= 0; i--) {
+    const c = claims.get(reasons[i]);
+    if (!c || !(replaced || (c.dir !== 0 && moved === -c.dir))) continue;
+    if (c.fact === null) reasons.splice(i, 1);
+    else reasons[i] = c.fact;
   }
 
   // §1/§8 base balance reason if nothing more specific fired
@@ -574,29 +1328,59 @@ function buildRecommendation(
   const isRaise = targetPpm > currentPpm;
   if (override?.mode === "exclude" && !leaseCapBreach) blockedByGuards.push("excluded (manual)");
   if (!ch.active) blockedByGuards.push("channel inactive");
-  // A base-fee drop is worth applying even when the ppm move is tiny — and a
-  // broken lease promise is fixed whatever the size of the move.
-  if (Math.abs(targetPpm - currentPpm) < minDelta && !baseFeeChanged && !leaseCapBreach) blockedByGuards.push("change below threshold");
+  // The anti-churn threshold judges the gap to the AIM — a channel close to
+  // where it should be is left alone — not the size of one bounded step.
+  // A base-fee drop is worth applying even when the ppm gap is tiny; a pin
+  // is the operator's explicit value; a broken lease promise is fixed
+  // whatever the size of the move. Neither are the no-flow rule's own moves
+  // (one ratchet step, or a jump to the price that won flow back or to the
+  // market's): they are deliberate, bounded and paced already (a lowering at
+  // most once a day), and at the low fees small nodes charge the threshold
+  // vetoed them within 25 ppm of their destination — review 2: idle at 70 ppm
+  // with a flow-won price of 50, the Why said "dropping to 50 ppm" and
+  // nothing was ever applied. Nor is any move from a fee outside the policy
+  // range (1,010 ppm against a max of 1,004 sat there, 6 ppm "below
+  // threshold").
+  const outsideRange = currentPpm < cfg.minPpm || currentPpm > ceiling;
+  const designedMove = noFlowLowering || outsideRange;
+  if (Math.abs(aimPpm - currentPpm) < minDelta && !baseFeeChanged && !leaseCapBreach && !pinned && !designedMove) {
+    blockedByGuards.push("change below threshold");
+  }
+  // An update LND refused (or that failed) waits before it is tried again —
+  // resent every run, each refusal was another failed line in the run history
+  // (~48 a day at the default interval). A broken lease promise is retried
+  // regardless.
+  const retryAfter = ctx.cooldown?.retryAfter?.[ch.id];
+  const retryAtMs = retryAfter ? Date.parse(retryAfter) : NaN;
+  if (Number.isFinite(retryAtMs) && retryAtMs > ctx.nowMs && !leaseCapBreach) {
+    const hours = Math.max(1, Math.ceil((retryAtMs - ctx.nowMs) / 3_600_000));
+    blockedByGuards.push(`its last fee update failed — tried again in ~${hours} h`);
+  }
   // Asymmetric pacing so the market can respond and outcomes stay measurable:
   // raises wait the LONG raise-cooldown (never thrash a working channel up — the
   // user's generic cooldown is often just hours, which would allow big daily
   // creep), lowers step at most once a day. A channel with no prior change
-  // applies immediately either way.
-  if (ctx.cooldown && !leaseCapBreach) {
+  // applies immediately either way. A pin applies as soon as it is set.
+  if (ctx.cooldown && !leaseCapBreach && !pinned) {
     const last = ctx.cooldown.lastApplied[ch.id];
     if (last) {
-      const elapsedH = (Date.now() - new Date(last).getTime()) / 3_600_000;
-      // The protect ramp may step at the user's cadence — it's hard-capped at
-      // protectPpm, unlike open-ended velocity raises which wait the long pause.
+      const elapsedH = (ctx.nowMs - new Date(last).getTime()) / 3_600_000;
+      // The protect and profit-floor ramps may step at the user's cadence —
+      // they are hard-capped (protectPpm, the floor), unlike open-ended
+      // raises, which wait the long pause. Only while a ramp sets the move.
       const limitH = isRaise
-        ? floored === "protecting_liquidity"
+        ? kind === "ramp"
           ? ctx.cooldown.cooldownHours
           : Math.max(ctx.cooldown.cooldownHours, cfg.cooldownHours)
         : LOWER_PACING_HOURS;
       if (elapsedH < limitH) blockedByGuards.push(isRaise ? "raise cooldown active" : "lower pacing (1/day)");
     }
   }
-  const wouldApply = blockedByGuards.length === 0;
+  // Nothing to write when neither the rate nor the base fee moves.
+  const wouldApply = blockedByGuards.length === 0 && (targetPpm !== currentPpm || baseFeeChanged);
+
+  const marketComparison: FeeRecMetrics["marketComparison"] =
+    marketPpm == null ? null : currentPpm > marketPpm * 1.5 ? "above" : currentPpm < marketPpm * 0.5 ? "below" : "in_line";
 
   return {
     channelId: ch.id,
@@ -604,11 +1388,14 @@ function buildRecommendation(
     capacity: ch.capacity,
     currentPpm,
     targetPpm,
+    aimPpm,
     transactionId: rate?.transaction_id ?? null,
     transactionVout: rate?.transaction_vout ?? null,
     currentBaseMsat,
     recommendedBaseMsat,
-    noFlowLowering,
+    // Only a lowering opens the flow-won episode — not a fee a pin took up.
+    noFlowLowering: noFlowLowering && targetPpm < currentPpm,
+    pinned,
     leaseCap: lease
       ? { source: lease.source, orderId: lease.orderId, feeRateCapPpm: lease.feeRateCapPpm, baseFeeCapMsat: lease.baseFeeCapMsat, untilHeight: lease.untilHeight }
       : null,
@@ -635,11 +1422,27 @@ function buildRecommendation(
       revenuePpm30d,
       costBasisPpm,
       costBasisSource: costBasisPpm != null ? "rebalance_avg" : "unknown",
+      costBasisRefills: basis?.refills ?? 0,
+      costBasisLatestAt: basis?.latestAt ?? null,
       profitFloorPpm,
+      profitFloorCapped,
       peerGate,
       role: ch.role,
       isTopEarner,
       benchmarkComparison,
+      marketPpm,
+      marketSamples: market?.samples ?? 0,
+      marketSeenAt: market && ctx.marketSeenAt != null ? new Date(ctx.marketSeenAt).toISOString() : null,
+      peerFeeToUsPpm: market?.peerFeeToUsPpm ?? null,
+      replacementCostPpm,
+      belowReplacement,
+      marketComparison,
+      draining,
+      refusedAttempts14d: demand?.attempts ?? 0,
+      refusedSats14d: demand?.sats ?? 0,
+      refusedDays14d: demand?.days ?? 0,
+      inDemand,
+      elasticityMod: ctx.elasticityMod,
     },
   };
 }

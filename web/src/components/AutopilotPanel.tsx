@@ -14,6 +14,7 @@ import { satsCompact, timeAgo } from "../format";
 import { parseNumField } from "../numField";
 import { runProgress } from "../statusNotes";
 import { buildPresets, matchesPreset as presetMatches } from "../presets";
+import { NEUTRAL_PPM_HINT, historyFeeLine } from "../feeView";
 import { OFFER_AUTOMATION_HINT, PRICING_MODES } from "../magmaView";
 import { RunState, Switch } from "./Switch";
 import { useUi } from "./Overlay";
@@ -47,9 +48,9 @@ const FEE_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "cooldownMinutes", label: "Fee cooldown (min)" },
   { key: "maxChangesPerRun", label: "Max fee changes / run" },
 ];
-const POLICY_FIELDS: { key: keyof AutopilotConfig["policy"]; label: string }[] = [
+const POLICY_FIELDS: { key: keyof AutopilotConfig["policy"]; label: string; hint?: string }[] = [
   { key: "minPpm", label: "Min ppm (full)" },
-  { key: "neutralPpm", label: "Neutral ppm (balanced)" },
+  { key: "neutralPpm", label: "Neutral ppm (balanced)", hint: NEUTRAL_PPM_HINT },
   { key: "maxPpm", label: "Max ppm (drained)" },
   { key: "protectPpm", label: "Protect ppm (drained+wanted)" },
   { key: "baseFeeMsat", label: "Base fee (msat)" },
@@ -264,12 +265,12 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     await (on ? turnSellingOn(deps) : turnSellingOff(deps));
   };
 
-  const numInput = (path: NumPath, label: string, step?: number) => {
+  const numInput = (path: NumPath, label: string, step?: number, hint?: string) => {
     const b = boundsFor(server, path);
     const saved = savedValue(config, path);
     return (
       <label key={path} className="policy-field">
-        <span>{label}</span>
+        <span title={hint}>{label}</span>
         <input
           type="number"
           min={b?.min}
@@ -407,7 +408,29 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
             <summary>Customize fee policy</summary>
             <div className="policy-controls">
               {numFields(FEE_NUM_FIELDS)}
-              {POLICY_FIELDS.map((f) => numInput(`policy.${f.key}`, f.label))}
+              {POLICY_FIELDS.map((f) => numInput(`policy.${f.key}`, f.label, undefined, f.hint))}
+            </div>
+            <p className="muted ap-hint">
+              Each update moves a fee by at most two “Round to” steps up (up to three where a learned elasticity says
+              raising pays; four while protecting a drained channel or recovering a refill’s cost) and at most the
+              idle-ratchet’s steps down. A fee is raised only when the channel drains below its target, its flow says
+              it drains, or a floor or Min ppm needs it — a channel that routes at its price keeps it. In one update
+              only: an idle channel dropping to the price that last won it flow or to the market’s price into its
+              peer, a pinned fee, a new channel’s protected fee, a broken lease promise, and a fee outside Min/Max ppm
+              (a fee below Min goes to Min first, then steps). “Min change” only skips fees already that close to
+              where the engine is heading — never an idle channel’s step or jump down, nor a fee brought into Min/Max.{" "}
+              {NEUTRAL_PPM_HINT}
+            </p>
+            <div className="ap-checks">
+              <label className="check ap-check">
+                <input
+                  type="checkbox"
+                  checked={config.feeFloorAboveMax}
+                  disabled={busy || writeOff}
+                  onChange={(e) => void save({ feeFloorAboveMax: e.target.checked })}
+                />
+                Let a channel’s refill cost (profit floor) lift its fee above Max ppm — off: the floor stops at Max ppm
+              </label>
             </div>
             {saveRow}
           </details>
@@ -536,8 +559,15 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
           ) : (
             <ul className="ap-history">
               {server.history.map((run, i) => {
-                const items: { ok: boolean; label: string; error?: string }[] = [
-                  ...(run.changes ?? []).map((c) => ({ ok: c.ok, label: `Fee · ${c.alias}: ${c.fromPpm}→${c.toPpm} ppm`, error: c.error })),
+                const items: { ok: boolean; label: string; why?: string; error?: string }[] = [
+                  ...(run.changes ?? []).map((c) => ({
+                    ok: c.ok,
+                    // Every change says why (the engine's reason, a lease
+                    // promise kept, or by hand).
+                    label: historyFeeLine(c),
+                    why: [c.why, c.clampedBy].filter(Boolean).join(" · ") || undefined,
+                    error: c.error,
+                  })),
                   ...(run.rebalances ?? []).map((r) => ({ ok: r.ok, label: `Rebalance · ${r.alias}${r.ok ? ` — ${r.feeSats} sat` : ""}`, error: r.error })),
                   ...(run.channels ?? []).map((c) => ({ ok: c.ok, label: `Open · ${c.alias}${c.ok ? ` — ${satsCompact(c.sizeSats)}` : ""}`, error: c.error })),
                   ...(run.sells ?? []).map((s) => ({ ok: s.ok, label: `Magma ${s.action} · ${satsCompact(s.sizeSats)}`, error: s.error })),
@@ -573,6 +603,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                               ) : (
                                 <span className={it.ok ? "ap-line-ok" : "ap-line-fail"}>{it.ok ? "✓" : "✗"} {it.label}</span>
                               )}
+                              {it.why ? <div className="muted small ap-why">{it.why}</div> : null}
                               {expandable && isOpen ? <div className="ap-err-msg">{it.error}</div> : null}
                             </div>
                           );

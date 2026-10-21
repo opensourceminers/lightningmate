@@ -84,6 +84,20 @@ export function leaseCapFrom(o: {
   };
 }
 
+/**
+ * Amboss counts a Magma lease from its own confirmation of the channel
+ * (VALID_CHANNEL_OPENING, a few blocks after the funding block), and ends it
+ * with CHANNEL_MONITORING_FINISHED. A sale's promise is kept a day of blocks
+ * longer than funding height + lease, so it can never end before Amboss's
+ * lease does. (LSPS1 leases are this node's own count: no margin.)
+ */
+export const MAGMA_LEASE_MARGIN_BLOCKS = 144;
+
+/** The last block (exclusive) a promise binds after its funding block. */
+export function leaseEndHeight(cap: Pick<LeaseCap, "source" | "leaseBlocks">, fundedAt: number): number {
+  return fundedAt + cap.leaseBlocks + (cap.source === "magma" ? MAGMA_LEASE_MARGIN_BLOCKS : 0);
+}
+
 /** The block a channel was funded in, from its short channel id
  *  ("BLOCKxTXxOUT"); null for a pending channel (not confirmed yet). */
 export function fundingHeight(channelId: string | null | undefined): number | null {
@@ -93,9 +107,10 @@ export function fundingHeight(channelId: string | null | undefined): number | nu
 
 /**
  * The promise binding a channel now, or null. The lease runs from the block the
- * funding transaction confirmed in for `leaseBlocks` blocks; a channel not yet
- * confirmed (no short channel id) is inside its lease. Several promises on one
- * outpoint (it should not happen): the strictest wins.
+ * funding transaction confirmed in for `leaseBlocks` blocks (a Magma sale's a
+ * day longer, see MAGMA_LEASE_MARGIN_BLOCKS); a channel not yet confirmed (no
+ * short channel id) is inside its lease. Several promises on one outpoint (it
+ * should not happen): the strictest wins.
  */
 export function activeCap(
   caps: readonly LeaseCap[],
@@ -106,7 +121,7 @@ export function activeCap(
   const funded = fundingHeight(channel.channelId);
   for (const c of caps) {
     if (c.fundingOutpoint !== channel.outpoint) continue;
-    const untilHeight = funded === null ? null : funded + c.leaseBlocks;
+    const untilHeight = funded === null ? null : leaseEndHeight(c, funded);
     if (untilHeight !== null && currentHeight > 0 && currentHeight >= untilHeight) continue; // lease over
     if (
       !found ||

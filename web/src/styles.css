@@ -1409,3 +1409,10 @@ tr.pending td { opacity: 0.9; }
   margin: 10px 0 4px; padding: 10px 12px; border-radius: 8px;
   background: var(--panel-3); font-size: 12.5px; display: grid; gap: 8px;
 }
+
+/* Fee override control: a refused save stays visible (review a6). */
+.ov-error { color: #ff9b9b; font-size: 11px; white-space: normal; max-width: 220px; }
+.ov .ov-btn { padding: 2px 6px; }
+/* Each fee change in the run history says why. */
+.ap-why { padding-left: 21px; word-break: break-word; }
+.apply-result .warn { color: #ff9b9b; }

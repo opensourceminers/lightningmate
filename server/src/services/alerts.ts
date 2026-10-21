@@ -34,6 +34,7 @@ const RESET_CONSEQUENCE: Record<string, string> = {
 /** What an "adjusted" file holds, in plain words, for the alert text. */
 const ADJUSTED_WHAT: Record<string, string> = {
   "autopilot.json": "Saved autopilot settings",
+  "overrides.json": "Fees pinned by hand",
 };
 
 function incidentMessage(i: StoreIncident): string {

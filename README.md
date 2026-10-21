@@ -58,8 +58,9 @@ standalone via Docker.
 - **More forwards** — the optional **Advertise routable size** pass keeps each
   channel's gossiped max HTLC just under its spendable balance (power-of-2
   buckets) so senders skip depleted channels, and the **Unserved demand** panel
-  shows the forwards your node had to refuse for lack of liquidity — exactly
-  where a rebalance pays for itself.
+  shows the payments your node had to turn away for lack of liquidity — with
+  probes, retries and HTLCs too big for any refill counted apart, so what is left
+  is possible demand a refill could have carried (not a promise of income).
 
 ## Architecture
 

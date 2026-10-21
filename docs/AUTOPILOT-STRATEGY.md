@@ -55,87 +55,219 @@ the Strategy overrides.
 **Config (defaults):**
 ```
 minPpm            25     # cheapest a channel can go (lots of outbound)
-neutralPpm        80     # fee for a balanced channel (at its target ratio)
+neutralPpm        80     # the curve's level for a balanced channel (at its target ratio) — a ceiling there, not a
+                         # target: raising it doesn't raise a channel routing at a lower fee (held, see below)
 maxPpm          1000     # priciest (fully drained)
-protectPpm       350     # floor for a drained-but-still-wanted channel
+protectPpm       350     # where a drained-but-still-wanted channel is ramped to
 newChannelMinPpm  80     # floor for brand-new channels (first 3 days)
 baseFeeMsat        0     # flat base fee to set (0 = volume-first)
-stepPpm           25     # round targets to this
-minChangePpm      25     # ignore changes smaller than this (anti-churn)
+stepPpm           25     # round to this (the autopilot passes the policy's "Round to", default 10)
+minChangePpm      25     # leave a fee alone when it is this close to where the engine is heading
 cooldownHours     72     # min time between raises on the same channel
 flowWindowDays    14     # "recent" flow window
 benchmarkWindowDays 30   # revenue/idle window
-safetyMargin    1.15     # profit floor = rebalance-cost-basis × this
+safetyMargin    1.15     # profit floor = refill cost basis × this
+floorAboveMax  false     # a profit floor may lift a fee above maxPpm only with this opt-in
 maxChangesPerRun   6     # at most N fee changes applied per run
 ```
+
+**Aim and move.** For each channel the engine derives an **aim** (where the fee should end
+up) and a **target** (this update's move toward it). Moves are small, bounded steps: a raise
+moves at most **2 steps** (on every channel, routing or not; a learned elasticity can widen
+the step to ×1.5 — **up to 3 steps** — never remove it); the protect and profit-floor ramps
+at most **4 steps**; **every lowering** at most the **idle-ratchet's steps** — idle, routing,
+new or drained. Only these move in one update, each for a reason of its own: an idle channel
+dropping to its **flow-won price** or to the **market price** into its peer (evidence, not a
+guess — and nothing is at stake on a channel nobody routes through), a **pin** (the
+operator's value), the **new-channel floor**, a broken **lease promise**, and a fee outside
+the policy's **min/max** (a fee below the min goes to the min, and raises step on from
+there — counted from the balanced level, a fee of 0 went "0 → 100" in one update).
+
+**Raise only on a drain signal.** A channel that isn't below its target ratio, and that
+nothing says drains (no drain velocity, no benchmark nudge for draining, not draining), is
+**held at its fee**: the balance curve's balanced level never raises it. Routing at that fee,
+it is the price that wins flow; routing nothing, a higher fee wins nothing back either. Only a
+drained channel (the curve), drain velocity, the benchmark's draining nudge, a draining
+channel's replacement cost, a floor or the policy's min raise a fee — and where a measured
+elasticity below 1 has switched the drain reflex off, draining raises nothing either (its
+reasons said "not raising toward the replacement cost" while the curve raised it). Raising **Neutral ppm**
+therefore no longer lifts balanced channels by itself: it lowers balanced channels priced above it, and it is
+where the curve starts for drained and full channels (the policy hint says so). Before, a price that had
+just won a channel two-way flow was raised straight back out of it (50 → 70 toward the
+balanced level of 80) and lowered again after two quiet weeks — in a 120-day simulation with
+demand that depends on the fee, such channels sat priced out 80–90 % of the time; now they
+keep the price that routes (a test runs that loop on every preset, with and without a market).
+
+**The threshold.** The anti-churn threshold (`max(minChangePpm, 20% of the fee)`) judges the
+gap between the fee and the aim, not the size of one step — it used to veto the engine's own
+steps (+20, −30, +40 at step 10 were all under it), freezing draining channels low and idle
+ones high. The no-flow rule's own moves (a ratchet step, a jump to the flow-won or market
+price) and any move from a fee outside the min/max range are not judged by it at all: they
+are deliberate, bounded and paced already, and at the low fees small nodes charge it vetoed
+them within 25 ppm of their destination ("dropping to 50 ppm" from 70, never applied; 1,010
+ppm against a max of 1,004 stayed, 6 ppm "below threshold").
+
+**A missing market reference never lowers a draining channel.** A report whose graph has no
+reference for a channel's peer uses the last one seen, for up to **7 days** (and says "last seen
+…"): a peer back from an outage still has the other nodes' channels into it disabled in the graph
+for a while (LND re-enables them ~20 minutes after it returns, then gossip, then this node's graph
+cache), so it drops under the 3 channels a reference needs — while our own channel to it is active
+again within seconds. With no reference at all (a thin peer, a cold start, a graph that can't be
+read) a draining channel is **held** where the balance curve would lower it: its refill cost is
+unknown. Before, one such run lowered a channel priced at its refill cost 340 → 310 toward the
+balanced level, and since every lowering restarts the 72 h raise wait, gaps every few days walked
+it down to ~100 ppm for good.
+
+**Why.** The first reason of a channel (the Why column, and the "why" of each change in the
+run history and the fee-change log) is the rule that set its move: a floor, the no-flow rule,
+a pin or a lease promise when one of them set it; otherwise the rule that set the aim — the
+replacement cost (`replacement: …`, also when a channel priced above it is lowered toward it),
+the market (`market: …`), a velocity or benchmark modifier, draining (`draining: …` — a channel
+at or above its target ratio raised because it drains), an elasticity modifier, or the balance
+curve itself (`balance: …`); for a write that only changes the base fee, the base fee. A line
+that denies the move is never left beside it: a hold that a floor, the range, a pin or a lease
+promise overrode, "never raised" or a no-flow lowering under a fee that goes up. Where a pin, an
+exclusion or a lease promise sets the move, the engine's rules keep only their facts ("profit
+floor: … = 1035 ppm", not "— ramping 80→120" beside a pin of 25), and a rule's claim of a
+direction the fee doesn't take is cut the same way ("lowering toward 95 ppm" under a floor's
+raise). A step guard ("a→b on the way to c") appears only where the step stops the move short of
+its aim. A broken lease promise says what breaks it (the rate, or only the base fee).
+Turned-away payments lead only when they are what kept the fee where it is (not lowered as
+idle).
 
 **Per-channel derivation order (`buildRecommendation`):**
 
 1. **Metrics** — routed-out/in over 14d & 30d, revenue, net drain, channel age (from the
-   channel-id block height), and a **cost basis** = average ppm we've paid to rebalance
-   *into* this channel. `profitFloorPpm = costBasis × 1.15` (never route below refill cost).
+   channel-id block height), and a **cost basis** = average ppm the *autopilot's* refills into
+   this channel cost over the last **30 days** (refills run by hand chose their own price and
+   set none). `profitFloorPpm = costBasis × safetyMargin`, capped at `maxPpm` unless the
+   operator opted in. Plus two outside signals:
+   - the **market** (public graph, nothing paid or sent): the capacity-weighted median fee
+     other nodes charge to forward into the same peer, and the peer's own fee back to us — a
+     refill costs at least both (**replacement cost**). The graph is read at most every 30
+     minutes; an older read (up to 12 h) is served at once while a fresh one runs, so a slow
+     read never drops the market from a report (it did on every other run: market-priced fees
+     flapped 80→50→70→40…). Only a cold start waits for the graph: a page up to 15 s, the
+     scheduled fee run up to 2 minutes. A read that never answers is given up after 10 minutes
+     (the next caller starts a new one). A channel whose peer drops out of the graph's
+     reference keeps its last one for 7 days (above);
+   - **refused demand** (failed-HTLC telemetry, de-noised: probes ≥ 90% of a channel,
+     retries of the same amount within 10 minutes and HTLCs over half the channel are
+     counted apart). A channel that turned away ≥ 3 real attempts on ≥ 2 days in 14 days is
+     **in demand**, even without a successful forward.
 
 2. **Role → target ratio.** Each channel is classified from lifetime flow:
    `source` (mostly receives) → target localRatio 0.45; `sink` (mostly sends) → 0.55;
    `router`/`neutral` (balanced) → 0.50.
 
 3. **Balance curve → base ppm.** Compare current localRatio to the target (deadband ±0.05):
-   - within deadband → `neutralPpm`
+   - within deadband → the balanced level: `neutralPpm`. On a channel that is **not
+     winning flow at its own price** (no forward in the 14-day flow window, testing a lower
+     fee, or well below the node's flow) the curve's balanced level is lowered to ~0.9 × the
+     market into the peer when that is cheaper — never on a top earner, a channel whose
+     velocity says draining, steady outbound demand or active and balanced, a draining
+     channel or one turning payments away (a top earner routing 2.4M a month at 80 ppm was
+     cut toward 27 ppm). Never raised — volume-first stays the default
    - more local than target (excess outbound) → interpolate **down toward `minPpm`**
    - drained below target → interpolate **up toward `maxPpm`**
-   (Idea: cheap when we have outbound to give away; expensive when we're running dry.)
+   - the curve lowers a fee above its level; it raises one **only on a drained channel**
+     (below its target ratio) — see "Raise only on a drain signal" above
 
 4. **Velocity modifier** (from real recent demand):
    - draining fast (gross ≥0.2, net ≥0.1 of capacity in 14d) → ×1.1 (small nudge up)
    - steady outbound demand → ×1.05
-   - idle **and** over-local → ×0.85 (**explore** a lower fee to attract flow)
+   - idle **and** over-local → ×0.85 (**explore** a lower fee to attract flow; not when in demand,
+     nor on a brand-new channel)
 
 5. **Benchmark modifier** (only with ≥5 channels): compare this channel's flow to the node
-   median. Outperforming + draining → ×1.05. **Top earners are never pushed cheaper.**
+   median. Outperforming + draining → ×1.05. **Top earners are never pushed cheaper** by
+   this nudge, the explore test or the market (only the balance curve or a measured
+   elasticity below 1 can lower one).
    Well below average + over-local → ×0.95 (test lower).
 
-6. **Elasticity gate** (learned per channel): if raising the fee here measurably *lost*
-   revenue before, the learned modifier is <1 and blocks the drain-reflex raise. If raising
-   *lifted* revenue, it's >1 and allows a higher price. Neutral history = 1.0 = no effect.
+6. **Elasticity** (learned per channel — only from strong evidence): at least 4 measured fee
+   changes on the channel that all point the same way, each with ≥ 10 forwards before and
+   after, and a mean of at least two standard errors, shrunk toward the node-wide signal.
+   Most small nodes have no such channel; the Fees tab says so. A modifier < 1 blocks the
+   drain-reflex raise; > 1 widens the raise step (at most ×1.5) — it never removes the bound,
+   and it raises only a fee a drain signal raises (a channel held at its price stays held).
+   Changes are measured from the **fee-change log** (every applied change, kept a year), each
+   over the interval until the next change on the channel, in msat, net of the rest of the
+   node's move.
 
 7. **Combine:** `combinedMod = clamp(velocity × benchmark × elasticity, 0.7, 1.5)`;
-   `target = baseCurve × combinedMod`.
+   `aim = baseCurve × combinedMod`. A **draining** channel (net outflow ≥ 10% of capacity
+   in 30 days, ≥ 3 forwards) is aimed at least at its replacement cost × safetyMargin (≤
+   maxPpm) — its outbound is not sold below what it costs to get back. Where raising has
+   measurably cost flow (elasticity < 1) the replacement cost raises nothing: the channel is
+   held at its current fee — not raised toward it, not sold cheaper either. Without any market
+   reference (none this run, none remembered) a draining channel is held where the curve would
+   lower it, and raised only by a higher aim.
 
-8. **Gentle-raise cap:** if the channel is actively routing, the rise is capped to
-   `current + 2×stepPpm` per run — **never slam a working channel up** (this was the failure
-   that once killed all routing: fees spiked and priced the node out of the market).
+8. **Bounded moves:** the target moves toward the aim by the steps above. **A drained channel
+   nobody routes through is never raised** (it jumped to ~900 ppm in one update before), and
+   lowered only by ratchet steps.
 
-9. **Hard floors (always win, may exceed maxPpm):**
+9. **Floors:**
    - new channel (<3 days, <3 forwards) → at least `newChannelMinPpm`
-   - profit floor → at least `costBasis × 1.15`
-   - **protect**: drained (<10% local) **but still in demand** → bump to `protectPpm` (350)
-     to slow the bleed (only if it's still getting forwards).
+   - profit floor → ramped toward `costBasis × safetyMargin` (4 steps a move)
+   - **protect**: drained (<10% local) **but still in demand** (forwards, or refused real
+     payments) → ramped toward `protectPpm` (4 steps a move, at the operator's cooldown)
 
 10. **No-flow rule (core volume lever):** if the channel routed **0 forwards in 30 days**,
-    has ≥10% local, and isn't brand-new → **lower the fee** to win flow back (overrides the
-    curve and floors, except new-channel protection). Two modes:
+    has ≥10% local, isn't brand-new and isn't turning real payments away → **lower the fee**
+    to win flow back (overrides the curve and floors, except new-channel protection):
     - with a **flow-won anchor** (the ppm at which routing last returned here, remembered
       per channel for 60 days): jump straight to that price — best evidence beats stepping;
+    - else, with a **market reference** above which it sits: jump to ~0.9 × what others charge
+      into the peer, on the "Round to" grid (a channel already there steps on below it —
+      before, the jump to 36 rounded back to 40 every day and the channel never moved again);
     - otherwise: ratchet down toward `minPpm` (`current − ratchetSteps×stepPpm` per step,
       paced once a day).
+    A jump lands exactly on that price, a ratchet exactly one step lower (at most to the min,
+    which it reaches exactly — rounding 25 to the 10-ppm grid stopped it at 30) — the balance
+    curve or the explore price no longer cut an idle channel further in one move (1,500 → 900
+    ppm at 20% local before). None of these is vetoed by the anti-churn threshold.
     The autopilot tracks each lowering episode and records the current fee as the new
     anchor the moment outbound flow returns. We never price-kill an idle channel.
 
-11. **Clamp + round** to `stepPpm`. Manual per-channel overrides (`exclude` = don't touch;
-    `fixed` = pin a ppm) win here.
+11. **Clamp + round** to `stepPpm` (rounding never stretches a bounded move, never turns a
+    move around and never moves a held fee; a fee at the policy's min or max, or at a floor —
+    a new channel's protected fee, a protect or profit-floor ramp — lands on it exactly: on a
+    25-ppm grid a new channel's 80 rounded to 75). A fee above the max is brought down to it in one move, one below the min up to
+    the min (only to it — raises step on from there), and says so (`range: …`). Manual per-channel overrides win here: `exclude` =
+    don't touch; `fixed` = the pinned ppm **exactly as set** — outside the policy range, the
+    rounding, the threshold and the pacing — applied once, then held. (On upgrading to this,
+    pins stored outside the policy's min/max — the old pin inputs saved a blank field as 0 —
+    were rewritten once to the fee the engine had given them, with an alert.)
 
 12. **Base fee → `baseFeeMsat` (0).** Managed now (previously just preserved at ~1 sat).
 
-13. **Apply guards (decide *whether* to apply, never the target):**
-    - skip if `|target − current| < minChangePpm` **unless** the base fee also needs changing
-    - **asymmetric pacing**: a **raise** waits `max(user cooldown, 72h)` since the last apply
-      (the user's generic cooldown is often just hours — without the 72h floor a routing
-      channel could creep up ~200 ppm/day); a **lowering** steps at most **once a day**
-      (price discovery, not a race to the floor — the loop runs every 30 min). A channel
-      with no prior change applies immediately either way.
-    - at most `maxChangesPerRun` (6) actual applies, biggest moves first.
+13. **Lease promise (D7)** — last: a channel sold through Magma or LSPS1 stays within the
+    caps its order locked, for the lease (a Magma lease a day of blocks longer, since Amboss
+    counts it from its own confirmation) — over every rule above, pins included.
 
-Applying uses LND `updateRoutingFees`, preserving `cltv_delta` and HTLC limits.
+14. **Apply guards (decide *whether* to apply, never the target):**
+    - skip when the fee is within the threshold of the aim, **unless** the base fee also needs
+      changing, it is a pin, a lease promise is broken, or the move is the no-flow rule's own
+      (a ratchet step or a jump) or starts from a fee outside the min/max range
+    - **asymmetric pacing**: a **raise** waits `max(user cooldown, 72h)` since the last apply
+      (a ramp — protect or profit floor — steps at the user cooldown); a **lowering** steps at
+      most **once a day**. A channel with no prior change applies immediately either way.
+    - a channel whose last update failed (LND refused it, or it couldn't be sent) waits
+      **6 hours** before it is tried again — a broken lease promise excepted;
+    - at most `maxChangesPerRun` actual applies: broken lease promises first, then pins, then
+      the biggest moves.
+
+Applying uses LND `updateRoutingFees`, preserving `cltv_delta` and HTLC limits (a legacy
+max HTLC above the channel's max pending amount is left out — LND would refuse the whole
+update). A channel LND refuses (it answers with per-channel failures, not an error) is a
+failure: no cooldown, no outcome — and no retry for 6 hours (the Fees tab shows it held; the
+same refusal again is not repeated in the run history). A broken lease promise is retried at
+every check. Every write — the autopilot's, a lease promise kept, a manual Apply or pin —
+goes through the same books: the cooldown, the run history (with the reason) and the
+fee-change log. The lease promises are checked every 10 minutes even with
+every switch off.
 
 ---
 
@@ -250,8 +382,9 @@ write any `sell*` key.
   profit fees" + "max volume rebalance" = pay to refill channels you then price out).
 - Shifting the whole fee curve (min + neutral) plus zeroing the base fee is the right
   primary lever for forward count.
-- The engine already resists the known failure mode (never slam a working channel up;
-  never price-kill an idle one; learn per-channel elasticity).
+- The engine already resists the known failure mode (never slam a channel up — every move
+  is a bounded step; never price-kill an idle one; learn elasticity only from strong
+  evidence; price draining channels against what replacing their outbound costs).
 
 **Open questions / candidate improvements (for the reviewing AI):**
 
@@ -268,8 +401,8 @@ write any `sell*` key.
 4. ~~`minPpm` 10 on Max routing is near-zero.~~ **DONE** — Max routing now floors at 25 ppm
    (10 is left for a possible future "experimental / ultra-volume" mode).
 
-5. **No closed-loop auto-tuning above the presets.** The engine learns per-channel
-   elasticity, but the chosen strategy is static. Would an "auto" strategy that hill-climbs
+5. **No closed-loop auto-tuning above the presets.** The engine can learn per-channel
+   elasticity — only from strong evidence (most nodes: none) — but the chosen strategy is static. Would an "auto" strategy that hill-climbs
    the node-wide revenue (or forward-count) target be worth it, or too unpredictable for a
    set-and-forget product? Note: over-automation previously caused an outage, so stability
    and explainability matter.

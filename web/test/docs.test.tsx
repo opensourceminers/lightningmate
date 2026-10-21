@@ -39,3 +39,12 @@ test("the README says selling is the operator's decision — no preset tunes it"
   assert.match(readme, /no preset ever touches\s+Magma selling/);
   assert.match(readme, /Selling is off by\s+default/);
 });
+
+test("the strategy doc says what the fee engine does now (review 3): Neutral ppm is a ceiling for balanced channels, per-channel elasticity is learned only from strong evidence, and a missing market reference never lowers a draining channel", () => {
+  assert.doesNotMatch(doc, /neutralPpm\s+80\s+# fee for a balanced channel/, "raising it no longer raises a balanced channel routing lower");
+  assert.match(doc, /neutralPpm\s+80\s+# the curve's level for a balanced channel \(at its target ratio\) — a ceiling there, not a/);
+  assert.doesNotMatch(doc, /The engine learns per-channel\s+elasticity/);
+  assert.match(doc, /can learn per-channel\s+elasticity — only from strong evidence \(most nodes: none\)/);
+  assert.match(doc, /\*\*A missing market reference never lowers a draining channel\.\*\*/);
+  assert.match(doc, /A read that never answers is given up after 10 minutes/);
+});

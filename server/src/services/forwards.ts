@@ -34,6 +34,13 @@ export interface FlowSummary {
 
 const MAX_PAGES = 100;
 
+/** Every forward of the last `windowDays`, with its exact fee in msat — for
+ *  measurements over arbitrary intervals (fee outcomes), where per-day sums
+ *  rounded to whole sats would drown a small channel's revenue. */
+export function getForwardEvents(lnd: AuthenticatedLnd, windowDays: number): Promise<ForwardEvent[]> {
+  return fetchForwards(lnd, windowDays);
+}
+
 /** Pull every forwarding event in the window, paging through the LND cursor. */
 async function fetchForwards(
   lnd: AuthenticatedLnd,

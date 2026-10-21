@@ -1,11 +1,11 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
-import { getWalletInfo, signMessage, type AuthenticatedLnd } from "lightning";
+import { getFeeRates, getWalletInfo, signMessage, type AuthenticatedLnd } from "lightning";
 import { getNodeScore } from "../services/score.js";
 import type { Config } from "../config.js";
 import { getNodeSummary, getOwnPubkey } from "../services/node.js";
 import { getChannelsView } from "../services/channels.js";
 import { getFlowSummary, getForwardsReport } from "../services/forwards.js";
-import { applyFees, getFeePreview, type FeeApplyItem, type FeePolicy } from "../services/fees.js";
+import { getFeePreview, type FeeApplyItem, type FeePolicy } from "../services/fees.js";
 import { getRebalanceCandidates, type RebalancePolicy } from "../services/rebalance.js";
 import { type SuggestionPolicy } from "../services/suggestions.js";
 import { getChannelSuggestionsV2, getCloseSuggestionsV2 } from "../services/suggestRecommend.js";
@@ -62,7 +62,7 @@ import type { RebalanceLog } from "../services/rebalanceLog.js";
 import { BackupStore, exportScb, getBackupStatus } from "../services/backup.js";
 import type { EarningsLog } from "../services/earningsLog.js";
 import type { Lsps1Service } from "../services/lsps1.js";
-import { getUnservedDemand, telemetryAgeDays } from "../services/htlcTelemetry.js";
+import { classifiedSince, getUnservedDemand, telemetryAgeDays } from "../services/htlcTelemetry.js";
 import { buildSellDiagnostics } from "../services/sellDiagnostics.js";
 
 // Pull the numeric keys of a policy object out of the query string.
@@ -270,10 +270,19 @@ export function createApiRouter(
     }),
   );
 
+  // Every channel with the fee it charges now (review a6: the Channels table
+  // could not show what a channel charges — only Autopilot → Fees could).
   router.get(
     "/channels",
     wrap(async (_req, res) => {
-      res.json(await getChannelsView(lnd));
+      const [channels, rates] = await Promise.all([getChannelsView(lnd), getFeeRates({ lnd }).catch(() => null)]);
+      const rateById = new Map((rates?.channels ?? []).map((c) => [c.id, c]));
+      res.json(
+        channels.map((c) => {
+          const r = rateById.get(c.id);
+          return { ...c, feeRatePpm: r ? r.fee_rate : null, baseFeeMsat: r ? Number(r.base_fee_mtokens) : null };
+        }),
+      );
     }),
   );
 
@@ -465,8 +474,38 @@ export function createApiRouter(
         items.push({ id: it.id, transactionId: it.transactionId, transactionVout: vout, feeRatePpm, baseFeeMsat });
       }
       // A manual apply is clamped to a sold channel's lease promise too (D7):
-      // the result says where it was.
-      res.json({ results: await applyFees(lnd, writeLnd, items, autopilot.capital.leaseCaps()) });
+      // the result says where it was. It goes through the autopilot's books
+      // (cooldown, run history, fee-change log), like its own changes.
+      const done = await autopilot.applyByHand(items);
+      if (!done) {
+        res.status(409).json({ error: "busy", message: "The autopilot is running right now — try again in a moment." });
+        return;
+      }
+      res.json({ results: done.results });
+    }),
+  );
+
+  // "Apply" on Autopilot → Fees: the engine's recommendations (target AND
+  // base fee), recomputed now and applied through the autopilot's books.
+  // `channelIds` limits it to the rows the operator saw.
+  router.post(
+    "/fees/apply-recommended",
+    wrap(async (req, res) => {
+      if (!writeLnd) {
+        res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
+        return;
+      }
+      const raw = req.body?.channelIds;
+      if (raw !== undefined && (!Array.isArray(raw) || raw.length > 500 || !raw.every((id: unknown) => isChannelId(id)))) {
+        res.status(400).json({ error: "bad_request", message: "channelIds must be a list of channel ids (at most 500)." });
+        return;
+      }
+      const changes = await autopilot.applyRecommended(raw as string[] | undefined);
+      if (!changes) {
+        res.status(409).json({ error: "busy", message: "The autopilot is running right now — try again in a moment." });
+        return;
+      }
+      res.json({ changes });
     }),
   );
 
@@ -606,7 +645,9 @@ export function createApiRouter(
   router.get(
     "/autopilot/outcomes",
     wrap(async (_req, res) => {
-      res.json(await getAutopilotOutcomes(lnd, autopilot.getState().history, rebalanceLog.recent(200)));
+      // The fee-change log (D15) — every applied change, for a year — not
+      // the run history's last 20 runs.
+      res.json(await getAutopilotOutcomes(lnd, autopilot.feeChanges(), rebalanceLog.recent(200)));
     }),
   );
 
@@ -886,18 +927,30 @@ export function createApiRouter(
 
   // Unserved demand — forwards we refused for lack of outbound liquidity,
   // aggregated per outgoing channel (failed-HTLC telemetry).
+  // Raw refusals and what de-noising (D20) makes of them: probes, retries
+  // and HTLCs too big for any refill are counted apart from the attempts a
+  // refilled channel could have carried. "Fees missed" = those attempts ×
+  // the channel's current fee — not the raw volume.
   router.get(
     "/htlc/demand",
     wrap(async (req, res) => {
       const days = intIn(req.query.days, 1, 30) ?? 7;
       const demand = getUnservedDemand(days);
-      // Join peer aliases so the UI can name the channels.
-      const channels = demand.length ? await getChannelsView(lnd) : [];
+      // Join peer aliases (and current fees) so the UI can name the channels.
+      const [channels, rates] = demand.length
+        ? await Promise.all([getChannelsView(lnd), getFeeRates({ lnd }).catch(() => null)])
+        : [[], null];
       const alias = new Map(channels.map((c) => [c.id, c.peerAlias]));
+      const ppm = new Map((rates?.channels ?? []).map((c) => [c.id, c.fee_rate]));
       res.json({
         days,
         trackedDays: telemetryAgeDays(),
-        channels: demand.map((d) => ({ ...d, alias: alias.get(d.outChannel) ?? d.outChannel })),
+        classifiedSince: classifiedSince(),
+        channels: demand.map((d) => ({
+          ...d,
+          alias: alias.get(d.outChannel) ?? d.outChannel,
+          missedFeesSats: Math.round((d.demandSats * (ppm.get(d.outChannel) ?? 0)) / 1_000_000),
+        })),
       });
     }),
   );

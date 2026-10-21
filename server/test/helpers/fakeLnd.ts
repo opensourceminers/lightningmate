@@ -65,6 +65,8 @@ export interface FakeChannel {
   isPrivate?: boolean;
   /** Opened by the peer, not by this node (default: by this node). */
   partnerInitiated?: boolean;
+  /** LND's max pending amount on our side (msat; default 990,000 sat). */
+  maxPendingMsat?: number;
 }
 
 export interface FakePendingChannel {
@@ -459,7 +461,7 @@ export class FakeLnd {
       lifetime: "86400",
       local_balance: String(c.localBalance),
       local_chan_reserve_sat: "10000",
-      local_constraints: constraints,
+      local_constraints: c.maxPendingMsat ? { ...constraints, max_pending_amt_msat: String(c.maxPendingMsat) } : constraints,
       memo: "",
       num_updates: "12",
       pending_htlcs: [],

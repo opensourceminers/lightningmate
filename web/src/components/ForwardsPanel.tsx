@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { ChannelForwardStat, DailyBucket, ForwardsReport, UnservedDemandReport } from "../types";
 import { sats, satsCompact, timeAgo, percent } from "../format";
+import { MIN_DEMAND_DAYS, demandSummary } from "../feeView";
 import { Sparkline } from "./Sparkline";
 
 const WINDOWS = [7, 30, 90];
@@ -95,16 +96,57 @@ export function ForwardsPanel() {
         <Stat label="Avg fee" value={`${data?.avgFeePpm ?? 0}`} unit="ppm" sub="earned per sat routed" />
       </div>
 
-      {demand && demand.channels.some((c) => c.liquidityCount > 0) ? (
-        <div className="dryrun-banner warn">
-          <strong>
-            {demand.channels.reduce((s, c) => s + c.liquidityCount, 0)} forwards refused for lack of liquidity
-          </strong>{" "}
-          in the last {Math.max(1, Math.min(demand.days, demand.trackedDays || demand.days))}d —
-          demand worth {satsCompact(demand.channels.reduce((s, c) => s + c.liquiditySats, 0))} sat you didn&apos;t
-          earn on. Refill the draining channels below (or size them up) to capture it.
-        </div>
-      ) : null}
+      {(() => {
+        // Honest (D20): only the de-noised attempts count as possible demand,
+        // what was taken out is said, nothing shows before 3 days of data —
+        // and no claim either way before refusals have been sorted that long.
+        const d = demandSummary(demand);
+        if (!d) return null;
+        if (d.kind === "sorting") {
+          return (
+            <div className="dryrun-banner">
+              {d.raw} HTLC{d.raw === 1 ? " was" : "s were"} refused for lack of outbound in {d.rawWindow} — not sorted yet into
+              probes, retries and possible demand: sorting began {d.classifiedSince ? timeAgo(d.classifiedSince) : "recently"} (with
+              the update), and the breakdown shows after {MIN_DEMAND_DAYS} days of it.
+            </div>
+          );
+        }
+        if (d.kind === "none" || d.kind === "none_unsorted") {
+          const sorted = (
+            <>
+              probes ({d.probes}), retries of the same amount ({d.retries})
+              {d.oversized ? `, HTLCs bigger than half the channel (${d.oversized})` : ""}
+            </>
+          );
+          return d.kind === "none" ? (
+            <div className="dryrun-banner">
+              No payment a refilled channel could have carried was turned away in {d.window}: the {d.raw} refused HTLCs were{" "}
+              {sorted}.
+            </div>
+          ) : (
+            <div className="dryrun-banner">
+              None of the refused HTLCs sorted in {d.window} was a payment a refilled channel could have carried — {sorted}.{" "}
+              {d.unclassified} more refused in {d.rawWindow} could not be sorted (from before sorting began, or on a channel of
+              unknown size).
+            </div>
+          );
+        }
+        return (
+          <div className="dryrun-banner warn">
+            <strong>
+              {d.attempts} payment{d.attempts === 1 ? "" : "s"} turned away for lack of outbound
+            </strong>{" "}
+            in {d.window} that a refilled channel could have carried — possible demand of {satsCompact(d.sats)} sat
+            {d.missedFeesSats ? <> (~{sats(d.missedFeesSats)} sat in fees at your current rates)</> : null}.{" "}
+            <span className="muted">
+              Of {d.raw} refused HTLCs in {d.rawWindow}, {d.probes} looked like probes (≥ 90% of the channel), {d.retries} were
+              retries of the same amount
+              {d.oversized ? `, ${d.oversized} were bigger than half the channel` : ""}
+              {d.unclassified ? `, ${d.unclassified} could not be sorted` : ""} — not counted.
+            </span>
+          </div>
+        );
+      })()}
 
       <div className="chart-head">
         <span className="sub" style={{ margin: 0 }}>Daily {metric}</span>
