@@ -112,6 +112,7 @@ test("coins promised to an accepted Magma order are not spent by a routing open 
   await autopilot.pollSellOrders(); // accepted: 2M promised to the buyer
   node.peers.push(suggestion.pubkey);
   (autopilot as unknown as AutopilotSeams).channelSuggestions = async () => ({ suggestions: [suggestion] });
+  (autopilot as unknown as AutopilotSeams).openFeeRate = async () => 2; // LND's economy estimate (the fake has none)
 
   // Two runs later (the old counter was reset at the start of every run).
   await autopilot.runOnce();
@@ -310,6 +311,7 @@ test("a sell reserve above the channel reserve: a routing open leaves it in plac
   assert.equal(magma.sales.get(sale.id)?.status, "WAITING_FOR_BUYER_PAYMENT", "3.1M − 501k ≥ 2M: accepted");
   node.peers.push(suggestion.pubkey);
   (autopilot as unknown as AutopilotSeams).channelSuggestions = async () => ({ suggestions: [suggestion] });
+  (autopilot as unknown as AutopilotSeams).openFeeRate = async () => 2; // LND's economy estimate (the fake has none)
 
   await autopilot.runOnce();
   assert.equal(node.callsTo("default.openChannel").length, 0, "no routing open: 598k left after what the buyer's open needs");
@@ -434,6 +436,7 @@ test("a routing peer slow to connect doesn't hold up a Magma accept", async (t) 
   const { autopilot, node, magma } = sellerSetup(t, { config: { channelEnabled: true, channelSizeSats: 1_000_000 } });
   const peer = { ...suggestion, socket: "9.9.9.9:9735" };
   (autopilot as unknown as AutopilotSeams).channelSuggestions = async () => ({ suggestions: [peer] });
+  (autopilot as unknown as AutopilotSeams).openFeeRate = async () => 2; // LND's economy estimate (the fake has none)
   let release = () => undefined as void;
   let dialing = false;
   node.override("default.connectPeer", (a, cb) => {
@@ -793,6 +796,7 @@ test("a Magma accept that lands while a routing open dials its peer: the routing
   });
   const peer = { ...suggestion, socket: "9.9.9.9:9735" };
   (autopilot as unknown as AutopilotSeams).channelSuggestions = async () => ({ suggestions: [peer] });
+  (autopilot as unknown as AutopilotSeams).openFeeRate = async () => 2; // LND's economy estimate (the fake has none)
   let release = () => undefined as void;
   let dialing = false;
   node.override("default.connectPeer", (a, cb) => {
@@ -821,8 +825,9 @@ test("a Magma accept that lands while a routing open dials its peer: the routing
 
   release();
   const done = await run;
-  assert.equal(done.channels[0]?.ok, false);
-  assert.match(done.channels[0]?.error ?? "", /^deferred: only 548000 sat spendable after the reserve and 2000000 sat promised/);
+  // A deferral is the channel stage's decision, not a failed run (D15).
+  assert.deepEqual(done.channels, []);
+  assert.match(autopilot.getState().decisions.channels?.text ?? "", /^deferred: only 548000 sat spendable after the reserve and 2000000 sat promised/);
   assert.equal(node.callsTo("default.openChannel").length, 0, "the buyer's coins stayed the buyer's");
   magma.buyerPays(sale.id, node);
   await autopilot.pollSellOrders();

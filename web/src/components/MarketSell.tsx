@@ -337,7 +337,7 @@ export function MarketSell() {
               className={`sug-need-tag ${
                 summary.good
                   ? "need-balanced"
-                  : rec.sell.state === "not_recommended_node_needs_inbound" || rec.sell.state === "insufficient_capital" || rec.sell.state === "market_too_cheap"
+                  : rec.sell.state === "insufficient_capital" || rec.sell.state === "market_too_cheap"
                     ? "need-need_inbound"
                     : ""
               }`}

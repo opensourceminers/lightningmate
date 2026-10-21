@@ -21,6 +21,7 @@ import {
   inFlightThrough,
   manualRefillRequest,
   refillOutcome,
+  stalePlanRefusal,
 } from "../rebalanceView";
 import { useUi } from "./Overlay";
 
@@ -114,7 +115,9 @@ export function RebalanceRecommendations() {
   const execute = async (r: RebalanceRecReport["recommendations"][number]) => {
     // The fee caps the dialog promises and the gate go with it (the server
     // caps it at what is left of today's budget as well).
-    const request = manualRefillRequest(r, data?.config?.profitShare);
+    // The plan's time goes with it: a row whose target was refilled since
+    // the plan was made is refused (409 stale_plan) and the plan reloaded.
+    const request = manualRefillRequest(r, data?.config?.profitShare, data?.generatedAt);
     if (!request) return;
     const ok = await ui.confirm({
       title: "Run rebalance",
@@ -129,7 +132,13 @@ export function RebalanceRecommendations() {
       ui.toast(outcome.text, outcome.kind);
       await Promise.all([load(), api.rebalanceLog().then(setLog).catch(() => {})]);
     } catch (e) {
-      ui.toast(e instanceof Error ? e.message : String(e), "error");
+      const stale = stalePlanRefusal(e);
+      if (stale) {
+        ui.toast(stale, "info");
+        await load();
+      } else {
+        ui.toast(e instanceof Error ? e.message : String(e), "error");
+      }
     } finally {
       setRunning(null);
     }

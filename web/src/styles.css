@@ -744,6 +744,11 @@ table { width: 100%; border-collapse: collapse; }
   border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px;
 }
 .tag-pending { color: var(--accent); border-color: rgba(247, 147, 26, 0.4); background: rgba(247, 147, 26, 0.1); }
+/* Channels the close list shows apart (opening/closing, leased). */
+.close-aside { margin: 6px 0 14px; padding-left: 18px; font-size: 13px; color: var(--muted); }
+.close-aside li { margin-bottom: 4px; }
+/* A channel inside its lease (sold or bought): closing it breaks the lease. */
+.tag-lease { color: #8ab4f8; border-color: rgba(138, 180, 248, 0.4); background: rgba(138, 180, 248, 0.1); }
 tr.pending td { opacity: 0.9; }
 .muted.small { font-size: 11px; }
 
@@ -1135,6 +1140,9 @@ tr.pending td { opacity: 0.9; }
 /* Close-channel dialog */
 .close-dialog { width: min(440px, 100%); }
 .close-dialog .modal-msg { margin-bottom: 18px; }
+.close-dialog .force-consequences { padding-left: 18px; }
+.close-dialog .force-consequences li { margin-bottom: 6px; }
+.close-dialog .check { display: block; margin: -8px 0 18px; font-size: 13px; }
 .close-dialog .modal-msg strong { color: var(--text); }
 
 .field-label {

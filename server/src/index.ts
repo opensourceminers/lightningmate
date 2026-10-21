@@ -7,6 +7,7 @@ import { assertSafeExposure } from "./exposure.js";
 import { RequestGate, SHUTDOWN_GRACE_MS, SHUTDOWN_WAIT_MS, appShutdownSteps, createShutdown } from "./shutdown.js";
 import { authRequired } from "./services/auth.js";
 import { LnPlusStore } from "./services/lnplusStore.js";
+import { setOutboundRouting } from "./services/http.js";
 import { Autopilot } from "./services/autopilot.js";
 import { CapitalLedger } from "./services/capital.js";
 import { RebalanceLog } from "./services/rebalanceLog.js";
@@ -74,7 +75,11 @@ function main(): void {
   const backupStore = new BackupStore(config.dataDir);
   // LN+ node reputation cache (public API, no key). Used to re-rank peer
   // suggestions with a social trust signal the network graph cannot provide.
-  const lnplusStore = new LnPlusStore(config.dataDir);
+  // The operator can switch LN+ lookups off (Settings → Privacy).
+  const lnplusStore = new LnPlusStore(config.dataDir, () => settings.get().lnplusLookups);
+  // Third-party lookups through Umbrel's Tor proxy when the app has one
+  // (TOR_PROXY_IP / TOR_PROXY_PORT), as the operator's setting says.
+  setOutboundRouting({ route: settings.get().torRoute });
   const earningsLog = new EarningsLog(config.dataDir);
   // The disclosed service fee on completed sales is paid from this persistent
   // ledger in the background — never inline in an accept/open/settle path.

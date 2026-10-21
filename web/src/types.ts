@@ -44,6 +44,48 @@ export interface ChannelView {
   /** What it charges now (GET /channels; null: not known, e.g. pending). */
   feeRatePpm?: number | null;
   baseFeeMsat?: number | null;
+  /** Open channels: a force-close's time-lock (LND's local CSV delay,
+   *  blocks) and the commitment fee LND last signed (sat). */
+  csvDelayBlocks?: number;
+  commitFeeSats?: number;
+  /** LND's per-channel monitoring since it started (ms). */
+  timeOfflineMs?: number;
+  timeOnlineMs?: number;
+  /** Sold on Magma or over LSPS1, or bought on Magma (GET /channels). */
+  lease?: ChannelLease | null;
+  /** How long its peer has been away (GET /channels; null: online). */
+  offline?: OfflineInfo | null;
+}
+
+/** A channel's lease (server leases.ts): sold or bought, running or over. */
+export interface ChannelLease {
+  kind: "magma_sale" | "lsps1_sale" | "magma_purchase";
+  orderId: string;
+  leaseBlocks: number;
+  /** The last block (exclusive) it binds; null while the funding is unconfirmed. */
+  untilHeight: number | null;
+  blocksLeft: number | null;
+  untilApprox: string | null;
+  running: boolean;
+  /** A purchase: what it cost (sat) and when it was paid. */
+  costSats?: number;
+  paidAt?: string | null;
+  /** A sale whose lease runs because Amboss reports it running — one only
+   *  Amboss knows of (no journal record), or one the journal counts as over
+   *  (Amboss confirmed the channel late): its end is Amboss's to say. */
+  reportedByAmboss?: boolean;
+  /** …as of Amboss's listing at this time (null: unknown). */
+  reportedAt?: string | null;
+}
+
+/** How long a channel's peer has been away (server channelUptime.ts). */
+export interface OfflineInfo {
+  since: string | null;
+  hours: number | null;
+  /** LND's share of time online over ≥ 14 days of monitoring (else null). */
+  uptimeShare: number | null;
+  /** Counts toward a close: offline ≥ 72 h, or online < 50 % of the time. */
+  long: boolean;
 }
 
 export interface FeeEstimates {
@@ -204,6 +246,8 @@ export interface AutopilotConfig {
   channelReserveSats: number;
   channelSizeSats: number;
   channelCooldownMinutes: number;
+  /** The most an automatic open pays on-chain (sat/vByte, economy rate). */
+  channelMaxFeeRate: number;
   sellEnabled: boolean;
   sellMaxDeploySats: number;
   sellReserveSats: number;
@@ -432,6 +476,9 @@ export interface RebalanceExecResult {
    *  once LND knows. */
   inFlight?: { paymentId: string; maxFeeSats: number };
   targetSentBefore?: number;
+  /** The target's outbound fee (ppm) as read for this refill: its hold is
+   *  booked at no more than this. */
+  targetPpm?: number;
   failedSourceIds?: string[];
   /** Stopped before its next attempt because LightningMate is shutting down:
    *  a skip, not a failure — nothing more was sent. */
@@ -452,6 +499,9 @@ export interface RebalanceExecRequest {
    *  it earns above the minimum net profit. A refill run with it passed the
    *  same check as the autopilot's, and its price is held the same way. */
   gate?: { revenuePpm: number; demandSats: number; minNetSats: number };
+  /** When the plan the row came from was made (its generatedAt): a target
+   *  refilled — or tried — since then is refused (409 stale_plan). */
+  planAt?: string;
 }
 
 /** A rebalance payment that may still land: its two channels are left alone
@@ -558,6 +608,14 @@ export interface ChannelSuggestion {
 
   /** LN+ reputation when the peer has a profile there, else null. */
   lnplus: LnPlusRating | null;
+  /** Every advertised address, in dialing order (.onion first on a Tor-only node). */
+  sockets?: string[];
+  /** The smallest channel the peer says it accepts (LN+), or null. */
+  peerMinChannelSats?: number | null;
+  /** This node closed a channel with the peer this many days ago (≤ 90), or null. */
+  closedDaysAgo?: number | null;
+  /** On the operator's "never open automatically" list. */
+  neverOpen?: boolean;
 }
 
 export interface LnPlusRating {
@@ -595,15 +653,83 @@ export interface CloseCandidate {
   uniqueReachLost: number;
   feeV2State: string;
   opportunityCandidates: { alias: string; score: number; sizeSats: number }[];
+  /** Its peer is away (null: online); `long` = it counts toward a close. */
+  offline: OfflineInfo | null;
+  /** A lease the channel had, over now (a bought one with its cost). */
+  lease: ChannelLease | null;
+  csvDelayBlocks: number | null;
+  commitFeeSats: number | null;
   reasons: string[];
   warnings: string[];
+}
+
+/** A channel the close list leaves alone, and why. */
+export interface ProtectedChannel {
+  channelId: string;
+  alias: string;
+  reason: string;
+  lease: ChannelLease | null;
+}
+
+/** A channel still opening or closing: never closable from the list. */
+export interface PendingChannel {
+  channelId: string;
+  alias: string;
+  status: "pending_open" | "pending_close";
+  capacitySats: number;
+  localSats: number;
+  lease: ChannelLease | null;
+  timelockBlocks: number | null;
 }
 
 export interface CloseCandidatesResponse {
   windowDays: number;
   candidates: CloseCandidate[];
   protectedCount: number;
+  protected: ProtectedChannel[];
+  pending: PendingChannel[];
   totalCapitalFreedSats: number;
+}
+
+/** What opening a channel would cost and leave (GET /channels/open-estimate). */
+export interface OpenEstimate {
+  sizeSats: number;
+  fees: FeeEstimates;
+  /** What can be spent after the reserve and the coins promised to buyers. */
+  spendableSat: number | null;
+  reserveSat: number | null;
+  promisedSat: number | null;
+  /** What a sat in this node's month-old channels earned (ppm/yr); null: not
+   *  measured (none a month old, or too little routing — see yieldEvidence). */
+  yieldPpmYear: number | null;
+  /** What that yield stands on over the last 30 days (null: LND unreadable). */
+  yieldEvidence: YieldEvidence | null;
+  /** The yield counts with this many forwards, or this much earned (sat). */
+  minYieldForwards: number;
+  minYieldEarnedSat: number;
+  openVbytes: number;
+  closeVbytes: number;
+  /** The autopilot's payback horizon (months). */
+  paybackMonths: number;
+  autopilotMaxFeeRate: number;
+  /** The routing fee a new channel starts with (the fee engine's new-channel fee). */
+  initialRoutingFee: StartingFee;
+}
+
+/** Month-old channels and their routing over the last 30 days (server openPlan.ts). */
+export interface YieldEvidence {
+  channels: number;
+  capacitySat: number;
+  forwards: number;
+  earnedSat: number;
+  /** False: LND's forwarding history couldn't be read. */
+  forwardsRead: boolean;
+}
+
+/** The routing fee a channel is opened with. */
+export interface StartingFee {
+  feeRatePpm: number;
+  baseFeeMsat: number;
 }
 
 export interface OpenChannelResult {
@@ -613,6 +739,8 @@ export interface OpenChannelResult {
   transactionId?: string;
   transactionVout?: number;
   error?: string;
+  /** The routing fee the channel was opened with (a successful open). */
+  startingFee?: StartingFee;
 }
 
 export interface SuggestionsResponse {
@@ -670,8 +798,23 @@ export type FiatCurrency = "off" | "USD" | "EUR" | "GBP" | "CHF";
 
 export interface AppSettings {
   fiatCurrency: FiatCurrency;
+  /** Look peers (and this node) up on lightningnetwork.plus. */
+  lnplusLookups: boolean;
+  /** Which outbound requests go through Umbrel's Tor proxy, when there is one. */
+  torRoute: TorRoute;
   lspModeEnabled: boolean;
   lspClearnetAddress: string;
+}
+
+export type TorRoute = "lookups" | "all" | "direct";
+
+/** Where LightningMate's own lookups go, and by which route (GET /privacy). */
+export interface PrivacyInfo {
+  /** Umbrel's Tor proxy (host:port), or null: everything goes direct. */
+  torProxy: string | null;
+  torRoute: TorRoute;
+  lnplusLookups: boolean;
+  destinations: { service: string; what: string; active: boolean; viaTor: boolean }[];
 }
 
 /** LSP mode (LSPS1) live status from GET /lsp/status. */
@@ -1714,8 +1857,7 @@ export interface MagmaV2Report {
       | "good_to_sell"
       | "sell_only_above_profit_floor"
       | "market_too_cheap"
-      | "insufficient_capital"
-      | "not_recommended_node_needs_inbound";
+      | "insufficient_capital";
     deployableCapitalSat: number;
     recommendedSellSizeSat: number | null;
     routingOpportunityPpmPerYear: number | null;
@@ -1798,6 +1940,10 @@ export interface LnPlusNode {
 }
 
 export interface LnPlusStatus {
+  /** The operator's LN+ switch (Settings → Privacy). */
+  enabled: boolean;
+  /** LN+ lookups go through Umbrel's Tor proxy right now. */
+  viaTor: boolean;
   pubkey: string;
   onLnPlus: boolean;
   me: LnPlusNode | null;

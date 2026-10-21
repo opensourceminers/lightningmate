@@ -12,6 +12,7 @@ import type {
   FeeMode,
   OverrideMap,
   PriceInfo,
+  PrivacyInfo,
   FeeApplyItem,
   FeeApplyResult,
   FeePolicy,
@@ -34,6 +35,7 @@ import type {
   NodeScore,
   NodeSummary,
   OpenChannelResult,
+  OpenEstimate,
   BuyQuote,
   BuyOffersResponse,
   Eligibility,
@@ -126,6 +128,8 @@ export const api = {
   score: () => get<NodeScore>("/score"),
   getSettings: () => get<AppSettings>("/settings"),
   setSettings: (s: Partial<AppSettings>) => post<AppSettings>("/settings", s),
+  /** Where the app's own lookups go and by which route (Settings → Privacy). */
+  privacy: () => get<PrivacyInfo>("/privacy"),
   lspStatus: () => get<LspStatus>("/lsp/status"),
   lspOrders: () => get<{ orders: LspOrder[] }>("/lsp/orders"),
   htlcDemand: (days = 7) => get<UnservedDemandReport>(`/htlc/demand?days=${days}`),
@@ -136,8 +140,12 @@ export const api = {
   alerts: () => get<Alert[]>("/alerts"),
   alertAck: (id: string) => post<{ ok: boolean }>("/alerts/ack", { id }),
   health: () => get<HealthInfo>("/health"),
-  channelClose: (transactionId: string, transactionVout: number, isForce: boolean, feeRate?: number) =>
-    post<CloseChannelResult>("/channels/close", { transactionId, transactionVout, isForce, feeRate }),
+  /** A channel inside its lease is refused (409 lease_active) unless
+   *  `breakLease` — sent only after the operator confirmed breaking it. */
+  channelClose: (transactionId: string, transactionVout: number, isForce: boolean, feeRate?: number, breakLease?: boolean) =>
+    post<CloseChannelResult>("/channels/close", { transactionId, transactionVout, isForce, feeRate, ...(breakLease ? { breakLease } : {}) }),
+  /** Dial a channel's peer again (the close dialog's first offer for a peer that is away). */
+  peerConnect: (pubkey: string, socket?: string) => post<{ ok: boolean; error?: string }>("/peers/connect", { pubkey, ...(socket ? { socket } : {}) }),
   feeEstimates: () => get<FeeEstimates>("/chain/fee-estimates"),
   forwardsReport: (days: number) => get<ForwardsReport>(`/forwards/report?days=${days}`),
   feesPreview: (policy?: Partial<FeePolicy>) => {
@@ -183,6 +191,11 @@ export const api = {
     get<LnPlusPoolResponse>(minCreditsSats ? `/lnplus/pool?minCredits=${minCreditsSats}` : "/lnplus/pool"),
   lnplusSwaps: (status?: "pending" | "opening" | "completed") =>
     get<LnPlusSwapsResponse>(status ? `/lnplus/swaps?status=${status}` : "/lnplus/swaps"),
+  /** Put a peer on (or take it off) the channel autopilot's "never open automatically" list. */
+  neverOpen: (pubkey: string, never: boolean, alias?: string) =>
+    post<{ ok: boolean; neverOpen: Record<string, { alias: string; at: string }> }>("/channels/never-open", { pubkey, never, ...(alias ? { alias } : {}) }),
+  /** What opening a channel of this size would cost and leave, before the click. */
+  openEstimate: (sizeSats: number) => get<OpenEstimate>(`/channels/open-estimate?size=${Math.round(sizeSats)}`),
   /** A 409 "capital_promised" refusal (coins promised to buyers) is thrown
    *  as an ApiError; send again with `spendPromised: true` only after the
    *  operator confirmed spending them (see statusNotes promisedSpend). */

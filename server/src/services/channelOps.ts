@@ -13,6 +13,12 @@ export interface OpenChannelParams {
   /** On-chain fee rate in sat/vByte; omit to let LND estimate. */
   feeRate?: number;
   isPrivate?: boolean;
+  /** The routing fee the channel starts with (ppm, and base msat): without
+   *  one it takes LND's configured default (stock LND: 1 sat + 1 ppm) until
+   *  something sets a fee — forever, with fee automation off. Ignored by
+   *  LND before 0.16. */
+  routingFeePpm?: number;
+  routingBaseFeeMsat?: number;
 }
 
 export interface OpenChannelResult {
@@ -54,10 +60,69 @@ function describe(err: unknown): string {
  * (otherwise: a second channel, or a refunded buyer with a free channel).
  */
 const PRE_BROADCAST_REFUSAL =
-  /couldn't connect|channel size must be|PeerIsNotOnline|is not online|RemotePeerDisconnected|disconnected$|RemotePeerExited|peer exiting|RemoteNodeDoesNotSupportMultipleChannels|multiple channels unsupported|PeerPendingChannelsExceedMaximumAllowable|pending channels exceed|InsufficientFundsToCreateChannel|not enough witness outputs|insufficient funds|reserved wallet balance invalidated|ChainUnsupported|CannotOpenChannelToOwnNode|WalletNotFullySynced|RemoteNodeSyncing|MaxChannelDescriptionLengthExceeded|ExpectedLargerChannelSizeForChannelOpen|rejected the channel|chan size of .* is (below|above)/i;
+  /couldn't connect|channel size must be|PeerIsNotOnline|is not online|RemotePeerDisconnected|disconnected$|RemotePeerExited|peer exiting|RemoteNodeDoesNotSupportMultipleChannels|multiple channels unsupported|PeerPendingChannelsExceedMaximumAllowable|pending channels exceed|InsufficientFundsToCreateChannel|not enough witness outputs|insufficient funds|reserved wallet balance invalidated|ChainUnsupported|CannotOpenChannelToOwnNode|WalletNotFullySynced|RemoteNodeSyncing|MaxChannelDescriptionLengthExceeded|ExpectedLargerChannelSizeForChannelOpen|rejected the channel|chan size of .* is (below|above)|chan size of .* exceeds max/i;
 
 export function isPreBroadcastRefusal(error: string): boolean {
   return PRE_BROADCAST_REFUSAL.test(error);
+}
+
+/**
+ * A refusal that comes from THIS node, not the peer — what it names, or null
+ * for anything else (review of P4: the channel autopilot booked these against
+ * the peers it was trying, backed each one off for a day, then a week, and
+ * wrote a failed run for each; one unsynced wallet used up the whole
+ * suggestion list). LND's wallet not synced to the chain yet, a wallet that
+ * can't fund the open ("not enough witness outputs": too few confirmed
+ * coins), an open that would dip into the coins LND keeps for anchor
+ * channels, a chain LND doesn't run, or the "peer" being this node itself.
+ *
+ * Both forms count: the library's code for the errors it knows
+ * (WalletNotFullySynced, InsufficientFundsToCreateChannel, ChainUnsupported,
+ * CannotOpenChannelToOwnNode) and LND's own text for the ones it passes on.
+ * A peer's error arrives as "received funding error from <peer>: …" — that is
+ * the peer's, whatever it says.
+ */
+export function nodeSideRefusal(error: string): string | null {
+  if (/received funding error from/i.test(error)) return null;
+  if (/WalletNotFullySynced|wallet is fully synced/i.test(error)) return "LND's wallet isn't fully synced to the chain yet";
+  // Before "insufficient funds": LND's text for it says that too.
+  if (/reserved wallet balance invalidated/i.test(error)) return "the open would dip into the coins LND keeps for closing anchor channels";
+  if (/InsufficientFundsToCreateChannel|not enough witness outputs|insufficient funds/i.test(error)) {
+    return "LND's wallet can't fund it (not enough confirmed coins)";
+  }
+  if (/ChainUnsupported|unknown chain/i.test(error)) return "LND doesn't run this chain";
+  if (/CannotOpenChannelToOwnNode|channel to self/i.test(error)) return "that is this node itself";
+  return null;
+}
+
+/** The peer couldn't be reached, or dropped while the open was negotiated —
+ *  its doing, unless this node is reachable by nobody at all right now (the
+ *  caller checks that before blaming the peer). */
+export const isUnreachable = (error: string): boolean =>
+  /couldn't connect|PeerIsNotOnline|is not online|RemotePeerDisconnected|disconnected$|RemotePeerExited|peer exiting/i.test(error);
+
+/** An amount in LND's error text: btcutil.Amount prints "0.02 BTC"; other
+ *  wordings say "2000000 sat". A bare number with a decimal point is BTC. */
+function amountSats(value: string, unit: string | undefined): number | null {
+  const n = Number(value.replace(/,/g, ""));
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const btc = unit ? /^btc$/i.test(unit) : value.includes(".");
+  return Math.round(btc ? n * 100_000_000 : n);
+}
+
+/** The smallest channel the peer said it takes, from its refusal — LND's
+ *  ErrChanTooSmall: "chan size of 0.01 BTC is below min chan size of 0.02 BTC"
+ *  (the reliable source: a peer's LN+ setting is only what it declares). */
+export function peerMinChannelFromError(error: string): number | null {
+  const m = /below min(?:imum)?\s+chan(?:nel)?\s+size\s+of\s+([\d.,]+)\s*(BTC|sats?)?/i.exec(error);
+  return m ? amountSats(m[1], m[2]) : null;
+}
+
+/** The largest channel the peer said it takes — LND's ErrChanTooLarge:
+ *  "chan size of 0.2 BTC exceeds maximum chan size of 0.16777215 BTC". */
+export function peerMaxChannelFromError(error: string): number | null {
+  const m = /(?:exceeds|above)\s+max(?:imum)?\s+chan(?:nel)?\s+size\s+of\s+([\d.,]+)\s*(BTC|sats?)?/i.exec(error);
+  return m ? amountSats(m[1], m[2]) : null;
 }
 
 /** LND refused because the peer already has as many pending channels as it
@@ -172,6 +237,10 @@ export async function fundChannel(writeLnd: AuthenticatedLnd, params: OpenChanne
       // the caller's on-chain mutex. connectForOpen has connected it already.
       ...(params.feeRate ? { chain_fee_tokens_per_vbyte: params.feeRate } : {}),
       ...(params.isPrivate ? { is_private: true } : {}),
+      ...(params.routingFeePpm !== undefined ? { fee_rate: params.routingFeePpm } : {}),
+      // A string: "0" is a base fee of zero (the library tests it for
+      // presence, and "0" is set).
+      ...(params.routingBaseFeeMsat !== undefined ? { base_fee_mtokens: String(params.routingBaseFeeMsat) } : {}),
     });
     return {
       ...base,

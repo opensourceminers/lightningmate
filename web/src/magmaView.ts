@@ -232,7 +232,6 @@ export const SUMMARY_LABEL: Record<MagmaV2Report["sell"]["state"], string> = {
   sell_only_above_profit_floor: "Sell above floor only",
   market_too_cheap: "Market too cheap right now",
   insufficient_capital: "Not enough idle capital",
-  not_recommended_node_needs_inbound: "Your node needs inbound",
 };
 
 /** A form whose window the autopilot would turn orders away from (with
@@ -352,7 +351,7 @@ export function freedCapitalMagmaHint(rec: MagmaV2Report | null, e: Eligibility 
   const r0 = rec?.sell.recommendations[0];
   if (!rec || !r0 || freedSat <= 0 || !e) return null;
   if (e.verdict !== "possible_but_slow" && e.verdict !== "realistic") return null;
-  if (!r0.economics.beatsRouting || rec.sell.state === "not_recommended_node_needs_inbound") return null;
+  if (!r0.economics.beatsRouting) return null;
   const sales = e.expectedSalesPerYear !== null ? `; offers like yours sell about ${e.expectedSalesPerYear.toFixed(1)} times a year` : "";
   // leaseApy is NET (after on-chain costs and the service fee), per sale.
   return (

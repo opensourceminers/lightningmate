@@ -59,7 +59,10 @@ export interface NodeMeta {
   alias: string;
   hasClearnet: boolean;
   updatedAt: number;
+  /** One address to show (clearnet preferred), "" if none. */
   socket: string;
+  /** Every address the node advertises, as the graph lists them. */
+  sockets: string[];
 }
 
 export interface GraphCache {
@@ -228,6 +231,7 @@ async function readGraph(lnd: AuthenticatedLnd): Promise<GraphCache> {
       hasClearnet: n.sockets.some(isClearnet),
       updatedAt: n.updated_at ? new Date(n.updated_at).getTime() : 0,
       socket: clearnet ?? n.sockets[0] ?? "",
+      sockets: [...n.sockets],
     });
   }
 

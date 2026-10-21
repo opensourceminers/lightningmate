@@ -520,6 +520,8 @@ test("a stored sub-minimum channel size never becomes a 2M auto-open: the upgrad
     async () => ({
       suggestions: [{ pubkey: peer, alias: "next-peer", socket: "", recommendedSizeSats: 2_000_000 } as SuggestionV2],
     });
+  // LND's economy fee estimate (the fake has none).
+  (autopilot as unknown as { openFeeRate: () => Promise<number | null> }).openFeeRate = async () => 2;
 
   const opened = () => node.callsTo("default.openChannel").map((c) => Number(c.local_funding_amount));
 

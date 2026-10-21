@@ -50,6 +50,12 @@ export interface AutopilotConfig {
   channelSizeSats: number;
   /** Minimum time between auto-opens. */
   channelCooldownMinutes: number;
+  /** The most an automatic open pays on-chain (sat/vByte, at the economy
+   *  rate it opens at): above it, opens wait for cheaper fees. With the
+   *  payback check (open + close within a year of what a channel earns
+   *  here) it replaced the old "≤ 1 % of the channel size" gate, which let
+   *  a 2M channel pay 114 sat/vB — years of its routing income. */
+  channelMaxFeeRate: number;
   /** Magma liquidity provision: auto-fulfill sell orders (accept + open channel). */
   sellEnabled: boolean;
   /** Max total capital deployed into sold channels (sats). */
@@ -98,6 +104,7 @@ export const DEFAULT_CONFIG: AutopilotConfig = {
   channelReserveSats: 50_000,
   channelSizeSats: 0,
   channelCooldownMinutes: 1_440,
+  channelMaxFeeRate: 20,
   sellEnabled: false,
   sellMaxDeploySats: 2_000_000,
   sellReserveSats: 50_000,
@@ -174,6 +181,8 @@ export const CONFIG_BOUNDS: Record<NumericTopKey, NumberBounds> = {
   channelReserveSats: int(25_000, MAX_MONEY_SATS),
   channelSizeSats: int(0, MAX_SATS),
   channelCooldownMinutes: int(360, MAX_COOLDOWN_MINUTES),
+  // ≥ 1: LND's floor. The ceiling only rejects garbage.
+  channelMaxFeeRate: int(1, 1_000),
   sellMaxDeploySats: int(0, MAX_SATS),
   sellReserveSats: int(25_000, MAX_MONEY_SATS),
   sellMaxChannelSats: int(0, MAX_SATS),

@@ -252,6 +252,9 @@ export interface RefillNote {
 }
 
 export interface RebalanceRecReport {
+  /** When the plan was made — before its inputs were read. A manual run
+   *  from it sends this back (planAt) and is refused once its target was
+   *  refilled since. */
   generatedAt: string;
   config: RebalanceRecConfig;
   summary: RebalanceRecSummary;
@@ -803,6 +806,10 @@ export async function getRebalanceRecommendations(
   opts: RebalanceRecOptions = {},
 ): Promise<RebalanceRecReport> {
   const cfg = { ...REBAL_REC_DEFAULTS, ...(opts.recOverrides ?? {}) };
+  // Stamped BEFORE its inputs are read: a refill that started while the
+  // channels were read and the routes probed is newer than this plan, and a
+  // manual run from it is refused as stale (autopilot.ts rebalanceByHand).
+  const generatedAt = new Date().toISOString();
   const [run, ownKey] = await Promise.all([runFeeEngine(lnd, engine), getOwnPubkey(lnd)]);
   const plan = await planRebalances(
     {
@@ -816,5 +823,5 @@ export async function getRebalanceRecommendations(
     },
     (source, target, amount) => estimateCost(lnd, ownKey, source, target, amount, cfg.probeCeilingPpm),
   );
-  return { generatedAt: new Date().toISOString(), config: cfg, ...plan };
+  return { generatedAt, config: cfg, ...plan };
 }

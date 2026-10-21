@@ -82,7 +82,7 @@ export async function startApi(
   const overrides = new OverridesStore(dir);
   const amboss = new AmbossStore(dir);
   const backup = new BackupStore(dir);
-  const lnplus = new LnPlusStore(dir);
+  const lnplus = new LnPlusStore(dir, () => settings.get().lnplusLookups);
   const earnings = new EarningsLog(dir);
   const serviceFees = new ServiceFeeLedger(dir, writeLnd ? lndFeeLightning(writeLnd) : null, {
     payTimeoutMs: opts.payTimeoutMs ?? 200,

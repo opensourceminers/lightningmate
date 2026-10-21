@@ -491,13 +491,16 @@ test("a signal that comes while an attempt's invoice is being made stops it befo
 
 test("a shutdown while a channel open is being planned: no funding transaction is broadcast", async (t) => {
   const { autopilot, node, seams } = autopilotWith(t, { channelEnabled: true });
+  seams.openFeeRate = async () => 2; // LND's economy estimate (the fake has none)
   seams.channelSuggestions = async () => {
     autopilot.shutdown(); // SIGTERM arrives during the (slow) graph read
     return { suggestions: [suggestion] };
   };
   const run = await autopilot.runOnce();
   assert.equal(node.callsTo("default.openChannel").length, 0);
-  assert.match(run.channels[0]?.error ?? "", /skipped: shutting down/);
+  // A deliberate stop, not a failed open (D15): the stage's decision says it.
+  assert.deepEqual(run.channels, []);
+  assert.match(autopilot.getState().decisions.channels?.text ?? "", /stopped: shutting down — no open was started/);
 });
 
 test("a shutdown during a Magma order step: that step completes, the next order's steps don't start", async (t) => {

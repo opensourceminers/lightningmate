@@ -39,6 +39,7 @@ type NumKey =
   | "channelReserveSats"
   | "channelSizeSats"
   | "channelCooldownMinutes"
+  | "channelMaxFeeRate"
   | "sellMaxDeploySats"
   | "sellReserveSats"
   | "sellMaxChannelSats";
@@ -71,7 +72,20 @@ const CHANNEL_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "channelSizeSats", label: "Channel size (sat, 0=auto)" },
   { key: "channelReserveSats", label: "Keep on-chain reserve (sat)" },
   { key: "channelCooldownMinutes", label: "Open cooldown (min)" },
+  { key: "channelMaxFeeRate", label: "Max on-chain fee for opens (sat/vB)" },
 ];
+/** How the channel autopilot decides (shown under its settings). */
+export const CHANNEL_OPEN_HINT =
+  "Opens wait for an economy fee rate (about half a day to confirm) at or below your maximum, and only when opening and later " +
+  "closing the channel would be paid back within a year of what a channel of that size earns on this node (channels older " +
+  "than a month, with at least 10 forwards or 1,000 sat earned in 30 days; with less, only the maximum applies). It walks " +
+  "down the suggestions: a peer that refused an open waits 1 day, then 7, then 30; one that takes bigger channels than your " +
+  "fixed size is skipped (auto size meets its minimum, up to a third of the node's capital); a peer closed within 90 days, " +
+  "rated poorly on LN+, without an address, of low usefulness or marked “never auto” is never opened to automatically. " +
+  "When the open fails on this node's side — LND's wallet not synced or short of confirmed coins, or no connection to any " +
+  "peer — no peer is held back for it, and the next run tries again. An open that ends unclearly starts the cooldown, as " +
+  "an open does.";
+
 const SELL_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "sellMaxDeploySats", label: "Max capital deployed (sat)" },
   { key: "sellMaxChannelSats", label: "Max channel size / order (sat)" },
@@ -460,10 +474,16 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
         </>
       ) : sub === "channels" ? (
         <>
-          {toggleRow("channelEnabled", "Channel autopilot", "Opens a channel to the top suggestion below when on-chain funds allow")}
+          {toggleRow(
+            "channelEnabled",
+            "Channel autopilot",
+            "Opens a channel to the best suggestion below that it can actually open — the peer's minimum size, earlier refusals, a recent close and on-chain fees checked — when on-chain funds allow",
+          )}
+          {decisionLine(server.decisions?.channels) ? <p className="muted ap-hint">{decisionLine(server.decisions?.channels)}</p> : null}
           <details className="ap-customize">
             <summary>Customize channel policy</summary>
             <div className="policy-controls">{numFields(CHANNEL_NUM_FIELDS)}</div>
+            <p className="muted ap-hint">{CHANNEL_OPEN_HINT}</p>
             {saveRow}
           </details>
           <SuggestionsPanel />

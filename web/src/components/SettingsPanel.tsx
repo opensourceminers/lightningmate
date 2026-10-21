@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { AmbossKeyCheck, AppSettings, FiatCurrency, LspStatus } from "../types";
+import type { AmbossKeyCheck, AppSettings, FiatCurrency, LspStatus, PrivacyInfo, TorRoute } from "../types";
+import { TOR_ROUTES, destinationLine, privacySummary } from "../privacyView";
 import { BackupCard } from "./BackupCard";
 import { AmbossKeyStatus } from "./AmbossKeyStatus";
 import { Switch, RunState } from "./Switch";
@@ -33,7 +34,12 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
   const [ambossBusy, setAmbossBusy] = useState(false);
   const [ambossError, setAmbossError] = useState<string | null>(null);
 
+  // Where the app's own lookups go (Privacy).
+  const [privacy, setPrivacy] = useState<PrivacyInfo | null>(null);
+  const loadPrivacy = () => api.privacy().then(setPrivacy).catch(() => setPrivacy(null));
+
   useEffect(() => {
+    void loadPrivacy();
     api.getSettings().then(setSettings).catch((e) => setError(e instanceof Error ? e.message : String(e)));
     api
       .ambossStatus()
@@ -118,6 +124,20 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
     try {
       setSettings(await api.setSettings({ fiatCurrency }));
       onChange();
+      void loadPrivacy();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const savePrivacy = async (patch: { lnplusLookups?: boolean; torRoute?: TorRoute }) => {
+    setBusy(true);
+    setError(null);
+    try {
+      setSettings(await api.setSettings(patch));
+      await loadPrivacy();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -247,8 +267,8 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
       <h3 className="sub">Fiat currency</h3>
       <div className="dryrun-banner">
         Show a fiat estimate next to sat amounts. <strong>Off by default</strong> — when
-        enabled, LightningMate fetches the BTC price from mempool.space (the only outbound
-        request it makes).
+        enabled, LightningMate fetches the BTC price from mempool.space (see <strong>Privacy</strong> below
+        for every lookup the app makes, and its route).
       </div>
       <div className="seg">
         {CURRENCIES.map((c) => (
@@ -264,6 +284,47 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
       </div>
 
       {error ? <p className="banner error">{error}</p> : null}
+
+      <h3 className="sub">Privacy</h3>
+      {privacy ? (
+        <>
+          <div className="dryrun-banner">{privacySummary(privacy)}</div>
+          <ul className="close-aside">
+            {privacy.destinations.map((d) => (
+              <li key={d.service}>{destinationLine(d)}</li>
+            ))}
+          </ul>
+          {privacy.torProxy ? (
+            <div className="seg">
+              {TOR_ROUTES.map((r) => (
+                <button
+                  key={r.id}
+                  className={`seg-btn ${privacy.torRoute === r.id ? "active" : ""}`}
+                  disabled={busy}
+                  title={r.desc}
+                  onClick={() => void savePrivacy({ torRoute: r.id })}
+                >
+                  {r.label}
+                </button>
+              ))}
+            </div>
+          ) : null}
+          <div className="amboss-row" style={{ marginTop: 10 }}>
+            <Switch
+              checked={privacy.lnplusLookups}
+              disabled={busy}
+              onChange={(v) => void savePrivacy({ lnplusLookups: v })}
+              label="LN+ lookups"
+            />
+            <span className="muted">
+              LN+ lookups (lightningnetwork.plus): peer reputations for picking peers, and the Pool and Swaps views — your
+              own node's public key included. Off: nothing is asked of LN+; what is cached is still used.
+            </span>
+          </div>
+        </>
+      ) : (
+        <p className="muted">Loading…</p>
+      )}
 
       <h3 className="sub">Amboss Magma</h3>
       <div className="dryrun-banner">

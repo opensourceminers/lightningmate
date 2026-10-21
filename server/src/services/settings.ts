@@ -1,10 +1,18 @@
 import { JsonStore } from "../store.js";
+import type { TorRoute } from "./http.js";
 
 export type FiatCurrency = "off" | "USD" | "EUR" | "GBP" | "CHF";
 
 export interface AppSettings {
   /** "off" = no external price calls at all (privacy-first default). */
   fiatCurrency: FiatCurrency;
+  /** Look peers (and this node) up on lightningnetwork.plus: reputation in
+   *  peer picking, the Pool and Swaps views. Off: no LN+ request at all
+   *  (cached answers are still used). */
+  lnplusLookups: boolean;
+  /** Which outbound requests go through Umbrel's Tor proxy when the app has
+   *  one (http.ts TorRoute). */
+  torRoute: TorRoute;
   /** LSP mode (beta): answer LSPS1 (bLIP-51) requests from wallets. Off by default. */
   lspModeEnabled: boolean;
   /** Clearnet address (host:port) to announce in the node graph, "" = none.
@@ -14,6 +22,10 @@ export interface AppSettings {
 
 export const DEFAULT_SETTINGS: AppSettings = {
   fiatCurrency: "off",
+  // On, as since LN+ came in (0.7.4) — with Umbrel's Tor proxy its lookups
+  // go through Tor; without one, Settings says they leave from this IP.
+  lnplusLookups: true,
+  torRoute: "lookups",
   lspModeEnabled: false,
   lspClearnetAddress: "",
 };

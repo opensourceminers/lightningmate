@@ -3,6 +3,7 @@ import { api } from "../api";
 import type { CloseCandidate, CloseCandidatesResponse, Eligibility, MagmaV2Report } from "../types";
 import { freedCapitalMagmaHint } from "../magmaView";
 import { satsCompact } from "../format";
+import { leaseTag, offlineLabel } from "../closeView";
 import { CloseChannelDialog, type CloseTarget } from "./CloseChannelDialog";
 import { EmptyState } from "./Skeleton";
 
@@ -32,13 +33,22 @@ export function CloseCandidatesPanel() {
     api.magmaEligibility().then(setElig).catch(() => setElig(null));
   }, []);
 
+  // Everything the dialog says before a close: the lease it would break, how
+  // long the peer has been away, what a force-close locks and costs.
   const openClose = (c: CloseCandidate) =>
     setCloseTarget({
       peerAlias: c.alias,
+      peerPubkey: c.peerPubkey,
       capacity: c.capacitySats,
+      localBalance: c.localSats,
+      initiator: c.weOpened ? "local" : "remote",
       active: c.active,
       transactionId: c.transactionId,
       transactionVout: c.transactionVout,
+      lease: c.lease,
+      offline: c.offline,
+      csvDelayBlocks: c.csvDelayBlocks,
+      commitFeeSats: c.commitFeeSats,
     });
 
   const rows = data?.candidates ?? [];
@@ -94,7 +104,8 @@ export function CloseCandidatesPanel() {
                     </td>
                     <td>
                       <div className="sug-peer">
-                        {c.alias} {c.active ? "" : <span className="muted">· offline</span>}
+                        {c.alias}{" "}
+                        {c.active ? "" : <span className="muted">· {offlineLabel(c.offline) ?? "offline"}</span>}
                       </div>
                       <div className="sug-badges">
                         <span className="sug-badge">{c.weOpened ? "you funded" : "peer-opened"}</span>
@@ -174,6 +185,38 @@ export function CloseCandidatesPanel() {
           </tbody>
         </table>
       )}
+
+      {data?.pending.length ? (
+        <>
+          <h3 className="sub">Opening or closing</h3>
+          <p className="muted small">
+            Waiting for their transaction to confirm — never close candidates, and there is nothing to close here.
+          </p>
+          <ul className="close-aside">
+            {data.pending.map((p) => (
+              <li key={p.channelId}>
+                <strong>{p.alias}</strong> · {satsCompact(p.capacitySats)} · {p.status === "pending_open" ? "opening" : p.timelockBlocks ? `closing — funds back in ~${p.timelockBlocks} blocks` : "closing"}
+                {leaseTag(p.lease) ? <span className="tag tag-lease">{leaseTag(p.lease)}</span> : null}
+              </li>
+            ))}
+          </ul>
+        </>
+      ) : null}
+
+      {data?.protected.some((p) => p.lease) ? (
+        <details className="ap-customize">
+          <summary>Leased — not suggested until the lease ends ({data.protected.filter((p) => p.lease).length})</summary>
+          <ul className="close-aside">
+            {data.protected
+              .filter((p) => p.lease)
+              .map((p) => (
+                <li key={p.channelId}>
+                  <strong>{p.alias}</strong> — {p.reason}
+                </li>
+              ))}
+          </ul>
+        </details>
+      ) : null}
 
       {closeTarget ? (
         <CloseChannelDialog

@@ -71,7 +71,11 @@ export function budgetBlocked(r: Pick<RebalanceRecommendation, "wouldRebalance" 
  * earnings side, so every smaller size the payment falls back to is checked
  * the same way. With the gate, the server books the refill's value as its
  * hold, like an autopilot refill's: the fee is kept until the refilled sats
- * have routed out (what the tab says). Null: the row has nothing to run.
+ * have routed out (what the tab says). The plan's time goes with it: the
+ * server refuses the row once its target was refilled (or tried) after the
+ * plan was made — the tab loads its plan once, and a stale row paid a
+ * second refill into a target the autopilot had just refilled. Null: the
+ * row has nothing to run.
  */
 export function manualRefillRequest(
   r: Pick<
@@ -88,6 +92,8 @@ export function manualRefillRequest(
   /** The operator's econRatio (the plan's profitShare): the cost cap's
    *  fallback when the row has no max ppm. */
   econRatio = 0.8,
+  /** The plan's generatedAt. */
+  planAt?: string,
 ): RebalanceExecRequest | null {
   if (!r.selectedSourceChannel || !r.recommendedAmount) return null;
   return {
@@ -100,7 +106,19 @@ export function manualRefillRequest(
     ...(r.expectedRevenuePpm != null
       ? { gate: { revenuePpm: r.expectedRevenuePpm, demandSats: r.earningDemandSats, minNetSats: r.minNetProfitSats } }
       : {}),
+    ...(planAt ? { planAt } : {}),
   };
+}
+
+/** A refused manual refill the tab answers by loading a fresh plan: the
+ *  row's target was refilled (or tried) after the plan was made (409
+ *  stale_plan). Null: any other error (shown as it is). */
+export function stalePlanRefusal(e: unknown): string | null {
+  const err = e as { status?: unknown; body?: unknown; message?: unknown } | null;
+  const body = err?.body as { error?: unknown; message?: unknown } | null | undefined;
+  if (err?.status !== 409 || body?.error !== "stale_plan") return null;
+  const why = typeof body.message === "string" && body.message ? body.message : "This channel was refilled (or tried) after this plan was made";
+  return `${why.replace(/: reload it$/, "")} — loading a fresh plan, nothing was sent.`;
 }
 
 /**

@@ -369,8 +369,29 @@ later are **not** failed runs: they go into the rebalance decision ("last decisi
 tab), never into the run history. A drained channel the gate turns down says what a refill would need
 (earnings per sat, outflow, net drain).
 
-**Channels** (`runChannels`): opens a channel to the top-scored peer suggestion when
-on-chain funds exceed the reserve. **Capital gate (`leaveForMagma`, D10):** a routing open
+**Channels** (`runChannels`, `openPlan.ts`): opens one channel per cooldown to the best
+peer suggestion it can really open, when on-chain funds exceed the reserve. It walks down the
+ranked suggestions and skips, with the reason, a peer of low usefulness, one LN+ operators
+rate poorly, one this node closed a channel with in the last 90 days, one on the operator's
+"never auto" list, one without an address to dial (unless connected), and one still backing
+off after a refusal (1 day, then 7, then 30). The size meets what the peer takes: its LN+
+minimum, or the minimum (or maximum) its refusal named — auto size rises to a minimum up to
+a third of the node's capital, a fixed size never does. It dials every address the peer
+advertises (.onion first on a Tor-only node), at most three peers a run and no new one after
+two minutes. The funding pays LND's economy rate (a 72-block target), never above the
+operator's maximum (`channelMaxFeeRate`, 20 sat/vB by default), and only when the open and a
+later close pay back within 12 months of what a channel of that size earns on this node
+(capacity-weighted yield of channels older than ~30 days, trusted only with at least 10 forwards
+or 1,000 sat earned through them in 30 days; with less — or no such channel — only the maximum
+rate applies, and the note says the payback was not checked). The channel starts at the fee
+engine's protected new-channel fee (manual opens too; the Open form says which).
+A failure on this node's own side — LND's wallet not synced, too few confirmed coins, the
+anchor reserve, or no connection to any peer at all (Tor or the internet down; then nobody is
+dialed) — holds no peer back: the stage stops, says why, and the next run tries again. An open
+that ends unclearly (its funding may be out) stops the run and starts the cooldown as an open does.
+Waits and deferrals are the stage's decision note, never failed runs; a refusal is one line
+of history, not one per run. Every open takes the shared on-chain mutex and capital ledger.
+**Capital gate (`leaveForMagma`, D10):** a routing open
 waits for Magma only when ALL of these hold — Amboss accepts the key and an offer of this node
 is listed (enabled); the selling check says better than "not realistic" (offers like this
 node's sell at least about once a year); and the lease income this capital can expect
@@ -411,7 +432,7 @@ policy: { minPpm, neutralPpm, maxPpm, baseFeeMsat, step, minChangePpm }
 rebalanceEnabled, rebalancePolicy{econRatio, minNetProfitSats, maxPaybackDays,
   maxAmountSats}, maxRebalancesPerRun, rebalanceCooldownMinutes,
   rebalanceHourStart, rebalanceHourEnd (UTC), rebalanceDailyBudgetSats (null = no limit)
-channelEnabled, channelReserveSats, channelSizeSats, channelCooldownMinutes
+channelEnabled, channelReserveSats, channelSizeSats, channelCooldownMinutes, channelMaxFeeRate
 sellEnabled, sellMaxDeploySats, sellReserveSats, sellMaxChannelSats,
   sellAutoClose, sellAutoRelist, sellAutoReprice, sellPricingMode
 ```

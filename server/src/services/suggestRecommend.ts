@@ -1,8 +1,10 @@
-import { type AuthenticatedLnd } from "lightning";
+import { getClosedChannels, getWalletInfo, type AuthenticatedLnd } from "lightning";
 import { getChannelsView, type ChannelView } from "./channels.js";
 import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
-import { getFeeRecommendations, type FeeRecConfig, type FeeRecState } from "./feeRecommend.js";
+import { getFeeRecommendations, type FeeRecConfig, type FeeRecState, type FeeRecommendation } from "./feeRecommend.js";
+import { channelLeases, leaseProtection, type ChannelLease, type LeaseSources } from "./leases.js";
+import { OFFLINE_CLOSE_SIGNAL_HOURS, UPTIME_WINDOW_MS, offlineText, type ChannelUptime, type OfflineInfo } from "./channelUptime.js";
 import { onchainCosts } from "./nodeEconomics.js";
 import type { RebalanceRecord } from "./rebalanceLog.js";
 import type { OverrideMap } from "./overrides.js";
@@ -53,31 +55,67 @@ export type NodeNeed =
   | "need_revenue"
   | "balanced";
 
-/** Our node's current need, inferred honestly from our own balance + revenue. */
+/**
+ * Our node's current need, inferred honestly from our own balance + revenue.
+ *
+ * A channel's localRatio is its OUTBOUND share (channels.ts). So a node with
+ * ≤ 30 % of its liquidity local can send and route out little — it is short
+ * of OUTBOUND, which is exactly what a channel it opens adds. A node with
+ * ≥ 70 % local is short of INBOUND: channels it opens add only more outbound;
+ * inbound comes from peers opening to it, Magma Buy or LN+ swaps. (Before,
+ * the two were swapped: an inbound-rich node read "you need inbound — new
+ * opens give outbound" on every suggestion, and Magma told it to buy inbound
+ * and not to lease.)
+ */
 export function computeNodeNeed(
   channels: ChannelView[],
   revenueWindowSats: number,
   windowDays: number,
-): { nodeNeed: NodeNeed; reason: string } {
+): { nodeNeed: NodeNeed; reason: string; localPct: number } {
   const totalCap = channels.reduce((s, c) => s + c.capacity, 0) || 1;
   const localSats = channels.reduce((s, c) => s + c.localRatio * c.capacity, 0);
   const myLocalRatio = localSats / totalCap;
+  const localPct = Math.round(myLocalRatio * 100);
   const revenuePerChannel = channels.length ? revenueWindowSats / channels.length : 0;
   if (channels.length < 5)
-    return { nodeNeed: "need_routing_diversity", reason: `only ${channels.length} channel${channels.length === 1 ? "" : "s"} — broaden into new clusters first` };
+    return { nodeNeed: "need_routing_diversity", localPct, reason: `only ${channels.length} channel${channels.length === 1 ? "" : "s"} — broaden into new clusters first` };
   if (myLocalRatio >= 0.7)
-    return { nodeNeed: "need_outbound", reason: `${Math.round(myLocalRatio * 100)}% of your liquidity is local — deploy it toward peers that pull flow` };
+    return {
+      nodeNeed: "need_inbound",
+      localPct,
+      reason:
+        `${localPct}% of your liquidity is local (outbound) — the node is short of inbound: channels you open add outbound only; ` +
+        "inbound comes from peers opening to you, Magma Buy or LN+ swaps",
+    };
   if (myLocalRatio <= 0.3)
-    return { nodeNeed: "need_inbound", reason: `only ${Math.round(myLocalRatio * 100)}% local — you need inbound; new opens give outbound, so prefer peers likely to send back` };
+    return {
+      nodeNeed: "need_outbound",
+      localPct,
+      reason: `only ${localPct}% of your liquidity is local — the node is short of outbound: channels you open add exactly that, so open toward peers that pull flow`,
+    };
   if (revenuePerChannel < 50)
-    return { nodeNeed: "need_revenue", reason: `low earnings per channel (${Math.round(revenuePerChannel)} sat/${windowDays}d) — chase real demand` };
-  return { nodeNeed: "balanced", reason: "well balanced — grow where you already see demand and into fresh clusters" };
+    return { nodeNeed: "need_revenue", localPct, reason: `low earnings per channel (${Math.round(revenuePerChannel)} sat/${windowDays}d) — chase real demand` };
+  return { nodeNeed: "balanced", localPct, reason: "well balanced — grow where you already see demand and into fresh clusters" };
+}
+
+/** The caveat every suggestion carries for this need, or null. Only an
+ *  outbound-heavy node gets one: what it lacks, an open can't give. */
+export function needWarning(need: NodeNeed): string | null {
+  return need === "need_inbound"
+    ? "Your node is short of inbound — opening this adds outbound only (inbound comes from peers opening to you, Magma Buy or LN+ swaps)."
+    : null;
 }
 
 export interface SuggestionV2 {
   pubkey: string;
   alias: string;
+  /** The first address to dial ("" if the node advertises none). */
   socket: string;
+  /** Every advertised address, in the order to dial them: .onion first on a
+   *  node that announces no clearnet address of its own (Tor-only), clearnet
+   *  first otherwise. Before, only one was ever dialed — clearnet whenever
+   *  the peer had one. */
+  sockets: string[];
   hasClearnet: boolean;
   channels: number;
   capacitySats: number;
@@ -122,6 +160,24 @@ export interface SuggestionV2 {
     /** What the reputation did to the score, in percent (+8 = lifted by 8%). */
     scoreEffectPct: number;
   } | null;
+  /** The smallest channel the peer says it accepts (its LN+ account
+   *  setting), or null when unknown. Self-declared: LND's own refusal
+   *  ("below min chan size of …") is the reliable source (autopilot). */
+  peerMinChannelSats: number | null;
+  /** This node closed a channel with the peer this many days ago (within
+   *  RECENT_CLOSE_DAYS), or null. */
+  closedDaysAgo: number | null;
+}
+
+/** A peer this node closed a channel with this recently is not proposed for
+ *  an automatic open (it says so on the suggestion). */
+export const RECENT_CLOSE_DAYS = 90;
+
+/** Every advertised address in the order to dial them (see SuggestionV2.sockets). */
+export function dialOrder(sockets: readonly string[], torOnly: boolean): string[] {
+  const onion = sockets.filter((x) => x.includes(".onion"));
+  const clear = sockets.filter((x) => !x.includes(".onion"));
+  return torOnly ? [...onion, ...clear] : [...clear, ...onion];
 }
 
 export interface SuggestV2Report {
@@ -151,7 +207,6 @@ export interface SuggestV2Report {
 }
 
 const clamp01 = (n: number) => Math.min(1, Math.max(0, n));
-const k = (n: number) => `${Math.round(n / 1000)}k`;
 function median(values: number[]): number {
   if (values.length === 0) return 0;
   const s = [...values].sort((a, b) => a - b);
@@ -204,12 +259,29 @@ export async function getChannelSuggestionsV2(
 ): Promise<SuggestV2Report> {
   const policy = { ...SUGGEST_V2_DEFAULTS, ...overrides };
 
-  const [graph, channels, ownKey, flow] = await Promise.all([
+  const [graph, channels, ownKey, flow, info, closed] = await Promise.all([
     buildGraphCache(lnd),
     getChannelsView(lnd),
     getOwnPubkey(lnd),
     getFlowSummary(lnd, policy.demandWindowDays).catch(() => null),
+    getWalletInfo({ lnd }).catch(() => null),
+    getClosedChannels({ lnd })
+      .then((r) => r.channels)
+      .catch(() => []),
   ]);
+  // A node that announces no clearnet address of its own dials over Tor:
+  // a peer's .onion first (no exit node in between).
+  const torOnly = !(info?.uris ?? []).some((u) => !u.includes(".onion"));
+  // The most recent close with each peer (blocks ago → days). A close with
+  // no confirmation height (a funding that never confirmed) can't be dated:
+  // it doesn't count — or a years-old one would bar the peer for good.
+  const height = info?.current_block_height ?? 0;
+  const closedDays = new Map<string, number>();
+  for (const c of closed) {
+    if (!c.close_confirm_height || !height) continue;
+    const days = Math.max(0, Math.floor((height - c.close_confirm_height) / 144));
+    if (days <= RECENT_CLOSE_DAYS && days < (closedDays.get(c.partner_public_key) ?? Infinity)) closedDays.set(c.partner_public_key, days);
+  }
 
   const now = Date.now();
   const peers = new Set(channels.map((c) => c.peerPubkey));
@@ -285,7 +357,7 @@ export async function getChannelSuggestionsV2(
       hasDemandData,
       suggestions: [],
       graphAgeSec: Math.round((now - graph.at) / 1000),
-      lnplus: { enabled: !!lnplus, checked: 0, known: 0, paused: lnplus?.isPaused() ?? false, error: null },
+      lnplus: { enabled: !!lnplus && lnplus.isEnabled(), checked: 0, known: 0, paused: lnplus?.isPaused() ?? false, error: null },
       portfolioSummary: { selectedCount: 0, estimatedNewReach: 0, estimatedWeightedNewReach: 0, demandCoveragePct: 0 },
     };
   }
@@ -426,10 +498,12 @@ export async function getChannelSuggestionsV2(
         roleFitScore = weightedReachScore;
         break;
       case "need_outbound":
+        // Short of outbound: an open is the fix — weight demand and depth.
         roleFitScore = 0.5 * demandScore + 0.5 * depthScore;
         break;
       case "need_inbound":
-        roleFitScore = 0.5 * demandScore + 0.2 * routerScore; // limited — opens give outbound
+        // Short of inbound: an open adds outbound only — limited fit.
+        roleFitScore = 0.5 * demandScore + 0.2 * routerScore;
         break;
       default:
         roleFitScore = 0.5 * demandScore + 0.5 * weightedReachScore;
@@ -567,12 +641,16 @@ export async function getChannelSuggestionsV2(
       warnings.push("Large hub: useful reach, but it overlaps heavily with peers you already connect to.");
     }
     if (s.avgFee > 2000) warnings.push("High average fees: handy for reach, less attractive for profitable routing.");
+    const closedDaysAgo = closedDays.get(pk) ?? null;
+    if (closedDaysAgo !== null) {
+      warnings.push(`You closed a channel with this node ${closedDaysAgo === 0 ? "recently" : `${closedDaysAgo} days ago`} — the autopilot doesn't reopen to it within ${RECENT_CLOSE_DAYS} days.`);
+    }
+    if (meta.sockets.length === 0) warnings.push("It advertises no address — it can only be opened to while it is connected to you.");
     if (hasDemandData && s.demandScore < 0.15) {
       warnings.push("Low demand evidence: this pick rests mainly on graph topology.");
     }
-    if (nodeNeed === "need_inbound") {
-      warnings.push("You need inbound — opening this gives outbound liquidity, not inbound.");
-    }
+    const needCaveat = needWarning(nodeNeed);
+    if (needCaveat) warnings.push(needCaveat);
 
     // Badges (compact, for the row).
     const badges: string[] = [];
@@ -603,10 +681,12 @@ export async function getChannelSuggestionsV2(
     const usefulness: SuggestionV2["usefulness"] =
       s.rawScore >= 0.55 ? "high" : s.rawScore >= 0.35 ? "medium" : "low";
 
+    const sockets = dialOrder(meta.sockets, torOnly);
     return {
       pubkey: pk,
       alias: meta.alias,
-      socket: meta.socket,
+      socket: sockets[0] ?? "",
+      sockets,
       hasClearnet: meta.hasClearnet,
       channels: stat.degree,
       capacitySats: stat.totalCapacity,
@@ -643,6 +723,8 @@ export async function getChannelSuggestionsV2(
             scoreEffectPct: Math.round((s.trustMultiplier - 1) * 100),
           }
         : null,
+      peerMinChannelSats: lp && lp.minChannelSizeSats > 0 ? lp.minChannelSizeSats : null,
+      closedDaysAgo,
     };
   });
 
@@ -667,7 +749,7 @@ export async function getChannelSuggestionsV2(
     suggestions,
     graphAgeSec: Math.round((now - graph.at) / 1000),
     lnplus: {
-      enabled: !!lnplus,
+      enabled: !!lnplus && lnplus.isEnabled(),
       checked: lnplusChecked,
       known: lnplusKnown,
       paused: lnplus?.isPaused() ?? false,
@@ -687,6 +769,16 @@ export async function getChannelSuggestionsV2(
 // actually frees YOUR capital. You only ever reclaim your *local* balance on close;
 // a channel the peer opened to you frees little (their capital, your small local)
 // and gives up free inbound, so it's judged very differently from one you funded.
+//
+// Never a close candidate (review a3-channels / a4 / a6, package P4):
+//  - a channel still opening or closing: it is listed apart, with no close button
+//    (before, a just-funded channel — a Magma or LSPS1 sale's too — was listed
+//    first as "Offline — peer unreachable", with only a force-close offered);
+//  - a channel inside its lease — sold on Magma, sold over LSPS1, or bought on
+//    Magma (leases.ts): closing it breaks what a buyer paid for, or throws away
+//    what this node paid. The 30-day guard covered only the shortest lease.
+// And a peer that is offline for a moment is not a close signal: only one away
+// for days (or online less than half the time) counts (channelUptime.ts).
 
 export interface CloseSuggestion {
   channelId: string;
@@ -701,7 +793,7 @@ export interface CloseSuggestion {
   localSats: number;
   /** What you'd actually reclaim on-chain on close = your current local balance. */
   capitalFreedSats: number;
-  /** Live on-chain cost to close this channel. */
+  /** Live on-chain cost to close this channel (cooperatively). */
   closeCostSat: number;
   /** Inbound liquidity you'd give up (the remote side), free if the peer opened it. */
   inboundLiquidityLostSats: number;
@@ -715,74 +807,126 @@ export interface CloseSuggestion {
   uniqueReachLost: number;
   feeV2State: FeeRecState;
   opportunityCandidates: { alias: string; score: number; sizeSats: number }[];
+  /** The peer is away: since when, and whether that counts toward a close
+   *  (null: online). A short outage is shown, never scored. */
+  offline: OfflineInfo | null;
+  /** A lease the channel had and that is over (a channel inside one is
+   *  never a candidate) — a bought one with what it cost. */
+  lease: ChannelLease | null;
+  /** What a force-close would mean, for the close dialog: our funds locked
+   *  this many blocks, and the commitment fee LND last signed (sat). */
+  csvDelayBlocks: number | null;
+  commitFeeSats: number | null;
   reasons: string[];
   warnings: string[];
+}
+
+/** A channel the close list leaves alone, and why. */
+export interface ProtectedChannel {
+  channelId: string;
+  alias: string;
+  reason: string;
+  /** Set when a running lease is the reason. */
+  lease: ChannelLease | null;
+}
+
+/** A channel still opening or closing: shown apart, never closable here. */
+export interface PendingChannel {
+  channelId: string;
+  alias: string;
+  status: "pending_open" | "pending_close";
+  capacitySats: number;
+  localSats: number;
+  /** A sale's or a purchase's lease (a pending one is inside it). */
+  lease: ChannelLease | null;
+  /** A force-close under way: blocks until the funds are spendable. */
+  timelockBlocks: number | null;
 }
 
 export interface CloseV2Report {
   windowDays: number;
   candidates: CloseSuggestion[];
   protectedCount: number;
+  /** Every protected channel with its reason (leases first). */
+  protected: ProtectedChannel[];
+  /** Channels still opening or closing. */
+  pending: PendingChannel[];
+  /** What closing every candidate would return (pending and leased channels
+   *  are never in it). */
   totalCapitalFreedSats: number;
 }
 
-export async function getCloseSuggestionsV2(
-  lnd: AuthenticatedLnd,
-  rebalanceRecords: RebalanceRecord[],
-  feeConfig: Partial<FeeRecConfig> = {},
-  channelOverrides: OverrideMap = {},
-): Promise<CloseV2Report> {
-  const [channels, ownKey, graph, flow60, feeRep, sugRep, oc] = await Promise.all([
-    getChannelsView(lnd),
-    getOwnPubkey(lnd),
-    buildGraphCache(lnd),
-    getFlowSummary(lnd, 60).catch(() => null),
-    getFeeRecommendations(lnd, rebalanceRecords, null, feeConfig, channelOverrides),
-    getChannelSuggestionsV2(lnd).catch(() => null),
-    onchainCosts(lnd),
-  ]);
-  const closeCostSat = oc.closeCostSat;
+/** What the close list needs beyond LND (the API route passes it). */
+export interface CloseContext {
+  /** Where leases come from (the capital and purchase ledgers). */
+  leaseSources?: LeaseSources;
+  /** The offline-duration record — observed with this read, then asked. */
+  uptime?: Pick<ChannelUptime, "observe" | "offlineInfo">;
+}
 
-  const now = Date.now();
-  const feeById = new Map(feeRep.recommendations.map((r) => [r.channelId, r]));
-  const flow60ById = new Map((flow60?.perChannel ?? []).map((f) => [f.channelId, f]));
-  const peersSet = new Set(channels.map((c) => c.peerPubkey));
+/** Everything the close ranking works from — no I/O (rankCloseCandidates). */
+export interface CloseInput {
+  channels: ChannelView[];
+  feeById: ReadonlyMap<string, FeeRecommendation>;
+  flow60ById: ReadonlyMap<string, { routedOut: number; routedIn: number; forwardCount: number; feesEarned: number }>;
+  /** Per channel: the 2-hop nodes only its peer reaches. */
+  uniqueReachByChan: ReadonlyMap<string, number>;
+  opportunity: { alias: string; score: number; sizeSats: number }[];
+  closeCostSat: number;
+  rebalanceRecords: RebalanceRecord[];
+  channelOverrides: OverrideMap;
+  leases: ReadonlyMap<string, ChannelLease>;
+  offline: (c: ChannelView) => OfflineInfo | null;
+  nowMs: number;
+}
+
+/** Thousands-separated "k" amounts ("2,000k", not "2000k"). */
+const kSep = (n: number) => `${Math.round(n / 1000).toLocaleString("en-US")}k`;
+
+/** What a bought channel was, for its reasons and warnings. */
+function boughtText(l: ChannelLease): string {
+  const days = Math.round(l.leaseBlocks / 144);
+  const ended = l.untilHeight !== null ? ` that ended at block ${l.untilHeight.toLocaleString("en-US")}` : "";
+  return `Bought on Magma for ${Math.round(l.costSats ?? 0).toLocaleString("en-US")} sat (order ${l.orderId.slice(0, 8)}…, a ${days}-day lease${ended})`;
+}
+
+/**
+ * The close list from its inputs — pure, so every protection and signal can
+ * be tested without a node.
+ */
+export function rankCloseCandidates(input: CloseInput): CloseV2Report {
+  const { channels, feeById, flow60ById, closeCostSat, rebalanceRecords, channelOverrides, nowMs } = input;
+  const maxUniqueReach = Math.max(1, ...[...input.uniqueReachByChan.values()]);
 
   // 60d revenue percentile is not needed once fee-v2 gives us isTopEarner; we keep
   // the rebalance-cost lookups window-aware for the P&L.
-  const within = (at: string, days: number) => now - new Date(at).getTime() <= days * 86_400_000;
+  const within = (at: string, days: number) => nowMs - new Date(at).getTime() <= days * 86_400_000;
   const rebalCost = (channelId: string, days: number) =>
     rebalanceRecords
       .filter((r) => r.ok && r.targetId === channelId && within(r.at, days))
       .reduce((s, r) => s + (r.feeSats ?? 0), 0);
 
-  // Reach cover: how many of our peers reach each 2-hop node. uniqueReach for a
-  // channel = nodes only its peer reaches → what we'd actually lose by closing it.
-  const cover = new Map<string, number>();
-  for (const c of channels) {
-    const ps = graph.stats.get(c.peerPubkey);
-    if (ps) for (const n of ps.neighbors) cover.set(n, (cover.get(n) ?? 0) + 1);
-  }
-  const uniqueReachOf = (peerPubkey: string): number => {
-    const ps = graph.stats.get(peerPubkey);
-    if (!ps) return 0;
-    let u = 0;
-    for (const n of ps.neighbors) if (cover.get(n) === 1 && !peersSet.has(n) && n !== ownKey) u += 1;
-    return u;
-  };
-  const uniqueReachByChan = new Map(channels.map((c) => [c.id, uniqueReachOf(c.peerPubkey)]));
-  const maxUniqueReach = Math.max(1, ...[...uniqueReachByChan.values()]);
-
-  const opportunity = (sugRep?.suggestions ?? []).slice(0, 3).map((s) => ({
-    alias: s.alias,
-    score: s.score,
-    sizeSats: s.recommendedSizeSats,
-  }));
-
-  let protectedCount = 0;
+  const protectedList: ProtectedChannel[] = [];
+  const pending: PendingChannel[] = [];
   const candidates: CloseSuggestion[] = [];
 
   for (const c of channels) {
+    const lease = input.leases.get(c.id) ?? null;
+    // Still opening or closing: no close button, never a candidate — and
+    // none of the signals below (no flow yet, no age, "inactive") mean
+    // anything for it.
+    if (c.status !== "open") {
+      pending.push({
+        channelId: c.id,
+        alias: c.peerAlias,
+        status: c.status,
+        capacitySats: c.capacity,
+        localSats: c.localBalance,
+        lease,
+        timelockBlocks: c.timelockBlocks ?? null,
+      });
+      continue;
+    }
     const fee = feeById.get(c.id);
     const f60 = flow60ById.get(c.id);
     const m = fee?.metrics;
@@ -795,41 +939,49 @@ export async function getCloseSuggestionsV2(
     const pnl30 = rev30 - rebalCost(c.id, 30);
     const pnl60 = rev60 - rebalCost(c.id, 60);
     const ageDays = m?.channelAgeDays ?? null;
-    const uniqueReach = uniqueReachByChan.get(c.id) ?? 0;
+    const uniqueReach = input.uniqueReachByChan.get(c.id) ?? 0;
     const reachContribution = uniqueReach / maxUniqueReach;
     const feeState = fee?.state ?? "normal";
     const weOpened = c.initiator === "local";
 
     // ── Protections: never suggest closing these ──
+    // "Routed recently" and "unique reach" hold whether or not the peer is
+    // connected this minute (before, both required c.active: a peer offline
+    // for a moment lost them and the channel went to the top of the list).
     let protectedReason: string | null = null;
-    if (channelOverrides[c.id]?.mode === "exclude") protectedReason = "manually protected";
+    if (lease?.running) protectedReason = leaseProtection(lease);
+    else if (channelOverrides[c.id]?.mode === "exclude") protectedReason = "manually protected";
     else if (ageDays != null && ageDays < 30) protectedReason = "new channel — still in its test period";
-    else if (c.active && routed30 > 0) protectedReason = "routed recently";
+    else if (routed30 > 0) protectedReason = "routed recently";
     else if (m?.isTopEarner) protectedReason = "top earner";
-    else if (c.active && reachContribution >= 0.5) protectedReason = "provides significant unique reach";
+    else if (reachContribution >= 0.5) protectedReason = "provides significant unique reach";
     if (protectedReason) {
-      protectedCount += 1;
+      protectedList.push({ channelId: c.id, alias: c.peerAlias, reason: protectedReason, lease: lease?.running ? lease : null });
       continue;
     }
 
     // ── Must have at least one real close signal ──
-    const offline = !c.active;
+    const away = input.offline(c);
+    // Away for days, or online less than half the time: a signal. A peer
+    // offline for hours is not one — it is shown, and the dialog offers a
+    // reconnect first (a force-close locks funds for the CSV delay).
+    const longOffline = away?.long === true;
     const idle60 = routed60 === 0;
     const losing = pnl60 < 0;
     const weak = feeState === "close_candidate" || m?.peerGate === "weak";
-    if (!offline && !idle60 && !losing && !weak) continue;
+    if (!longOffline && !idle60 && !losing && !weak) continue;
 
     // ── Score ──
-    const idleScore = offline ? 1 : idle60 ? 0.8 : routed30 === 0 ? 0.4 : 0;
+    const idleScore = longOffline ? 1 : idle60 ? 0.8 : routed30 === 0 ? 0.4 : 0;
     const negPnlScore = pnl60 < 0 ? clamp01(-pnl60 / 5000) : 0;
-    const weakPeerScore = feeState === "close_candidate" ? 1 : offline ? 0.6 : m?.peerGate === "weak" ? 0.5 : 0;
+    const weakPeerScore = feeState === "close_candidate" ? 1 : longOffline ? 0.6 : m?.peerGate === "weak" ? 0.5 : 0;
     const lowReachScore = 1 - reachContribution;
     // What closing actually returns on-chain to redeploy = our current local balance
     // minus the on-chain cost to close, regardless of who opened the channel.
     const capitalFreed = Math.max(0, c.localBalance);
     const netFreed = Math.max(0, capitalFreed - closeCostSat);
     const opportunityScore = clamp01(netFreed / 2_000_000);
-    const staleScore = feeState === "close_candidate" || offline ? 0.7 : 0.3;
+    const staleScore = feeState === "close_candidate" || longOffline ? 0.7 : 0.3;
     let closeScore = Math.round(
       100 *
         (0.28 * idleScore +
@@ -846,7 +998,16 @@ export async function getCloseSuggestionsV2(
 
     // ── Reasons ──
     const reasons: string[] = [];
-    if (offline) reasons.push("Offline — peer unreachable.");
+    if (longOffline && away) {
+      if (away.hours !== null && away.hours >= OFFLINE_CLOSE_SIGNAL_HOURS) {
+        reasons.push(`Offline for ${offlineText(away).replace(/^offline for /, "")} — peer unreachable.`);
+      } else if (away.uptimeShare !== null) {
+        reasons.push(
+          `Flaky peer — online only ${Math.round(away.uptimeShare * 100)}% of the time over LND's last ${Math.round(UPTIME_WINDOW_MS / 86_400_000)}+ days` +
+            `${away.hours !== null ? ` (${offlineText(away)} now)` : ""}.`,
+        );
+      }
+    }
     if (idle60 && lifetime === 0) reasons.push("Never routed.");
     else if (idle60) reasons.push("No forwards in 60d.");
     if (losing)
@@ -855,24 +1016,34 @@ export async function getCloseSuggestionsV2(
       );
     if (feeState === "close_candidate") reasons.push("Fee autopilot flags this peer as a close candidate.");
     if (reachContribution < 0.15) reasons.push("Adds little unique reach — other channels already cover the same nodes.");
-    if (capitalFreed >= 500_000 && opportunity.length) {
+    if (capitalFreed >= 500_000 && input.opportunity.length) {
       reasons.push(
-        `Frees ${k(capitalFreed)} you could redeploy into ${opportunity[0].alias}${opportunity.length > 1 ? ` +${opportunity.length - 1} more` : ""}.`,
+        `Frees ${kSep(capitalFreed)} you could redeploy into ${input.opportunity[0].alias}${input.opportunity.length > 1 ? ` +${input.opportunity.length - 1} more` : ""}.`,
       );
     }
     if (reasons.length === 0) reasons.push("Weak, low-value channel.");
 
     // ── Warnings: be honest about what a close really costs ──
     const warnings: string[] = [];
+    if (!c.active && !longOffline) {
+      warnings.push(
+        `The peer is ${away ? offlineText(away) : "offline right now"} — a short outage is no reason to close: reconnect, or wait for it to come back and close cooperatively. ` +
+          `A force-close locks your funds for ${c.csvDelayBlocks ?? "the CSV delay of"} blocks.`,
+      );
+    }
     if (capitalFreed < 0.2 * c.capacity) {
-      warnings.push(`Mostly drained — only ${k(capitalFreed)} returns on-chain (the rest already routed out).`);
+      warnings.push(`Mostly drained — only ${kSep(capitalFreed)} returns on-chain (the rest already routed out).`);
     }
     if (c.remoteBalance >= 0.3 * c.capacity) {
       warnings.push(
-        weOpened
-          ? `Closing gives up ${k(c.remoteBalance)} of inbound liquidity.`
-          : `Peer opened this channel — closing gives up ${k(c.remoteBalance)} of free inbound liquidity it provided.`,
+        lease?.kind === "magma_purchase"
+          ? `${boughtText(lease)} — closing gives up the ${kSep(c.remoteBalance)} of inbound it provided.`
+          : weOpened
+            ? `Closing gives up ${kSep(c.remoteBalance)} of inbound liquidity.`
+            : `Peer opened this channel — closing gives up ${kSep(c.remoteBalance)} of free inbound liquidity it provided.`,
       );
+    } else if (lease?.kind === "magma_purchase") {
+      warnings.push(`${boughtText(lease)}.`);
     }
     if (closeCostSat > 0.3 * Math.max(capitalFreed, 1)) {
       warnings.push(
@@ -903,15 +1074,88 @@ export async function getCloseSuggestionsV2(
       uniqueReachLost: uniqueReach,
       feeV2State: feeState,
       // Only dangle redeploy candidates when a close actually frees usable capital.
-      opportunityCandidates: capitalFreed >= 500_000 ? opportunity : [],
+      opportunityCandidates: capitalFreed >= 500_000 ? input.opportunity : [],
+      offline: away,
+      lease,
+      csvDelayBlocks: c.csvDelayBlocks ?? null,
+      commitFeeSats: c.commitFeeSats ?? null,
       reasons,
       warnings,
     });
   }
 
-  // Offline first, then highest close score.
-  candidates.sort((a, b) => Number(a.active) - Number(b.active) || b.closeScore - a.closeScore);
+  // Highest close score first. (Before: "offline first" — a peer away for a
+  // moment led the list.)
+  candidates.sort((a, b) => b.closeScore - a.closeScore);
+  // Leases first among the protected: the ones a close would break.
+  protectedList.sort((a, b) => Number(!!b.lease) - Number(!!a.lease));
   const totalCapitalFreedSats = candidates.reduce((s, c) => s + c.capitalFreedSats, 0);
 
-  return { windowDays: 60, candidates, protectedCount, totalCapitalFreedSats };
+  return {
+    windowDays: 60,
+    candidates,
+    protectedCount: protectedList.length,
+    protected: protectedList,
+    pending,
+    totalCapitalFreedSats,
+  };
+}
+
+export async function getCloseSuggestionsV2(
+  lnd: AuthenticatedLnd,
+  rebalanceRecords: RebalanceRecord[],
+  feeConfig: Partial<FeeRecConfig> = {},
+  channelOverrides: OverrideMap = {},
+  ctx: CloseContext = {},
+): Promise<CloseV2Report> {
+  const [channels, ownKey, graph, flow60, feeRep, sugRep, oc, height] = await Promise.all([
+    getChannelsView(lnd),
+    getOwnPubkey(lnd),
+    buildGraphCache(lnd),
+    getFlowSummary(lnd, 60).catch(() => null),
+    getFeeRecommendations(lnd, rebalanceRecords, null, feeConfig, channelOverrides),
+    getChannelSuggestionsV2(lnd).catch(() => null),
+    onchainCosts(lnd),
+    getWalletInfo({ lnd })
+      .then((w) => w.current_block_height)
+      .catch(() => 0),
+  ]);
+  const nowMs = Date.now();
+  // A fresh observation: the offline durations below include this moment.
+  ctx.uptime?.observe(channels, nowMs);
+
+  // Reach cover: how many of our peers reach each 2-hop node. uniqueReach for a
+  // channel = nodes only its peer reaches → what we'd actually lose by closing it.
+  const peersSet = new Set(channels.map((c) => c.peerPubkey));
+  const cover = new Map<string, number>();
+  for (const c of channels) {
+    const ps = graph.stats.get(c.peerPubkey);
+    if (ps) for (const n of ps.neighbors) cover.set(n, (cover.get(n) ?? 0) + 1);
+  }
+  const uniqueReachOf = (peerPubkey: string): number => {
+    const ps = graph.stats.get(peerPubkey);
+    if (!ps) return 0;
+    let u = 0;
+    for (const n of ps.neighbors) if (cover.get(n) === 1 && !peersSet.has(n) && n !== ownKey) u += 1;
+    return u;
+  };
+
+  return rankCloseCandidates({
+    channels,
+    feeById: new Map(feeRep.recommendations.map((r) => [r.channelId, r])),
+    flow60ById: new Map((flow60?.perChannel ?? []).map((f) => [f.channelId, f])),
+    uniqueReachByChan: new Map(channels.map((c) => [c.id, uniqueReachOf(c.peerPubkey)])),
+    opportunity: (sugRep?.suggestions ?? []).slice(0, 3).map((s) => ({
+      alias: s.alias,
+      score: s.score,
+      sizeSats: s.recommendedSizeSats,
+    })),
+    closeCostSat: oc.closeCostSat,
+    rebalanceRecords,
+    channelOverrides,
+    leases: ctx.leaseSources ? channelLeases(channels, ctx.leaseSources, height, nowMs) : new Map(),
+    // Without the record (a caller of its own), no peer counts as away long.
+    offline: (c) => (ctx.uptime ? ctx.uptime.offlineInfo(c, nowMs) : null),
+    nowMs,
+  });
 }

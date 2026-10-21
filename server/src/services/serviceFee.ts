@@ -114,6 +114,7 @@ export async function fetchFeeInvoice(address: string, sats: number): Promise<st
     `https://${domain}/.well-known/lnurlp/${encodeURIComponent(name)}`,
     { headers: { Accept: "application/json" } },
     HTTP_TIMEOUTS.lnurlMs,
+    "lnurl",
   );
   if (!metaRes.ok) throw new FeeInvoiceError("lnurl", `fee address lookup failed (HTTP ${metaRes.status})`);
   const meta = await metaRes.json<LnurlPayMeta>();
@@ -140,7 +141,7 @@ export async function fetchFeeInvoice(address: string, sats: number): Promise<st
     throw new FeeInvoiceError("lnurl", `fee of ${sats} sat is outside the fee server's limits`);
   }
   callback.searchParams.set("amount", String(msat));
-  const cbRes = await httpRequest(callback.toString(), { headers: { Accept: "application/json" } }, HTTP_TIMEOUTS.lnurlMs);
+  const cbRes = await httpRequest(callback.toString(), { headers: { Accept: "application/json" } }, HTTP_TIMEOUTS.lnurlMs, "lnurl");
   if (!cbRes.ok) throw new FeeInvoiceError("lnurl", `fee invoice request failed (HTTP ${cbRes.status})`);
   const cb = await cbRes.json<{ pr?: unknown; status?: unknown; reason?: unknown }>();
   if (cb.status === "ERROR") throw new FeeInvoiceError("lnurl", `fee server error: ${String(cb.reason ?? "")}`);

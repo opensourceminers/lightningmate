@@ -1,6 +1,14 @@
-import { getChannels, getFeeRates, getPayment, getWalletInfo, type AuthenticatedLnd } from "lightning";
+import { getChainBalance, getChainFeeRate, getChannels, getFeeRates, getPayment, getPeers, getWalletInfo, type AuthenticatedLnd } from "lightning";
 import { JsonStore, recordStoreIncident } from "../store.js";
-import { connectForOpen, fundChannel } from "./channelOps.js";
+import {
+  connectForOpen,
+  fundChannel,
+  isPreBroadcastRefusal,
+  isUnreachable,
+  nodeSideRefusal,
+  peerMaxChannelFromError,
+  peerMinChannelFromError,
+} from "./channelOps.js";
 import { isAuthError } from "./amboss.js";
 import { createOffer, getMyOffer, getMyOffers, toggleOffer, updateOffer, type MyOffer, type OfferTerms } from "./magmaApi.js";
 import { MagmaDesk, type MagmaSellAction, type SellActionKind } from "./magmaDesk.js";
@@ -17,19 +25,37 @@ import {
 import { assessEligibility, cachedPublicBook, publicBook, publicBookFailure, type Eligibility } from "./magmaEligibility.js";
 import type { LeaseBenchmark } from "./dashboard.js";
 import { MagmaPurchases, type PaymentReport } from "./magmaPurchases.js";
+import { ChannelUptime } from "./channelUptime.js";
+import type { LeaseSources } from "./leases.js";
 import { getOrder } from "./amboss.js";
 import { runMaxHtlcPass, type MaxHtlcChange } from "./maxHtlc.js";
 import { saleFeeConfig, type ServiceFeeLedger } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { errorText } from "./errorText.js";
 import { getOwnPubkey } from "./node.js";
-import { getChannelSuggestionsV2 } from "./suggestRecommend.js";
+import { getChannelSuggestionsV2, type SuggestionV2 } from "./suggestRecommend.js";
+import {
+  MAX_CAPITAL_SHARE_PER_OPEN,
+  MAX_OPEN_TRIES_PER_RUN,
+  OPEN_CONF_TARGET,
+  OPEN_DIAL_BUDGET_MS,
+  PEER_BACKOFF_DAYS,
+  PEER_RECORDS_KEPT,
+  measuredYield,
+  monthOldChannels,
+  planOpen,
+  unmeasuredYieldText,
+  type OpenContext,
+  type PeerOpenRecord,
+  type YieldEvidence,
+} from "./openPlan.js";
 import type { LnPlusStore } from "./lnplusStore.js";
 import { getMagmaRecommendations, type MagmaV2Report } from "./magmaRecommend.js";
 import { onchainCosts } from "./nodeEconomics.js";
 import { getFeeElasticity } from "./outcomes.js";
 import { DEFAULT_POLICY, applyFees, type FeeApplyItem, type FeeApplyResult } from "./fees.js";
 import {
+  FEE_REC_DEFAULTS,
   MARKET_RUN_WAIT_MS,
   floorWindowStart,
   getFeeRecommendations,
@@ -117,6 +143,38 @@ export class RefillInFlightError extends Error {
     );
     this.name = "RefillInFlightError";
   }
+}
+
+/**
+ * A manual refill run from a plan older than the target's last refill (or
+ * attempt): refused before anything is sent — the API answers 409 and the
+ * Rebalancing tab reloads its plan. The tab loads its plan once; after the
+ * autopilot refilled that target, the row's Run button paid a second refill
+ * into it at once, valued on the same 14-day outflow as the first (review
+ * of P3). A plan made after the last refill still bypasses the cooldown on
+ * purpose: an explicit run.
+ */
+export class StalePlanError extends Error {
+  constructor(
+    readonly targetId: string,
+    /** When the target was last refilled (or tried). */
+    readonly lastAt: string,
+    /** When the plan the request came from was made. */
+    readonly planAt: string,
+  ) {
+    super("This channel was refilled (or tried) after this plan was made: reload it");
+    this.name = "StalePlanError";
+  }
+}
+
+/** The hold a refill is booked with: the gate's value — never above the
+ *  fee the target really charged when the refill was sent. A gate from a
+ *  plan made before the fee dropped valued the sats above what they sell
+ *  for now, and the fee engine would ramp the fee back up toward that hold
+ *  (review of P3). The autopilot's own gate is never above the fee. */
+function heldAt(gatePpm: number | null | undefined, targetPpm: number | undefined): number | null | undefined {
+  if (gatePpm == null || targetPpm === undefined) return gatePpm;
+  return Math.min(gatePpm, targetPpm);
 }
 
 /** A fee item for a channel LND doesn't have at that outpoint (applyByHand):
@@ -356,6 +414,10 @@ interface PersistedState {
   perChannelLastApplied: Record<string, string>;
   perTargetLastRebalanced: Record<string, string>;
   lastChannelOpenAt: string | null;
+  /** Set when the open behind lastChannelOpenAt ended unclearly (the peer's
+   *  alias): its funding may have been broadcast, so the cooldown runs as
+   *  after an open — the note says which open it was. */
+  lastChannelOpenUnclear?: string | null;
   lastSellRepriceAt: string | null;
   /** Adaptive Magma pricing state (mode "auto"): the current 0..1 price level and
    *  the fill bookkeeping that ratchets it up (sells fast) or down (sits unsold). */
@@ -397,6 +459,13 @@ interface PersistedState {
   offerControl?: Record<string, OfferControl>;
   /** Per area: the latest decision not to act, and why (decisionNote). */
   decisions?: Partial<Record<DecisionArea, { at: string; text: string }>>;
+  /** Peers that refused an automatic open, by pubkey: each waits out its
+   *  back-off, and the size limits its refusal named are met next time
+   *  (openPlan.ts). A successful open forgets the record. */
+  peerOpenFailures?: Record<string, PeerOpenRecord>;
+  /** Peers the operator never wants opened to automatically (Channels →
+   *  suggestions), by pubkey. */
+  neverOpen?: Record<string, { alias: string; at: string }>;
   history: AutopilotRun[];
 }
 
@@ -508,6 +577,11 @@ function sellable(sp: Spendable, headroomSat: number, maxChannelSats: number): P
 }
 
 const fmtSat = (n: number): string => Math.round(n).toLocaleString("en-US");
+
+/** The channel stage's run-history key for failures of this node's own (its
+ *  wallet, its chain, its connection) — one line while the cause stays the
+ *  same, whichever peer the open was meant for (channelNews). */
+const SELF_NEWS_KEY = "self";
 
 /**
  * The status capital safety wants for an offer now, or null for none:
@@ -656,6 +730,9 @@ export class Autopilot {
   /** Per order, the last failed lane action written to the run history —
    *  the same failure again is not news (laneNews). */
   private readonly laneLast = new Map<string, string>();
+  /** Per peer, the last failed automatic open written to the run history —
+   *  the same failure again is not news (channelNews). */
+  private readonly channelLast = new Map<string, string>();
   private running = false;
   /** When the current main run took its lock (null when idle) — exposed so a
    *  run that takes unusually long is visible, not just a stale lastRunAt. */
@@ -670,6 +747,10 @@ export class Autopilot {
   /** Inbound bought on Magma (magmaPurchases.ts): followed after each order
    *  lane pass (followPurchases). */
   readonly purchases: MagmaPurchases;
+  /** How long each channel's peer has been offline (channelUptime.ts): the
+   *  close list and the close dialog read it. Observed every 10 minutes from
+   *  start() — a read, so also on a read-only node. */
+  readonly uptime: ChannelUptime;
   /** A purchase follow-up is under way (its own flag, not the lane's). */
   private followingPurchases = false;
   /** Per offer: the status change under way (withOffer). */
@@ -719,6 +800,7 @@ export class Autopilot {
     });
     initMagmaHistory(dataDir);
     this.purchases = new MagmaPurchases(dataDir);
+    this.uptime = new ChannelUptime(dataDir);
     this.feeLog = new FeeChangeLog(dataDir);
     this.state = this.store.read({
       config: DEFAULT_CONFIG,
@@ -928,6 +1010,41 @@ export class Autopilot {
     return offerFeeCaps(this.state.config.policy);
   }
 
+  /** The peers the operator never wants opened to automatically. */
+  neverOpenPeers(): Record<string, { alias: string; at: string }> {
+    return { ...(this.state.neverOpen ?? {}) };
+  }
+
+  /** Mark a peer "never open automatically" (or allow it again). The
+   *  channel stage skips it; opening to it by hand is still the operator's. */
+  setNeverOpen(pubkey: string, never: boolean, alias = ""): void {
+    const list = (this.state.neverOpen ??= {});
+    if (never) list[pubkey] = { alias, at: new Date().toISOString() };
+    else delete list[pubkey];
+    this.persist();
+  }
+
+  /** Where channel leases come from (leases.ts): every channel sold through
+   *  Magma or LSPS1 (the capital ledger), the inbound bought on Magma, and
+   *  the sales Amboss last listed with a running lease (kept on disk). */
+  leaseSources(): LeaseSources {
+    return {
+      soldLeases: this.capital.soldLeases(),
+      purchases: this.purchases.list(),
+      ambossRunning: this.magma.runningLeasesOnAmboss(),
+      ambossListedAt: this.magma.runningLeasesListedAt(),
+    };
+  }
+
+  /** The same, with Amboss's listing asked again first when it is more than
+   *  an hour old (an Amboss key set) — for the close list and a close, which
+   *  must not offer or perform a close inside a lease Amboss knows of. Waits
+   *  a few seconds for Amboss at most (MagmaDesk.runningLeasesFresh). */
+  async leaseSourcesFresh(): Promise<LeaseSources> {
+    await this.magma.runningLeasesFresh();
+    return this.leaseSources();
+  }
+
   /** Sell caps shared with LSP mode — one capital budget across both demand sources. */
   sellCaps(): { maxChannelSats: number; reserveSats: number; maxDeploySats: number } {
     return {
@@ -1047,6 +1164,8 @@ export class Autopilot {
     this.migrateOutOfRangePins();
     this.reschedule();
     this.startOrderLane();
+    // Offline durations accrue whatever the switches say (a read).
+    if (!this.shuttingDown) this.uptime.start(this.readLnd);
   }
 
   /**
@@ -1103,6 +1222,7 @@ export class Autopilot {
     this.inflightTimer = undefined;
     if (this.leaseTimer) clearInterval(this.leaseTimer);
     this.leaseTimer = undefined;
+    this.uptime.stop();
     this.stop();
   }
 
@@ -1815,6 +1935,9 @@ export class Autopilot {
    * `holdPpm`: what the profit gate valued the refill at — given for one
    * that passed the gate (the autopilot's, or one run by hand with it); the
    * fee engine holds that price while the refilled sats are in the channel.
+   * It is booked at no more than the target's fee as the executor read it
+   * when the refill was sent (heldAt): in the write-ahead record and in the
+   * log record alike.
    */
   private refillBooks(meta: { targetId: string; via: "autopilot" | "manual"; holdPpm?: number | null }) {
     const sent = new Map<string, PendingRebalance>();
@@ -1833,8 +1956,10 @@ export class Autopilot {
       amountSats: number;
       maxFeeSats: number;
       targetSentBefore?: number;
+      targetPpm?: number;
     }): PendingRebalance => {
       const at = new Date().toISOString();
+      const hold = heldAt(meta.holdPpm, p.targetPpm);
       return {
         id: p.id,
         targetId: meta.targetId,
@@ -1847,7 +1972,7 @@ export class Autopilot {
         at,
         via: meta.via,
         ...(p.targetSentBefore !== undefined ? { targetSentBefore: p.targetSentBefore } : {}),
-        ...(meta.holdPpm != null ? { holdPpm: meta.holdPpm } : {}),
+        ...(hold != null ? { holdPpm: hold } : {}),
       };
     };
     const hooks: RefillHooks = {
@@ -1860,6 +1985,7 @@ export class Autopilot {
           amountSats: a.amountSats,
           maxFeeSats: a.maxFeeSats,
           targetSentBefore: a.targetSentBefore,
+          targetPpm: a.targetPpm,
         });
         (this.state.pendingRebalances ??= []).push(entry);
         try {
@@ -1897,6 +2023,7 @@ export class Autopilot {
                 amountSats: res.amountSats,
                 maxFeeSats,
                 targetSentBefore: res.targetSentBefore,
+                targetPpm: res.targetPpm,
               }),
             );
           }
@@ -1913,7 +2040,10 @@ export class Autopilot {
           // Its fee belongs to the budget day it was sent on, like a payment
           // that ends after a restart.
           const entry = res.paymentId ? sent.get(res.paymentId) : undefined;
-          this.rebalanceLog.append({ ...this.rebalanceRecord(res, meta.via, meta.holdPpm), ...(entry ? { startedAt: entry.at } : {}) });
+          this.rebalanceLog.append({
+            ...this.rebalanceRecord(res, meta.via, heldAt(meta.holdPpm, res.targetPpm)),
+            ...(entry ? { startedAt: entry.at } : {}),
+          });
           if (entry) this.dropPending(entry.id);
         }
         // Spent sats and the back-off must not be forgotten if a later stage
@@ -2039,13 +2169,32 @@ export class Autopilot {
    * the same way (refillLots), as the Rebalancing tab says (review of P3: it
    * got no hold, and the engine could cut the fee right after it). One run
    * without the gate chose its own price and sets no floor.
+   *
+   * `planAt`: when the plan the request came from was made (the tab sends
+   * its plan's generatedAt). A target refilled — or tried — since then is
+   * refused (StalePlanError): the row was planned for a channel that is no
+   * longer the one it describes (review of P3: a stale row paid a second
+   * refill into a target the autopilot had just refilled). A request
+   * without it (an API client of its own) is not checked.
    */
-  async rebalanceByHand(params: RebalanceExecParams): Promise<RebalanceExecResult | null> {
+  async rebalanceByHand(params: RebalanceExecParams & { planAt?: string }): Promise<RebalanceExecResult | null> {
     const writeLnd = this.writeLnd;
     if (!writeLnd) throw new Error("writing is disabled");
     if (this.refilling || this.shuttingDown) return null;
     const busy = this.inFlightThrough([params.targetId, params.sourceId, ...(params.sources ?? []).map((s) => s.id)]);
     if (busy) throw new RefillInFlightError(busy.channelId, busy.payment);
+    const { planAt, ...exec } = params;
+    // The target's last refill (or try): when it started — the cooldown
+    // stamp — and when it ended, as booked. A plan made while one was under
+    // way read the channel drained and is as stale as one made before it:
+    // the start alone let it through (review of P4: a plan stamped between
+    // an autopilot refill's start and its landing paid a second refill).
+    const lastAt = [this.state.perTargetLastRebalanced[params.targetId], this.rebalanceLog.lastInto(params.targetId)]
+      .filter((at): at is string => typeof at === "string" && Number.isFinite(Date.parse(at)))
+      .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+    if (planAt !== undefined && lastAt !== undefined && Date.parse(lastAt) > Date.parse(planAt)) {
+      throw new StalePlanError(params.targetId, lastAt, planAt);
+    }
     const budget = this.rebalanceBudget();
     if (budget.leftSats !== null && budget.leftSats <= 0) throw new RebalanceBudgetError(budget);
     this.refilling = true;
@@ -2054,7 +2203,7 @@ export class Autopilot {
       return await this.refillBooks({ targetId: params.targetId, via: "manual", holdPpm: params.gate?.revenuePpm ?? null }).settle((hooks) =>
         this.rebalanceExec(
           writeLnd,
-          { ...params, ...(Number.isFinite(maxFeeSats) ? { maxFeeSats } : {}) },
+          { ...exec, ...(Number.isFinite(maxFeeSats) ? { maxFeeSats } : {}) },
           { ...hooks, shouldStop: () => this.shuttingDown },
         ),
       );
@@ -2100,14 +2249,46 @@ export class Autopilot {
     return { ...report, budget: this.rebalanceBudget(), inFlight: this.refillsInFlight() };
   }
 
-  /** Open a channel to the top suggestion when on-chain funds allow. */
+  /**
+   * The channel stage: open a channel to the best suggestion that can really
+   * be opened, when on-chain funds allow (review a3-channels — package P4).
+   *
+   * Before, it looked at suggestion #1 only. A peer that refused (its minimum
+   * channel size, no address, offline) was asked again every 30 minutes,
+   * forever, and nothing else was ever tried; a top pick bigger than the
+   * wallet ended the stage silently. Every deferral was written as a failed
+   * run — 48 a day in a 50-run history.
+   *
+   * Now it walks down the ranked suggestions (planOpen decides per peer:
+   * usefulness, LN+ sentiment, a recent close, an earlier refusal's back-off,
+   * an address to dial, the peer's known minimum and maximum, the funds, the
+   * payback) and dials at most MAX_OPEN_TRIES_PER_RUN of them; a peer that
+   * refuses before anything is broadcast is remembered with a back-off and
+   * the next one is tried. Opens pay an economy fee rate (OPEN_CONF_TARGET)
+   * at or below the operator's maximum, and only when opening and later
+   * closing pay back within OPEN_PAYBACK_MONTHS of what a channel earns here.
+   * Every open goes through the shared on-chain mutex and capital ledger.
+   * Waits and deferrals are the stage's decision note (D15/D16), not failed
+   * runs; a real attempt that failed is a run entry — once, not again while
+   * it keeps failing the same way.
+   */
   private async runChannels(writeLnd: AuthenticatedLnd): Promise<AutopilotChannelOpen[]> {
     const cfg = this.state.config;
+    const note = (text: string) => this.decisionNote("channels", text);
 
-    // Respect the cooldown between auto-opens.
+    // Respect the cooldown between auto-opens — after an open, and after one
+    // that ended unclearly (it may have opened a channel).
     if (this.state.lastChannelOpenAt) {
       const elapsedMin = (Date.now() - new Date(this.state.lastChannelOpenAt).getTime()) / 60_000;
-      if (elapsedMin < cfg.channelCooldownMinutes) return [];
+      if (elapsedMin < cfg.channelCooldownMinutes) {
+        const unclear = this.state.lastChannelOpenUnclear;
+        note(
+          unclear
+            ? `the open to ${unclear} ${Math.round(elapsedMin)} min ago ended unclearly — it may have opened a channel; the next open waits for the ${cfg.channelCooldownMinutes}-minute cooldown`
+            : `a channel was opened ${Math.round(elapsedMin)} min ago — the next open waits for the ${cfg.channelCooldownMinutes}-minute cooldown`,
+        );
+        return [];
+      }
     }
 
     // A cheap look first: no point in the slow planning reads below without
@@ -2116,16 +2297,26 @@ export class Autopilot {
     // included) minus every coin promised to a sold channel not yet opened —
     // Magma and LSPS1 alike, across runs and restarts.
     const pre = await spendableOnchain(this.readLnd, this.capital, cfg.channelReserveSats);
-    if (pre.spendableSat <= 0) return [];
+    if (pre.spendableSat <= 0) {
+      note(
+        `nothing to open with: ${fmtSat(pre.chainSat)} sat on chain, all of it needed for the reserve (${fmtSat(pre.reserve.totalSat)} sat)` +
+          (pre.reservedSat > 0 ? ` and the ${fmtSat(pre.reservedSat)} sat promised to sold channels` : ""),
+      );
+      return [];
+    }
 
-    // The autopilot opens channels with real capital, so it gets the LN+ trust
-    // signal too: a peer other operators rate badly is a bad place to lock funds.
-    const { suggestions } = await this.channelSuggestions();
-    const top = suggestions[0];
-    if (!top) return [];
-
-    const size = cfg.channelSizeSats > 0 ? cfg.channelSizeSats : top.recommendedSizeSats;
-    if (pre.spendableSat < size) return []; // not enough on-chain to fund it + keep the reserve
+    // The on-chain fee an open pays: an economy rate — an open is not
+    // urgent — and never above the operator's maximum. No estimate from LND:
+    // no open (LND would have to guess the fee itself).
+    const rate = await this.openFeeRate();
+    if (rate === null) {
+      note("LND gave no on-chain fee estimate — no channel is opened until it does");
+      return [];
+    }
+    if (rate > cfg.channelMaxFeeRate) {
+      note(`on-chain fees are ${rate} sat/vB at the economy rate — above your ${cfg.channelMaxFeeRate} sat/vB maximum for opens; waiting for cheaper fees`);
+      return [];
+    }
 
     // Capital engine (D10): with Liquidity provision on, a routing open waits
     // — the coins left for Magma — only when Magma can actually take them and
@@ -2141,74 +2332,317 @@ export class Autopilot {
       } catch {
         // No answer: no deferral — the open goes ahead.
       }
-      if (deferral) return [{ alias: top.alias, sizeSats: size, ok: false, error: deferral }];
-    }
-
-    // On-chain fee awareness: don't open when the funding fee eats >1% of the
-    // channel — opening into a mempool spike is throwing money away; wait it out.
-    const oc = await onchainCosts(this.readLnd);
-    if (oc.feePerVbyte != null && oc.openCostSat > size * 0.01) {
-      return [
-        { alias: top.alias, sizeSats: size, ok: false, error: `on-chain fees too high (~${oc.openCostSat} sat to open) — deferred` },
-      ];
-    }
-
-    // Dial the peer BEFORE taking the mutex: over Tor that can take a minute
-    // and a half, and a slow routing peer must not hold up a Magma accept's
-    // capital check or anyone else's open meanwhile.
-    if (this.shuttingDown) return [{ alias: top.alias, sizeSats: size, ok: false, error: "skipped: shutting down" }];
-    const connected = await connectForOpen(writeLnd, { pubkey: top.pubkey, socket: top.socket || undefined });
-    if (!connected.ok) return [{ alias: top.alias, sizeSats: size, ok: false, error: connected.error }];
-
-    // One on-chain commitment at a time (Magma fulfilment, LSPS1, manual
-    // opens): the check and the open happen together, inside the mutex.
-    return this.capital.mutex.run("autopilot open", async (): Promise<AutopilotChannelOpen[]> => {
-      // The reads above take a while (graph, forwards, fee estimate). A
-      // shutdown signal that arrived meanwhile must not be followed by a
-      // funding broadcast.
-      if (this.shuttingDown) {
-        return [{ alias: top.alias, sizeSats: size, ok: false, error: "skipped: shutting down" }];
+      if (deferral) {
+        note(deferral);
+        return [];
       }
+    }
+
+    // The autopilot opens channels with real capital, so it gets the LN+ trust
+    // signal too: a peer other operators rate badly is a bad place to lock funds.
+    const [{ suggestions }, earning, connected] = await Promise.all([
+      this.channelSuggestions(),
+      this.openEconomics(),
+      this.connectedPeers(),
+    ]);
+    if (this.shuttingDown) {
+      note("stopped: shutting down — no open was started");
+      return [];
+    }
+    // This node's own connection first: LND keeps a few peers connected for
+    // gossip at all times, so none at all means Tor or the internet is down
+    // here — every dial would fail, and each failure would be booked against
+    // a good peer (a day's back-off, then a week's). Nobody is dialed, and
+    // nobody held back, until LND is connected again.
+    if (connected === null) {
+      note("LND didn't list its connected peers — no peer is dialed this run (and none is held back for it)");
+      return [];
+    }
+    if (connected.size === 0) {
+      note("this node is connected to no peer at all right now (Tor or the internet down?) — no peer is dialed, and none is held back for it, until it is");
+      return [];
+    }
+    if (suggestions.length === 0) {
+      note("no peer to suggest right now (no candidate in the graph passes the filters)");
+      return [];
+    }
+    const ctx: OpenContext = {
+      fixedSize: cfg.channelSizeSats > 0 ? cfg.channelSizeSats : null,
+      spendableSat: pre.spendableSat,
+      feeRate: rate,
+      yieldPpmYear: earning?.ppmYear ?? null,
+      maxRaiseSat: Math.floor((earning?.capitalSat ?? pre.chainSat) * MAX_CAPITAL_SHARE_PER_OPEN),
+      peers: this.state.peerOpenFailures ?? {},
+      connected,
+      neverOpen: new Set(Object.keys(this.state.neverOpen ?? {})),
+      nowMs: Date.now(),
+    };
+
+    const skipped: string[] = [];
+    const refused: string[] = [];
+    const out: AutopilotChannelOpen[] = [];
+    let tries = 0;
+    const dialsFrom = Date.now();
+    for (const s of suggestions) {
+      if (tries >= MAX_OPEN_TRIES_PER_RUN || (tries > 0 && Date.now() - dialsFrom > OPEN_DIAL_BUDGET_MS)) break;
+      if (this.shuttingDown) {
+        note("stopped: shutting down — no open was started");
+        return out;
+      }
+      const plan = planOpen(s, ctx);
+      if ("skip" in plan) {
+        skipped.push(`${s.alias}: ${plan.skip}`);
+        continue;
+      }
+      tries += 1;
+      const res = await this.openTo(writeLnd, s, plan.sizeSats, rate);
+      if (res.kind === "opened") {
+        delete this.state.peerOpenFailures?.[s.pubkey];
+        this.channelLast.delete(s.pubkey);
+        this.channelLast.delete(SELF_NEWS_KEY);
+        // Said when the payback could not be checked (only the fee cap applied).
+        const unchecked =
+          earning === null
+            ? "what a channel earns here couldn't be read from LND"
+            : earning.ppmYear === null
+              ? unmeasuredYieldText(earning.evidence)
+              : null;
+        note(
+          `opened ${fmtSat(plan.sizeSats)} sat to ${s.alias} at ${rate} sat/vB${plan.why ? ` (${plan.why})` : ""}` +
+            (unchecked ? ` — no payback check: ${unchecked}` : ""),
+        );
+        this.persist();
+        return [...out, { alias: s.alias, sizeSats: plan.sizeSats, ok: true, transactionId: res.transactionId }];
+      }
+      if (res.kind === "deferred") {
+        // The final capital check (inside the mutex) or the shutdown: not
+        // the peer's doing — nothing to remember about it.
+        note(res.reason);
+        return out;
+      }
+      // This node's own doing — its wallet, its chain, its connection — is
+      // not the peer's: nobody is held back for it, and no further peer is
+      // tried (each would fail the same way). One line of history while the
+      // cause stays the same.
+      const own = nodeSideRefusal(res.error) ?? (isUnreachable(res.error) ? await this.connectivityLost() : null);
+      if (own) {
+        if (this.channelNews(SELF_NEWS_KEY, own)) {
+          out.push({ alias: s.alias, sizeSats: plan.sizeSats, ok: false, error: `${own} — not the peer's doing (${res.error})` });
+        }
+        // (LND's text in full: "need 0.05 BTC only have 0.045 BTC available"
+        // says how far the wallet is from it.)
+        note(
+          `no channel opened — ${own}: the open to ${s.alias} failed (${res.error.replace(/^\w+: /, "")}), not by the peer's doing — ` +
+            "no peer is held back for it, and the next run tries again",
+        );
+        this.persist();
+        return out;
+      }
+      // The node itself was fine: its next trouble is news again.
+      this.channelLast.delete(SELF_NEWS_KEY);
+      this.notePeerRefusal(s, res.error, plan.sizeSats);
+      refused.push(s.alias);
+      if (this.channelNews(s.pubkey, res.error)) out.push({ alias: s.alias, sizeSats: plan.sizeSats, ok: false, error: res.error });
+      if (!res.preBroadcast) {
+        // The outcome is unclear (a dropped stream, a timeout): the funding
+        // may have been broadcast. No other open now — the next run sees the
+        // wallet as it really is — and the cooldown runs as after an open:
+        // before, the next run (30 minutes later) opened another channel
+        // beside the one that may exist, whatever the operator's cooldown.
+        this.state.lastChannelOpenAt = new Date().toISOString();
+        this.state.lastChannelOpenUnclear = s.alias;
+        note(`the open to ${s.alias} ended unclearly (${res.error}) — it may have opened a channel: no other open this run, and the next waits for the cooldown`);
+        this.persist();
+        return out;
+      }
+    }
+    this.persist();
+    // (Every refusal counts here, also one not repeated in the run history.)
+    const tried = refused.length ? `${refused.join(", ")} refused an open (each waits before it is tried again)` : "";
+    const why = skipped.slice(0, 3).join("; ") + (skipped.length > 3 ? `; and ${skipped.length - 3} more` : "");
+    note(`no channel opened — ${[tried, why].filter(Boolean).join(" · ") || "no suggestion qualified"}`);
+    return out;
+  }
+
+  /** The peers LND is connected to right now (null: LND didn't say). */
+  private async connectedPeers(): Promise<Set<string> | null> {
+    try {
+      const { peers } = await getPeers({ lnd: this.readLnd });
+      return new Set(peers.map((p) => p.public_key));
+    } catch {
+      return null;
+    }
+  }
+
+  /** After a peer couldn't be reached: whether this node lost its own
+   *  connection meanwhile — no peer connected at all (or LND can't say) —
+   *  and then what to call it; null: other peers are connected, so the
+   *  unreachable one is the peer's doing. */
+  private async connectivityLost(): Promise<string | null> {
+    const peers = await this.connectedPeers();
+    if (peers === null) return "LND didn't list its connected peers";
+    return peers.size === 0 ? "this node lost its connection to every peer (Tor or the internet down?)" : null;
+  }
+
+  /** The economy fee rate an automatic open pays (sat/vB, rounded up), or
+   *  null when LND can't estimate one. */
+  private async openFeeRate(): Promise<number | null> {
+    try {
+      const { tokens_per_vbyte } = await getChainFeeRate({ lnd: this.readLnd, confirmation_target: OPEN_CONF_TARGET });
+      return Number.isFinite(tokens_per_vbyte) && tokens_per_vbyte > 0 ? Math.max(1, Math.ceil(tokens_per_vbyte)) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * What a sat in this node's month-old channels earned (ppm/yr, the last
+   * 30 days, capacity-weighted) — what a new channel's open and close must
+   * pay back — with what that stands on, and the node's capital (on chain +
+   * its side of open channels). Yield null: no channel older than a month,
+   * or too little routing through them to tell (measuredYield) — then there
+   * is nothing to measure a payback against, and only the maximum fee rate
+   * applies (a node can always open its first channels).
+   *
+   * (The Magma comparison, D10, asks what the MEDIAN month-old channel
+   * earns — robust to one big earner, for "beats a new routing channel";
+   * each decision note names the measure it quotes.)
+   */
+  async openEconomics(): Promise<{ ppmYear: number | null; capitalSat: number; evidence: YieldEvidence } | null> {
+    try {
+      const [chans, report, info, chain] = await Promise.all([
+        getChannelsView(this.readLnd),
+        getForwardsReport(this.readLnd, 30).catch(() => null),
+        getWalletInfo({ lnd: this.readLnd }),
+        getChainBalance({ lnd: this.readLnd }),
+      ]);
+      const capitalSat = chain.chain_balance + chans.filter((c) => c.status === "open").reduce((s, c) => s + c.localBalance, 0);
+      const aged = monthOldChannels(chans, info.current_block_height);
+      const stats = new Map((report?.perChannel ?? []).map((c) => [c.channelId, c]));
+      const evidence: YieldEvidence = {
+        channels: aged.length,
+        capacitySat: aged.reduce((s, c) => s + c.capacity, 0),
+        forwards: aged.reduce((s, c) => s + (stats.get(c.id)?.forwardCount ?? 0), 0),
+        earnedSat: aged.reduce((s, c) => s + (stats.get(c.id)?.feesEarnedSats ?? 0), 0),
+        forwardsRead: report !== null,
+      };
+      return { ppmYear: measuredYield(evidence), capitalSat, evidence };
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Dial the peer (outside the mutex: over Tor that can take a minute and a
+   * half, and a slow routing peer must not hold up a Magma accept's capital
+   * check), then check the capital again and open, inside the on-chain mutex
+   * every commitment shares (Magma fulfilment, LSPS1, manual opens).
+   */
+  private async openTo(
+    writeLnd: AuthenticatedLnd,
+    s: Pick<SuggestionV2, "pubkey" | "alias" | "socket" | "sockets">,
+    sizeSats: number,
+    feeRate: number,
+  ): Promise<
+    | { kind: "opened"; transactionId?: string }
+    | { kind: "deferred"; reason: string }
+    | { kind: "refused"; error: string; preBroadcast: boolean }
+  > {
+    // Every address it advertises, in dialing order (then the graph's).
+    const sockets = [...new Set([...(s.sockets ?? []), ...(s.socket ? [s.socket] : [])])];
+    const connected = await connectForOpen(writeLnd, { pubkey: s.pubkey, sockets });
+    if (!connected.ok) return { kind: "refused", error: connected.error, preBroadcast: true };
+    return this.capital.mutex.run("autopilot open", async () => {
+      // The reads and the dial take a while. A shutdown signal that arrived
+      // meanwhile must not be followed by a funding broadcast.
+      if (this.shuttingDown) return { kind: "deferred" as const, reason: "stopped: shutting down — no open was started" };
       // Authoritative check with a fresh balance: a Magma order accepted since
       // the look above has its coins reserved, and they are not ours to spend
       // — nor what its own open will need on top: its funding fee, its step
       // of LND's anchor reserve, and the SELL reserve its check applies (a
       // sell reserve above the channel reserve used to be spent here).
-      const sp = await spendableOnchain(this.readLnd, this.capital, cfg.channelReserveSats);
-      if (sp.spendableSat < size) {
-        return [
-          {
-            alias: top.alias,
-            sizeSats: size,
-            ok: false,
-            error: `deferred: only ${sp.spendableSat} sat spendable after the reserve and ${sp.reservedSat} sat promised to sold channels`,
-          },
-        ];
+      const sp = await spendableOnchain(this.readLnd, this.capital, this.state.config.channelReserveSats);
+      if (sp.spendableSat < sizeSats) {
+        return {
+          kind: "deferred" as const,
+          reason: `deferred: only ${sp.spendableSat} sat spendable after the reserve and ${sp.reservedSat} sat promised to sold channels — ${s.alias} needs ${sizeSats}`,
+        };
       }
-      if (this.shuttingDown) {
-        return [{ alias: top.alias, sizeSats: size, ok: false, error: "skipped: shutting down" }];
-      }
+      if (this.shuttingDown) return { kind: "deferred" as const, reason: "stopped: shutting down — no open was started" };
+      const routing = this.initialRoutingFee();
       const res = await fundChannel(writeLnd, {
-        pubkey: top.pubkey,
-        socket: top.socket || undefined,
-        localTokens: size,
+        pubkey: s.pubkey,
+        localTokens: sizeSats,
+        feeRate,
+        routingFeePpm: routing.feeRatePpm,
+        routingBaseFeeMsat: routing.baseFeeMsat,
       });
       if (res.ok) {
         this.state.lastChannelOpenAt = new Date().toISOString();
+        this.state.lastChannelOpenUnclear = null;
         // The open cooldown is the only thing between runs that stops another
         // open — it must survive a crash right after this one.
         this.persist();
+        return { kind: "opened" as const, transactionId: res.transactionId };
       }
-      return [
-        {
-          alias: top.alias,
-          sizeSats: size,
-          ok: res.ok,
-          transactionId: res.transactionId,
-          error: res.error,
-        },
-      ];
+      const error = res.error ?? "the open failed";
+      return { kind: "refused" as const, error, preBroadcast: isPreBroadcastRefusal(error) };
     });
+  }
+
+  /**
+   * The routing fee a new channel starts with — the protected fee the fee
+   * engine gives a brand-new channel (FEE_REC_DEFAULTS.newChannelMinPpm),
+   * within the policy's range, and the policy's base fee. Without it a new
+   * channel kept LND's own default (stock: 1 sat + 1 ppm) until something set
+   * a fee: forever, with fee automation off. Manual opens start the same way.
+   */
+  initialRoutingFee(): { feeRatePpm: number; baseFeeMsat: number } {
+    const p = this.state.config.policy;
+    return {
+      feeRatePpm: Math.min(p.maxPpm, Math.max(p.minPpm, FEE_REC_DEFAULTS.newChannelMinPpm)),
+      baseFeeMsat: p.baseFeeMsat,
+    };
+  }
+
+  /** A peer refused an open (or couldn't be reached): remember it, with a
+   *  back-off — none when it told its size limits: the next plan meets them
+   *  (or skips the peer, saying why). */
+  private notePeerRefusal(s: Pick<SuggestionV2, "pubkey" | "alias">, error: string, sizeSats: number): void {
+    const peers = (this.state.peerOpenFailures ??= {});
+    const prev = peers[s.pubkey];
+    const fails = (prev?.fails ?? 0) + 1;
+    const min = peerMinChannelFromError(error);
+    const max = peerMaxChannelFromError(error);
+    const sizeLimit = (min !== null && min > sizeSats) || (max !== null && max < sizeSats);
+    const backoffDays = sizeLimit ? 0 : PEER_BACKOFF_DAYS[Math.min(fails, PEER_BACKOFF_DAYS.length) - 1];
+    const nowMs = Date.now();
+    peers[s.pubkey] = {
+      alias: s.alias,
+      fails,
+      lastAt: new Date(nowMs).toISOString(),
+      retryAt: new Date(nowMs + backoffDays * 86_400_000).toISOString(),
+      error,
+      ...(min !== null ? { minChannelSats: min } : prev?.minChannelSats !== undefined ? { minChannelSats: prev.minChannelSats } : {}),
+      ...(max !== null ? { maxChannelSats: max } : prev?.maxChannelSats !== undefined ? { maxChannelSats: prev.maxChannelSats } : {}),
+    };
+    // Bounded: the oldest records go first.
+    const keys = Object.keys(peers);
+    if (keys.length > PEER_RECORDS_KEPT) {
+      for (const k of keys.sort((a, b) => Date.parse(peers[a].lastAt) - Date.parse(peers[b].lastAt)).slice(0, keys.length - PEER_RECORDS_KEPT)) delete peers[k];
+    }
+  }
+
+  /** Whether a failed open is news for the run history: the first of a run
+   *  of identical failures to one peer is; the same one again is not (it is
+   *  counted on the peer's record and said in the decision note). Amounts
+   *  don't make a failure different. */
+  private channelNews(pubkey: string, error: string): boolean {
+    const sig = error.replace(/\d[\d,.]*/g, "#");
+    if (this.channelLast.get(pubkey) === sig) return false;
+    this.channelLast.set(pubkey, sig);
+    while (this.channelLast.size > 500) this.channelLast.delete(this.channelLast.keys().next().value as string);
+    return true;
   }
 
   /**
@@ -2276,6 +2710,8 @@ export class Autopilot {
       return failed(`could not read your offers from Amboss: ${errText(err)}`);
     }
     sync.lastError = null;
+    // Upkeep works again: its next failure is news (laneNews).
+    this.laneLast.delete("offers");
 
     // Adaptive pricing (mode "auto"): ratchet the level UP when an order fills —
     // you could have charged more — and hold it otherwise.
@@ -2961,17 +3397,16 @@ export class Autopilot {
       getWalletInfo({ lnd: this.readLnd }),
     ]);
     // Channels with a month of history (≈ 4320 blocks) say what a channel earns.
-    const aged = chans.filter((c) => {
-      const funded = Number(c.id.split("x")[0]);
-      return c.active && c.status === "open" && Number.isFinite(funded) && funded > 0 && info.current_block_height - funded >= 4_320;
-    });
+    const aged = monthOldChannels(chans, info.current_block_height);
     if (aged.length === 0) return null;
     const revByChan = new Map(report.perChannel.map((c) => [c.channelId, c.feesEarnedSats]));
     const routing = routingYieldStats(aged, revByChan).medianPpmYear;
     if (leasePpmYear <= routing) return null;
+    // (The measure is named: the payback check of the same stage quotes the
+    // capacity-weighted yield of the same channels — openEconomics.)
     return (
       `deferred: selling on Magma is expected to earn more on this capital (~${leasePpmYear} ppm/yr: offers like yours ` +
-      `fill ~${fillsPerYear.toFixed(1)} times a year) than a new routing channel (~${routing} ppm/yr) — left for Magma`
+      `fill ~${fillsPerYear.toFixed(1)} times a year) than a new routing channel (~${routing} ppm/yr: what the median month-old channel here earned) — left for Magma`
     );
   }
 
@@ -3282,8 +3717,12 @@ export class Autopilot {
       const maxHtlc = await stage("max_htlc", this.state.config.maxHtlcEnabled, () =>
         runMaxHtlcPass(this.readLnd, writeLnd, this.maxHtlcBackoff).catch(() => [] as MaxHtlcChange[]),
       );
-      // "skip" entries are non-actions (cap/reserve) — don't count them as attempts.
-      const acted = sells.filter((s) => s.action !== "skip");
+      // "skip" entries are non-actions (cap/reserve) — don't count them as
+      // attempts. And offer upkeep that fails the same way every run (Amboss
+      // down, a write it keeps refusing) is one line of history, not one per
+      // run (laneNews; review a3-channels:history-flood — the offer sync
+      // status keeps its last error either way).
+      const acted = this.laneNews(sells.filter((s) => s.action !== "skip"));
 
       const run: AutopilotRun = {
         at: new Date().toISOString(),
@@ -3304,7 +3743,7 @@ export class Autopilot {
         changes,
         rebalances,
         channels,
-        sells,
+        sells: acted,
         maxHtlc,
         ...(errors.length ? { errors } : {}),
       };

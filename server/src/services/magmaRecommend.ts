@@ -233,8 +233,7 @@ export interface MagmaV2Report {
       | "good_to_sell"
       | "sell_only_above_profit_floor"
       | "market_too_cheap"
-      | "insufficient_capital"
-      | "not_recommended_node_needs_inbound";
+      | "insufficient_capital";
     deployableCapitalSat: number;
     recommendedSellSizeSat: number | null;
     routingOpportunityPpmPerYear: number | null;
@@ -310,11 +309,21 @@ const sizeBandLabel = (min: number, max: number) => `${sizeLabel(min)}–${sizeL
 
 const COMMON_LEASES = new Set(COMMON_LEASE_BLOCKS);
 
+/**
+ * How much a routing channel is worth here, relative to the node's measured
+ * yield — the bar a lease must clear. A node short of OUTBOUND (≤ 30 % local)
+ * gains exactly what a routing open adds: routing is worth more, and the
+ * same coins tied up in a buyer's channel must earn more to beat it. A node
+ * short of INBOUND (≥ 70 % local) gains little from more outbound: routing is
+ * worth less. Leasing itself is never blocked by the node's balance — it
+ * spends on-chain coins and changes neither side of the node's own channels
+ * (computeNodeNeed; before, the need was inverted and blocked selling).
+ */
 const NEED_MULTIPLIER: Record<NodeNeed, number> = {
   need_revenue: 1.25,
   need_routing_diversity: 1.1,
   need_inbound: 0.8,
-  need_outbound: 1,
+  need_outbound: 1.2,
   balanced: 1,
 };
 
@@ -360,7 +369,7 @@ export async function getMagmaRecommendations(
   const hasRoutingData = routingOpportunityPpmPerYear != null;
   const baseRouting = routingOpportunityPpmPerYear ?? cfg.defaultRoutingOpportunityPpmPerYear;
 
-  const { nodeNeed, reason: nodeNeedReason } = computeNodeNeed(channels, fees30, 30);
+  const { nodeNeed, reason: nodeNeedReason, localPct } = computeNodeNeed(channels, fees30, 30);
   const adjustedRouting = Math.round(baseRouting * NEED_MULTIPLIER[nodeNeed]);
   const recommendedMinLeasePpmPerYear = Math.round(adjustedRouting * cfg.minLeaseVsRoutingRatio);
 
@@ -746,10 +755,7 @@ export async function getMagmaRecommendations(
   const sellReasons: string[] = [];
   const sellWarnings: string[] = [];
   let sellState: MagmaV2Report["sell"]["state"];
-  if (nodeNeed === "need_inbound") {
-    sellState = "not_recommended_node_needs_inbound";
-    sellWarnings.push("your node currently needs inbound liquidity — selling more outbound may not improve receive capacity");
-  } else if (deployableCapitalSat < cfg.minSellSizeSat) {
+  if (deployableCapitalSat < cfg.minSellSizeSat) {
     sellState = "insufficient_capital";
     sellReasons.push(`only ${Math.round(deployableCapitalSat / 1000)}k deployable on-chain after reserve — below the ${cfg.minSellSizeSat / 1e6}M minimum`);
   } else {
@@ -775,6 +781,16 @@ export async function getMagmaRecommendations(
       // is named: a 90-day one costs about three times a 30-day one.
       sellReasons.push(`per sale, a ${leaseDays(recLease)}-day lease at around ${recEff} ppm effective beats routing this capital`);
     }
+  }
+
+  // Short of outbound: a routing channel adds what the node lacks, so the
+  // lease must beat routing valued higher (NEED_MULTIPLIER) — said, not
+  // hidden. (Leasing is never blocked by the node's balance: it spends
+  // on-chain coins, not the node's own inbound or outbound.)
+  if (nodeNeed === "need_outbound") {
+    sellReasons.push(
+      `your node is short of outbound (only ${localPct}% of its liquidity is local) — a routing channel adds exactly that, so a lease must beat routing valued ${NEED_MULTIPLIER.need_outbound}×`,
+    );
   }
 
   // ── Buy v2 — true-cost ranking ──
@@ -823,10 +839,17 @@ export async function getMagmaRecommendations(
     buyState = "no_good_offers";
     buyWarnings.push(`no offers fit your ${(desired / 1e6).toFixed(1)}M target right now`);
   } else if (nodeNeed === "need_inbound") {
+    // Outbound-heavy: inbound is what it lacks, and a purchase adds exactly that.
     buyState = "recommended";
-    buyReasons.push("your node needs inbound — buying inbound liquidity would help directly");
+    buyReasons.push(`your node is short of inbound (${localPct}% of its liquidity is local) — buying inbound adds exactly that`);
+  } else if (nodeNeed === "need_outbound") {
+    // Inbound-rich: more inbound won't help — before, this node was told to buy it.
+    buyState = "not_needed";
+    buyReasons.push(
+      `your node already has plenty of inbound (only ${localPct}% of its liquidity is local) — buying more won't help; it lacks outbound, which opening channels adds`,
+    );
   } else {
-    buyState = nodeNeed === "need_outbound" ? "not_needed" : "optional";
+    buyState = "optional";
     buyReasons.push("inbound isn't your bottleneck right now — buy only for a specific route");
   }
 

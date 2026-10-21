@@ -22,6 +22,7 @@ import {
   inFlightThrough,
   manualRefillRequest,
   refillOutcome,
+  stalePlanRefusal,
 } from "../src/rebalanceView";
 import { RefillAction } from "../src/components/RebalanceRecommendations";
 import { buildPresets } from "../src/presets";
@@ -142,9 +143,22 @@ test("'Run it' sends the row's fee caps and the profit gate — the cap the dial
   assert.equal(manualRefillRequest(recommended({ recommendedAmount: null })), null);
   // The tab sends exactly this — no request of its own beside it.
   const tab = readFileSync(new URL("../src/components/RebalanceRecommendations.tsx", import.meta.url), "utf8");
-  assert.match(tab, /const request = manualRefillRequest\(r, data\?\.config\?\.profitShare\);/);
+  assert.match(tab, /const request = manualRefillRequest\(r, data\?\.config\?\.profitShare, data\?\.generatedAt\);/);
   assert.match(tab, /api\.rebalanceExecute\(request\)/);
   assert.doesNotMatch(tab, /econRatio: 0\.8/, "the operator's econRatio, not a constant");
+});
+
+test("a Run from the tab carries its plan's time: a row whose target was refilled since the plan was made is refused (409 stale_plan), and the tab loads a fresh plan instead of showing an error", () => {
+  const planAt = "2026-10-21T10:00:00.000Z";
+  assert.equal(manualRefillRequest(recommended(), 0.8, planAt)?.planAt, planAt);
+  assert.equal(manualRefillRequest(recommended(), 0.8)?.planAt, undefined, "no plan time: none sent");
+  const refused = { status: 409, body: { error: "stale_plan", message: "This channel was refilled (or tried) after this plan was made: reload it" } };
+  assert.equal(stalePlanRefusal(refused), "This channel was refilled (or tried) after this plan was made — loading a fresh plan, nothing was sent.");
+  // Any other refusal is shown as it is.
+  assert.equal(stalePlanRefusal({ status: 409, body: { error: "busy" } }), null);
+  assert.equal(stalePlanRefusal(new Error("boom")), null);
+  const tab = readFileSync(new URL("../src/components/RebalanceRecommendations.tsx", import.meta.url), "utf8");
+  assert.match(tab, /const stale = stalePlanRefusal\(e\);\s*if \(stale\) \{\s*ui\.toast\(stale, "info"\);\s*await load\(\);/);
 });
 
 test("the confirm dialog says the refill's price is then held, as after an autopilot refill", () => {

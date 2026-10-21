@@ -31,6 +31,7 @@ import { makeNodeKey, makePaymentRequest, parsePaymentRequest, type NodeKey } fr
  *     (stream) → subscribeToInvoice
  *   default.listPeers / default.connectPeer → getPeers / addPeer
  *   default.openChannel (stream) → openChannel
+ *   default.closeChannel (stream) → closeChannel
  *   router.sendPaymentV2 (stream) → pay / payViaPaymentRequest / payViaPaymentDetails
  *   router.trackPaymentV2 (stream) → getPayment
  *   chain.registerBlockEpochNtfn (stream) → subscribeToBlocks / getHeight
@@ -245,6 +246,7 @@ export class FakeLnd {
           cb(null, {});
         },
         openChannel: (a: GrpcArgs) => this.openChannelStream(a),
+        closeChannel: (a: GrpcArgs) => this.closeChannelStream(a),
       },
       router: {
         sendPaymentV2: (a: GrpcArgs) => this.sendPaymentStream(a),
@@ -728,6 +730,32 @@ export class FakeLnd {
       this.chainBalance -= amount;
       this.pending.push({ partnerPublicKey: partner, capacity: amount, transactionId: txid, transactionVout: 0 });
       s.emit("data", { update: "chan_pending", chan_pending: { txid: txidBytes(txid), output_index: 0 } });
+    });
+    return s;
+  }
+
+  /** A close (cooperative or forced — `args.force`): the channel moves to
+   *  "waiting close" and LND answers with the closing transaction. */
+  private closeChannelStream(a: GrpcArgs) {
+    const s = stream();
+    later(() => {
+      const point = a.channel_point as { funding_txid_bytes: Buffer; output_index: number };
+      const txid = Buffer.from(point.funding_txid_bytes).reverse().toString("hex");
+      const i = this.channels.findIndex((c) => c.transactionId === txid && c.transactionVout === point.output_index);
+      if (i < 0) {
+        s.emit("error", { details: "unable to find channel" });
+        return;
+      }
+      const [c] = this.channels.splice(i, 1);
+      this.pending.push({
+        partnerPublicKey: c.partnerPublicKey,
+        capacity: c.capacity,
+        localBalance: c.localBalance,
+        transactionId: c.transactionId,
+        transactionVout: c.transactionVout,
+        state: "waiting_close",
+      });
+      s.emit("data", { update: "close_pending", close_pending: { txid: txidBytes(rand32()), output_index: 0 } });
     });
     return s;
   }

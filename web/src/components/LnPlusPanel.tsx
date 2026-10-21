@@ -143,12 +143,22 @@ export function LnPlusPanel() {
   const [swaps, setSwaps] = useState<LnPlusSwapsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const [statusLoaded, setStatusLoaded] = useState(false);
   useEffect(() => {
-    api.lnplusStatus().then(setStatus).catch(() => setStatus(null));
+    api
+      .lnplusStatus()
+      .then(setStatus)
+      .catch(() => setStatus(null))
+      .finally(() => setStatusLoaded(true));
   }, []);
+
+  // LN+ switched off (Settings → Privacy): nothing is asked of LN+.
+  const off = status?.enabled === false;
 
   useEffect(() => {
     setError(null);
+    // (Once the status said whether LN+ is on; a failed status read doesn't block the views.)
+    if (!statusLoaded || off) return;
     if (sub === "pool" && pool === null) {
       api
         .lnplusPool()
@@ -161,7 +171,7 @@ export function LnPlusPanel() {
         .then(setSwaps)
         .catch((e: Error) => setError(e.message));
     }
-  }, [sub, pool, swaps]);
+  }, [sub, pool, swaps, statusLoaded, off]);
 
   const me = status?.me ?? null;
   const cache = status?.cache ?? null;
@@ -206,6 +216,15 @@ export function LnPlusPanel() {
         ) : null}
       </div>
 
+      {off ? (
+        <div className="dryrun-banner">
+          LN+ lookups are switched off (Settings → Privacy): nothing is asked of lightningnetwork.plus. Peer picking uses the
+          reputations already cached.
+        </div>
+      ) : status && !status.viaTor ? (
+        <p className="muted pad">LN+ lookups leave from this server's IP address (no Tor proxy — see Settings → Privacy).</p>
+      ) : null}
+
       <p className="muted pad">
         LN+ trades channels for channels or for liquidity credits, not for sats. Joining commits you
         to opening a channel within 48 hours and keeping it open for the full term, so the app shows
@@ -214,7 +233,7 @@ export function LnPlusPanel() {
 
       {error ? <div className="sug-warn pad">⚠ {error}</div> : null}
 
-      {sub === "pool" ? (
+      {off ? null : sub === "pool" ? (
         pool === null && !error ? (
           <div className="muted pad">Loading pool…</div>
         ) : (

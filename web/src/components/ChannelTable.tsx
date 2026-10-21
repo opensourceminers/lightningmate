@@ -3,6 +3,7 @@ import { api } from "../api";
 import type { ChannelRole, ChannelView, FeeMode, OverrideMap } from "../types";
 import { satsCompact } from "../format";
 import { feeText } from "../feeView";
+import { leaseTag, offlineLabel } from "../closeView";
 import { CloseChannelDialog } from "./CloseChannelDialog";
 import { FeeOverrideControl } from "./FeeOverrideControl";
 import { EmptyState } from "./Skeleton";
@@ -95,6 +96,16 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
                   <span className="tag tag-opening">pending open</span>
                 ) : c.private ? (
                   <span className="tag">priv</span>
+                ) : null}
+                {leaseTag(c.lease) ? (
+                  <span className="tag tag-lease" title="Closing it before the lease ends breaks the lease — the close dialog asks first">
+                    {leaseTag(c.lease)}
+                  </span>
+                ) : null}
+                {!pending && offlineLabel(c.offline) ? (
+                  <span className={`tag ${c.offline?.long ? "tag-pending" : ""}`} title="How long the peer has been away (short outages are common over Tor)">
+                    {offlineLabel(c.offline)}
+                  </span>
                 ) : null}
               </td>
               <td>

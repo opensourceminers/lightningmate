@@ -180,6 +180,7 @@ test("a channel open's cooldown is on disk before the run goes on", async (t) =>
   const { autopilot, node, seams, dir } = autopilotWith(t, { channelEnabled: true });
   node.peers.push(suggestion.pubkey); // connected: the open goes straight through
   seams.channelSuggestions = async () => ({ suggestions: [suggestion] });
+  seams.openFeeRate = async () => 2; // LND's economy estimate (the fake has none)
   const onDiskMidRun = laterStageFails(t, seams, dir);
 
   await autopilot.runOnce();

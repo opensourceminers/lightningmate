@@ -185,6 +185,7 @@ async function deferralSetup(t: Parameters<typeof sellerSetup>[0], fills: (score
   s.magma.addOffer({ minSats: 1_000_000, maxSats: 5_000_000, totalSats: 5_000_000 });
   await s.autopilot.runOnce(); // offer upkeep: the enabled offer is on record
   (s.autopilot as unknown as AutopilotSeams).channelSuggestions = async () => ({ suggestions: [suggestion] });
+  (s.autopilot as unknown as AutopilotSeams).openFeeRate = async () => 2; // LND's economy estimate (the fake has none)
   s.node.peers.push(suggestion.pubkey); // connected: the open itself is what is tested
   s.autopilot.setConfig({ channelEnabled: true, channelSizeSats: 1_000_000 });
   return s;
@@ -215,8 +216,9 @@ test("D10: the open waits for Magma only where selling is realistic AND the expe
   quiet(t);
   const s = await deferralSetup(t, (score) => (score <= 15 ? 12 : 30));
   const run = await s.autopilot.runOnce();
-  assert.equal(run.channels[0]?.ok, false);
-  assert.match(run.channels[0]?.error ?? "", /^deferred: selling on Magma is expected to earn more on this capital \(~\d+ ppm\/yr: offers like yours fill ~[\d.]+ times a year\) than a new routing channel \(~0 ppm\/yr\)/);
+  // A deferral is the channel stage's decision, not a failed run (D15).
+  assert.deepEqual(run.channels, []);
+  assert.match(s.autopilot.getState().decisions.channels?.text ?? "", /^deferred: selling on Magma is expected to earn more on this capital \(~\d+ ppm\/yr: offers like yours fill ~[\d.]+ times a year\) than a new routing channel \(~0 ppm\/yr: what the median month-old channel here earned\)/);
   assert.equal(s.node.callsTo("default.openChannel").length, 0);
 });
 
@@ -298,7 +300,8 @@ test("D10: routing that out-earns the lease keeps the open going — selling rea
   // earned 2,000 sat in 30 days (~12,200 ppm/yr) earns less: the open waits.
   forwardsEarning(s.node, "850000x1x0", 2_000);
   const slow = await s.autopilot.runOnce();
-  assert.match(slow.channels[0]?.error ?? "", /^deferred: .* than a new routing channel \(~12167 ppm\/yr\)/);
+  assert.deepEqual(slow.channels, []);
+  assert.match(s.autopilot.getState().decisions.channels?.text ?? "", /^deferred: .* than a new routing channel \(~12167 ppm\/yr: what the median month-old channel here earned\)/);
   assert.equal(s.node.callsTo("default.openChannel").length, 0);
   // One that earned 20,000 sat (~121,700 ppm/yr) beats the lease: routing
   // gets the capital. (Without the comparison — the core of D10 — it would
@@ -316,6 +319,13 @@ test("D10: a sale that nets nothing at today's on-chain fees leaves nothing for 
   __setHistoryForTests(
     Array.from({ length: 30 }, (_, i) => ({ at: Date.now() - i * 86_400_000, sizeSat: 3_000_000, blocks: 4320, apr: 0.0005, leasePpm: 41, status: "FINISHED" })),
   );
+  // (The open's own payback check reads 30 days of forwards too: answered
+  // here without a read, so the count below is the Magma comparison's alone.)
+  s.autopilot.openEconomics = async () => ({
+    ppmYear: null,
+    capitalSat: 20_000_000,
+    evidence: { channels: 0, capacitySat: 0, forwards: 0, earnedSat: 0, forwardsRead: true },
+  });
   const forwardsBefore = s.node.callsTo("default.forwardingHistory").length;
   const run = await s.autopilot.runOnce();
   assert.equal(run.channels[0]?.ok, true, JSON.stringify(run.channels));

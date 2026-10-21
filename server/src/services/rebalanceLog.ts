@@ -83,6 +83,16 @@ export class RebalanceLog {
     return this.records.some((r) => r.paymentId === paymentId);
   }
 
+  /** When the latest refill into `targetId` — paid or failed — was booked
+   *  (it ended then), or null. */
+  lastInto(targetId: string): string | null {
+    let latest: string | null = null;
+    for (const r of this.records) {
+      if (r.targetId === targetId && (latest === null || Date.parse(r.at) > Date.parse(latest))) latest = r.at;
+    }
+    return latest;
+  }
+
   /** The newest `n` records, failures included (the Rebalance tab's list). */
   recent(n = 50): RebalanceRecord[] {
     return this.records.slice(0, n);

@@ -26,6 +26,15 @@ export interface ChannelView {
   status: ChannelStatus;
   /** Force-close in progress: blocks until time-locked funds are spendable. */
   timelockBlocks?: number;
+  /** Open channels: how long a force-close would lock our funds (LND's
+   *  local CSV delay, blocks) and the commitment transaction's fee as LND
+   *  last signed it (sat) — what the close dialog states before a force-close. */
+  csvDelayBlocks?: number;
+  commitFeeSats?: number;
+  /** Open channels: LND's per-channel monitoring since it started (ms) —
+   *  reset by every LND restart (channelUptime.ts keeps its own record). */
+  timeOfflineMs?: number;
+  timeOnlineMs?: number;
   /**
    * Heuristic classification from lifetime flow:
    *  - source: mostly receives (drains inbound) → keep fees low
@@ -75,6 +84,10 @@ export async function getChannelsView(
         totalReceived: c.received,
         unsettled: c.unsettled_balance,
         status: "open",
+        ...(typeof c.local_csv === "number" ? { csvDelayBlocks: c.local_csv } : {}),
+        ...(Number.isFinite(c.commit_transaction_fee) ? { commitFeeSats: c.commit_transaction_fee } : {}),
+        ...(Number.isFinite(c.time_offline) ? { timeOfflineMs: c.time_offline } : {}),
+        ...(Number.isFinite(c.time_online) ? { timeOnlineMs: c.time_online } : {}),
         role: classify(c.sent, c.received),
       };
     }),

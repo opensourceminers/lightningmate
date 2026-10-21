@@ -16,9 +16,18 @@ standalone via Docker.
   revenue vs channel-open and rebalancing costs), a liquidity map, recent
   activity, your **top earning channels** and graph-based **peer suggestions**.
 - **Channels** — live balance bars with source / sink / router roles, scored
-  peer suggestions, and close candidates. Closing opens a dialog to pick the
-  on-chain fee (fast / economy / custom) or force-close, and the channel stays
-  visible as "pending close" until it confirms.
+  peer suggestions, and close candidates — never a channel still opening or
+  closing, or one inside its lease (sold on Magma or over LSPS1, or bought on
+  Magma; the table tags those — a sale older than the app's order journal is
+  known from Amboss's listing, kept on disk and asked again hourly while an
+  Amboss key is set, and a sale that listing still reports running stays
+  protected even after the journal's own count has ended), and a peer counts
+  as offline only after days away.
+  Closing opens a dialog to pick the on-chain fee (fast / economy / custom); a
+  peer that is away is offered a reconnect first, a force-close is
+  its own step that says what it does, and breaking a lease needs an explicit
+  "close it anyway". The channel stays visible as "pending close" until it
+  confirms.
 - **Market (Amboss Magma)** — **buy** inbound liquidity (offers ranked by what
   they really cost per year of lease, Amboss's fee included; purchases are
   recorded and followed to their channel) and, as an advanced opt-in feature,

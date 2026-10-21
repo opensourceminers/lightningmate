@@ -57,7 +57,12 @@ export class LnPlusStore {
   private pausedUntil = 0;
   private lastError: string | null = null;
 
-  constructor(dataDir: string) {
+  constructor(
+    dataDir: string,
+    /** The operator's LN+ switch (Settings → Privacy): off, nothing is asked
+     *  of LN+ — what is cached is still used. */
+    private readonly enabled: () => boolean = () => true,
+  ) {
     this.store = new JsonStore<CacheState>(dataDir, "lnplus-nodes.json");
     this.state = this.store.read({ nodes: {}, calls: [] });
     if (!this.state.nodes) this.state.nodes = {};
@@ -84,6 +89,11 @@ export class LnPlusStore {
     if (!e) return false;
     const ttl = e.node ? HIT_TTL_MS : MISS_TTL_MS;
     return Date.now() - e.at < ttl;
+  }
+
+  /** Whether LN+ may be asked at all (the operator's switch). */
+  isEnabled(): boolean {
+    return this.enabled();
   }
 
   /** Cached profile without touching the network. undefined = we don't know. */
@@ -132,7 +142,8 @@ export class LnPlusStore {
     // The rolling day budget bounds everything: a per-pass budget alone would
     // let 48 autopilot runs spend 576 calls against a 100/day allowance.
     const allowed = Math.min(budget, this.remainingToday());
-    if (!missing.length || this.isPaused() || allowed <= 0) return out;
+    // Switched off: what is cached, nothing asked.
+    if (!missing.length || this.isPaused() || allowed <= 0 || !this.enabled()) return out;
 
     const queue = missing.slice(0, allowed);
     let dirty = false;

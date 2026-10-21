@@ -39,6 +39,7 @@ async function get<T>(path: string): Promise<T> {
       `${BASE}${path}`,
       { headers: { Accept: "application/json", "User-Agent": UA } },
       HTTP_TIMEOUTS.lnplusMs,
+      "lnplus",
     );
   } catch (e) {
     throw new Error(`LN+ unreachable: ${e instanceof Error ? e.message : String(e)}`);

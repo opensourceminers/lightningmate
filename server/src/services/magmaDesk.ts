@@ -1,5 +1,5 @@
 import { getChannels, getWalletInfo, type AuthenticatedLnd } from "lightning";
-import { recordStoreIncident } from "../store.js";
+import { JsonStore, recordStoreIncident } from "../store.js";
 import {
   AmbossError,
   ORDER_FAILED,
@@ -133,6 +133,27 @@ const SEEN_MAX_AGE_MS = 24 * 3_600_000;
 const REPORT_RESEND_MS = 10 * 60_000;
 /** The deployed-capital listing is re-read at most this often. */
 const DEPLOYED_TTL_MS = 30_000;
+/** The last listing of this node's sales with a running lease (the lease
+ *  registry's fallback for sales the journal never recorded) is trusted this
+ *  long; the close list and a close ask Amboss again after it. */
+export const AMBOSS_LEASES_MAX_AGE_MS = 3_600_000;
+/** How long the close list or a close waits for that listing — then it goes
+ *  on with the last one known (kept on disk). */
+const AMBOSS_LEASES_WAIT_MS = 5_000;
+/** A listing that failed is not asked for again before this. */
+const AMBOSS_LEASES_RETRY_MS = 5 * 60_000;
+
+/** A sale of this node that Amboss lists with a running lease, and its channel. */
+export interface AmbossRunningLease {
+  orderId: string;
+  channelId: string;
+}
+
+/** magma-amboss-leases.json: the last such listing, and when it was made. */
+interface AmbossLeasesFile {
+  at: string | null;
+  leases: AmbossRunningLease[];
+}
 
 export type SellActionKind =
   | "accept"
@@ -360,6 +381,18 @@ export class MagmaDesk {
   /** Magma capital in sold channels with a running lease (and orders accepted
    *  outside this journal), from the last listing — the deploy-cap share. */
   private deployed = { sats: 0, at: 0 };
+  /** This node's sales Amboss reports with a running lease and a channel,
+   *  from the same listing (refreshDeployed) — the lease registry's fallback
+   *  for sales this journal never recorded (leases.ts) — and when that
+   *  listing was made. Kept on disk (review of P4: it lived in memory only,
+   *  so after a restart, or while selling was off, the registry knew none of
+   *  these sales and the close list offered them mid-lease). */
+  private ambossLeases: AmbossRunningLease[] = [];
+  private ambossLeasesAt = 0;
+  private ambossLeasesSavedAt = 0;
+  private ambossLeasesTriedAt = 0;
+  private ambossLeasesRefresh: Promise<void> | null = null;
+  private readonly ambossLeasesStore: JsonStore<AmbossLeasesFile>;
   /** Funding txids of finished leases, learned once per process. */
   private readonly finishedTxids = new Map<string, string | null>();
   /** Orders whose last read Amboss refused or failed, whatever the failure
@@ -381,6 +414,16 @@ export class MagmaDesk {
 
   constructor(private readonly deps: MagmaDeskDeps) {
     this.journal = new MagmaJournal(deps.dataDir);
+    this.ambossLeasesStore = new JsonStore<AmbossLeasesFile>(deps.dataDir, "magma-amboss-leases.json");
+    const kept = this.ambossLeasesStore.read({ at: null, leases: [] });
+    const keptAt = typeof kept.at === "string" ? Date.parse(kept.at) : NaN;
+    if (Number.isFinite(keptAt) && Array.isArray(kept.leases)) {
+      this.ambossLeases = kept.leases.filter(
+        (l): l is AmbossRunningLease => !!l && typeof l.orderId === "string" && typeof l.channelId === "string",
+      );
+      this.ambossLeasesAt = keptAt;
+      this.ambossLeasesSavedAt = keptAt;
+    }
     deps.capital.register("magma", {
       // Each accepted order's open will be checked against the sell reserve.
       reservations: () => this.journal.reservations(deps.config().sellReserveSats),
@@ -2306,7 +2349,75 @@ export class MagmaDesk {
       .filter((o) => o.sellerPubkey === own && !reserving.has(`magma:${o.id}`))
       .reduce((s, o) => s + o.sizeSats, 0);
     this.deployed = { sats, at: Date.now() };
+    const running = new Set<string>(LEASE_RUNNING_STATUSES);
+    this.keepAmbossLeases(
+      orders
+        .filter((o) => o.sellerPubkey === own && running.has(o.status) && !!o.channelId)
+        .map((o) => ({ orderId: o.id, channelId: o.channelId as string })),
+    );
     return sats;
+  }
+
+  /** A new listing of the running leases: in memory, and on disk when it
+   *  changed (or the copy there is getting old — its time says how fresh it
+   *  is after a restart). */
+  private keepAmbossLeases(leases: AmbossRunningLease[]): void {
+    const nowMs = Date.now();
+    const changed = JSON.stringify(leases) !== JSON.stringify(this.ambossLeases);
+    this.ambossLeases = leases;
+    this.ambossLeasesAt = nowMs;
+    if (changed || nowMs - this.ambossLeasesSavedAt >= AMBOSS_LEASES_MAX_AGE_MS / 2) {
+      this.ambossLeasesStore.write({ at: new Date(nowMs).toISOString(), leases });
+      this.ambossLeasesSavedAt = nowMs;
+    }
+  }
+
+  /** This node's sales whose lease Amboss reported running at its last
+   *  listing (with their channel) — this process's, or the one before's
+   *  (kept on disk). */
+  runningLeasesOnAmboss(): AmbossRunningLease[] {
+    return [...this.ambossLeases];
+  }
+
+  /** When that listing was made (null: never). */
+  runningLeasesListedAt(): string | null {
+    return this.ambossLeasesAt > 0 ? new Date(this.ambossLeasesAt).toISOString() : null;
+  }
+
+  /**
+   * The running leases as Amboss lists them, asked again first when the last
+   * listing is older than AMBOSS_LEASES_MAX_AGE_MS and an Amboss key is set —
+   * for the close list and a close, which must not go by a listing from
+   * hours ago (or none: the deploy cap's listing runs only while selling
+   * does). Waits at most AMBOSS_LEASES_WAIT_MS for Amboss (the listing then
+   * lands for the next read); a failed listing is not asked for again
+   * before AMBOSS_LEASES_RETRY_MS. Never throws.
+   */
+  async runningLeasesFresh(): Promise<AmbossRunningLease[]> {
+    const nowMs = Date.now();
+    const stale = nowMs - this.ambossLeasesAt > AMBOSS_LEASES_MAX_AGE_MS;
+    if (stale && this.deps.amboss.hasKey() && (this.ambossLeasesRefresh || nowMs - this.ambossLeasesTriedAt >= AMBOSS_LEASES_RETRY_MS)) {
+      if (!this.ambossLeasesRefresh) {
+        this.ambossLeasesTriedAt = nowMs;
+        this.ambossLeasesRefresh = this.refreshDeployed(true)
+          .then(
+            () => undefined,
+            () => undefined, // Amboss unreachable: the last listing known stands
+          )
+          .finally(() => {
+            this.ambossLeasesRefresh = null;
+          });
+      }
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, AMBOSS_LEASES_WAIT_MS);
+        timer.unref?.();
+        void this.ambossLeasesRefresh?.then(() => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
+    return this.runningLeasesOnAmboss();
   }
 
   /** Close sold channels whose lease is over (CHANNEL_MONITORING_FINISHED). */

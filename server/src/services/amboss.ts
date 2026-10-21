@@ -211,6 +211,7 @@ export async function ambossGql<T>(
         body: JSON.stringify(variables ? { query, variables } : { query }),
       },
       timeoutMs,
+      "amboss",
     );
   } catch (e) {
     if (e instanceof HttpTimeoutError) throw new AmbossError("timeout", `Amboss ${e.message}`);

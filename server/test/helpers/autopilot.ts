@@ -42,10 +42,18 @@ export interface AutopilotSeams {
    *  payment left in flight when the stub returns it). */
   rebalanceExec: (writeLnd: unknown, p: RebalanceExecParams, opts?: RebalanceExecOptions) => Promise<RebalanceExecResult>;
   channelSuggestions: () => Promise<Pick<SuggestV2Report, "suggestions">>;
+  /** The economy fee rate an automatic open pays (sat/vB) — LND's estimate;
+   *  the fake LND has none unless a test gives it one (null: no open). */
+  openFeeRate: () => Promise<number | null>;
   /** The Magma stage — the one that always runs after the fee, rebalance and
    *  channel stages; a test replaces it to look at the disk mid-run. */
   runSell: () => Promise<unknown[]>;
 }
+
+/** A peer LND is connected to for gossip (no channel with it). A live LND
+ *  keeps a few such peers at all times; with none at all, the channel stage
+ *  takes this node to be offline and dials nobody. */
+export const GOSSIP_PEER = "03" + "9a".repeat(32);
 
 /**
  * An Autopilot on a fake node, with `config` stored as its settings (and
@@ -53,14 +61,15 @@ export interface AutopilotSeams {
  * (every run also refreshes Amboss's public sale history in the background —
  * answered here with an empty one). `files`: other state files of the data
  * dir as a previous process left them (e.g. "rebalances.json"). `node`: the
- * fake LND to run on (default: an empty one with 20M on chain).
+ * fake LND to run on (default: an empty one with 20M on chain, connected to a
+ * gossip peer).
  */
 export function autopilotWith(
   t: AfterHook,
   config: Record<string, unknown>,
   stored: Record<string, unknown> = {},
   files: Record<string, unknown> = {},
-  node: FakeLnd = new FakeLnd({ chainBalance: 20_000_000 }),
+  node: FakeLnd = new FakeLnd({ chainBalance: 20_000_000, peers: [GOSSIP_PEER] }),
 ) {
   const http = installFetchMock(t);
   http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
@@ -129,7 +138,7 @@ export function sellerSetup(
   // Amboss's public market data (offer book, node stats, dollar rate): empty
   // unless a test fills it — the engine and the selling check stay offline.
   const market = new FakeMarket(http, t);
-  const node = new FakeLnd({ chainBalance: opts.chainBalance ?? 20_000_000 });
+  const node = new FakeLnd({ chainBalance: opts.chainBalance ?? 20_000_000, peers: [GOSSIP_PEER] });
   // Sales and offers are this node's unless a test says otherwise.
   magma.sellerPubkey = node.publicKey;
   const dir = makeTempDir(t);
@@ -242,13 +251,19 @@ export const failedRebalance = (p: RebalanceExecParams): RebalanceExecResult => 
   error: "no route",
 });
 
-/** A channel to open, as the suggestion engine ranks it first. */
+/** A channel to open, as the suggestion engine ranks it first (a useful
+ *  peer with an address to dial, no LN+ profile, never closed with). */
 export const suggestion = {
   pubkey: "02" + "cd".repeat(32),
   alias: "next-peer",
   socket: "",
+  sockets: ["abcdefghijklmnopqrstuvwxyz234567abcdefghijklmnopqrstuvwx.onion:9735"],
   recommendedSizeSats: 2_000_000,
-} as SuggestionV2;
+  usefulness: "high",
+  lnplus: null,
+  peerMinChannelSats: null,
+  closedDaysAgo: null,
+} as unknown as SuggestionV2;
 
 /** A fee recommendation (only the fields the autopilot reads): by default one
  *  the engine would apply. */

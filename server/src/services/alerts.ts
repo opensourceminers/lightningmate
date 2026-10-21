@@ -20,7 +20,10 @@ const RESET_CONSEQUENCE: Record<string, string> = {
   "lsps1-orders.json": "LSP orders that were in progress can no longer be tracked — check them in LND.",
   "amboss.json": "Reconnect your Amboss key in Settings.",
   "overrides.json": "Per-channel fee overrides (incl. exclusions) are gone — re-check them on the Channels tab.",
-  "settings.json": "Check your Settings (LSP mode, currency).",
+  "settings.json": "Check your Settings (LSP mode, currency, privacy: LN+ lookups and the Tor route).",
+  "channel-uptime.json": "How long each channel's peer has been offline is counted again from now — no channel counts as long offline until it has been for 72 hours.",
+  "magma-amboss-leases.json":
+    "The last list of older Magma sales Amboss reports with a running lease is fetched again (with an Amboss key set) — until then, such a sale's channel is not marked as leased.",
   "service-fees.json": "Pending service-fee records were lost.",
   "magma-purchases.json":
     "The record of inbound you bought on Magma was lost — the channels are not affected; P&L no longer shows those purchases.",

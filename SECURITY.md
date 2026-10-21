@@ -9,14 +9,35 @@ security@opensourceminers.de (please don't open a public issue first).
 - **Read-only by default.** Writes (fee changes, rebalancing, opening/closing
   channels, autopilot) are off unless you opt in with `LM_ENABLE_WRITE=true` and
   a write-capable macaroon.
-- **Minimal outbound traffic.** Beyond LND, outbound calls happen only for
-  features you use: the optional fiat price lookup (mempool.space) when a
-  currency is set, the Amboss Magma marketplace (api.amboss.space for public
-  market data, magma.amboss.tech for everything that acts) when you add an
-  Amboss API key, and — on a completed
-  liquidity sale with the service fee enabled — an LNURL-pay lookup of the
-  configured fee address. Nothing else leaves your node, and every outbound
-  request has a hard deadline.
+- **Outbound traffic, said plainly.** Your node stays Tor-only, but
+  LightningMate's own lookups are the app's, not the node's. Beyond LND, the
+  app talks to:
+  - **LN+ (lightningnetwork.plus)**: node reputations for picking peers and
+    for the Pool and Swaps views. This includes a lookup of this node's own
+    public key. LN+ lookups are **on by default**; switch them off under
+    Settings → Privacy ("LN+ lookups").
+  - **Amboss**: public Magma market data from api.amboss.space (offers,
+    recent sales, and this node's public seller score, so its public key too).
+    This is fetched **with or without an Amboss API key**, by the autopilot's
+    runs and the Market pages. With a key, the app also reads and manages
+    your offers, orders and purchases (magma.amboss.tech for everything that
+    acts). Those calls are tied to your Amboss account.
+  - **mempool.space**: the BTC price, only while a fiat currency is chosen.
+  - **The service-fee lightning address**: an LNURL-pay lookup after a
+    completed liquidity sale with the service fee enabled.
+
+  The route depends on whether Umbrel gives the app its Tor proxy
+  (`TOR_PROXY_IP` / `TOR_PROXY_PORT`):
+  - **With the proxy**, LN+ and the price lookup go through Tor by default
+    ("Lookups via Tor"). Amboss and the LNURL lookup go through Tor only with
+    "Everything via Tor", and "Direct" sends nothing through it (Settings →
+    Privacy). A lookup routed through Tor never falls back to a direct
+    connection.
+  - **Without the proxy**, every one of them leaves from this server's
+    internet connection, which is your home IP address.
+
+  Settings → Privacy lists each destination with the route it takes right
+  now. Every outbound request has a hard deadline.
 - **LSP mode is off by default** and adds the only surface that processes input
   from arbitrary network peers: LSPS1 (bLIP-51) JSON-RPC over BOLT8 custom
   messages. It is rate-limited per peer, strictly validated, wrapped in a hard

@@ -211,6 +211,11 @@ export interface RebalanceExecResult {
   /** The target's lifetime "sent" counter (LND) before the refill: the fee
    *  engine retires the refilled sats against it (refill lots). */
   targetSentBefore?: number;
+  /** The target's outbound fee (ppm) as LND reported it for this refill —
+   *  what its sats are really sold at now. The books never hold the fee
+   *  above it (refillBooks: a gate from a stale plan may value the refill
+   *  above a fee that has dropped since). Absent: LND didn't list it. */
+  targetPpm?: number;
   /** Sources that were tried and paid nothing (no route within the cap) —
    *  each pair backs off on its own. */
   failedSourceIds?: string[];
@@ -235,6 +240,9 @@ export interface RefillAttempt {
   maxFeeSats: number;
   /** The target's lifetime "sent" counter before the refill. */
   targetSentBefore?: number;
+  /** The target's outbound fee (ppm) as read for this refill (absent: LND
+   *  didn't list it) — the write-ahead record books no hold above it. */
+  targetPpm?: number;
 }
 
 /**
@@ -350,7 +358,8 @@ export async function executeRebalance(
   }
 
   const rates = await getFeeRates({ lnd: readLnd });
-  const outboundPpm = rates.channels.find((c) => c.id === params.targetId)?.fee_rate ?? 0;
+  const targetPpm = rates.channels.find((c) => c.id === params.targetId)?.fee_rate;
+  const outboundPpm = targetPpm ?? 0;
   // Manual runs may pass an explicit budget; otherwise it's the profit-gated
   // fraction of what the target earns on outbound.
   const budgetPpm =
@@ -368,7 +377,7 @@ export async function executeRebalance(
     .then((w) => w.current_block_height)
     .catch(() => null);
 
-  const withTarget = { ...base, budgetPpm, targetSentBefore: target.totalSent };
+  const withTarget = { ...base, budgetPpm, targetSentBefore: target.totalSent, ...(targetPpm !== undefined ? { targetPpm } : {}) };
   const failedSourceIds: string[] = [];
   let lastErr: unknown = null;
   let tried = false;
@@ -429,6 +438,7 @@ export async function executeRebalance(
             amountSats: amount,
             maxFeeSats,
             targetSentBefore: target.totalSent,
+            ...(targetPpm !== undefined ? { targetPpm } : {}),
           });
         } catch (err) {
           return {

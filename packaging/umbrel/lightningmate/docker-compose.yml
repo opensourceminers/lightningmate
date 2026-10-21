@@ -44,3 +44,9 @@ services:
       # comment these two lines out.
       LM_ENABLE_WRITE: "true"
       LND_WRITE_MACAROON_PATH: "/lnd/data/chain/bitcoin/$APP_BITCOIN_NETWORK/admin.macaroon"
+      # Umbrel's Tor proxy (SOCKS5). LightningMate's own third-party lookups
+      # (LN+ reputations — this node's pubkey included — and the BTC price)
+      # go through it instead of the home connection; Settings → Privacy can
+      # route Amboss through it too. Without these lines they go out directly.
+      TOR_PROXY_IP: "$TOR_PROXY_IP"
+      TOR_PROXY_PORT: "$TOR_PROXY_PORT"

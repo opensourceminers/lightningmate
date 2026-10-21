@@ -8,6 +8,7 @@ import { getFlowSummary, getForwardsReport } from "../services/forwards.js";
 import { getFeePreview, type FeeApplyItem, type FeePolicy } from "../services/fees.js";
 import { type SuggestionPolicy } from "../services/suggestions.js";
 import { getChannelSuggestionsV2, getCloseSuggestionsV2 } from "../services/suggestRecommend.js";
+import { channelLeases, leaseProtection } from "../services/leases.js";
 import type { LnPlusStore } from "../services/lnplusStore.js";
 import { checkSwapEligibility, getPoolNodes, getSwaps, type NodeFacts } from "../services/lnplus.js";
 import { getMagmaRecommendations } from "../services/magmaRecommend.js";
@@ -27,11 +28,14 @@ import {
   newAddress,
   sendOnchain,
 } from "../services/onchain.js";
-import { closeChannelByOutpoint, connectForOpen, fundChannel, MIN_CHANNEL_SATS } from "../services/channelOps.js";
-import { promisedSpendRefusal, type PromisedSpendRefusal } from "../services/capital.js";
+import { closeChannelByOutpoint, connectForOpen, fundChannel, MIN_CHANNEL_SATS, type OpenChannelResult } from "../services/channelOps.js";
+import { promisedSpendRefusal, spendableOnchain, type PromisedSpendRefusal } from "../services/capital.js";
+import { CLOSE_TX_VBYTES, OPEN_TX_VBYTES } from "../services/nodeEconomics.js";
+import { MIN_YIELD_EARNED_SAT, MIN_YIELD_FORWARDS, OPEN_PAYBACK_MONTHS } from "../services/openPlan.js";
 import { saleFeeConfig, type ServiceFeeLedger } from "../services/serviceFee.js";
 import { floorWindowStart, getFeeRecommendations } from "../services/feeRecommend.js";
 import { getBtcPrice } from "../services/price.js";
+import { outboundRouting, setOutboundRouting, viaTor } from "../services/http.js";
 import type { SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
 import { getAlerts, magmaRefusalAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
@@ -55,7 +59,7 @@ import {
 } from "../services/magmaApi.js";
 import type { DeskResult } from "../services/magmaDesk.js";
 import type { AmbossStore } from "../services/ambossStore.js";
-import { FeeItemError, RebalanceBudgetError, RefillInFlightError, ambossFields, termsMatch, type Autopilot, type OfferWrite } from "../services/autopilot.js";
+import { FeeItemError, RebalanceBudgetError, RefillInFlightError, StalePlanError, ambossFields, termsMatch, type Autopilot, type OfferWrite } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 import { BackupStore, exportScb, getBackupStatus } from "../services/backup.js";
 import type { EarningsLog } from "../services/earningsLog.js";
@@ -167,6 +171,11 @@ export function createApiRouter(
   serviceFees: ServiceFeeLedger,
 ): Router {
   const router = Router();
+  /** The chain tip as LND sees it (0 when it can't say: leases then read as running). */
+  const currentHeight = (): Promise<number> =>
+    getWalletInfo({ lnd })
+      .then((w) => w.current_block_height)
+      .catch(() => 0);
 
   // Limits are kept PER CLIENT ADDRESS. Umbrel's app_proxy (the owner's
   // browser) and other containers on the Docker network arrive from different
@@ -269,16 +278,32 @@ export function createApiRouter(
   );
 
   // Every channel with the fee it charges now (review a6: the Channels table
-  // could not show what a channel charges — only Autopilot → Fees could).
+  // could not show what a channel charges — only Autopilot → Fees could), its
+  // lease (sold on Magma or over LSPS1, or bought on Magma — the table tags
+  // it and the close dialog asks before breaking it), and how long its peer
+  // has been away (a short outage is no reason to force-close).
   router.get(
     "/channels",
     wrap(async (_req, res) => {
-      const [channels, rates] = await Promise.all([getChannelsView(lnd), getFeeRates({ lnd }).catch(() => null)]);
+      const [channels, rates, height] = await Promise.all([
+        getChannelsView(lnd),
+        getFeeRates({ lnd }).catch(() => null),
+        currentHeight(),
+      ]);
+      const nowMs = Date.now();
+      autopilot.uptime.observe(channels, nowMs);
+      const leases = channelLeases(channels, autopilot.leaseSources(), height, nowMs);
       const rateById = new Map((rates?.channels ?? []).map((c) => [c.id, c]));
       res.json(
         channels.map((c) => {
           const r = rateById.get(c.id);
-          return { ...c, feeRatePpm: r ? r.fee_rate : null, baseFeeMsat: r ? Number(r.base_fee_mtokens) : null };
+          return {
+            ...c,
+            feeRatePpm: r ? r.fee_rate : null,
+            baseFeeMsat: r ? Number(r.base_fee_mtokens) : null,
+            lease: leases.get(c.id) ?? null,
+            offline: autopilot.uptime.offlineInfo(c, nowMs),
+          };
         }),
       );
     }),
@@ -422,6 +447,12 @@ export function createApiRouter(
   });
 
   // Close a channel by funding outpoint — real on-chain action, write only.
+  // A channel inside its lease (sold on Magma or over LSPS1, or bought on
+  // Magma) is refused unless the request says `breakLease: true` — what the
+  // close dialog sends only after the operator confirmed breaking it (review
+  // a3/a4/a6: closing one broke a buyer's lease, which Amboss counts against
+  // the seller score, or threw away inbound this node paid for). A channel
+  // still opening can't be closed at all.
   router.post(
     "/channels/close",
     wrap(async (req, res) => {
@@ -429,15 +460,60 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { transactionId, transactionVout, isForce, feeRate } = req.body ?? {};
+      const { transactionId, transactionVout, isForce, feeRate, breakLease } = req.body ?? {};
       const vout = intIn(transactionVout, 0, 1_000_000);
       if (!isTxid(transactionId) || vout === null) {
         res.status(400).json({ error: "bad_request", message: "valid transactionId (64 hex) and transactionVout required." });
         return;
       }
+      if (breakLease !== undefined && typeof breakLease !== "boolean") {
+        res.status(400).json({ error: "bad_request", message: "breakLease must be true or false." });
+        return;
+      }
       // Optional sat/vByte for cooperative closes; ignored for force-closes.
       const rate = feeRate === undefined ? undefined : (intIn(feeRate, 1, 5000) ?? undefined);
+      const [channels, height, sources] = await Promise.all([getChannelsView(lnd), currentHeight(), autopilot.leaseSourcesFresh()]);
+      const channel = channels.find((c) => c.transactionId === transactionId && c.transactionVout === vout);
+      if (channel?.status === "pending_open") {
+        res.status(409).json({
+          error: "pending",
+          message: "This channel is still opening — it can't be closed until its funding transaction confirms.",
+        });
+        return;
+      }
+      // Matched against every channel, as the Channels table and the close
+      // list match it: a purchase is claimed by the same channel everywhere.
+      const lease = channel ? channelLeases(channels, sources, height).get(channel.id) : undefined;
+      if (lease?.running && breakLease !== true) {
+        res.status(409).json({
+          error: "lease_active",
+          message: `Not closed: this channel was ${leaseProtection(lease)}. Confirm breaking the lease to close it anyway.`,
+          lease,
+        });
+        return;
+      }
       res.json(await closeChannelByOutpoint(writeLnd, transactionId, vout, Boolean(isForce), rate));
+    }),
+  );
+
+  // Reconnect to a channel's peer (the close dialog offers this first for a
+  // peer that is offline: a short outage is no reason to force-close). Dials
+  // the given address, then the ones the graph knows — over Tor that can
+  // take up to a minute and a half.
+  router.post(
+    "/peers/connect",
+    wrap(async (req, res) => {
+      if (!writeLnd) {
+        res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
+        return;
+      }
+      const { pubkey, socket } = req.body ?? {};
+      if (!isPubkey(pubkey) || (socket !== undefined && (typeof socket !== "string" || socket.length > 256))) {
+        res.status(400).json({ error: "bad_request", message: "valid pubkey (66 hex) and optional socket required." });
+        return;
+      }
+      const done = await connectForOpen(writeLnd, { pubkey, socket: socket || undefined });
+      res.json(done.ok ? { ok: true } : { ok: false, error: done.error });
     }),
   );
 
@@ -573,8 +649,11 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { targetId, sourceId, amountSats, econRatio, maxFeePpm, maxFeeSats, gate } = req.body ?? {};
+      const { targetId, sourceId, amountSats, econRatio, maxFeePpm, maxFeeSats, gate, planAt } = req.body ?? {};
       const amount = intIn(amountSats, 1000, MAX_REBALANCE_SATS);
+      // When the plan the row came from was made (the tab sends its
+      // generatedAt): a target refilled since is refused as stale.
+      const planOk = planAt === undefined || (typeof planAt === "string" && planAt.length <= 64 && Number.isFinite(Date.parse(planAt)));
       const ratio = econRatio === undefined ? 0.8 : numIn(econRatio, 0.05, 1);
       const maxFee = maxFeePpm === undefined ? undefined : intIn(maxFeePpm, 1, MAX_FEE_PPM);
       const maxSats = maxFeeSats === undefined ? undefined : intIn(maxFeeSats, 1, MAX_REBALANCE_SATS);
@@ -595,12 +674,13 @@ export function createApiRouter(
         ratio === null ||
         (maxFeePpm !== undefined && maxFee === null) ||
         (maxFeeSats !== undefined && maxSats === null) ||
-        (g !== undefined && (g.revenuePpm === null || g.demandSats === null || g.minNetSats === null))
+        (g !== undefined && (g.revenuePpm === null || g.demandSats === null || g.minNetSats === null)) ||
+        !planOk
       ) {
         res.status(400).json({
           error: "bad_request",
           message:
-            "valid targetId/sourceId, amountSats (1k–1 BTC), econRatio (0.05–1) and optional maxFeePpm, maxFeeSats (the most the refill may pay, sat) and gate {revenuePpm, demandSats, minNetSats} required.",
+            "valid targetId/sourceId, amountSats (1k–1 BTC), econRatio (0.05–1) and optional maxFeePpm, maxFeeSats (the most the refill may pay, sat), gate {revenuePpm, demandSats, minNetSats} and planAt (when the plan was made, ISO time) required.",
         });
         return;
       }
@@ -620,8 +700,15 @@ export function createApiRouter(
           ...(maxFee !== null && maxFee !== undefined ? { maxFeePpm: maxFee } : {}),
           ...(maxSats !== null && maxSats !== undefined ? { maxFeeSats: maxSats } : {}),
           ...(g ? { gate: { revenuePpm: g.revenuePpm as number, demandSats: g.demandSats as number, minNetSats: g.minNetSats as number } } : {}),
+          ...(planAt !== undefined ? { planAt: planAt as string } : {}),
         });
       } catch (err) {
+        if (err instanceof StalePlanError) {
+          // Nothing was sent: the row was planned before its target's last
+          // refill — the tab reloads its plan.
+          res.status(409).json({ error: "stale_plan", message: err.message, targetId: err.targetId, lastAt: err.lastAt, planAt: err.planAt });
+          return;
+        }
         if (err instanceof RebalanceBudgetError) {
           res.status(409).json({ error: "budget_exhausted", message: err.message, budget: err.budget });
           return;
@@ -721,21 +808,38 @@ export function createApiRouter(
       if (req.query.requireClearnet !== undefined) {
         overrides.requireClearnet = req.query.requireClearnet === "true";
       }
-      res.json(await getChannelSuggestionsV2(lnd, overrides, lnplus));
+      const report = await getChannelSuggestionsV2(lnd, overrides, lnplus);
+      // Which of them the channel autopilot never opens to (the operator's list).
+      const never = autopilot.neverOpenPeers();
+      res.json({ ...report, suggestions: report.suggestions.map((s) => ({ ...s, neverOpen: Object.prototype.hasOwnProperty.call(never, s.pubkey) })) });
     }),
   );
 
-  // Channels worth closing — demand/P&L/reach-aware, honest about freed capital.
+  // The operator's "never open automatically" list (the channel autopilot
+  // skips these peers; an open by hand is still possible). A preference, no
+  // node write.
+  router.post("/channels/never-open", (req, res) => {
+    const { pubkey, never, alias } = req.body ?? {};
+    if (!isPubkey(pubkey) || typeof never !== "boolean" || (alias !== undefined && (typeof alias !== "string" || alias.length > 100))) {
+      res.status(400).json({ error: "bad_request", message: "valid pubkey (66 hex), never (true/false) and optional alias required." });
+      return;
+    }
+    autopilot.setNeverOpen(pubkey, never, alias ?? "");
+    res.json({ ok: true, neverOpen: autopilot.neverOpenPeers() });
+  });
+
+  // Channels worth closing — demand/P&L/reach-aware, honest about freed
+  // capital — never one still opening or closing, or inside its lease, and
+  // never because its peer went away for a moment.
   router.get(
     "/suggestions/close",
     wrap(async (_req, res) => {
+      const leaseSources = await autopilot.leaseSourcesFresh();
       res.json(
-        await getCloseSuggestionsV2(
-          lnd,
-          rebalanceLog.successes(),
-          autopilot.feeV2Overrides(),
-          overrides.all(),
-        ),
+        await getCloseSuggestionsV2(lnd, rebalanceLog.successes(), autopilot.feeV2Overrides(), overrides.all(), {
+          leaseSources,
+          uptime: autopilot.uptime,
+        }),
       );
     }),
   );
@@ -746,13 +850,16 @@ export function createApiRouter(
   // (Pool and Swaps) that work differently from Magma — you trade channels for
   // channels or for credits, not for sats.
 
-  // Our own LN+ standing, and what the reputation cache is doing.
+  // Our own LN+ standing, and what the reputation cache is doing. (With LN+
+  // lookups switched off: what is cached, nothing asked.)
   router.get(
     "/lnplus/status",
     wrap(async (_req, res) => {
       const ownKey = await getOwnPubkey(lnd);
       const me = await lnplus.lookup(ownKey).catch(() => null);
       res.json({
+        enabled: lnplus.isEnabled(),
+        viaTor: viaTor("lnplus"),
         pubkey: ownKey,
         onLnPlus: !!me,
         me,
@@ -761,12 +868,20 @@ export function createApiRouter(
     }),
   );
 
+  /** 409 for an LN+ view while the operator has LN+ lookups switched off. */
+  const lnplusOff = (res: Response): boolean => {
+    if (lnplus.isEnabled()) return false;
+    res.status(409).json({ error: "lnplus_off", message: "LN+ lookups are switched off (Settings → Privacy)." });
+    return true;
+  };
+
   // Liquidity Pool participants: nodes that will open you a channel in exchange
   // for liquidity credits rather than sats. "minCredits" filters by how many
   // credits a node holds, which is what it can actually spend on a channel.
   router.get(
     "/lnplus/pool",
     wrap(async (req, res) => {
+      if (lnplusOff(res)) return;
       const minCredits = Number(req.query.minCredits);
       const nodes = await getPoolNodes({
         minCreditsSats: Number.isFinite(minCredits) && minCredits > 0 ? minCredits : undefined,
@@ -786,6 +901,7 @@ export function createApiRouter(
   router.get(
     "/lnplus/swaps",
     wrap(async (req, res) => {
+      if (lnplusOff(res)) return;
       const status = req.query.status === "opening" || req.query.status === "completed"
         ? (req.query.status as "opening" | "completed")
         : "pending";
@@ -821,6 +937,48 @@ export function createApiRouter(
     res.status(409).json({ error: "capital_promised", ...r });
   };
 
+  // What opening a channel of `size` would cost and leave (the Open form):
+  // the mempool's rates, what can be spent after the reserve and the coins
+  // promised to buyers, and what a sat in this node's month-old channels
+  // earns — so the form shows the open's cost, the balance left and its
+  // payback before anything is sent (review a3-channels:open-fee-gate-too-loose).
+  router.get(
+    "/channels/open-estimate",
+    wrap(async (req, res) => {
+      const size = intIn(req.query.size, MIN_CHANNEL_SATS, MAX_CHANNEL_SATS);
+      if (size === null) {
+        res.status(400).json({ error: "bad_request", message: `size (${MIN_CHANNEL_SATS}–${MAX_CHANNEL_SATS} sat) required.` });
+        return;
+      }
+      const reserveSat = autopilot.getState().config.channelReserveSats;
+      const [fees, sp, economics] = await Promise.all([
+        getFeeEstimates(lnd),
+        spendableOnchain(lnd, autopilot.capital, reserveSat).catch(() => null),
+        autopilot.openEconomics(),
+      ]);
+      res.json({
+        sizeSats: size,
+        fees,
+        spendableSat: sp?.spendableSat ?? null,
+        reserveSat: sp?.reserve.totalSat ?? null,
+        promisedSat: sp?.reservedSat ?? null,
+        yieldPpmYear: economics?.ppmYear ?? null,
+        // What that yield stands on (null: LND couldn't be read) — with too
+        // little routing behind it the form says so instead of a payback.
+        yieldEvidence: economics?.evidence ?? null,
+        minYieldForwards: MIN_YIELD_FORWARDS,
+        minYieldEarnedSat: MIN_YIELD_EARNED_SAT,
+        openVbytes: OPEN_TX_VBYTES,
+        closeVbytes: CLOSE_TX_VBYTES,
+        paybackMonths: OPEN_PAYBACK_MONTHS,
+        autopilotMaxFeeRate: autopilot.getState().config.channelMaxFeeRate,
+        // The routing fee the channel starts with (POST /channels/open sets
+        // it) — the form says so before the click.
+        initialRoutingFee: autopilot.initialRoutingFee(),
+      });
+    }),
+  );
+
   // Open a channel to a peer — real on-chain action, requires write access.
   router.post(
     "/channels/open",
@@ -849,12 +1007,17 @@ export function createApiRouter(
         res.status(400).json({ error: "bad_request", message: "spendPromised must be true or false." });
         return;
       }
+      // The routing fee it starts with: the one the fee engine protects a new
+      // channel at — not LND's default (stock: 1 sat + 1 ppm).
+      const routing = autopilot.initialRoutingFee();
       const params = {
         pubkey,
         socket: socket ? String(socket) : undefined,
         localTokens: amount,
         feeRate: fee ?? undefined,
         isPrivate: Boolean(isPrivate),
+        routingFeePpm: routing.feeRatePpm,
+        routingBaseFeeMsat: routing.baseFeeMsat,
       };
       // Coins promised to buyers are not the click's to spend (unless the
       // operator confirmed exactly that): a cheap look before the dial, so a
@@ -873,14 +1036,15 @@ export function createApiRouter(
         res.json({ ok: false, pubkey, localTokens: amount, error: connected.error });
         return;
       }
-      const done = await autopilot.capital.mutex.run("manual open", async (): Promise<{ refusal: PromisedSpendRefusal } | { opened: unknown }> => {
+      const done = await autopilot.capital.mutex.run("manual open", async (): Promise<{ refusal: PromisedSpendRefusal } | { opened: OpenChannelResult }> => {
         // Again, with the balance as it is now: an order may have been
         // accepted (or paid) while the peer was dialed.
         const refusal = spendPromised ? null : await promisedSpendRefusal(lnd, autopilot.capital, amount, { newChannel: true });
         return refusal ? { refusal } : { opened: await fundChannel(writeLnd, params) };
       });
       if ("refusal" in done) refusePromisedSpend(res, done.refusal);
-      else res.json(done.opened);
+      // An open also says the routing fee the channel starts with.
+      else res.json(done.opened.ok ? { ...done.opened, startingFee: routing } : done.opened);
     }),
   );
 
@@ -889,7 +1053,7 @@ export function createApiRouter(
     res.json(settings.get());
   });
   router.post("/settings", (req, res) => {
-    const { fiatCurrency, lspModeEnabled } = req.body ?? {};
+    const { fiatCurrency, lspModeEnabled, lnplusLookups, torRoute } = req.body ?? {};
     const patch: Parameters<typeof settings.set>[0] = {};
     if (fiatCurrency !== undefined) {
       if (!["off", "USD", "EUR", "GBP", "CHF"].includes(fiatCurrency)) {
@@ -897,6 +1061,20 @@ export function createApiRouter(
         return;
       }
       patch.fiatCurrency = fiatCurrency;
+    }
+    if (lnplusLookups !== undefined) {
+      if (typeof lnplusLookups !== "boolean") {
+        res.status(400).json({ error: "bad_request", message: "lnplusLookups must be true or false." });
+        return;
+      }
+      patch.lnplusLookups = lnplusLookups;
+    }
+    if (torRoute !== undefined) {
+      if (!["lookups", "all", "direct"].includes(torRoute)) {
+        res.status(400).json({ error: "bad_request", message: "torRoute must be lookups, all or direct." });
+        return;
+      }
+      patch.torRoute = torRoute;
     }
     if (lspModeEnabled !== undefined) {
       if (typeof lspModeEnabled !== "boolean") {
@@ -932,8 +1110,51 @@ export function createApiRouter(
       patch.lspClearnetAddress = value;
     }
     const next = settings.set(patch);
+    setOutboundRouting({ route: next.torRoute });
     lsps1.applySettings();
     res.json(next);
+  });
+
+  // Where LightningMate's own lookups go, and over which route — the
+  // Settings page's privacy card. The node is Tor-only; these lookups are the
+  // app's, from this server's internet connection unless Umbrel's Tor proxy
+  // carries them (review a3-channels:lnplus-clearnet-lookups).
+  router.get("/privacy", (_req, res) => {
+    const s = settings.get();
+    const proxy = outboundRouting().proxy;
+    res.json({
+      torProxy: proxy ? `${proxy.host}:${proxy.port}` : null,
+      torRoute: s.torRoute,
+      lnplusLookups: s.lnplusLookups,
+      destinations: [
+        {
+          service: "Amboss (api.amboss.space, magma.amboss.tech)",
+          // The public book (eligibility, buy offers) asks for this node's own
+          // seller score — by its public key — with or without a key.
+          what: "Magma market data, your own node's public seller score included (by its public key), with or without a key; with your key also your offers, orders and purchases — tied to your Amboss account",
+          active: true,
+          viaTor: viaTor("amboss"),
+        },
+        {
+          service: "lightningnetwork.plus",
+          what: "node reputations for peer picking, the Pool and Swaps views — your own node's public key included",
+          active: s.lnplusLookups,
+          viaTor: viaTor("lnplus"),
+        },
+        {
+          service: "mempool.space",
+          what: "the BTC price, only while a fiat currency is chosen",
+          active: s.fiatCurrency !== "off",
+          viaTor: viaTor("price"),
+        },
+        {
+          service: "the service-fee lightning address",
+          what: "an invoice for the 1 % fee after a completed sale",
+          active: true,
+          viaTor: viaTor("lnurl"),
+        },
+      ],
+    });
   });
 
   // LSP mode (LSPS1) — live status + the offer wallets currently see.

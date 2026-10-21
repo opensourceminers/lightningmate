@@ -1,3 +1,5 @@
+import { socksFetch, torProxyFromEnv, type SocksProxy } from "./torProxy.js";
+
 /**
  * The one way this app makes outbound HTTP requests (Amboss, LN+, mempool.space,
  * the service-fee LNURL server).
@@ -27,6 +29,46 @@ export const HTTP_TIMEOUTS = {
   lnurlMs: 15_000,
 };
 
+/** What an outbound request is for — what decides its route. */
+export type OutboundPurpose = "amboss" | "lnplus" | "price" | "lnurl";
+
+/**
+ * Which outbound requests go through the Tor proxy (when one is available):
+ *  - "lookups" (default): the third-party lookups that tie this server's IP
+ *    to the node — LN+ (its own pubkey included) and the BTC price;
+ *  - "all": Amboss (Magma market, offers, orders — tied to the Amboss
+ *    account anyway; slower over Tor) and the service-fee LNURL too;
+ *  - "direct": nothing (a lookup service that blocks Tor exits).
+ * Without a proxy every request goes direct, and the Settings page says so.
+ */
+export type TorRoute = "lookups" | "all" | "direct";
+
+export interface OutboundRouting {
+  /** Umbrel's Tor proxy (TOR_PROXY_IP / TOR_PROXY_PORT), or null. */
+  proxy: SocksProxy | null;
+  route: TorRoute;
+  /** Tests only: the CA a proxied TLS connection trusts. */
+  tlsCa?: string | Buffer;
+}
+
+let routing: OutboundRouting = { proxy: torProxyFromEnv(), route: "lookups" };
+
+/** Change the routing (the operator's setting, or a test's proxy). */
+export function setOutboundRouting(patch: Partial<OutboundRouting>): void {
+  routing = { ...routing, ...patch };
+}
+
+/** The routing in force (for the Settings page). */
+export function outboundRouting(): Readonly<OutboundRouting> {
+  return routing;
+}
+
+/** Whether a request for `purpose` goes through the Tor proxy right now. */
+export function viaTor(purpose: OutboundPurpose | undefined): boolean {
+  if (!routing.proxy || !purpose || routing.route === "direct") return false;
+  return routing.route === "all" || purpose === "lnplus" || purpose === "price";
+}
+
 export class HttpTimeoutError extends Error {
   constructor(
     readonly url: string,
@@ -51,7 +93,7 @@ export interface TimedResponse {
  * does not answer in time, and the returned body readers reject the same way
  * when the body stalls. Network errors are passed through unchanged.
  */
-export async function httpRequest(url: string, init: RequestInit, timeoutMs: number): Promise<TimedResponse> {
+export async function httpRequest(url: string, init: RequestInit, timeoutMs: number, purpose?: OutboundPurpose): Promise<TimedResponse> {
   const deadline = AbortSignal.timeout(timeoutMs);
   const signal = init.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
   // The signal also tells fetch to tear the connection down; the race makes the
@@ -75,6 +117,30 @@ export async function httpRequest(url: string, init: RequestInit, timeoutMs: num
         },
       );
     });
+  if (viaTor(purpose) && routing.proxy) {
+    // Through the Tor proxy, the same deadline over the whole exchange — and
+    // never a quiet fallback to a direct connection.
+    const proxied = await bounded(
+      socksFetch(
+        url,
+        {
+          method: init.method,
+          headers: init.headers as Record<string, string> | undefined,
+          body: typeof init.body === "string" ? init.body : undefined,
+        },
+        routing.proxy,
+        signal,
+        routing.tlsCa,
+      ),
+    );
+    return {
+      status: proxied.status,
+      ok: proxied.status >= 200 && proxied.status < 300,
+      headers: proxied.headers,
+      json: async <T>() => JSON.parse(proxied.body) as T,
+      text: async () => proxied.body,
+    };
+  }
   const res = await bounded(fetch(url, { ...init, signal }));
   return {
     status: res.status,
