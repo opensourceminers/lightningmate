@@ -1,3 +1,88 @@
+import type {
+  AlertAckRequest,
+  AlertAckResult,
+  AmbossKeyRequest,
+  AmbossKeyResult,
+  AmbossStatus,
+  ApplyRecommendedRequest,
+  ApplyRecommendedResponse,
+  AuthStatus,
+  AuthUnlockRequest,
+  AuthUnlockResult,
+  AutopilotConfigPatch,
+  AutopilotResumeResult,
+  AutopilotRunResult,
+  AutopilotState,
+  BoughtInboundResponse,
+  BuyCancelRequest,
+  BuyCancelResult,
+  BuyOffersResponse,
+  BuyPayRequest,
+  BuyPayResult,
+  BuyQuoteRequest,
+  BuyQuoteResponse,
+  ChannelCloseRequest,
+  ChannelOpenRequest,
+  ChannelView as ApiChannelView,
+  DaysQuery,
+  EligibilityQuery,
+  FeeApplyRequest,
+  FeeApplyResponse,
+  FeePreviewQuery,
+  ForwardsReportQuery,
+  HealthInfo,
+  LnDecodeRequest,
+  LnInvoiceRequest,
+  LnPayRequest,
+  LnPlusPoolQuery,
+  LnPlusPoolResponse,
+  LnPlusStatus,
+  LnPlusSwapsQuery,
+  LnPlusSwapsResponse,
+  LspOrdersResponse,
+  LspStatus,
+  MyOffersResponse,
+  MyOrder as ApiMyOrder,
+  MyOrdersView,
+  NeverOpenRequest,
+  NeverOpenResult,
+  OfferAutomationRequest,
+  OfferAutomationResult,
+  OfferCreateResult,
+  OfferTermsRequest,
+  OfferToggleRequest,
+  OfferToggleResult,
+  OfferUpdateRequest,
+  OfferUpdateResult,
+  OnchainSendRequest,
+  OnchainSendResult,
+  OnchainState as ApiOnchainState,
+  OpenChannelResult as ApiOpenChannelResult,
+  OpenEstimate,
+  OrderActionRequest,
+  OrderQuery,
+  OrderState as ApiOrderState,
+  OverrideRequest,
+  PayResult as ApiPayResult,
+  PeerConnectRequest,
+  PeerConnectResult,
+  PriceInfo,
+  PrivacyInfo,
+  PurchasePaymentHint,
+  PurchasesResponse,
+  RebalanceCostsResponse,
+  RebalanceExecRequest,
+  RebalanceLogResponse,
+  SendPreviewQuery,
+  SettingsPatch,
+  SignRequest,
+  SignResult,
+  SizeQuery,
+  SuggestionsQuery,
+  SuggestionsResponse,
+  TzQuery,
+  UnservedDemandReport,
+} from "../apiTypes.js";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { Router, type Request, type Response, type NextFunction } from "express";
@@ -16,7 +101,6 @@ import { labelCostChannels, rebalanceCosts } from "../services/rebalanceCosts.js
 import { getAlias } from "../services/aliases.js";
 import type { LnPlusStore } from "../services/lnplusStore.js";
 import { checkSwapEligibility, getPoolNodes, getSwaps, type NodeFacts } from "../services/lnplus.js";
-import { getMagmaRecommendations } from "../services/magmaRecommend.js";
 import { getAutopilotOutcomes } from "../services/outcomes.js";
 import { getPnl } from "../services/pnl.js";
 import { buildDashboard } from "../services/dashboard.js";
@@ -39,6 +123,7 @@ import {
   type SendCheckCode,
   type SendPreview,
   type SendRequest,
+  type SendResult,
 } from "../services/onchain.js";
 import { closeChannelByOutpoint, connectForOpen, fundChannel, MIN_CHANNEL_SATS, type OpenChannelResult } from "../services/channelOps.js";
 import { promisedSpendRefusal, spendableOnchain, type PromisedSpendRefusal } from "../services/capital.js";
@@ -47,9 +132,9 @@ import { MIN_YIELD_EARNED_SAT, MIN_YIELD_FORWARDS, OPEN_PAYBACK_MONTHS } from ".
 import { saleFeeConfig, type ServiceFeeLedger } from "../services/serviceFee.js";
 import { floorWindowStart, getFeeRecommendations } from "../services/feeRecommend.js";
 import { getBtcPrice } from "../services/price.js";
-import { outboundRouting, setOutboundRouting, viaTor } from "../services/http.js";
-import type { SettingsStore } from "../services/settings.js";
-import type { ChannelOverride, OverridesStore } from "../services/overrides.js";
+import { outboundRouting, setOutboundRouting, viaTor, type TorRoute } from "../services/http.js";
+import type { FiatCurrency, SettingsStore } from "../services/settings.js";
+import type { ChannelOverride, FeeMode, OverridesStore } from "../services/overrides.js";
 import { getAlerts, magmaRefusalAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
 import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
 import { SlidingWindowLimiter } from "../services/rateLimit.js";
@@ -79,11 +164,12 @@ import type { Lsps1Service } from "../services/lsps1.js";
 import { classifiedSince, getUnservedDemand, telemetryAgeDays } from "../services/htlcTelemetry.js";
 import { buildSellDiagnostics } from "../services/sellDiagnostics.js";
 
-// Pull the numeric keys of a policy object out of the query string.
-function numericOverrides<T>(query: Request["query"], keys: (keyof T)[]): Partial<T> {
+// Pull the numeric keys of a policy object out of the query string (read as
+// its contract type: queryOf).
+function numericOverrides<T>(query: Fields<T>, keys: (keyof T)[]): Partial<T> {
   const out: Partial<T> = {};
   for (const key of keys) {
-    const n = Number(query[key as string]);
+    const n = Number(query[key]);
     if (Number.isFinite(n)) out[key] = n as T[keyof T];
   }
   return out;
@@ -92,6 +178,57 @@ function numericOverrides<T>(query: Request["query"], keys: (keyof T)[]): Partia
 const WRITE_DISABLED_MSG =
   "Writing is disabled. Set LM_ENABLE_WRITE=true and provide a write macaroon " +
   "(LND_WRITE_MACAROON / LND_WRITE_MACAROON_PATH, or admin.macaroon on Umbrel).";
+
+// ── What a request carries, as the contract names it ─────────────────────────
+
+/** The mark a read carries of the contract type it was read as (Fields) —
+ *  declared only: nothing of it exists at run time. */
+declare const readAs: unique symbol;
+
+/**
+ * A request's fields as the contract type `T` names them (apiTypes.ts — what
+ * the web sends): each of T's keys, none of them promised, every value
+ * `unknown` until the route's own checks have vouched for it (anything can
+ * arrive over HTTP).
+ *
+ * The mark keeps a read what it was read as: it can't be handed on as — or
+ * joined with — the read of another contract type that has a key it lacks.
+ * So whatever reads a request (the route, or a parser it hands the read to)
+ * reads its route's own contract's keys only. Before, the on-chain send read
+ * its body as the preview's query and its own body at once (`Fields<
+ * SendPreviewQuery> & Fields<OnchainSendRequest>`): a key renamed in one of
+ * the two, the web changed to match, still compiled while the other kept the
+ * old name — and every send of an amount would have got a 400 (review of P8,
+ * run 2). A read may still go where fewer keys are read: an offer's update
+ * (id and terms) to the terms' parser. `key => void` makes that the rule — a
+ * read of A passes as one of B only when every key of B is one of A's.
+ */
+type Fields<T> = { [K in keyof T]?: unknown } & { readonly [readAs]?: (key: keyof T) => void };
+
+/**
+ * A request's body, read as the contract names it. A route reads its body
+ * only through this (web/test/apiContract.test.tsx holds it to that, and
+ * pairs the type with the one the web's request names): a key the route
+ * reads that the contract doesn't have fails to compile here, and the web
+ * builds the body from the same type — before, the routes destructured an
+ * untyped `req.body`, and a field renamed on one side passed every check
+ * (review of P8, final round).
+ */
+function bodyOf<T extends object>(req: Request): Fields<T> {
+  return (req.body ?? {}) as Fields<T>;
+}
+
+/** A query string's parameters the same way (the one the web sends as an
+ *  object: GET /onchain/send-preview). */
+function queryOf<T extends object>(req: Request): Fields<T> {
+  return req.query as Fields<T>;
+}
+
+/** An object inside a request (a refill's gate, a fee item) the same way —
+ *  no fields at all when it is no object. */
+function fieldsOf<T extends object>(value: unknown): Fields<T> {
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Fields<T>) : {};
+}
 
 // ── Input validation helpers (defense for fund-moving endpoints) ──────────────
 const isHex = (s: unknown, len: number): s is string =>
@@ -107,6 +244,14 @@ const isPayRequest = (s: unknown): s is string =>
 const isBtcAddress = (s: unknown): s is string =>
   typeof s === "string" &&
   (/^bc1[a-z0-9]{8,87}$/i.test(s.trim()) || /^[13][a-km-zA-HJ-NP-Z1-9]{20,40}$/.test(s.trim()));
+/** `value` is one of `options` (a string union's allowed values). */
+function isOneOf<T extends string>(value: unknown, options: readonly T[]): value is T {
+  return typeof value === "string" && (options as readonly string[]).includes(value);
+}
+const FIAT_CURRENCIES: readonly FiatCurrency[] = ["off", "USD", "EUR", "GBP", "CHF"];
+const TOR_ROUTES: readonly TorRoute[] = ["lookups", "all", "direct"];
+const FEE_MODES: readonly FeeMode[] = ["auto", "fixed", "exclude"];
+const isFeeMode = (v: unknown): v is FeeMode => isOneOf(v, FEE_MODES);
 /** Finite integer within [min, max], else null. */
 function intIn(v: unknown, min: number, max: number): number | null {
   const n = Number(v);
@@ -127,9 +272,9 @@ const MAX_ONCHAIN_SEND_SATS = 1_000_000_000; // 10 BTC per send
 const MAX_FEE_RATE = 2_000; // sat/vByte
 
 // Read optional fee-policy overrides from the query string.
-function parsePolicyQuery(query: Request["query"]): Partial<FeePolicy> {
+function parsePolicyQuery(query: Fields<FeePreviewQuery>): Partial<FeePolicy> {
   const out: Partial<FeePolicy> = {};
-  const keys: (keyof FeePolicy)[] = [
+  const keys: (keyof FeePreviewQuery)[] = [
     "minPpm",
     "maxPpm",
     "baseFeeMsat",
@@ -260,7 +405,7 @@ export function createApiRouter(
 
   // Whether a login is required, and whether this request is already signed in.
   router.get("/auth/status", (req, res) => {
-    res.json({ authRequired: authRequired(), unlocked: verifyToken(bearer(req)) });
+    res.json({ authRequired: authRequired(), unlocked: verifyToken(bearer(req)) } satisfies AuthStatus);
   });
 
   // Exchange the app password for a session token. Brute-force guarded by
@@ -273,13 +418,13 @@ export function createApiRouter(
       res.status(429).json({ error: "rate_limited", message: "Too many attempts; wait a minute." });
       return;
     }
-    if (!verifyPassword(req.body?.password)) {
+    if (!verifyPassword(bodyOf<AuthUnlockRequest>(req).password)) {
       unlockFailures.hit(key);
       res.status(401).json({ error: "bad_password", message: "Wrong password." });
       return;
     }
     unlockFailures.reset(key);
-    res.json({ token: issueToken() });
+    res.json({ token: issueToken() } satisfies AuthUnlockResult);
   });
 
   router.get("/health", (_req, res) => {
@@ -290,7 +435,7 @@ export function createApiRouter(
       // Umbrel hands the app its LND through APP_LIGHTNING_NODE_IP (config.ts):
       // the UI's words for "LND unreachable" differ (no .env to check there).
       platform: process.env.APP_LIGHTNING_NODE_IP?.trim() ? "umbrel" : "standalone",
-    });
+    } satisfies HealthInfo);
   });
 
   // Umbrel home-screen widget (four-stats). Polled by umbreld; cached briefly so
@@ -356,7 +501,7 @@ export function createApiRouter(
             baseFeeMsat: r ? Number(r.base_fee_mtokens) : null,
             lease: leases.get(c.id) ?? null,
             offline: autopilot.uptime.offlineInfo(c, nowMs),
-          };
+          } satisfies ApiChannelView;
         }),
       );
     }),
@@ -365,7 +510,7 @@ export function createApiRouter(
   router.get(
     "/flows",
     wrap(async (req, res) => {
-      const days = Number(req.query.days ?? config.flowWindowDays);
+      const days = Number(queryOf<DaysQuery>(req).days ?? config.flowWindowDays);
       const windowDays = Number.isFinite(days) && days > 0 ? days : config.flowWindowDays;
       res.json(await getFlowSummary(lnd, windowDays));
     }),
@@ -376,9 +521,10 @@ export function createApiRouter(
   router.get(
     "/forwards/report",
     wrap(async (req, res) => {
-      const days = Number(req.query.days ?? 30);
+      const q = queryOf<ForwardsReportQuery>(req);
+      const days = Number(q.days ?? 30);
       const windowDays = Math.min(90, Math.max(1, Number.isFinite(days) ? days : 30));
-      res.json(await getForwardsReport(lnd, windowDays, { tzOffsetMin: parseTzOffset(req.query.tz) }));
+      res.json(await getForwardsReport(lnd, windowDays, { tzOffsetMin: parseTzOffset(q.tz) }));
     }),
   );
 
@@ -386,7 +532,7 @@ export function createApiRouter(
   router.get(
     "/fees/preview",
     wrap(async (req, res) => {
-      res.json(await getFeePreview(lnd, parsePolicyQuery(req.query), overrides.all()));
+      res.json(await getFeePreview(lnd, parsePolicyQuery(queryOf<FeePreviewQuery>(req)), overrides.all()));
     }),
   );
 
@@ -449,8 +595,8 @@ export function createApiRouter(
     res.json(overrides.all());
   });
   router.post("/overrides", (req, res) => {
-    const { channelId, mode, fixedPpm } = req.body ?? {};
-    if (!isChannelId(channelId) || !["auto", "fixed", "exclude"].includes(mode)) {
+    const { channelId, mode, fixedPpm } = bodyOf<OverrideRequest>(req);
+    if (!isChannelId(channelId) || !isFeeMode(mode)) {
       res.status(400).json({ error: "bad_request", message: "valid channelId and mode (auto/fixed/exclude) required." });
       return;
     }
@@ -479,7 +625,8 @@ export function createApiRouter(
 
   // Operator has read an acknowledgeable alert ("state:<id>" / "fee:<key>").
   router.post("/alerts/ack", (req, res) => {
-    const id = typeof req.body?.id === "string" ? req.body.id : "";
+    const { id: given } = bodyOf<AlertAckRequest>(req);
+    const id = typeof given === "string" ? given : "";
     const ok = id.startsWith("state:")
       ? acknowledgeStoreIncident(config.dataDir, id.slice("state:".length))
       : id.startsWith("fee:")
@@ -491,7 +638,7 @@ export function createApiRouter(
       res.status(404).json({ error: "not_found", message: "No such alert." });
       return;
     }
-    res.json({ ok: true });
+    res.json({ ok: true } satisfies AlertAckResult);
   });
 
   // The service-fee ledger, for transparency: what was owed, paid or refused.
@@ -514,7 +661,7 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { transactionId, transactionVout, isForce, feeRate, breakLease } = req.body ?? {};
+      const { transactionId, transactionVout, isForce, feeRate, breakLease } = bodyOf<ChannelCloseRequest>(req);
       const vout = intIn(transactionVout, 0, 1_000_000);
       if (!isTxid(transactionId) || vout === null) {
         res.status(400).json({ error: "bad_request", message: "valid transactionId (64 hex) and transactionVout required." });
@@ -561,13 +708,13 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { pubkey, socket } = req.body ?? {};
+      const { pubkey, socket } = bodyOf<PeerConnectRequest>(req);
       if (!isPubkey(pubkey) || (socket !== undefined && (typeof socket !== "string" || socket.length > 256))) {
         res.status(400).json({ error: "bad_request", message: "valid pubkey (66 hex) and optional socket required." });
         return;
       }
       const done = await connectForOpen(writeLnd, { pubkey, socket: socket || undefined });
-      res.json(done.ok ? { ok: true } : { ok: false, error: done.error });
+      res.json((done.ok ? { ok: true } : { ok: false, error: done.error }) satisfies PeerConnectResult);
     }),
   );
 
@@ -587,17 +734,19 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const raw = Array.isArray(req.body?.items) ? req.body.items : [];
+      const { items: given } = bodyOf<FeeApplyRequest>(req);
+      const raw: unknown[] = Array.isArray(given) ? given : [];
       if (raw.length === 0 || raw.length > 500) {
         res.status(400).json({ error: "bad_request", message: "1–500 fee items required." });
         return;
       }
       const items: FeeApplyItem[] = [];
-      for (const it of raw) {
-        const vout = intIn(it?.transactionVout, 0, 1_000_000);
-        const feeRatePpm = intIn(it?.feeRatePpm, 0, MAX_FEE_PPM);
-        const baseFeeMsat = intIn(it?.baseFeeMsat, 0, MAX_BASE_MSAT);
-        if (typeof it?.id !== "string" || !isTxid(it?.transactionId) || vout === null || feeRatePpm === null || baseFeeMsat === null) {
+      for (const entry of raw) {
+        const it = fieldsOf<FeeApplyItem>(entry);
+        const vout = intIn(it.transactionVout, 0, 1_000_000);
+        const feeRatePpm = intIn(it.feeRatePpm, 0, MAX_FEE_PPM);
+        const baseFeeMsat = intIn(it.baseFeeMsat, 0, MAX_BASE_MSAT);
+        if (typeof it.id !== "string" || !isTxid(it.transactionId) || vout === null || feeRatePpm === null || baseFeeMsat === null) {
           res.status(400).json({ error: "bad_request", message: "invalid fee item." });
           return;
         }
@@ -622,7 +771,7 @@ export function createApiRouter(
         res.status(409).json({ error: "busy", message: "The autopilot is running right now — try again in a moment." });
         return;
       }
-      res.json({ results: done.results });
+      res.json({ results: done.results } satisfies FeeApplyResponse);
     }),
   );
 
@@ -636,7 +785,7 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const raw = req.body?.channelIds;
+      const { channelIds: raw } = bodyOf<ApplyRecommendedRequest>(req);
       if (raw !== undefined && (!Array.isArray(raw) || raw.length > 500 || !raw.every((id: unknown) => isChannelId(id)))) {
         res.status(400).json({ error: "bad_request", message: "channelIds must be a list of channel ids (at most 500)." });
         return;
@@ -646,7 +795,7 @@ export function createApiRouter(
         res.status(409).json({ error: "busy", message: "The autopilot is running right now — try again in a moment." });
         return;
       }
-      res.json({ changes });
+      res.json({ changes } satisfies ApplyRecommendedResponse);
     }),
   );
 
@@ -657,7 +806,7 @@ export function createApiRouter(
   // own" were untrue with it on). It runs only with write access.
   const lspModeOn = (): boolean => settings.get().lspModeEnabled && !!writeLnd;
   /** The autopilot's state as the pages get it. */
-  const autopilotView = () => ({ ...autopilot.getState(), lspModeOn: lspModeOn() });
+  const autopilotView = (): AutopilotState => ({ ...autopilot.getState(), lspModeOn: lspModeOn() });
 
   // Autopilot status/config.
   router.get("/autopilot", (_req, res) => {
@@ -669,7 +818,7 @@ export function createApiRouter(
   // with a message naming it, and nothing is saved.
   router.post("/autopilot", (req, res) => {
     try {
-      autopilot.setConfig(req.body);
+      autopilot.setConfig(bodyOf<AutopilotConfigPatch>(req));
     } catch (err) {
       if (err instanceof ConfigValidationError) {
         res.status(400).json({ error: "invalid_config", message: err.message, errors: err.errors });
@@ -742,7 +891,7 @@ export function createApiRouter(
   });
   router.post("/autopilot/resume", (_req, res) => {
     const { resumed, sellingWasOn } = autopilot.resumeAll();
-    res.json({ resumed, sellingWasOn, state: autopilotView() });
+    res.json({ resumed, sellingWasOn, state: autopilotView() } satisfies AutopilotResumeResult);
   });
 
   // Trigger one autopilot run immediately.
@@ -766,7 +915,7 @@ export function createApiRouter(
         });
         return;
       }
-      res.json({ run, state: autopilotView() });
+      res.json({ run, state: autopilotView() } satisfies AutopilotRunResult);
     }),
   );
 
@@ -790,7 +939,7 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { targetId, sourceId, amountSats, econRatio, maxFeePpm, maxFeeSats, gate, planAt } = req.body ?? {};
+      const { targetId, sourceId, amountSats, econRatio, maxFeePpm, maxFeeSats, gate, planAt, routeCostPpm } = bodyOf<RebalanceExecRequest>(req);
       const amount = intIn(amountSats, 1000, MAX_REBALANCE_SATS);
       // When the plan the row came from was made (the tab sends its
       // generatedAt): a target refilled since is refused as stale.
@@ -798,15 +947,18 @@ export function createApiRouter(
       const ratio = econRatio === undefined ? 0.8 : numIn(econRatio, 0.05, 1);
       const maxFee = maxFeePpm === undefined ? undefined : intIn(maxFeePpm, 1, MAX_FEE_PPM);
       const maxSats = maxFeeSats === undefined ? undefined : intIn(maxFeeSats, 1, MAX_REBALANCE_SATS);
+      // The plan's route cost for the row's size (a recommended row sends it).
+      const routeCost = routeCostPpm === undefined ? undefined : intIn(routeCostPpm, 0, MAX_FEE_PPM);
       // The profit gate's earnings side (a recommended row sends it): each
       // size it tries may pay at most what it earns above the minimum.
+      const gateFields = fieldsOf<NonNullable<RebalanceExecRequest["gate"]>>(gate);
       const g =
         gate === undefined
           ? undefined
           : {
-              revenuePpm: intIn(gate?.revenuePpm, 1, MAX_FEE_PPM),
-              demandSats: intIn(gate?.demandSats, 0, MAX_REBALANCE_SATS * 1000),
-              minNetSats: intIn(gate?.minNetSats, 0, MAX_REBALANCE_SATS),
+              revenuePpm: intIn(gateFields.revenuePpm, 1, MAX_FEE_PPM),
+              demandSats: intIn(gateFields.demandSats, 0, MAX_REBALANCE_SATS * 1000),
+              minNetSats: intIn(gateFields.minNetSats, 0, MAX_REBALANCE_SATS),
             };
       if (
         !isChannelId(targetId) ||
@@ -815,13 +967,14 @@ export function createApiRouter(
         ratio === null ||
         (maxFeePpm !== undefined && maxFee === null) ||
         (maxFeeSats !== undefined && maxSats === null) ||
+        (routeCostPpm !== undefined && routeCost === null) ||
         (g !== undefined && (g.revenuePpm === null || g.demandSats === null || g.minNetSats === null)) ||
         !planOk
       ) {
         res.status(400).json({
           error: "bad_request",
           message:
-            "valid targetId/sourceId, amountSats (1k–1 BTC), econRatio (0.05–1) and optional maxFeePpm, maxFeeSats (the most the refill may pay, sat), gate {revenuePpm, demandSats, minNetSats} and planAt (when the plan was made, ISO time) required.",
+            "valid targetId/sourceId, amountSats (1k–1 BTC), econRatio (0.05–1) and optional maxFeePpm, maxFeeSats (the most the refill may pay, sat), gate {revenuePpm, demandSats, minNetSats}, routeCostPpm (the plan's route cost) and planAt (when the plan was made, ISO time) required.",
         });
         return;
       }
@@ -841,6 +994,7 @@ export function createApiRouter(
           ...(maxFee !== null && maxFee !== undefined ? { maxFeePpm: maxFee } : {}),
           ...(maxSats !== null && maxSats !== undefined ? { maxFeeSats: maxSats } : {}),
           ...(g ? { gate: { revenuePpm: g.revenuePpm as number, demandSats: g.demandSats as number, minNetSats: g.minNetSats as number } } : {}),
+          ...(routeCost !== null && routeCost !== undefined ? { routeCostPpm: routeCost } : {}),
           ...(planAt !== undefined ? { planAt: planAt as string } : {}),
         });
       } catch (err) {
@@ -876,7 +1030,7 @@ export function createApiRouter(
   // Rebalance accounting log + totals over a stated window (the Rebalance
   // tab's "N done · X sat fees" covered an unlabelled 200 attempts).
   router.get("/rebalance/log", (_req, res) => {
-    res.json({ summary: rebalanceLog.summary(30), records: rebalanceLog.recent(), trackedSince: rebalanceLog.trackedSince() });
+    res.json({ summary: rebalanceLog.summary(30), records: rebalanceLog.recent(), trackedSince: rebalanceLog.trackedSince() } satisfies RebalanceLogResponse);
   });
 
   // What rebalancing cost over a window, per refilled channel — from LND's
@@ -885,7 +1039,7 @@ export function createApiRouter(
   router.get(
     "/rebalance/costs",
     wrap(async (req, res) => {
-      const days = intIn(req.query.days ?? 30, 1, 36_500);
+      const days = intIn(queryOf<DaysQuery>(req).days ?? 30, 1, 36_500);
       if (days === null) {
         res.status(400).json({ error: "bad_request", message: "days must be 1–36500." });
         return;
@@ -905,7 +1059,7 @@ export function createApiRouter(
         const peer = peerOfClosed.get(c.channelId);
         if (c.channelId && !logged.has(c.channelId) && peer) logged.set(c.channelId, await getAlias(lnd, peer));
       }
-      res.json({ windowDays: days, ...costs, perChannel: labelCostChannels(costs.perChannel, channels, (id) => logged.get(id)) });
+      res.json({ windowDays: days, ...costs, perChannel: labelCostChannels(costs.perChannel, channels, (id) => logged.get(id)) } satisfies RebalanceCostsResponse);
     }),
   );
 
@@ -932,7 +1086,7 @@ export function createApiRouter(
   router.get(
     "/pnl",
     wrap(async (req, res) => {
-      const days = Number(req.query.days ?? config.flowWindowDays);
+      const days = Number(queryOf<DaysQuery>(req).days ?? config.flowWindowDays);
       const windowDays = Number.isFinite(days) && days > 0 ? days : config.flowWindowDays;
       res.json(await getPnl(lnd, { rebalanceLog, earnings, serviceFees, purchases: autopilot.purchases, closeTxs: autopilot.closeTxs }, windowDays));
     }),
@@ -955,7 +1109,7 @@ export function createApiRouter(
   router.get(
     "/analytics/bought-inbound",
     wrap(async (req, res) => {
-      const windowDays = intIn(req.query.days ?? 30, 1, 36_500);
+      const windowDays = intIn(queryOf<DaysQuery>(req).days ?? 30, 1, 36_500);
       if (windowDays === null) {
         res.status(400).json({ error: "bad_request", message: "days must be 1–36500." });
         return;
@@ -965,7 +1119,7 @@ export function createApiRouter(
       const amortizedSats = amortizedPurchaseCost(autopilot.purchases.paidCosts(), windowDays, nowMs);
       const purchases = autopilot.purchases.list().filter((p) => p.state === "channel_open" && p.paidAt);
       if (purchases.length === 0) {
-        res.json({ method: BOUGHT_INBOUND_METHOD, windowDays, amortizedSats, items: [] });
+        res.json({ method: BOUGHT_INBOUND_METHOD, windowDays, amortizedSats, items: [] } satisfies BoughtInboundResponse);
         return;
       }
       const oldest = Math.min(...purchases.map((p) => Date.parse(p.paidAt as string)).filter((t) => Number.isFinite(t)));
@@ -987,7 +1141,7 @@ export function createApiRouter(
         // Whether the read got every forward: a read cut short misses the newest.
         forwardsComplete: forwards.complete,
         items: boughtInboundRoi(purchases, channelOf, forwards.events, nowMs, { fromMs: nowMs - days * 86_400_000, complete: forwards.complete }),
-      });
+      } satisfies BoughtInboundResponse);
     }),
   );
 
@@ -998,7 +1152,7 @@ export function createApiRouter(
     wrap(async (req, res) => {
       const nowMs = Date.now();
       const [report, ln, onchain, channels, leaseBenchmark, ownPubkey, closed] = await Promise.all([
-        getForwardsReport(lnd, 30, { tzOffsetMin: parseTzOffset(req.query.tz), nowMs }),
+        getForwardsReport(lnd, 30, { tzOffsetMin: parseTzOffset(queryOf<TzQuery>(req).tz), nowMs }),
         getLnActivity(lnd, 10),
         getOnchainTxs(lnd, 10),
         getChannelsView(lnd),
@@ -1066,20 +1220,24 @@ export function createApiRouter(
   router.get(
     "/suggestions",
     wrap(async (req, res) => {
-      const overrides: Partial<SuggestionPolicy> = numericOverrides<SuggestionPolicy>(req.query, [
+      const q = queryOf<SuggestionsQuery>(req);
+      const overrides: Partial<SuggestionPolicy> = numericOverrides(q, [
         "count",
         "minChannels",
         "maxStaleDays",
         "minSizeSats",
         "maxSizeSats",
       ]);
-      if (req.query.requireClearnet !== undefined) {
-        overrides.requireClearnet = req.query.requireClearnet === "true";
+      if (q.requireClearnet !== undefined) {
+        overrides.requireClearnet = q.requireClearnet === "true";
       }
       const report = await getChannelSuggestionsV2(lnd, overrides, lnplus);
       // Which of them the channel autopilot never opens to (the operator's list).
       const never = autopilot.neverOpenPeers();
-      res.json({ ...report, suggestions: report.suggestions.map((s) => ({ ...s, neverOpen: Object.prototype.hasOwnProperty.call(never, s.pubkey) })) });
+      res.json({
+        ...report,
+        suggestions: report.suggestions.map((s) => ({ ...s, neverOpen: Object.prototype.hasOwnProperty.call(never, s.pubkey) })),
+      } satisfies SuggestionsResponse);
     }),
   );
 
@@ -1087,13 +1245,13 @@ export function createApiRouter(
   // skips these peers; an open by hand is still possible). A preference, no
   // node write.
   router.post("/channels/never-open", (req, res) => {
-    const { pubkey, never, alias } = req.body ?? {};
+    const { pubkey, never, alias } = bodyOf<NeverOpenRequest>(req);
     if (!isPubkey(pubkey) || typeof never !== "boolean" || (alias !== undefined && (typeof alias !== "string" || alias.length > 100))) {
       res.status(400).json({ error: "bad_request", message: "valid pubkey (66 hex), never (true/false) and optional alias required." });
       return;
     }
     autopilot.setNeverOpen(pubkey, never, alias ?? "");
-    res.json({ ok: true, neverOpen: autopilot.neverOpenPeers() });
+    res.json({ ok: true, neverOpen: autopilot.neverOpenPeers() } satisfies NeverOpenResult);
   });
 
   // Channels worth closing — demand/P&L/reach-aware, honest about freed
@@ -1135,7 +1293,7 @@ export function createApiRouter(
         onLnPlus: !!me,
         me,
         cache: lnplus.stats(),
-      });
+      } satisfies LnPlusStatus);
     }),
   );
 
@@ -1153,7 +1311,7 @@ export function createApiRouter(
     "/lnplus/pool",
     wrap(async (req, res) => {
       if (lnplusOff(res)) return;
-      const minCredits = Number(req.query.minCredits);
+      const minCredits = Number(queryOf<LnPlusPoolQuery>(req).minCredits);
       const nodes = await getPoolNodes({
         minCreditsSats: Number.isFinite(minCredits) && minCredits > 0 ? minCredits : undefined,
         limit: 50,
@@ -1162,7 +1320,7 @@ export function createApiRouter(
       const peers = new Set((await getChannelsView(lnd)).map((c) => c.peerPubkey));
       res.json({
         nodes: nodes.map((n) => ({ ...n, alreadyPeered: peers.has(n.pubkey) })),
-      });
+      } satisfies LnPlusPoolResponse);
     }),
   );
 
@@ -1173,9 +1331,8 @@ export function createApiRouter(
     "/lnplus/swaps",
     wrap(async (req, res) => {
       if (lnplusOff(res)) return;
-      const status = req.query.status === "opening" || req.query.status === "completed"
-        ? (req.query.status as "opening" | "completed")
-        : "pending";
+      const { status: asked } = queryOf<LnPlusSwapsQuery>(req);
+      const status = asked === "opening" || asked === "completed" ? asked : "pending";
       const [swaps, channels, info, ownKey] = await Promise.all([
         getSwaps({ status, limit: 50 }),
         getChannelsView(lnd),
@@ -1197,7 +1354,7 @@ export function createApiRouter(
         swaps: swaps
           .filter((s) => !s.isPrivate)
           .map((s) => ({ ...s, eligibility: checkSwapEligibility(s, facts) })),
-      });
+      } satisfies LnPlusSwapsResponse);
     }),
   );
 
@@ -1216,7 +1373,7 @@ export function createApiRouter(
   router.get(
     "/channels/open-estimate",
     wrap(async (req, res) => {
-      const size = intIn(req.query.size, MIN_CHANNEL_SATS, MAX_CHANNEL_SATS);
+      const size = intIn(queryOf<SizeQuery>(req).size, MIN_CHANNEL_SATS, MAX_CHANNEL_SATS);
       if (size === null) {
         res.status(400).json({ error: "bad_request", message: `size (${MIN_CHANNEL_SATS}–${MAX_CHANNEL_SATS} sat) required.` });
         return;
@@ -1246,7 +1403,7 @@ export function createApiRouter(
         // The routing fee the channel starts with (POST /channels/open sets
         // it) — the form says so before the click.
         initialRoutingFee: autopilot.initialRoutingFee(),
-      });
+      } satisfies OpenEstimate);
     }),
   );
 
@@ -1258,7 +1415,7 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { pubkey, socket, localTokens, feeRate, isPrivate } = req.body ?? {};
+      const { pubkey, socket, localTokens, feeRate, isPrivate, spendPromised } = bodyOf<ChannelOpenRequest>(req);
       const amount = intIn(localTokens, 20_000, MAX_CHANNEL_SATS);
       if (!isPubkey(pubkey) || amount === null) {
         res.status(400).json({ error: "bad_request", message: "valid pubkey (66 hex) and localTokens (20k–10 BTC) required." });
@@ -1273,7 +1430,6 @@ export function createApiRouter(
         res.status(400).json({ error: "bad_request", message: "feeRate out of range (1–10000 sat/vByte)." });
         return;
       }
-      const spendPromised = req.body?.spendPromised;
       if (spendPromised !== undefined && typeof spendPromised !== "boolean") {
         res.status(400).json({ error: "bad_request", message: "spendPromised must be true or false." });
         return;
@@ -1304,7 +1460,7 @@ export function createApiRouter(
       // the balance while this open is spending it.
       const connected = await connectForOpen(writeLnd, params);
       if (!connected.ok) {
-        res.json({ ok: false, pubkey, localTokens: amount, error: connected.error });
+        res.json({ ok: false, pubkey, localTokens: amount, error: connected.error } satisfies ApiOpenChannelResult);
         return;
       }
       const done = await autopilot.capital.mutex.run("manual open", async (): Promise<{ refusal: PromisedSpendRefusal } | { opened: OpenChannelResult }> => {
@@ -1315,7 +1471,7 @@ export function createApiRouter(
       });
       if ("refusal" in done) refusePromisedSpend(res, done.refusal);
       // An open also says the routing fee the channel starts with.
-      else res.json(done.opened.ok ? { ...done.opened, startingFee: routing } : done.opened);
+      else res.json((done.opened.ok ? { ...done.opened, startingFee: routing } : done.opened) satisfies ApiOpenChannelResult);
     }),
   );
 
@@ -1324,10 +1480,10 @@ export function createApiRouter(
     res.json(settings.get());
   });
   router.post("/settings", (req, res) => {
-    const { fiatCurrency, lspModeEnabled, lnplusLookups, torRoute } = req.body ?? {};
+    const { fiatCurrency, lspModeEnabled, lnplusLookups, torRoute, lspClearnetAddress } = bodyOf<SettingsPatch>(req);
     const patch: Parameters<typeof settings.set>[0] = {};
     if (fiatCurrency !== undefined) {
-      if (!["off", "USD", "EUR", "GBP", "CHF"].includes(fiatCurrency)) {
+      if (!isOneOf(fiatCurrency, FIAT_CURRENCIES)) {
         res.status(400).json({ error: "bad_request", message: "invalid fiatCurrency" });
         return;
       }
@@ -1341,7 +1497,7 @@ export function createApiRouter(
       patch.lnplusLookups = lnplusLookups;
     }
     if (torRoute !== undefined) {
-      if (!["lookups", "all", "direct"].includes(torRoute)) {
+      if (!isOneOf(torRoute, TOR_ROUTES)) {
         res.status(400).json({ error: "bad_request", message: "torRoute must be lookups, all or direct." });
         return;
       }
@@ -1358,7 +1514,6 @@ export function createApiRouter(
       }
       patch.lspModeEnabled = lspModeEnabled;
     }
-    const { lspClearnetAddress } = req.body ?? {};
     if (lspClearnetAddress !== undefined) {
       // host:port (IPv4 or domain), or "" to withdraw. Tor is announced by LND
       // itself — .onion doesn't belong here.
@@ -1433,7 +1588,7 @@ export function createApiRouter(
           viaTor: viaTor("lnurl"),
         },
       ],
-    });
+    } satisfies PrivacyInfo);
   });
 
   // LSP mode (LSPS1) — live status + the offer wallets currently see.
@@ -1441,13 +1596,13 @@ export function createApiRouter(
     "/lsp/status",
     wrap(async (_req, res) => {
       const [status, info] = await Promise.all([lsps1.status(), getWalletInfo({ lnd })]);
-      res.json({ ...status, pubkey: info.public_key, uris: info.uris ?? [] });
+      res.json({ ...status, pubkey: info.public_key, uris: info.uris ?? [] } satisfies LspStatus);
     }),
   );
 
   // LSPS1 orders for the Market → Orders tab (never exposes invoice secrets).
   router.get("/lsp/orders", (_req, res) => {
-    res.json({ orders: lsps1.orderViews() });
+    res.json({ orders: lsps1.orderViews() } satisfies LspOrdersResponse);
   });
 
   // Unserved demand — forwards we refused for lack of outbound liquidity,
@@ -1459,7 +1614,7 @@ export function createApiRouter(
   router.get(
     "/htlc/demand",
     wrap(async (req, res) => {
-      const days = intIn(req.query.days, 1, 30) ?? 7;
+      const days = intIn(queryOf<DaysQuery>(req).days, 1, 30) ?? 7;
       const demand = getUnservedDemand(days);
       // Join peer aliases (and current fees) so the UI can name the channels.
       const [channels, rates] = demand.length
@@ -1476,7 +1631,7 @@ export function createApiRouter(
           alias: alias.get(d.outChannel) ?? d.outChannel,
           missedFeesSats: Math.round((d.demandSats * (ppm.get(d.outChannel) ?? 0)) / 1_000_000),
         })),
-      });
+      } satisfies UnservedDemandReport);
     }),
   );
 
@@ -1485,7 +1640,7 @@ export function createApiRouter(
     "/price",
     wrap(async (_req, res) => {
       const currency = settings.get().fiatCurrency;
-      res.json({ currency, btcPrice: await getBtcPrice(currency) });
+      res.json({ currency, btcPrice: await getBtcPrice(currency) } satisfies PriceInfo);
     }),
   );
 
@@ -1503,7 +1658,7 @@ export function createApiRouter(
   router.post(
     "/ln/decode",
     wrap(async (req, res) => {
-      const { request } = req.body ?? {};
+      const { request } = bodyOf<LnDecodeRequest>(req);
       if (!isPayRequest(request)) {
         res.status(400).json({ error: "bad_request", message: "valid BOLT11 request required." });
         return;
@@ -1520,7 +1675,7 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { tokens, description, expirySec } = req.body ?? {};
+      const { tokens, description, expirySec } = bodyOf<LnInvoiceRequest>(req);
       const amount = intIn(tokens ?? 0, 0, MAX_RECEIVE_SATS);
       const expiry = intIn(expirySec ?? 3600, 60, 31_536_000);
       if (amount === null || expiry === null) {
@@ -1549,7 +1704,7 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { request, maxFeeSats, tokens } = req.body ?? {};
+      const { request, maxFeeSats, tokens } = bodyOf<LnPayRequest>(req);
       const maxFee = intIn(maxFeeSats ?? 0, 0, MAX_PAY_FEE_SATS);
       const amount = tokens === undefined ? undefined : intIn(tokens, 1, MAX_RECEIVE_SATS);
       if (!isPayRequest(request) || maxFee === null || (tokens !== undefined && amount === null)) {
@@ -1560,7 +1715,7 @@ export function createApiRouter(
         res.json(await payRequest(writeLnd, { request: request.trim(), maxFeeSats: maxFee, tokens: amount ?? undefined }));
       } catch (err) {
         // A failed payment (no route, rejected, …) is a normal result, not a 502.
-        res.json({ ok: false, id: "", tokens: 0, feeSats: 0, secret: "", error: describeError(err) });
+        res.json({ ok: false, id: "", tokens: 0, feeSats: 0, secret: "", error: describeError(err) } satisfies ApiPayResult);
       }
     }),
   );
@@ -1577,7 +1732,7 @@ export function createApiRouter(
         getOnchainState(lnd),
         sendBudget(lnd, autopilot.capital, autopilot.onchainReserveSetting()).catch(() => null),
       ]);
-      res.json({ ...state, budget });
+      res.json({ ...state, budget } satisfies ApiOnchainState);
     }),
   );
 
@@ -1601,20 +1756,26 @@ export function createApiRouter(
     }),
   );
 
-  /** An on-chain send as asked (the preview's query or the send's body):
-   *  an address, a fee rate, and one of an amount, `max` or `all` (sweep).
-   *  Null after a 400 naming what is wrong. */
-  const parseSend = (input: Record<string, unknown>, res: Response): SendRequest | null => {
+  /** An on-chain send as asked, in the parser's own words. Each route fills
+   *  it from its own contract type's keys, one by one (the preview's `all` is
+   *  the send's `sendAll`; the send has no `max`): neither route's request is
+   *  read as the other's (see Fields). */
+  type SendAsk = { address: unknown; feeRate: unknown; tokens: unknown; max: unknown; sendAll: unknown };
+
+  /** An on-chain send as asked: an address, a fee rate, and exactly one of an
+   *  amount, `max` or a sweep — `modes` names them as the route does, for the
+   *  400. Null after a 400 naming what is wrong. */
+  const parseSend = (input: SendAsk, modes: string, res: Response): SendRequest | null => {
     const flag = (v: unknown): boolean | null => (v === undefined ? false : v === true || v === "1" || v === "true" ? true : v === false || v === "0" || v === "false" ? false : null);
     const max = flag(input.max);
-    const sendAll = flag(input.all ?? input.sendAll);
+    const sendAll = flag(input.sendAll);
     const rate = intIn(input.feeRate, 1, MAX_FEE_RATE);
     const amount = input.tokens === undefined || input.tokens === "" ? undefined : intIn(input.tokens, MIN_SEND_SATS, MAX_ONCHAIN_SEND_SATS);
-    const modes = [amount !== undefined, max === true, sendAll === true].filter(Boolean).length;
-    if (!isBtcAddress(input.address) || rate === null || amount === null || max === null || sendAll === null || modes !== 1) {
+    const given = [amount !== undefined, max === true, sendAll === true].filter(Boolean).length;
+    if (!isBtcAddress(input.address) || rate === null || amount === null || max === null || sendAll === null || given !== 1) {
       res.status(400).json({
         error: "bad_request",
-        message: `a valid address, feeRate (1–${MAX_FEE_RATE} sat/vB) and one of tokens (≥${MIN_SEND_SATS} sat), max or sendAll required.`,
+        message: `a valid address, feeRate (1–${MAX_FEE_RATE} sat/vB) and one of ${modes} required.`,
       });
       return null;
     }
@@ -1630,7 +1791,12 @@ export function createApiRouter(
   router.get(
     "/onchain/send-preview",
     wrap(async (req, res) => {
-      const ask = parseSend(req.query as Record<string, unknown>, res);
+      const q = queryOf<SendPreviewQuery>(req);
+      const ask = parseSend(
+        { address: q.address, feeRate: q.feeRate, tokens: q.tokens, max: q.max, sendAll: q.all },
+        `tokens (≥${MIN_SEND_SATS} sat), max or all`,
+        res,
+      );
       if (!ask) return;
       res.json(await previewSend(lnd, autopilot.capital, autopilot.onchainReserveSetting(), ask));
     }),
@@ -1648,18 +1814,26 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const body = (req.body ?? {}) as Record<string, unknown>;
+      // The send's own body. `max` and `all` are the preview's words, which
+      // the contract declares never sent here: the preview's max goes as its
+      // amount, a sweep is `sendAll`. Refused rather than ignored — an `all`
+      // next to an amount would otherwise send the amount without a word.
+      const body = bodyOf<OnchainSendRequest>(req);
       const { spendPromised, confirmed } = body;
-      const codes = Array.isArray(confirmed) ? confirmed : confirmed === undefined ? [] : null;
+      const codes: unknown[] | null = Array.isArray(confirmed) ? confirmed : confirmed === undefined ? [] : null;
       if ((spendPromised !== undefined && typeof spendPromised !== "boolean") || codes === null || !codes.every((c) => typeof c === "string")) {
         res.status(400).json({ error: "bad_request", message: "spendPromised must be true/false and confirmed a list of check codes." });
         return;
       }
-      if (body.max !== undefined) {
-        res.status(400).json({ error: "bad_request", message: "send an amount (the preview's max) or sendAll — not max." });
+      if (body.max !== undefined || body.all !== undefined) {
+        res.status(400).json({ error: "bad_request", message: "send an amount (the preview's max) or sendAll — not the preview's max or all." });
         return;
       }
-      const ask = parseSend(body, res);
+      const ask = parseSend(
+        { address: body.address, feeRate: body.feeRate, tokens: body.tokens, max: undefined, sendAll: body.sendAll },
+        `tokens (≥${MIN_SEND_SATS} sat) or sendAll`,
+        res,
+      );
       if (!ask) return;
       // Taken in turn with every channel open (Magma, LSPS1, the autopilot,
       // manual): a send in the middle of an open's check would spend what
@@ -1670,7 +1844,7 @@ export function createApiRouter(
         | { refusal: PromisedSpendRefusal }
         | { invalid: string }
         | { confirm: { checks: SendPreview["checks"]; preview: SendPreview } }
-        | { sent: unknown };
+        | { sent: SendResult };
       try {
         done = await autopilot.capital.mutex.run("on-chain send", async () => {
           const { preview, promised } = await planSend(lnd, autopilot.capital, autopilot.onchainReserveSetting(), ask);
@@ -1681,7 +1855,7 @@ export function createApiRouter(
           return { sent: await sendOnchain(writeLnd, { address: ask.address, feeRate: ask.feeRate, ...(ask.sendAll ? { sendAll: true } : { tokens: ask.tokens }) }) };
         });
       } catch (err) {
-        res.json({ ok: false, transactionId: "", error: describeError(err) });
+        res.json({ ok: false, transactionId: "", error: describeError(err) } satisfies OnchainSendResult);
         return;
       }
       if ("refusal" in done) refusePromisedSpend(res, done.refusal);
@@ -1693,7 +1867,7 @@ export function createApiRouter(
           checks: done.confirm.checks,
           preview: done.confirm.preview,
         });
-      } else res.json(done.sent);
+      } else res.json(done.sent satisfies OnchainSendResult);
     }),
   );
 
@@ -1706,13 +1880,14 @@ export function createApiRouter(
         res.status(403).json({ error: "read_only", message: "Enable write mode to sign (needs the admin macaroon)." });
         return;
       }
-      const message = typeof req.body?.message === "string" ? req.body.message : "";
+      const { message: given } = bodyOf<SignRequest>(req);
+      const message = typeof given === "string" ? given : "";
       if (!message.trim()) {
         res.status(400).json({ error: "bad_request", message: "Enter a message to sign." });
         return;
       }
       const { signature } = await signMessage({ lnd: writeLnd, message });
-      res.json({ signature });
+      res.json({ signature } satisfies SignResult);
     }),
   );
 
@@ -1737,7 +1912,7 @@ export function createApiRouter(
    *  warns with that count before the key is removed: without a key those
    *  orders can't be opened, reported or settled (held payments are still
    *  released before they expire). */
-  const keyStatus = () => ({
+  const keyStatus = (): AmbossStatus => ({
     ...amboss.status(),
     saleFeeBps: saleFeeConfig().bps,
     ordersInFlight: autopilot.magma.ordersInFlight(),
@@ -1772,7 +1947,8 @@ export function createApiRouter(
   );
 
   router.post("/amboss/key", async (req, res) => {
-    const apiKey = typeof req.body?.apiKey === "string" ? req.body.apiKey.trim() : "";
+    const { apiKey: given } = bodyOf<AmbossKeyRequest>(req);
+    const apiKey = typeof given === "string" ? given.trim() : "";
     if (!apiKey) {
       res.status(400).json({ error: "missing_key", message: "Missing API key." });
       return;
@@ -1791,12 +1967,12 @@ export function createApiRouter(
       return;
     }
     amboss.setKey(apiKey);
-    res.json({ ok: true, connected: true });
+    res.json({ ok: true, connected: true } satisfies AmbossKeyResult);
   });
 
   router.delete("/amboss/key", (_req, res) => {
     amboss.clear();
-    res.json({ ok: true, connected: false });
+    res.json({ ok: true, connected: false } satisfies AmbossKeyResult);
   });
 
   /** This node, as an offer's buyer conditions see it. */
@@ -1818,7 +1994,7 @@ export function createApiRouter(
   router.get(
     "/amboss/buy-offers",
     wrap(async (req, res) => {
-      const sizeSats = intIn(req.query.size, MIN_CHANNEL_SATS, MAX_CHANNEL_SATS) ?? 2_000_000;
+      const sizeSats = intIn(queryOf<SizeQuery>(req).size, MIN_CHANNEL_SATS, MAX_CHANNEL_SATS) ?? 2_000_000;
       const own = await getOwnPubkey(lnd);
       const [market, me, book] = await Promise.all([getMarket(), buyerFacts(), publicBook(own).catch(() => null)]);
       const tiers = book ? feeTiers(book.offers) : [];
@@ -1828,7 +2004,7 @@ export function createApiRouter(
         ambossFeeTiers: tiers.map((t) => ({ ambossFeePpm: t.ambossFee, upToSats: t.upTo })),
         inboundSatsPerUsd: market.inboundSatsPerUsd,
         satsPerUsd: market.satsPerUsd,
-      });
+      } satisfies BuyOffersResponse);
     }),
   );
 
@@ -1842,13 +2018,14 @@ export function createApiRouter(
         res.status(400).json({ error: "no_key", message: "Connect Amboss in Settings first." });
         return;
       }
-      const usdCents = Math.floor(Number(req.body?.usdCents));
-      const wantsOffer = typeof req.body?.offerId === "string" && req.body.offerId.trim().length > 0;
+      const asked = bodyOf<BuyQuoteRequest>(req);
+      const usdCents = Math.floor(Number(asked.usdCents));
+      const wantsOffer = typeof asked.offerId === "string" && asked.offerId.trim().length > 0;
       if (!wantsOffer && (!Number.isFinite(usdCents) || usdCents < 500)) {
         res.status(400).json({ error: "bad_amount", message: "Minimum is $5 (500 cents)." });
         return;
       }
-      const isPrivate = req.body?.private === true;
+      const isPrivate = asked.private === true;
       const info = await getWalletInfo({ lnd });
       const uri = info.uris?.[0];
       if (!uri) {
@@ -1863,8 +2040,8 @@ export function createApiRouter(
       // Amboss choose the seller, which made the ranking decorative: whatever the
       // user clicked, someone else could get the order. `market.order.create`
       // takes an offer_id, so the pick decides.
-      const offerId = typeof req.body?.offerId === "string" ? req.body.offerId.trim() : "";
-      const sizeSats = Math.floor(Number(req.body?.sizeSats));
+      const offerId = typeof asked.offerId === "string" ? asked.offerId.trim() : "";
+      const sizeSats = Math.floor(Number(asked.sizeSats));
       if (offerId) {
         if (!Number.isFinite(sizeSats) || sizeSats < MIN_CHANNEL_SATS || sizeSats > MAX_CHANNEL_SATS) {
           res.status(400).json({ error: "bad_size", message: "Choose a channel size within the offer's range." });
@@ -1911,7 +2088,7 @@ export function createApiRouter(
           feeRateCapPpm: purchase.feeRateCapPpm,
           baseFeeCapSats: purchase.baseFeeCapSats,
           ambossFeeSats: targeted.ambossFeeSats ?? null,
-        });
+        } satisfies BuyQuoteResponse);
         return;
       }
       const quote = await withAmboss(() => buyLiquidity(amboss.getKey(), uri, usdCents, isPrivate));
@@ -1937,7 +2114,7 @@ export function createApiRouter(
         paymentRequest: quote.paymentRequest,
         sats: decoded.tokens,
         channelSizeSats: quote.channelSizeSats,
-      });
+      } satisfies BuyQuoteResponse);
     }),
   );
 
@@ -1947,7 +2124,8 @@ export function createApiRouter(
     "/amboss/buy/cancel",
     wrap(async (req, res) => {
       if (!needKey(res)) return;
-      const orderId = typeof req.body?.orderId === "string" ? req.body.orderId : "";
+      const { orderId: given } = bodyOf<BuyCancelRequest>(req);
+      const orderId = typeof given === "string" ? given : "";
       if (!autopilot.purchases.get(orderId)) {
         res.status(404).json({ error: "not_found", message: "No quote on record for this order." });
         return;
@@ -1982,7 +2160,7 @@ export function createApiRouter(
         ok: true,
         cancelled,
         message: cancelled ? "Order cancelled on Amboss." : `Not paid; Amboss didn't confirm the cancel (${error}) — the unpaid order expires on its own.`,
-      });
+      } satisfies BuyCancelResult);
     }),
   );
 
@@ -1996,8 +2174,9 @@ export function createApiRouter(
         res.status(403).json({ error: "read_only", message: "Write mode is off." });
         return;
       }
-      const orderId = typeof req.body?.orderId === "string" ? req.body.orderId : "";
-      const maxSats = Math.floor(Number(req.body?.maxSats));
+      const pay = bodyOf<BuyPayRequest>(req);
+      const orderId = typeof pay.orderId === "string" ? pay.orderId : "";
+      const maxSats = Math.floor(Number(pay.maxSats));
       if (!orderId || !Number.isFinite(maxSats) || maxSats <= 0) {
         res.status(400).json({ error: "bad_request", message: "Missing order or confirmed amount." });
         return;
@@ -2013,7 +2192,7 @@ export function createApiRouter(
         res.status(409).json({ error: "bad_state", message: `This order is ${p.state} — not paying it again.` });
         return;
       }
-      const sent = typeof req.body?.paymentRequest === "string" ? req.body.paymentRequest.trim() : "";
+      const sent = typeof pay.paymentRequest === "string" ? pay.paymentRequest.trim() : "";
       if (sent && sent !== p.paymentRequest) {
         res.status(400).json({ error: "wrong_invoice", message: "That is not the invoice of this quote. Aborted." });
         return;
@@ -2051,12 +2230,12 @@ export function createApiRouter(
           ),
         )
         .catch((e) => autopilot.purchases.paymentOutcome(orderId, { status: "failed", error: describeError(e), confirmed: false }));
-      res.json({ ok: true, sats: decoded.tokens });
+      res.json({ ok: true, sats: decoded.tokens } satisfies BuyPayResult);
     }),
   );
 
   /** The payment hint for an order, from the purchase ledger. */
-  const paymentHint = (orderId: string) => {
+  const paymentHint = (orderId: string): PurchasePaymentHint | null => {
     const p = autopilot.purchases.get(orderId);
     if (!p) return null;
     if (p.state === "paying") return { state: "paying" as const };
@@ -2077,20 +2256,21 @@ export function createApiRouter(
         res.status(400).json({ error: "no_key", message: "Connect Amboss in Settings first." });
         return;
       }
-      const id = typeof req.query.id === "string" ? req.query.id : "";
+      const { id: asked } = queryOf<OrderQuery>(req);
+      const id = typeof asked === "string" ? asked : "";
       if (!id) {
         res.status(400).json({ error: "bad_request", message: "Missing order id." });
         return;
       }
       const order = await withAmboss(() => getOrder(amboss.getKey(), id));
       autopilot.purchases.fromOrder(id, order);
-      res.json({ ...order, payment: paymentHint(id) });
+      res.json({ ...order, payment: paymentHint(id) } satisfies ApiOrderState);
     }),
   );
 
   // Inbound bought here (newest first): quotes, cancels, payments, channels.
   router.get("/amboss/purchases", (_req, res) => {
-    res.json({ purchases: autopilot.purchases.list() });
+    res.json({ purchases: autopilot.purchases.list() } satisfies PurchasesResponse);
   });
 
   // ── Magma selling (offers + orders, on the Magma API) ───────────────────────
@@ -2124,7 +2304,9 @@ export function createApiRouter(
   router.get(
     "/amboss/eligibility",
     wrap(async (req, res) => {
-      res.json(await autopilot.magmaEligibility(req.query.refresh === "1"));
+      // A flag the web sends as "true" (curl's "1" is taken too).
+      const { refresh } = queryOf<EligibilityQuery>(req);
+      res.json(await autopilot.magmaEligibility(refresh === "true" || refresh === "1"));
     }),
   );
 
@@ -2136,7 +2318,7 @@ export function createApiRouter(
       if (!needKey(res)) return;
       const own = await getOwnPubkey(lnd);
       const offers = await withAmboss(() => getMyOffers(amboss.getKey(), own));
-      res.json({ offers, sync: autopilot.offerSyncStatus(), controls: autopilot.offerControls(), feeCaps: autopilot.offerFeeCaps() });
+      res.json({ offers, sync: autopilot.offerSyncStatus(), controls: autopilot.offerControls(), feeCaps: autopilot.offerFeeCaps() } satisfies MyOffersResponse);
     }),
   );
 
@@ -2205,11 +2387,17 @@ export function createApiRouter(
       res.json({
         pendingSeller: view.pendingSeller,
         lane: autopilot.magma.laneStatus(),
-        orders: view.orders.map((o) => {
+        orders: view.orders.map((o): ApiMyOrder => {
           const local = autopilot.magma.localView(o.id);
-          return { ...o, transactionId: local?.fundingOutpoint?.split(":")[0] ?? o.transactionId, local };
+          return {
+            ...o,
+            transactionId: local?.fundingOutpoint?.split(":")[0] ?? o.transactionId,
+            local,
+            // Who opens the sale's channel once it is paid: the lane, or you.
+            opensItself: autopilot.magma.opensItself(o.id),
+          };
         }),
-      });
+      } satisfies MyOrdersView);
     }),
   );
 
@@ -2230,7 +2418,7 @@ export function createApiRouter(
   };
 
   /** Offer terms from a request body (sizes in sats, rate in ppm, lease in blocks). */
-  const parseOfferTerms = (b: Record<string, unknown>, res: Response): OfferTerms | null => {
+  const parseOfferTerms = (b: Fields<OfferTermsRequest>, res: Response): OfferTerms | null => {
     const terms = {
       totalSizeSats: Math.floor(Number(b.totalSizeSats)),
       minSizeSats: Math.floor(Number(b.minSizeSats)),
@@ -2265,7 +2453,7 @@ export function createApiRouter(
     "/amboss/offer",
     wrap(async (req, res) => {
       if (!needKey(res)) return;
-      const parsed = parseOfferTerms(req.body ?? {}, res);
+      const parsed = parseOfferTerms(bodyOf<OfferTermsRequest>(req), res);
       if (!parsed) return;
       // Every offer carries the routing-fee promise (D7) — kept by the fee
       // autopilot for each channel sold.
@@ -2287,7 +2475,7 @@ export function createApiRouter(
       autopilot.pauseOfferAutomation(offerId, "you created this offer by hand");
       const created = await getMyOffer(amboss.getKey(), offerId).catch(() => null);
       autopilot.recordOfferWrite(created, offerId, { ...write, verified: created ? created.id === offerId : undefined });
-      res.json({ ok: true, offerId });
+      res.json({ ok: true, offerId } satisfies OfferCreateResult);
     }),
   );
 
@@ -2295,7 +2483,7 @@ export function createApiRouter(
     "/amboss/offer/update",
     wrap(async (req, res) => {
       if (!needKey(res)) return;
-      const b = req.body ?? {};
+      const b = bodyOf<OfferUpdateRequest>(req);
       const id = typeof b.id === "string" ? b.id : "";
       if (!id) {
         res.status(400).json({ error: "bad_request", message: "Missing offer id." });
@@ -2337,7 +2525,7 @@ export function createApiRouter(
         res.status(502).json({ error: "amboss_refused", message: `Offer not updated: ${write.error}` });
         return;
       }
-      res.json({ ok: true, verified: write.verified ?? null, offer: read });
+      res.json({ ok: true, verified: write.verified ?? null, offer: read } satisfies OfferUpdateResult);
     }),
   );
 
@@ -2352,12 +2540,12 @@ export function createApiRouter(
     "/amboss/offer/toggle",
     wrap(async (req, res) => {
       if (!needKey(res)) return;
-      const id = typeof req.body?.id === "string" ? req.body.id : "";
+      const { id: given, want: wantRaw } = bodyOf<OfferToggleRequest>(req);
+      const id = typeof given === "string" ? given : "";
       if (!id) {
         res.status(400).json({ error: "bad_request", message: "Missing offer id." });
         return;
       }
-      const wantRaw = req.body?.want;
       if (wantRaw !== undefined && wantRaw !== "ENABLED" && wantRaw !== "DISABLED") {
         res.status(400).json({ error: "bad_request", message: "want must be ENABLED or DISABLED." });
         return;
@@ -2376,7 +2564,7 @@ export function createApiRouter(
         // when capital returns.
         if (want && offer.status !== (want === "ENABLED" ? "DISABLED" : "ENABLED")) {
           if (offer.status === want) autopilot.offerStatusSetByHand(id, want);
-          res.json({ status: offer.status, changed: false });
+          res.json({ status: offer.status, changed: false } satisfies OfferToggleResult);
           return;
         }
         const write: OfferWrite = { at: new Date().toISOString(), by: "manual", action: "update", fields: { offer_id: id }, ok: false };
@@ -2404,7 +2592,7 @@ export function createApiRouter(
           res.status(502).json({ error: "not_toggled", status, message: `Offer not ${want === "DISABLED" ? "disabled" : "enabled"}: ${write.error}.` });
           return;
         }
-        res.json({ status, changed: true });
+        res.json({ status, changed: true } satisfies OfferToggleResult);
       });
     }),
   );
@@ -2415,8 +2603,8 @@ export function createApiRouter(
     "/amboss/offer/automation",
     wrap(async (req, res) => {
       if (!needKey(res)) return;
-      const id = typeof req.body?.id === "string" ? req.body.id : "";
-      const managed = req.body?.managed;
+      const { id: given, managed } = bodyOf<OfferAutomationRequest>(req);
+      const id = typeof given === "string" ? given : "";
       if (!id || typeof managed !== "boolean") {
         res.status(400).json({ error: "bad_request", message: "Offer id and managed (true/false) required." });
         return;
@@ -2424,7 +2612,7 @@ export function createApiRouter(
       if (!(await ownOffer(id, res))) return;
       if (managed) autopilot.resumeOfferAutomation(id);
       else autopilot.pauseOfferAutomation(id, "you took it over");
-      res.json({ ok: true, sync: autopilot.offerSyncStatus(), controls: autopilot.offerControls() });
+      res.json({ ok: true, sync: autopilot.offerSyncStatus(), controls: autopilot.offerControls() } satisfies OfferAutomationResult);
     }),
   );
 
@@ -2438,7 +2626,7 @@ export function createApiRouter(
       return;
     }
     const status =
-      r.code === "read_only" ? 403
+      r.code === "read_only" || r.code === "permission" ? 403
       : r.code === "no_key" ? 400
       : r.code === "shutting_down" || r.code === "journal" ? 503
       : r.code === "bad_status" || r.code === "capital" || r.code === "unreachable" || r.code === "not_held" ? 409
@@ -2446,8 +2634,9 @@ export function createApiRouter(
     res.status(status).json({ ...r, error: r.code ?? "failed" });
   };
 
-  const orderId = (req: Request, res: Response): string | null => {
-    const id = typeof req.body?.id === "string" ? req.body.id.trim() : "";
+  /** The order a click acts on (its body's `id`). Null after a 400. */
+  const orderId = (body: Fields<OrderActionRequest>, res: Response): string | null => {
+    const id = typeof body.id === "string" ? body.id.trim() : "";
     if (!id || id.length > 100) {
       res.status(400).json({ error: "bad_request", message: "Missing order id." });
       return null;
@@ -2460,8 +2649,11 @@ export function createApiRouter(
   router.post(
     "/amboss/order/accept",
     wrap(async (req, res) => {
-      const id = orderId(req, res);
-      if (id) sendDesk(res, await autopilot.magma.accept(id));
+      const id = orderId(bodyOf<OrderActionRequest>(req), res);
+      if (!id) return;
+      const result = await autopilot.magma.accept(id);
+      // What happens once the buyer pays: the lane opens it, or you do.
+      sendDesk(res, result.ok ? { ...result, opensItself: autopilot.magma.opensItself(id) } : result);
     }),
   );
 
@@ -2469,7 +2661,7 @@ export function createApiRouter(
   router.post(
     "/amboss/order/open",
     wrap(async (req, res) => {
-      const id = orderId(req, res);
+      const id = orderId(bodyOf<OrderActionRequest>(req), res);
       if (id) sendDesk(res, await autopilot.magma.open(id));
     }),
   );
@@ -2478,7 +2670,7 @@ export function createApiRouter(
   router.post(
     "/amboss/order/reject",
     wrap(async (req, res) => {
-      const id = orderId(req, res);
+      const id = orderId(bodyOf<OrderActionRequest>(req), res);
       if (id) sendDesk(res, await autopilot.magma.reject(id));
     }),
   );

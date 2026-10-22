@@ -33,6 +33,10 @@ import { suppressSchedulerKicks } from "./autopilot.js";
  * i.e. looks like a different client (another container) to the server.
  * `from: "::1"` does the same over IPv6 loopback, through a second listener
  * on [::1] that serves the same app — for macOS, which has no 127.0.0.2.
+ * Requests are the app's own, as the web client sends them: same-origin
+ * (`Sec-Fetch-Site: same-origin`) and every POST as JSON — `{}` when there is
+ * no body. `headers` adds or replaces headers (`Sec-Fetch-Site: cross-site`,
+ * a form's `Content-Type`), `rawBody` sends a body as it is (a form's).
  * Outbound HTTP (Amboss, LNURL, …) is NOT mocked here — install the fetch mock
  * in the test when a route needs it.
  */
@@ -55,7 +59,7 @@ export interface ApiHarness {
     method: string,
     path: string,
     body?: unknown,
-    opts?: { token?: string; from?: string; host?: string },
+    opts?: { token?: string; from?: string; host?: string; headers?: Record<string, string>; rawBody?: string },
   ): Promise<{ status: number; body: any; headers: http.IncomingHttpHeaders }>;
 }
 
@@ -72,11 +76,14 @@ export async function startApi(
      *  on a slow runner after it, failing its fetch mock with "unexpected
      *  outbound request(s)". A test that wants them says so. */
     schedulerKicks?: boolean;
+    /** gRPC methods LND refuses the write client: its macaroon lacks them
+     *  (FakeLnd.withoutPermission). The read client may call everything. */
+    writeDenied?: string[];
   } = {},
 ): Promise<ApiHarness> {
   const dir = opts.dir ?? makeTempDir(t);
   const node = opts.node ?? new FakeLnd();
-  const writeLnd = opts.readOnly ? undefined : node.lnd;
+  const writeLnd = opts.readOnly ? undefined : opts.writeDenied?.length ? node.withoutPermission(...opts.writeDenied) : node.lnd;
   const rebalanceLog = new RebalanceLog(dir);
   const settings = new SettingsStore(dir);
   const overrides = new OverridesStore(dir);
@@ -165,7 +172,9 @@ export async function startApi(
       ? { host: "::1", port: await openV6() }
       : { host: "127.0.0.1", port, localAddress: ropts.from };
     return new Promise((resolve, reject) => {
-      const payload = body === undefined ? undefined : JSON.stringify(body);
+      // The web client POSTs JSON every time — `{}` for an action without a body.
+      const json = body === undefined ? (method === "GET" || method === "DELETE" ? undefined : "{}") : JSON.stringify(body);
+      const payload = ropts.rawBody ?? json;
       const req = http.request(
         {
           ...target,
@@ -173,8 +182,10 @@ export async function startApi(
           path: `/api${path}`,
           headers: {
             Host: ropts.host ?? `localhost:${port}`,
-            ...(payload ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } : {}),
+            "Sec-Fetch-Site": "same-origin",
+            ...(payload !== undefined ? { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(payload) } : {}),
             ...(ropts.token ? { Authorization: `Bearer ${ropts.token}` } : {}),
+            ...ropts.headers,
           },
         },
         (res) => {
@@ -193,7 +204,7 @@ export async function startApi(
         },
       );
       req.on("error", reject);
-      if (payload) req.write(payload);
+      if (payload !== undefined) req.write(payload);
       req.end();
     });
   };

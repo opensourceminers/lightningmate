@@ -89,10 +89,10 @@ test("D9: the confirmation before switching selling on carries the live verdict 
 });
 
 test("the Orders tab never calls an order paid that LightningMate didn't hold the payment for", () => {
-  assert.equal(localLabel({ phase: "settled", booked: true }), "completed · payment settled");
-  assert.match(localLabel({ phase: "settled", booked: false }), /not booked/);
-  assert.equal(localLabel({ phase: "failed", external: "accepted_elsewhere" }), "accepted outside LightningMate");
-  assert.equal(localLabel({ phase: "rejected", external: "other_node" }), "another node's order");
+  assert.equal(localLabel({ phase: "settled", booked: true, external: null }), "completed · payment settled");
+  assert.match(localLabel({ phase: "settled", booked: false, external: null }), /not booked/);
+  assert.equal(localLabel({ phase: "failed", booked: null, external: "accepted_elsewhere" }), "accepted outside LightningMate");
+  assert.equal(localLabel({ phase: "rejected", booked: null, external: "other_node" }), "another node's order");
 });
 
 test("offer ownership as the Sell tab shows it: yours after a manual edit, the autopilot's otherwise, nobody's with selling off", () => {

@@ -107,13 +107,27 @@ const BUY_STATUS: Record<string, string> = {
   BUYER_REJECTED: "Cancelled by you",
 };
 
-/** An order's status in plain words, for the side this node is on. */
-export function orderStatusLabel(status: string, side: "SELL" | "BUY" | string): string {
+/** An order's status in plain words, for the side this node is on. A paid
+ *  sale says who opens its channel: the order lane (`opensItself`, from the
+ *  server — with Liquidity provision on, or an order the lane accepted
+ *  itself), or you (review of P7: "waiting for you to open the channel"
+ *  showed while the lane was opening it). */
+export function orderStatusLabel(status: string, side: "SELL" | "BUY" | string, opensItself = false): string {
+  if (side !== "BUY" && status === "WAITING_FOR_CHANNEL_OPEN" && opensItself) return "Paid — the autopilot opens the channel";
   const words = (side === "BUY" ? BUY_STATUS[status] : undefined) ?? SELL_STATUS[status];
   if (words) return words;
   // A status this version doesn't know yet: readable all the same.
   const plain = status.toLowerCase().replace(/_/g, " ");
   return plain.charAt(0).toUpperCase() + plain.slice(1);
+}
+
+/** The toast after an order is accepted by hand: who opens its channel
+ *  once the buyer has paid — the order lane (Liquidity provision on), or
+ *  you ("Open channel"). */
+export function acceptedToast(opensItself: boolean): string {
+  return opensItself
+    ? "Order accepted — the autopilot opens the channel once the buyer has paid."
+    : "Order accepted — open the channel once the buyer has paid.";
 }
 
 /** This node's own record of an order, in a few words. */

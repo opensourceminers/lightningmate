@@ -176,7 +176,7 @@ test("a plan made while the autopilot's refill of the target was under way — a
   assert.deepEqual(new RebalanceLog(api.dir).successes().map((r) => r.via), ["autopilot"]);
 });
 
-test("a plan is stamped BEFORE its inputs are read: a refill that started while the channels were read is newer than the plan", async (t) => {
+test("a plan is stamped BEFORE its inputs are read: a refill that started while the channels were read is newer than the plan", async () => {
   const node = routingNode();
   let firstReadAt = 0;
   node.beforeCall = () => {

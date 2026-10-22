@@ -65,8 +65,9 @@ export interface PnlSummary {
   channelCloseCount: number;
   /** … and those of them whose cost couldn't all be worked out. */
   channelCloseUnknownCount: number;
-  /** Inbound bought on Magma (invoice + Lightning routing fee) whose channel
-   *  opened in the window. */
+  /** Inbound bought on Magma (invoice + Lightning routing fee): purchases
+   *  whose channel opened, counted in the window they were PAID in
+   *  (purchaseCostsSince — by paidAt, not by when the channel opened). */
   inboundPurchaseCostSats: number;
   inboundPurchaseCount: number;
   otherChainFeesSats: number;

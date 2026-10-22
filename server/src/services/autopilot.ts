@@ -1,11 +1,14 @@
 import { getChainBalance, getChainFeeRate, getChannels, getFeeRates, getPayment, getPeers, getWalletInfo, type AuthenticatedLnd } from "lightning";
 import { JsonStore, recordStoreIncident } from "../store.js";
 import {
+  checkPeerListing,
   connectForOpen,
   fundChannel,
+  isPermissionDenied,
   isPreBroadcastRefusal,
   isUnreachable,
   nodeSideRefusal,
+  opensBlocked,
   peerMaxChannelFromError,
   peerMinChannelFromError,
 } from "./channelOps.js";
@@ -206,6 +209,9 @@ export interface AutopilotChange {
   clampedBy?: string;
   ok: boolean;
   error?: string;
+  /** Failed the same way as the last attempt on this channel: counted in
+   *  the pass's own result, left out of the run history (not news). */
+  repeat?: boolean;
 }
 
 /** A fee write with what the books need about it (writeFees). */
@@ -258,6 +264,10 @@ export interface AutopilotChannelOpen {
   ok: boolean;
   transactionId?: string;
   error?: string;
+  /** Failed the same way as the last open of its kind (to that peer, or
+   *  this node's own trouble): counted in the pass's own result, left out
+   *  of the run history (channelNews). */
+  repeat?: boolean;
 }
 
 /** One Magma action (order lane or offer upkeep) as the run history shows it. */
@@ -598,18 +608,16 @@ export interface RunSummary {
  */
 export function feeDecision(
   recs: readonly Pick<FeeRecommendation, "alias" | "currentPpm" | "targetPpm" | "wouldApply" | "blockedByGuards">[],
-  eligible: number,
-  changes: readonly Pick<AutopilotChange, "alias" | "fromPpm" | "toPpm" | "ok" | "error">[],
+  changes: readonly Pick<AutopilotChange, "alias" | "fromPpm" | "toPpm" | "ok" | "error" | "repeat">[],
 ): { text: string; state: DecisionState } {
   const ok = changes.filter((c) => c.ok);
   const failed = changes.filter((c) => !c.ok);
-  // A failure LND repeats on a channel is left out of the run history
-  // (quietRepeats) — still a failure here.
-  const quiet = Math.max(0, eligible - changes.length);
-  const refused = failed.length + quiet;
-  const refusedText = refused
-    ? `${refused} update${refused === 1 ? "" : "s"} LND refused (${failed[0]?.error ?? "the same refusal as before — not retried for 6 h"})`
-    : "";
+  // Every write that failed in the pass — one LND refused the same way as
+  // last time included (a `repeat`, left out of the run history only): its
+  // own words, LND's reason (review of P7: a repeat read "the same refusal
+  // as before", with no reason at all).
+  const refused = failed.length;
+  const refusedText = refused ? `${refused} update${refused === 1 ? "" : "s"} LND refused (${failed[0].error ?? "failed"})` : "";
   if (ok.length) {
     const shown = ok.slice(0, 3).map((c) => `${c.alias} ${c.fromPpm}→${c.toPpm} ppm`);
     return {
@@ -1489,6 +1497,10 @@ export class Autopilot {
     this.migrateOutOfRangePins();
     this.reschedule();
     this.startOrderLane();
+    // Whether LND lists its peers to the write client at all (peers:read):
+    // without it no channel can be opened, and the channel and Magma areas
+    // say so from the start — not first when an order is turned down for it.
+    if (this.writeLnd && !this.shuttingDown) void checkPeerListing(this.writeLnd);
     // Offline durations accrue whatever the switches say (a read); so does
     // the copy of the close transactions the books need (a read too).
     if (!this.shuttingDown) {
@@ -1779,7 +1791,7 @@ export class Autopilot {
       shouldStop: () => this.stopWhy("enabled") !== null,
     });
     this.explain("fees", () => {
-      const d = feeDecision(report.recommendations, eligible.length - notSent, changes);
+      const d = feeDecision(report.recommendations, changes);
       if (notSent === 0) return d;
       const stopped = unsent(notSent, this.stopWhy("enabled") ?? "stopped during the run");
       // What was sent still counts (applied, or refused); none sent: a wait.
@@ -1858,8 +1870,12 @@ export class Autopilot {
    * an update LND kept refusing was resent every run, each a failed line in
    * the run history (~48 a day: the 50-line history held one day). With
    * `quietRepeats` (the autopilot's own passes) the same failure again on a
-   * channel is left out of the result, i.e. the run history: the first one
-   * is on record, and the Fees tab shows the channel held.
+   * channel is marked `repeat`: it is in the pass's own result — what "Run
+   * once now" and the Overview count, with LND's reason — and left out of
+   * the run history only (runOnce): the first one is on record there, and
+   * the Fees tab shows the channel held. (Review of P7: it was dropped from
+   * the result itself, and the Overview read "nothing needed changing"
+   * right above "Fee automation failed".)
    *
    * `shouldStop` (the fee autopilot's batch): asked before each write — the
    * writes after it says yes are not sent; `notSent` counts them. Nothing
@@ -1890,6 +1906,7 @@ export class Autopilot {
       const toBaseMsat = res.baseFeeMsat ?? w?.baseFeeMsat;
       const why = w?.why;
       let error = res.error;
+      let repeat = false;
       if (res.ok) {
         this.feeRetry.delete(res.id);
         this.state.perChannelLastApplied[res.id] = nowIso;
@@ -1908,9 +1925,8 @@ export class Autopilot {
         });
       } else {
         const raw = res.error ?? "failed";
-        const repeat = this.feeRetry.get(res.id)?.error === raw;
+        repeat = opts.quietRepeats === true && this.feeRetry.get(res.id)?.error === raw;
         this.feeRetry.set(res.id, { until: nowMs + FEE_RETRY_BACKOFF_MS, error: raw });
-        if (repeat && opts.quietRepeats) continue;
         if (!w?.leaseBreach) error = `${raw} — not retried for ${Math.round(FEE_RETRY_BACKOFF_MS / 3_600_000)} h`;
       }
       changes.push({
@@ -1925,6 +1941,7 @@ export class Autopilot {
         ...(res.clampedBy ? { clampedBy: res.clampedBy } : {}),
         ok: res.ok,
         ...(res.ok ? {} : { error }),
+        ...(repeat ? { repeat: true } : {}),
       });
     }
     this.feeLog.append(logged);
@@ -2099,9 +2116,12 @@ export class Autopilot {
   }
 
   /** A run-history line for work done outside the main run (lease keeper,
-   *  manual applies). Not lastRunAt: that is the main run's. */
+   *  manual applies). Not lastRunAt: that is the main run's. News only, as
+   *  the main run's line: a write that failed the same way as the last one
+   *  on its channel (`repeat`) is no new line. */
   private recordRun(part: Partial<Pick<AutopilotRun, "changes">>): void {
-    const changes = part.changes ?? [];
+    const changes = (part.changes ?? []).filter((c) => !c.repeat);
+    if (changes.length === 0) return;
     this.state.history.unshift({
       at: new Date().toISOString(),
       attempted: changes.length,
@@ -2250,6 +2270,14 @@ export class Autopilot {
             ...(r.expectedRevenuePpm != null
               ? { gate: { revenuePpm: r.expectedRevenuePpm, demandSats: r.earningDemandSats, minNetSats: r.minNetProfitSats } }
               : {}),
+            // The plan's route cost, for the executor's fitted size
+            // (fitBelowPlanned) — which this run hardly ever reaches: a move
+            // whose estimated fee is more than the budget left waits for the
+            // budget (the backstop above) before any size is tried, and the
+            // plan's size already fits its other limits. It is a manual
+            // run's (POST /rebalance/execute), whose cap — the budget left,
+            // what the dialog promised — can be below the plan's.
+            ...(r.estimatedRouteCostPpm != null ? { routeCostPpm: r.estimatedRouteCostPpm } : {}),
           },
           // Inside the refill too, no attempt starts after the shutdown
           // signal — or once auto-rebalance is off.
@@ -2721,6 +2749,20 @@ export class Autopilot {
     const cfg = this.state.config;
     const note = (text: string, state: DecisionState) => this.decisionNote("channels", text, state);
 
+    // LND refused the write client the peer listing every open needs (no
+    // peers:read — at start, or in an earlier run's open): asked again, which
+    // is cheap, and while it still refuses no plan is worked out (LN+ lookups
+    // and all) for an open that can't go out. The run that ran into it has
+    // the failed open on record; this is the area's standing state.
+    if (opensBlocked(writeLnd)) {
+      await checkPeerListing(writeLnd);
+      const blocked = opensBlocked(writeLnd);
+      if (blocked) {
+        note(`no channel opened — ${blocked}`, "blocked");
+        return [];
+      }
+    }
+
     // Respect the cooldown between auto-opens — after an open, and after one
     // that ended unclearly (it may have opened a channel).
     if (this.state.lastChannelOpenAt) {
@@ -2879,21 +2921,38 @@ export class Autopilot {
         note([refusalNote(refused), res.reason].filter(Boolean).join(" · "), "waiting");
         return out;
       }
+      if (res.kind === "blocked") {
+        // LND won't list its peers to the write macaroon (no peers:read): no
+        // connection can be checked, so no open can go out — to this peer or
+        // any other. This node's setup, not the peer's refusal: nobody is
+        // held back for it, no further peer is tried, and the area says it
+        // is blocked until the operator fixes the macaroon (before, it read
+        // "the peer looks offline", and each healthy peer was backed off a
+        // day, then a week, then a month). In the pass's result every time;
+        // a line of history only while it is news.
+        const repeat = !this.channelNews(SELF_NEWS_KEY, res.reason);
+        out.push({ alias: s.alias, sizeSats: plan.sizeSats, ok: false, error: res.reason, ...(repeat ? { repeat } : {}) });
+        note([refusalNote(refused), `no channel opened — ${res.reason}`].filter(Boolean).join(" · "), "blocked");
+        this.persist();
+        return out;
+      }
       // This node's own doing — its wallet, its chain, its connection — is
       // not the peer's: nobody is held back for it, and no further peer is
       // tried (each would fail the same way). One line of history while the
       // cause stays the same.
       const own = nodeSideRefusal(res.error) ?? (isUnreachable(res.error) ? await this.connectivityLost() : null);
       if (own) {
-        if (this.channelNews(SELF_NEWS_KEY, own)) {
-          out.push({ alias: s.alias, sizeSats: plan.sizeSats, ok: false, error: `${own} — not the peer's doing (${res.error})` });
-        }
+        // In the pass's result every time; a line of history only while
+        // it is news (runOnce leaves `repeat` out of the history).
+        const repeat = !this.channelNews(SELF_NEWS_KEY, own);
+        out.push({ alias: s.alias, sizeSats: plan.sizeSats, ok: false, error: `${own} — not the peer's doing (${res.error})`, ...(repeat ? { repeat } : {}) });
         // (LND's text in full: "need 0.05 BTC only have 0.045 BTC available"
         // says how far the wallet is from it.)
+        // (A macaroon LND refuses the open: the operator's to fix — blocked.)
         note(
           `no channel opened — ${own}: the open to ${s.alias} failed (${res.error.replace(/^\w+: /, "")}), not by the peer's doing — ` +
             "no peer is held back for it, and the next run tries again",
-          "error",
+          isPermissionDenied(res.error) ? "blocked" : "error",
         );
         this.persist();
         return out;
@@ -2901,7 +2960,8 @@ export class Autopilot {
       // The node itself was fine: its next trouble is news again.
       this.channelLast.delete(SELF_NEWS_KEY);
       refused.push({ alias: s.alias, ...this.notePeerRefusal(s, res.error, plan.sizeSats) });
-      if (this.channelNews(s.pubkey, res.error)) out.push({ alias: s.alias, sizeSats: plan.sizeSats, ok: false, error: res.error });
+      const repeat = !this.channelNews(s.pubkey, res.error);
+      out.push({ alias: s.alias, sizeSats: plan.sizeSats, ok: false, error: res.error, ...(repeat ? { repeat } : {}) });
       if (!res.preBroadcast) {
         // The outcome is unclear (a dropped stream, a timeout): the funding
         // may have been broadcast. No other open now — the next run sees the
@@ -3006,12 +3066,15 @@ export class Autopilot {
   ): Promise<
     | { kind: "opened"; transactionId?: string }
     | { kind: "deferred"; reason: string }
+    | { kind: "blocked"; reason: string }
     | { kind: "refused"; error: string; preBroadcast: boolean }
   > {
     // Every address it advertises, in dialing order (then the graph's).
     const sockets = [...new Set([...(s.sockets ?? []), ...(s.socket ? [s.socket] : [])])];
     const connected = await connectForOpen(writeLnd, { pubkey: s.pubkey, sockets });
-    if (!connected.ok) return { kind: "refused", error: connected.error, preBroadcast: true };
+    if (!connected.ok) {
+      return connected.blocked ? { kind: "blocked", reason: connected.error } : { kind: "refused", error: connected.error, preBroadcast: true };
+    }
     return this.capital.mutex.run("autopilot open", async () => {
       // The reads, the dial and the wait for the mutex take a while. A
       // shutdown signal — or the switch going off — that came meanwhile must
@@ -4213,6 +4276,16 @@ export class Autopilot {
         return { state: "blocked", text: "write mode is off (LM_ENABLE_WRITE) — the autopilot can't change anything on the node", at: null, ...(d ? { last: d } : {}) };
       }
       if (!on) return { state: "off", text: offText, at: null, ...(d ? { last: d } : {}) };
+      // LND won't list its peers to the write macaroon (no peers:read): no
+      // channel can be opened — an autopilot open's or a Magma order's —
+      // whatever the area last decided, until a listing goes through again
+      // (a restart with a macaroon that has it). Checked at start too
+      // (checkPeerListing), so it shows before an order is turned down for it.
+      const blocked = area === "channels" || area === "magma" ? opensBlocked(this.writeLnd) : null;
+      if (blocked) {
+        const what = area === "magma" ? "new orders are turned down, and a paid order's channel can't be opened" : "no channel can be opened";
+        return { state: "blocked", text: `${what}: ${blocked}`, at: null, ...(d ? { last: d } : {}) };
+      }
       if (area === "magma") {
         if (!this.amboss.hasKey()) {
           return { state: "blocked", text: "no Amboss API key — connect one in Settings: no offer is kept and no order is taken", at: null, ...(d ? { last: d } : {}) };
@@ -4531,48 +4604,52 @@ export class Autopilot {
         return moved;
       });
       // "skip" entries are non-actions (cap/reserve) — don't count them as
-      // attempts. And offer upkeep that fails the same way every run (Amboss
-      // down, a write it keeps refusing) is one line of history, not one per
-      // run (laneNews; review a3-channels:history-flood — the offer sync
-      // status keeps its last error either way).
-      const acted = this.laneNews(sells.filter((s) => s.action !== "skip"));
+      // attempts.
+      const acted = sells.filter((s) => s.action !== "skip");
 
       // A refill still in flight is no failure (not yet): counted neither way.
       const refillsFailed = rebalances.filter((r) => !r.ok && !r.inFlight).length;
-      const items = changes.length + rebalances.length + channels.length + acted.length + maxHtlc.length;
-      const itemsFailed =
-        changes.filter((c) => !c.ok).length +
-        refillsFailed +
-        channels.filter((c) => !c.ok).length +
-        acted.filter((s) => !s.ok).length +
-        maxHtlc.filter((m) => !m.ok).length;
       const at = new Date().toISOString();
-      const lineOf = (stageErrors: { stage: string; error: string }[]): AutopilotRun => ({
+      type Items = { changes: AutopilotChange[]; channels: AutopilotChannelOpen[]; sells: AutopilotSell[] };
+      const lineOf = (it: Items, stageErrors: { stage: string; error: string }[]): AutopilotRun => ({
         at,
-        attempted: items + stageErrors.length,
+        attempted: it.changes.length + rebalances.length + it.channels.length + it.sells.length + maxHtlc.length + stageErrors.length,
         applied:
-          changes.filter((c) => c.ok).length +
+          it.changes.filter((c) => c.ok).length +
           rebalances.filter((r) => r.ok).length +
-          channels.filter((c) => c.ok).length +
-          acted.filter((s) => s.ok).length +
+          it.channels.filter((c) => c.ok).length +
+          it.sells.filter((s) => s.ok).length +
           maxHtlc.filter((m) => m.ok).length,
-        failed: itemsFailed + stageErrors.length,
-        changes,
+        failed:
+          it.changes.filter((c) => !c.ok).length +
+          refillsFailed +
+          it.channels.filter((c) => !c.ok).length +
+          it.sells.filter((s) => !s.ok).length +
+          maxHtlc.filter((m) => !m.ok).length +
+          stageErrors.length,
+        changes: it.changes,
         rebalances,
-        channels,
-        sells: acted,
+        channels: it.channels,
+        sells: it.sells,
         maxHtlc,
         ...(stageErrors.length ? { errors: stageErrors } : {}),
       });
-      // What THIS pass did, every stage that failed in it included — what
-      // "Run once now" answers and the Overview counts. (Review of P7: a
-      // stage failing the same way again was left out of the pass's own
-      // result too, and the Overview read "nothing needed changing" right
-      // above "Fee automation failed".) The run history gets the failure only
-      // when it is news: LND down for an hour is one line there, not two a
-      // run.
-      const run = lineOf(errors);
-      const line = lineOf(errors.filter((e) => news.has(e.stage)));
+      // What THIS pass did — every item and every stage that failed in it
+      // included: what "Run once now" answers and the Overview counts.
+      // (Review of P7: a stage, then a fee write, an own open or an offer
+      // write failing the same way again was left out of the pass's own
+      // result, and the Overview read "nothing needed changing" right above
+      // "Fee automation failed".) The run history gets a failure only when
+      // it is news: LND down for an hour, a fee LND keeps refusing, a wallet
+      // that can't fund an open, offer upkeep failing while Amboss is down —
+      // each one line there, not one (or two) a run (review
+      // a3-channels:history-flood; the area's status counts the repeats, and
+      // the offer sync status keeps its last error either way).
+      const run = lineOf({ changes, channels, sells: acted }, errors);
+      const line = lineOf(
+        { changes: changes.filter((c) => !c.repeat), channels: channels.filter((c) => !c.repeat), sells: this.laneNews(acted) },
+        errors.filter((e) => news.has(e.stage)),
+      );
 
       this.state.lastRunAt = run.at;
       // Every pass in numbers — the ones that did nothing too: the Overview

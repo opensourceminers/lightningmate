@@ -62,7 +62,9 @@ export const GOSSIP_PEER = "03" + "9a".repeat(32);
  * answered here with an empty one). `files`: other state files of the data
  * dir as a previous process left them (e.g. "rebalances.json"). `node`: the
  * fake LND to run on (default: an empty one with 20M on chain, connected to a
- * gossip peer).
+ * gossip peer). `writeDenied`: the gRPC methods LND refuses the write client
+ * (its macaroon lacks them, FakeLnd.withoutPermission); the read client may
+ * call everything.
  */
 export function autopilotWith(
   t: AfterHook,
@@ -70,6 +72,7 @@ export function autopilotWith(
   stored: Record<string, unknown> = {},
   files: Record<string, unknown> = {},
   node: FakeLnd = new FakeLnd({ chainBalance: 20_000_000, peers: [GOSSIP_PEER] }),
+  writeDenied: string[] = [],
 ) {
   const http = installFetchMock(t);
   http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
@@ -84,7 +87,7 @@ export function autopilotWith(
   const autopilot = new Autopilot(
     dir,
     node.lnd,
-    node.lnd,
+    writeDenied.length > 0 ? node.withoutPermission(...writeDenied) : node.lnd,
     new RebalanceLog(dir),
     new OverridesStore(dir),
     amboss,
@@ -127,10 +130,12 @@ export const BUYER = "02" + "ab".repeat(32);
  * on, auto-pricing/sizing/relisting off (no market reads), generous caps.
  * `restart()` builds a NEW autopilot on the same data dir, node and Amboss —
  * what a process restart sees: the disk and LND, nothing from memory.
+ * `writeDenied`: the gRPC methods LND refuses the write client (its macaroon
+ * lacks them, FakeLnd.withoutPermission).
  */
 export function sellerSetup(
   t: AfterHook,
-  opts: { config?: Record<string, unknown>; chainBalance?: number; payFees?: boolean; payTimeoutMs?: number } = {},
+  opts: { config?: Record<string, unknown>; chainBalance?: number; payFees?: boolean; payTimeoutMs?: number; writeDenied?: string[] } = {},
 ) {
   const http = installFetchMock(t);
   http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
@@ -164,12 +169,13 @@ export function sellerSetup(
   const fees = new ServiceFeeLedger(dir, opts.payFees ? lndFeeLightning(node.lnd) : null, {
     payTimeoutMs: opts.payTimeoutMs ?? 10_000,
   });
+  const writeLnd = opts.writeDenied?.length ? node.withoutPermission(...opts.writeDenied) : node.lnd;
   const started: Autopilot[] = [];
   const make = () => {
     const ap = new Autopilot(
       dir,
       node.lnd,
-      node.lnd,
+      writeLnd,
       new RebalanceLog(dir),
       new OverridesStore(dir),
       new AmbossStore(dir),
@@ -186,7 +192,7 @@ export function sellerSetup(
   const autopilot = new Autopilot(
     dir,
     node.lnd,
-    node.lnd,
+    writeLnd,
     new RebalanceLog(dir),
     new OverridesStore(dir),
     amboss,

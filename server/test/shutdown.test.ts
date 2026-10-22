@@ -695,14 +695,15 @@ async function serveGated(t: AfterHook, router: Router) {
     let req!: http.ClientRequest;
     const status = new Promise<number>((resolve, reject) => {
       req = http.request(
-        { host: "127.0.0.1", port, method: "POST", path: `/api${path}`, headers: { Host: `localhost:${port}` } },
+        // JSON, as the web client sends every POST (the API refuses any other type).
+        { host: "127.0.0.1", port, method: "POST", path: `/api${path}`, headers: { Host: `localhost:${port}`, "Content-Type": "application/json", "Content-Length": 2 } },
         (res) => {
           res.resume();
           resolve(res.statusCode ?? 0);
         },
       );
       req.on("error", reject);
-      req.end();
+      req.end("{}");
     });
     status.catch(() => undefined); // a dropped connection is the point of some tests
     return { req, status };

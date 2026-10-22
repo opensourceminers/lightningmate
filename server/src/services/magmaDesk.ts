@@ -38,6 +38,7 @@ import {
 } from "./hodl.js";
 import { channelsWith, findOpenedChannel, spendableOnchain, type CapitalLedger } from "./capital.js";
 import {
+  MissingPermission,
   closeChannelByOutpoint,
   couldNotConnect,
   ensureConnected,
@@ -220,6 +221,9 @@ export interface DeskResult {
     | "amboss"
     /** LND did not answer (nothing was changed). */
     | "node"
+    /** LND refused the write macaroon a call this needs (nothing was
+     *  changed): the operator's to fix — the message names the permission. */
+    | "permission"
     | "bad_status"
     | "capital"
     | "unreachable"
@@ -233,6 +237,9 @@ export interface DeskResult {
   /** For an opened channel: has Amboss taken the funding transaction yet?
    *  (If not, the order lane keeps reporting it — it is never reopened.) */
   reported?: boolean;
+  /** An accepted order: does the lane open its channel once the buyer has
+   *  paid (opensItself), or must the operator click "Open channel"? */
+  opensItself?: boolean;
 }
 
 /** What this node knows about an order — merged into the Orders view. */
@@ -335,8 +342,10 @@ interface LanePass {
   reason: string | null;
   /** The key check was asked once this pass already. */
   rechecked: boolean;
-  /** A problem with Amboss's answers that isn't an outage — Amboss rejecting
-   *  the lane's own request — for the lane's status (the pass goes on). */
+  /** A problem that isn't an outage and won't clear by itself — Amboss
+   *  rejecting the lane's own request, or LND refusing the write macaroon
+   *  the peer listing every order's open needs — for the lane's status (the
+   *  pass goes on). */
   problem: string | null;
   /** The orders this pass's listing shows waiting on us, as listed (null: no
    *  listing this pass). An order in it exists, whatever a read of it
@@ -587,6 +596,33 @@ export class MagmaDesk {
         via: e.via,
         external: e.external ?? null,
       }));
+  }
+
+  /**
+   * Does the order lane open this order's channel by itself once the buyer
+   * has paid — or is it the operator's "Open channel" click? With Liquidity
+   * provision on, every paid order of this node is the lane's (an unknown
+   * one is adopted); with it off — or all automation paused — only those
+   * the lane accepted itself, which it carries to their end (fulfil: auto).
+   * Without write mode or an Amboss key, nothing is opened by itself — nor
+   * for an order this node has finished with (settled, cancelled, rejected,
+   * failed: its held payment released, say) or one accepted outside
+   * LightningMate or by another node of the account (`external`), whatever
+   * Amboss still lists: the lane opens no channel for those (advance()).
+   * (Review of P7: Market → Orders said "waiting for you to open the
+   * channel" for orders the lane was about to open itself. Review of P8:
+   * and "the autopilot opens the channel · accepted outside LightningMate"
+   * for one it never opens.) With selling off, "accepted itself" means past
+   * "seen": an order the paused lane only saw is the operator's to decide
+   * (SELLING_OFF_SKIP) — accepted on Amboss's site after all, Orders said
+   * "Paid — the autopilot opens the channel" until the next pass found it
+   * accepted elsewhere (review of P8, final round).
+   */
+  opensItself(orderId: string): boolean {
+    if (!this.deps.writeLnd || !this.deps.amboss.hasKey()) return false;
+    const entry = this.journal.get(orderId);
+    if (entry && (TERMINAL_PHASES.has(entry.phase) || entry.external)) return false;
+    return this.deps.config().sellEnabled || (entry?.via === "autopilot" && entry.phase !== "seen");
   }
 
   localView(orderId: string): MagmaOrderLocal | null {
@@ -1315,8 +1351,21 @@ export class MagmaDesk {
     return out;
   }
 
-  /** The lane's decision on an order waiting for approval: accept, or reject
-   *  at once when it cannot be served — never let it time out. */
+  /**
+   * The lane's decision on an order waiting for approval: accept, or reject
+   * at once when it cannot be served — never let it time out.
+   *
+   * Only while Liquidity provision is on, asked live — before anything is
+   * decided and again after every wait (the capital check, the dial): a
+   * paused lane never turns an order down on its own, as it never accepts
+   * one (acceptOrder); the order is the operator's (SELLING_OFF_SKIP). D6's
+   * immediate reject is a RUNNING lane's. Review of P7: advance() calls this
+   * on the settings read before the order's Amboss read, and the capital
+   * check and the buyer's dial (up to ~90 s over Tor) are awaited — a pause
+   * in any of them still sent RejectOrder ("the buyer's node is
+   * unreachable", "not enough on-chain capital", or "could not decide on it
+   * in time" near the deadline).
+   */
   private async decide(order: SaleOrderDetail, pass: LanePass): Promise<MagmaSellAction[]> {
     const entry =
       this.journal.get(order.id) ??
@@ -1333,6 +1382,8 @@ export class MagmaDesk {
     if (order.timeout !== null && Date.parse(order.timeout) <= Date.now()) {
       return [this.skip(entry, "the approval deadline has passed")];
     }
+    const sellingOff = () => !this.deps.config().sellEnabled;
+    if (sellingOff()) return [this.skip(entry, SELLING_OFF_SKIP)];
     if (order.assetType !== "BASE_ASSET") return this.rejectOrder(entry, `not a bitcoin channel (${order.assetType})`);
     if (!/^[0-9a-f]{66}$/i.test(order.buyerPubkey)) return this.rejectOrder(entry, "the order names no valid buyer node");
     if (order.sizeSats <= 0) return this.rejectOrder(entry, "the order has no channel size");
@@ -1349,18 +1400,34 @@ export class MagmaDesk {
       // A key Amboss refuses now: the pass turns to LND alone (advance).
       if (isAuthError(err) && !(await this.keyStillValid(pass))) throw err;
       if (isQueryRejected(err)) pass.problem ??= queryRejectedText(err);
+      // Paused while the check ran: not undecided — the operator's to decide
+      // (never "could not decide on it in time" near the deadline).
+      if (sellingOff()) return [this.skip(entry, SELLING_OFF_SKIP)];
       return this.undecided(entry, order, capitalCheckFailed(err), pass);
     }
+    // The check is awaited (LND's wallet, maybe Amboss's listing).
+    if (sellingOff()) return [this.skip(entry, SELLING_OFF_SKIP)];
     if (lacking) return this.rejectOrder(entry, lacking.reason, lacking.kind);
-    if (!(await this.connectBuyer(order))) return this.rejectOrder(entry, "the buyer's node is unreachable");
-    if (this.stopping) return [this.skip(entry, "shutting down")];
+    const reached = await this.connectBuyer(order);
     // Dialing the buyer can take a minute and a half over Tor: Liquidity
     // provision may have been switched off — or all automation paused —
     // meanwhile (review of P7: the lane accepted on the switch it read when
-    // the pass began). Then nothing is promised: the order waits for the
+    // the pass began, and turned the order down when the dial then failed).
+    // Then nothing is promised and nothing refused: the order waits for the
     // operator's decision on Market → Orders. (acceptOrder asks again after
     // each of its own waits, up to the moment the accept goes out.)
-    if (!this.deps.config().sellEnabled) return [this.skip(entry, SELLING_OFF_SKIP)];
+    if (sellingOff()) return [this.skip(entry, SELLING_OFF_SKIP)];
+    if (!reached.ok && reached.blocked) {
+      // LND won't list its peers to the write macaroon (no peers:read): the
+      // buyer's connection can't be checked, and no channel could be opened
+      // for it. Still turned down at once (D6) — never left to time out —
+      // but for what it is: this node's setup, not the buyer (before: "the
+      // buyer's node is unreachable", for every order). The lane says it too.
+      pass.problem ??= reached.blocked;
+      return this.rejectOrder(entry, `this node can't check its connection to the buyer: ${reached.blocked}`);
+    }
+    if (!reached.ok) return this.rejectOrder(entry, "the buyer's node is unreachable");
+    if (this.stopping) return [this.skip(entry, "shutting down")];
     return this.acceptOrder(entry, order, fee, "autopilot", pass);
   }
 
@@ -1439,6 +1506,8 @@ export class MagmaDesk {
           expiresAt: new Date(Date.now() + HODL_EXPIRY_MS).toISOString(),
           cltvDelta: HODL_CLTV_DELTA,
         };
+        // A new attempt: its accept has not gone out (sendAccept marks it).
+        entry.acceptSentAt = undefined;
         entry.acceptAttempts += 1;
         entry.decision = { at: now(), action: "accept", reason: via === "manual" ? "accepted by you" : "within your caps and capital" };
         this.journal.event(entry, "accepting: preimage saved");
@@ -1470,7 +1539,7 @@ export class MagmaDesk {
     // the accept goes out. (A failed invoice left nothing reserved either.)
     if (sellingOff()) return [made ? await this.withdrawAccept(entry) : this.skip(entry, SELLING_OFF_SKIP)];
     if (!made) return this.invoiceFailed(entry, order, pass);
-    return [await this.sendAccept(entry)];
+    return this.sendAccept(entry, order, pass);
   }
 
   /**
@@ -1495,16 +1564,27 @@ export class MagmaDesk {
   }
 
   /**
-   * LND could not make (or find) the order's HODL invoice: nothing was
-   * offered — ensureInvoice put the order back to "seen", nothing reserved.
-   * The lane tries again on its next pass; with the approval deadline close,
-   * it rejects the order instead of leaving it to time out. A click (or an
-   * order taken on by hand) is only told.
+   * LND could not make (or find) the order's HODL invoice — or the accept's
+   * mark could not be saved (unmarkedAccept): nothing Amboss holds us to was
+   * offered (unmarkedAccept says why for a resend), the order is back to
+   * "seen", nothing reserved. A running lane tries again on its next pass;
+   * with the approval deadline close, it rejects the order instead of
+   * leaving it to time out. A paused lane — Liquidity provision
+   * off, or all automation paused, asked live — turns nothing down on its
+   * own: the order is the operator's (SELLING_OFF_SKIP), as in decide(). A
+   * click (or an order taken on by hand) is only told. (Review of P8, round
+   * 2: a resend whose mark couldn't be saved, the lane paused since the
+   * first send, was rejected near its deadline with a "turned down" alert —
+   * the one reject path left that didn't ask the switch.)
    */
   private async invoiceFailed(entry: MagmaJournalEntry, order: SaleOrder, pass: LanePass | null): Promise<MagmaSellAction[]> {
     const error = entry.lastError ?? "could not create the HODL invoice";
     const failed: MagmaSellAction = { orderId: entry.orderId, action: "accept", sizeSats: entry.sizeSats, ok: false, error };
     if (!pass || entry.via === "manual") return [failed];
+    if (!this.deps.config().sellEnabled) {
+      this.skip(entry, SELLING_OFF_SKIP);
+      return [failed];
+    }
     const rejected = await this.rejectUndecided(entry, order, error, pass);
     if (rejected) return [failed, ...rejected];
     pass.undecided.push(error);
@@ -1546,12 +1626,28 @@ export class MagmaDesk {
     }
   }
 
-  private async sendAccept(entry: MagmaJournalEntry): Promise<MagmaSellAction> {
+  /**
+   * Send the accept. `acceptSentAt` is on disk BEFORE it goes out: after a
+   * crash, resumeAccept tells an accept that may have reached Amboss (it is
+   * completed, as the step under way) from one that never left (with selling
+   * off since, it is withdrawn — review of P7: nothing recorded whether the
+   * accept went out, so a lane paused before a crash still sent it after the
+   * restart). A marker that can't be saved sends nothing — the journal's
+   * rule for every external step (unmarkedAccept). `pass`: the lane's, or
+   * null for a click.
+   */
+  private async sendAccept(entry: MagmaJournalEntry, order: SaleOrder, pass: LanePass | null): Promise<MagmaSellAction[]> {
     const inv = entry.invoice!;
     const base = { orderId: entry.orderId, action: "accept" as const, sizeSats: entry.sizeSats };
+    const sentBefore = entry.acceptSentAt;
     entry.acceptSentAt = now();
-    this.journal.event(entry, "accept sent");
-    this.journal.note(entry);
+    this.journal.event(entry, "sending the accept");
+    try {
+      this.journal.commit(entry);
+    } catch (err) {
+      entry.acceptSentAt = sentBefore;
+      return this.unmarkedAccept(entry, order, pass, msg(err), sentBefore !== undefined);
+    }
     let ok: boolean;
     try {
       ok = await this.ambossAccept(this.deps.amboss.getKey(), entry.orderId, inv.request!);
@@ -1561,11 +1657,11 @@ export class MagmaDesk {
       if (isAuthError(err) || isQueryRejected(err)) throw err;
       // Maybe applied, maybe not: the next pass asks Amboss (resumeAccept).
       this.noteError(entry, `accept not confirmed (${msg(err)}) — checking with Amboss on the next pass`);
-      return { ...base, ok: false, error: entry.lastError };
+      return [{ ...base, ok: false, error: entry.lastError }];
     }
     if (ok) {
       this.toPhase(entry, "accepted", "Amboss confirmed the accept");
-      return { ...base, ok: true };
+      return [{ ...base, ok: true }];
     }
     // Refused: release the unused invoice; the lane may try again (bounded).
     await this.lndCancel(inv.id).catch(() => undefined);
@@ -1573,16 +1669,78 @@ export class MagmaDesk {
     entry.invoice = null;
     this.noteError(entry, "Amboss refused the accept");
     if (entry.acceptAttempts >= MAX_ACCEPT_ATTEMPTS && entry.via === "autopilot") {
-      const [rejected] = await this.rejectOrder(entry, `Amboss refused the accept ${entry.acceptAttempts} times`);
-      return rejected ?? { ...base, ok: false, error: "Amboss refused the accept" };
+      // Paused while the accept was out: no reject of the lane's own — the
+      // order (nothing promised: the invoice is released) is the operator's.
+      if (!this.deps.config().sellEnabled) {
+        this.skip(entry, SELLING_OFF_SKIP);
+        return [{ ...base, ok: false, error: "Amboss refused the accept" }];
+      }
+      const rejected = await this.rejectOrder(entry, `Amboss refused the accept ${entry.acceptAttempts} times`);
+      return rejected.length ? rejected : [{ ...base, ok: false, error: "Amboss refused the accept" }];
     }
-    return { ...base, ok: false, error: "Amboss refused the accept" };
+    return [{ ...base, ok: false, error: "Amboss refused the accept" }];
   }
 
-  /** Our accept may or may not have reached Amboss (timeout, crash), and the
-   *  order still waits for approval: send it again with the same invoice
-   *  while that still has its 48 h. Older than that, start over. `pass`: the
-   *  lane's, or null for a click. */
+  /**
+   * The accept's mark could not be saved (a full disk, say), so the accept
+   * is not sent: one that went out unmarked could, after a crash, be
+   * withdrawn while Amboss holds us to it. Nothing is kept for it — the
+   * invoice is released, the coins are free, the order is back to "seen" as
+   * a failed invoice leaves it — and that withdraws nothing Amboss holds us
+   * to. On a first send nothing reached Amboss: nobody but this node has the
+   * invoice's request. On a resend (`resent`) the earlier send of this
+   * attempt went out, marked, and may well have handed Amboss the request —
+   * but Amboss has not applied it: only resumeAccept resends, and it is
+   * called only while the order, read from Amboss just before (the lane's
+   * pass in advance(), or a click's accept), still awaits the seller's
+   * approval. An accept Amboss applied moves the order on, and the pass
+   * takes it as accepted instead. The attempt is not counted — unless it was
+   * a resend: its earlier send went out, and that one counts
+   * (MAX_ACCEPT_ATTEMPTS). Then as invoiceFailed: a running lane decides
+   * afresh on its next pass, and with the approval deadline close it rejects
+   * the order rather than leave it to time out on us (D6); the lane's status
+   * says why meanwhile. A paused lane leaves the order to the operator. A
+   * click — or an order taken on by hand — is only told. (Review of P8: the
+   * entry stayed "accepting" with its invoice open in LND, tried again every
+   * pass until the order timed out — SELLER_FAILED_TO_REACT, the
+   * seller-score hit D6 exists to prevent. Round 3: this said nothing had
+   * been offered, which a resend's earlier send may have done.)
+   */
+  private async unmarkedAccept(
+    entry: MagmaJournalEntry,
+    order: SaleOrder,
+    pass: LanePass | null,
+    error: string,
+    resent: boolean,
+  ): Promise<MagmaSellAction[]> {
+    const inv = entry.invoice;
+    entry.phase = "seen";
+    entry.invoice = null;
+    if (!resent) entry.acceptAttempts = Math.max(0, entry.acceptAttempts - 1);
+    this.noteError(entry, `cannot save the order journal (${error}) — the accept was not sent and its invoice was released`);
+    if (inv) await this.lndCancel(inv.id).catch(() => undefined);
+    return this.invoiceFailed(entry, order, pass);
+  }
+
+  /**
+   * An accept under way when the last pass (or process) stopped, and the
+   * order still waits for approval. Sent — maybe it reached Amboss (a
+   * timeout, a crash after `acceptSentAt` was saved): sent again with the
+   * same invoice while that still has its 48 h — the step under way is
+   * completed, whatever the switch says now. Never sent (a crash between the
+   * invoice and the accept): with Liquidity provision off since — or all
+   * automation paused — the lane's accept is withdrawn as if the pause had
+   * come before it (withdrawAccept: back to "seen", coins and invoice
+   * released, the attempt not counted); a click's is the operator's own and
+   * goes on. An invoice older than that: start over. `pass`: the lane's, or
+   * null for a click.
+   *
+   * The switch is asked before the invoice is checked and again after: when
+   * a crash lost the invoice's request, ensureInvoice asks LND for it — an
+   * await, during which a pause can land — and acceptOrder, too, asks after
+   * its own invoice wait. (Review of P8, round 2: a pause during that lookup
+   * still sent the lane's never-sent accept.)
+   */
   private async resumeAccept(entry: MagmaJournalEntry, order: SaleOrderDetail, pass: LanePass | null): Promise<MagmaSellAction[]> {
     const inv = entry.invoice;
     if (!inv || Date.parse(inv.expiresAt) - Date.now() < MIN_INVOICE_LIFE_MS) {
@@ -1594,8 +1752,12 @@ export class MagmaDesk {
       // The lane decides afresh; a manual accept is repeated by the caller.
       return entry.via !== "manual" && pass && this.deps.config().sellEnabled ? this.decide(order, pass) : [];
     }
+    // The lane's own accept that never went out, with selling off by now.
+    const toWithdraw = () => !entry.acceptSentAt && entry.via === "autopilot" && pass !== null && !this.deps.config().sellEnabled;
+    if (toWithdraw()) return [await this.withdrawAccept(entry)];
     if (!(await this.ensureInvoice(entry))) return this.invoiceFailed(entry, order, pass);
-    return [await this.sendAccept(entry)];
+    if (toWithdraw()) return [await this.withdrawAccept(entry)];
+    return this.sendAccept(entry, order, pass);
   }
 
   // ── reject ─────────────────────────────────────────────────────────────────
@@ -1699,7 +1861,13 @@ export class MagmaDesk {
     const base = { orderId: entry.orderId, action: "open" as const, sizeSats: entry.sizeSats };
     const unfit = await this.cannotOpen(entry, order);
     if (unfit) return unfit;
-    if (!(await this.connectBuyer(order))) return this.openFailed(entry, order, couldNotConnect(entry.buyerPubkey));
+    const reached = await this.connectBuyer(order);
+    // A macaroon LND won't list peers to blocks every open — the operator's
+    // to fix (and restart): the payment stays held while there is time, as
+    // for a buyer that is away, and is released with this reason after.
+    if (!reached.ok) {
+      return reached.blocked ? this.openFailed(entry, order, reached.blocked, true) : this.openFailed(entry, order, couldNotConnect(entry.buyerPubkey));
+    }
     if (this.stopping) return [{ ...base, ok: false, error: "shutting down" }];
     return this.deps.capital.mutex.run("magma open", async (): Promise<MagmaSellAction[]> => {
       if (entry.phase !== "held") return []; // someone else got here first
@@ -1790,10 +1958,12 @@ export class MagmaDesk {
   }
 
   /** A failed open: retried on later passes while it may still work and there
-   *  is time; otherwise the held payment is released (buyer refunded). */
-  private async openFailed(entry: MagmaJournalEntry, order: SaleOrder, error: string): Promise<MagmaSellAction[]> {
+   *  is time; otherwise the held payment is released (buyer refunded).
+   *  `retry`: whether it may still work — by default, from the error's words
+   *  (isTransientOpen). */
+  private async openFailed(entry: MagmaJournalEntry, order: SaleOrder, error: string, retry = isTransientOpen(error)): Promise<MagmaSellAction[]> {
     const base = { orderId: entry.orderId, action: "open" as const, sizeSats: entry.sizeSats };
-    if (isTransientOpen(error) && this.timeLeftToOpen(entry, order)) {
+    if (retry && this.timeLeftToOpen(entry, order)) {
       this.noteError(entry, `${error} — will try again`);
       return [{ ...base, ok: false, error: `${error} — will try again` }];
     }
@@ -2296,7 +2466,13 @@ export class MagmaDesk {
       }
       const fee = this.invoiceMsat(order);
       if (fee <= 0n) return { ok: false, code: "amboss", message: "Amboss reports no fee for this order yet — try again in a minute." };
-      if (!(await this.connectBuyer(order))) {
+      const reached = await this.connectBuyer(order);
+      if (!reached.ok && reached.blocked) {
+        // This node's setup, not the buyer: nothing to reject the order for
+        // — fix the macaroon, restart, and accept it while there is time.
+        return { ok: false, code: "permission", message: `Not accepted: this node can't check its connection to the buyer — ${reached.blocked}.` };
+      }
+      if (!reached.ok) {
         return { ok: false, code: "unreachable", message: "The buyer's node is unreachable right now — rejecting the order is safer than accepting it." };
       }
       entry ??= this.journal.create({
@@ -2425,6 +2601,11 @@ export class MagmaDesk {
         isPrivate: order.isPrivate,
         feeMsat: String(this.invoiceMsat(order)),
       });
+      // The operator's decision, also on an order the lane recorded first
+      // (one it left to them — SELLING_OFF_SKIP — or couldn't decide): never
+      // a "turned down" alert, nor a refusal on the Overview (refusals()
+      // counts the lane's own). As the manual accept does (acceptOrder).
+      entry.via = "manual";
       const [res] = await this.rejectOrder(entry, "rejected by you");
       return this.result(entry, res);
     });
@@ -2613,11 +2794,15 @@ export class MagmaDesk {
     }
   }
 
-  private async connectBuyer(order: SaleOrderDetail): Promise<boolean> {
+  /** Dial the buyer: connected, or not — and `blocked` (the reason) when
+   *  LND won't list its peers to the write macaroon (no peers:read), so no
+   *  buyer's connection can be checked: this node's setup, never the buyer's
+   *  node being unreachable (MissingPermission). */
+  private async connectBuyer(order: SaleOrderDetail): Promise<{ ok: true } | { ok: false; blocked: string | null }> {
     try {
-      return await this.lndConnect(order.buyerPubkey, order.sockets);
-    } catch {
-      return false;
+      return (await this.lndConnect(order.buyerPubkey, order.sockets)) ? { ok: true } : { ok: false, blocked: null };
+    } catch (err) {
+      return { ok: false, blocked: err instanceof MissingPermission ? err.message : null };
     }
   }
 

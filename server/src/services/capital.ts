@@ -359,18 +359,15 @@ export interface PromisedSpendRefusal {
  * their own checks apply. With nothing promised there is nothing to protect
  * — no reserve of the autopilot's is imposed on a manual spend; LND applies
  * its own limits. Null: go ahead. Call it inside the on-chain mutex when the
- * answer decides the spend.
- *
- * `sendFeeSat`: an on-chain send's own fee (its preview's). The spend then
- * pays that, not a funding-fee estimate — the same sum the send's preview
- * uses, so "Max" never reads as touching the promised coins, nor a send
- * the preview flags as touching them as not (onchain.ts planSend).
+ * answer decides the spend. (A manual open's check: an on-chain send makes
+ * it from figures its preview read already, with its own fee —
+ * promisedSpendFrom.)
  */
 export async function promisedSpendRefusal(
   lnd: AuthenticatedLnd,
   ledger: CapitalLedger,
   amountSat: number,
-  opts: { newChannel: boolean; sendFeeSat?: number },
+  opts: { newChannel: boolean },
 ): Promise<PromisedSpendRefusal | null> {
   const pending = ledger.pending();
   if (pending.length === 0) return null;
@@ -379,7 +376,11 @@ export async function promisedSpendRefusal(
 }
 
 /** promisedSpendRefusal from figures already read: the confirmed balance,
- *  LND's reserve inputs and the promises standing (`pending`). */
+ *  LND's reserve inputs and the promises standing (`pending`).
+ *  `sendFeeSat`: an on-chain send's own fee (its preview's). The spend then
+ *  pays that, not a funding-fee estimate — the same sum the send's preview
+ *  uses, so "Max" never reads as touching the promised coins, nor a send
+ *  the preview flags as touching them as not (onchain.ts planSend). */
 export function promisedSpendFrom(
   chainSat: number,
   inputs: ReserveInputs,

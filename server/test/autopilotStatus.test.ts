@@ -28,7 +28,7 @@ import { AmbossStore } from "../src/services/ambossStore.js";
 import { EarningsLog } from "../src/services/earningsLog.js";
 import { ServiceFeeLedger } from "../src/services/serviceFee.js";
 import { timestampConsole } from "../src/services/log.js";
-import { autopilotWith, failedRebalance, plannedFeeChange, plannedRebalance, sellerSetup, suppressSchedulerKicks } from "./helpers/autopilot.js";
+import { autopilotWith, failedRebalance, plannedFeeChange, plannedRebalance, sellerSetup, suggestion, suppressSchedulerKicks } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
 import { installChain, installPayments } from "./helpers/chain.js";
@@ -66,7 +66,7 @@ test("a fee run that changes fees says which — and one whose every update LND 
   const fees = autopilot.getState().status.fees;
   assert.deepEqual([fees.state, fees.text], ["acted", "2 fee updates applied: peer-800001x1x0 300→280 ppm, peer-800002x1x0 100→120 ppm"]);
   // Every update refused: red, with LND's words.
-  const r = feeDecision([plannedFeeChange("a", 1, 2)], 1, [{ alias: "a", fromPpm: 1, toPpm: 2, ok: false, error: "LND refused: invalid policy — not retried for 6 h" }]);
+  const r = feeDecision([plannedFeeChange("a", 1, 2)], [{ alias: "a", fromPpm: 1, toPpm: 2, ok: false, error: "LND refused: invalid policy — not retried for 6 h" }]);
   assert.deepEqual(r, { text: "1 update LND refused (LND refused: invalid policy — not retried for 6 h)", state: "error" });
 });
 
@@ -195,7 +195,7 @@ test("the Overview pairs the last run's time with THAT run's counts — a fresh 
   assert.deepEqual(d.autopilot.lastRun, { applied: 0, attempted: 0, failed: 0, feeChanges: 0, rebalances: 0, sells: 0, opens: 0, maxHtlc: 0, errors: [] });
   assert.equal(d.autopilot.lastActionAt, threeDaysAgo, "the last change is its own item");
   assert.equal(d.autopilot.pausedAt, null);
-  assert.equal(d.autopilot.status.fees.state, "idle");
+  assert.equal(d.autopilot.status.fees?.state, "idle");
 
   // A run whose every fee update fails: its failures are counted.
   seams.feeReport = async () => ({ recommendations: [plannedFeeChange("800001x1x0", 300, 280)] });
@@ -215,7 +215,7 @@ test("a summary from before the upgrade (none for the latest run) is never paire
     [],
     { count: 0, totalAmountSats: 0 },
     {
-      config: { enabled: true, rebalanceEnabled: false, channelEnabled: false, sellEnabled: false, intervalMinutes: 30 },
+      config: { enabled: true, rebalanceEnabled: false, channelEnabled: false, sellEnabled: false, maxHtlcEnabled: false, intervalMinutes: 30 },
       lastRunAt: new Date().toISOString(),
       // A summary of an older pass (the latest one threw before it was kept).
       lastRun: {
@@ -451,7 +451,7 @@ test("GET /diagnostics: version, settings, each area's status and decision chang
   const d = res.body;
   assert.equal(d.app.writeEnabled, true);
   assert.equal(d.autopilot.config.enabled, true);
-  assert.equal(d.autopilot.status.fees.state, "idle");
+  assert.equal(d.autopilot.status.fees?.state, "idle");
   assert.ok(d.autopilot.decisionLog.some((e: { area: string }) => e.area === "fees"));
   assert.equal(d.autopilot.lastRun.at, d.autopilot.lastRunAt);
   assert.equal(d.magma.key.connected, true);
@@ -614,11 +614,14 @@ test("a shared Magma report whose read failed is not kept: the next ask reads af
   assert.equal(reads, 2, "a good read is shared");
 });
 
-test("fee updates LND refuses again — left out of the run history as repeats — still count as refusals in the fee decision", () => {
+test("fee updates LND refuses again — left out of the run history as repeats — still count as refusals in the fee decision, with LND's words", () => {
   const recs = [plannedFeeChange("a", 300, 280), plannedFeeChange("b", 300, 280)];
-  // Two updates were sent; LND refused both, the second the same way as
-  // before (a repeat, not in the result).
-  const r = feeDecision(recs, 2, [{ alias: "a", fromPpm: 300, toPpm: 280, ok: false, error: "LND refused the update: invalid policy — not retried for 6 h" }]);
+  // Two updates were sent; LND refused both, the first the same way as
+  // before (a repeat: in the pass's result, flagged).
+  const r = feeDecision(recs, [
+    { alias: "a", fromPpm: 300, toPpm: 280, ok: false, error: "LND refused the update: invalid policy — not retried for 6 h", repeat: true },
+    { alias: "b", fromPpm: 300, toPpm: 280, ok: false, error: "LND refused the update: invalid policy — not retried for 6 h" },
+  ]);
   assert.deepEqual(r, { text: "2 updates LND refused (LND refused the update: invalid policy — not retried for 6 h)", state: "error" });
 });
 
@@ -721,4 +724,117 @@ test("diagnostics name the commit the image was built from — the Dockerfile an
   assert.match(dockerfile, /APP_REVISION=\$APP_REVISION/);
   const workflow = readFileSync(new URL("../../.github/workflows/build-image.yml", import.meta.url), "utf8");
   assert.match(workflow, /build-args: \|\n\s+APP_VERSION=.*\n\s+APP_REVISION=\$\{\{ github\.sha \}\}/);
+});
+
+// ── review of P7 (final): an item that fails the same way again ─────────────
+//
+// The repair counted every stage error in the pass's own result, but an
+// ITEM that failed the same way as in the last run — a fee write LND refused
+// again (quietRepeats), this node's own open failing again (channelNews), an
+// offer write failing again (laneNews) — was dropped before the pass's
+// result was built. The Overview then read "Autopilot 0s ago: nothing needed
+// changing" right above "Fee automation failed: …", the tile "0 applied",
+// "Run once now" "nothing needed doing" — and the fee status lost LND's
+// reason ("the same refusal as before"). The words for these numbers are
+// pinned in web/test/autopilotView.test.tsx (PROBE-DIGEST-QUIET-REPEAT).
+
+/** The Overview's autopilot block for this autopilot's state, as the
+ *  dashboard builds it (no forwards, no payments). */
+function overviewOf(autopilot: Autopilot) {
+  const report = { windowDays: 30, totalFeesEarnedSats: 0, totalForwards: 0, totalRoutedSats: 0, daily: [], recent: [], perChannel: [] } as unknown as Parameters<typeof buildDashboard>[0];
+  return buildDashboard(report, { invoices: [], payments: [] }, [], { count: 0, totalAmountSats: 0 }, autopilot.getState(), 0).autopilot;
+}
+
+test("PROBE-DIGEST-QUIET-REPEAT: a fee update LND refuses again the same way is a failure of that run too — in the run, lastRun and the Overview's numbers, with LND's reason on the fee status; the history keeps one line", async (t) => {
+  quiet(t);
+  const { autopilot, seams } = autopilotWith(t, { enabled: true });
+  seams.feeReport = async () => ({ recommendations: [plannedFeeChange("800001x1x0", 300, 280)] });
+  seams.feeApply = async (_w, items) => items.map((i) => ({ id: i.id, ok: false, feeRatePpm: i.feeRatePpm, error: "LND refused the update: invalid policy" }));
+  const run1 = await autopilot.runOnce();
+  const run2 = await autopilot.runOnce(); // (the back-off is the engine's guard; this stub plans the write regardless)
+  // Before: the second run was 0 attempted, 0 failed.
+  assert.deepEqual([run1.attempted, run1.failed], [1, 1]);
+  assert.deepEqual([run2.attempted, run2.applied, run2.failed], [1, 0, 1]);
+  assert.equal(run2.changes[0]?.repeat, true, "flagged as the same failure again");
+  assert.equal(run1.changes[0]?.repeat, undefined, "the first one is news");
+  const st = autopilot.getState();
+  assert.deepEqual([st.lastRun?.attempted, st.lastRun?.applied, st.lastRun?.failed], [1, 0, 1]);
+  assert.deepEqual(st.lastRun?.feeChanges, { ok: 0, failed: 1 });
+  const o = overviewOf(autopilot).lastRun;
+  assert.deepEqual([o?.applied, o?.attempted, o?.failed, o?.feeChanges, o?.errors], [0, 1, 1, 0, []]);
+  // LND's own reason — not "the same refusal as before".
+  assert.equal(st.status.fees.text, "1 update LND refused (LND refused the update: invalid policy — not retried for 6 h)");
+  assert.equal(st.status.fees.state, "error");
+  // The run history: one line for the two identical failures (not news).
+  assert.equal(st.history.flatMap((r) => r.changes).length, 1);
+});
+
+// Only the autopilot's own passes keep a repeated failure out of the history
+// (quietRepeats). A click is the operator's: each "Apply" LND refuses is on
+// the record, the same refusal as the click before included — flagged as a
+// repeat, recordRun would drop it without a word.
+test("an Apply by hand that LND refuses the same way as the click before is on the record both times — never flagged as a repeat", async (t) => {
+  quiet(t);
+  const { autopilot, seams } = autopilotWith(t, { enabled: false });
+  seams.feeReport = async () => ({ recommendations: [plannedFeeChange("800001x1x0", 300, 280)] });
+  seams.feeApply = async (_w, items) => items.map((i) => ({ id: i.id, ok: false, feeRatePpm: i.feeRatePpm, error: "LND refused the update: invalid policy" }));
+  const first = await autopilot.applyRecommended();
+  const second = await autopilot.applyRecommended();
+  assert.deepEqual([first?.length, second?.length], [1, 1]);
+  assert.deepEqual([first?.[0]?.ok, first?.[0]?.repeat, second?.[0]?.ok, second?.[0]?.repeat], [false, undefined, false, undefined]);
+  const lines = autopilot.getState().history.flatMap((r) => r.changes);
+  assert.deepEqual(lines.map((c) => [c.id, c.via, c.ok]), [["800001x1x0", "manual", false], ["800001x1x0", "manual", false]], "both clicks are on the record");
+});
+
+test("PROBE-DIGEST-QUIET-REPEAT-OPEN: the wallet can't fund an open, run after run — every run says it failed; the history keeps one line", async (t) => {
+  quiet(t);
+  const env = autopilotWith(t, { channelEnabled: true, channelCooldownMinutes: 360 });
+  env.seams.openFeeRate = async () => 2;
+  env.node.override("default.forwardingHistory", (_a, cb) => cb(null, { forwarding_events: [], last_offset_index: "0" }));
+  env.seams.channelSuggestions = async () => ({ suggestions: [{ ...suggestion, pubkey: "02" + "11".repeat(32), alias: "peer" }] });
+  env.node.beforeCall = (method) => {
+    if (method === "default.openChannel") env.node.openFailure = "insufficient funds available to construct transaction";
+  };
+  const run1 = await env.autopilot.runOnce();
+  const run2 = await env.autopilot.runOnce();
+  // Before: the second run reported nothing at all.
+  assert.deepEqual([run1.failed, run2.failed], [1, 1]);
+  assert.deepEqual(run2.channels.map((c) => [c.alias, c.ok, c.repeat]), [["peer", false, true]]);
+  assert.match(run2.channels[0]?.error ?? "", /not the peer's doing/);
+  const st = env.autopilot.getState();
+  assert.deepEqual(st.lastRun?.opens, { ok: 0, failed: 1 });
+  assert.deepEqual([overviewOf(env.autopilot).lastRun?.applied, overviewOf(env.autopilot).lastRun?.failed], [0, 1]);
+  assert.equal(st.history.flatMap((r) => r.channels).length, 1, "one line of history for the two");
+});
+
+test("offer upkeep failing the same way again (Amboss down) is a failure of every run that hit it — one line of history all the same", async (t) => {
+  quiet(t);
+  const { autopilot, magma } = sellerSetup(t);
+  magma.addOffer({});
+  magma.readBehaviour = "throw";
+  const failed: number[] = [];
+  for (let i = 0; i < 3; i++) failed.push((await autopilot.runOnce()).failed);
+  assert.deepEqual(failed, [1, 1, 1], "before: 1, 0, 0 — the Overview read 'nothing needed changing'");
+  assert.deepEqual(autopilot.getState().lastRun?.sells, { ok: 0, failed: 1 });
+  assert.equal(autopilot.getState().history.flatMap((r) => r.sells).length, 1);
+});
+
+test("the Overview's autopilot block says whether Advertise routable size is on — the digest counts it as an automation (review of P7: it was left out)", (t) => {
+  quiet(t);
+  const on = autopilotWith(t, { enabled: false, maxHtlcEnabled: true });
+  assert.equal(overviewOf(on.autopilot).maxHtlc, true);
+  const off = autopilotWith(t, { enabled: false, maxHtlcEnabled: false });
+  assert.equal(overviewOf(off.autopilot).maxHtlc, false);
+});
+
+test("the Magma report says when its reads came in — a copy the pages share later still says that, not when it was handed out (review of P7: Market → Sell's 'as of')", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const before = Date.now();
+  const report = await s.autopilot.magmaReportShared();
+  const readAt = Date.parse(report.generatedAt);
+  assert.ok(readAt >= before && readAt <= Date.now(), report.generatedAt);
+  await new Promise((r) => setTimeout(r, 20));
+  const shared = await s.autopilot.magmaReportShared();
+  assert.equal(shared.generatedAt, report.generatedAt, "the shared copy: as of its read");
 });

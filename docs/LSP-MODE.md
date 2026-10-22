@@ -1,10 +1,13 @@
 # LSP Mode — selling channels via LSPS1 (bLIP-51)
 
-> Design doc / kickoff plan. Goal: LightningMate nodes can SELL inbound channels
+> Design and status. Goal: LightningMate nodes can SELL inbound channels
 > directly to wallets and nodes speaking the open LSP standard — a second demand
 > source beside Amboss Magma, with no marketplace dependency. Verified in the
 > 2026-07 liquidity-market research: LSPS1/bLIP-51 is finalized ("For
 > Implementation"), actively implemented by ZEUS, Breez, Megalithic and others.
+> Status (2026-10): built and hardened (P1–P4 below, and the 2026-10 review's
+> fixes); **experimental and off by default** — few buyers can reach a Tor-only
+> node this way ("Reach" below).
 
 ## Protocol summary (to re-verify against the spec at build time)
 
@@ -33,7 +36,7 @@
 | Piece | Source |
 |---|---|
 | Pricing (fee = fixed + ppm × size, duration-scaled) | `magmaRecommend` profit floor + **fill telemetry** (price to what sells) |
-| Capital guards (on-chain reserve, max deploy, max channel size, per-run budget) | Magma fulfilment path in `autopilot.runSell` |
+| Capital guards (the effective on-chain reserve, the coins promised to orders not opened yet, the shared deploy cap, the per-channel limit) | the capital ledger and the one on-chain mutex in `capital.ts`, shared with the Magma order lane (`magmaDesk.ts`) and the channel autopilot |
 | Channel opening | `channelOps.connectForOpen` (dial, outside the on-chain mutex) + `channelOps.fundChannel` (the open, inside it) |
 | Earnings/P&L recording | `earningsLog` (new `via: "lsps1"`) |
 | Fast reaction | the Magma order lane (45 s poll, its own lane) → here: event-driven |
@@ -180,8 +183,16 @@ Wallet compatibility (package P5 of the 2026-10 review):
 - Pricing never runs in the request path while a price is cached (ZEUS gives
   `create_order` 7 s); the first order after a start waits at most 4 s for
   the market, then quotes the local profit floor.
+- A write macaroon without `peers:read` (see SECURITY.md) can open no
+  channel: LND won't list its peers to it, and every open checks its peer's
+  connection that way. LSP mode then takes no order (`create_order` answers
+  "this LSP can't open channels right now", no invoice made), a paid order
+  that runs into it is refunded at once naming the cause, and the Settings
+  card says "New orders are turned away: …" — while it listens, too (the
+  macaroon still reads peer messages). Checked at start and at each order.
 - Still open: an end-to-end buy with a real ZEUS embedded node over Tor has
-  not been run (no live calls in development).
+  not been run (no live calls in development). The manual procedure is in
+  [E2E-TESTING.md](E2E-TESTING.md), part B — run it before relying on LSP mode.
 
 ## Risks
 

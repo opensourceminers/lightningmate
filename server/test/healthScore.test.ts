@@ -12,7 +12,6 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { computeNodeScore, leaseIncomeInLast30, MIN_HISTORY_DAYS, purchasesInLast30, type ScoreInput } from "../src/services/score.js";
-import type { ChannelView } from "../src/services/channels.js";
 import type { SaleRecord } from "../src/services/earningsLog.js";
 import type { ServiceFeeEntry } from "../src/services/serviceFee.js";
 import type { MagmaPurchase } from "../src/services/magmaPurchases.js";

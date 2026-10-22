@@ -49,8 +49,12 @@ Magma selling.
 ## 2. The fee engine (the heart) — `feeRecommend.ts`
 
 For each channel the engine derives ONE target `fee_rate` in a fixed order, so signals
-don't fight. All numbers below are the current defaults (`FEE_REC_DEFAULTS`), some of which
-the Strategy overrides.
+don't fight. The numbers below are what the autopilot (and the Fees tab) runs the engine
+with by default: its settings where it passes them (`feeV2Overrides`: the policy's
+min/neutral/max, protect, safety margin, ratchet steps, explore modifier, base fee, "Round
+to" and min change, the run's change limit, the floor opt-in), the engine's own defaults
+(`FEE_REC_DEFAULTS`) where it doesn't. The Strategy presets override some of them. (A test
+compares this block with the code.)
 
 **Config (defaults):**
 ```
@@ -61,14 +65,14 @@ maxPpm          1000     # priciest (fully drained)
 protectPpm       350     # where a drained-but-still-wanted channel is ramped to
 newChannelMinPpm  80     # floor for brand-new channels (first 3 days)
 baseFeeMsat        0     # flat base fee to set (0 = volume-first)
-stepPpm           25     # round to this (the autopilot passes the policy's "Round to", default 10)
+stepPpm           10     # round to this — the policy's "Round to" (the engine's own default is 25)
 minChangePpm      25     # leave a fee alone when it is this close to where the engine is heading
 cooldownHours     72     # min time between raises on the same channel
 flowWindowDays    14     # "recent" flow window
 benchmarkWindowDays 30   # revenue/idle window
 safetyMargin    1.15     # profit floor = refill cost basis × this
 floorAboveMax  false     # a profit floor may lift a fee above maxPpm only with this opt-in
-maxChangesPerRun   6     # at most N fee changes applied per run
+maxChangesPerRun   5     # at most N fee changes applied per run — the autopilot's setting (the engine's own default is 6)
 ```
 
 **Aim and move.** For each channel the engine derives an **aim** (where the fee should end
@@ -295,7 +299,16 @@ already in progress asks the live switch before each fee write, refill payment, 
 max-HTLC update, offer write and Magma order accept — after every read that step waits for, so
 nothing is awaited between the check and the step — and starts nothing new after the pause (the
 step under way finishes; Magma orders already taken on are carried to their end; an accept whose
-hold invoice was made but not yet sent is withdrawn, its coins freed). **Resume** switches those
+hold invoice was made but not yet sent is withdrawn, its coins freed). A paused order lane
+neither accepts nor turns down a new order — before deciding, and again after its capital
+check and its dial of the buyer, it asks the switch: the order waits for the operator on
+Market → Orders. (D6's immediate reject of an order the node can't serve is a running lane's.)
+After a crash, an accept is completed only if it may have gone out (it is marked on disk
+before it is sent); the lane's own accept that never left is withdrawn when selling is off by
+then (one the operator clicked is theirs and goes out). An accept whose mark can't be saved
+(a full disk) is never sent: its invoice is released and the order is decided again — a running
+lane rejects it when its approval deadline is close, never leaving it to time out; a paused lane
+leaves it to the operator. **Resume** switches those
 back on — Liquidity provision excepted, whose switch-on is its own decision with the selling
 check in front of you (D9). LSP mode (Settings) is no switch of the autopilot's: the pause leaves
 it on — it keeps answering wallet orders and opening their channels — and the pause dialog, the
@@ -304,12 +317,15 @@ paused banner and the Overview say so while it is on.
 Each area keeps its **last decision and why** (D16): acted, nothing to do, waiting (a
 cooldown, the hours, the budget, the fee rate, the funds, a switch turned off during the run),
 deferred (capital left for Magma), blocked (no Amboss key or one Amboss rejects, write mode
-off, selling on with no offer and auto-pricing off) or error — and "not run yet" for an area
-switched on that hasn't decided anything — shown at the top of its sub-tab and, compactly, on
-the Overview, and logged with its time when it changes. The same standing decision again only
+off, selling on with no offer and auto-pricing off, or — for the channel and Magma areas — a
+write macaroon without `peers:read`, which every open needs to check its peer's connection:
+named as such, checked at start, and a new Magma order turned down for it says so) or error —
+and "not run yet" for an area switched on that hasn't decided anything — shown at the top of
+its sub-tab and, compactly, on the Overview, and logged with its time when it changes. The same standing decision again only
 counts up ("waiting ×48 since 08:00"); each action is a decision of its own. Waits and
-deferrals are never failed runs; a stage that fails the same way run after run is one line of
-history, but every one of those runs reports it (the Overview, "Run once now").
+deferrals are never failed runs; a stage — or a fee write, an own open, an offer write — that
+fails the same way run after run is one line of history, but every one of those runs reports it
+(its counts, the Overview, "Run once now"), and a fee LND refuses again keeps LND's reason.
 
 Each preset sets the full fee curve, its **behaviour** (protect floor, profit-floor margin,
 how fast idle channels get cheaper, how aggressive the explore-lower cut is) AND the
@@ -363,7 +379,15 @@ price while the refilled sats are in the channel (see the profit floor above), s
 estimate and the engine agree. A move passes only if its route costs at most `econRatio` of
 the expected earnings, it nets at least `minNetProfitSats` and pays back within
 `maxPaybackDays` — and **the payment's max fee is that same limit at every size it tries**
-(the halved fallbacks too), never more than is left of today's budget.
+(the smaller fallbacks too), never more than is left of today's budget. The sizes, per
+source: the planned one; when that fails the check, the **largest size whose fee at the
+route's probed cost stays within the limit** (rounded down to 10k, at least the 50k
+minimum) — a 1.25M refill turned down only by the payback limit is planned at 1.12M rather
+than dropped, since its half no longer nets the minimum; then its half and its quarter. A
+**manual** refill does the same when it runs, with the plan's route cost, if the planned size
+no longer fits its cap — the budget left has shrunk since the plan, or the confirm dialog
+promised less. The autopilot's own run doesn't get there that way: a move whose estimated fee
+is more than the budget left waits for the daily budget before any size is tried (below).
 Sources: never a channel younger than 14 days, a private one, one sold through Magma or LSPS1
 in its lease (or one whose Magma lease Amboss still lists as running — a sale the order
 journal never recorded too), one with any net outflow in 14 days, a top earner or the node's single best
@@ -373,7 +397,9 @@ target, the next one when no route pays from the one before; a failed source bac
 that target only (cooldown × 2^fails, at most ×8). A refill of ≥ 500k may split over 3 paths
 (the payment carries the invoice's feature bits — without them LND never splits).
 Runs at most `maxRebalancesPerRun` (the best moves that fit the budget left — a pricey best
-move no longer blocks a cheaper one), respects a per-target cooldown and an hour window in
+move no longer blocks a cheaper one; a move whose estimated fee no longer fits what is left
+after the run's earlier payments waits for the daily budget rather than going out with a
+starved fee cap), respects a per-target cooldown and an hour window in
 **UTC**. **The daily fee budget** covers the autopilot's and manual refills alike and is read
 from the rebalance log (payments still in flight count at their maximum fee): a restart or a
 crash can't reset it, and it starts afresh at 00:00 UTC. Every payment attempt is written to
@@ -428,7 +454,11 @@ channels. This is the one place capital allocation is unified across routing vs 
 **Magma** — two parts. The **order lane** (every 45 s, its own busy flag, never the main
 run's lock) accepts orders with a hold invoice, opens the channel, reports it, settles once
 Amboss confirms it and rejects at once what it can't serve — every step recorded in a
-per-order journal first. The **offer upkeep** (`runSell`, in the main run, only with
+per-order journal first. It decides on new orders only while Liquidity provision is on (a
+paused lane neither accepts nor rejects one); an order it accepted itself it carries to its
+end either way, and with selling on it also opens the channel of an order accepted by hand
+(Market → Orders says who opens a paid order's channel). An order the operator rejects is
+their decision: no "turned down" alert. The **offer upkeep** (`runSell`, in the main run, only with
 Liquidity provision on) keeps each offer fundable (cut, disabled while its smallest channel
 can't be funded, listed again once it can), gives it the standard 4,320-block lease and the
 routing-fee promise (with auto-size), and prices it per `sellPricingMode` (with
@@ -451,15 +481,20 @@ service fee applies to completed sales.
 ## 5. Config model (`AutopilotConfig`)
 
 ```
-enabled, intervalMinutes, cooldownMinutes, maxChangesPerRun
-policy: { minPpm, neutralPpm, maxPpm, baseFeeMsat, step, minChangePpm }
+enabled, intervalMinutes, cooldownMinutes, maxChangesPerRun, feeFloorAboveMax
+policy: { minPpm, neutralPpm, maxPpm, baseFeeMsat, protectPpm, safetyMargin,
+  noFlowRatchetSteps, exploreLowerModifier, step, minChangePpm }
 rebalanceEnabled, rebalancePolicy{econRatio, minNetProfitSats, maxPaybackDays,
   maxAmountSats}, maxRebalancesPerRun, rebalanceCooldownMinutes,
   rebalanceHourStart, rebalanceHourEnd (UTC), rebalanceDailyBudgetSats (null = no limit)
 channelEnabled, channelReserveSats, channelSizeSats, channelCooldownMinutes, channelMaxFeeRate
 sellEnabled, sellMaxDeploySats, sellReserveSats, sellMaxChannelSats,
-  sellAutoClose, sellAutoRelist, sellAutoReprice, sellPricingMode
+  sellAutoClose, sellAutoRelist, sellAutoReprice, sellAutoSize, sellPricingMode
+maxHtlcEnabled
 ```
+
+Every numeric setting has bounds (`GET /api/autopilot` publishes them); a blank or
+out-of-range value is refused with the field named, never turned into 0 (D17).
 
 The Strategy presets write: `enabled`, `rebalanceEnabled` and (except Max profit)
 `channelEnabled`, the `policy` curve and behaviour, and the rebalance economics

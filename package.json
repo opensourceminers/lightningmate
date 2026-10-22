@@ -12,14 +12,15 @@
     "build": "npm run build -w server && npm run build -w web",
     "start": "npm run start -w server",
     "typecheck": "npm run typecheck -w server && npm run typecheck -w web",
-    "test": "npm run test -w server && npm run test -w web"
+    "test": "npm run test -w server && npm run test -w web",
+    "check:api-types": "tsc -p server/tsconfig.json --noEmit && npm run typecheck -w web && node --import tsx --test web/test/apiContract.test.tsx"
   },
   "devDependencies": {
-    "concurrently": "^9.1.0"
+    "concurrently": "^9.2.5"
   },
-  "comment:overrides": "Force patched transitive deps (DoS advisories) that lightning pins to vulnerable ranges.",
+  "comment:overrides": "Patched transitive deps that the lightning library's own ranges would let through - as ranges, so a later fix is taken too: @grpc/grpc-js ^1.14.6 (GHSA-m9gg-hp2v-232j and GHSA-f596-whhp-79r4: fixed in 1.14.5; GHSA-5375-pq7m-f5r2 and GHSA-99f4-grh7-6pcq: fixed in 1.14.4), bn.js ^5.2.3 (GHSA-378v-28hj-76wf, an infinite loop: fixed in 5.2.3). Drop each once lightning's ranges exclude the vulnerable versions; CI runs npm audit on the production dependencies.",
   "overrides": {
-    "@grpc/grpc-js": "1.14.4",
-    "bn.js": "5.2.3"
+    "@grpc/grpc-js": "^1.14.6",
+    "bn.js": "^5.2.3"
   }
 }

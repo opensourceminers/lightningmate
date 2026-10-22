@@ -306,6 +306,15 @@ function kept(inputs: ReserveInputs, userReserveSat: number, ledger: CapitalLedg
   return { pending, reserve, reserveSats, promisedSats, keepSats: reserveSats + promisedSats };
 }
 
+/** What the wallet can spare for a send (sendBudget): the on-chain reserve,
+ *  the coins promised to buyers, and what "Max" fills in at `feeRate`. */
+export interface SendBudget {
+  reserveSats: number;
+  promisedSats: number;
+  availableSats: number;
+  feeRate: number | null;
+}
+
 /**
  * What the wallet can spare now, as the wallet page shows it: what "Max"
  * fills in at the rate the send form starts with (LND's 3-block estimate,
@@ -318,7 +327,7 @@ export async function sendBudget(
   lnd: AuthenticatedLnd,
   ledger: CapitalLedger,
   userReserveSat: number,
-): Promise<{ reserveSats: number; promisedSats: number; availableSats: number; feeRate: number | null }> {
+): Promise<SendBudget> {
   const [{ chain_balance: confirmed }, inputs, rate] = await Promise.all([
     getChainBalance({ lnd }),
     reserveInputs(lnd),

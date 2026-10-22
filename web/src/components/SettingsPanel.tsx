@@ -2,10 +2,11 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import { pageHidden } from "../usePolledData";
 import type { AmbossKeyCheck, AppSettings, FiatCurrency, LspStatus, PrivacyInfo, TorRoute } from "../types";
-import { CLEARNET_WARNING, lspBuyerGuide, lspIgnoredLine, lspReachText, lspRecoveryLine, lspRefusalLines, lspServedLine } from "../lspView";
+import { CLEARNET_WARNING, lspBuyerGuide, lspIgnoredLine, lspReachText, lspRecoveryLine } from "../lspView";
 import { TOR_ROUTES, destinationLine, privacySummary } from "../privacyView";
 import { BackupCard } from "./BackupCard";
 import { AmbossKeyStatus } from "./AmbossKeyStatus";
+import { LspActivity } from "./LspActivity";
 import { Switch, RunState } from "./Switch";
 import { useUi } from "./Overlay";
 import { satsCompact, timeAgo } from "../format";
@@ -384,19 +385,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
       {lsp ? <p className="hint">{lspReachText(lsp.uris)}</p> : null}
       {settings?.lspModeEnabled && lsp ? (
         <>
-          <div className="amboss-row" style={{ marginTop: 10 }}>
-            <span className={`conn ${lsp.running ? "up" : "down"}`}>
-              <i /> {lsp.running ? "Listening for LSP clients" : "Not listening"}
-            </span>
-            <span className="muted">
-              Requests answered: {lspServedLine(lsp)}
-              {lsp.lastRequestAt ? ` · last request ${timeAgo(lsp.lastRequestAt)}` : ""}
-            </span>
-          </div>
-          {!lsp.running && lsp.lastError ? <p className="banner error">{lsp.lastError}</p> : null}
-          {lspRefusalLines(lsp).map((line) => (
-            <p key={line} className="banner error">Refused — {line}</p>
-          ))}
+          <LspActivity lsp={lsp} />
           {lsp.clients.length > 0 ? (
             <p className="muted">
               Wallets seen: {lsp.clients.map((c) => `${c.app}${c.version ? ` ${c.version}` : ""} (${timeAgo(c.lastAt)})`).join(", ")}

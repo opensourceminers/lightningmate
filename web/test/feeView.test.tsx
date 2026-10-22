@@ -93,6 +93,7 @@ test("a fee change in the run history: the move, the base fee, who made it", () 
 const demandReport = (o: Partial<UnservedDemandReport> = {}): UnservedDemandReport => ({
   days: 7,
   trackedDays: 10,
+  classifiedSince: null,
   channels: [
     {
       outChannel: "a",

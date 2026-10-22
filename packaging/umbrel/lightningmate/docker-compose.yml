@@ -7,12 +7,11 @@ services:
       APP_PORT: 3001
 
   web:
-    # Pinned to the image of the last Umbrel store SUBMISSION (tag + digest).
-    # The release pipeline sets this line when it publishes a release to the
-    # community store; it is not the version a running install has — that is
-    # shown in the app's footer, in Settings and on Market → Sell's selling
-    # diagnostics (and served at /api/health).
-    image: ghcr.io/opensourceminers/lightningmate:v0.6.10@sha256:199a9df7855714d3b2fe2bc011ebdda88bd58fee2653f283111b35094ca61c1a
+    # The image the stores publish now (tag + digest), as in
+    # getumbrel/umbrel-apps/lightningmate. A release sets this line to the
+    # pin its image workflow prints (docs/RELEASING.md); the version a running
+    # install has is shown in the app's footer, in Settings and at /api/health.
+    image: ghcr.io/opensourceminers/lightningmate:v0.7.7@sha256:917fa062d9520ea5bf92fb94bbe12b2947ed025c2bd8b82b3dcd5435127392ce
     user: "1000:1000"
     restart: on-failure
     stop_grace_period: 1m
@@ -44,9 +43,17 @@ services:
       # comment these two lines out.
       LM_ENABLE_WRITE: "true"
       LND_WRITE_MACAROON_PATH: "/lnd/data/chain/bitcoin/$APP_BITCOIN_NETWORK/admin.macaroon"
+      # The disclosed 1 % service fee on completed sales (Magma and LSPS1),
+      # paid in the background to this lightning address — shown in the app
+      # before anything is sold. "0" turns it off.
+      LM_SELL_FEE_BPS: "100"
+      LM_SELL_FEE_ADDRESS: "lightningmate@btcpay.opensourceminers.de"
       # Umbrel's Tor proxy (SOCKS5). LightningMate's own third-party lookups
-      # (LN+ reputations — this node's pubkey included — and the BTC price)
-      # go through it instead of the home connection; Settings → Privacy can
-      # route Amboss through it too. Without these lines they go out directly.
+      # (LN+ reputations — this node's pubkey included — the BTC price and
+      # Amboss's public market data) go through it instead of the home
+      # connection; Settings → Privacy can route the Amboss account calls through
+      # it too. Without these lines they go out directly.
+      # NOT YET IN THE STORES' COMPOSE: add both lines there with the next
+      # release (docs/RELEASING.md).
       TOR_PROXY_IP: "$TOR_PROXY_IP"
       TOR_PROXY_PORT: "$TOR_PROXY_PORT"

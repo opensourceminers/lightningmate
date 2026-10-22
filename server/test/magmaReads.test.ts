@@ -6,7 +6,6 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { join } from "node:path";
 import { forbidden, gqlError, internalError, orderNotFound, resolverFailed, throttled } from "./helpers/magma.js";
 import { AmbossError } from "../src/services/amboss.js";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
@@ -399,7 +398,7 @@ test("a newer order's read times out every pass: the older order's confirmed cha
   // Amboss's resolver is slow for that one order (say, the confirmations of a
   // funding transaction its chain backend doesn't know): every read of it
   // runs into the deadline; the listing and every other read answer.
-  const read = readsHang(autopilot, (id) => id === newer.id);
+  readsHang(autopilot, (id) => id === newer.id);
   magma.setStatus(sold.id, "VALID_CHANNEL_OPENING");
   await autopilot.pollSellOrders();
   // Before: that timeout counted as "Amboss down", and every order after it

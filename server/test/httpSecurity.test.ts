@@ -142,3 +142,99 @@ test("with a login: only the open paths answer without a valid, unexpired, untam
   assert.equal((await api.request("GET", "/autopilot", undefined, { token: old })).status, 401);
 });
 
+
+// ── P8 hardening: where a request comes from ─────────────────────────────────
+//
+// Standalone without a password serves the API on 127.0.0.1 with no login,
+// and nothing checked where a request came from: any page the owner opened
+// could send a cross-site HTML form POST to /api/autopilot/resume, /run,
+// /pause or /backup/export — routes that act without a JSON body. (On Umbrel
+// and with a password the session token, which a foreign page can't set,
+// already stopped it.) Now a page of another site is refused outright, and
+// every POST must be JSON — which a form can't send, and a cross-site fetch
+// can't without a CORS preflight the server never grants.
+
+/** What a browser sends for a form on another site's page: a form type, and
+ *  `Sec-Fetch-Site: cross-site` (an older browser leaves that out). */
+const FORM = { "Content-Type": "application/x-www-form-urlencoded" };
+const CROSS_SITE = { "Sec-Fetch-Site": "cross-site" };
+
+test("standalone without a password: a cross-site form POST to the body-less actions is refused — 403 from a modern browser, 415 from any other — and nothing happens", async (t) => {
+  const api = await startApi(t);
+  api.autopilot.setConfig({ enabled: true });
+  api.autopilot.pauseAll();
+  for (const path of ["/autopilot/resume", "/autopilot/pause", "/autopilot/run", "/backup/export"]) {
+    const modern = await api.request("POST", path, undefined, { headers: { ...FORM, ...CROSS_SITE }, rawBody: "" });
+    assert.deepEqual([modern.status, modern.body?.error], [403, "cross_site"], path);
+    // An older browser sends no Sec-Fetch-Site: the content type gives it away.
+    for (const type of ["application/x-www-form-urlencoded", "multipart/form-data; boundary=x", "text/plain"]) {
+      const old = await api.request("POST", path, undefined, { headers: { "Content-Type": type, "Sec-Fetch-Site": "" }, rawBody: "a=1" });
+      assert.deepEqual([old.status, old.body?.error], [415, "json_required"], `${path} as ${type}`);
+    }
+  }
+  // Nothing acted: still paused, no run, no export.
+  assert.ok(api.autopilot.getState().paused, "a forged resume changed nothing");
+  assert.equal(api.backup.get().lastExportAt ?? null, null, "no backup exported");
+  // The app's own request (JSON, same-origin) still works.
+  const own = await api.request("POST", "/autopilot/resume");
+  assert.equal(own.status, 200, JSON.stringify(own.body));
+  assert.equal(api.autopilot.getState().paused, null);
+});
+
+test("a body-less POST without any content type is refused too — it is no request of the app's", async (t) => {
+  const api = await startApi(t);
+  const bare = await api.request("POST", "/autopilot/pause", undefined, { headers: { "Content-Type": "", "Content-Length": "0" }, rawBody: "" });
+  assert.equal(bare.status, 415);
+  assert.equal(api.autopilot.getState().paused, null);
+});
+
+test("a request a browser marks as cross-site is refused whatever it asks — a read, or JSON — while same-origin, same-site and typed-in requests are served", async (t) => {
+  const api = await startApi(t);
+  assert.equal((await api.request("GET", "/autopilot", undefined, { headers: CROSS_SITE })).status, 403);
+  assert.equal((await api.request("POST", "/autopilot", { intervalMinutes: 45 }, { headers: CROSS_SITE })).status, 403);
+  assert.equal(api.autopilot.getState().config.intervalMinutes, 30, "the JSON write was refused before it acted");
+  for (const site of ["same-origin", "same-site", "none"]) {
+    assert.equal((await api.request("GET", "/autopilot", undefined, { headers: { "Sec-Fetch-Site": site } })).status, 200, site);
+  }
+  // A client that sends no Sec-Fetch-Site at all (curl, an older browser): its JSON is served.
+  assert.equal((await api.request("POST", "/autopilot", { intervalMinutes: 45 }, { headers: { "Sec-Fetch-Site": "" } })).status, 200);
+  assert.equal(api.autopilot.getState().config.intervalMinutes, 45);
+});
+
+test("with a login too: a form POST is refused even with a valid token, and the Host is not checked (Umbrel's app proxy may rewrite it)", async (t) => {
+  withEnv(t, { APP_PASSWORD: "owner-password", APP_SEED: "seed" });
+  const api = await startApi(t);
+  const { body } = await api.request("POST", "/auth/unlock", { password: "owner-password" });
+  const form = await api.request("POST", "/autopilot/pause", undefined, { token: body.token, headers: FORM, rawBody: "x=1" });
+  assert.equal(form.status, 415);
+  assert.equal((await api.request("POST", "/autopilot/pause", undefined, { token: body.token, host: "lightningmate_web_1:3001" })).status, 200);
+  // The login itself is JSON, as the web client sends it.
+  assert.equal((await api.request("POST", "/auth/unlock", undefined, { headers: FORM, rawBody: "password=owner-password" })).status, 415);
+});
+
+test("without a password, a Host other than localhost, 127.0.0.1 or the bound address is refused — the DNS-rebinding defence — on the whole API", async (t) => {
+  const api = await startApi(t);
+  assert.equal((await api.request("GET", "/autopilot", undefined, { host: "attacker.example:3001" })).status, 403);
+  assert.equal((await api.request("POST", "/autopilot/pause", undefined, { host: "rebound.attacker.example" })).status, 403);
+  assert.equal(api.autopilot.getState().paused, null);
+  assert.equal((await api.request("GET", "/autopilot", undefined, { host: "127.0.0.1:3001" })).status, 200);
+  // The address it is bound to (LM_BIND), when that is another loopback one.
+  assert.deepEqual(effectiveAllowedHosts([], false, "127.0.0.2"), ["localhost", "127.0.0.1", "::1", "127.0.0.2"]);
+  assert.deepEqual(effectiveAllowedHosts([], false, "127.0.0.1"), ["localhost", "127.0.0.1", "::1"]);
+  assert.deepEqual(effectiveAllowedHosts([], false, "::1"), ["localhost", "127.0.0.1", "::1"]);
+  assert.deepEqual(effectiveAllowedHosts([], true, "0.0.0.0"), [], "with a login: no Host list (Umbrel's proxy)");
+  const app = createHttpApp({ apiRouter: Router().get("/ping", (_q, r) => void r.json({ ok: true })), allowedHosts: [], authRequired: false, bindHost: "127.0.0.2", requestGate: new RequestGate() });
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>((r) => server.once("listening", () => r()));
+  t.after(() => new Promise<void>((r) => server.close(() => r())));
+  const { port } = server.address() as AddressInfo;
+  const get = (host: string) =>
+    new Promise<number>((resolve, reject) => {
+      http.get({ host: "127.0.0.1", port, path: "/api/ping", headers: { Host: host } }, (res) => {
+        res.resume();
+        resolve(res.statusCode ?? 0);
+      }).on("error", reject);
+    });
+  assert.equal(await get("127.0.0.2:3001"), 200, "the bound address");
+  assert.equal(await get("attacker.example:3001"), 403);
+});

@@ -59,9 +59,17 @@ export interface LspNode {
   buyer: string;
 }
 
+/** `writeDenied`: the gRPC methods LND refuses the write client (its macaroon
+ *  lacks them, FakeLnd.withoutPermission); the read client may call all. */
 export function lspNode(
   t: AfterHook,
-  opts: { node?: FakeLnd; dir?: string; lspMode?: boolean; caps?: { maxChannelSats: number; reserveSats: number; maxDeploySats: number } } = {},
+  opts: {
+    node?: FakeLnd;
+    dir?: string;
+    lspMode?: boolean;
+    caps?: { maxChannelSats: number; reserveSats: number; maxDeploySats: number };
+    writeDenied?: string[];
+  } = {},
 ): LspNode {
   const dir = opts.dir ?? makeTempDir(t);
   const node = opts.node ?? new FakeLnd({ chainBalance: 20_000_000, peers: [BUYER] });
@@ -74,7 +82,7 @@ export function lspNode(
   const svc = new Lsps1Service(
     dir,
     node.lnd,
-    node.lnd,
+    opts.writeDenied?.length ? node.withoutPermission(...opts.writeDenied) : node.lnd,
     settings,
     () => caps,
     () => ({ sellPricingMode: "balanced", adaptiveLevel: 0.5, offerFeeCaps: { feeRateCapPpm: 2_200, baseFeeCapSats: 1 } }),

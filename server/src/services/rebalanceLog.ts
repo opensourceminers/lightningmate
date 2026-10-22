@@ -1,4 +1,4 @@
-import { JsonStore } from "../store.js";
+import { JsonStore, recordStoreIncident } from "../store.js";
 
 export interface RebalanceRecord {
   /** When the record was written: when the rebalance ended. */
@@ -87,6 +87,48 @@ export interface LogCosts {
 
 const emptyTotals = (): RebalanceTotals => ({ trackedSince: null, throughMs: null, days: {} });
 
+const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object" && !Array.isArray(v);
+
+/** A sum's count or amount as kept: a finite number ≥ 0 — numeric text is
+ *  read as the number it says — else null. */
+function sumField(v: unknown): number | null {
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
+  return typeof n === "number" && Number.isFinite(n) && n >= 0 ? n : null;
+}
+
+/**
+ * The daily sums as rebalance-totals.json holds them, each checked (final
+ * review of P6: they were taken as they came — a JSON-valid but malformed
+ * entry, a day of `null` or a channel's sum of text, made P&L throw or add
+ * up strings). Kept: a YYYY-MM-DD day of channel sums, each with numbers ≥ 0
+ * (numeric text read as numbers — repaired). Anything else is dropped, and
+ * said: `problems` names what was dropped or repaired.
+ */
+export function checkedDays(raw: unknown): { days: Record<string, Record<string, RebalanceDayTotal>>; problems: string[] } {
+  const days: Record<string, Record<string, RebalanceDayTotal>> = {};
+  const problems: string[] = [];
+  if (raw === undefined) return { days, problems };
+  if (!isObject(raw)) return { days, problems: ["the daily sums were not a list of days — dropped"] };
+  for (const [day, byTarget] of Object.entries(raw)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || !Number.isFinite(Date.parse(day)) || !isObject(byTarget)) {
+      problems.push(`${JSON.stringify(day).slice(0, 40)}: not a day of channel sums — dropped`);
+      continue;
+    }
+    for (const [target, t] of Object.entries(byTarget)) {
+      const feeSats = isObject(t) ? sumField(t.feeSats) : null;
+      const amountSats = isObject(t) ? sumField(t.amountSats) : null;
+      const count = isObject(t) ? sumField(t.count) : null;
+      if (!isObject(t) || feeSats === null || amountSats === null || count === null) {
+        problems.push(`${day} ${target.slice(0, 40)}: not a sum of fees, amounts and a count — dropped`);
+        continue;
+      }
+      if (t.feeSats !== feeSats || t.amountSats !== amountSats || t.count !== count) problems.push(`${day} ${target.slice(0, 40)}: numbers stored as text — read as numbers`);
+      (days[day] ??= {})[target] = { feeSats, amountSats, count };
+    }
+  }
+  return { days, problems };
+}
+
 /**
  * Log of executed rebalances — the accounting trail. Before, one list of 200
  * records held failures and successes alike: a burst of failed attempts
@@ -108,11 +150,21 @@ export class RebalanceLog {
     const read = this.store.read([]);
     this.records = Array.isArray(read) ? read : [];
     const totals = this.totalsStore.read(emptyTotals());
+    const checked = checkedDays(totals.days);
     this.totals = {
       trackedSince: typeof totals.trackedSince === "string" ? totals.trackedSince : null,
       throughMs: typeof totals.throughMs === "number" && Number.isFinite(totals.throughMs) ? totals.throughMs : null,
-      days: totals.days && typeof totals.days === "object" ? totals.days : {},
+      days: checked.days,
     };
+    if (checked.problems.length > 0) {
+      // Never silently (D18): the operator learns P&L's older totals were
+      // repaired or lost something. Saved repaired, so it is said once.
+      const shown = checked.problems.slice(0, 5).join("; ") + (checked.problems.length > 5 ? `; and ${checked.problems.length - 5} more` : "");
+      console.warn(`[rebalance] rebalance-totals.json: ${shown}`);
+      // (alerts.ts words it: repaired or dropped, P&L's older costs maybe lower.)
+      recordStoreIncident(dataDir, { file: "rebalance-totals.json", kind: "adjusted", detail: shown });
+      this.totalsStore.write(this.totals);
+    }
     // A success already in the daily sums but still on file (the process
     // stopped between the two saves) is counted there only.
     const through = this.totals.throughMs;

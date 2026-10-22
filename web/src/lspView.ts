@@ -74,6 +74,18 @@ export function lspRefusalLines(s: Pick<LspStatus, "requests">): string[] {
     });
 }
 
+/**
+ * Why LSP mode turns new orders away right now — the write macaroon lacks
+ * peers:read, so no channel could be opened — or null. Said whether or not the
+ * listener runs: with such a macaroon it does, and the card showed "Listening
+ * for LSP clients" and, after an order, only the buyer's line ("this LSP
+ * can't open channels right now") — the cause named nowhere (review of P8,
+ * run 2).
+ */
+export function lspBlockedLine(s: Pick<LspStatus, "blocked">): string | null {
+  return s.blocked ? `New orders are turned away: ${s.blocked}` : null;
+}
+
 /** "client_info ×4" — parameters wallets sent that this LSP ignores (D14). */
 export function lspIgnoredLine(s: Pick<LspStatus, "ignoredParams">): string | null {
   if (!s.ignoredParams.length) return null;

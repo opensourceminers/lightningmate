@@ -22,6 +22,8 @@ const fields = {
   feeRatePpm: 3000,
   baseFeeSats: 852,
   minBlockLength: 4320,
+  feeRateCapPpm: null,
+  baseFeeCapSats: null,
 };
 
 const failed: OfferWrite = {
@@ -136,6 +138,8 @@ test("Accept and Reject are offered for a sale awaiting your approval with nothi
     reason: null,
     decision: null,
     lastError: null,
+    booked: null,
+    external: null,
     ...o,
   });
   const waiting = { side: "SELL" as const, status: "WAITING_FOR_SELLER_APPROVAL" };

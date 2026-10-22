@@ -14,8 +14,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   MULTI_PATH_MAX_PATHS,
+  adaptiveAmounts,
   executeRebalance,
   feeCapAt,
+  fitBelowPlanned,
+  largestFittingRefill,
 } from "../src/services/rebalance.js";
 import {
   FEE_REC_DEFAULTS,
@@ -30,7 +33,9 @@ import { RebalanceLog, type RebalanceRecord } from "../src/services/rebalanceLog
 import type { ChannelView } from "../src/services/channels.js";
 import { chanNumber, feeNode, forwardsOut, withMarket, type FakeForward, type FeeChannel } from "./helpers/feeNode.js";
 import { INVOICE_FEATURE } from "./helpers/fakeLnd.js";
-import { autopilotWith } from "./helpers/autopilot.js";
+import { autopilotWith, paidRebalance, plannedRebalance } from "./helpers/autopilot.js";
+import { startApi } from "./helpers/apiHarness.js";
+import type { RebalanceExecParams } from "../src/services/rebalance.js";
 
 const PEER = (n: number) => "02" + n.toString(16).padStart(2, "0").repeat(32);
 const TX = (n: number) => n.toString(16).padStart(2, "0").repeat(32);
@@ -544,4 +549,119 @@ test("a refill run by hand from a recommended row carries the gate — and its p
   assert.deepEqual([own.rec?.via, own.rec?.holdPpm], ["manual", undefined]);
   assert.equal(own.fee.metrics.profitFloorPpm, null);
   assert.ok(own.fee.aimPpm < 400 && own.fee.targetPpm < 400, `${own.fee.targetPpm} (aim ${own.fee.aimPpm}) | ${own.fee.reasons.join(" | ")}`);
+});
+
+// ── review of P7: a size between the planned one and its half ───────────────
+//
+// The sizes tried were the planned one, its half and its quarter only: a
+// refill turned down only by the payback limit — 1.25M at ~300 ppm needing
+// 375 sat against a 336 sat limit — fell to 625k, which no longer netted the
+// minimum, while 1.0M–1.12M would have passed (rebalanceSources.test.ts,
+// probe A). Now the largest size whose fee at the probed route cost fits the
+// gate's cap comes before the halves — every gate as it was.
+
+/** Probe A's gate: 400 ppm earnings valued at 320 ppm of cost, 1.2M of
+ *  14-day outflow, a 100 sat minimum and a 336 sat payback limit. */
+const PROBE_A = { maxCostPpm: 320, maxFeeSats: 336, earnings: { revenuePpm: 400, demandSats: 1_200_000, minNetSats: 100 } };
+
+test("the largest refill that fits the gate at the probed route cost: rounded down to 10k, below the planned size, at least the minimum — or none", () => {
+  // 1.12M costs 336 at 300 ppm: within the 336 payback limit and netting 112.
+  assert.equal(largestFittingRefill(PROBE_A, 1_250_000, 300), 1_120_000);
+  assert.ok(feeCapAt(PROBE_A, 1_130_000) < 339, "1.13M would not fit");
+  // Never the planned size itself, nor above it.
+  assert.equal(largestFittingRefill(PROBE_A, 1_100_000, 300), 1_090_000);
+  // A route dearer than the cost cap fits at no size; nor does one where the
+  // payback limit and the minimum net exclude each other.
+  assert.equal(largestFittingRefill(PROBE_A, 1_250_000, 330), null);
+  assert.equal(largestFittingRefill({ ...PROBE_A, maxFeeSats: 288 }, 1_250_000, 300), null);
+  // At least the minimum size.
+  assert.equal(largestFittingRefill({ maxCostPpm: 1000, maxFeeSats: 20 }, 1_000_000, 300), 60_000);
+  assert.equal(largestFittingRefill({ maxCostPpm: 1000, maxFeeSats: 10 }, 1_000_000, 300), null, "30k would fit, but is below the 50k minimum");
+  assert.equal(largestFittingRefill({ maxCostPpm: 1000, maxFeeSats: 10 }, 1_000_000, 300, 30_000), 30_000);
+  // Only when the planned size doesn't fit (fitBelowPlanned).
+  assert.equal(fitBelowPlanned(PROBE_A, 1_250_000, 300), 1_120_000);
+  assert.equal(fitBelowPlanned(PROBE_A, 1_120_000, 300), null, "the planned size fits: nothing to add");
+  assert.equal(fitBelowPlanned(PROBE_A, 1_250_000, undefined), null, "no probed cost: nothing to go by");
+  // The ladder: largest first; the fitted size before the halves.
+  assert.deepEqual(adaptiveAmounts(1_250_000), [1_250_000, 625_000, 312_500]);
+  assert.deepEqual(adaptiveAmounts(1_250_000, 1_120_000), [1_250_000, 1_120_000, 625_000, 312_500]);
+  assert.deepEqual(adaptiveAmounts(1_250_000, 400_000), [1_250_000, 625_000, 400_000, 312_500]);
+  assert.deepEqual(adaptiveAmounts(1_250_000, 1_250_000), [1_250_000, 625_000, 312_500], "never the planned size twice");
+  assert.deepEqual(adaptiveAmounts(1_250_000, 40_000), [1_250_000, 625_000, 312_500], "never below the minimum");
+});
+
+test("a fee that isn't a whole sat is reckoned high when a size is fitted: 1.11M at 301 ppm (334.11 sat) does not fit a 334 sat cap — 1.10M (331.1 sat) does", () => {
+  const cap = { maxCostPpm: 320, maxFeeSats: 334, earnings: { revenuePpm: 400, demandSats: 1_200_000, minNetSats: 100 } };
+  assert.equal(feeCapAt(cap, 1_110_000), 334);
+  // Rounded down, 334.11 would read as 334 — within the cap.
+  assert.equal(largestFittingRefill(cap, 1_250_000, 301), 1_100_000);
+  // The same rule decides whether the planned size fits at all.
+  assert.equal(fitBelowPlanned(cap, 1_110_000, 301), 1_100_000, "1.11M itself doesn't fit: the next size down does");
+  assert.equal(fitBelowPlanned(cap, 1_100_000, 301), null, "1.10M fits as planned");
+});
+
+test("the executor tries the largest size the cap allows at the plan's route cost before the halves — when today's budget left no longer covers the planned size — each attempt with the gate's own cap", async () => {
+  const node = refillNode();
+  node.payOutcome = "fail"; // no route: every size is tried
+  // Earning 1,000 ppm on 2M of outflow, a 600 ppm route probed: 1.25M costs
+  // 750 sat, but only 500 sat of today's budget is left.
+  const res = await executeRebalance(node.lnd, node.lnd, {
+    targetId: "850000x1x0",
+    sourceId: "850000x2x0",
+    amountSats: 1_250_000,
+    econRatio: 0.8,
+    maxFeePpm: 800,
+    maxFeeSats: 500,
+    gate: { revenuePpm: 1000, demandSats: 2_000_000, minNetSats: 100 },
+    routeCostPpm: 600,
+  });
+  assert.equal(res.ok, false);
+  // Before: 1.25M, 625k, 312.5k — the 830k that fits the 500 sat left never tried.
+  assert.deepEqual(
+    sentPayments(node).map((p) => [p.sats, p.maxFee]),
+    [
+      [1_250_000, 500],
+      [830_000, 500],
+      [625_000, 500],
+      [312_500, 212],
+    ],
+  );
+  // The planned size fits at the probed cost: nothing in between.
+  const fits = refillNode();
+  fits.payOutcome = "fail";
+  await executeRebalance(fits.lnd, fits.lnd, {
+    targetId: "850000x1x0",
+    sourceId: "850000x2x0",
+    amountSats: 1_250_000,
+    econRatio: 0.8,
+    maxFeePpm: 800,
+    gate: { revenuePpm: 1000, demandSats: 2_000_000, minNetSats: 100 },
+    routeCostPpm: 600,
+  });
+  assert.deepEqual(sentPayments(fits).map((p) => p.sats), [1_250_000, 625_000, 312_500]);
+});
+
+test("the autopilot hands the executor the plan's route cost — and the manual run passes the row's on", async (t) => {
+  const { autopilot, seams } = autopilotWith(t, { rebalanceEnabled: true, rebalanceDailyBudgetSats: 10_000 });
+  seams.rebalanceReport = async () => ({
+    recommendations: [{ ...plannedRebalance("800001x1x0", 500), estimatedRouteCostPpm: 300 }],
+  });
+  const got: RebalanceExecParams[] = [];
+  seams.rebalanceExec = async (_w, p) => {
+    got.push(p);
+    return paidRebalance(p);
+  };
+  await autopilot.runOnce();
+  assert.equal(got[0]?.routeCostPpm, 300);
+  // By hand: through the API, validated, to the executor.
+  const api = await startApi(t);
+  const manual: RebalanceExecParams[] = [];
+  (api.autopilot as unknown as { rebalanceExec: (w: unknown, p: RebalanceExecParams) => Promise<unknown> }).rebalanceExec = async (_w, p) => {
+    manual.push(p);
+    return paidRebalance(p);
+  };
+  const body = { targetId: "800001x1x0", sourceId: "800000x1x0", amountSats: 100_000, econRatio: 0.8 };
+  assert.equal((await api.request("POST", "/rebalance/execute", { ...body, routeCostPpm: 250 })).status, 200);
+  assert.equal(manual[0]?.routeCostPpm, 250);
+  assert.equal((await api.request("POST", "/rebalance/execute", { ...body, routeCostPpm: "cheap" })).status, 400);
 });

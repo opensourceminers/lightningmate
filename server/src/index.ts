@@ -146,6 +146,7 @@ function main(): void {
     ),
     allowedHosts: config.allowedHosts,
     authRequired: authRequired(),
+    bindHost: config.bindHost,
     webDir: config.webDir,
   });
 

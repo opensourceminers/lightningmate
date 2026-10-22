@@ -225,6 +225,11 @@ export interface MagmaSellAnalytics {
 }
 
 export interface MagmaV2Report {
+  /** When the reads behind it came in (ISO). Pages share one read — the
+   *  server keeps it a minute (magmaReportShared), each view a minute more —
+   *  so "as of" is this, never when a view got its copy (review of P7: up
+   *  to ~2 min off). */
+  generatedAt: string;
   nodeNeed: NodeNeed;
   nodeNeedReason: string;
   hasRoutingData: boolean;
@@ -375,6 +380,8 @@ export async function getMagmaRecommendations(
     onchainCosts(lnd, cfg.openTxVbytes, cfg.closeTxVbytes),
     refreshMagmaHistory(),
   ]);
+  // When the reads came in: what a view's "as of" means (generatedAt).
+  const readAt = new Date().toISOString();
 
   const offers = market.offers;
   const myOrders = myOrdersView.orders.filter((o) => o.side === "SELL");
@@ -973,6 +980,7 @@ export async function getMagmaRecommendations(
   const projectedMonthlySat = Math.round(filled30.length * avgFeePerFill);
 
   return {
+    generatedAt: readAt,
     nodeNeed,
     nodeNeedReason,
     hasRoutingData,

@@ -31,6 +31,7 @@ import {
   rollingForwardsLine,
   scoreBar,
   topChannels,
+  topChannelsState,
   trendBadge,
 } from "../src/analyticsView";
 import { satsCompact } from "../src/format";
@@ -166,6 +167,31 @@ test("P&L lists the routing fees of the Lightning payments sent beside the on-ch
 test("the Overview's top channels rank what they earned plus what they brought in", () => {
   const top = topChannels([stat("a", { feesEarnedSats: 500 }), stat("b", { inboundFeesSats: 900 }), stat("c")]);
   assert.deepEqual(top.map((c) => c.channelId), ["b", "a"]);
+});
+
+// Review of P7 (final): the tile turned a failed forwards read into an empty
+// list — "No routing fees yet." — and a failed refresh over older figures
+// said nothing about when they were from.
+test("Top channels says when the routing report couldn't be read — never 'No routing fees yet' — and from when older rows are", () => {
+  const at = Date.parse("2026-10-22T09:15:00Z");
+  const time = new Date(at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  assert.deepEqual(topChannelsState({ data: null, error: null, updatedAt: null }), { kind: "loading" });
+  // Before: [] — rendered as "No routing fees yet."
+  assert.deepEqual(topChannelsState({ data: null, error: "Bad Gateway", updatedAt: null }), {
+    kind: "error",
+    text: "The routing report couldn't be read (Bad Gateway).",
+  });
+  const report = { perChannel: [stat("a", { feesEarnedSats: 500 }), stat("b")] };
+  assert.deepEqual(topChannelsState({ data: report, error: null, updatedAt: at }), { kind: "rows", rows: [report.perChannel[0]], stale: null });
+  // A failed refresh keeps the rows, with the error and their time.
+  const stale = topChannelsState({ data: report, error: "Bad Gateway", updatedAt: at });
+  assert.equal(stale.kind, "rows");
+  assert.equal(stale.kind === "rows" ? stale.stale : null, `Couldn't refresh (Bad Gateway) — as of ${time}.`);
+  // Read fine, nothing earned: that is "No routing fees yet" (the tile's words).
+  assert.deepEqual(topChannelsState({ data: { perChannel: [stat("c")] }, error: null, updatedAt: at }), { kind: "rows", rows: [], stale: null });
+  const tile = readFileSync(new URL("../src/components/TopChannelsTile.tsx", import.meta.url), "utf8");
+  assert.match(tile, /const view = topChannelsState\(report\);/);
+  assert.doesNotMatch(tile, /report\.error \? \[\]/);
 });
 
 test("a closed channel reads 'closed' — never 'draining · 0% left' in red", () => {

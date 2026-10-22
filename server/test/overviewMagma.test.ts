@@ -40,7 +40,7 @@ const emptyReport = (feesSats: number) =>
     recent: [],
     perChannel: [],
   }) as unknown as Parameters<typeof buildDashboard>[0];
-const autopilotState = { config: { enabled: false, rebalanceEnabled: false, channelEnabled: false, sellEnabled: false, intervalMinutes: 30 }, lastRunAt: null, history: [] };
+const autopilotState = { config: { enabled: false, rebalanceEnabled: false, channelEnabled: false, sellEnabled: false, maxHtlcEnabled: false, intervalMinutes: 30 }, lastRunAt: null, history: [] };
 
 test("routing yield is on this node's own channel balance, gross and net of rebalancing — not on peers' balances or channels still opening", () => {
   const d = buildDashboard(emptyReport(1_000), { invoices: [], payments: [] } as never, [], { count: 0, totalAmountSats: 0 }, autopilotState, 10_000_000, {
@@ -193,6 +193,14 @@ test("the enable confirmation's eligibility check answers at once while a failed
   market.behaviour = "ok";
   for (let i = 0; i < 6; i++) market.addOffer({ totalSats: 20_000_000, sellerScore: i, filledOrders: 0 });
   assert.equal((await api.request("GET", "/amboss/eligibility?refresh=1")).body.verdict, "not_realistic");
+  // As the web asks it now — the flag as "true", the query built from its
+  // contract type (review of P8, run 2) — it asks Amboss again too; without
+  // the flag the day's copy is served, Amboss not asked.
+  const asked = market.requests;
+  assert.equal((await api.request("GET", "/amboss/eligibility")).body.verdict, "not_realistic");
+  assert.equal(market.requests, asked, "the copy: Amboss not asked");
+  assert.equal((await api.request("GET", "/amboss/eligibility?refresh=true")).body.verdict, "not_realistic");
+  assert.ok(market.requests > asked, "refresh=true asks Amboss again");
 });
 
 test("an order the lane turned down raises an alert with the reason and a digest count — until dismissed", async (t) => {

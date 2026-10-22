@@ -15,8 +15,6 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
 import { rankCloseCandidates, type CloseInput } from "../src/services/suggestRecommend.js";
 import { channelLeases, leaseLeftText, leaseProtection, standardChannelId, type ChannelLease } from "../src/services/leases.js";
 import { ChannelUptime, MAX_GAP_MS, OFFLINE_CLOSE_SIGNAL_HOURS, type OfflineInfo } from "../src/services/channelUptime.js";

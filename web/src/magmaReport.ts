@@ -34,19 +34,25 @@ export function forgetMagmaReport(): void {
   entry = null;
 }
 
-/** A view's copy of the report: the report, when it was got, and why the
+/** A view's copy of the report: the report, when it was read, and why the
  *  last refresh failed (null: it didn't). */
 export interface ReportView {
   report: MagmaV2Report | null;
+  /** When its reads came in (ms): what "as of" and "what follows is from"
+   *  say. */
   at: number | null;
   error: string | null;
 }
 
 export const EMPTY_REPORT_VIEW: ReportView = { report: null, at: null, error: null };
 
-/** A refresh got the report. */
+/** A refresh got the report — as of when it was READ (its generatedAt):
+ *  copies are shared, by the server for a minute and by the views for a
+ *  minute more, so when this view got it could be ~2 min later (review of
+ *  P7). A report without the time (an older server) is as of now. */
 export function reportLoaded(report: MagmaV2Report, nowMs = Date.now()): ReportView {
-  return { report, at: nowMs, error: null };
+  const readAt = Date.parse(report.generatedAt);
+  return { report, at: Number.isFinite(readAt) ? readAt : nowMs, error: null };
 }
 
 /** A refresh failed: the last report stays, shown as of when it was got,

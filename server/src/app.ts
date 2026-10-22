@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import express, { type Express, type Router } from "express";
-import { effectiveAllowedHosts, hostAllowlist } from "./exposure.js";
+import { apiRequestGuard, effectiveAllowedHosts, hostAllowlist } from "./exposure.js";
 import type { RequestGate } from "./shutdown.js";
 
 /**
@@ -14,6 +14,9 @@ export function createHttpApp(opts: {
   allowedHosts: string[];
   /** Whether the API requires a login (APP_PASSWORD set). */
   authRequired: boolean;
+  /** The address the server listens on (LM_BIND): allowed as a Host
+   *  without a login, beside the loopback names. */
+  bindHost?: string;
   webDir?: string;
   /** Refuses new state-changing API requests once shutdown has begun. */
   requestGate: RequestGate;
@@ -22,9 +25,15 @@ export function createHttpApp(opts: {
   app.disable("x-powered-by");
 
   // Host-header allowlist — the DNS-rebinding defence. Explicit hosts win;
-  // without a login it defaults to loopback names (see exposure.ts).
-  const allowed = effectiveAllowedHosts(opts.allowedHosts, opts.authRequired);
+  // without a login it defaults to loopback names and the bound address
+  // (see exposure.ts).
+  const allowed = effectiveAllowedHosts(opts.allowedHosts, opts.authRequired, opts.bindHost);
   if (allowed.length > 0) app.use(hostAllowlist(allowed));
+
+  // Never another site's page, and every POST as JSON (exposure.ts) — before
+  // anything else of the API's: a refused request is never "under way" for
+  // the shutdown to wait on, and its body is never parsed.
+  app.use("/api", apiRequestGuard());
 
   // Shutting down: no new channel open, payment or order step may start from
   // the API, and the ones under way are waited for (see RequestGate).
@@ -32,7 +41,9 @@ export function createHttpApp(opts: {
 
   // No CORS: the UI is served same-origin (Vite proxies /api in dev), so a
   // cross-origin site can neither read responses nor make preflighted JSON
-  // POSTs — closing the cross-site / CSRF vector on the fund-moving API.
+  // POSTs — and a form, the one cross-site POST without a preflight, is not
+  // JSON (apiRequestGuard). That closes the cross-site / CSRF vector on the
+  // fund-moving API.
   app.use(express.json({ limit: "256kb" }));
   app.use("/api", opts.apiRouter);
 

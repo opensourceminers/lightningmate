@@ -91,9 +91,10 @@ export function MarketSell() {
   const [error, setError] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
-  // The report, when this view got it (its pending-orders banner is as of
-  // then), and why the last refresh failed — a failure keeps the report it
-  // had (the engine fails rather than read 0 sat on chain).
+  // The report, when it was read (its "as of" — the server's and the views'
+  // shared copies make that up to ~2 min before this view got it), and why
+  // the last refresh failed — a failure keeps the report it had (the engine
+  // fails rather than read 0 sat on chain).
   const [recView, setRecView] = useState<ReportView>(EMPTY_REPORT_VIEW);
   const rec = recView.report;
   const recAt = recView.at;

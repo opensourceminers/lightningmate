@@ -34,10 +34,10 @@ import { buildPresets } from "../src/presets";
 import { EMPTY_REPORT_VIEW, MAGMA_REPORT_MAX_AGE_MS, forgetMagmaReport, reportErrorText, reportLoaded, reportRefreshFailed, sharedMagmaReport } from "../src/magmaReport";
 import { caretButtonProps, trapTab } from "../src/a11y";
 import { pollGuard, shouldPoll, visibleTicker, type IntervalTimers, type VisibilitySource } from "../src/usePolledData";
-import { orderStatusLabel } from "../src/magmaView";
+import { acceptedToast, orderStatusLabel } from "../src/magmaView";
 import { WRITE_MODE_HINT, nodeErrorHint } from "../src/statusNotes";
 import { PresetPreview, StatusLine } from "../src/components/AutopilotPanel";
-import { InfoTip } from "../src/components/InfoTip";
+import { InfoTip, infoTipKeyDown } from "../src/components/InfoTip";
 import { pauseAllAutomation } from "../src/components/SellingSwitch";
 import { dashStaleText } from "../src/components/Overview";
 import type { ConfirmOpts } from "../src/components/Overlay";
@@ -222,11 +222,16 @@ const ap = (o: Partial<DashboardData["autopilot"]> = {}): DashboardData["autopil
   rebalance: false,
   channel: false,
   sell: false,
+  maxHtlc: false,
   lastRunAt: iso(3),
   lastRun: { applied: 0, attempted: 0, failed: 0, feeChanges: 0, rebalances: 0, sells: 0, opens: 0, maxHtlc: 0, errors: [] },
   lastActionAt: iso(3 * 24 * 60),
   intervalMinutes: 30,
+  pausedAt: null,
+  lspModeOn: false,
   status: {},
+  magmaRefusals: 0,
+  magmaRefusalReason: null,
   ...o,
 });
 
@@ -331,6 +336,39 @@ test("a stage failing the same way run after run is a failure of every one of th
   assert.equal(runResultLine({ applied: 0, failed: 0, attempted: 0, errors: [{ stage: "fees", error: "LND unreachable" }] }), "Run finished: nothing applied — the fees stage failed: LND unreachable.");
 });
 
+// Review of P7 (final): an item failing the same way as in the last run (a
+// fee LND refused again, the wallet failing an open again) was dropped from
+// the pass's counts — the server now counts it (autopilotStatus.test.ts,
+// PROBE-DIGEST-QUIET-REPEAT): these are the words for those counts.
+test("PROBE-DIGEST-QUIET-REPEAT: a run whose one fee update LND refused again reads 'nothing applied · 1 failed' — never 'nothing needed changing' — beside the fee area's failure; 'Run once now' never says 'nothing needed doing'", () => {
+  const repeated = ap({
+    lastRun: { applied: 0, attempted: 1, failed: 1, feeChanges: 0, rebalances: 0, sells: 0, opens: 0, maxHtlc: 0, errors: [] },
+    status: { fees: { state: "error", text: "1 update LND refused (LND refused the update: invalid policy — not retried for 6 h)", at: iso(3) } },
+  });
+  const items = autopilotDigest(repeated, NOW);
+  assert.deepEqual(
+    items.filter((i) => i.key === "ap" || i.key === "ap-fees").map((i) => [i.text, i.warn]),
+    [
+      ["Autopilot 3m ago: nothing applied · 1 failed — next run in ~27 min", true],
+      ["Fee automation failed: 1 update LND refused (LND refused the update: invalid policy — not retried for 6 h)", true],
+    ],
+  );
+  assert.equal(autopilotTileFoot(repeated, NOW), "Last run 3m ago · 0 applied, 1 failed");
+  assert.equal(runResultLine({ applied: 0, failed: 1, attempted: 1 }), "Run finished: 0 applied, 1 failed of 1.");
+});
+
+// Review of P7 (final): the digest left out Advertise routable size — on
+// alone, its runs and its failures never reached the Overview.
+test("the digest counts Advertise routable size (max_htlc) as an automation: on alone, its run is said — and its area's failure too", () => {
+  const only = ap({ fees: false, maxHtlc: true, lastRun: { applied: 2, attempted: 2, failed: 0, feeChanges: 0, rebalances: 0, sells: 0, opens: 0, maxHtlc: 2, errors: [] } });
+  // Before: nothing at all — anyOn read fees, rebalancing, channels and selling only.
+  assert.equal(autopilotDigest(only, NOW)[0]?.text, "Autopilot 3m ago: 2 max-HTLC updates — next run in ~27 min");
+  const failing = autopilotDigest(ap({ fees: false, maxHtlc: true, status: { maxHtlc: { state: "error", text: "the max_htlc stage failed: transport is closing", at: iso(3) } } }), NOW);
+  assert.ok(failing.some((i) => i.key === "ap-maxHtlc" && i.text === "Routable size failed: the max_htlc stage failed: transport is closing" && i.warn && i.sub === "fees"));
+  // Off: nothing of it is said.
+  assert.equal(autopilotDigest(ap({ fees: false, maxHtlc: false, status: { maxHtlc: { state: "error", text: "x", at: null } } }), NOW).length, 0);
+});
+
 test("an area switched on that hasn't decided anything yet reads 'not run yet' — not 'nothing to do', which nobody checked", () => {
   assert.deepEqual(STATE_CHIP.not_run, { label: "not run yet", tone: "info" });
   const v = areaStatusView({ state: "not_run", text: "not run yet since it was switched on — the next run decides", at: null }, NOW);
@@ -354,7 +392,7 @@ test("the Overview says when its figures couldn't be loaded, and from when the o
 
 const int = (min: number, max: number): NumberBounds => ({ min, max, integer: true });
 const bounds: AutopilotBounds = {
-  config: { intervalMinutes: int(5, 35_791), channelSizeSats: int(0, 1_000_000_000), rebalanceDailyBudgetSats: { ...int(1, 10_000_000), nullable: true } },
+  config: { intervalMinutes: int(5, 35_791), channelSizeSats: int(0, 1_000_000_000), rebalanceDailyBudgetSats: { ...int(1, 10_000_000), nullable: true } } as AutopilotBounds["config"],
   policy: { minPpm: int(0, 50_000), maxPpm: int(1, 50_000), neutralPpm: int(0, 50_000) } as AutopilotBounds["policy"],
   rebalancePolicy: { econRatio: { min: 0.05, max: 1, integer: false } } as AutopilotBounds["rebalancePolicy"],
   rules: { channelSizeMinSats: 20_000 },
@@ -470,33 +508,35 @@ test("the poll ticker skips a tick while the tab is hidden, catches up once on c
   assert.equal(page.listeners.size, 0);
 });
 
-test("one poll at a time: a second load while the first is under way calls nothing — a forced one neither — and a hidden page polls only when forced", async () => {
+test("one poll at a time: a second load while the first is under way calls nothing — a forced one waits for it — and a hidden page polls only when forced", async () => {
   let calls = 0;
-  let release!: (v: string) => void;
+  const releases: ((v: string) => void)[] = [];
   let hidden = false;
   const seen: string[] = [];
   const load = pollGuard(
     () => {
       calls += 1;
-      return new Promise<string>((r) => (release = r));
+      return new Promise<string>((r) => releases.push(r));
     },
     () => hidden,
     { loaded: (v) => void seen.push(`ok:${v}`), failed: (e) => void seen.push(`err:${String(e)}`), settled: () => void seen.push("settled") },
   );
   const first = load();
   assert.equal(await load(), false, "the earlier request is still under way");
-  assert.equal(await load(true), false, "forced too: no pile-up on a slow node");
-  assert.equal(calls, 1);
-  release("a");
+  const forced = load(true);
+  assert.equal(calls, 1, "no pile-up on a slow node: the forced load waits for the one under way");
+  releases[0]("a");
   assert.equal(await first, true);
-  assert.deepEqual(seen, ["ok:a", "settled"]);
+  releases[1]("b");
+  assert.equal(await forced, true, "it ran right after");
+  assert.deepEqual(seen, ["ok:a", "settled", "ok:b", "settled"]);
   hidden = true;
   assert.equal(await load(), false, "hidden: no poll");
-  assert.equal(calls, 1);
-  const forced = load(true);
-  release("b");
-  assert.equal(await forced, true, "the first load and Try again run hidden or not");
   assert.equal(calls, 2);
+  const tryAgain = load(true);
+  releases[2]("c");
+  assert.equal(await tryAgain, true, "the first load and Try again run hidden or not");
+  assert.equal(calls, 3);
   // A failure goes to `failed` (the view keeps the data it had), and the
   // next poll can start.
   hidden = false;
@@ -510,6 +550,40 @@ test("one poll at a time: a second load while the first is under way calls nothi
   assert.deepEqual(seen.slice(-2), ["err:502", "err:502"]);
 });
 
+// Review of P7 (final): pollGuard dropped a forced load that came while a
+// poll was under way — AlertsBar's Dismiss refreshes with one, and the poll
+// in flight, answered from before the dismiss, kept the alert on screen for
+// another 30 s.
+test("a forced load during a poll in flight causes exactly one more call, right after it settles — however many came meanwhile; an ordinary poll during it none", async () => {
+  let calls = 0;
+  const releases: ((v: string) => void)[] = [];
+  const seen: string[] = [];
+  const load = pollGuard(
+    () => {
+      calls += 1;
+      return new Promise<string>((r) => releases.push(r));
+    },
+    () => false,
+    { loaded: (v) => void seen.push(v), failed: () => undefined, settled: () => undefined },
+  );
+  const poll = load(); // the 30 s poll, answering with the alert still listed
+  const dismiss = load(true); // Dismiss → refresh
+  const again = load(true);
+  void load(); // the next tick: still one in flight
+  assert.equal(calls, 1);
+  releases[0]("before the dismiss");
+  await poll;
+  assert.equal(calls, 2, "one more call — after the one under way");
+  releases[1]("after the dismiss");
+  assert.deepEqual([await dismiss, await again], [true, true]);
+  assert.equal(calls, 2, "exactly one: the two forced loads share it");
+  assert.deepEqual(seen, ["before the dismiss", "after the dismiss"], "the view ends on the answer from after the dismiss");
+  // Nothing owed: the next poll is an ordinary one.
+  const next = load();
+  releases[2]("later");
+  assert.equal(await next, true);
+  assert.equal(calls, 3);
+});
 test("Market → Sell keeps the last market picture when a refresh fails — with the error, and from when — instead of blanking it", () => {
   const report = { sell: {} } as MagmaV2Report;
   const at = Date.parse("2026-10-22T11:58:00.000Z");
@@ -528,6 +602,26 @@ test("Market → Sell keeps the last market picture when a refresh fails — wit
   // still shows the offer as it was.
   const sell = readFileSync(new URL("../src/components/MarketSell.tsx", import.meta.url), "utf8");
   assert.match(sell, /const reload = async \(\) => \{\n\s+forgetMagmaReport\(\);\n\s+await load\(\);/);
+});
+
+// Review of P7 (final): "as of" stamped when the view received the shared
+// report — with the server's 60 s memo and the views' 60 s cache, up to
+// about two minutes after it was read.
+test("Market → Sell's 'as of' is when the report was READ on the server — not when this view got its shared copy", () => {
+  const readAt = Date.parse("2026-10-22T11:58:00.000Z");
+  const gotAt = readAt + 110_000; // a copy shared by the server, then by another view
+  const report = { generatedAt: new Date(readAt).toISOString(), sell: {} } as MagmaV2Report;
+  const view = reportLoaded(report, gotAt);
+  assert.equal(view.at, readAt, "before: the time the view got it");
+  // So does the failed refresh's "what follows is from …".
+  const failed = reportRefreshFailed(view, new Error("Bad Gateway"));
+  const time = new Date(readAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  assert.equal(reportErrorText(failed), `Couldn't refresh the market picture (Bad Gateway) — what follows is from ${time}.`);
+  // A report without the time (an older server): as of when it came.
+  assert.equal(reportLoaded({ sell: {} } as MagmaV2Report, gotAt).at, gotAt);
+  const sell = readFileSync(new URL("../src/components/MarketSell.tsx", import.meta.url), "utf8");
+  assert.match(sell, /as of \{new Date\(recAt\)\.toLocaleTimeString/);
+  assert.match(sell, /const takeReport = \(r: MagmaV2Report\) => setRecView\(reportLoaded\(r\)\);/);
 });
 
 test("the Magma report is fetched once and shared — a failed fetch is not kept, and a write makes the next view fetch afresh", async () => {
@@ -652,6 +746,19 @@ test("help that was only a hover tooltip opens on a tap: an (i) button that says
   assert.match(overview, /<InfoTip text=\{d\.leaseBenchmark\.text\}/);
 });
 
+// Review of P7: InfoTip stopped every key from reaching its parents — inside
+// a dialog, Esc would no longer close it and Tab would leave its focus trap.
+test("the (i) button keeps only the keys it acts on (Enter, Space) from its parent — Esc and Tab go on to a dialog", () => {
+  const stopped = (key: string) => {
+    let s = false;
+    infoTipKeyDown({ key, stopPropagation: () => void (s = true) });
+    return s;
+  };
+  assert.deepEqual(["Enter", " ", "Escape", "Tab", "ArrowDown", "a"].map(stopped), [true, true, false, false, false, false]);
+  const src = readFileSync(new URL("../src/components/InfoTip.tsx", import.meta.url), "utf8");
+  assert.match(src, /onKeyDown=\{infoTipKeyDown\}/);
+});
+
 test("Umbrel users are no longer sent to a .env; write mode is described as what it is; order statuses read as words", () => {
   assert.equal(nodeErrorHint("umbrel"), "Is the Lightning Node app running and fully synced? LightningMate keeps trying every 15 seconds.");
   assert.doesNotMatch(nodeErrorHint("umbrel"), /\.env|LND_SOCKET|macaroon/);
@@ -666,7 +773,21 @@ test("Umbrel users are no longer sent to a .env; write mode is described as what
   assert.equal(orderStatusLabel("WAITING_FOR_SELLER_APPROVAL", "BUY"), "Waiting for the seller to accept");
   assert.equal(orderStatusLabel("SOMETHING_NEW", "SELL"), "Something new");
   const orders = readFileSync(new URL("../src/components/MarketOrders.tsx", import.meta.url), "utf8");
-  assert.match(orders, /\{orderStatusLabel\(o\.status, o\.side\)\}/);
+  assert.match(orders, /\{orderStatusLabel\(o\.status, o\.side, o\.opensItself\)\}/);
+});
+
+// Review of P7: "Paid — waiting for you to open the channel" also showed when
+// the order lane opens the channel itself. The server says who (opensItself).
+test("a paid sale says who opens its channel — the autopilot, or you — and so does the toast after a manual accept", () => {
+  assert.equal(orderStatusLabel("WAITING_FOR_CHANNEL_OPEN", "SELL", true), "Paid — the autopilot opens the channel");
+  assert.equal(orderStatusLabel("WAITING_FOR_CHANNEL_OPEN", "SELL", false), "Paid — waiting for you to open the channel");
+  assert.equal(orderStatusLabel("WAITING_FOR_CHANNEL_OPEN", "SELL"), "Paid — waiting for you to open the channel");
+  // A purchase is the seller's to open, whatever the flag.
+  assert.equal(orderStatusLabel("WAITING_FOR_CHANNEL_OPEN", "BUY", true), "Paid — waiting for the seller to open the channel");
+  assert.equal(acceptedToast(true), "Order accepted — the autopilot opens the channel once the buyer has paid.");
+  assert.equal(acceptedToast(false), "Order accepted — open the channel once the buyer has paid.");
+  const orders = readFileSync(new URL("../src/components/MarketOrders.tsx", import.meta.url), "utf8");
+  assert.match(orders, /ui\.toast\(acceptedToast\(r\.opensItself === true\), "success"\)/);
 });
 
 test("no internal engine badges ('v1', 'v2') on the panels; the LN+ tables scroll on a phone like the others", () => {

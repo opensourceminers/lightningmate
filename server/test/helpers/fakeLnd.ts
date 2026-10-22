@@ -44,6 +44,11 @@ import { makeNodeKey, makePaymentRequest, parsePaymentRequest, type NodeKey } fr
  * A method that is neither implemented nor overridden is ABSENT, so the
  * library fails fast with its "ExpectedLnd…" error instead of hanging.
  *
+ * Macaroons: `node.lnd` may call everything. `node.withoutPermission(m…)` is
+ * a second client of the same node — another macaroon — that LND refuses
+ * those gRPC methods ("permission denied", answered before the call runs),
+ * e.g. a write macaroon baked without peers:read.
+ *
  * Payments: `payOutcome` decides what `sendPaymentV2` does — "succeed",
  * "fail", or "hang" (stays IN_FLIGHT until `resolvePayment()`), which is how
  * a test reproduces a stuck HTLC.
@@ -202,6 +207,8 @@ export class FakeLnd {
   beforeCall: ((method: string, args: GrpcArgs) => void) | null = null;
   private readonly overrides = new Map<string, UnaryImpl | StreamImpl>();
   private readonly failures: { method: string; details: string; when: () => boolean }[] = [];
+  /** A client of this node whose macaroon LND refuses `denied` (gRPC names). */
+  private readonly clientWithout: (denied: ReadonlySet<string>) => AuthenticatedLnd;
   private readonly paymentStreams = new Map<string, EventEmitter[]>();
   private readonly invoiceStreams = new Map<string, EventEmitter[]>();
   private readonly messageStreams: EventEmitter[] = [];
@@ -325,7 +332,7 @@ export class FakeLnd {
       },
     };
 
-    const namespace = (ns: string) =>
+    const namespace = (ns: string, denied: ReadonlySet<string>) =>
       new Proxy(
         {},
         {
@@ -337,6 +344,19 @@ export class FakeLnd {
             return (args: GrpcArgs, cb?: Callback) => {
               this.calls.push({ method: name, args });
               this.beforeCall?.(name, args);
+              // LND's macaroon check: refused before the call runs (a
+              // stream ends as grpc-js ends a refused one: an error, then
+              // its status — the library reads either, per method).
+              if (denied.has(name)) {
+                const refusal = { code: 2, details: "permission denied" };
+                if (cb) return cb(refusal);
+                const s = stream();
+                later(() => {
+                  if (s.listenerCount("error") > 0) s.emit("error", refusal);
+                  s.emit("status", refusal);
+                });
+                return s;
+              }
               const failure = cb ? this.failures.findIndex((f) => f.method === name && f.when()) : -1;
               if (failure >= 0) {
                 const [f] = this.failures.splice(failure, 1);
@@ -347,16 +367,25 @@ export class FakeLnd {
           },
         },
       );
-    this.lnd = {
-      default: namespace("default"),
-      router: namespace("router"),
-      invoices: namespace("invoices"),
-      wallet: namespace("wallet"),
-      chain: namespace("chain"),
-      peers: namespace("peers"),
-      signer: namespace("signer"),
-      version: namespace("version"),
-    } as unknown as AuthenticatedLnd;
+    this.clientWithout = (denied) =>
+      ({
+        default: namespace("default", denied),
+        router: namespace("router", denied),
+        invoices: namespace("invoices", denied),
+        wallet: namespace("wallet", denied),
+        chain: namespace("chain", denied),
+        peers: namespace("peers", denied),
+        signer: namespace("signer", denied),
+        version: namespace("version", denied),
+      }) as unknown as AuthenticatedLnd;
+    this.lnd = this.clientWithout(new Set());
+  }
+
+  /** A second client of this node — another macaroon — that LND refuses the
+   *  given gRPC methods (e.g. "default.listPeers": a macaroon without
+   *  peers:read). Same node, same state, same call log. */
+  withoutPermission(...methods: string[]): AuthenticatedLnd {
+    return this.clientWithout(new Set(methods));
   }
 
   get publicKey(): string {

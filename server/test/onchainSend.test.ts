@@ -223,15 +223,44 @@ test("a send the wallet can't cover is refused with the reason, and every reques
   assert.equal(p.body.feeApprox, true);
   const refused = await api.request("POST", "/onchain/send", { address: ADDRESS, tokens: 99_900, feeRate: 10, confirmed: ["fee_share_high", "below_reserve"] });
   assert.deepEqual([refused.status, refused.body.error], [400, "bad_send"]);
+  // From here the wallet covers every amount asked, with nothing to confirm:
+  // a request the send failed to refuse would go out, not merely ask a
+  // second yes.
+  node.chainBalance = 5_000_000;
   for (const body of [
     { address: ADDRESS, tokens: 50_000, sendAll: true, feeRate: 2 },
     { address: ADDRESS, feeRate: 2 },
-    { address: ADDRESS, max: true, feeRate: 2 },
     { address: ADDRESS, tokens: 50_000, feeRate: 2, confirmed: "fee_rate_high" },
     { address: ADDRESS, tokens: 50_000, feeRate: 2_001 },
   ]) {
     assert.equal((await api.request("POST", "/onchain/send", body)).status, 400, JSON.stringify(body));
   }
+  // `max` and `all` are the preview's words (the send's amount is `tokens`,
+  // a sweep `sendAll`): refused with the reason, not ignored — next to an
+  // amount either would send the amount without a word. The send hands its
+  // parser no `max`, so this refusal is all that stops the first (review of
+  // P8, run 2: each route reads only its own contract's keys).
+  for (const body of [
+    { address: ADDRESS, tokens: 50_000, max: true, feeRate: 2 },
+    { address: ADDRESS, tokens: 50_000, all: true, feeRate: 2 },
+    { address: ADDRESS, sendAll: true, max: true, feeRate: 2 },
+    { address: ADDRESS, max: true, feeRate: 2 },
+    { address: ADDRESS, all: true, feeRate: 2 },
+  ]) {
+    const res = await api.request("POST", "/onchain/send", body);
+    assert.deepEqual(
+      [res.status, res.body.error, res.body.message],
+      [400, "bad_request", "send an amount (the preview's max) or sendAll — not the preview's max or all."],
+      JSON.stringify(body),
+    );
+  }
+  // Each route takes its own words, and names them when none was given: the
+  // send's `sendAll` is no sweep in the preview.
+  const unsaid = await preview({ sendAll: 1, feeRate: 2 });
+  assert.equal(unsaid.status, 400);
+  assert.match(unsaid.body.message, /and one of tokens \(≥\d+ sat\), max or all required\.$/);
+  const sendUnsaid = await api.request("POST", "/onchain/send", { address: ADDRESS, feeRate: 2 });
+  assert.match(sendUnsaid.body.message, /and one of tokens \(≥\d+ sat\) or sendAll required\.$/);
   assert.equal(node.callsTo("default.sendCoins").length, 0);
 });
 

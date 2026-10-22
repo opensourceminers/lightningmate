@@ -13,7 +13,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { OnchainMutex, effectiveReserve, listableSat, spendableFrom, type Reservation } from "../src/services/capital.js";
+import { OnchainMutex, effectiveReserve, listableSat, promisedSpendFrom, promisedSpendRefusal, spendableFrom, type Reservation } from "../src/services/capital.js";
 import type { Lsps1Order } from "../src/services/lsps1.js";
 import { FakeLnd, type FakeChannel } from "./helpers/fakeLnd.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
@@ -1133,4 +1133,21 @@ test("LSPS1: LND not answering while an unclear open is looked for is no answer 
   assert.equal(opens, 0);
   assert.equal(counts.settles, 1);
   assert.equal(order.orderState, "COMPLETED");
+});
+
+// Final review of P5: promisedSpendRefusal took a `sendFeeSat` no caller
+// passed — it is a manual open's check; an on-chain send makes its check from
+// the figures its preview read, with its own fee (promisedSpendFrom). The
+// dead option is gone (the typecheck enforces it), and the send's fee still
+// counts where it is used.
+test("promisedSpendRefusal is the manual open's check — no send fee option; a send's own fee goes through promisedSpendFrom", async () => {
+  const typeOnly = (lnd: Parameters<typeof promisedSpendRefusal>[0], ledger: Parameters<typeof promisedSpendRefusal>[1]) =>
+    // @ts-expect-error — no such option: an on-chain send's fee is promisedSpendFrom's
+    promisedSpendRefusal(lnd, ledger, 1, { newChannel: true, sendFeeSat: 5 });
+  assert.equal(typeof typeOnly, "function");
+  const inputs = { anchorChannels: 0, fundingFeeSat: 1_000 };
+  const pending: Reservation[] = [{ key: "magma:o1", sats: 500_000, reserveSat: 0 }];
+  // The send pays its own 200 sat fee, not the 1,000 sat funding-fee estimate.
+  assert.equal(promisedSpendFrom(1_000_000, inputs, pending, 498_000, { newChannel: false, sendFeeSat: 200 })?.spendableSat, 488_800);
+  assert.equal(promisedSpendFrom(1_000_000, inputs, pending, 498_000, { newChannel: false })?.spendableSat, 488_000);
 });

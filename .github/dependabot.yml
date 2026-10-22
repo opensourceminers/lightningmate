@@ -1,0 +1,37 @@
+# Dependency updates as pull requests (review a8-engineering:supply-chain-
+# release-traceability: no update tooling, actions pinned to moving tags,
+# an override pin that blocked a fix). Each PR runs CI — the production audit
+# included — before anyone merges it. Releases stay manual (docs/RELEASING.md).
+version: 2
+updates:
+  # The npm workspaces (server, web) share the root lockfile.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      npm-minor-and-patch:
+        update-types: [minor, patch]
+
+  # The workflows' actions are pinned to commits; this keeps the pins current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # The Dockerfile's base image is pinned by digest; this proposes new ones —
+  # within its Node major, the one CI tests (ci.yml's node-version). Left to
+  # itself it would also propose another major (node:22.x-alpine → a 24.x
+  # alpine tag), and the release checklist merges its bumps: the image would
+  # ship on a Node major CI never ran. A new Node major is a deliberate change
+  # of its own — the Dockerfile's FROM lines and ci.yml's node-version
+  # together, in one pull request (server/test/releaseWorkflow.test.ts holds
+  # them together).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    ignore:
+      - dependency-name: "node"
+        update-types: ["version-update:semver-major"]

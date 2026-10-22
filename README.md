@@ -26,13 +26,13 @@ standalone via Docker.
 - **Channels** — live balance bars with source / sink / router roles, scored
   peer suggestions, and close candidates — never a channel still opening or
   closing, or one inside its lease (sold on Magma or over LSPS1, or bought on
-  Magma; the table tags those — a sale older than the app's order journal is
-  known from Amboss's listing, kept on disk and asked again — when it is over
-  an hour old — before the close list or a close goes by it, while an Amboss
-  key is set; a sale that listing still reports running stays protected, its
-  routing-fee promise kept and its channel never drained by a rebalance, even
-  after the journal's own count has ended), and a peer counts as offline only
-  after days away.
+  Magma; the table tags those). A sale older than the app's order journal is
+  known from Amboss's listing of this node's running leases (with an Amboss
+  key): the listing is kept on disk, and the close list and a close ask
+  Amboss for it again only when the copy is over an hour old. A sale that
+  listing still reports running stays protected — its routing-fee promise
+  kept, its channel never drained by a rebalance — even after the journal's
+  own count has ended. A peer counts as offline only after days away.
   Closing opens a dialog to pick the on-chain fee (fast / economy / custom); a
   peer that is away is offered a reconnect first, a force-close is
   its own step that says what it does, and breaking a lease needs an explicit
@@ -84,20 +84,26 @@ standalone via Docker.
   **Pause all automation** switches every automation off at once — a run in
   progress starts no further fee write, refill, open, offer change or Magma
   order accept (a payment or open already under way finishes, and Magma
-  orders already taken on are carried to their end); Resume brings back what
+  orders already taken on are carried to their end). A paused order lane
+  neither accepts nor turns down a new order: it waits for you on Market →
+  Orders, which says whether a paid order's channel is opened by the
+  autopilot or by you. Resume brings back what
   was on, selling excepted. LSP mode (Settings) is not part of the pause:
   while it is on it keeps answering wallet orders and opening their channels,
   and the pause says so. Each area — fees, rebalancing, channels, Magma —
   says what it last decided and why (acted, nothing to do, waiting, deferred,
-  blocked, error), on its sub-tab and on the Overview; settings below the
+  blocked, error), on its sub-tab and on the Overview — a failure that repeats
+  (a fee LND keeps refusing, a wallet that can't fund an open) is reported by
+  every run it happens in, with one line in the run history; settings below the
   switches are saved together, after a check of every value. Fees are volume-first
   (competitive, zero base fee) with profit floors so a channel never routes
   below its refill cost — and every channel sold through Magma or LSPS1 is kept
   within the routing-fee cap its buyer was promised, for the lease; rebalances
   run only when they pass the profit check (valued at the fee the channel keeps
-  after the refill, the payment capped by that check), within one daily fee
-  budget that manual runs count toward too — on a small, low-fee node that is
-  rarely; channels open to top peers;
+  after the refill, the payment capped by that check — at the planned size, the
+  largest size the check allows at the route's cost, then smaller ones), within
+  one daily fee budget that manual runs count toward too — on a small, low-fee
+  node that is rarely; channels open to top peers;
   with Liquidity provision on, Magma sell orders are fulfilled — all on
   recommended settings with safe caps, per-channel cooldowns and an on-chain
   reserve. Off until you enable it, and every fund-moving action is gated behind
@@ -114,13 +120,28 @@ standalone via Docker.
 ```
 LightningMate/
 ├── server/   Node + TypeScript backend (LND gRPC via ln-service, REST API, Amboss client)
+│   └── src/apiTypes.ts   the API's payload types — one source for server and web
 └── web/      React + Vite dashboard
 ```
 
 The backend talks to LND with the [`lightning`](https://www.npmjs.com/package/lightning)
-(ln-service) library and to the Amboss Magma marketplace over GraphQL. In
-production it also serves the built React app, so the whole tool is **one
-container on one port**.
+(ln-service) library and to the Amboss Magma marketplace over GraphQL (selling
+on Amboss's Magma API, `magma.amboss.tech`). In production it also serves the
+built React app, so the whole tool is **one container on one port**. The API's
+payload types — what the routes answer and what the web sends them — are
+declared once (`server/src/apiTypes.ts`): every body a route builds is checked
+against them where it is sent, a route reads a request's body and query
+string only as their contract types (`bodyOf<…>(req)`, `queryOf<…>(req)`,
+whose keys are the type's — a read can't be widened to another contract
+type's keys, nor handed to code that reads them), and the web imports them
+type-only — a payload that changes shape fails the type-check instead of
+drifting from a hand-kept copy. The contract check
+(`npm run check:api-types`) also pairs the two sides: every body a route can
+send must fit the type the web client reads that route's answer as, and
+every request the web sends — its body, its query — names the very type its
+route reads. The server's compiler settings include the checks the web's
+applies to the server files it reads, so a server-only change fails in the
+server's own check, not in the web's build.
 
 ## Authentication
 
@@ -129,7 +150,13 @@ container on one port**.
   whole API requires a session token proving that password, so no other app on
   your server can read your node or move your funds.
 - **Standalone** binds to `127.0.0.1` and runs without a login (reachable only
-  from the same machine). Don't expose it to a LAN/WAN without an authenticating
+  from the same machine). It refuses to start bound to anything else unless
+  `APP_PASSWORD` sets a login. Without a login it serves only requests for
+  `localhost`, `127.0.0.1`, `::1` or the address it is bound to (no DNS
+  rebinding), refuses any request a browser marks as coming from another
+  site, and takes every POST as JSON only — so a web page you happen to open
+  can't pause, resume or run the autopilot, or export your channel backup
+  (SECURITY.md). Don't expose it to a LAN/WAN without an authenticating
   reverse proxy.
 
 ## Read-only vs. write
@@ -143,14 +170,15 @@ auto-discovered from the mounted LND data dir.
 
 ## Connecting to your Umbrel LND (standalone)
 
-Lightning Mate needs the LND gRPC socket, the TLS cert, and a macaroon
-(**read-only** to observe, **admin** to also manage):
+Lightning Mate needs the LND gRPC socket, the TLS cert and the **read-only**
+macaroon to observe — and, to also manage, a **write** macaroon of its own:
 
-| Value          | Where it lives on Umbrel                                                            |
-| -------------- | ---------------------------------------------------------------------------------- |
-| `LND_SOCKET`   | host:port of LND gRPC, e.g. `umbrel.local:10009` or the container host `lnd:10009` |
-| `LND_CERT`     | base64 of `tls.cert`                                                                |
-| `LND_MACAROON` | base64 of `readonly.macaroon` (or `admin.macaroon` for write mode)                  |
+| Value                | Where it lives on Umbrel                                                            |
+| -------------------- | ---------------------------------------------------------------------------------- |
+| `LND_SOCKET`         | host:port of LND gRPC, e.g. `umbrel.local:10009` or the container host `lnd:10009` |
+| `LND_CERT`           | base64 of `tls.cert`                                                                |
+| `LND_MACAROON`       | base64 of `readonly.macaroon` — the reads; it never writes                          |
+| `LND_WRITE_MACAROON` | write mode only (with `LM_ENABLE_WRITE=true`): base64 of `admin.macaroon`, or of the least-privilege macaroon [SECURITY.md](SECURITY.md) bakes (`peers:read` included) |
 
 On Umbrel the LND data dir is typically `~/umbrel/app-data/lightning/data/lnd/`.
 Grab the cert + macaroon as base64 (run on the Umbrel host):
@@ -161,7 +189,7 @@ base64 -w0 ~/umbrel/app-data/lightning/data/lnd/data/chain/bitcoin/mainnet/reado
 ```
 
 Then copy `.env.example` → `.env` and paste the values. (Prefer mounting files?
-Use `LND_CERT_PATH` / `LND_MACAROON_PATH` instead.)
+Use `LND_CERT_PATH` / `LND_MACAROON_PATH` / `LND_WRITE_MACAROON_PATH` instead.)
 
 ## Development
 
@@ -169,11 +197,16 @@ Use `LND_CERT_PATH` / `LND_MACAROON_PATH` instead.)
 npm install            # installs both server and web workspaces
 npm run dev            # backend (:3001) + frontend (:5173) together
 npm run typecheck      # server + web, including the tests
+npm run check:api-types  # the routes' bodies and the web against the one set of payload types
 npm test               # server + web test suites (node:test, fake LND, no network)
 ```
 
-Open http://localhost:5173. CI runs `npm ci`, the type-check, the tests and the
-build on every push and pull request (`.github/workflows/ci.yml`).
+Open http://localhost:5173. CI runs `npm ci`, an audit of the production
+dependencies, the type-check, the API contract check, the tests and the build
+on every push and pull request (`.github/workflows/ci.yml`); Dependabot keeps
+dependencies, actions and the base image current. The tests never touch a
+real node or Amboss; the money paths that need the real systems have manual
+end-to-end procedures in [docs/E2E-TESTING.md](docs/E2E-TESTING.md).
 
 ## Production (single container)
 
@@ -183,20 +216,35 @@ docker build -t lightningmate .
 # login — set LM_BIND=0.0.0.0 and APP_PASSWORD in .env (see .env.example), not
 # with -e on the command line, where the password would end up in your shell
 # history and in `ps`. The port is published on this machine only.
-docker run -p 127.0.0.1:3001:3001 --env-file .env lightningmate
+# --stop-timeout 60: Docker kills a container 10 s after `docker stop` by default;
+# the app takes up to 45 s to let work under way finish and save its state
+# (below). Umbrel's compose gives it the same minute (stop_grace_period: 1m).
+docker run -p 127.0.0.1:3001:3001 --env-file .env -v lightningmate-data:/data --stop-timeout 60 lightningmate
 ```
+
+The named volume `lightningmate-data` holds the app's state (`/data` in the
+container): the settings and the autopilot's history, the Magma and LSPS1
+order records — what claims a buyer's held payment — the rebalance, earnings
+and service-fee ledgers, and the Amboss key. Keep it across updates (run the
+new image with the same `-v`); without a volume that state goes with the
+container.
 
 LightningMate refuses to start when it would serve its API beyond loopback
 without a login. On `docker stop` it answers new state-changing requests with
 `503` (send them again once it is back up; reads keep working), starts no new
 payment, channel open or order step of its own, and gives whatever is already
 under way — an autopilot step, an LSP channel open, a request sent from the UI,
-even one whose browser or proxy connection has already gone — about half a
-minute to finish (a held LSP payment is left for restart recovery). Then it
-saves its state and exits.
+even one whose browser or proxy connection has already gone — up to 37 seconds
+to finish (a held LSP payment is left for restart recovery). Then it saves its
+state and exits, within 45 seconds of the signal: hence the recipe's
+`--stop-timeout 60`. With Docker's default of 10 s, work still under way would
+be cut off and left for the restart's recovery instead.
 
 The published multi-arch image is built by CI on version tags and pushed to
-`ghcr.io/opensourceminers/lightningmate` (amd64 + arm64, digest-pinned).
+`ghcr.io/opensourceminers/lightningmate` (amd64 + arm64): every image carries
+its source, commit and version, a provenance attestation and an SBOM, and a
+published tag is never rebuilt or overwritten. How a release is cut and goes
+to the two Umbrel stores: [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Umbrel App Store
 
@@ -211,6 +259,25 @@ macaroon is auto-discovered for write mode.
 - **Official store** — submission PR to
   [`getumbrel/umbrel-apps`](https://github.com/getumbrel/umbrel-apps). See
   [`packaging/umbrel/SUBMISSION.md`](packaging/umbrel/SUBMISSION.md).
+
+The folder holds what the next release publishes: the image pin and version
+the stores have now, plus the changes waiting for that release (the Tor proxy
+lines, the official store's category, draft release notes). A release updates
+both stores from it and then the folder ([docs/RELEASING.md](docs/RELEASING.md)).
+
+## Documentation
+
+- [SECURITY.md](SECURITY.md) — what leaves your node and by which route, auth,
+  state on disk, the service fee, release integrity, hardening.
+- [docs/AUTOPILOT-STRATEGY.md](docs/AUTOPILOT-STRATEGY.md) — how the fee engine,
+  rebalancing, channel opens, Magma selling and the presets work.
+- [docs/LSP-MODE.md](docs/LSP-MODE.md) — LSP mode (LSPS1), its reach and its
+  safety.
+- [docs/RELEASING.md](docs/RELEASING.md) — cutting a release; the store manifests.
+- [docs/E2E-TESTING.md](docs/E2E-TESTING.md) — manual end-to-end tests: Magma
+  selling with a second node, an LSPS1 buy from ZEUS over Tor.
+- [docs/ALGO-AUDIT.md](docs/ALGO-AUDIT.md) — the June 2026 algorithm audit
+  (German, historical) with what the fixes made of it.
 
 ## License
 

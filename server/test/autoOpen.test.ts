@@ -333,8 +333,12 @@ test("an unreachable peer backs off 1 day, then 7, then 30 — and its repeated 
     rec().retryAt = new Date(Date.now() - 1).toISOString();
     const run = await s.autopilot.runOnce();
     assert.deepEqual([rec().fails, waits()], [n, days]);
-    assert.deepEqual(run.channels, [], "the same failure again is not a new line in the run history");
+    // The pass's own result says it failed (review of P7: it read as a run
+    // with nothing to do) — flagged as the same failure again …
+    assert.deepEqual(run.channels.map((c) => [c.alias, c.ok, c.repeat]), [["gone", false, true]]);
+    assert.equal(run.failed, 1);
   }
+  // … which is no new line in the run history.
   assert.equal(s.autopilot.getState().history.length, 1, "one line for three identical failures");
 });
 

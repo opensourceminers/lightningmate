@@ -449,7 +449,7 @@ export async function getChannelSuggestionsV2(
   });
 
   const scored: Scored[] = pre.map((p) => {
-    const { stat, meta } = p.e;
+    const { stat } = p.e;
     const avgFee = stat.feeCount ? stat.feeSum / stat.feeCount : 0;
     const newReach = p.newReachNodes.length;
 

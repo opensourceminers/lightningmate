@@ -46,6 +46,16 @@ const ADJUSTED_WHAT: Record<string, string> = {
   "overrides.json": "Fees pinned by hand",
 };
 
+/** An "adjusted" file whose repair is not about limits: what was done, and
+ *  what it costs the operator. (Review of P8: malformed daily sums dropped
+ *  from rebalance-totals.json read "were outside the current limits and were
+ *  adjusted", and nothing said P&L's older costs were now lower.) */
+const ADJUSTED_MESSAGE: Record<string, (detail: string) => string> = {
+  "rebalance-totals.json": (detail) =>
+    `Some daily sums of older rebalancing fees in rebalance-totals.json were malformed and have been repaired or dropped: ${detail}. ` +
+    "P&L may now count less rebalancing cost for those days than you paid — by what was dropped — unless LND's payment history still lists those rebalances.",
+};
+
 function incidentMessage(i: StoreIncident): string {
   // A missing file names the most recent damaged copy found beside it, which
   // may stem from an earlier incident — say so rather than claim it is this one.
@@ -64,7 +74,10 @@ function incidentMessage(i: StoreIncident): string {
     case "write_failed":
       return `Could not save ${i.file} (${i.detail}) — recent changes will be lost on restart. Is the disk full?`;
     case "adjusted":
-      return `${ADJUSTED_WHAT[i.file] ?? `Values in ${i.file}`} were outside the current limits and were adjusted: ${i.detail}.`;
+      return (
+        ADJUSTED_MESSAGE[i.file]?.(i.detail) ??
+        `${ADJUSTED_WHAT[i.file] ?? `Values in ${i.file}`} were outside the current limits and were adjusted: ${i.detail}.`
+      );
     case "unrecorded_open":
       return `${i.detail} Is the disk full?`;
     case "unpaid_channel":

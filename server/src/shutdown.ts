@@ -11,8 +11,10 @@ import type { RequestHandler } from "express";
  * recorded state, flush state to disk and exit cleanly well inside the grace.
  */
 
-/** Total shutdown budget: well inside docker's stop_grace_period (1 min in
- *  our composes), after which the process is SIGKILLed. */
+/** Total shutdown budget: well inside the time Docker gives a stop before it
+ *  SIGKILLs the process — 1 min in our composes (stop_grace_period) and in
+ *  the README's `docker run` (--stop-timeout 60; Docker's default is 10 s).
+ *  server/test/docsMatchCode.test.ts holds both to it. */
 export const SHUTDOWN_GRACE_MS = 45_000;
 /** Kept back from the wait for the flush and the server close. */
 export const SHUTDOWN_FLUSH_RESERVE_MS = 8_000;

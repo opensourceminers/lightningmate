@@ -28,7 +28,8 @@ import { EarningsLog } from "../src/services/earningsLog.js";
 import { ServiceFeeLedger, type ServiceFeeEntry } from "../src/services/serviceFee.js";
 import { MagmaPurchases, type MagmaPurchase } from "../src/services/magmaPurchases.js";
 import { forgetSelfPayments, rebalanceCosts } from "../src/services/rebalanceCosts.js";
-import { JsonStore } from "../src/store.js";
+import { JsonStore, storeIncidents } from "../src/store.js";
+import { stateAlerts } from "../src/services/alerts.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { installChain, installPayments, paymentRpc } from "./helpers/chain.js";
@@ -530,4 +531,119 @@ test("P&L shows the routing fees of the Lightning payments this node sent — ap
   // Not counted in net: like the other on-chain fees, a cost of spending.
   assert.equal(p.netProfitSats, p.routingRevenueSats + p.magmaRevenueSats - p.totalCostSats);
   assert.equal(p.totalCostSats, p.channelOpenCostSats + p.channelCloseCostSats + p.rebalanceCostSats + p.inboundPurchaseCostSats + p.serviceFeePaidSats);
+});
+
+// ── final review of P6: two guards of the rebalance cost ledger ─────────────
+
+// F5: legacyMatch's amount check — a record from before payment hashes were
+// kept is paired with an LND payment only of its own amount. Without it, a
+// pre-hash record whose own payment LND no longer lists took another tool's
+// payment of a different amount into the same channel, and its own fee
+// dropped out of P&L.
+test("PROBE-LEGACY-AMOUNT: a pre-hash record whose payment LND no longer lists is never paired with another tool's payment of another amount — both fees count", async (t) => {
+  quiet(t);
+  const dir = makeTempDir(t);
+  const node = new FakeLnd({ chainBalance: 1_000_000 });
+  const at = new Date(Date.now() - 3 * DAY).toISOString();
+  const legacy: RebalanceRecord = { at, via: "autopilot", targetId: T1, targetAlias: "t1", sourceId: "850001x1x0", sourceAlias: "s", amountSats: 200_000, budgetPpm: 1000, feeSats: 33, costPpm: 165, ok: true };
+  writeFileSync(join(dir, "rebalances.json"), JSON.stringify([legacy]));
+  node.override("default.forwardingHistory", (_a, cb) => cb(null, { forwarding_events: [], last_offset_index: "0" }));
+  installChain(node);
+  // Its own payment pruned from LND; a bos rebalance of 500k into the same
+  // channel two minutes earlier is listed.
+  installPayments(node, [paymentRpc({ at: Date.parse(at) - 120_000, tokens: 500_000, feeMsat: 70_000, destination: node.publicKey, lastChannel: T1 })]);
+  const api = await startApi(t, { node, dir });
+  const p = (await api.request("GET", "/pnl?days=30")).body;
+  // Without the check: 70 sat, 1 rebalance — the 33 sat of the record gone.
+  assert.deepEqual([p.rebalanceCostSats, p.rebalanceCount], [103, 2]);
+});
+
+// F4: only an HTLC attempt that succeeded carries the payment back through
+// its last-hop channel. A failed earlier attempt — of a multi-path or a
+// retried payment — through another channel moved nothing there.
+test("a rebalance whose earlier attempt failed through another last-hop channel books its fee only on the channel it came back through — never a share on the failed attempt's channel", async (t) => {
+  quiet(t);
+  const node = new FakeLnd({ chainBalance: 1_000_000 });
+  node.override("default.forwardingHistory", (_a, cb) => cb(null, { forwarding_events: [], last_offset_index: "0" }));
+  installChain(node);
+  const pay = paymentRpc({
+    at: Date.now() - DAY,
+    tokens: 300_000,
+    feeMsat: 90_000,
+    destination: node.publicKey,
+    parts: [
+      { lastChannel: T2, tokens: 300_000, feeMsat: 120_000 }, // tried first: failed
+      { lastChannel: T1, tokens: 300_000, feeMsat: 90_000 }, // the one that paid
+    ],
+  });
+  pay.htlcs[0].status = "FAILED";
+  installPayments(node, [pay]);
+  const api = await startApi(t, { node });
+  const costs = (await api.request("GET", "/rebalance/costs?days=30")).body;
+  // Without the check: T2 got 120/210 of the fee (51 sat), T1 39.
+  assert.deepEqual(
+    costs.perChannel.map((c: { channelId: string; feeSats: number; count: number }) => [c.channelId, c.feeSats, c.count]),
+    [[T1, 90, 1]],
+  );
+  assert.equal(costs.feeSats, 90);
+});
+
+// Final review of P6: the daily sums of rebalance-totals.json were taken as
+// they came — a day of `null`, a channel's sum of `null` or of text made P&L
+// throw (Object.entries(null)) or add up strings.
+test("malformed daily rebalance sums are checked on load: repaired where the number is there (as text), dropped where it isn't — P&L reads the rest, and the operator is told once", async (t) => {
+  quiet(t);
+  const dir = makeTempDir(t);
+  const old = (daysAgo: number) => new Date(Date.now() - daysAgo * DAY).toISOString().slice(0, 10);
+  writeFileSync(
+    join(dir, "rebalance-totals.json"),
+    JSON.stringify({
+      trackedSince: new Date(Date.now() - 900 * DAY).toISOString(),
+      throughMs: Date.now() - 410 * DAY,
+      days: {
+        [old(500)]: { [T1]: { feeSats: 40, amountSats: 400_000, count: 1 } }, // fine
+        [old(501)]: null, // before: P&L threw (Object.entries(null))
+        [old(502)]: { [T1]: null, [T2]: { feeSats: "12", amountSats: "100000", count: "1" } }, // a null sum; numbers as text
+        [old(503)]: { [T2]: { feeSats: "a lot", amountSats: 1, count: 1 } }, // not a number
+        [old(504)]: { [T2]: { feeSats: -5, amountSats: 1, count: 1 } }, // a negative fee
+        "not a day": { [T1]: { feeSats: 1, amountSats: 1, count: 1 } },
+      },
+    }),
+  );
+  const log = new RebalanceLog(dir);
+  const all = log.costsSince();
+  // Before: a TypeError — or "4012" sat, the text added up.
+  assert.deepEqual([all.feeSats, all.amountSats, all.count], [52, 500_000, 2]);
+  assert.deepEqual(log.dailySums().map((d) => [d.day, d.targetId, d.feeSats]), [
+    [old(502), T2, 12],
+    [old(500), T1, 40],
+  ].sort((a, b) => String(a[0]).localeCompare(String(b[0]))));
+  // Saved repaired: on disk, only the checked sums — numbers as numbers.
+  const onDisk = JSON.parse(readFileSync(join(dir, "rebalance-totals.json"), "utf8")) as { days: Record<string, Record<string, Record<string, unknown>>> };
+  assert.deepEqual(Object.keys(onDisk.days).sort(), [old(500), old(502)].sort());
+  assert.deepEqual(onDisk.days[old(502)], { [T2]: { feeSats: 12, amountSats: 100_000, count: 1 } });
+  // Said, once: a second load finds nothing to say.
+  const incidents = storeIncidents(dir).filter((i) => i.file === "rebalance-totals.json");
+  assert.equal(incidents.length, 1);
+  assert.equal(incidents[0].kind, "adjusted");
+  assert.match(incidents[0].detail, /dropped/);
+  assert.match(incidents[0].detail, /numbers stored as text — read as numbers/);
+  // The alert says what happened — repaired or dropped, not "outside the
+  // current limits" — and that P&L's older costs may be lower for it.
+  const [alert] = stateAlerts(dir).filter((a) => a.message.includes("rebalance-totals.json"));
+  assert.ok(alert, "an alert");
+  assert.doesNotMatch(alert.message, /outside the current limits/);
+  assert.match(alert.message, /malformed and have been repaired or dropped: .*not a day of channel sums — dropped/);
+  assert.match(alert.message, /P&L may now count less rebalancing cost for those days than you paid/);
+  new RebalanceLog(dir);
+  assert.equal(storeIncidents(dir).filter((i) => i.file === "rebalance-totals.json").length, 1);
+  // P&L over everything, from the log (LND lists no rebalance): answered.
+  const node = new FakeLnd({ chainBalance: 1_000_000 });
+  node.override("default.forwardingHistory", (_a, cb) => cb(null, { forwarding_events: [], last_offset_index: "0" }));
+  installChain(node);
+  installPayments(node, []);
+  const api = await startApi(t, { node, dir });
+  const p = await api.request("GET", "/pnl?days=3650");
+  assert.equal(p.status, 200, JSON.stringify(p.body));
+  assert.equal(p.body.rebalanceCostSats, 52);
 });

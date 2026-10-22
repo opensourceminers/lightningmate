@@ -148,6 +148,14 @@ test("'Run it' sends the row's fee caps and the profit gate — the cap the dial
   assert.doesNotMatch(tab, /econRatio: 0\.8/, "the operator's econRatio, not a constant");
 });
 
+// Review of P7 (a P3 gap): a run whose planned size the cap no longer allows
+// (today's budget left shrank since the plan) tries the largest size that
+// fits at the plan's route cost before the halves — the server needs it.
+test("'Run it' carries the plan's route cost for the row's size — so a size the cap no longer allows falls to the largest one it does before the halves", () => {
+  assert.equal(manualRefillRequest(recommended({ estimatedRouteCostPpm: 300 }), 0.8)?.routeCostPpm, 300);
+  assert.equal(manualRefillRequest(recommended({ estimatedRouteCostPpm: null }), 0.8)?.routeCostPpm, undefined, "no probed cost: none sent");
+});
+
 test("a Run from the tab carries its plan's time: a row whose target was refilled since the plan was made is refused (409 stale_plan), and the tab loads a fresh plan instead of showing an error", () => {
   const planAt = "2026-10-21T10:00:00.000Z";
   assert.equal(manualRefillRequest(recommended(), 0.8, planAt)?.planAt, planAt);

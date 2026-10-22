@@ -1,6 +1,7 @@
 import type { ForwardsReport } from "./forwards.js";
 import type { LnActivity } from "./payments.js";
 import type { OnchainTx } from "./onchain.js";
+import type { AreaStatus, DecisionArea } from "./autopilot.js";
 
 /**
  * Assembles the Overview dashboard from data already fetched by the route, so
@@ -86,6 +87,9 @@ export interface DashboardData {
     rebalance: boolean;
     channel: boolean;
     sell: boolean;
+    /** "Advertise routable size" (the max_htlc pass) — an automation like
+     *  the others: the digest counts it as on, and says when it fails. */
+    maxHtlc: boolean;
     /** The main run's last pass … */
     lastRunAt: string | null;
     /** … and what THAT pass did — never an older run's counts (review
@@ -117,7 +121,7 @@ export interface DashboardData {
      *  rather than "nothing new starts on its own" (review of P7). */
     lspModeOn: boolean;
     /** Per area: the last decision, or off / blocked (D16, compact). */
-    status: Record<string, { state: string; text: string; at: string | null }>;
+    status: Partial<Record<DecisionArea, { state: AreaStatus["state"]; text: string; at: string | null }>>;
     /** Magma orders the lane turned down in the last two days (not dismissed). */
     magmaRefusals: number;
     magmaRefusalReason: string | null;
@@ -152,6 +156,7 @@ interface AutopilotState {
     rebalanceEnabled: boolean;
     channelEnabled: boolean;
     sellEnabled: boolean;
+    maxHtlcEnabled: boolean;
     intervalMinutes: number;
   };
   lastRunAt: string | null;
@@ -171,7 +176,7 @@ interface AutopilotState {
   /** autopilot.ts getState().lastActionAt (null: none on record). */
   lastActionAt?: string | null;
   paused?: { at: string } | null;
-  status?: Record<string, { state: string; text: string; at: string | null }>;
+  status?: Partial<Record<DecisionArea, Pick<AreaStatus, "state" | "text" | "at">>>;
   history?: unknown[];
 }
 
@@ -305,6 +310,7 @@ export function buildDashboard(
       rebalance: autopilot.config.rebalanceEnabled,
       channel: autopilot.config.channelEnabled,
       sell: autopilot.config.sellEnabled,
+      maxHtlc: autopilot.config.maxHtlcEnabled,
       lastRunAt: autopilot.lastRunAt,
       lastRun: run
         ? {

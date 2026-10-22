@@ -78,10 +78,17 @@ export function useVisibleInterval(tick: () => void, intervalMs: number): void {
 /**
  * One poll at a time (review a6-ux:polling-and-stale-data): `load()` calls
  * `fn` only while the page is visible and no earlier call is still under
- * way; `load(true)` — the first load, a "Try again" — skips the visibility
- * check, never the one-at-a-time rule. Resolves to whether `fn` was called.
- * The outcome goes to `on`: the value, or the error (the caller keeps the
- * data it had), then `settled`.
+ * way; `load(true)` — the first load, a "Try again", a refresh after a
+ * change (a dismissed alert) — skips the visibility check, never the
+ * one-at-a-time rule. The outcome goes to `on`: the value, or the error (the
+ * caller keeps the data it had), then `settled`.
+ *
+ * A forced load that comes while a call is under way is not dropped: that
+ * call's answer may be from before what the caller just changed (review of
+ * P7: an alert dismissed during a poll stayed up for another 30 s, the poll
+ * in flight answering with it). It runs once more right after — one such
+ * re-run however many forced loads came meanwhile — and resolves when that
+ * re-run has. Resolves to whether `fn` was called for it.
  */
 export function pollGuard<T>(
   fn: () => Promise<T>,
@@ -89,8 +96,19 @@ export function pollGuard<T>(
   on: { loaded(value: T): void; failed(err: unknown): void; settled(): void },
 ): (force?: boolean) => Promise<boolean> {
   let inFlight = false;
-  return async (force = false) => {
-    if (inFlight || (!force && !shouldPoll(hidden(), inFlight))) return false;
+  /** The re-run owed to forced loads that came during a call. */
+  let rerun: { done: Promise<boolean>; resolve: (called: boolean) => void } | null = null;
+  const load = async (force = false): Promise<boolean> => {
+    if (inFlight) {
+      if (!force) return false;
+      if (!rerun) {
+        let resolve!: (called: boolean) => void;
+        const done = new Promise<boolean>((r) => (resolve = r));
+        rerun = { done, resolve };
+      }
+      return rerun.done;
+    }
+    if (!force && !shouldPoll(hidden(), inFlight)) return false;
     inFlight = true;
     try {
       on.loaded(await fn());
@@ -100,8 +118,14 @@ export function pollGuard<T>(
       inFlight = false;
       on.settled();
     }
+    const owed = rerun;
+    rerun = null;
+    // (Started at once: `load` marks itself in flight before it awaits, so
+    // no other call slips in between.)
+    if (owed) void load(true).then(owed.resolve);
     return true;
   };
+  return load;
 }
 
 /** Fetch `fn` on mount and every `intervalMs` while the page is visible,

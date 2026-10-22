@@ -6,6 +6,15 @@
     "outDir": "dist",
     "rootDir": "src",
     "strict": true,
+    // The web's type-check compiles the server's files the API contract
+    // reaches (src/apiTypes.ts → services) with these on: the server's own
+    // check has them too, so an unused local or a re-export the web can't
+    // compile is reported here, in the server's check — not as a web or
+    // build failure in a server file (web/test/apiContract.test.tsx).
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "isolatedModules": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,

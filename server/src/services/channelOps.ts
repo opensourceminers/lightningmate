@@ -1,6 +1,51 @@
-import { addPeer, closeChannel, getNode, getPeers, openChannel, type AuthenticatedLnd } from "lightning";
+import { addPeer, closeChannel, getNode, getPeers, openChannel, type AuthenticatedLnd, type GetPeersResult } from "lightning";
+import { errorText } from "./errorText.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * LND refused the call for want of a permission on the macaroon: its
+ * macaroon check answers "permission denied" before the call runs — so
+ * nothing was done, and no retry helps until the macaroon does.
+ */
+export const isPermissionDenied = (error: unknown): boolean =>
+  /permission denied/i.test(typeof error === "string" ? error : errorText(error));
+
+/**
+ * Why no channel can be opened when LND won't list its peers to the write
+ * macaroon (no `peers:read`, which SECURITY.md's least-privilege recipe left
+ * out before): every open checks its connection to the peer with LND's
+ * ListPeers — LightningMate's own check, and the lightning library's addPeer
+ * after it dials. This node's setup, never a peer that is away.
+ */
+export const PEERS_READ_MISSING =
+  "the write macaroon lacks peers:read — LND refused to list its peers to it, and every channel open checks its connection to the peer that way; " +
+  "add peers:read to the macaroon (SECURITY.md) and restart LightningMate";
+
+/** LND refused a check the write client must make, for want of a permission
+ *  on its macaroon (`permission`, in LND's words). The message says what
+ *  is blocked and what to do. */
+export class MissingPermission extends Error {
+  constructor(
+    readonly permission: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "MissingPermission";
+  }
+}
+
+/** Clients LND has refused to list its peers to (no peers:read) — until a
+ *  listing goes through again. So the areas that open channels can say they
+ *  are blocked, not only the open that ran into it. Per client object: one
+ *  LND connection's verdict is never another's. */
+const peersReadRefused = new WeakSet<AuthenticatedLnd>();
+
+/** Why this (write) client can open no channel right now — LND refused it
+ *  the peer listing every open needs — or null. */
+export function opensBlocked(lnd: AuthenticatedLnd | undefined): string | null {
+  return lnd && peersReadRefused.has(lnd) ? PEERS_READ_MISSING : null;
+}
 
 export interface OpenChannelParams {
   pubkey: string;
@@ -52,9 +97,11 @@ function describe(err: unknown): string {
 
 /**
  * Refusals that come before any funding transaction exists: our own checks
- * (no connection, a size below LND's floor), and LND or the peer saying no
- * during the negotiation (peer offline, too many pending channels, a size
- * the peer won't take, a wallet that can't fund it, LND's anchor reserve).
+ * (no connection, a size below LND's floor), LND refusing the macaroon the
+ * call ("permission denied": its check runs before the call does), and LND
+ * or the peer saying no during the negotiation (peer offline, too many
+ * pending channels, a size the peer won't take, a wallet that can't fund it,
+ * LND's anchor reserve).
  *
  * Anything else — a dropped gRPC stream, a timeout, an error we don't know —
  * may have come AFTER LND broadcast the funding transaction. Such an open is
@@ -63,7 +110,7 @@ function describe(err: unknown): string {
  * (otherwise: a second channel, or a refunded buyer with a free channel).
  */
 const PRE_BROADCAST_REFUSAL =
-  /couldn't connect|channel size must be|PeerIsNotOnline|is not online|RemotePeerDisconnected|disconnected$|RemotePeerExited|peer exiting|RemoteNodeDoesNotSupportMultipleChannels|multiple channels unsupported|PeerPendingChannelsExceedMaximumAllowable|pending channels exceed|InsufficientFundsToCreateChannel|not enough witness outputs|insufficient funds|reserved wallet balance invalidated|ChainUnsupported|CannotOpenChannelToOwnNode|WalletNotFullySynced|RemoteNodeSyncing|MaxChannelDescriptionLengthExceeded|ExpectedLargerChannelSizeForChannelOpen|rejected the channel|chan size of .* is (below|above)|chan size of .* exceeds max/i;
+  /couldn't connect|channel size must be|PeerIsNotOnline|is not online|RemotePeerDisconnected|disconnected$|RemotePeerExited|peer exiting|RemoteNodeDoesNotSupportMultipleChannels|multiple channels unsupported|PeerPendingChannelsExceedMaximumAllowable|pending channels exceed|InsufficientFundsToCreateChannel|not enough witness outputs|insufficient funds|reserved wallet balance invalidated|ChainUnsupported|CannotOpenChannelToOwnNode|WalletNotFullySynced|RemoteNodeSyncing|MaxChannelDescriptionLengthExceeded|ExpectedLargerChannelSizeForChannelOpen|rejected the channel|chan size of .* is (below|above)|chan size of .* exceeds max|permission denied/i;
 
 export function isPreBroadcastRefusal(error: string): boolean {
   return PRE_BROADCAST_REFUSAL.test(error);
@@ -83,10 +130,15 @@ export function isPreBroadcastRefusal(error: string): boolean {
  * (WalletNotFullySynced, InsufficientFundsToCreateChannel, ChainUnsupported,
  * CannotOpenChannelToOwnNode) and LND's own text for the ones it passes on.
  * A peer's error arrives as "received funding error from <peer>: …" — that is
- * the peer's, whatever it says.
+ * the peer's, whatever it says. And LND refusing the write macaroon the open
+ * ("permission denied", answered before the call runs) is this node's setup:
+ * no peer has seen the open, and no funding exists (PRE_BROADCAST_REFUSAL).
  */
 export function nodeSideRefusal(error: string): string | null {
   if (/received funding error from/i.test(error)) return null;
+  if (isPermissionDenied(error)) {
+    return "the write macaroon may not open channels (LND: permission denied — an open needs onchain:write and offchain:write, see SECURITY.md)";
+  }
   if (/WalletNotFullySynced|wallet is fully synced/i.test(error)) return "LND's wallet isn't fully synced to the chain yet";
   // Before "insufficient funds": LND's text for it says that too.
   if (/reserved wallet balance invalidated/i.test(error)) return "the open would dip into the coins LND keeps for closing anchor channels";
@@ -133,12 +185,41 @@ export function peerMaxChannelFromError(error: string): number | null {
 export const isPendingChannelsLimit = (error: string): boolean =>
   /PeerPendingChannelsExceedMaximumAllowable|pending channels exceed/i.test(error);
 
-async function isConnected(lnd: AuthenticatedLnd, pubkey: string): Promise<boolean> {
+/**
+ * The peers LND is connected to, as this client may see them — null when LND
+ * didn't answer. LND refusing the listing for want of peers:read throws
+ * MissingPermission (and is remembered for the client, opensBlocked): before,
+ * it read as "not connected", so every open said the peer looked offline and
+ * every Magma order was turned down as "the buyer's node is unreachable".
+ */
+async function connectedKeys(lnd: AuthenticatedLnd): Promise<Set<string> | null> {
+  let listed: GetPeersResult;
   try {
-    const { peers } = await getPeers({ lnd });
-    return peers.some((p) => p.public_key === pubkey);
+    listed = await getPeers({ lnd });
+  } catch (err) {
+    if (!isPermissionDenied(err)) return null;
+    peersReadRefused.add(lnd);
+    throw new MissingPermission("peers:read", PEERS_READ_MISSING);
+  }
+  peersReadRefused.delete(lnd);
+  return new Set(listed.peers.map((p) => p.public_key));
+}
+
+/** @throws MissingPermission when LND won't list its peers to this client. */
+async function isConnected(lnd: AuthenticatedLnd, pubkey: string): Promise<boolean> {
+  return (await connectedKeys(lnd))?.has(pubkey) ?? false;
+}
+
+/**
+ * Ask LND once whether it lists its peers to this (write) client — at start,
+ * so a macaroon without peers:read shows the channel and Magma areas as
+ * blocked before an open or an order runs into it. Never throws.
+ */
+export async function checkPeerListing(lnd: AuthenticatedLnd): Promise<void> {
+  try {
+    await connectedKeys(lnd);
   } catch {
-    return false;
+    // MissingPermission: remembered (opensBlocked)
   }
 }
 
@@ -162,12 +243,14 @@ const CONNECT_BUDGET_MS = 90_000;
  * exponential backoff — about 50 s per call before, and it was called three
  * times per address, so an unreachable peer took minutes), then verify the
  * peer shows up as connected (the handshake can take a moment).
+ * @throws MissingPermission when LND won't list its peers to this client.
  */
 async function dial(lnd: AuthenticatedLnd, pubkey: string, socket: string): Promise<boolean> {
   try {
     await addPeer({ lnd, public_key: pubkey, socket, retry_count: 1, retry_delay: 1_000, timeout: CONNECT_ATTEMPT_MS });
   } catch {
-    // "already connected" or a dial error — verify below either way
+    // "already connected", a dial error — or the library's own ListPeers
+    // after ConnectPeer refused (no peers:read) — verify below either way
   }
   for (let check = 0; check < 3; check++) {
     if (await isConnected(lnd, pubkey)) return true;
@@ -182,6 +265,10 @@ async function dial(lnd: AuthenticatedLnd, pubkey: string, socket: string): Prom
  * socket in turn, then the addresses the graph knows, within one overall
  * budget. Before, one missing or stale socket meant "peer offline" at once,
  * even when the buyer listed another address or the graph had a working one.
+ *
+ * @throws MissingPermission when LND won't list its peers to this client (no
+ * peers:read): no connection can be checked, so none is dialed — this node's
+ * setup to fix, not the peer's absence.
  */
 export async function ensureConnected(lnd: AuthenticatedLnd, pubkey: string, sockets: string[] = []): Promise<boolean> {
   if (await isConnected(lnd, pubkey)) return true;
@@ -201,6 +288,12 @@ export async function ensureConnected(lnd: AuthenticatedLnd, pubkey: string, soc
 export const couldNotConnect = (pubkey: string): string =>
   `couldn't connect to ${pubkey.slice(0, 12)}… — the peer looks offline. Try again later.`;
 
+/** A peer connection for an open: made — or not, and then why, in words an
+ *  open's failure can carry. `blocked`: not the peer's doing but this node's
+ *  setup (the write macaroon lacks a permission every open needs) — no other
+ *  peer would fare better until the operator fixes it. */
+export type PeerConnection = { ok: true } | { ok: false; error: string; blocked?: true };
+
 /**
  * Connect to the peer (dialing each address given, then the graph's), and
  * report the failure the way an open would. Slow over Tor — up to about a
@@ -211,9 +304,14 @@ export const couldNotConnect = (pubkey: string): string =>
 export async function connectForOpen(
   writeLnd: AuthenticatedLnd,
   params: Pick<OpenChannelParams, "pubkey" | "socket" | "sockets">,
-): Promise<{ ok: true } | { ok: false; error: string }> {
+): Promise<PeerConnection> {
   const sockets = [...(params.socket ? [params.socket] : []), ...(params.sockets ?? [])];
-  return (await ensureConnected(writeLnd, params.pubkey, sockets)) ? { ok: true } : { ok: false, error: couldNotConnect(params.pubkey) };
+  try {
+    return (await ensureConnected(writeLnd, params.pubkey, sockets)) ? { ok: true } : { ok: false, error: couldNotConnect(params.pubkey) };
+  } catch (err) {
+    if (err instanceof MissingPermission) return { ok: false, error: err.message, blocked: true };
+    throw err;
+  }
 }
 
 /**

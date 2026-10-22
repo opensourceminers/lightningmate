@@ -1,8 +1,18 @@
-# Official Umbrel App Store manifest (getumbrel/umbrel-apps).
-# Per the packaging guide: bare `lightningmate` id, gallery [], NO icon field —
-# the Umbrel team hosts the final icon + screenshots (provide them in the PR body).
+# Official Umbrel App Store manifest (getumbrel/umbrel-apps/lightningmate):
+# what the next update PR publishes there. Per the packaging guide: bare
+# `lightningmate` id, NO icon field — the Umbrel team hosts the icon and the
+# gallery images. `version` and the image pin (docker-compose.yml) are the
+# published 0.7.7's until a release sets them; a release updates them and
+# `releaseNotes` here and in both stores: docs/RELEASING.md.
 manifestVersion: 1
 id: lightningmate
+storage:
+  dataRoot: data
+# The official store still lists `finance` (as published for 0.7.7). The owner
+# decided on 2026-10-21 that Lightning Mate is a bitcoin app — like Lightning
+# Node, Ride The Lightning, Core Lightning and Lightning Terminal, and as the
+# community store lists it: the next official update PR sets `bitcoin` and says
+# why in its body (docs/RELEASING.md).
 category: bitcoin
 name: Lightning Mate
 version: "0.7.7"
@@ -18,7 +28,7 @@ description: >-
   the network graph and open channels in a click, plus a node health score.
 
 
-  Flip on the Autopilot and the node tunes its own fees, runs only profitable
+  Flip on the Autopilot and the node tunes its own pricing, runs only profitable
   rebalances, and opens channels to top peers — all on recommended settings with
   safe caps and cooldowns.
 
@@ -29,7 +39,7 @@ description: >-
   reserve caps.
 
 
-  LSP mode (beta) turns your node into a Lightning Service Provider: wallets
+  LSP mode (experimental) turns your node into a Lightning Service Provider: wallets
   speaking the open LSPS1 standard (bLIP-51) can buy inbound channels from you
   directly — priced automatically, paid via a hold invoice that only settles
   once the channel is opening, refunded automatically on any failure. Off by
@@ -39,25 +49,57 @@ description: >-
   Lightning Mate signs in with the per-app password Umbrel generates for it
   (shown when you open the app), so no other app on your server can read your
   node or move your funds.
-releaseNotes: >-
-  LSP mode (beta): sell inbound channels directly to wallets speaking the open
-  LSPS1 standard (bLIP-51) — a second demand source beside Magma with no
-  marketplace fee. Priced by the same profit-aware engine, paid via a hold
-  invoice that only settles once the channel is opening; every failure path
-  refunds the buyer automatically. Off by default (Settings → LSP mode).
-  Includes graph discovery (feature bit 729), a shareable buyer guide, and an
-  optional clearnet-address announcement for nodes with a static IP or DDNS.
+# DRAFT notes for the next release — what the 2026-10 review fixes change.
+# Before publishing, check them against the release's code and its manual
+# end-to-end results (docs/E2E-TESTING.md, docs/RELEASING.md). Never claim that
+# price or size wins orders or raises the seller score (D11, D19): Amboss
+# decides which seller gets an order. (The published 0.7.7 notes claimed that
+# size decides whether a buyer can be matched — disproven; they must not be
+# copied out again. server/test/docsMatchCode.test.ts refuses them.)
+releaseNotes: |-
+  A reliability and honesty release: Magma selling moves to Amboss's new
+  Magma API, and every part of the autopilot says what it decided and why.
 
+  Magma selling (off by default)
+  - Orders are accepted with a hold invoice: the buyer's payment settles only
+    once Amboss confirms the channel, and every failure refunds it.
+  - Each order step is recorded before it happens, so a restart never opens a
+    second channel, and an order the node can't serve is rejected at once
+    rather than left to time out.
+  - Offers carry the standard 30-day lease and a routing-fee promise, which
+    the fee autopilot keeps for every channel sold.
+  - A live check shows how often offers like yours sell. Amboss decides which
+    seller gets an order, mostly by track record; price and size don't buy a
+    match, and the app no longer says they do.
+  - Turning selling on is its own confirmed step; no preset turns it on.
 
-  More forwards: the new "Advertise routable size" autopilot option keeps each
-  channel's max HTLC just under its spendable balance so senders skip depleted
-  channels, and the new "Unserved demand" panel on the Rebalancing tab shows
-  the routing demand your node had to turn away — exactly where a rebalance
-  pays for itself.
+  Autopilot
+  - Fees move toward an aim in bounded steps, rise only when a channel drains,
+    and a draining channel is priced against what refilling it costs.
+  - A refill never pays more than the profit check allowed; the daily budget
+    survives restarts and counts refills run by hand.
+  - Automatic channel opens pay a capped fee rate and, where the node's
+    routing yield is measured, must pay back their on-chain cost within a
+    year; a peer that is briefly offline is no reason to close.
+  - Presets show what they change before they apply, "Pause all automation"
+    switches every autopilot automation off at once (LSP mode, a Settings
+    switch, keeps running and says so), and each area says what it last
+    decided and why.
 
+  Profit & loss
+  - Every cost counts: closes and their sweeps, rebalances made with any tool,
+    inbound bought on Magma.
 
-  Plus security hardening around the new LSP surface (shared capital
-  deployment cap across Magma + LSP sales, crash-proof peer-message handling).
+  Wallet and LSP mode
+  - An on-chain send shows its fee in sats and asks again before it overpays
+    or dips into the reserve.
+  - LSP mode (experimental, off by default) accepts the order request of
+    ZEUS's embedded node; orders are paced and capped.
+
+  Privacy and security
+  - With Umbrel's Tor proxy, the app's own lookups (LN+, the BTC price, Amboss
+    market data) go through Tor; Settings → Privacy lists every destination.
+  - The API refuses requests a browser marks as cross-site.
 developer: opensourceminers.de
 website: https://opensourceminers.de
 dependencies:
@@ -65,32 +107,16 @@ dependencies:
 repo: https://github.com/opensourceminers/lightningmate
 support: https://github.com/opensourceminers/lightningmate/issues
 port: 3742
-gallery: []
+gallery:
+  - 1.webp
+  - 2.webp
+  - 3.webp
+  - 4.webp
+  - 5.webp
+  - 6.webp
 path: ""
 defaultUsername: ""
 defaultPassword: ""
 deterministicPassword: true
 submitter: opensourceminers
 submission: "https://github.com/getumbrel/umbrel-apps/pull/5783"
-widgets:
-  - id: "stats"
-    type: "four-stats"
-    refresh: "60s"
-    endpoint: "web:3001/api/widget/stats"
-    link: ""
-    example:
-      type: "four-stats"
-      link: ""
-      items:
-        - title: "Channels"
-          text: "25"
-          subtext: "active"
-        - title: "Outbound"
-          text: "55.7M"
-          subtext: "can send"
-        - title: "Earned"
-          text: "1.3k"
-          subtext: "sat · 30d"
-        - title: "Forwards"
-          text: "234"
-          subtext: "30d"

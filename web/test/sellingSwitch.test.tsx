@@ -17,6 +17,7 @@ import type { MyOffer } from "../src/types";
 
 const offer = (id: string, status = "ENABLED"): MyOffer => ({
   id,
+  nodePubkey: "02" + "11".repeat(32),
   status,
   minSizeSats: 1_000_000,
   maxSizeSats: 2_000_000,

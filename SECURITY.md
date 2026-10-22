@@ -70,7 +70,17 @@ security@opensourceminers.de (please don't open a public issue first).
   (VALID_CHANNEL_OPENING). Every failure — the open fails, the channel doesn't
   match, the held payment nears its expiry — cancels the invoice, refunding the
   buyer. Each step is written to `magma-orders.json` before it happens, so a
-  restart never opens a second channel for an order. Every channel open and
+  restart never opens a second channel for an order; the accept itself is
+  marked on disk before it goes out, so after a crash the order lane's own
+  accept that never left is withdrawn (nothing promised) if selling was
+  switched off meanwhile — one you clicked is your decision and goes out —
+  and one that may have reached Amboss is completed. An accept whose mark
+  can't be saved is not sent at all: its invoice is released, and the order
+  is decided again — a running lane rejects it rather than leave it to time
+  out when its approval deadline is close; a paused lane leaves it to the
+  operator. Switched off — or with
+  all automation paused — the order lane neither accepts nor turns down a new
+  order: it is the operator's to decide. Every channel open and
   every on-chain send takes one on-chain lock; Magma, LSPS1 and autopilot opens
   share one capital budget, and a manual open or send may not spend the coins
   promised to buyers (accepted Magma orders, paid LSPS1 orders) unless you
@@ -81,8 +91,13 @@ security@opensourceminers.de (please don't open a public issue first).
   land on it later.
 - **Secrets** (`tls.cert`, macaroons) are read from the mounted LND data dir at
   runtime — never baked into the image, committed to git, or logged.
-- **Dependencies** are pinned and `npm audit` is kept at 0 known vulnerabilities
-  (transitive DoS advisories patched via `overrides`).
+- **Dependencies** come from the lockfile (`npm ci`). CI fails a commit with a
+  known high or critical vulnerability in a production dependency
+  (`npm audit --omit=dev --audit-level=high`), and Dependabot proposes updates
+  to the npm packages, the workflow actions and the base image. Transitive
+  fixes the `lightning` library's own ranges would let through are forced with
+  `overrides`, as ranges, each named with its advisory in `package.json`.
+- **Releases** are traceable and immutable — see "Release integrity" below.
 
 ## Network exposure & auth
 
@@ -99,14 +114,46 @@ security@opensourceminers.de (please don't open a public issue first).
   reverse proxy.
 - **No CORS** is sent, so a malicious web page can't read responses or make
   cross-site JSON requests to the API.
-- **DNS rebinding:** without a login, only loopback `Host` headers
-  (`localhost`, `127.0.0.1`, `::1`) are served by default. `LM_ALLOWED_HOSTS`
-  (comma-separated) sets the list explicitly, in any mode.
+- **Cross-site requests are refused** under `/api`, in every mode: a request a
+  browser marks as coming from another site's page (`Sec-Fetch-Site:
+  cross-site`) gets `403`, and every POST must be JSON (`Content-Type:
+  application/json`, else `415`) — the one kind of cross-site write a browser
+  sends without asking first, an HTML form, can't be JSON, and a cross-site
+  fetch that is needs a CORS preflight the server never grants. This matters
+  most for standalone without a password, which has no login: before, any
+  page the owner opened could POST a form to `/api/autopilot/resume`, `/run`,
+  `/pause` or `/backup/export`, which act without a body. (On Umbrel and with
+  a password the session token, which a foreign page can't set, already
+  stopped that.) The web UI sends JSON on every POST. Nothing else calls the
+  API: Umbrel's widget poll is a GET from umbreld, LSPS1 runs over Lightning
+  peer messages, and no service calls back.
+- **DNS rebinding:** without a login, only requests for `localhost`,
+  `127.0.0.1`, `::1` or the address the API is bound to (`LM_BIND`) are
+  served — a page that rebinds its own name to 127.0.0.1 gets `403`.
+  `LM_ALLOWED_HOSTS` (comma-separated) sets the list explicitly, in any mode.
+  With a login there is no default list (Umbrel's app proxy may rewrite
+  `Host`), and the request's `Origin` is never compared with its `Host`.
 - All state-changing endpoints validate inputs (pubkey/txid/channel-id formats,
   sat/ppm bounds; every autopilot setting has a range — out-of-range or blank
   values are rejected, never coerced). Write and login limits are kept **per
   client address**, and only failed logins count, so another container on the
   Docker network can't lock the owner out.
+
+## Release integrity
+
+- **Images are immutable**: the image workflow refuses to publish a tag the
+  registry already has, and a manual run can publish only test tags
+  (`dev-…`). A broken release is fixed by the next version.
+- **Every image says where it came from**: OCI labels (source, commit,
+  version) on each architecture's image and as annotations on the manifest
+  list, a build provenance attestation and an SBOM pushed with it, and the
+  commit stamped into the app ("Download diagnostics").
+- **Pinned inputs**: the Dockerfile's base image by digest, every workflow
+  action by commit (the image workflow can write packages). The runtime image
+  holds the server's production dependencies only.
+- To check an image: `docker buildx imagetools inspect
+  ghcr.io/opensourceminers/lightningmate:<tag>` (and `--format '{{json
+  .Provenance}}'`); the steps are in [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Service fee (completed sales)
 
@@ -126,6 +173,14 @@ an alert silences only the problem it showed: a later, different one — another
 kind of refusal, or the give-up after a dismissed refusal — is alerted again.
 
 ## State on disk
+
+The state lives in `DATA_DIR`: in the Docker image `/data`, owned by the user
+the app runs as (`node`, uid 1000 — never root; the app's own code under
+`/app` is root's and not writable by it) — on Umbrel the app's own data dir,
+standalone a volume (README: `-v lightningmate-data:/data`); run from a
+checkout, `<repo>/.data`. It holds the settings, the Amboss key and the order
+records whose saved preimages claim buyers' held payments: the files are
+written readable by their owner only (mode 0600) — keep the directory private.
 
 All state files are written atomically (temp file → fsync → rename; the previous
 version is kept as `.bak`). A damaged file is never silently replaced by
@@ -163,13 +218,23 @@ it:
 ```bash
 # in the Umbrel lightning app (or via lncli)
 lncli bakemacaroon \
-  info:read offchain:read onchain:read invoices:read \
+  info:read offchain:read onchain:read invoices:read peers:read \
   offchain:write onchain:write peers:write invoices:write address:write \
   --save_to lightningmate.macaroon
 ```
 
-(`invoices:read` + `address:write` are used by LSP mode's hold-invoice flow;
-include them even if you don't plan to enable it — they grant no spend power.)
+- `peers:read` is needed by every channel open — manual, autopilot, Magma or
+  LSP mode: before an open, LightningMate checks the connection to the peer
+  with LND's ListPeers, and the lightning library's addPeer does the same
+  right after it dials. Without it no channel can be opened, and LightningMate
+  says so: the channel and Magma areas show as blocked naming the missing
+  permission, a new Magma order is turned down with that reason, and LSP mode
+  takes no new order, its Settings card saying why. (An earlier version of
+  this recipe left it out; a macaroon baked from it needs baking again, and
+  LightningMate a restart.)
+- `invoices:read`/`invoices:write` and `address:write` are used by the hold
+  invoices of Magma sales and LSP mode, and by rebalancing's own invoices —
+  include them even if you don't sell; they grant no spend power.
 
 Then in the app config:
 

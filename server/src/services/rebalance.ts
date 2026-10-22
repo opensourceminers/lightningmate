@@ -76,10 +76,18 @@ export async function estimateCost(
 /** The smallest refill worth trying (the recommender's minRebalanceAmount). */
 export const MIN_REFILL_SATS = 50_000;
 
-/** Amounts to attempt, largest first, down to a floor — for adaptive rebalancing. */
-export function adaptiveAmounts(target: number): number[] {
-  const raw = [target, Math.round(target / 2), Math.round(target / 4)];
-  return [...new Set(raw.filter((a) => a >= MIN_REFILL_SATS))];
+/** A size fitted to the gate (largestFittingRefill) is rounded down to this. */
+export const REFILL_FIT_STEP_SATS = 10_000;
+
+/**
+ * Amounts to attempt, largest first, down to a floor — for adaptive
+ * rebalancing: the planned size; then, when given, `fit` — the largest size
+ * the gate allows at the route cost probed for the planned one
+ * (largestFittingRefill) — and the planned size's half and quarter.
+ */
+export function adaptiveAmounts(target: number, fit: number | null = null): number[] {
+  const raw = [target, ...(fit !== null && fit < target ? [fit] : []), Math.round(target / 2), Math.round(target / 4)];
+  return [...new Set(raw.filter((a) => a >= MIN_REFILL_SATS))].sort((a, b) => b - a);
 }
 
 /** A refill at least this big may be split over several paths (MPP): one
@@ -117,6 +125,42 @@ export function feeCapAt(cap: RefillFeeCap, amountSats: number): number {
     sats = Math.min(sats, Math.floor(earned - e.minNetSats));
   }
   return Math.max(0, sats);
+}
+
+/**
+ * The largest refill below `planned` whose fee at `costPpm` — the route cost
+ * probed for the planned size — stays within the gate's cap at its own size
+ * (feeCapAt), rounded down to REFILL_FIT_STEP_SATS and at least `minSats`.
+ * Null: no such size. The fee is reckoned high (rounded up): the planner
+ * probes the route at that size and judges it as any other, and a payment
+ * of that size is capped by feeCapAt whatever the route costs — every gate
+ * stays as it is.
+ *
+ * Review of P7 (a P3 gap): the sizes tried were the planned one, its half and
+ * its quarter only. A refill that failed only on the payback limit — 1.25M
+ * at ~300 ppm needing 375 sat against a 336 sat limit — fell to 625k, which
+ * no longer cleared the minimum net profit, while 1.0M–1.12M would have
+ * passed: the drained channel got no refill at all.
+ */
+export function largestFittingRefill(cap: RefillFeeCap, planned: number, costPpm: number, minSats = MIN_REFILL_SATS): number | null {
+  if (!Number.isFinite(costPpm) || costPpm < 0) return null;
+  const top = Math.floor((planned - 1) / REFILL_FIT_STEP_SATS) * REFILL_FIT_STEP_SATS;
+  for (let a = top; a >= minSats; a -= REFILL_FIT_STEP_SATS) {
+    const max = feeCapAt(cap, a);
+    if (max >= 1 && Math.ceil((a * costPpm) / 1_000_000) <= max) return a;
+  }
+  return null;
+}
+
+/** The route cost (ppm) a probe found for a refill's planned size: when that
+ *  size doesn't fit the gate's cap at that cost, the largest size that does
+ *  (largestFittingRefill) — else null (the planned size fits, or nothing
+ *  smaller does). */
+export function fitBelowPlanned(cap: RefillFeeCap, planned: number, costPpm: number | null | undefined, minSats = MIN_REFILL_SATS): number | null {
+  if (costPpm == null) return null;
+  const max = feeCapAt(cap, planned);
+  if (max >= 1 && Math.ceil((planned * costPpm) / 1_000_000) <= max) return null;
+  return largestFittingRefill(cap, planned, costPpm, minSats);
 }
 
 // Pathfinding budget per attempt. Generous because over a dev SSH tunnel each
@@ -187,6 +231,11 @@ export interface RebalanceExecParams {
    *  at most what it is expected to earn minus the minimum net profit — at
    *  the halved fallback sizes too. Absent for a manual run without it. */
   gate?: { revenuePpm: number; demandSats: number; minNetSats: number };
+  /** The route cost (ppm) the plan probed for `amountSats`. When the
+   *  planned size doesn't fit the cap at that cost (a daily budget left
+   *  smaller than at planning, say), the largest size that does is tried
+   *  before the halves (fitBelowPlanned). */
+  routeCostPpm?: number;
 }
 
 export interface RebalanceExecResult {
@@ -410,7 +459,11 @@ export async function executeRebalance(
       const reason = why === true ? "shutting down" : why;
       return { ...withTarget, failedSourceIds, stopped: true, error: `skipped: ${reason} — no further attempt was sent` };
     };
-    for (const amount of adaptiveAmounts(Math.min(params.amountSats, spare))) {
+    // The planned size (what this source can spare of it), the largest
+    // size the cap allows at the plan's route cost when the planned one
+    // doesn't, then the halves.
+    const planned = Math.min(params.amountSats, spare);
+    for (const amount of adaptiveAmounts(planned, fitBelowPlanned(cap, planned, params.routeCostPpm))) {
       const left = deadline - Date.now();
       if (left <= 0) {
         lastErr ??= new Error("rebalance time limit reached");

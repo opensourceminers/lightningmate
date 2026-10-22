@@ -1,7 +1,15 @@
 import { type AuthenticatedLnd } from "lightning";
 import { type ChannelRole, type ChannelView } from "./channels.js";
 import { getOwnPubkey } from "./node.js";
-import { DEFAULT_REBALANCE_POLICY, adaptiveAmounts, estimateCost, feeCapAt } from "./rebalance.js";
+import {
+  DEFAULT_REBALANCE_POLICY,
+  MIN_REFILL_SATS,
+  adaptiveAmounts,
+  estimateCost,
+  feeCapAt,
+  largestFittingRefill,
+  type RefillFeeCap,
+} from "./rebalance.js";
 import {
   feeAfterRefill,
   runFeeEngine,
@@ -516,11 +524,18 @@ interface Probed {
 }
 
 /**
- * Route costs from one source at the planned amount and two smaller ones, and
- * the gate for each: the moved sats are valued at the lower of the drained
+ * Route costs from one source at the planned amount and smaller ones, and the
+ * gate for each: the moved sats are valued at the lower of the drained
  * channel's earnings estimate and the fee the engine takes it to after the
  * refill (its own rules, the refill's hold included) — and a route passes
  * only when its fee is within feeCapAt, the same cap the payment carries.
+ *
+ * The smaller sizes: the planned one's half and quarter — and, when the
+ * planned size doesn't pass, first the largest size the cap allows at the
+ * route cost probed for it (largestFittingRefill), probed and judged like the
+ * others (review of P7: a 1.25M refill turned down only by the payback limit
+ * fell to 625k, which no longer netted the minimum, while 1.0M–1.12M would
+ * have passed — the channel got no refill at all).
  */
 async function probeSource(
   rec: RebalanceRecommendation,
@@ -532,38 +547,46 @@ async function probeSource(
   probeRoute: RouteProbe,
 ): Promise<Probed[]> {
   const h0 = rec.preRefillPpm ?? 0;
-  const amounts = adaptiveAmounts(amount).filter((a) => a >= cfg.minRebalanceAmount);
-  const probes = await Promise.all(
-    amounts.map(async (a): Promise<Probed | null> => {
-      const { costPpm, feeSats } = await probeRoute(source, target, a);
-      if (costPpm == null || feeSats == null) return null;
-      const postPpm = ctx ? feeAfterRefill(target, ctx, { amountSats: a, feeSats, holdPpm: h0 }).aimPpm : h0;
-      const value = Math.min(h0, postPpm);
-      const maxCostPpm = Math.round(value * cfg.profitShare);
-      const earnings = (Math.min(a, rec.earningDemandSats) * value) / 1_000_000;
-      const maxFeeSats = feeCapAt(
-        {
-          maxCostPpm,
-          maxFeeSats: rec.maxCostSatsByPayback,
-          earnings: { revenuePpm: value, demandSats: rec.earningDemandSats, minNetSats: cfg.minExpectedNetProfitSats },
-        },
-        a,
-      );
-      return {
-        amount: a,
-        costPpm,
-        feeSats,
-        postPpm,
-        value,
-        maxCostPpm,
-        maxFeeSats,
-        net: Math.floor(earnings - feeSats),
-        paybackDays: rec.avgDailyRevenueSats > 0 ? Math.round((feeSats / rec.avgDailyRevenueSats) * 10) / 10 : null,
-        passes: maxFeeSats >= 1 && feeSats <= maxFeeSats,
-      };
-    }),
-  );
-  return probes.filter((p): p is Probed => p !== null);
+  /** The gate's cap for a route whose moved sats are valued at `value`. */
+  const capAt = (value: number): RefillFeeCap => ({
+    maxCostPpm: Math.round(value * cfg.profitShare),
+    maxFeeSats: rec.maxCostSatsByPayback,
+    earnings: { revenuePpm: value, demandSats: rec.earningDemandSats, minNetSats: cfg.minExpectedNetProfitSats },
+  });
+  const probeAt = async (a: number): Promise<Probed | null> => {
+    const { costPpm, feeSats } = await probeRoute(source, target, a);
+    if (costPpm == null || feeSats == null) return null;
+    const postPpm = ctx ? feeAfterRefill(target, ctx, { amountSats: a, feeSats, holdPpm: h0 }).aimPpm : h0;
+    const value = Math.min(h0, postPpm);
+    const cap = capAt(value);
+    const earnings = (Math.min(a, rec.earningDemandSats) * value) / 1_000_000;
+    const maxFeeSats = feeCapAt(cap, a);
+    return {
+      amount: a,
+      costPpm,
+      feeSats,
+      postPpm,
+      value,
+      maxCostPpm: cap.maxCostPpm,
+      maxFeeSats,
+      net: Math.floor(earnings - feeSats),
+      paybackDays: rec.avgDailyRevenueSats > 0 ? Math.round((feeSats / rec.avgDailyRevenueSats) * 10) / 10 : null,
+      passes: maxFeeSats >= 1 && feeSats <= maxFeeSats,
+    };
+  };
+  const ladder = adaptiveAmounts(amount).filter((a) => a >= cfg.minRebalanceAmount);
+  const probes = (await Promise.all(ladder.map(probeAt))).filter((p): p is Probed => p !== null);
+  // The planned size turned down: the largest size that fits the cap at its
+  // route cost (valued as the planned one was), unless the ladder has it.
+  const planned = probes.find((p) => p.amount === ladder[0]);
+  if (planned && !planned.passes) {
+    const fit = largestFittingRefill(capAt(planned.value), planned.amount, planned.costPpm, Math.max(MIN_REFILL_SATS, cfg.minRebalanceAmount));
+    if (fit !== null && !ladder.includes(fit)) {
+      const p = await probeAt(fit);
+      if (p) probes.push(p);
+    }
+  }
+  return probes.sort((a, b) => b.amount - a.amount);
 }
 
 /** Why the cheapest route from a source didn't pass. */

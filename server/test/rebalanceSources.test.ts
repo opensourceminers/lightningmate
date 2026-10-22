@@ -238,11 +238,11 @@ test("a source that failed for a target backs off for THAT target only — the a
   // whatever source had failed.
 });
 
-test("the payback limit binds the gate: the full refill's fee isn't earned back within 21 days of the channel's revenue — the half-size one is", async () => {
+test("the payback limit binds the gate: the full refill's fee isn't earned back within 21 days of the channel's revenue — the largest size whose fee is, is planned", async () => {
   // 1,000 ppm on 1M out (1,000 sat in 30 days: ~33 sat a day → 693 sat of
   // payback). A 600 ppm route: 1.25M costs 750 sat — within the cost cap
-  // (800 ppm) and netting 250 sat, but not earned back in time; 625k costs
-  // 375 and nets 250 too.
+  // (800 ppm), but not earned back in time. Up to 1.15M (690 sat) is; 625k,
+  // the half, nets less (250 sat against 310).
   const n = nodeOf(
     [drained(1, { feePpm: 1000, f14: flow(1_000_000, 0, 20, 1000), f30: flow(1_000_000, 0, 20, 1000) }), { n: 2, local: 4_000_000 }],
     { ...cfg, maxPpm: 3000 },
@@ -251,9 +251,11 @@ test("the payback limit binds the gate: the full refill's fee isn't earned back 
   const rec = recommendations.find((r) => r.channelId === "850000x1x0")!;
   assert.equal(rec.maxCostSatsByPayback, 693);
   assert.equal(rec.state, "route_found_profitable", rec.reasons.join(" | "));
-  assert.equal(rec.recommendedAmount, 625_000, "the size whose fee pays back in time");
-  assert.equal(rec.estimatedRouteFeeSats, 375);
-  assert.equal(rec.maxFeeSats, 500);
+  // Before (review of P7): 625k — only the planned size and its halves were tried.
+  assert.equal(rec.recommendedAmount, 1_150_000, "the largest size whose fee pays back in time");
+  assert.equal(rec.estimatedRouteFeeSats, 690);
+  assert.equal(rec.maxFeeSats, 693, "the payment's cap at that size: the payback limit");
+  assert.equal(rec.expectedNetProfitSats, 310);
 });
 
 // ── the plumbing, end to end ──────────────────────────────────────────────────
@@ -421,27 +423,62 @@ test("a channel holding a refill's price (recovering its cost) is no source — 
 // ignored the payback limit and how far the channel was from its target
 // share. The two cases are the review's probes, A and A2.
 
-test("a refill the payback limit turns down says so — the revenue a day or the route it would take — not outflow the channel already has (probe A)", async () => {
+test("probe A (review of P7): a refill the payback limit turned down at its planned size is planned at the largest size that pays back — 1.12M, not nothing", async () => {
   // A 5M channel at 15 % local, 1.2M out in 14 days at 400 ppm (480 sat in 30
-  // days: ~16 sat a day), a 300 ppm route.
+  // days: ~16 sat a day, so at most 336 sat of payback), a 300 ppm route.
+  // 1.25M planned costs ~375 sat; 625k and 312k don't net the 100 sat
+  // minimum; 1.0M–1.12M clear both.
+  const n = nodeOf([
+    { n: 1, local: 750_000, feePpm: 400, f14: flow(1_200_000, 0, 20, 480), f30: flow(1_200_000, 0, 20, 480) },
+    { n: 2, local: 4_500_000, feePpm: 100, f14: NO_FLOW, f30: flow(0, 50_000, 1, 0) },
+  ]);
+  const probed: number[] = [];
+  const route = routeAt(300);
+  const plan = await planRebalances(
+    { channels: n.channels, fees: n.fees, contextOf: (id) => n.contexts.get(id), cfg: REBAL_REC_DEFAULTS, overrides: {}, soldLeases: [], currentBlock: HEIGHT },
+    async (s, t, amount) => {
+      probed.push(amount);
+      return route(s, t, amount);
+    },
+  );
+  const r = plan.recommendations.find((x) => x.channelId === "850000x1x0") as RebalanceRecommendation;
+  // Before: route_found_too_expensive — no refill at all.
+  assert.equal(r.state, "route_found_profitable", r.reasons.join(" | "));
+  assert.deepEqual([r.recommendedAmount, r.estimatedRouteFeeSats, r.maxFeeSats, r.maxCostSatsByPayback, r.expectedNetProfitSats], [1_120_000, 336, 336, 336, 112]);
+  assert.deepEqual(probed.sort((a, b) => b - a), [1_250_000, 1_120_000, 625_000, 312_500], "the fitted size is probed — once — beside the planned one and its halves");
+  assert.match(r.reasons.join(" | "), /profitable: move 1\.12M from peer-2 at 300 ppm ≤ max 320, payback ~21d, net \+112 sat \(pays at most 336 sat\)/);
+});
+
+test("a refill the payback limit turns down at every size says so — the revenue a day or the route it would take — not outflow the channel already has (probe A, with an 18-day payback limit)", async () => {
+  // As probe A, with fees to be earned back within 18 days (~16 sat a day:
+  // at most 288 sat): a refill that pays back (≤ 960k at 300 ppm) nets the
+  // 100 sat minimum only from 1M up — no size clears both.
   const n = nodeOf([
     { n: 1, local: 750_000, feePpm: 400, f14: flow(1_200_000, 0, 20, 480), f30: flow(1_200_000, 0, 20, 480) },
     { n: 2, local: 4_500_000, feePpm: 100, f14: NO_FLOW, f30: flow(0, 50_000, 1, 0) },
   ]);
   const plan = await planRebalances(
-    { channels: n.channels, fees: n.fees, contextOf: (id) => n.contexts.get(id), cfg: REBAL_REC_DEFAULTS, overrides: {}, soldLeases: [], currentBlock: HEIGHT },
+    {
+      channels: n.channels,
+      fees: n.fees,
+      contextOf: (id) => n.contexts.get(id),
+      cfg: { ...REBAL_REC_DEFAULTS, maxPaybackDays: 18 },
+      overrides: {},
+      soldLeases: [],
+      currentBlock: HEIGHT,
+    },
     routeAt(300),
   );
   const r = plan.recommendations.find((x) => x.channelId === "850000x1x0") as RebalanceRecommendation;
   assert.equal(r.state, "route_found_too_expensive");
-  assert.deepEqual([r.recommendedAmount, r.estimatedRouteFeeSats, r.maxCostSatsByPayback], [1_250_000, 375, 336]);
+  assert.deepEqual([r.recommendedAmount, r.estimatedRouteFeeSats, r.maxCostSatsByPayback], [1_250_000, 375, 288]);
   const line = r.reasons[r.reasons.length - 1];
-  // Before: "… it needs a refill of ≥ 1M: ≥ 1M of 14-day outflow (now 1.2M)
-  // and ≥ 667k of 14-day net drain (now 1.2M)" — both met already.
+  // Before (review of P3): "… it needs a refill of ≥ 1M: ≥ 1M of 14-day
+  // outflow (now 1.2M) and ≥ 667k of 14-day net drain (now 1.2M)" — both met.
   assert.equal(
     line,
     "to clear the 100 sat minimum at 400 ppm earnings and a ~300 ppm route a refill nets it from 1M up; the 1.25M refill planned costs ~375 sat, " +
-      "more than 21 days of this channel's revenue pay back (~16 sat a day now, so at most 336 sat) — that takes ≥ 18 sat a day of revenue, or a route of ≤ 268 ppm",
+      "more than 18 days of this channel's revenue pay back (~16 sat a day now, so at most 288 sat) — that takes ≥ 21 sat a day of revenue, or a route of ≤ 230 ppm",
   );
   assert.doesNotMatch(line, /outflow|net drain/);
 });

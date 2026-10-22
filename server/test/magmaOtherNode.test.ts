@@ -58,6 +58,26 @@ test("an order of another node that this node had taken on (before orders were t
   assert.match(e?.reason ?? "", /another node of your Amboss account/);
 });
 
+test("another node's order whose held payment couldn't be released yet is not 'opened by the autopilot' — it is no order of this node's to open (review of P8)", async (t) => {
+  quiet(t);
+  const { autopilot, magma, node, dir, desk } = sellerSetup(t);
+  const sale = magma.addSale({ buyerPubkey: BUYER });
+  await autopilot.pollSellOrders();
+  const hash = magma.buyerPays(sale.id, node);
+  magma.sales.get(sale.id)!.sellerPubkey = OTHER_NODE;
+  node.failNext("invoices.cancelInvoice", "transport is closing");
+  await autopilot.pollSellOrders();
+  const e = entryOnDisk(dir, sale.id);
+  // Not ended yet (the release is tried again), but marked another node's.
+  assert.equal(node.invoices.get(hash)?.state, "ACCEPTED", "still held — released on a later pass");
+  assert.notEqual(e?.phase, "cancelled");
+  assert.equal(e?.external, "other_node");
+  assert.equal(magma.sales.get(sale.id)?.status, "WAITING_FOR_CHANNEL_OPEN");
+  assert.equal(node.callsTo("default.openChannel").length, 0);
+  // Before: true — this node's lane, selling on.
+  assert.equal(desk.opensItself(sale.id), false);
+});
+
 test("Accept, Open channel and Reject refuse another node's order — nothing is sent to Amboss", async (t) => {
   quiet(t);
   const { autopilot, magma } = sellerSetup(t, { config: { sellEnabled: false } });

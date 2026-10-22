@@ -19,16 +19,21 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { MagmaJournalEntry } from "../src/services/magmaJournal.js";
 import { JsonStore, storeIncidents } from "../src/store.js";
-import { paymentHashOf } from "./helpers/fakeLnd.js";
-import { acceptedInvoice } from "./helpers/magma.js";
+import { FakeLnd, paymentHashOf } from "./helpers/fakeLnd.js";
+import { FakeMagma, acceptedInvoice } from "./helpers/magma.js";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
+import { installFetchMock } from "./helpers/fetchMock.js";
+import { startApi } from "./helpers/apiHarness.js";
 import {
+  IN_AN_HOUR,
+  crashAt,
   entryOnDisk,
   feeEnv,
   feesOnDisk,
   quiet,
   salesOnDisk,
   sleep,
+  type Seam,
 } from "./helpers/lifecycle.js";
 
 test("full lifecycle: HODL accept → payment held → open → add_transaction → VALID_CHANNEL_OPENING → settle → fee enqueued exactly once", async (t) => {
@@ -321,22 +326,6 @@ test("with selling off, an order taken on by hand waits for your click — and s
 
 // ── restarts ──────────────────────────────────────────────────────────────────
 
-type Seam = "lndCreateHodl" | "ambossAccept" | "lndOpen" | "ambossAddTx" | "lndSettle";
-
-/** Make one external step "kill the process": the step's side effect happens
- *  (when `after`), then nothing of ours ever runs again in that process. */
-function crashAt(desk: object, seam: Seam, when: "before" | "after"): () => boolean {
-  const d = desk as Record<Seam, (...a: unknown[]) => Promise<unknown>>;
-  const real = d[seam].bind(desk);
-  let reached = false;
-  d[seam] = async (...args: unknown[]) => {
-    if (when === "after") await real(...args);
-    reached = true;
-    return new Promise(() => undefined); // the process is gone
-  };
-  return () => reached;
-}
-
 async function until(cond: () => boolean, what: string): Promise<void> {
   for (let i = 0; i < 500 && !cond(); i++) await sleep(5);
   assert.ok(cond(), `never reached: ${what}`);
@@ -402,6 +391,51 @@ for (const c of CRASHES) {
     assert.equal(salesOnDisk(s.dir).filter((r) => r.orderId === sale.id).length, 1, "one sale");
   });
 }
+
+// Review of P8, round 3: a resend whose mark can't be saved releases its
+// invoice (unmarkedAccept), although the earlier send may have handed Amboss
+// the request — safe only because a resend happens while Amboss still shows
+// the order awaiting approval, i.e. has not applied that earlier send. The
+// lane's pass takes an order Amboss shows accepted as accepted (the crash
+// above, "accept applied by Amboss, answer lost"); a click has to stop there
+// too — nothing pinned that it does.
+test("restart after a crash (a click's accept applied by Amboss, answer lost): Accept clicked again sends nothing and releases nothing — journal writable or not — and the lane takes the order as accepted", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t, { config: { sellEnabled: false } });
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  const crashed = crashAt(s.desk, "ambossAccept", "after");
+  void s.desk.accept(sale.id);
+  await until(crashed, "the click's accept was applied");
+  const amboss = s.magma.sales.get(sale.id)!;
+  assert.equal(amboss.status, "WAITING_FOR_BUYER_PAYMENT", "Amboss applied it");
+  const before = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([before?.phase, before?.via, Boolean(before?.acceptSentAt)], ["accepting", "manual", true], "sent, marked — its answer lost");
+  const invoice = () => s.node.invoices.get(acceptedInvoice(amboss).id)?.state;
+
+  const p2 = s.restart();
+  const journal = p2.magma.journal as unknown as { commit: (e: unknown) => void };
+  const commit = journal.commit.bind(p2.magma.journal);
+  journal.commit = () => {
+    throw new Error("ENOSPC: no space left on device");
+  };
+  // Resent with its mark failing, the accept would be released
+  // (unmarkedAccept); resent with a writable journal, Amboss would refuse it,
+  // and a refused accept is released too — either way the invoice the buyer
+  // is about to pay.
+  for (const disk of ["full", "writable"] as const) {
+    if (disk === "writable") journal.commit = commit;
+    const res = await p2.magma.accept(sale.id);
+    assert.equal(invoice(), "OPEN", `${disk}: the invoice the buyer is to pay stays open`);
+    assert.equal(s.magma.count("AcceptOrder"), 1, `${disk}: no second accept`);
+    assert.deepEqual([res.ok, res.code], [false, "bad_status"], `${disk}: ${res.message}`);
+    const e = entryOnDisk(s.dir, sale.id);
+    assert.deepEqual([e?.phase, e?.invoice?.id], ["accepting", before?.invoice?.id], `${disk}: the journal is as it was`);
+  }
+  await p2.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted", "the lane's pass takes it as accepted");
+  s.magma.buyerPays(sale.id, s.node);
+  assert.equal(invoice(), "ACCEPTED", "the buyer's payment is held");
+});
 
 test("the funding outpoint can't be saved after the open (disk full): fail closed — alert, no second open, the restart finds the channel in LND", async (t) => {
   feeEnv(t);
@@ -507,4 +541,118 @@ test("an order retrying every 45 s doesn't flood the run history — and the lan
   await autopilot.pollSellOrders();
   const after = (autopilot as unknown as { state: { history: { sells: { orderId: string; action: string; ok: boolean }[] }[] } }).state.history;
   assert.deepEqual(after[0]?.sells.map((s) => [s.action, s.ok]), [["open", true], ["report", true]], "what moved the order on is recorded");
+});
+
+// Review of P7 (final): Market → Orders said "Paid — waiting for you to open
+// the channel" also for orders the lane opens itself. The view now says who.
+test("who opens a paid order's channel: the lane with selling on, or for an order it accepted itself; you, for one you accepted by hand with selling off — said in the Orders view and after a manual accept", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const laneSale = s.magma.addSale({ buyerPubkey: BUYER });
+  await s.autopilot.pollSellOrders(); // the lane accepts it
+  assert.equal(entryOnDisk(s.dir, laneSale.id)?.via, "autopilot");
+  s.autopilot.setConfig({ sellEnabled: false });
+  const handSale = s.magma.addSale({ buyerPubkey: BUYER });
+  const accepted = await s.desk.accept(handSale.id);
+  assert.equal(accepted.ok, true, accepted.message);
+  // Selling off: the lane carries its own order to the end; yours waits for you.
+  assert.equal(s.desk.opensItself(laneSale.id), true);
+  assert.equal(s.desk.opensItself(handSale.id), false);
+  s.magma.buyerPays(handSale.id, s.node);
+  await s.autopilot.pollSellOrders();
+  assert.equal(s.node.callsTo("default.openChannel").length, 0, "it really waits for you");
+  // Selling on: every paid order is the lane's.
+  s.autopilot.setConfig({ sellEnabled: true });
+  assert.equal(s.desk.opensItself(handSale.id), true);
+  // No key: nothing opens by itself.
+  s.amboss.clear();
+  assert.equal(s.desk.opensItself(laneSale.id), false);
+});
+
+test("over HTTP: the Orders view and a manual accept say whether the lane opens the channel", async (t) => {
+  quiet(t);
+  const http = installFetchMock(t);
+  const magma = new FakeMagma(http, t);
+  const api = await startApi(t, { node: new FakeLnd({ chainBalance: 20_000_000 }) });
+  magma.sellerPubkey = api.node.publicKey;
+  api.amboss.setKey("test-key");
+  const sale = magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  // Selling is off on a fresh install: an order accepted by hand is yours to open.
+  const res = await api.request("POST", "/amboss/order/accept", { id: sale.id });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.opensItself, false);
+  const view = await api.request("GET", "/amboss/my-orders");
+  assert.deepEqual(view.body.orders.map((o: { id: string; opensItself: boolean }) => [o.id, o.opensItself]), [[sale.id, false]]);
+  const off = await api.request("POST", "/autopilot", { sellEnabled: true });
+  assert.equal(off.status, 200, JSON.stringify(off.body));
+  const again = await api.request("GET", "/amboss/my-orders");
+  assert.equal(again.body.orders[0].opensItself, true);
+  // Selling on: an order accepted by hand is opened by the lane once paid —
+  // the accept's answer (the toast's wording) says so. (Review of P8, round
+  // 2: nothing checked it with selling on; an answer that always said "you
+  // open it" passed.)
+  const second = magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  const accepted = await api.request("POST", "/amboss/order/accept", { id: second.id });
+  assert.equal(accepted.status, 200, JSON.stringify(accepted.body));
+  assert.equal(accepted.body.opensItself, true);
+});
+
+// Review of P8: with selling on, opensItself said yes for every order — also
+// for paid orders the lane will never open. Market → Orders then read "Paid —
+// the autopilot opens the channel · accepted outside LightningMate".
+test("an order accepted outside LightningMate is never one 'the autopilot opens' — selling on, Amboss waiting for its channel", async (t) => {
+  feeEnv(t);
+  quiet(t);
+  const s = sellerSetup(t);
+  // Only seen here (Amboss reported no fee), then accepted with another tool.
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, feeSeller: "0", timeout: IN_AN_HOUR() });
+  await s.autopilot.pollSellOrders();
+  s.magma.sales.get(sale.id)!.feeSeller = "12345";
+  s.magma.setStatus(sale.id, "WAITING_FOR_BUYER_PAYMENT");
+  await s.autopilot.pollSellOrders();
+  s.magma.setStatus(sale.id, "WAITING_FOR_CHANNEL_OPEN");
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.external, "accepted_elsewhere");
+  assert.equal(s.node.callsTo("default.openChannel").length, 0, "the lane opens no channel for it");
+  assert.equal(s.autopilot.getState().config.sellEnabled, true);
+  assert.equal(s.desk.opensItself(sale.id), false, "before: true — 'Paid — the autopilot opens the channel'");
+});
+
+test("an order this node has finished with — its held payment released before the HTLC expired — is never one 'the autopilot opens', though Amboss still waits for its channel", async (t) => {
+  quiet(t);
+  const { autopilot, node, magma, dir, desk } = sellerSetup(t);
+  const sale = magma.addSale({ buyerPubkey: BUYER });
+  await autopilot.pollSellOrders();
+  const inv = acceptedInvoice(magma.sales.get(sale.id)!);
+  node.payHoldInvoice(inv.id, { expiryHeight: node.blockHeight + 20 });
+  magma.setStatus(sale.id, "WAITING_FOR_CHANNEL_OPEN");
+  await autopilot.pollSellOrders();
+  const e = entryOnDisk(dir, sale.id);
+  assert.deepEqual([e?.phase, e?.external, e?.via], ["cancelled", undefined, "autopilot"]);
+  assert.equal(magma.sales.get(sale.id)?.status, "WAITING_FOR_CHANNEL_OPEN");
+  assert.equal(node.callsTo("default.openChannel").length, 0);
+  // Before: true — its own order, selling on.
+  assert.equal(desk.opensItself(sale.id), false);
+});
+
+// Review of P8, final round: with selling off, "accepted by the lane itself"
+// was read from `via` alone — an order the paused lane had only seen, then
+// accepted on Amboss's site, read "Paid — the autopilot opens the channel"
+// until the next pass found it accepted elsewhere (about 45 s).
+test("an order the paused lane only saw is the operator's: never one 'the autopilot opens' — the lane's own accept still is", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  // Seen, not decided: Amboss reported no fee for it yet.
+  const seen = s.magma.addSale({ buyerPubkey: BUYER, feeSeller: "0", timeout: IN_AN_HOUR() });
+  const taken = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  await s.autopilot.pollSellOrders();
+  const before = entryOnDisk(s.dir, seen.id);
+  assert.deepEqual([before?.phase, before?.via], ["seen", "autopilot"]);
+  assert.equal(entryOnDisk(s.dir, taken.id)?.phase, "accepted");
+  s.autopilot.pauseAll();
+  // Accepted on Amboss's site and paid: Amboss waits for its channel.
+  s.magma.sales.get(seen.id)!.feeSeller = "12345";
+  s.magma.setStatus(seen.id, "WAITING_FOR_CHANNEL_OPEN");
+  assert.equal(s.desk.opensItself(seen.id), false, "before: true — 'Paid — the autopilot opens the channel'");
+  assert.equal(s.desk.opensItself(taken.id), true, "an order the lane accepted itself is carried to its end");
 });

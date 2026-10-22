@@ -75,3 +75,21 @@ export function readsHang(
   };
   return read;
 }
+
+/** An external step of the Magma desk a test can make "kill the process". */
+export type Seam = "lndCreateHodl" | "ambossAccept" | "lndOpen" | "ambossAddTx" | "lndSettle";
+
+/** Make one external step "kill the process": the step's side effect happens
+ *  (when `after`), then nothing of ours ever runs again in that process.
+ *  Returns whether the step was reached. */
+export function crashAt(desk: object, seam: Seam, when: "before" | "after"): () => boolean {
+  const d = desk as Record<Seam, (...a: unknown[]) => Promise<unknown>>;
+  const real = d[seam].bind(desk);
+  let reached = false;
+  d[seam] = async (...args: unknown[]) => {
+    if (when === "after") await real(...args);
+    reached = true;
+    return new Promise(() => undefined); // the process is gone
+  };
+  return () => reached;
+}

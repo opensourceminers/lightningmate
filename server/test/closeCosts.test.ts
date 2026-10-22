@@ -769,3 +769,53 @@ test("a record in the copy that isn't a whole transaction record is left out on 
   assert.equal(p.status, 200, JSON.stringify(p.body));
   assert.deepEqual([p.body.channelCloseCostSats, p.body.channelCloseUnknownCount], [9_340 + 660 + 1_000, 0]);
 });
+
+// Final review of P6 (F15): a batched sweep's share is booked only when it
+// is positive. When the peer funded a channel, the anchor of its commitment
+// our sweep spent was the peer's 330 sat: that comes off the channel's share
+// of the sweep's fee — and a share smaller than that would turn negative and
+// reduce the close costs.
+test("a batched sweep holding a peer-funded channel's anchor: a share that would come out negative books no fee — the other channel's share is booked as usual", () => {
+  // A: the peer funded it; its commitment (our force close) pays 600,000,
+  // 395,000 and two 330-sat anchors. B: ours, a legacy commitment.
+  const fundA = rawTx({ inputs: [coin()], outputs: [{ value: 1_000_000 }] });
+  const commitA = rawTx({ inputs: [{ txid: fundA.txid, vout: 0 }], outputs: [{ value: 600_000 }, { value: 395_000 }, { value: 330 }, { value: 330 }] });
+  const fundB = rawTx({ inputs: [coin()], outputs: [{ value: 1_000_000 }] });
+  const commitB = rawTx({ inputs: [{ txid: fundB.txid, vout: 0 }], outputs: [{ value: 500_000 }, { value: 497_000 }] }); // 3,000 fee
+  // One sweep: A's anchor (the peer's 330) and B's to_local → 499,930: 400 fee,
+  // shared by input — 200 each; A's share less the peer's anchor: −130.
+  const batch = rawTx({ inputs: [{ txid: commitA.txid, vout: 2 }, { txid: commitB.txid, vout: 0 }], outputs: [{ value: 499_930 }] });
+  const facts = (id: string, fund: typeof fundA, commit: typeof commitA, weFunded: boolean): ClosedChannelFacts => ({
+    channelId: id,
+    capacity: 1_000_000,
+    fundingTxid: fund.txid,
+    fundingVout: 0,
+    closeTxid: commit.txid,
+    closeHeight: null,
+    kind: "local_force",
+    weFunded,
+    weClosed: true,
+    sweepTxids: [],
+  });
+  const held = (tx: ReturnType<typeof rawTx>, w: Partial<WalletTx> = {}): WalletTx => ({
+    id: tx.txid,
+    createdAt: new Date(ago(10)).toISOString(),
+    isConfirmed: false,
+    isOutgoing: false,
+    transaction: tx.hex,
+    inputs: [],
+    ...w,
+  });
+  const costs = closeCostsFrom(
+    [facts("868000x1x0", fundA, commitA, false), facts("868001x1x0", fundB, commitB, true)],
+    [held(commitA), held(commitB), held(batch, { isConfirmed: true, inputs: [{ txid: commitA.txid, vout: 2, isLocal: false }, { txid: commitB.txid, vout: 0, isLocal: false }] })],
+    { nowMs: now, height: null },
+  );
+  const byId = Object.fromEntries(costs.map((c) => [c.channelId, feesOf(c)]));
+  // Before (without the check): A booked a −130 sat "sweep", taking 130 off the closes.
+  assert.deepEqual(byId["868000x1x0"], []);
+  assert.deepEqual(byId["868001x1x0"], [
+    ["close", 3_000],
+    ["sweep", 200],
+  ]);
+});

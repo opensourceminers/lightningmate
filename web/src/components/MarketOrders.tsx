@@ -7,7 +7,7 @@ import { sats, satsCompact } from "../format";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
 import { awaitsYourDecision, laneBanner } from "../statusNotes";
-import { localLabel, orderStatusLabel, purchaseLabel } from "../magmaView";
+import { acceptedToast, localLabel, orderStatusLabel, purchaseLabel } from "../magmaView";
 import { lspOrderLabel } from "../lspView";
 
 /** Why the order is where it is: the reason, the lane's last decision, or the
@@ -71,8 +71,8 @@ export function MarketOrders() {
     if (!ok) return;
     setBusyId(o.id);
     try {
-      await api.ambossAcceptOrder(o.id);
-      ui.toast("Order accepted — open the channel once the buyer has paid.", "success");
+      const r = await api.ambossAcceptOrder(o.id);
+      ui.toast(acceptedToast(r.opensItself === true), "success");
       await load();
     } catch (e) {
       ui.toast(e instanceof Error ? e.message : String(e), "error");
@@ -278,7 +278,7 @@ export function MarketOrders() {
                 <td className="num">{satsCompact(o.sizeSats)}</td>
                 <td className="num">{o.feeSats > 0 ? o.feeSats.toLocaleString() : "—"}</td>
                 <td title={`${o.status}${localDetail(o) ? ` · ${localDetail(o)}` : ""}`}>
-                  {orderStatusLabel(o.status, o.side)}
+                  {orderStatusLabel(o.status, o.side, o.opensItself)}
                   {o.local ? <span className="muted"> · {localLabel(o.local)}</span> : null}
                   {/* Why — on the page, not only in a tooltip (a11y). */}
                   {localDetail(o) ? <div className="muted small">{localDetail(o)}</div> : null}

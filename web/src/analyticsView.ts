@@ -140,6 +140,31 @@ export function topChannelValue(c: ChannelForwardStat): { earned: string; assist
   return { earned: sats(c.feesEarnedSats), assisted: c.inboundFeesSats ? `+${sats(c.inboundFeesSats)} brought in` : null };
 }
 
+/**
+ * What the Overview's Top channels tile shows for its polled routing report
+ * (review of P7: a failed read became an empty list — "No routing fees
+ * yet." — a failure shown as data, and a failed refresh over older figures
+ * said nothing about their age). Loading; the error, when there is nothing
+ * to show; the rows (none: no routing fees yet) — with, after a failed
+ * refresh, the error and the time the rows are from, as HealthScore says it.
+ */
+export type TopChannelsState =
+  | { kind: "loading" }
+  | { kind: "error"; text: string }
+  | { kind: "rows"; rows: ChannelForwardStat[]; stale: string | null };
+
+export function topChannelsState(
+  polled: { data: { perChannel: ChannelForwardStat[] } | null; error: string | null; updatedAt: number | null },
+  n = 5,
+): TopChannelsState {
+  if (!polled.data) {
+    return polled.error ? { kind: "error", text: `The routing report couldn't be read (${polled.error}).` } : { kind: "loading" };
+  }
+  const at = polled.updatedAt !== null ? new Date(polled.updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : null;
+  const stale = polled.error ? `Couldn't refresh (${polled.error})${at ? ` — as of ${at}` : ""}.` : null;
+  return { kind: "rows", rows: topChannels(polled.data.perChannel, n), stale };
+}
+
 /** Flow label + the action it implies. "draining" with little local balance
  *  left is the urgent case — the channel will soon stop routing. A channel no
  *  longer open is "closed": its 0% local ratio is no warning (it read

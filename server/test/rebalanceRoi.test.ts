@@ -249,3 +249,38 @@ test("GET /autopilot/outcomes reads each channel's sent counter now: what left b
   const [item] = (await api.request("GET", "/autopilot/outcomes")).body.rebalances.items;
   assert.deepEqual([item.routedOutSats, item.earnedSats, item.otherOutSats, item.remainingSats], [100_000, 100, 150_000, 50_000]);
 });
+
+// Final review of P6 (F1): measureRefills sorts the refills oldest first —
+// load-bearing in production, where RebalanceLog.successes() hands them over
+// NEWEST first. Every pure test passed them oldest first and the API tests had
+// at most one refill in reach, so without the sort first-in-first-out ran
+// backwards unnoticed.
+test("PROBE-FIFO-ORDER: refills as the log lists them (newest first) are still retired oldest first — through GET /autopilot/outcomes", async (t) => {
+  quiet(t);
+  const now = Date.now();
+  const dir = makeTempDir(t);
+  const rec = (daysAgo: number): RebalanceRecord => {
+    const when = new Date(now - daysAgo * DAY).toISOString();
+    return { at: when, startedAt: when, via: "autopilot", targetId: T, targetAlias: "t", sourceId: S, sourceAlias: "s", amountSats: 100_000, budgetPpm: 1000, feeSats: 100, costPpm: 1000, ok: true };
+  };
+  // Newest first, as RebalanceLog.successes() returns them.
+  writeFileSync(join(dir, "rebalances.json"), JSON.stringify([rec(10), rec(20)]));
+  const forwards: FakeForward[] = [
+    { at: now - 15 * DAY, inId: S, outId: T, tokens: 60_000, feeMsat: 60_000 },
+    { at: now - 5 * DAY, inId: S, outId: T, tokens: 80_000, feeMsat: 80_000 },
+  ];
+  const node = feeNode({
+    channels: [
+      { id: T, partnerPublicKey: "02" + "a1".repeat(32), capacity: 2_000_000, localBalance: 500_000, transactionId: "a1".repeat(32), transactionVout: 0 },
+      { id: S, partnerPublicKey: "02" + "a2".repeat(32), capacity: 2_000_000, localBalance: 1_500_000, transactionId: "a2".repeat(32), transactionVout: 0 },
+    ],
+    forwards,
+  });
+  const api = await startApi(t, { node, dir });
+  const items = (await api.request("GET", "/autopilot/outcomes")).body.rebalances.items as { at: string; routedOutSats: number; earnedSats: number }[];
+  const by = Object.fromEntries(items.map((i) => [Math.round((now - Date.parse(i.at)) / DAY), [i.routedOutSats, i.earnedSats]]));
+  // The older one (20 d) first: the 60k of day 15, then 40k of the 80k of
+  // day 5; the newer one (10 d) the other 40k. Without the sort: reversed.
+  assert.deepEqual(by[20], [100_000, 100]);
+  assert.deepEqual(by[10], [40_000, 40]);
+});

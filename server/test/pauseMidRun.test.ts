@@ -24,7 +24,8 @@ import { BUYER, autopilotWith, paidRebalance, plannedFeeChange, plannedRebalance
 import { feeNode, type FeeChannel } from "./helpers/feeNode.js";
 import type { FakeMarket } from "./helpers/market.js";
 import { SALE_DEFAULTS } from "./helpers/magma.js";
-import { entryOnDisk, quiet } from "./helpers/lifecycle.js";
+import { crashAt, entryOnDisk, quiet } from "./helpers/lifecycle.js";
+import { magmaRefusalAlerts } from "../src/services/alerts.js";
 import { until } from "./helpers/wait.js";
 import type { AfterHook } from "./helpers/tmp.js";
 import type { FeeRecommendation } from "../src/services/feeRecommend.js";
@@ -593,4 +594,412 @@ test("the order lane: a pause while the HODL invoice is made, and making it fail
   assert.equal(capital.reservedSat(), 0);
   const e = entryOnDisk(dir, sale.id);
   assert.deepEqual([e?.phase, e?.decision?.reason], ["seen", SELLING_OFF_SKIP]);
+});
+
+// ── review of P7 (final): a paused lane never turns an order down on its own ──
+//
+// acceptOrder neither accepts nor rejects once Liquidity provision is off —
+// but decide() still sent RejectOrder after a pause: it awaits the first
+// capital check and the buyer's dial (up to ~90 s over Tor), its capital
+// catch went on to "could not decide on it in time" near the deadline, and
+// advance() called it on the settings read before the order's Amboss read.
+// D6's immediate reject is a RUNNING lane's; a paused one leaves the order
+// to the operator (SELLING_OFF_SKIP), as the README and the strategy doc say.
+
+/** The order is the operator's: not accepted, not refused, nothing promised. */
+function leftToOperator(s: ReturnType<typeof sellerSetup>, id: string, what: string): void {
+  assert.equal(s.magma.count("RejectOrder"), 0, `${what}: no reject after the pause`);
+  assert.equal(s.magma.count("AcceptOrder"), 0, `${what}: no accept either`);
+  assert.equal(s.capital.reservedSat(), 0, `${what}: no coins promised`);
+  const e = entryOnDisk(s.dir, id);
+  assert.deepEqual([e?.phase, e?.decision?.reason], ["seen", SELLING_OFF_SKIP], what);
+  assert.equal(s.magma.sales.get(id)?.status, "WAITING_FOR_SELLER_APPROVAL", `${what}: still the operator's to decide`);
+}
+
+test("PROBE-DECIDE-DIAL: a pause while the buyer is dialed, and the dial fails — the order is not turned down as unreachable", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  s.node.beforeCall = (method) => {
+    if (method === "default.connectPeer" && !s.autopilot.getState().paused) {
+      s.autopilot.pauseAll(); // the operator pauses during a slow dial over Tor
+      s.node.failNext("default.connectPeer", "unable to connect: dial timeout");
+    }
+  };
+  await s.autopilot.pollSellOrders();
+  // Before: RejectOrder 1, "the buyer's node is unreachable".
+  leftToOperator(s, sale.id, "dial failed");
+});
+
+test("PROBE-DECIDE-CAPITAL: a pause during the first capital check (before the mutex) — coins gone, or the read failing with the deadline a minute away — no reject", async (t) => {
+  quiet(t);
+  for (const read of ["coins gone", "read fails"] as const) {
+    const s = sellerSetup(t);
+    const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: closeToDeadline() });
+    s.node.beforeCall = (method) => {
+      // decide()'s own capital check runs outside the on-chain mutex.
+      if (method !== "default.walletBalance" || s.capital.mutex.heldBy !== null || s.autopilot.getState().paused) return;
+      s.autopilot.pauseAll();
+      if (read === "coins gone") s.node.chainBalance = 0;
+      else s.node.failNext("default.walletBalance", "transport is closing");
+    };
+    await s.autopilot.pollSellOrders();
+    assert.ok(s.autopilot.getState().paused, `${read}: the pause landed in the check`);
+    // Before: "not enough on-chain capital …" — or, the read failing near the
+    // deadline, "could not decide on it in time".
+    leftToOperator(s, sale.id, read);
+    assert.equal(s.autopilot.magma.laneStatus().error, null, `${read}: not reported as an order the lane couldn't decide`);
+  }
+});
+
+test("a pause while the order is read from Amboss — the pass began with selling on — and the order can't be served: not refused either", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  // Not a bitcoin channel: refused at once by a running lane (D6).
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, assetType: "TAPROOT_ASSET" });
+  s.magma.saleRead = () => {
+    if (!s.autopilot.getState().paused) s.autopilot.pauseAll();
+    return null; // answered as usual — after the pause
+  };
+  await s.autopilot.pollSellOrders();
+  // Before: rejected on the settings read before this order's read.
+  leftToOperator(s, sale.id, "paused during the read");
+  // Running again: the lane's own reject, as D6 says.
+  s.magma.saleRead = null;
+  s.autopilot.resumeAll();
+  s.autopilot.setConfig({ sellEnabled: true });
+  await s.autopilot.pollSellOrders();
+  assert.equal(s.magma.count("RejectOrder"), 1);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "rejected");
+});
+
+test("an accept Amboss refuses a third time while the lane was paused meanwhile — released, and left to the operator, not turned down", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  s.magma.behave.AcceptOrder = "false";
+  await s.autopilot.pollSellOrders();
+  await s.autopilot.pollSellOrders();
+  assert.equal(s.magma.count("AcceptOrder"), 2);
+  // The third accept goes out; the operator pauses while Amboss answers it.
+  s.magma.onMutation = (op) => {
+    if (op === "AcceptOrder") s.autopilot.pauseAll();
+  };
+  await s.autopilot.pollSellOrders();
+  assert.equal(s.magma.count("AcceptOrder"), 3);
+  // Before: "Amboss refused the accept 3 times" — rejected by the paused lane.
+  assert.equal(s.magma.count("RejectOrder"), 0);
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.invoice, e?.decision?.reason], ["seen", null, SELLING_OFF_SKIP]);
+  assert.equal(s.capital.reservedSat(), 0, "no coins promised");
+});
+
+test("the operator rejects an order the paused lane left to them: their own decision — no 'turned down' alert, no refusal on the Overview", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  s.node.beforeCall = (method) => {
+    if (method === "default.connectPeer" && !s.autopilot.getState().paused) s.autopilot.pauseAll();
+  };
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.decision?.reason, SELLING_OFF_SKIP);
+  s.node.beforeCall = null;
+  const res = await s.desk.reject(sale.id); // the click the skip asked for
+  assert.equal(res.ok, true, res.message);
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.via, e?.reason], ["rejected", "manual", "rejected by you"]);
+  // Before: "A 2,000,000 sat Magma order was turned down: rejected by you",
+  // and "1 Magma order turned down" on the Overview.
+  assert.deepEqual(magmaRefusalAlerts(s.autopilot.magma), []);
+  assert.deepEqual(s.autopilot.magma.refusals(), [], "the dashboard's magmaRefusals counts these");
+});
+
+// After a crash between making the HODL invoice and sending the accept,
+// resumeAccept sent the accept even with selling off by then: nothing
+// recorded whether it had gone out. `acceptSentAt` is on disk before it goes
+// out now: without it the accept never left, and a paused lane withdraws it.
+
+test("restart after a crash before the accept went out, with selling paused since: the accept is withdrawn — invoice released, coins free, the attempt not counted", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  // The invoice is made in LND, then the process dies (nothing after it runs).
+  const crashed = crashAt(s.autopilot.magma, "lndCreateHodl", "after");
+  void s.autopilot.pollSellOrders();
+  await until(crashed, "the invoice was made");
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepting");
+  assert.equal(entryOnDisk(s.dir, sale.id)?.acceptSentAt, undefined, "the accept never went out");
+  const p2 = s.restart();
+  p2.pauseAll(); // the operator paused (or switched selling off) meanwhile
+  await p2.pollSellOrders();
+  // Before: AcceptOrder sent by the restarted, paused lane.
+  assert.equal(s.magma.count("AcceptOrder"), 0);
+  assert.equal(s.magma.count("RejectOrder"), 0);
+  const [made] = s.node.callsTo("invoices.addHoldInvoice");
+  assert.equal(s.node.invoices.get(Buffer.from(made.hash as Buffer).toString("hex"))?.state, "CANCELED", "the invoice is released");
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.invoice, e?.decision?.reason, e?.acceptAttempts], ["seen", null, SELLING_OFF_SKIP, 0]);
+  assert.equal(p2.capital.reservedSat(), 0, "the coins are free");
+  // The operator can still take it: a fresh invoice, the accept sent.
+  const res = await p2.magma.accept(sale.id);
+  assert.equal(res.ok, true, res.message);
+  assert.equal(s.magma.count("AcceptOrder"), 1);
+});
+
+test("restart after a crash once the accept was on its way out (its mark saved), with selling paused since: the step under way is completed", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  const crashed = crashAt(s.autopilot.magma, "ambossAccept", "before");
+  void s.autopilot.pollSellOrders();
+  await until(crashed, "the accept was about to go out");
+  assert.ok(entryOnDisk(s.dir, sale.id)?.acceptSentAt, "marked on disk before it went out");
+  const p2 = s.restart();
+  p2.pauseAll();
+  await p2.pollSellOrders();
+  // It may have reached Amboss: completed, whatever the switch says now.
+  assert.equal(s.magma.count("AcceptOrder"), 1);
+  assert.equal(s.magma.sales.get(sale.id)?.status, "WAITING_FOR_BUYER_PAYMENT");
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted");
+});
+
+/** The disk fills up right after the order's HODL invoice is recorded:
+ *  ensureInvoice's own commit goes through, the accept's mark (and, with
+ *  `forGood`, every commit after it) can't be saved. */
+function diskFullAfterInvoice(s: ReturnType<typeof sellerSetup>, forGood: boolean): { restore: () => void } {
+  const desk = s.autopilot.magma as unknown as { lndCreateHodl: (p: unknown) => Promise<unknown> };
+  const real = desk.lndCreateHodl.bind(s.autopilot.magma);
+  const journal = s.autopilot.magma.journal as unknown as { commit: (e: unknown) => void };
+  const commit = journal.commit.bind(s.autopilot.magma.journal);
+  let commits = 0;
+  desk.lndCreateHodl = async (p) => {
+    const r = await real(p);
+    journal.commit = (e) => {
+      commits += 1;
+      if (commits === 2 || (forGood && commits > 2)) throw new Error("ENOSPC: no space left on device");
+      commit(e);
+    };
+    return r;
+  };
+  return { restore: () => (journal.commit = commit) };
+}
+
+test("an accept whose mark can't be saved is not sent — the journal's rule for every external step: its invoice is released, the order is to be decided again, and the next pass sends a fresh accept", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  const disk = diskFullAfterInvoice(s, false);
+  await s.autopilot.pollSellOrders();
+  assert.equal(s.magma.count("AcceptOrder"), 0, "not sent without its mark on disk");
+  assert.equal(s.magma.count("RejectOrder"), 0, "the deadline is far: decided again on the next pass");
+  // Before: left "accepting" with its invoice open in LND, retried every pass.
+  const [made] = s.node.callsTo("invoices.addHoldInvoice");
+  assert.equal(s.node.invoices.get(Buffer.from(made.hash as Buffer).toString("hex"))?.state, "CANCELED", "the invoice is released");
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.invoice, e?.acceptSentAt, e?.acceptAttempts], ["seen", null, undefined, 0]);
+  assert.match(e?.lastError ?? "", /cannot save the order journal \(ENOSPC.*\) — the accept was not sent and its invoice was released/);
+  assert.equal(s.capital.reservedSat(), 0, "the coins are free");
+  // The lane says why, meanwhile.
+  assert.match(s.autopilot.getState().magmaLane.error ?? "", /could not decide 1 order \(cannot save the order journal/);
+  disk.restore();
+  await s.autopilot.pollSellOrders();
+  assert.equal(s.magma.count("AcceptOrder"), 1, "sent once it can be marked");
+  assert.equal(s.node.callsTo("invoices.addHoldInvoice").length, 2, "with a fresh invoice");
+  assert.deepEqual([entryOnDisk(s.dir, sale.id)?.phase, entryOnDisk(s.dir, sale.id)?.acceptAttempts], ["accepted", 1]);
+});
+
+test("an accept whose mark can't be saved, with the approval deadline a minute away: the order is rejected — never left to time out on us (D6)", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: new Date(Date.now() + 60_000).toISOString() });
+  diskFullAfterInvoice(s, true);
+  await s.autopilot.pollSellOrders();
+  await s.autopilot.pollSellOrders();
+  // Before: AcceptOrder 0 and RejectOrder 0 after every pass — "accepting",
+  // "tried again on the next pass", until Amboss ended it SELLER_FAILED_TO_REACT.
+  assert.equal(s.magma.count("AcceptOrder"), 0, "not sent without its mark");
+  assert.equal(s.magma.count("RejectOrder"), 1);
+  assert.equal(s.magma.sales.get(sale.id)?.status, "SELLER_REJECTED");
+  const [made] = s.node.callsTo("invoices.addHoldInvoice");
+  assert.equal(s.node.invoices.get(Buffer.from(made.hash as Buffer).toString("hex"))?.state, "CANCELED");
+  assert.equal(s.capital.reservedSat(), 0);
+});
+
+test("a resend whose mark can't be saved is released the same way — but the earlier send, which went out marked, still counts as an attempt", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  s.magma.behave.AcceptOrder = (n) => (n === 0 ? "throw" : "ok");
+  await s.autopilot.pollSellOrders(); // sent, marked — no answer
+  assert.equal(s.magma.count("AcceptOrder"), 1);
+  assert.ok(entryOnDisk(s.dir, sale.id)?.acceptSentAt, "the first send was marked");
+  const journal = s.autopilot.magma.journal as unknown as { commit: (e: unknown) => void };
+  const commit = journal.commit.bind(s.autopilot.magma.journal);
+  journal.commit = () => {
+    throw new Error("ENOSPC: no space left on device");
+  };
+  await s.autopilot.pollSellOrders(); // the resend's mark fails
+  assert.equal(s.magma.count("AcceptOrder"), 1, "no resend without its mark");
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.invoice, e?.acceptAttempts], ["seen", null, 1], "the attempt that went out stays counted");
+  journal.commit = commit;
+  await s.autopilot.pollSellOrders();
+  assert.equal(s.magma.count("AcceptOrder"), 2);
+  assert.deepEqual([entryOnDisk(s.dir, sale.id)?.phase, entryOnDisk(s.dir, sale.id)?.acceptAttempts], ["accepted", 2]);
+});
+
+test("an order you accepted by hand whose resend can't be marked is left to you — the lane rejects none of yours, near its deadline neither", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t, { config: { sellEnabled: false } });
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: new Date(Date.now() + 60_000).toISOString() });
+  s.magma.behave.AcceptOrder = (n) => (n === 0 ? "throw" : "ok");
+  const clicked = await s.desk.accept(sale.id); // sent, marked — no answer
+  assert.equal(clicked.ok, false);
+  assert.deepEqual([entryOnDisk(s.dir, sale.id)?.phase, entryOnDisk(s.dir, sale.id)?.via], ["accepting", "manual"]);
+  const journal = s.autopilot.magma.journal as unknown as { commit: (e: unknown) => void };
+  journal.commit = () => {
+    throw new Error("ENOSPC: no space left on device");
+  };
+  await s.autopilot.pollSellOrders(); // the lane resumes your accept; its mark fails
+  assert.equal(s.magma.count("AcceptOrder"), 1, "no resend without its mark");
+  assert.equal(s.magma.count("RejectOrder"), 0, "your order: never rejected by the lane");
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "seen", "back with you, its invoice released");
+});
+
+test("a click whose accept can't be marked is told so — nothing sent, the invoice released, the order still yours to decide", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t, { config: { sellEnabled: false } });
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  const disk = diskFullAfterInvoice(s, false);
+  const res = await s.desk.accept(sale.id);
+  assert.equal(res.ok, false);
+  assert.match(res.message ?? "", /cannot save the order journal .* — the accept was not sent/);
+  assert.equal(s.magma.count("AcceptOrder"), 0);
+  assert.equal(s.magma.count("RejectOrder"), 0, "a click's order is never rejected for it");
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "seen");
+  disk.restore();
+  const again = await s.desk.accept(sale.id);
+  assert.equal(again.ok, true, again.message);
+  assert.equal(s.magma.count("AcceptOrder"), 1);
+});
+
+test("the mark is per attempt: an earlier accept Amboss refused leaves no mark on the next one — a crash before that one went out, with selling paused since, still withdraws it", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  s.magma.behave.AcceptOrder = (n) => (n === 0 ? "false" : "ok");
+  await s.autopilot.pollSellOrders(); // attempt 1: sent, refused
+  assert.equal(s.magma.count("AcceptOrder"), 1);
+  assert.ok(entryOnDisk(s.dir, sale.id)?.acceptSentAt, "attempt 1 was marked");
+  // Attempt 2: the invoice is made, then the process dies before the accept.
+  const crashed = crashAt(s.autopilot.magma, "lndCreateHodl", "after");
+  void s.autopilot.pollSellOrders();
+  await until(crashed, "attempt 2's invoice was made");
+  assert.equal(entryOnDisk(s.dir, sale.id)?.acceptSentAt, undefined, "attempt 2 starts unmarked");
+  const p2 = s.restart();
+  p2.pauseAll();
+  await p2.pollSellOrders();
+  // Before: attempt 1's mark made attempt 2 look sent — completed after the pause.
+  assert.equal(s.magma.count("AcceptOrder"), 1);
+  assert.deepEqual([entryOnDisk(s.dir, sale.id)?.phase, entryOnDisk(s.dir, sale.id)?.decision?.reason], ["seen", SELLING_OFF_SKIP]);
+});
+
+// Review of P8, round 2: two ways a paused lane still acted on its own.
+// invoiceFailed — where an accept whose mark can't be saved ends up
+// (unmarkedAccept) — rejected near the approval deadline without asking the
+// switch; and resumeAccept asked it only before ensureInvoice, whose LND
+// lookup (the invoice's request lost in a crash) is awaited.
+
+/** The order's one HODL invoice, as LND has it now. */
+function invoiceState(s: ReturnType<typeof sellerSetup>): string | undefined {
+  const made = s.node.callsTo("invoices.addHoldInvoice");
+  assert.equal(made.length, 1, "one invoice made");
+  return s.node.invoices.get(Buffer.from(made[0].hash as Buffer).toString("hex"))?.state;
+}
+
+test("a resend whose mark can't be saved, the lane paused since the first send and the approval deadline a minute away: released and left to the operator — not turned down", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: closeToDeadline() });
+  s.magma.behave.AcceptOrder = (n) => (n === 0 ? "throw" : "ok");
+  await s.autopilot.pollSellOrders(); // sent, marked — no answer
+  assert.equal(s.magma.count("AcceptOrder"), 1);
+  assert.ok(entryOnDisk(s.dir, sale.id)?.acceptSentAt, "the first send was marked");
+  s.autopilot.pauseAll();
+  const journal = s.autopilot.magma.journal as unknown as { commit: (e: unknown) => void };
+  journal.commit = () => {
+    throw new Error("ENOSPC: no space left on device");
+  };
+  // The step under way is completed whatever the switch says — but its
+  // resend can't be marked, so it is released instead.
+  await s.autopilot.pollSellOrders();
+  // Before: RejectOrder 1 — "could not decide on it in time: cannot save the
+  // order journal …" — and a "turned down" alert, from a paused lane.
+  assert.equal(s.magma.count("RejectOrder"), 0, "a paused lane never rejects an order on its own");
+  assert.equal(s.magma.count("AcceptOrder"), 1, "no resend without its mark");
+  assert.equal(s.magma.sales.get(sale.id)?.status, "WAITING_FOR_SELLER_APPROVAL", "still the operator's to decide");
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.invoice, e?.decision?.reason, e?.acceptAttempts], ["seen", null, SELLING_OFF_SKIP, 1]);
+  assert.equal(invoiceState(s), "CANCELED", "the invoice is released");
+  assert.equal(s.capital.reservedSat(), 0, "no coins promised");
+  assert.deepEqual(magmaRefusalAlerts(s.autopilot.magma), []);
+  assert.equal(s.autopilot.magma.laneStatus().error, null, "not an order the lane couldn't decide: the operator's");
+});
+
+test("restart after a crash that lost the invoice's request, the pause landing while LND is asked for it: the lane's never-sent accept is withdrawn, not sent", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  // The invoice is made in LND, then the process dies before its request is saved.
+  const crashed = crashAt(s.autopilot.magma, "lndCreateHodl", "after");
+  void s.autopilot.pollSellOrders();
+  await until(crashed, "the invoice was made");
+  const left = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([left?.phase, left?.invoice?.request, left?.acceptSentAt], ["accepting", null, undefined], "its request is not on disk; the accept never went out");
+  const p2 = s.restart();
+  const desk = p2.magma as unknown as { lndHodlStatus: (id: string) => Promise<unknown> };
+  const lookup = desk.lndHodlStatus.bind(p2.magma);
+  let lookups = 0;
+  desk.lndHodlStatus = async (id) => {
+    lookups += 1;
+    if (!p2.getState().paused) p2.pauseAll(); // the operator pauses while LND is asked
+    return lookup(id);
+  };
+  await p2.pollSellOrders();
+  assert.equal(lookups, 1, "ensureInvoice asked LND for the lost request");
+  assert.ok(p2.getState().paused);
+  // Before: AcceptOrder 1 — the paused lane's accept, the order "accepted".
+  assert.equal(s.magma.count("AcceptOrder"), 0);
+  assert.equal(s.magma.count("RejectOrder"), 0);
+  assert.equal(invoiceState(s), "CANCELED", "the invoice is released");
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.invoice, e?.decision?.reason, e?.acceptAttempts], ["seen", null, SELLING_OFF_SKIP, 0]);
+  assert.equal(p2.capital.reservedSat(), 0, "the coins are free");
+});
+
+test("restart with selling paused since, and LND not answering about the order's invoice: the never-sent accept is withdrawn without asking — the attempt not counted", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  const crashed = crashAt(s.autopilot.magma, "lndCreateHodl", "after");
+  void s.autopilot.pollSellOrders();
+  await until(crashed, "the invoice was made");
+  const p2 = s.restart();
+  p2.pauseAll();
+  const desk = p2.magma as unknown as { lndHodlStatus: (id: string) => Promise<unknown> };
+  let lookups = 0;
+  desk.lndHodlStatus = async () => {
+    lookups += 1;
+    throw new Error("transport is closing");
+  };
+  await p2.pollSellOrders();
+  // The switch is asked before the invoice is: withdrawn as it stands. (Asked
+  // only after, the failed lookup left the never-sent attempt counted toward
+  // the three refused accepts after which the lane turns an order down.)
+  assert.equal(lookups, 0, "nothing to ask LND: the accept never went out, and the lane is paused");
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.invoice, e?.decision?.reason, e?.acceptAttempts], ["seen", null, SELLING_OFF_SKIP, 0]);
+  assert.equal(s.magma.count("AcceptOrder"), 0);
+  assert.equal(s.magma.count("RejectOrder"), 0);
+  assert.equal(p2.capital.reservedSat(), 0);
 });

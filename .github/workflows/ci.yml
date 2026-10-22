@@ -1,9 +1,11 @@
 name: ci
 
-# The gate for every change: install from the lockfile, type-check the sources
-# AND the tests, run the test suite, and build — on Node 22, the same major the
-# Docker image runs. Releases (build-image.yml) are cut by tag, by hand; this
-# workflow is what tells you whether a commit is fit to tag.
+# The gate for every change: install from the lockfile, audit what runs in
+# production, type-check the sources AND the tests, check the API contract,
+# run the test suite, and build — on Node 22, the same major the Docker image
+# runs. Releases (build-image.yml) are cut by tag, by hand (docs/RELEASING.md);
+# this workflow is what tells you whether a commit is fit to tag. Actions are
+# pinned to commits (Dependabot keeps them current).
 
 on:
   push:
@@ -21,18 +23,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
+          # The Dockerfile's base image runs this major: a new one changes
+          # both in one pull request (server/test/releaseWorkflow.test.ts).
           node-version: 22
           cache: npm
 
       - name: Install (lockfile)
         run: npm ci
 
+      # A known vulnerability in what runs in production (the server's and
+      # the web's runtime dependencies) fails the build. Dev-only tools are
+      # kept current by Dependabot (.github/dependabot.yml).
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
       - name: Type-check (server, web, tests)
         run: npm run typecheck
+
+      # One set of payload types for the server and the web: every body a
+      # route builds is checked against server/src/apiTypes.ts where it is
+      # sent, the web type-checks against those same types, and each answer
+      # the web reads is paired with what its route sends — so a shape that
+      # drifts fails here, and no hand-kept copy creeps back.
+      - name: API contract (shared payload types)
+        run: npm run check:api-types
 
       - name: Test
         run: npm test

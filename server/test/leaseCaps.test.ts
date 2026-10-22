@@ -9,7 +9,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { MAGMA_LEASE_MARGIN_BLOCKS, activeCap, clampToCap, leaseCapFrom, leaseRunning, offerFeeCaps, type LeaseCap } from "../src/services/leaseCaps.js";
 import { getFeeRecommendations } from "../src/services/feeRecommend.js";
@@ -603,13 +603,20 @@ test("…and the engine keeps clamping a sold channel in that margin", async () 
 
 // ── review repair ───────────────────────────────────────────────────────────
 
-/** An autopilot on `node` with a Magma sale of channel 3 in its journal. */
-function keeperSetup(t: Parameters<typeof makeTempDir>[0], node: ReturnType<typeof feeNode>, config: Record<string, unknown>) {
+/** An autopilot on `node` with a Magma sale of channel 3 in its journal.
+ *  `dir`: its data dir (a fresh one when absent); `history`: the run history
+ *  it starts with. */
+function keeperSetup(
+  t: Parameters<typeof makeTempDir>[0],
+  node: ReturnType<typeof feeNode>,
+  config: Record<string, unknown>,
+  opts: { dir?: string; history?: unknown[] } = {},
+) {
   const http = installFetchMock(t);
   http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
-  const dir = makeTempDir(t);
+  const dir = opts.dir ?? makeTempDir(t);
   writeFileSync(join(dir, "magma-orders.json"), JSON.stringify([journalSale("magma-3", TX(3))]));
-  writeFileSync(join(dir, "autopilot.json"), JSON.stringify({ config, history: [], sellAutoSizeMigrated: true }));
+  writeFileSync(join(dir, "autopilot.json"), JSON.stringify({ config, history: opts.history ?? [], sellAutoSizeMigrated: true }));
   const autopilot = new Autopilot(dir, node.lnd, node.lnd, new RebalanceLog(dir), new OverridesStore(dir), new AmbossStore(dir), new EarningsLog(dir), new ServiceFeeLedger(dir, null));
   suppressSchedulerKicks(autopilot);
   t.after(() => autopilot.shutdown());
@@ -644,6 +651,44 @@ test("a broken promise LND refuses to fix is tried again at every check — no b
   autopilot.setConfig({ enabled: true });
   await autopilot.runOnce();
   assert.equal(toChannel3(), 4);
+});
+
+// Review of P8, round 2: writeFees returns repeats now, so the keeper hands
+// recordRun nothing but a repeat at every check (LEASE_PROMISE_CHECK_MS)
+// while LND keeps refusing. Without recordRun's own "nothing new, no line",
+// each check added an empty line: getState() hides those, but they count
+// toward the 50 lines kept — the real history was flushed within hours
+// (a3-channels:history-flood).
+test("a refusal LND repeats at every check for 9 hours adds no line after its first — the run history keeps its real lines", async (t) => {
+  const { node } = engineSetup();
+  node.refusals.set(`${TX(3)}:0`, "refused for the test");
+  const dir = makeTempDir(t);
+  // A full history: 49 runs before this one (50 lines are kept).
+  const earlier = Array.from({ length: 49 }, (_, i) => ({
+    at: new Date(Date.now() - (i + 1) * 3_600_000).toISOString(),
+    attempted: 1,
+    applied: 1,
+    failed: 0,
+    changes: [{ id: "859000x2x0", alias: "p2", fromPpm: 900, toPpm: 950 + i, via: "manual", why: "set by hand", ok: true }],
+    rebalances: [],
+    channels: [],
+    sells: [],
+  }));
+  const autopilot = keeperSetup(t, node, {}, { dir, history: earlier });
+  const checks = Math.ceil((9 * 3_600_000) / LEASE_PROMISE_CHECK_MS) + 1;
+  for (let i = 0; i < checks; i++) await autopilot.keepLeasePromisesNow();
+  const toChannel3 = node.policyRequests.filter((r) => (r.chan_point as { funding_txid_str: string }).funding_txid_str === TX(3)).length;
+  assert.equal(toChannel3, checks, "tried at every check");
+  // Before: 50 empty lines on disk — the refusal and the 49 runs before it gone.
+  const kept = (JSON.parse(readFileSync(join(dir, "autopilot.json"), "utf8")) as { history: { attempted: number; changes: { ok: boolean; error?: string }[] }[] }).history;
+  assert.equal(kept.length, 50);
+  assert.deepEqual(kept.filter((r) => r.attempted === 0), [], "no empty line");
+  assert.match(kept[0].changes[0].error ?? "", /^LND refused the update: refused for the test/, "the refusal, once");
+  assert.equal(kept.flatMap((r) => r.changes).filter((c) => !c.ok).length, 1);
+  assert.equal(kept[49].changes[0].error, undefined, "the oldest run kept is one from before");
+  const shown = autopilot.getState().history;
+  assert.equal(shown.length, 20, "the page shows its 20 latest lines, the refusal first");
+  assert.equal(shown[0].changes[0].ok, false);
 });
 
 test("shutdown stops the lease keeper's timer — no check runs after it", async (t) => {

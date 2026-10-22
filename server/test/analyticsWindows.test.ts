@@ -161,7 +161,7 @@ test("the activity feed shows a rebalance once, as what it cost — and funding 
       { id: "c1".repeat(32), amountSats: 1_198_600, feeSats: 0, confirmations: 6, isConfirmed: true, isOutgoing: false, createdAt: new Date(NOW - 2 * HOUR).toISOString() },
     ],
     { count: 1, totalAmountSats: 200_000 },
-    { config: { enabled: false, rebalanceEnabled: false, channelEnabled: false, sellEnabled: false, intervalMinutes: 30 }, lastRunAt: null, history: [] },
+    { config: { enabled: false, rebalanceEnabled: false, channelEnabled: false, sellEnabled: false, maxHtlcEnabled: false, intervalMinutes: 30 }, lastRunAt: null, history: [] },
     0,
     {
       ownCapitalSats: 0,
@@ -203,7 +203,7 @@ test("a channel still closing: its closing transaction and the fee bump spending
       { id: "d3".repeat(32), amountSats: -50_000, feeSats: 300, confirmations: 1, isConfirmed: true, isOutgoing: true, createdAt: new Date(NOW - 3 * HOUR).toISOString(), spends: ["e9".repeat(32)] },
     ],
     { count: 0, totalAmountSats: 0 },
-    { config: { enabled: false, rebalanceEnabled: false, channelEnabled: false, sellEnabled: false, intervalMinutes: 30 }, lastRunAt: null, history: [] },
+    { config: { enabled: false, rebalanceEnabled: false, channelEnabled: false, sellEnabled: false, maxHtlcEnabled: false, intervalMinutes: 30 }, lastRunAt: null, history: [] },
     0,
     {
       ownCapitalSats: 0,
@@ -250,7 +250,7 @@ test("a send funded by a close's payout stays a send — a long-closed cooperati
       },
     ],
     { count: 0, totalAmountSats: 0 },
-    { config: { enabled: false, rebalanceEnabled: false, channelEnabled: false, sellEnabled: false, intervalMinutes: 30 }, lastRunAt: null, history: [] },
+    { config: { enabled: false, rebalanceEnabled: false, channelEnabled: false, sellEnabled: false, maxHtlcEnabled: false, intervalMinutes: 30 }, lastRunAt: null, history: [] },
     0,
     {
       ownCapitalSats: 0,

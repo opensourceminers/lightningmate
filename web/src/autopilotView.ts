@@ -284,7 +284,9 @@ export function runFailures(r: Pick<NonNullable<DashboardData["autopilot"]["last
 export function autopilotDigest(a: DashboardData["autopilot"], nowMs = Date.now()): { key: string; text: string; warn?: boolean; sub?: string }[] {
   const items: { key: string; text: string; warn?: boolean; sub?: string }[] = [];
   if (a.pausedAt) items.push({ key: "ap-paused", text: `All automation paused ${ago(a.pausedAt, nowMs)} — ${pausedText(a.lspModeOn)}` });
-  const anyOn = a.fees || a.rebalance || a.channel || a.sell;
+  // Every automation of the autopilot's, Advertise routable size (the
+  // max_htlc pass) included: on alone, its runs and failures are news too.
+  const anyOn = a.fees || a.rebalance || a.channel || a.sell || a.maxHtlc;
   if (anyOn && a.lastRunAt) {
     const r = a.lastRun;
     const parts = r
@@ -308,7 +310,7 @@ export function autopilotDigest(a: DashboardData["autopilot"], nowMs = Date.now(
   }
   // Only areas that are switched on: one that is off has nothing to fail at
   // (on a read-only node every area reads "blocked: write mode is off").
-  const on: Partial<Record<DecisionArea, boolean>> = { fees: a.fees, rebalance: a.rebalance, channels: a.channel, magma: a.sell };
+  const on: Partial<Record<DecisionArea, boolean>> = { fees: a.fees, rebalance: a.rebalance, channels: a.channel, magma: a.sell, maxHtlc: a.maxHtlc };
   for (const [area, s] of Object.entries(a.status ?? {}) as [DecisionArea, { state: string; text: string }][]) {
     if (!on[area] || (s.state !== "error" && s.state !== "blocked")) continue;
     items.push({ key: `ap-${area}`, text: `${AREA_LABEL[area]} ${s.state === "error" ? "failed" : "blocked"}: ${s.text}`, warn: true, sub: AREA_SUB[area] });

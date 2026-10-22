@@ -28,7 +28,7 @@ import type { EarningsLog } from "./earningsLog.js";
 import { getMagmaRecommendations, MAGMA_V2_DEFAULTS } from "./magmaRecommend.js";
 import { onchainCosts } from "./nodeEconomics.js";
 import { saleFeeConfig, type ServiceFeeLedger } from "./serviceFee.js";
-import { couldNotConnect, ensureConnected, fundChannel, isPendingChannelsLimit, isPreBroadcastRefusal } from "./channelOps.js";
+import { checkPeerListing, couldNotConnect, ensureConnected, fundChannel, isPendingChannelsLimit, isPreBroadcastRefusal, opensBlocked } from "./channelOps.js";
 import { HODL_CANCEL_MARGIN_BLOCKS, cancelHodl, createHodl, heldUntilHeightOf, newHodlSecret, settleHodl } from "./hodl.js";
 import {
   CapitalLedger,
@@ -372,10 +372,19 @@ export interface Lsps1Status {
   /** Peer-message subscription is live (write mode on + LND reachable). */
   running: boolean;
   canWrite: boolean;
+  /** Why no new order is taken right now — LND refuses the write macaroon
+   *  the peer listing every channel open needs (no peers:read) — or null.
+   *  Apart from `lastError`: such a macaroon still reads peer messages, so
+   *  the listener runs, and the card (which shows `lastError` only while it
+   *  doesn't) said "Listening for LSP clients" and nothing of why every
+   *  order was turned away (review of P8, run 2). */
+  blocked: string | null;
   /** Requests answered with a result (any method). */
   requestsServed: number;
   /** The last request of any kind — served or refused. */
   lastRequestAt: string | null;
+  /** The service's own last error: the peer-message listener's, or an
+   *  internal one while handling a request — not why orders are refused. */
   lastError: string | null;
   /** Per method: served and refused (by error code). Before, only served
    *  requests counted — every ZEUS order refused while the card counted its
@@ -566,6 +575,10 @@ export class Lsps1Service {
 
   start(): void {
     this.applySettings();
+    // Whether LND lists its peers to the write client at all (peers:read):
+    // without it no order's channel can be opened — the status says so from
+    // the start, and no order is taken (createOrder).
+    if (this.writeLnd) void checkPeerListing(this.writeLnd);
     void this.recoverOrders();
     // Hourly re-check of the announced clearnet address: a DDNS name follows
     // the home IP, so re-resolve and swap the announcement when it moved.
@@ -785,6 +798,9 @@ export class Lsps1Service {
       enabled,
       running: !!this.sub,
       canWrite: !!this.writeLnd,
+      // No new order while LND refuses the write macaroon the peer listing
+      // every open needs (createOrder) — said for as long as it does.
+      blocked: opensBlocked(this.writeLnd),
       requestsServed: this.requestsServed,
       lastRequestAt: this.lastRequestAt,
       lastError: this.lastError,
@@ -1369,6 +1385,16 @@ export class Lsps1Service {
     const same = this.sameQuote(peer, terms);
     if (same) return rpcResult(rid, this.orderPayload(same));
 
+    // LND refuses the write macaroon the peer listing every open needs (no
+    // peers:read — found at start, or by an open): asked again (cheap), and
+    // while it still refuses, no order is made — a buyer must not pay for a
+    // channel this node can't open. The buyer hears only that; the operator
+    // reads why in the LSP status (status()).
+    if (opensBlocked(this.writeLnd)) {
+      await checkPeerListing(this.writeLnd);
+      if (opensBlocked(this.writeLnd)) return refused("this LSP can't open channels right now — try again later");
+    }
+
     // Abuse caps: open (unresolved) orders, per peer and total, and the
     // pace of asking again (orderSlot). A buyer at its own cap that asks
     // for something else replaces its oldest unpaid quote — once the new
@@ -1810,7 +1836,11 @@ export class Lsps1Service {
         if (hold.kind === "unknown") continue;
         if (this.stopping) return;
         // Connect first, OUTSIDE the mutex: dialing over Tor can take a minute
-        // and a half, and must not hold up anyone else's open meanwhile.
+        // and a half, and must not hold up anyone else's open meanwhile. LND
+        // refusing the write macaroon the peer listing (no peers:read) throws
+        // MissingPermission: no open is possible until the operator fixes the
+        // macaroon and restarts, so the order ends at once — refunded, with
+        // that reason (below) — never read as a buyer that is offline.
         if (!(await this.lndConnect(order.peer))) {
           lastError = couldNotConnect(order.peer);
           this.noteWaitingForBuyer(order, true);

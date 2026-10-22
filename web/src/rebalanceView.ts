@@ -88,6 +88,7 @@ export function manualRefillRequest(
     | "expectedRevenuePpm"
     | "earningDemandSats"
     | "minNetProfitSats"
+    | "estimatedRouteCostPpm"
   >,
   /** The operator's econRatio (the plan's profitShare): the cost cap's
    *  fallback when the row has no max ppm. */
@@ -106,6 +107,9 @@ export function manualRefillRequest(
     ...(r.expectedRevenuePpm != null
       ? { gate: { revenuePpm: r.expectedRevenuePpm, demandSats: r.earningDemandSats, minNetSats: r.minNetProfitSats } }
       : {}),
+    // The plan's route cost at that size: a size the cap no longer allows
+    // (today's budget left shrank) falls to the largest one it does first.
+    ...(r.estimatedRouteCostPpm != null ? { routeCostPpm: r.estimatedRouteCostPpm } : {}),
     ...(planAt ? { planAt } : {}),
   };
 }

@@ -1,8 +1,20 @@
 # Submitting Lightning Mate to the official Umbrel App Store
 
 The official-store package is [`lightningmate/`](./lightningmate/): bare
-`lightningmate` id, `gallery: []`, **no `icon` field** (Umbrel hosts the final
-assets, provided in the PR). Docs: <https://github.com/getumbrel/umbrel-apps>.
+`lightningmate` id, **no `icon` field** — Umbrel hosts the icon and the gallery
+images (provided in the PR; `gallery` lists them by file name). The folder
+holds what the next update PR publishes: the image pin and `version` of what
+`getumbrel/umbrel-apps` publishes now (v0.7.7), plus what that PR changes — the
+two Tor proxy lines, `category: bitcoin` (the store lists `finance` now; say
+why in the PR body, docs/RELEASING.md) and draft release notes. Docs:
+<https://github.com/getumbrel/umbrel-apps>.
+
+This file is about the pull request itself. Cutting a release — the image, its
+checks, both stores' manifests — is [docs/RELEASING.md](../../docs/RELEASING.md).
+
+The community store's manifest (`opensourceminers-lightningmate`) also declares
+the four-stats home-screen widget (`web:3001/api/widget/stats`, open without a
+login, non-sensitive totals only); the official one does not.
 
 ## Prerequisites
 
@@ -42,7 +54,7 @@ assets, provided in the PR). Docs: <https://github.com/getumbrel/umbrel-apps>.
 - Sign-in: the per-app password Umbrel generates (deterministicPassword), shown
   on first open; the API requires it so no other app on the server can use it
 - Host access: none beyond the mounted LND data dir (read-only mount)
-- Runs as uid 1000 (non-root); a one-shot init container fixes the data-dir owner
+- Runs as uid 1000 (non-root), writing only its own data dir
 - Writes (fees / rebalance / channel open+close / Magma fulfilment / autopilot)
   use the auto-discovered admin macaroon, like RTL / Thunderhub / Lightning
   Terminal. The autopilot stays OFF until the user enables it and every

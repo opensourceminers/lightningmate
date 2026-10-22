@@ -3,7 +3,8 @@ name: build-image
 # Builds the multi-arch (amd64 + arm64) LightningMate image and pushes it to the
 # GitHub Container Registry (ghcr.io/<owner>/lightningmate). Runs on version tags
 # (v*) or manually. The final manifest digest is printed in the run summary —
-# paste it into the community store's docker-compose.yml.
+# paste it into the community store's docker-compose.yml. The whole release
+# process, with the store's compose, is in docs/RELEASING.md.
 #
 # Each architecture builds on its OWN native runner and pushes by digest; a merge
 # job then stitches the two into one manifest list. We do NOT emulate arm64 with
@@ -11,6 +12,15 @@ name: build-image
 # (Illegal instruction)" on node:22-alpine, which is a QEMU limitation and not
 # something the Dockerfile can work around. Native runners are also ~4x faster.
 # GitHub provides arm64 runners free of charge for public repositories.
+#
+# Traceability (review a8-engineering:supply-chain-release-traceability):
+#  - a published tag is never overwritten — the guard job refuses a tag that
+#    exists already (v0.7.4 was once moved to another commit and rebuilt
+#    under the same name), and a manual run publishes dev-… test tags only;
+#  - every image carries its source, commit and version as OCI labels, the
+#    manifest list as annotations, and a provenance attestation and an SBOM;
+#  - every action is pinned to a commit (Dependabot keeps them current) —
+#    this workflow can write packages.
 
 on:
   push:
@@ -18,18 +28,79 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Image tag to publish (e.g. 0.4.0)"
-        default: "dev"
+        description: "Test image tag: dev-… only, e.g. dev-myfix (default: dev-<commit>). Release tags (v…) come only from pushing a git tag."
+        default: ""
 
 permissions:
   contents: read
-  packages: write
 
 env:
   IMAGE: ghcr.io/${{ github.repository }}
 
 jobs:
+  # Which tag this run publishes — and that it doesn't exist yet: an image
+  # once published is immutable.
+  guard:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: tag
+        name: Image tag (never one that exists)
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            TAG="${INPUT_TAG:-dev-${GITHUB_SHA::7}}"
+            # A manual run publishes test images only: dev-… tags. Anything
+            # else — v0.8.0, but also latest, 0.8.0 or V0.8.0 — would be an
+            # immutable tag nobody cut as a release.
+            if ! [[ "$TAG" =~ ^dev-[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::A manual run publishes test tags only (dev-…), not $TAG. A release tag is published only by pushing the git tag — see docs/RELEASING.md."
+              exit 1
+            fi
+          else
+            TAG="$REF_NAME"
+            # A pushed tag is a release: a semantic version with the v prefix
+            # (v0.8.0, v0.8.0-rc.1) — the version the app shows.
+            if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::A release tag is a semantic version with a v prefix (e.g. v0.8.0), not $TAG — see docs/RELEASING.md."
+              exit 1
+            fi
+          fi
+          if ! [[ "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+            echo "::error::Not a valid image tag: $TAG"
+            exit 1
+          fi
+          if out=$(docker buildx imagetools inspect "$IMAGE:$TAG" 2>&1); then
+            echo "::error::$IMAGE:$TAG is published already — images are immutable. Cut a new version instead (docs/RELEASING.md)."
+            exit 1
+          fi
+          if ! grep -qiE "not found|manifest unknown|404" <<< "$out"; then
+            echo "::error::Could not tell whether $IMAGE:$TAG exists: $out"
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: guard
+    permissions:
+      contents: read
+      packages: write
     strategy:
       fail-fast: false
       matrix:
@@ -42,34 +113,38 @@ jobs:
             slug: arm64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Push by digest only: the tags are applied once, on the merged manifest.
+      # Push by digest only: the tag is applied once, on the merged manifest.
+      # The digest pushed is an index: the image and its attestations (build
+      # provenance, SBOM) — `imagetools create` below merges such indexes.
       - id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           platforms: ${{ matrix.platform }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
-          provenance: false
+          provenance: mode=max
+          sbom: true
           cache-from: type=gha,scope=${{ matrix.slug }}
           cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
           build-args: |
-            APP_VERSION=${{ github.event.inputs.tag || github.ref_name }}
+            APP_VERSION=${{ needs.guard.outputs.tag }}
             APP_REVISION=${{ github.sha }}
           # Traceability: which repo and commit an image was built from.
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ github.event.inputs.tag || github.ref_name }}
+            org.opencontainers.image.version=${{ needs.guard.outputs.tag }}
+            org.opencontainers.image.licenses=MIT
 
       # The per-arch digest becomes a filename; the merge job turns the set of
       # filenames back into the manifest-list members.
@@ -81,7 +156,7 @@ jobs:
           mkdir -p /tmp/digests
           touch "/tmp/digests/${DIGEST#sha256:}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: digest-${{ matrix.slug }}
           path: /tmp/digests/*
@@ -89,53 +164,70 @@ jobs:
           retention-days: 1
 
   merge:
-    needs: build
+    needs: [guard, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: /tmp/digests
           pattern: digest-*
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.IMAGE }}
-          tags: |
-            type=ref,event=tag
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' }}
-
+      # One manifest list, tagged once, with the same source/revision/version
+      # as annotations on the index — what a registry shows for the tag.
       - name: Create manifest list
         working-directory: /tmp/digests
+        shell: bash
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
         run: |
+          # Asked again right before the tag is written (a run of the same
+          # tag may have finished since the guard looked) — and, as in the
+          # guard, only the registry's "not found" lets it go on: a failed
+          # look (network, auth) is no answer.
+          if out=$(docker buildx imagetools inspect "$IMAGE:$TAG" 2>&1); then
+            echo "::error::$IMAGE:$TAG was published meanwhile — not overwritten."
+            exit 1
+          fi
+          if ! grep -qiE "not found|manifest unknown|404" <<< "$out"; then
+            echo "::error::Could not tell whether $IMAGE:$TAG exists: $out — not tagged."
+            exit 1
+          fi
           docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            -t "$IMAGE:$TAG" \
+            --annotation "index:org.opencontainers.image.source=$SOURCE" \
+            --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "index:org.opencontainers.image.version=$TAG" \
+            --annotation "index:org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             $(printf "${IMAGE}@sha256:%s " *)
 
       - name: Report digest
+        shell: bash
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
         run: |
-          TAG="$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")"
-          DIGEST="$(docker buildx imagetools inspect "$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          DIGEST="$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{json .Manifest.Digest}}' | tr -d '"')"
           {
             echo "### Image pushed"
             echo ""
-            echo "Tags:"
-            echo '```'
-            jq -r '.tags[]' <<< "$DOCKER_METADATA_OUTPUT_JSON"
-            echo '```'
+            echo "Tag: \`$IMAGE:$TAG\` (commit \`$GITHUB_SHA\`)"
+            echo ""
             echo "Manifest digest: \`${DIGEST}\`"
             echo ""
-            echo "Pin this in the community store's docker-compose.yml:"
+            echo "Pin this in the community store's docker-compose.yml (docs/RELEASING.md):"
             echo '```'
-            echo "${TAG}@${DIGEST}"
+            echo "$IMAGE:$TAG@${DIGEST}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
