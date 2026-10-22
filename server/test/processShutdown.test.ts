@@ -61,5 +61,8 @@ test("SIGTERM stops the server cleanly with exit code 0", { timeout: 60_000 }, a
   assert.equal(code, 0, output);
   assert.match(output, /\[shutdown\] SIGTERM received/);
   assert.match(output, /\[shutdown\] done/);
+  // Every line carries its time (review a8: the log had none).
+  assert.match(output, /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z ⚡ LightningMate listening on/);
+  assert.match(output, /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z \[shutdown\] done/);
   assert.ok(existsSync(join(dataDir, "autopilot.json")), "state was written");
 });

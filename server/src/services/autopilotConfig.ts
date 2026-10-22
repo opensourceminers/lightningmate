@@ -230,11 +230,17 @@ const BOOLEAN_KEYS = [
 
 const PRICING_MODES = ["fast", "balanced", "premium", "auto"] as const;
 
-/** What GET /api/autopilot sends the UI so its inputs carry the same limits. */
+/** What GET /api/autopilot sends the UI so its inputs carry the same limits
+ *  — and the rules that span fields (crossFieldErrors), which the form
+ *  checks before it sends anything (D17). */
 export const AUTOPILOT_CONFIG_BOUNDS = {
   config: CONFIG_BOUNDS,
   policy: POLICY_BOUNDS,
   rebalancePolicy: REBALANCE_POLICY_BOUNDS,
+  rules: {
+    /** channelSizeSats is 0 (auto) or at least this. */
+    channelSizeMinSats: MIN_CHANNEL_SATS,
+  },
 };
 
 export type AutopilotConfigPatch = Partial<Omit<AutopilotConfig, "policy" | "rebalancePolicy">> & {
@@ -469,6 +475,49 @@ const LOAD_ROUNDING: Partial<Record<string, Rounding>> = {
 };
 const loadRounding = (field: string): Rounding | undefined => (has(LOAD_ROUNDING, field) ? LOAD_ROUNDING[field] : undefined);
 
+/** A number written as text ("5000000", " 0 ", "1e6"): what 0.7.7's arithmetic
+ *  made of it — `balance - "5000000"`, `"0" > 0`, `slice(0, "0")` all read
+ *  it as the number. Null for anything else (a blank string is no number:
+ *  the UI never saved one, and guessing 0 for it could mean "no reserve"). */
+function numberInText(v: unknown): number | null {
+  if (typeof v !== "string" || v.trim() === "") return null;
+  const n = Number(v.trim());
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * The stored config with every numeric setting written as text turned into
+ * the number it stood for — before any repair looks at it. 0.7.7 stored
+ * whatever POST /autopilot was sent, so a config made by a direct API call
+ * can hold "5000000" for a reserve; its arithmetic read that as 5,000,000.
+ * Read as "not a number", the repair below fell back to the DEFAULT — a
+ * 50,000 sat reserve, 5 fee changes a run where "0" kept fees untouched, an
+ * automatic size where "2000000000" opened nothing — with automation left on
+ * (review of P0). As numbers, the usual clamps apply, and so does the rule
+ * that a repair which would let the autopilot do more switches it off.
+ * Switches are not converted: a mistyped switch goes off, whatever it says.
+ */
+function numbersFromText(src: Record<string, unknown>, repairs: string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...src };
+  const convert = (into: Record<string, unknown>, key: string, field: string) => {
+    const n = numberInText(into[key]);
+    if (n === null) return;
+    repairs.push(`${field}: ${JSON.stringify(into[key])} was stored as text — read as the number ${n}`);
+    into[key] = n;
+  };
+  for (const key of Object.keys(CONFIG_BOUNDS)) if (has(out, key)) convert(out, key, key);
+  for (const [name, bounds] of [
+    ["policy", POLICY_BOUNDS],
+    ["rebalancePolicy", REBALANCE_POLICY_BOUNDS],
+  ] as const) {
+    if (!isPlainObject(out[name])) continue;
+    const section = { ...(out[name] as Record<string, unknown>) };
+    for (const key of Object.keys(bounds)) if (has(section, key)) convert(section, key, `${name}.${key}`);
+    out[name] = section;
+  }
+  return out;
+}
+
 /**
  * Bring a config read from disk into range. Older versions accepted anything,
  * so a persisted file can hold out-of-range or mistyped values. Numbers are
@@ -477,11 +526,12 @@ const loadRounding = (field: string): Rounding | undefined => (has(LOAD_ROUNDING
  * value would let the autopilot do MORE than the stored one did (a value that
  * kept it idle), that automation is switched off instead: an upgrade never
  * starts spending on its own. Every repair is reported so it can be logged and
- * shown to the operator.
+ * shown to the operator. A number stored as text counts as that number
+ * (numbersFromText).
  */
 export function sanitizePersistedConfig(raw: unknown): { config: AutopilotConfig; repairs: string[] } {
-  const src = isPlainObject(raw) ? raw : {};
   const repairs: string[] = [];
+  const src = numbersFromText(isPlainObject(raw) ? raw : {}, repairs);
   const config: AutopilotConfig = {
     ...DEFAULT_CONFIG,
     policy: { ...DEFAULT_POLICY },

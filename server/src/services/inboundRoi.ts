@@ -32,8 +32,19 @@ export interface BoughtInboundRoi {
   inboundForwards: number;
   routedInSats: number;
   inboundFeesSats: number;
-  /** inboundFees / cost (%); null with no channel to follow. */
+  /** inboundFees / cost (%); null with no channel to follow, or when the
+   *  forwards read doesn't cover the lease (roiNote says which). */
   roiPct: number | null;
+  /** Why roiPct is null when a channel was found — the "—" cell's title. */
+  roiNote: string | null;
+}
+
+/** What the forwards behind the figures cover: from `fromMs`, and — a read
+ *  cut short (LND holds more than are read; it pages oldest first) — only up
+ *  to the newest forward read. */
+export interface ForwardsRead {
+  fromMs: number;
+  complete: boolean;
 }
 
 export const BOUGHT_INBOUND_METHOD =
@@ -87,13 +98,25 @@ export function amortizedPurchaseCost(
 }
 
 /** Purchases whose channel opened, set against the forwards that came in
- *  through their channel during the lease — pure, for tests. */
+ *  through their channel during the lease — pure, for tests.
+ *
+ *  A lease the forwards read doesn't cover is not measured (review of P6: it
+ *  read a measured 0 %): one that began before the read (it reaches back 400
+ *  days at most), and — the read cut short, so the newest forwards are
+ *  missing — one still running or ended after the newest forward read. */
 export function boughtInboundRoi(
   purchases: readonly MagmaPurchase[],
   channelOf: (p: MagmaPurchase) => { channelId: string; alias: string } | null,
   events: readonly ForwardEvent[],
   nowMs: number,
+  read: ForwardsRead = { fromMs: -Infinity, complete: true },
 ): BoughtInboundRoi[] {
+  // A read cut short reaches only as far as its newest forward.
+  let readToMs = nowMs;
+  if (!read.complete) {
+    readToMs = -Infinity;
+    for (const e of events) readToMs = Math.max(readToMs, Date.parse(e.createdAt));
+  }
   const out: BoughtInboundRoi[] = [];
   for (const p of purchases) {
     if (p.state !== "channel_open" || !p.paidAt) continue;
@@ -117,6 +140,12 @@ export function boughtInboundRoi(
     }
     const costSats = p.feeSats + (p.routingFeeSats ?? 0);
     const inboundFeesSats = Math.round(feeMsat / 1000);
+    const unread =
+      start < read.fromMs
+        ? `not measured: the lease began ${new Date(start).toISOString().slice(0, 10)}, before the forwards read (they are read from ${new Date(read.fromMs).toISOString().slice(0, 10)})`
+        : Math.min(end, nowMs) > readToMs
+          ? "not measured: LND holds more forwards than are read, and the newest — this lease's latest — are the ones missing"
+          : null;
     out.push({
       orderId: p.orderId,
       channelId: ch?.channelId ?? null,
@@ -130,7 +159,8 @@ export function boughtInboundRoi(
       inboundForwards,
       routedInSats,
       inboundFeesSats,
-      roiPct: ch && costSats > 0 ? Math.round(((feeMsat / 1000) / costSats) * 100) : null,
+      roiPct: ch && costSats > 0 && !unread ? Math.round(((feeMsat / 1000) / costSats) * 100) : null,
+      roiNote: ch ? unread : null,
     });
   }
   return out.sort((a, b) => b.paidAt.localeCompare(a.paidAt));

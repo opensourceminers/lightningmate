@@ -307,10 +307,19 @@ const asOf = (reportedAt: string | null | undefined, nowMs: number): string => {
   return Number.isFinite(at) && nowMs - at > OLD_LISTING_MS ? ` (as of ${new Date(at).toISOString().slice(0, 10)})` : "";
 };
 
+/** What a lease with no count of blocks left says: its funding hasn't
+ *  confirmed (no end yet), or it has — the end is known — and only the
+ *  current block height couldn't be read (review of P4: both read "funding
+ *  not confirmed yet"). */
+export const HEIGHT_UNKNOWN_TEXT = "time left unknown: the current block height couldn't be read";
+
 /** How long a running lease has left, in words ("41 d", "5 h"). */
-export function leaseLeftText(l: Pick<ChannelLease, "blocksLeft" | "reportedByAmboss" | "reportedAt">, nowMs = Date.now()): string {
+export function leaseLeftText(
+  l: Pick<ChannelLease, "blocksLeft" | "reportedByAmboss" | "reportedAt"> & Partial<Pick<ChannelLease, "untilHeight">>,
+  nowMs = Date.now(),
+): string {
   if (l.reportedByAmboss) return `Amboss reports it still running${asOf(l.reportedAt, nowMs)}`;
-  if (l.blocksLeft === null) return "funding not confirmed yet";
+  if (l.blocksLeft === null) return l.untilHeight != null ? HEIGHT_UNKNOWN_TEXT : "funding not confirmed yet";
   const hours = (Math.max(0, l.blocksLeft) * MS_PER_BLOCK) / 3_600_000;
   return hours >= 48 ? `~${Math.round(hours / 24)} d left` : `~${Math.max(1, Math.round(hours))} h left`;
 }

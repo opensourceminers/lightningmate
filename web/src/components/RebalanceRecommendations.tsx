@@ -25,6 +25,7 @@ import {
   stalePlanRefusal,
 } from "../rebalanceView";
 import { useUi } from "./Overlay";
+import { caretButtonProps } from "../a11y";
 
 const STATE_LABEL: Record<RebalanceRecState, string> = {
   not_needed: "ok",
@@ -157,7 +158,7 @@ export function RebalanceRecommendations() {
     <section className="panel feerec">
       <div className="panel-head">
         <h2>
-          Smart rebalance <span className="v2-badge">v1</span>
+          Smart rebalance
         </h2>
         {s ? <span className="change-badge">{s.profitableRecommendations} worth doing</span> : null}
       </div>
@@ -275,7 +276,9 @@ export function RebalanceRecommendations() {
                 return (
                   <Fragment key={r.channelId}>
                     <tr className={`feerec-row ${r.wouldRebalance ? "changing" : ""}`} onClick={() => toggle(r.channelId)}>
-                      <td className="feerec-caret">{isOpen ? "▾" : "▸"}</td>
+                      <td className="feerec-caret">
+                        <button {...caretButtonProps(isOpen, () => toggle(r.channelId), `Details: ${r.alias}`)}>{isOpen ? "▾" : "▸"}</button>
+                      </td>
                       <td>{r.alias}</td>
                       <td className="num">{pct(r.localRatio)}</td>
                       <td>
@@ -284,6 +287,20 @@ export function RebalanceRecommendations() {
                           <span className="feerec-state s-cost" title="Today's fee budget can't pay for it now — it waits for the reset (00:00 UTC)">
                             {" "}budget-blocked
                           </span>
+                        ) : null}
+                        {/* The Run action in the row itself — it was only
+                            inside the opened row (a11y). It asks first. */}
+                        {r.wouldRebalance && canWrite && !inFlightThrough(r, data.inFlight) ? (
+                          <button
+                            className="row-btn"
+                            disabled={running === r.channelId}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void execute(r);
+                            }}
+                          >
+                            {running === r.channelId ? "Running…" : "Run…"}
+                          </button>
                         ) : null}
                       </td>
                       <td className="num">{r.recommendedAmount ? satsCompact(r.recommendedAmount) : "—"}</td>

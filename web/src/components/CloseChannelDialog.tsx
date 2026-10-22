@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../api";
+import { useDialogFocus } from "../a11y";
 import type { FeeEstimates } from "../types";
 import { satsCompact } from "../format";
 import { fastRateHint } from "../onchainView";
@@ -88,6 +89,12 @@ export function CloseChannelDialog({
   const [refused, setRefused] = useState<ChannelLease | null>(null);
   const [error, setError] = useState<string | null>(null);
   const offline = !channel.active;
+  // Focus into the dialog, Tab kept inside it, Esc cancels — not while a
+  // close is being sent (a11y).
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useDialogFocus(dialogRef, true, () => {
+    if (busy === null) onCancel();
+  });
   const lease = dialogLease(channel, refused);
   const leaseWarning = leaseBreakWarning(lease);
   const can = closeButtons({ busy: busy !== null, rate, lease, breakLease });
@@ -157,7 +164,15 @@ export function CloseChannelDialog({
 
   return (
     <div className="modal-overlay" onClick={onCancel}>
-      <div className="modal close-dialog" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
+      <div
+        className="modal close-dialog"
+        ref={dialogRef}
+        tabIndex={-1}
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Close the channel with ${channel.peerAlias}`}
+      >
         {step === "force" ? (
           <ForceCloseConfirm
             peerAlias={channel.peerAlias}

@@ -64,6 +64,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=${{ matrix.slug }}
           build-args: |
             APP_VERSION=${{ github.event.inputs.tag || github.ref_name }}
+            APP_REVISION=${{ github.sha }}
           # Traceability: which repo and commit an image was built from.
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}

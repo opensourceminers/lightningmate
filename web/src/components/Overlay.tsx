@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useRef, useState, type ReactNode } from "react";
+import { useDialogFocus } from "../a11y";
 
 type ToastType = "success" | "error" | "info";
 interface Toast {
@@ -52,6 +53,9 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
     pending?.resolve(result);
     setPending(null);
   };
+  // Focus into the dialog, Tab kept inside it, Esc cancels (a11y).
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useDialogFocus(dialogRef, pending !== null, () => settle(false));
 
   return (
     <Ctx.Provider value={{ toast, confirm }}>
@@ -68,8 +72,20 @@ export function OverlayProvider({ children }: { children: ReactNode }) {
 
       {pending ? (
         <div className="modal-overlay" onClick={() => settle(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true">
-            {pending.opts.title ? <h3 className="modal-title">{pending.opts.title}</h3> : null}
+          <div
+            className="modal"
+            ref={dialogRef}
+            tabIndex={-1}
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby={pending.opts.title ? "confirm-title" : undefined}
+          >
+            {pending.opts.title ? (
+              <h3 className="modal-title" id="confirm-title">
+                {pending.opts.title}
+              </h3>
+            ) : null}
             {pending.opts.message ? <p className="modal-msg">{pending.opts.message}</p> : null}
             {pending.opts.body ?? null}
             <div className="modal-actions">

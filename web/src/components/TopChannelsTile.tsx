@@ -1,31 +1,14 @@
-import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { ChannelForwardStat } from "../types";
 import { topChannels, topChannelValue } from "../analyticsView";
+import { usePolledData } from "../usePolledData";
 import { Sparkline } from "./Sparkline";
 
 export function TopChannelsTile({ onOpen }: { onOpen?: () => void }) {
-  const [rows, setRows] = useState<ChannelForwardStat[] | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = () =>
-      api
-        .forwardsReport(30)
-        .then((r) => {
-          if (cancelled) return;
-          // Ranked by what each earned out PLUS what it brought in: the
-          // source of the best route is a top channel too.
-          setRows(topChannels(r.perChannel, 5));
-        })
-        .catch(() => !cancelled && setRows((cur) => cur ?? []));
-    load();
-    const id = setInterval(load, 120_000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, []);
+  // Every 2 min while the page is visible (30 days of forwards each time).
+  const report = usePolledData(() => api.forwardsReport(30), 120_000);
+  // Ranked by what each earned out PLUS what it brought in: the source of
+  // the best route is a top channel too.
+  const rows = report.data ? topChannels(report.data.perChannel, 5) : report.error ? [] : null;
 
   return (
     <section

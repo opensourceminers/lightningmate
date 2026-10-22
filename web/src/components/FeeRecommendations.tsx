@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
+import { caretButtonProps } from "../a11y";
 import type { AutopilotChange, FeeMode, FeeRecReport, FeeRecState, OverrideMap } from "../types";
 import { satsCompact, timeAgo } from "../format";
 import { applyChannelIds, baseChange, marketRefText } from "../feeView";
@@ -123,7 +124,7 @@ export function FeeRecommendations() {
     <section className="panel feerec">
       <div className="panel-head">
         <h2>
-          Smart fees <span className="v2-badge">v2</span>
+          Smart fees
         </h2>
         <div className="head-actions">
           {data ? <span className="change-badge">{wouldApply.length} to change</span> : null}
@@ -215,7 +216,9 @@ export function FeeRecommendations() {
                   return (
                     <Fragment key={r.channelId}>
                       <tr className={`feerec-row ${r.wouldApply ? "changing" : ""}`} onClick={() => toggle(r.channelId)}>
-                        <td className="feerec-caret">{isOpen ? "▾" : "▸"}</td>
+                        <td className="feerec-caret">
+                          <button {...caretButtonProps(isOpen, () => toggle(r.channelId), `Why: ${r.alias}`)}>{isOpen ? "▾" : "▸"}</button>
+                        </td>
                         <td>
                           {r.alias}
                           {m.isTopEarner ? <span className="top-earner" title="top earner"> ★</span> : null}

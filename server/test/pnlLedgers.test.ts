@@ -126,7 +126,10 @@ test("rebalances made with another tool count: LND's payments to this node itsel
   const { api } = await ledgerApi(t, { payments, dir, node });
   const p = (await api.request("GET", "/pnl?days=30")).body;
   // Before: 110 sat — LightningMate's two only.
-  assert.deepEqual([p.rebalanceCostSats, p.rebalanceCount, p.rebalanceNotLogged], [350, 5, 3]);
+  // (The log began 5 days ago, with its oldest record: the bos refill from
+  // 8 days ago can't be told from one of LightningMate's own the old log may
+  // have dropped — counted apart, not "made outside LightningMate".)
+  assert.deepEqual([p.rebalanceCostSats, p.rebalanceCount, p.rebalanceNotLogged, p.rebalanceBeforeLog], [350, 5, 2, 1]);
   const costs = (await api.request("GET", "/rebalance/costs?days=30")).body;
   assert.deepEqual(
     costs.perChannel.map((c: { channelId: string; feeSats: number; count: number }) => [c.channelId, c.feeSats, c.count]),
@@ -432,4 +435,99 @@ test("a rebalance split over two paths: each part's fee goes to the channel it c
       [T2, 30],
     ],
   );
+});
+
+// ── review of P6 (final): labels that claimed too much, and a cost shown nowhere ──
+
+test("PROBE-NOTLOGGED: LightningMate's own refill from before its (0.7.x, capped) log began is no longer 'made outside LightningMate' — it is counted apart", async (t) => {
+  const dir = makeTempDir(t);
+  const node = new FakeLnd({ chainBalance: 1_000_000 });
+  // A 0.7.7 log as on disk: its oldest kept record is 10 days old (the
+  // 200-record cap dropped older ones); 0.7.x records carry no paymentId.
+  const r10 = record(10, 40, { startedAt: undefined });
+  const r5 = record(5, 30, { startedAt: undefined });
+  writeFileSync(join(dir, "rebalances.json"), JSON.stringify([r5, r10]));
+  const payments = [
+    paymentRpc({ at: Date.parse(r5.at) - 60_000, tokens: 200_000, feeMsat: 30_000, destination: node.publicKey, lastChannel: T1 }),
+    paymentRpc({ at: Date.parse(r10.at) - 60_000, tokens: 200_000, feeMsat: 40_000, destination: node.publicKey, lastChannel: T1 }),
+    // LightningMate's own refill 40 days ago: its record went with 0.7.x's cap.
+    paymentRpc({ at: Date.now() - 40 * DAY, tokens: 200_000, feeMsat: 50_000, destination: node.publicKey, lastChannel: T1 }),
+  ];
+  const { api } = await ledgerApi(t, { payments, dir, node });
+  const p = (await api.request("GET", "/pnl?days=90")).body;
+  assert.equal(p.rebalanceCostSats, 120, "every fee still counts");
+  // Before: rebalanceNotLogged 1 — "incl. 1 made outside LightningMate".
+  assert.deepEqual([p.rebalanceNotLogged, p.rebalanceBeforeLog], [0, 1]);
+  assert.equal(p.rebalanceLogSince?.slice(0, 10), r10.at.slice(0, 10));
+  const c = (await api.request("GET", "/rebalance/costs?days=90")).body;
+  assert.deepEqual([c.notLogged, c.beforeLog], [0, 1]);
+
+  // A rebalance after the log began that it has no record of IS another tool's.
+  installPayments(node, [...payments, paymentRpc({ at: Date.now() - 2 * DAY, tokens: 300_000, feeMsat: 20_000, destination: node.publicKey, lastChannel: T2 })]);
+  forgetSelfPayments(node.lnd);
+  const after = (await api.request("GET", "/rebalance/costs?days=90")).body;
+  assert.deepEqual([after.notLogged, after.beforeLog], [1, 1]);
+});
+
+test("GET /rebalance/costs names each refilled channel and says whether it is still there: an open one refilled with no forward since is open, under its alias — one closed since is 'closed', named by the log", async (t) => {
+  const dir = makeTempDir(t);
+  const node = new FakeLnd({
+    chainBalance: 1_000_000,
+    channels: [{ id: T1, partnerPublicKey: "02" + "a1".repeat(32), capacity: 2_000_000, localBalance: 900_000, transactionId: "a1".repeat(32), transactionVout: 0 }],
+  });
+  const gone = "850009x1x0";
+  writeFileSync(join(dir, "rebalances.json"), JSON.stringify([record(3, 25, { paymentId: hash(31), targetId: gone, targetAlias: "old-peer" })]));
+  const payments = [selfPay(node, 1, 30, { channel: T1 }), selfPay(node, 3, 25, { id: hash(31), channel: gone })];
+  const { api } = await ledgerApi(t, { payments, dir, node });
+  const c = (await api.request("GET", "/rebalance/costs?days=30")).body;
+  const by = Object.fromEntries(c.perChannel.map((x: { channelId: string; alias?: string; status?: string }) => [x.channelId, [x.alias, x.status]]));
+  assert.equal(by[T1][1], "open");
+  assert.ok(by[T1][0] && by[T1][0] !== T1, `the open channel carries its peer's alias: ${JSON.stringify(by[T1])}`);
+  assert.deepEqual(by[gone], ["old-peer", "closed"]);
+});
+
+test("P&L shows the routing fees of the Lightning payments this node sent — apart, like the other on-chain fees, and never the ones already counted (a Magma purchase, a service fee)", async (t) => {
+  const dir = makeTempDir(t);
+  const node = new FakeLnd({ chainBalance: 1_000_000 });
+  const bought = hash(41);
+  const fee = hash(42);
+  // A purchase whose invoice was paid with a 12 sat routing fee, and a
+  // service fee paid with a 2 sat one: P&L counts both under their own cost.
+  writeFileSync(
+    join(dir, "magma-purchases.json"),
+    JSON.stringify([
+      {
+        orderId: "buy-1", createdAt: new Date(Date.now() - 2 * DAY).toISOString(), updatedAt: new Date().toISOString(), offerId: null,
+        sellerPubkey: "02" + "f6".repeat(32), sizeSats: 2_000_000, feeSats: 9_000, paymentRequest: "lnbc1", paymentHash: bought,
+        payee: "02" + "f6".repeat(32), expiresAt: new Date().toISOString(), leaseBlocks: 4_320, feeRateCapPpm: null, baseFeeCapSats: null,
+        usdCents: null, state: "channel_open", routingFeeSats: 12, paidAt: new Date(Date.now() - 2 * DAY).toISOString(),
+        orderStatus: "VALID_CHANNEL_OPENING", channelId: null,
+      } satisfies MagmaPurchase,
+    ]),
+  );
+  const paidFee: ServiceFeeEntry = {
+    key: "magma:sale-1", source: "magma", orderId: "sale-1", earnedSats: 10_000, bps: 100, feeSats: 100, createdAt: new Date().toISOString(),
+    state: "paid", attempts: 1, nextAttemptAt: new Date().toISOString(), paymentHash: fee, paidAt: new Date(Date.now() - DAY).toISOString(), paidSats: 100, routingFeeSats: 2,
+  };
+  writeFileSync(join(dir, "service-fees.json"), JSON.stringify([paidFee]));
+  const other = "02" + "e5".repeat(32);
+  const payments = [
+    paymentRpc({ at: Date.now() - DAY, tokens: 5_000, feeMsat: 4_000, destination: other }),
+    paymentRpc({ at: Date.now() - 3 * DAY, tokens: 50_000, feeMsat: 7_500, destination: other }),
+    paymentRpc({ id: bought, at: Date.now() - 2 * DAY, tokens: 9_000, feeMsat: 12_000, destination: "02" + "f6".repeat(32) }),
+    paymentRpc({ id: fee, at: Date.now() - DAY, tokens: 100, feeMsat: 2_000, destination: other }),
+    // A rebalance is a rebalance, never a "Lightning payment sent".
+    selfPay(node, 1, 30),
+    // Older than the window.
+    paymentRpc({ at: Date.now() - 40 * DAY, tokens: 1_000, feeMsat: 9_000, destination: other }),
+  ];
+  const { api } = await ledgerApi(t, { payments, dir, node });
+  const p = (await api.request("GET", "/pnl?days=30")).body;
+  // Before: shown nowhere.
+  assert.deepEqual([p.lightningPaymentFeesSats, p.lightningPaymentCount], [12, 2], "4 + 7.5 sat: the purchase, the service fee and the rebalance left out");
+  assert.equal(p.inboundPurchaseCostSats, 9_012, "the purchase's routing fee stays in its own line");
+  assert.equal(p.rebalanceCostSats, 30);
+  // Not counted in net: like the other on-chain fees, a cost of spending.
+  assert.equal(p.netProfitSats, p.routingRevenueSats + p.magmaRevenueSats - p.totalCostSats);
+  assert.equal(p.totalCostSats, p.channelOpenCostSats + p.channelCloseCostSats + p.rebalanceCostSats + p.inboundPurchaseCostSats + p.serviceFeePaidSats);
 });

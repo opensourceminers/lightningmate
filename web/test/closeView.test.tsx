@@ -60,6 +60,10 @@ test("leased channels are tagged with what they are and how long the lease has l
   assert.equal(leaseTag(lease({ kind: "lsps1_sale", blocksLeft: 30 })), "LSP lease · ~5 h left");
   assert.equal(leaseTag(lease({ kind: "magma_purchase" })), "bought on Magma · ~41 d left");
   assert.equal(leaseTag(lease({ untilHeight: null, blocksLeft: null })), "Magma lease · funding not confirmed yet");
+  // Review of P4: a confirmed lease (its end known) whose time left is unknown
+  // only because the block height wasn't read is no unconfirmed funding.
+  assert.equal(leaseTag(lease({ untilHeight: 900_000, blocksLeft: null })), "Magma lease · time left unknown (block height not read)");
+  assert.match(leaseBreakWarning(lease({ untilHeight: 900_000, blocksLeft: null })) ?? "", /until block 900,000 \(time left unknown \(block height not read\)\)/);
   assert.equal(leaseTag(lease({ running: false, blocksLeft: -10 })), null);
   assert.equal(leaseTag(lease({ kind: "magma_purchase", running: false })), "bought on Magma · lease over");
   assert.equal(leaseTag(null), null);

@@ -415,3 +415,58 @@ test("a channel holding a refill's price (recovering its cost) is no source — 
   refilled.feeById.set(id, fee);
   assert.deepEqual(pool(refilled), []);
 });
+
+// ── what a turned-down refill would take (review of P3, issue 2) ─────────────
+// The line asked for outflow and net drain the channel already had: it
+// ignored the payback limit and how far the channel was from its target
+// share. The two cases are the review's probes, A and A2.
+
+test("a refill the payback limit turns down says so — the revenue a day or the route it would take — not outflow the channel already has (probe A)", async () => {
+  // A 5M channel at 15 % local, 1.2M out in 14 days at 400 ppm (480 sat in 30
+  // days: ~16 sat a day), a 300 ppm route.
+  const n = nodeOf([
+    { n: 1, local: 750_000, feePpm: 400, f14: flow(1_200_000, 0, 20, 480), f30: flow(1_200_000, 0, 20, 480) },
+    { n: 2, local: 4_500_000, feePpm: 100, f14: NO_FLOW, f30: flow(0, 50_000, 1, 0) },
+  ]);
+  const plan = await planRebalances(
+    { channels: n.channels, fees: n.fees, contextOf: (id) => n.contexts.get(id), cfg: REBAL_REC_DEFAULTS, overrides: {}, soldLeases: [], currentBlock: HEIGHT },
+    routeAt(300),
+  );
+  const r = plan.recommendations.find((x) => x.channelId === "850000x1x0") as RebalanceRecommendation;
+  assert.equal(r.state, "route_found_too_expensive");
+  assert.deepEqual([r.recommendedAmount, r.estimatedRouteFeeSats, r.maxCostSatsByPayback], [1_250_000, 375, 336]);
+  const line = r.reasons[r.reasons.length - 1];
+  // Before: "… it needs a refill of ≥ 1M: ≥ 1M of 14-day outflow (now 1.2M)
+  // and ≥ 667k of 14-day net drain (now 1.2M)" — both met already.
+  assert.equal(
+    line,
+    "to clear the 100 sat minimum at 400 ppm earnings and a ~300 ppm route a refill nets it from 1M up; the 1.25M refill planned costs ~375 sat, " +
+      "more than 21 days of this channel's revenue pay back (~16 sat a day now, so at most 336 sat) — that takes ≥ 18 sat a day of revenue, or a route of ≤ 268 ppm",
+  );
+  assert.doesNotMatch(line, /outflow|net drain/);
+});
+
+test("a channel only a little short of its target share says so — and what a refill that size would have to earn — not outflow it already has (probe A2)", async () => {
+  // A 2M channel at 28 % local: 440k short of its 50 % share. 1M out, 0 in, a
+  // 200 ppm route: a refill nets 100 sat only from 500k up.
+  const n = nodeOf([
+    { n: 1, capacity: 2_000_000, local: 560_000, feePpm: 400, f14: flow(1_000_000, 0, 20, 400), f30: flow(2_000_000, 0, 40, 800) },
+    { n: 2, local: 4_500_000, feePpm: 100 },
+  ]);
+  const plan = await planRebalances(
+    { channels: n.channels, fees: n.fees, contextOf: (id) => n.contexts.get(id), cfg: REBAL_REC_DEFAULTS, overrides: {}, soldLeases: [], currentBlock: HEIGHT },
+    routeAt(200),
+  );
+  const r = plan.recommendations.find((x) => x.channelId === "850000x1x0") as RebalanceRecommendation;
+  assert.equal(r.state, "unprofitable_skip");
+  assert.equal(r.amountToReachTargetLocalRatio, 440_000);
+  const line = r.reasons[r.reasons.length - 1];
+  // Before: "… it needs a refill of ≥ 500k: ≥ 500k of 14-day outflow (now 1M)
+  // and ≥ 333k of 14-day net drain (now 1M)" — a refill the channel can't take.
+  assert.equal(
+    line,
+    "to clear the 100 sat minimum at a ~200 ppm route: the channel is only 440k short of its target share (50%), " +
+      "and a refill that size nets 100 sat only with earnings of ≥ 428 ppm (now 400 ppm) or a route of ≤ 172 ppm",
+  );
+  assert.doesNotMatch(line, /outflow|net drain/);
+});

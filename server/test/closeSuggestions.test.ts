@@ -18,7 +18,7 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { rankCloseCandidates, type CloseInput } from "../src/services/suggestRecommend.js";
-import { channelLeases, leaseProtection, standardChannelId, type ChannelLease } from "../src/services/leases.js";
+import { channelLeases, leaseLeftText, leaseProtection, standardChannelId, type ChannelLease } from "../src/services/leases.js";
 import { ChannelUptime, MAX_GAP_MS, OFFLINE_CLOSE_SIGNAL_HOURS, type OfflineInfo } from "../src/services/channelUptime.js";
 import type { ChannelView } from "../src/services/channels.js";
 import type { FeeRecommendation } from "../src/services/feeRecommend.js";
@@ -244,6 +244,30 @@ test("two purchases of one seller and size, neither named by Amboss yet: each cl
     assert.deepEqual([l.get(C1.id)?.orderId, l.get(C2.id)?.orderId], ["P1-older", "P2-newer"], purchases.map((p) => p.orderId).join(","));
     assert.equal(l.get(C1.id)?.untilHeight, HEIGHT - 2_736 + 25_920 + 144, "C1 keeps P1's 180-day lease");
   }
+});
+
+// Review of P4: a lease whose funding HAS confirmed (its end is known) read
+// "funding not confirmed yet" whenever only LND's block height was unknown.
+test("a confirmed lease whose time left is unknown (no block height) says that — not 'funding not confirmed yet'", () => {
+  const sale = chan(1, { ageBlocks: 5_000 });
+  const opening = chan(4, { pending: true });
+  const sources = {
+    soldLeases: [
+      { fundingOutpoint: `${TX(1)}:0`, source: "magma" as const, orderId: "magma-order", leaseBlocks: 8_640 },
+      { fundingOutpoint: `${TX(4)}:0`, source: "magma" as const, orderId: "fresh-sale", leaseBlocks: 4_320 },
+    ],
+    purchases: [],
+  };
+  // currentHeight 0: LND didn't say (the API's currentHeight() fallback).
+  const leases = channelLeases([sale, opening], sources, 0);
+  const confirmed = leases.get(sale.id) as ChannelLease;
+  assert.deepEqual([confirmed.untilHeight, confirmed.blocksLeft, confirmed.running], [855_000 + 8_640 + 144, null, true]);
+  const text = leaseProtection(confirmed);
+  assert.doesNotMatch(text, /funding not confirmed/, text);
+  assert.match(text, /leased until block 863,784 \(time left unknown: the current block height couldn't be read\)/);
+  // A channel still opening: its funding really hasn't confirmed.
+  assert.match(leaseProtection(leases.get(opening.id) as ChannelLease), /until its funding confirms and the lease has run/);
+  assert.equal(leaseLeftText({ blocksLeft: null, untilHeight: null }), "funding not confirmed yet");
 });
 
 // Review of P4: BOUGHT_STATES left out "paying" — a hold-invoice purchase

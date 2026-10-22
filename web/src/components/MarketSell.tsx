@@ -1,6 +1,16 @@
 import { useEffect, useState } from "react";
 import { goTo } from "../nav";
 import { api } from "../api";
+import {
+  EMPTY_REPORT_VIEW,
+  forgetMagmaReport,
+  reportErrorText,
+  reportLoaded,
+  reportRefreshFailed,
+  sharedMagmaReport,
+  type ReportView,
+} from "../magmaReport";
+import { useVisibleInterval } from "../usePolledData";
 import type {
   AmbossKeyCheck,
   AutopilotConfig,
@@ -15,6 +25,7 @@ import type {
 } from "../types";
 import { sats, satsCompact } from "../format";
 import { EmptyState } from "./Skeleton";
+import { InfoTip } from "./InfoTip";
 import { useUi } from "./Overlay";
 import { failedOfferWrite } from "../statusNotes";
 import { EligibilityCard, HowAmbossPicks, OfferPromiseNote, SellDiagnosticsCard } from "./MagmaSellInfo";
@@ -80,7 +91,14 @@ export function MarketSell() {
   const [error, setError] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
-  const [rec, setRec] = useState<MagmaV2Report | null>(null);
+  // The report, when this view got it (its pending-orders banner is as of
+  // then), and why the last refresh failed — a failure keeps the report it
+  // had (the engine fails rather than read 0 sat on chain).
+  const [recView, setRecView] = useState<ReportView>(EMPTY_REPORT_VIEW);
+  const rec = recView.report;
+  const recAt = recView.at;
+  const takeReport = (r: MagmaV2Report) => setRecView(reportLoaded(r));
+  const reportFailed = (e: unknown) => setRecView((v) => reportRefreshFailed(v, e));
   const [elig, setElig] = useState<Eligibility | null>(null);
   const [eligBusy, setEligBusy] = useState(false);
   const [diag, setDiag] = useState<SellDiagnostics | null>(null);
@@ -110,7 +128,7 @@ export function MarketSell() {
     }
     // The market picture and the selling check need no key: the user deciding
     // whether to sell at all — or whose key just expired — needs them most.
-    api.magmaRecommendations().then(setRec).catch(() => setRec(null));
+    sharedMagmaReport().then(takeReport).catch(reportFailed);
     loadEligibility();
     api.sellDiagnostics().then(setDiag).catch(() => setDiag(null));
     api
@@ -133,6 +151,14 @@ export function MarketSell() {
   useEffect(() => {
     void load();
   }, []);
+  // The report again every minute while the page is visible: its "orders
+  // waiting on you" banner went stale — the tab never refreshed it.
+  useVisibleInterval(() => void sharedMagmaReport().then(takeReport).catch(reportFailed), 60_000);
+  /** After a write here: the next read is fresh, not the shared copy. */
+  const reload = async () => {
+    forgetMagmaReport();
+    await load();
+  };
 
   const defaults = offerDraftDefaults(rec, cfg);
   const form = draft ?? defaults;
@@ -218,7 +244,7 @@ export function MarketSell() {
       setEditingId(null);
       setDraft(null);
       setPricedFor(null);
-      await load();
+      await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -240,7 +266,7 @@ export function MarketSell() {
       // By state, not by flip: if the autopilot changed it since this page
       // loaded, a flip would do the opposite of what the button says.
       await api.ambossToggleOffer(o.id, o.status === "ENABLED" ? "DISABLED" : "ENABLED");
-      await load();
+      await reload();
     } catch (e) {
       ui.toast(e instanceof Error ? e.message : String(e), "error");
     } finally {
@@ -252,7 +278,7 @@ export function MarketSell() {
     try {
       await api.ambossOfferAutomation(o.id, managed);
       ui.toast(managed ? "The autopilot manages this offer again from its next run." : "Taken over: the autopilot leaves this offer's terms to you.", "success");
-      await load();
+      await reload();
     } catch (e) {
       ui.toast(e instanceof Error ? e.message : String(e), "error");
     }
@@ -328,6 +354,7 @@ export function MarketSell() {
 
       <EligibilityCard e={elig} busy={eligBusy} onRefresh={() => loadEligibility(true)} />
       <SellDiagnosticsCard d={diag} onFix={(tab, sub) => goTo(tab, sub)} />
+      {recView.error ? <p className="banner error">{reportErrorText(recView)}</p> : null}
       <HowAmbossPicks usdOrderSat={elig?.usdOrders?.minOrderSat ?? null} usdAtOwnPriceSat={elig?.usdOrders?.atOwnPriceSat ?? null} feeTiers={elig?.feeTiers ?? null} />
 
       {rec && summary ? (
@@ -345,6 +372,7 @@ export function MarketSell() {
             >
               {summary.label}
             </span>
+            <InfoTip text="Whether a sale at today's prices would beat routing this capital — per sale, not whether a sale will come." />
             <span className="muted">{summary.line}</span>
           </div>
           {rec.sell.reasons.length > 1 || rec.sell.warnings.length ? (
@@ -377,6 +405,7 @@ export function MarketSell() {
               </>
             ) : null}
             standard lease <b>{rec.sell.standardLeaseBlocks} blocks</b> · ~{rec.sell.onchainOpenCostSat} sat to open on-chain
+            {recAt ? <> · as of {new Date(recAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</> : null}
             {rec.sell.pricingMode === "auto" ? (
               <>
                 {" "}
@@ -404,6 +433,7 @@ export function MarketSell() {
                 <span className={`magma-verdict ${evPerYear !== null && evPerYear > 0 ? "win" : "lose"}`} title="Expected sales a year (offers like yours) × what one sale nets">
                   {evPerYear === null ? "per sale only" : `expected ≈ ${sats(evPerYear)} sat/yr`}
                 </span>
+                <InfoTip text="Expected sales a year (offers like yours, from the selling check) × what one sale nets. 'Per sale only': the check has no estimate." />
               </div>
 
               <div className="magma-price-card">
@@ -528,9 +558,11 @@ export function MarketSell() {
       <h3 className="sub">{editingId ? "Edit your offer" : offers.length ? "New offer (you have one already — this lists another)" : "New offer"}</h3>
       <div className="policy-controls">
         {FIELDS.map((f) => (
-          <label key={f.key} className="policy-field" title={f.hint}>
+          <label key={f.key} className="policy-field">
             <span>{f.label}</span>
             <input type="number" min={0} value={form[f.key]} onChange={(e) => setNum(f.key, Number(e.target.value))} />
+            {/* On the page, not only in a tooltip (touch screens have none). */}
+            <span className="field-hint">{f.hint}</span>
           </label>
         ))}
         <button className="primary-btn" disabled={busy} onClick={() => void submit()}>

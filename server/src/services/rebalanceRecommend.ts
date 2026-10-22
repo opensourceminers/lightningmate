@@ -574,11 +574,40 @@ function rejection(p: Probed, rec: RebalanceRecommendation): string {
 }
 
 /**
+ * The largest refill a channel can take now, and what sets it: a share of its
+ * capacity (maxCapacityRefillRatio), the operator's max per move, or how far
+ * it is from its target share — a refill never fills a channel past that.
+ */
+function refillCeiling(rec: RebalanceRecommendation, cfg: RebalanceRecConfig): { sats: number; why: string } {
+  const share = Math.round(rec.capacity * cfg.maxCapacityRefillRatio);
+  const max = Math.round(cfg.maxRebalanceAmountPerChannel);
+  // (A recommendation always carries it; a hand-made one may not.)
+  const short = Number.isFinite(rec.amountToReachTargetLocalRatio) ? Math.round(rec.amountToReachTargetLocalRatio) : Infinity;
+  const sats = Math.min(share, max, short);
+  if (sats === short) return { sats, why: `the channel is only ${k(sats)} short of its target share (${pct(rec.targetLocalRatio)})` };
+  if (sats === max) return { sats, why: "your max refill per move" };
+  return { sats, why: `${pct(cfg.maxCapacityRefillRatio)} of its capacity` };
+}
+
+/**
  * What a drained channel would need for a refill to clear the gate (review
  * a2, inert-settings-and-presets: "auto-rebalance on, nothing happens" must be
  * explained, not look broken). From its earnings (r), a route cost (c — the
  * probed one, else the market's replacement cost), the largest refill the
- * caps allow and the minimum net profit.
+ * channel can take now (refillCeiling), the payback limit and the minimum net
+ * profit.
+ *
+ * It names the limit that binds (review of P3: the line ignored the payback
+ * limit and how far the channel was from its target share, and asked for
+ * outflow and net drain the channel already had — "≥ 1M of 14-day outflow
+ * (now 1.2M)" for a refill the payback limit had turned down):
+ *  - the most the channel takes is below the smallest refill that nets the
+ *    minimum: what a refill of that size would have to earn, or cost;
+ *  - the fee of the planned refill (or of the smallest that nets the
+ *    minimum) can't be earned back within maxPaybackDays of the channel's
+ *    revenue: the revenue a day, or the route, that would take;
+ *  - else the demand it lacks — outflow or net drain, each only when it is
+ *    not met yet.
  */
 export function wouldTake(
   rec: RebalanceRecommendation,
@@ -587,24 +616,74 @@ export function wouldTake(
 ): string | null {
   const r = rec.expectedRevenuePpm ?? rec.revenuePpm30d;
   const minNet = cfg.minExpectedNetProfitSats;
-  const largest = Math.round(Math.min(rec.capacity * cfg.maxCapacityRefillRatio, cfg.maxRebalanceAmountPerChannel));
   if (!r || r <= 0) return `to clear the gate it first needs routed revenue (no outflow priced in 30 d)`;
+  const ceiling = refillCeiling(rec, cfg);
+  const largest = ceiling.sats;
+  if (!(largest > 0)) return null;
   const c = rec.estimatedRouteCostPpm ?? replacementCostPpm;
   const head = `to clear the ${minNet} sat minimum`;
+  const routedOut = rec.routedOut14d ?? 0;
+  const drain = Math.max(0, routedOut - (rec.routedIn14d ?? 0));
+  /** The demand a refill of `size` lacks: its earnings are capped at the
+   *  14-day outflow, and the planner sizes a refill by the net drain. */
+  const unmetDemand = (size: number): string[] => {
+    const need = Math.ceil(size / cfg.demandCoverageMultiplier);
+    return [
+      ...(routedOut < size ? [`≥ ${k(size)} of 14-day outflow (now ${k(routedOut)})`] : []),
+      ...(drain < need ? [`≥ ${k(need)} of 14-day net drain (now ${k(drain)})`] : []),
+    ];
+  };
+  const withDemand = (text: string, size: number): string => {
+    const unmet = unmetDemand(size);
+    return unmet.length ? `${text}; it also needs ${unmet.join(" and ")}` : text;
+  };
   if (c == null) {
     const margin = Math.ceil((minNet * 1_000_000) / largest);
-    return `${head}, even a ${k(largest)} refill (the most this channel takes) needs a route at least ${margin} ppm below its ${r} ppm earnings, and at most ${Math.round(r * cfg.profitShare)} ppm`;
+    return `${head}, even a ${k(largest)} refill (the most it takes now: ${ceiling.why}) needs a route at least ${margin} ppm below its ${r} ppm earnings, and at most ${Math.round(r * cfg.profitShare)} ppm`;
   }
-  const needPpm = Math.max(Math.ceil(c / cfg.profitShare), Math.ceil(c + (minNet * 1_000_000) / largest));
-  if (c > r * cfg.profitShare || r - c <= 0 || Math.ceil((minNet * 1_000_000) / (r - c)) > largest) {
+  const smallest = r - c > 0 ? Math.ceil((minNet * 1_000_000) / (r - c)) : Infinity;
+  if (c > r * cfg.profitShare || smallest > largest) {
+    const needPpm = Math.max(Math.ceil(c / cfg.profitShare), Math.ceil(c + (minNet * 1_000_000) / largest));
+    const maxRoute = Math.min(Math.floor(r * cfg.profitShare), Math.floor(r - (minNet * 1_000_000) / largest));
+    if (ceiling.why.startsWith("the channel is only") && c <= r * cfg.profitShare) {
+      // A bigger refill would clear it — but the channel can't take one.
+      return withDemand(
+        `${head} at a ~${c} ppm route: ${ceiling.why}, and a refill that size nets ${minNet} sat only with earnings of ≥ ${needPpm} ppm (now ${r} ppm)` +
+          (maxRoute > 0 ? ` or a route of ≤ ${maxRoute} ppm` : ""),
+        largest,
+      );
+    }
     return `${head} at a ~${c} ppm route it needs earnings of ≥ ${needPpm} ppm (now ${r} ppm) on a refill of up to ${k(largest)}`;
   }
-  const smallest = Math.ceil((minNet * 1_000_000) / (r - c));
-  const drain = Math.max(0, rec.routedOut14d - rec.routedIn14d);
-  return (
-    `${head} at ${r} ppm earnings and a ~${c} ppm route it needs a refill of ≥ ${k(smallest)}: ` +
-    `≥ ${k(smallest)} of 14-day outflow (now ${k(rec.routedOut14d)}) and ≥ ${k(Math.ceil(smallest / cfg.demandCoverageMultiplier))} of 14-day net drain (now ${k(drain)})`
-  );
+  // The payback limit: a refill's fee must be earned back within
+  // maxPaybackDays of the channel's routing revenue.
+  const P = rec.maxCostSatsByPayback;
+  const days = rec.maxPaybackDays ?? cfg.maxPaybackDays;
+  const perDay = rec.avgDailyRevenueSats ?? 0;
+  /** "costs ~F sat, more than N days … pay back (…) — that takes …": a
+   *  refill of `size` whose fee the payback limit (P) can't cover. */
+  const paybackFails = (size: number, feeSats: number, limit: number): string =>
+    `costs ~${feeSats.toLocaleString("en-US")} sat, more than ${days} days of this channel's revenue pay back ` +
+    `(~${perDay.toLocaleString("en-US")} sat a day now, so at most ${limit.toLocaleString("en-US")} sat) — ` +
+    `that takes ≥ ${Math.ceil(feeSats / days).toLocaleString("en-US")} sat a day of revenue, or a route of ≤ ${Math.floor((limit * 1_000_000) / size)} ppm`;
+  const planned = rec.recommendedAmount;
+  const plannedFee = rec.estimatedRouteFeeSats;
+  if (P != null && planned && plannedFee != null && plannedFee > P) {
+    return withDemand(
+      `${head} at ${r} ppm earnings and a ~${c} ppm route a refill nets it from ${k(smallest)} up; the ${k(planned)} refill planned ${paybackFails(planned, plannedFee, P)}`,
+      smallest,
+    );
+  }
+  const smallestFee = Math.ceil((smallest * c) / 1_000_000);
+  if (P != null && smallestFee > P) {
+    return withDemand(`${head} at ${r} ppm earnings and a ~${c} ppm route it needs a refill of ≥ ${k(smallest)}, which ${paybackFails(smallest, smallestFee, P)}`, smallest);
+  }
+  const unmet = unmetDemand(smallest);
+  const base = `${head} at ${r} ppm earnings and a ~${c} ppm route it needs a refill of ≥ ${k(smallest)}`;
+  if (unmet.length) return `${base}: ${unmet.join(" and ")}`;
+  const spare = rec.sourceCandidates?.[0]?.spareSats;
+  if (spare !== undefined && spare < smallest) return `${base} — more than the source can spare now (${k(spare)})`;
+  return base;
 }
 
 /** What planRebalances works from: one fee engine run, and the node. */

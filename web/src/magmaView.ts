@@ -72,6 +72,50 @@ export function disableSellingMessage(enabledOffers: number): string {
   );
 }
 
+/** Amboss's order statuses in plain words, as the side this node is on sees
+ *  them (review a6-ux:nav-a11y-copy: Market → Orders showed the raw enums,
+ *  "WAITING_FOR_SELLER_APPROVAL"). */
+const SELL_STATUS: Record<string, string> = {
+  WAITING_FOR_SELLER_APPROVAL: "Waiting for you to accept",
+  WAITING_FOR_BUYER_PAYMENT: "Accepted — waiting for the buyer to pay",
+  WAITING_FOR_CHANNEL_OPEN: "Paid — waiting for you to open the channel",
+  SELLER_SENT_TRANSACTION: "Channel opened — reported to Amboss",
+  SELLER_OPENED_CHANNEL: "Channel opened",
+  WAITING_FOR_ON_CHAIN_CONFIRMATION: "Channel confirming on-chain",
+  ON_CHAIN_CONFIRMATION: "Channel confirming on-chain",
+  VALID_CHANNEL_OPENING: "Channel confirmed — lease running",
+  CHANNEL_MONITORING_FINISHED: "Lease over",
+  SELLER_REJECTED: "Rejected (by you or the autopilot)",
+  SELLER_FAILED_TO_REACT: "Expired — not accepted or rejected in time",
+  SELLER_FAILED_TO_OPEN_CHANNEL: "Failed — the channel wasn't opened in time",
+  SELLER_FAILED_TO_SEND_SWAP: "Failed — the swap wasn't sent",
+  BUYER_FAILED_TO_PAY: "The buyer didn't pay",
+  BUYER_REJECTED: "Cancelled by the buyer",
+  INVALID_CHANNEL_OPENING: "The channel didn't match the order — the buyer was refunded",
+  ADMIN_CLOSED: "Closed by Amboss",
+};
+const BUY_STATUS: Record<string, string> = {
+  WAITING_FOR_SELLER_APPROVAL: "Waiting for the seller to accept",
+  WAITING_FOR_BUYER_PAYMENT: "Waiting for your payment",
+  WAITING_FOR_CHANNEL_OPEN: "Paid — waiting for the seller to open the channel",
+  SELLER_SENT_TRANSACTION: "The seller opened the channel",
+  SELLER_OPENED_CHANNEL: "The seller opened the channel",
+  SELLER_REJECTED: "Rejected by the seller",
+  SELLER_FAILED_TO_REACT: "Expired — the seller didn't answer in time",
+  SELLER_FAILED_TO_OPEN_CHANNEL: "Failed — the seller didn't open the channel",
+  BUYER_FAILED_TO_PAY: "Not paid in time",
+  BUYER_REJECTED: "Cancelled by you",
+};
+
+/** An order's status in plain words, for the side this node is on. */
+export function orderStatusLabel(status: string, side: "SELL" | "BUY" | string): string {
+  const words = (side === "BUY" ? BUY_STATUS[status] : undefined) ?? SELL_STATUS[status];
+  if (words) return words;
+  // A status this version doesn't know yet: readable all the same.
+  const plain = status.toLowerCase().replace(/_/g, " ");
+  return plain.charAt(0).toUpperCase() + plain.slice(1);
+}
+
 /** This node's own record of an order, in a few words. */
 export function localLabel(local: Pick<MagmaOrderLocal, "phase" | "booked" | "external">): string {
   if (local.external === "accepted_elsewhere") return "accepted outside LightningMate";

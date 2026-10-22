@@ -236,12 +236,18 @@ export async function maxPendingByOutpoint(lnd: AuthenticatedLnd): Promise<Map<s
  * the autopilot's and a manual apply alike — is clamped to the promise of the
  * channel it targets while its lease runs; the result says so. This is the
  * last gate before LND, so no path can raise a sold channel past its promise.
+ *
+ * `shouldStop`: asked before each channel's write — once it says yes, the
+ * items not written yet are left out of the result (nothing was sent for
+ * them). The fee autopilot's batch stops so when fee automation is switched
+ * off — or all automation paused — while it writes (review of P7).
  */
 export async function applyFees(
   readLnd: AuthenticatedLnd,
   writeLnd: AuthenticatedLnd,
   items: FeeApplyItem[],
   leaseCaps: readonly LeaseCap[] = [],
+  opts: { shouldStop?: () => boolean } = {},
 ): Promise<FeeApplyResult[]> {
   const mine = await getOwnPubkey(readLnd);
   const results: FeeApplyResult[] = [];
@@ -254,6 +260,7 @@ export async function applyFees(
   const maxPending = await maxPendingByOutpoint(readLnd);
 
   for (const asked of items) {
+    if (opts.shouldStop?.()) break;
     const cap = leaseCaps.length
       ? activeCap(leaseCaps, { outpoint: `${asked.transactionId}:${asked.transactionVout}`, channelId: asked.id }, height)
       : null;
@@ -286,6 +293,8 @@ export async function applyFees(
 
       const limit = maxPending.get(`${item.transactionId}:${item.transactionVout}`);
       const echoMaxHtlc = !!current.max_htlc_mtokens && (limit === undefined || Number(current.max_htlc_mtokens) <= limit);
+      // Again right before the write: the policy read above took a moment.
+      if (opts.shouldStop?.()) break;
       const res = await updateRoutingFees({
         lnd: writeLnd,
         transaction_id: item.transactionId,

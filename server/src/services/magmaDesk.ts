@@ -23,7 +23,7 @@ import {
   type SaleOrderDetail,
   type SalesFilter,
 } from "./magmaApi.js";
-import { MagmaJournal, TERMINAL_PHASES, type MagmaJournalEntry, type MagmaPhase } from "./magmaJournal.js";
+import { MagmaJournal, TERMINAL_PHASES, type MagmaJournalEntry, type MagmaPhase, type RefusalKind } from "./magmaJournal.js";
 import {
   HODL_CANCEL_MARGIN_BLOCKS,
   cancelHodl,
@@ -125,6 +125,10 @@ const OPEN_RETRY_WINDOW_MS = 30 * 60_000;
 const MAX_ACCEPT_ATTEMPTS = 3;
 /** Reject (rather than wait) once the approval deadline is this close. */
 const REJECT_MARGIN_MS = 2 * 60_000;
+/** An order the lane was deciding when selling was switched off (or all
+ *  automation paused): nothing was promised — it is the operator's now. */
+export const SELLING_OFF_SKIP =
+  "Liquidity provision was switched off before it was accepted — nothing was promised; accept or reject it on Market → Orders";
 /** An order with nothing of ours tied to it that Amboss neither lists nor
  *  shows any more ends here this long after its approval deadline (Amboss has
  *  ended it by then; the slack covers clocks that differ). */
@@ -245,6 +249,33 @@ export interface MagmaOrderLocal {
   booked: boolean | null;
   /** Ended here without LightningMate taking it on (see the journal). */
   external: MagmaJournalEntry["external"] | null;
+}
+
+export type { RefusalKind } from "./magmaJournal.js";
+
+/** An order the lane turned down, for the alert and the Overview digest. */
+export interface MagmaRefusal {
+  orderId: string;
+  sizeSats: number;
+  reason: string;
+  /** What it was refused for: only "cap" and "capital" refusals are helped
+   *  by raising the caps or funding the wallet. */
+  kind: RefusalKind;
+  at: string;
+}
+
+/** Why the caps or the wallet can't take an order (capitalFor). */
+interface Lacking {
+  kind: "cap" | "capital";
+  reason: string;
+}
+
+/** The kind of a refusal recorded before the kind was kept — from the words
+ *  capitalFor uses (a refusal of the last two days still raises its alert). */
+export function refusalKindOf(reason: string): RefusalKind {
+  if (/^(above your max channel size|deploy cap reached)/.test(reason)) return "cap";
+  if (/^not enough on-chain capital/.test(reason)) return "capital";
+  return "other";
 }
 
 export interface LaneStatus {
@@ -497,7 +528,7 @@ export class MagmaDesk {
    * left no trace when nothing else happened in the same run: no alert, no
    * Overview line — while the operator assumed the autopilot had it handled.
    */
-  refusals(nowMs = Date.now()): { orderId: string; sizeSats: number; reason: string; at: string }[] {
+  refusals(nowMs = Date.now()): MagmaRefusal[] {
     return this.journal
       .all()
       .filter(
@@ -508,7 +539,10 @@ export class MagmaDesk {
           !e.alertAckAt &&
           nowMs - Date.parse(e.decision.at) <= 48 * 3_600_000,
       )
-      .map((e) => ({ orderId: e.orderId, sizeSats: e.sizeSats, reason: e.reason ?? e.decision?.reason ?? "rejected", at: e.decision!.at }));
+      .map((e) => {
+        const reason = e.reason ?? e.decision?.reason ?? "rejected";
+        return { orderId: e.orderId, sizeSats: e.sizeSats, reason, kind: e.refusalKind ?? refusalKindOf(reason), at: e.decision!.at };
+      });
   }
 
   /** The operator read the alert about a turned-down order. */
@@ -1204,10 +1238,10 @@ export class MagmaDesk {
        *  it is not asked again (see refreshDeployedFor). */
       pass?: LanePass | null;
     },
-  ): Promise<string | null> {
+  ): Promise<Lacking | null> {
     const cfg = this.deps.config();
     if (opts.caps && sizeSats > cfg.sellMaxChannelSats) {
-      return `above your max channel size (${fmt(sizeSats)} > ${fmt(cfg.sellMaxChannelSats)} sat)`;
+      return { kind: "cap", reason: `above your max channel size (${fmt(sizeSats)} > ${fmt(cfg.sellMaxChannelSats)} sat)` };
     }
     // The wallet before the deploy cap: LND is local and quick, and an order
     // the wallet can't fund is turned down at once — whatever Amboss's
@@ -1216,16 +1250,18 @@ export class MagmaDesk {
     if (sp.spendableSat < sizeSats) {
       const n = sp.reserve.pendingOpens;
       const fees = n > 0 ? `the funding fees of this and ${n} promised open${n === 1 ? "" : "s"}` : "the funding fee";
-      return (
-        `not enough on-chain capital: ${fmt(sp.spendableSat)} sat spendable after a ${fmt(sp.reserve.totalSat)} sat ` +
-        `reserve (incl. LND's anchor reserve and ${fees}) and ${fmt(sp.reservedSat)} sat promised to other orders`
-      );
+      return {
+        kind: "capital",
+        reason:
+          `not enough on-chain capital: ${fmt(sp.spendableSat)} sat spendable after a ${fmt(sp.reserve.totalSat)} sat ` +
+          `reserve (incl. LND's anchor reserve and ${fees}) and ${fmt(sp.reservedSat)} sat promised to other orders`,
+      };
     }
     if (opts.caps) {
       if (opts.refresh !== false) await this.refreshDeployedFor(opts.pass ?? null);
       const committed = this.deps.capital.deployedSat() + this.deps.capital.reservedSat(opts.exceptKey);
       if (committed + sizeSats > cfg.sellMaxDeploySats) {
-        return `deploy cap reached (${fmt(committed)} sat already sold or promised, cap ${fmt(cfg.sellMaxDeploySats)} sat)`;
+        return { kind: "cap", reason: `deploy cap reached (${fmt(committed)} sat already sold or promised, cap ${fmt(cfg.sellMaxDeploySats)} sat)` };
       }
     }
     return null;
@@ -1306,7 +1342,7 @@ export class MagmaDesk {
       return [this.skip(entry, "waiting for Amboss to report the order's fee")];
     }
     // Cheap capital check first: no point dialing a buyer we must turn down.
-    let lacking: string | null;
+    let lacking: Lacking | null;
     try {
       lacking = await this.capitalFor(order.sizeSats, { caps: true, exceptKey: `magma:${order.id}`, pass });
     } catch (err) {
@@ -1315,9 +1351,16 @@ export class MagmaDesk {
       if (isQueryRejected(err)) pass.problem ??= queryRejectedText(err);
       return this.undecided(entry, order, capitalCheckFailed(err), pass);
     }
-    if (lacking) return this.rejectOrder(entry, lacking);
+    if (lacking) return this.rejectOrder(entry, lacking.reason, lacking.kind);
     if (!(await this.connectBuyer(order))) return this.rejectOrder(entry, "the buyer's node is unreachable");
     if (this.stopping) return [this.skip(entry, "shutting down")];
+    // Dialing the buyer can take a minute and a half over Tor: Liquidity
+    // provision may have been switched off — or all automation paused —
+    // meanwhile (review of P7: the lane accepted on the switch it read when
+    // the pass began). Then nothing is promised: the order waits for the
+    // operator's decision on Market → Orders. (acceptOrder asks again after
+    // each of its own waits, up to the moment the accept goes out.)
+    if (!this.deps.config().sellEnabled) return [this.skip(entry, SELLING_OFF_SKIP)];
     return this.acceptOrder(entry, order, fee, "autopilot", pass);
   }
 
@@ -1354,18 +1397,31 @@ export class MagmaDesk {
     pass: LanePass | null,
   ): Promise<MagmaSellAction[]> {
     const fail = (error: string): MagmaSellAction => ({ orderId: entry.orderId, action: "accept", sizeSats: entry.sizeSats, ok: false, error });
+    // The lane's accept is selling's: it goes on only while Liquidity
+    // provision is on, asked after every wait and read — so that nothing is
+    // awaited between the last check and the step it guards (review of P7,
+    // round 2: a pause that landed during the capital re-read, or while the
+    // HODL invoice was made, still accepted the order). Switched off, the
+    // order is the operator's: the lane neither accepts nor rejects it. A
+    // click is the operator's own decision.
+    const sellingOff = () => via === "autopilot" && !this.deps.config().sellEnabled;
     const secret = newHodlSecret();
     const step = await this.deps.capital.mutex.run(
       "magma accept",
-      async (): Promise<{ lacking: string } | { unsaved: string } | { unchecked: unknown } | null> => {
+      async (): Promise<{ lacking: Lacking } | { unsaved: string } | { unchecked: unknown } | { off: true } | null> => {
+        // The wait for the mutex can be long (an open broadcasting).
+        if (sellingOff()) return { off: true };
         // The deploy-cap listing was refreshed just before (decide): no slow
         // Amboss call while the on-chain mutex is held.
-        let lacking: string | null;
+        let lacking: Lacking | null;
         try {
           lacking = await this.capitalFor(order.sizeSats, { caps: via === "autopilot", exceptKey: `magma:${entry.orderId}`, refresh: false });
         } catch (err) {
-          return { unchecked: err }; // nothing changed yet
+          return sellingOff() ? { off: true } : { unchecked: err }; // nothing changed yet
         }
+        // The re-read (LND's balance and channels) is awaited: the switch
+        // again, before anything is reserved — or the order turned down.
+        if (sellingOff()) return { off: true };
         if (lacking) return { lacking };
         entry.via = via;
         entry.phase = "accepting";
@@ -1398,6 +1454,7 @@ export class MagmaDesk {
         return null;
       },
     );
+    if (step && "off" in step) return [this.skip(entry, SELLING_OFF_SKIP)];
     if (step && "unchecked" in step) {
       if (via === "manual" || !pass) throw step.unchecked; // the click is told; nothing changed
       return this.undecided(entry, order, capitalCheckFailed(step.unchecked), pass);
@@ -1407,9 +1464,34 @@ export class MagmaDesk {
       this.noteError(entry, reason);
       return via === "autopilot" ? [fail(reason), ...(await this.rejectOrder(entry, reason))] : [fail(reason)];
     }
-    if (step) return via === "autopilot" ? this.rejectOrder(entry, step.lacking) : [fail(step.lacking)];
-    if (!(await this.ensureInvoice(entry))) return this.invoiceFailed(entry, order, pass);
+    if (step) return via === "autopilot" ? this.rejectOrder(entry, step.lacking.reason, step.lacking.kind) : [fail(step.lacking.reason)];
+    const made = await this.ensureInvoice(entry);
+    // Making the invoice is awaited too: the switch, once more, right before
+    // the accept goes out. (A failed invoice left nothing reserved either.)
+    if (sellingOff()) return [made ? await this.withdrawAccept(entry) : this.skip(entry, SELLING_OFF_SKIP)];
+    if (!made) return this.invoiceFailed(entry, order, pass);
     return [await this.sendAccept(entry)];
+  }
+
+  /**
+   * Selling was switched off — or all automation paused — after the lane's
+   * accept had reserved the coins and made the HODL invoice, but before the
+   * accept went out: nothing was offered to Amboss, so nothing is promised.
+   * The coins are free again, the invoice is released (nobody but this node
+   * has its request; if LND can't cancel it now, it expires unpaid), and the
+   * order waits for the operator's decision on Market → Orders, as one the
+   * lane never took up.
+   */
+  private async withdrawAccept(entry: MagmaJournalEntry): Promise<MagmaSellAction> {
+    const inv = entry.invoice;
+    entry.phase = "seen";
+    entry.invoice = null;
+    // Never sent: the count of accepts Amboss refused stays true (MAX_ACCEPT_ATTEMPTS).
+    entry.acceptAttempts = Math.max(0, entry.acceptAttempts - 1);
+    this.journal.event(entry, "Liquidity provision was switched off before the accept was sent — its invoice was released, nothing promised");
+    const skipped = this.skip(entry, SELLING_OFF_SKIP); // saved: the reservation is gone on disk too
+    if (inv) await this.lndCancel(inv.id).catch(() => undefined);
+    return skipped;
   }
 
   /**
@@ -1518,7 +1600,12 @@ export class MagmaDesk {
 
   // ── reject ─────────────────────────────────────────────────────────────────
 
-  private async rejectOrder(entry: MagmaJournalEntry, reason: string): Promise<MagmaSellAction[]> {
+  /** Turn an order down with Amboss. `kind`: what the refusal was about —
+   *  the caps or the wallet (the alert then says raising the caps or funding
+   *  the wallet would serve orders like it), or anything else (an unreachable
+   *  buyer, an asset or a fee Amboss didn't report, a deadline: more capital
+   *  wouldn't have helped, and the alert doesn't say it would). */
+  private async rejectOrder(entry: MagmaJournalEntry, reason: string, kind: RefusalKind = "other"): Promise<MagmaSellAction[]> {
     const base = { orderId: entry.orderId, action: "reject" as const, sizeSats: entry.sizeSats };
     entry.decision = { at: now(), action: "reject", reason };
     let ok: boolean;
@@ -1536,6 +1623,7 @@ export class MagmaDesk {
       return [{ ...base, ok: false, error: `${reason} — Amboss refused the reject` }];
     }
     entry.reason = reason;
+    entry.refusalKind = kind;
     this.toPhase(entry, "rejected", `rejected: ${reason}`);
     console.log(`[magma] rejected order ${entry.orderId}: ${reason}`);
     return [{ ...base, ok: true, error: reason }];
@@ -1619,7 +1707,7 @@ export class MagmaDesk {
       const gone = await this.cannotOpen(entry, order);
       if (gone) return gone;
       const lacking = await this.capitalFor(entry.sizeSats, { caps: false, exceptKey: `magma:${entry.orderId}` });
-      if (lacking) return this.openFailed(entry, order, lacking);
+      if (lacking) return this.openFailed(entry, order, lacking.reason);
       const preExisting = (await channelsWith(this.deps.readLnd, entry.buyerPubkey)).map((c) => c.outpoint);
       if (this.stopping) return [{ ...base, ok: false, error: "shutting down" }];
       entry.phase = "opening";
@@ -2460,7 +2548,9 @@ export class MagmaDesk {
     const open = (await getChannels({ lnd: this.deps.readLnd })).channels;
     const out: MagmaSellAction[] = [];
     for (const o of orders) {
-      if (this.stopping) break;
+      // (Auto-close is selling's automation: none starts once Liquidity
+      // provision is switched off — or all automation paused — meanwhile.)
+      if (this.stopping || !this.deps.config().sellEnabled) break;
       let txid = this.journal.get(o.id)?.fundingOutpoint?.split(":")[0] ?? this.finishedTxids.get(o.id);
       if (txid === undefined) {
         // Asked once per process — but only Amboss's answer is remembered. A
@@ -2474,6 +2564,8 @@ export class MagmaDesk {
       }
       const ch = txid ? open.find((c) => c.transaction_id === txid) : undefined;
       if (!ch) continue; // closed already, or not ours
+      // Again right before the close: the read above may have taken a while.
+      if (this.stopping || !this.deps.config().sellEnabled) break;
       const res = await closeChannelByOutpoint(writeLnd, ch.transaction_id, ch.transaction_vout, false);
       const entry = this.journal.get(o.id);
       if (entry && res.ok) {

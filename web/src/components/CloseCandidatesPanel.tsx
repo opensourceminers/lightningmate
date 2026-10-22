@@ -1,5 +1,7 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
+import { caretButtonProps } from "../a11y";
+import { sharedMagmaReport } from "../magmaReport";
 import type { CloseCandidate, CloseCandidatesResponse, Eligibility, MagmaV2Report } from "../types";
 import { freedCapitalMagmaHint } from "../magmaView";
 import { satsCompact } from "../format";
@@ -29,7 +31,7 @@ export function CloseCandidatesPanel() {
   useEffect(() => {
     void load();
     api.autopilotGet().then((s) => setCanWrite(s.canWrite)).catch(() => setCanWrite(false));
-    api.magmaRecommendations().then(setMagma).catch(() => {});
+    sharedMagmaReport().then(setMagma).catch(() => {});
     api.magmaEligibility().then(setElig).catch(() => setElig(null));
   }, []);
 
@@ -59,7 +61,7 @@ export function CloseCandidatesPanel() {
     <section className="panel feerec">
       <div className="panel-head">
         <h2>
-          Channels to close <span className="v2-badge">v2</span>
+          Channels to close
         </h2>
         {data ? (
           <span className="muted">
@@ -98,7 +100,9 @@ export function CloseCandidatesPanel() {
               return (
                 <Fragment key={c.channelId}>
                   <tr className={`feerec-row ${c.active ? "" : "inactive"}`} onClick={() => toggle(c.channelId)}>
-                    <td className="feerec-caret">{isOpen ? "▾" : "▸"}</td>
+                    <td className="feerec-caret">
+                      <button {...caretButtonProps(isOpen, () => toggle(c.channelId), `Details: ${c.alias}`)}>{isOpen ? "▾" : "▸"}</button>
+                    </td>
                     <td className="num strong">
                       <span className={`sug-score ${scoreClass(c.closeScore)}`}>{c.closeScore}</span>
                     </td>

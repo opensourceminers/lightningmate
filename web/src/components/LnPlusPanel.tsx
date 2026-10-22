@@ -28,7 +28,7 @@ function RankChip({ rank, rankName }: { rank: number; rankName?: string }) {
 function PoolTable({ nodes }: { nodes: LnPlusPoolNode[] }) {
   if (!nodes.length) return <div className="muted pad">No pool nodes returned right now.</div>;
   return (
-    <table className="table">
+    <table className="fee-table">
       <thead>
         <tr>
           <th>Node</th>
@@ -82,7 +82,7 @@ function SwapsTable({ data }: { data: LnPlusSwapsResponse }) {
           {data.me.prime ? " · LN+ Prime" : " · not Prime"}
         </span>
       </div>
-      <table className="table">
+      <table className="fee-table">
         <thead>
           <tr>
             <th>Swap</th>

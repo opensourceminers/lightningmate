@@ -274,6 +274,41 @@ test("a peer that refuses below its minimum: the next suggestion opens in the sa
   assert.equal(s.books.peerOpenFailures?.[A.pubkey], undefined, "a successful open forgets the refusal");
 });
 
+// Review of P4: the note said refused peers "each wait", also one that only
+// refused the size — it is tried again the very next run, at its minimum.
+test("the channel note tells a peer that waits out a back-off from one that only refused the size and is tried again next run", async (t) => {
+  t.mock.method(console, "warn", () => undefined);
+  const s = stage(t);
+  const picky = { ...suggestion, pubkey: PK(1), alias: "picky" };
+  const gone = { ...suggestion, pubkey: PK(3), alias: "gone", sockets: ["goneonion.onion:9735"] };
+  s.seams.channelSuggestions = async () => ({ suggestions: [picky, gone] });
+  s.node.override("default.connectPeer", (a, cb) => {
+    const pk = (a.addr as { pubkey: string }).pubkey;
+    if (pk === gone.pubkey) return cb({ details: "dial tcp: i/o timeout" });
+    if (!s.node.peers.includes(pk)) s.node.peers.push(pk);
+    cb(null, {});
+  });
+  s.node.beforeCall = (method, args) => {
+    if (method !== "default.openChannel") return;
+    s.node.openFailure = pubkeyOf(args) === picky.pubkey ? `received funding error from ${picky.pubkey}: chan size of 0.02 BTC is below min chan size of 0.05 BTC` : null;
+  };
+  await s.autopilot.runOnce();
+  const text = s.autopilot.getState().decisions.channels?.text ?? "";
+  // Before: "picky, gone refused an open (each waits before it is tried again)".
+  assert.equal(
+    text,
+    "no channel opened — gone refused an open (it waits 1 day before it is tried again) · " +
+      "picky refused the size — it is tried again next run, at a size within the limit it named",
+  );
+  // A wait, not "nothing to do" (D16): the Overview tile shows a waiting
+  // area's reason, and hides an idle one's.
+  assert.equal(s.autopilot.getState().decisions.channels?.state, "waiting");
+  // And so it is: the next run opens to picky at its minimum.
+  s.node.peers.push(picky.pubkey);
+  await s.autopilot.runOnce();
+  assert.deepEqual(s.opened().slice(-1), [[picky.pubkey, 5_000_000]]);
+});
+
 test("an unreachable peer backs off 1 day, then 7, then 30 — and its repeated identical failure is one line of history, not one per run", async (t) => {
   t.mock.method(console, "warn", () => undefined);
   const s = stage(t);
@@ -431,13 +466,20 @@ test("nothing silent: a top pick bigger than the wallet, the cooldown and an emp
   s.seams.channelSuggestions = async () => ({ suggestions: [suggestion] });
   const run = await s.autopilot.runOnce();
   assert.deepEqual(run.channels, []);
-  assert.match(s.autopilot.getState().decisions.channels?.text ?? "", /^no channel opened — next-peer: needs 2,000,000 sat — 1,4\d\d,\d{3} spendable after the reserve/);
+  const decision = () => s.autopilot.getState().decisions.channels;
+  assert.match(decision()?.text ?? "", /^no channel opened — next-peer: needs 2,000,000 sat — 1,4\d\d,\d{3} spendable after the reserve/);
+  // Each is a wait (D16), never "nothing to do": the Overview tile shows a
+  // waiting area's reason — "Channel autopilot — waiting: …" — and hides an
+  // idle one's.
+  assert.equal(decision()?.state, "waiting");
   s.node.chainBalance = 0;
   await s.autopilot.runOnce();
-  assert.match(s.autopilot.getState().decisions.channels?.text ?? "", /^nothing to open with: 0 sat on chain/);
+  assert.match(decision()?.text ?? "", /^nothing to open with: 0 sat on chain/);
+  assert.equal(decision()?.state, "waiting");
   s.books.lastChannelOpenAt = new Date().toISOString();
   await s.autopilot.runOnce();
-  assert.match(s.autopilot.getState().decisions.channels?.text ?? "", /^a channel was opened 0 min ago — the next open waits for the 360-minute cooldown$/);
+  assert.match(decision()?.text ?? "", /^a channel was opened 0 min ago — the next open waits for the 360-minute cooldown$/);
+  assert.equal(decision()?.state, "waiting");
   assert.equal(s.autopilot.getState().history.length, 0);
 });
 

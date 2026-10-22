@@ -42,6 +42,34 @@ export interface RebalanceCostChannel {
   channelId: string;
   feeSats: number;
   count: number;
+  /** Who the channel is with, and whether it is still there (GET
+   *  /rebalance/costs: labelCostChannels) — absent where it isn't known. */
+  alias?: string;
+  status?: "open" | "pending" | "closed";
+}
+
+/**
+ * Each refilled channel's alias and status, for the per-channel views
+ * (review of P6: a channel refilled in the window with no forward in it was
+ * shown as "closed", under its bare id — the forwards report lists only
+ * channels seen in a forward). A channel in the node's list is open, or
+ * pending while it opens or closes; one not in it was closed since, and is
+ * named by LightningMate's log of its refills or by its peer. With no channel
+ * list (LND didn't answer), the status is left out: unknown, not "closed".
+ */
+export function labelCostChannels(
+  perChannel: readonly RebalanceCostChannel[],
+  channels: readonly { id: string; peerAlias: string; status: "open" | "pending_open" | "pending_close" }[] | null,
+  closedAlias: (channelId: string) => string | undefined,
+): RebalanceCostChannel[] {
+  const listed = new Map((channels ?? []).map((c) => [c.id, c]));
+  return perChannel.map((c) => {
+    if (!c.channelId) return c;
+    const ch = listed.get(c.channelId);
+    if (ch) return { ...c, alias: ch.peerAlias, status: ch.status === "open" ? "open" : "pending" };
+    const alias = closedAlias(c.channelId);
+    return { ...c, ...(alias ? { alias } : {}), ...(channels ? { status: "closed" as const } : {}) };
+  });
 }
 
 export interface RebalanceCosts {
@@ -54,10 +82,14 @@ export interface RebalanceCosts {
   amountSats: number;
   /** By refilled channel ("": LND didn't say which). */
   perChannel: RebalanceCostChannel[];
-  /** Rebalances LND lists that LightningMate's log has no record of: made
-   *  outside LightningMate — with another tool (bos, RTL, ThunderHub …), or
-   *  before its log existed. */
+  /** Rebalances LND lists, from when LightningMate's log covers them on,
+   *  that it has no record of: made outside LightningMate — with another
+   *  tool (bos, RTL, ThunderHub …). */
   notLogged: number;
+  /** Rebalances LND lists from before LightningMate's log began
+   *  (logTrackedSince) — LightningMate's own older ones among them (0.7.x
+   *  kept only its newest 200 records), so whose they were can't be told. */
+  beforeLog: number;
   /** Rebalances on LightningMate's log that LND no longer lists (its
    *  payment history was pruned): counted from the log — its records, and
    *  its daily sums for the days before LND's history begins. */
@@ -78,8 +110,21 @@ const CACHE_MS = 60_000;
  *  payment of the same channel and amount, sent within this before it ended. */
 const LEGACY_MATCH_MS = 30 * 60_000;
 
+/** A successful payment this node sent to someone else (not a rebalance). */
+export interface SentPayment {
+  id: string;
+  at: string;
+  /** Sats delivered. */
+  tokens: number;
+  /** The routing fee it paid. */
+  feeMsat: number;
+}
+
 type Listing = { items: SelfPayment[]; complete: boolean };
-const cache = new WeakMap<AuthenticatedLnd, { at: number; sinceMs: number; listing: Listing }>();
+/** One read of LND's payments: rebalances (to this node itself) and the
+ *  payments to anyone else, apart. */
+type PaymentsRead = Listing & { sent: SentPayment[] };
+const cache = new WeakMap<AuthenticatedLnd, { at: number; sinceMs: number; listing: PaymentsRead }>();
 
 /** Forget what was read (a test changes the node's payments). */
 export function forgetSelfPayments(lnd: AuthenticatedLnd): void {
@@ -92,12 +137,26 @@ export function forgetSelfPayments(lnd: AuthenticatedLnd): void {
  * are then missing.
  */
 export async function listSelfPayments(lnd: AuthenticatedLnd, sinceMs: number, nowMs = Date.now()): Promise<Listing> {
+  const read = await readPayments(lnd, sinceMs, nowMs);
+  return { items: read.items, complete: read.complete };
+}
+
+/** This node's successful payments to anyone else since `sinceMs`, newest
+ *  first — from the same read (and cache) as its rebalances. */
+export async function listSentPayments(lnd: AuthenticatedLnd, sinceMs: number, nowMs = Date.now()): Promise<{ items: SentPayment[]; complete: boolean }> {
+  const read = await readPayments(lnd, sinceMs, nowMs);
+  return { items: read.sent, complete: read.complete };
+}
+
+async function readPayments(lnd: AuthenticatedLnd, sinceMs: number, nowMs: number): Promise<PaymentsRead> {
   const cached = cache.get(lnd);
   if (cached && nowMs - cached.at < CACHE_MS && cached.sinceMs <= sinceMs) {
-    return { items: cached.listing.items.filter((p) => !(Date.parse(p.at) < sinceMs)), complete: cached.listing.complete };
+    const inWindow = <T extends { at: string }>(xs: T[]) => xs.filter((p) => !(Date.parse(p.at) < sinceMs));
+    return { items: inWindow(cached.listing.items), sent: inWindow(cached.listing.sent), complete: cached.listing.complete };
   }
   const own = await getOwnPubkey(lnd);
   const items: SelfPayment[] = [];
+  const sent: SentPayment[] = [];
   let complete = true;
   let token: string | undefined;
   const after = Number.isFinite(sinceMs) && sinceMs > 0 ? new Date(sinceMs).toISOString() : undefined;
@@ -115,7 +174,12 @@ export async function listSelfPayments(lnd: AuthenticatedLnd, sinceMs: number, n
         older = true;
         continue;
       }
-      if (!p.is_confirmed || p.destination !== own) continue;
+      if (!p.is_confirmed) continue;
+      const feeMsat = p.fee_mtokens !== undefined ? Number(p.fee_mtokens) : (p.fee ?? 0) * 1000;
+      if (p.destination !== own) {
+        sent.push({ id: p.id, at: p.created_at, tokens: p.tokens, feeMsat });
+        continue;
+      }
       const targets: SelfPayment["targets"] = [];
       for (const a of p.attempts ?? []) {
         if (!a.is_confirmed) continue;
@@ -123,22 +187,40 @@ export async function listSelfPayments(lnd: AuthenticatedLnd, sinceMs: number, n
         const last = hops[hops.length - 1];
         if (last?.channel) targets.push({ channelId: last.channel, feeMsat: Number(a.route.fee_mtokens ?? 0) });
       }
-      items.push({
-        id: p.id,
-        at: p.created_at,
-        tokens: p.tokens,
-        feeMsat: p.fee_mtokens !== undefined ? Number(p.fee_mtokens) : (p.fee ?? 0) * 1000,
-        targets,
-      });
+      items.push({ id: p.id, at: p.created_at, tokens: p.tokens, feeMsat, targets });
     }
     // Pages run newest to oldest: once one reaches past the window, the
     // rest are older still.
     if (!res.next || older) break;
     token = res.next;
   }
-  const listing = { items, complete };
+  const listing = { items, sent, complete };
   cache.set(lnd, { at: nowMs, sinceMs, listing });
   return listing;
+}
+
+/**
+ * The routing fees of the Lightning payments this node sent since `sinceMs` —
+ * its own sends (a payment from the Wallet tab, or another wallet on the same
+ * LND): not rebalances (to itself), and not the payments P&L already counts
+ * under their own cost, given by payment hash in `counted` (a Magma
+ * purchase's invoice, a service fee). Review of P6: P&L showed them nowhere.
+ * Null when LND's payments can't be read.
+ */
+export async function lightningPaymentFees(
+  lnd: AuthenticatedLnd,
+  sinceMs: number,
+  counted: ReadonlySet<string>,
+  nowMs = Date.now(),
+): Promise<{ feeSats: number; count: number; complete: boolean } | null> {
+  let read: { items: SentPayment[]; complete: boolean };
+  try {
+    read = await listSentPayments(lnd, sinceMs, nowMs);
+  } catch {
+    return null;
+  }
+  const own = read.items.filter((p) => !counted.has(p.id));
+  return { feeSats: msatToSats(own.reduce((s, p) => s + p.feeMsat, 0)), count: own.length, complete: read.complete };
 }
 
 const msatToSats = (msat: number): number => Math.round(msat / 1000);
@@ -174,6 +256,7 @@ export async function rebalanceCosts(lnd: AuthenticatedLnd, log: RebalanceLog, s
       amountSats: own.amountSats,
       perChannel: [...own.perTarget].map(([channelId, t]) => ({ channelId, feeSats: t.feeSats, count: t.count })),
       notLogged: 0,
+      beforeLog: 0,
       logOnly: 0,
       logTrackedSince,
       note:
@@ -248,11 +331,18 @@ export async function rebalanceCosts(lnd: AuthenticatedLnd, log: RebalanceLog, s
     add(d.targetId, d.feeSats, d.count);
   }
 
-  // LND's payments the log has no record of — counted only where the log
-  // still holds its records one by one (older ones are in its daily sums,
-  // which can't be paired with a payment).
-  const detailFrom = log.detailSinceMs() ?? -Infinity;
-  const notLogged = [...open.values()].filter((p) => Date.parse(p.at) >= detailFrom).length;
+  // LND's payments the log has no record of — "made outside LightningMate"
+  // only where the log covers them: from when it began (trackedSince) and
+  // while it still holds its records one by one (older ones are in its daily
+  // sums, which can't be paired with a payment). One from before the log
+  // began may be LightningMate's own: 0.7.x kept its newest 200 records, and
+  // on every upgraded node its older refills read as another tool's (review
+  // of P6). Those are counted apart.
+  const trackedMs = logTrackedSince ? Date.parse(logTrackedSince) : NaN;
+  const coverFrom = Math.max(Number.isFinite(trackedMs) ? trackedMs : -Infinity, log.detailSinceMs() ?? -Infinity);
+  const unmatched = [...open.values()].map((p) => Date.parse(p.at));
+  const notLogged = unmatched.filter((t) => t >= coverFrom).length;
+  const beforeLog = Number.isFinite(trackedMs) ? unmatched.filter((t) => t < trackedMs).length : 0;
 
   const notes: string[] = [];
   if (!listing.complete) notes.push(`LND lists more payments than were read (the newest ${(PAGE * MAX_PAGES).toLocaleString("en-US")}) — older rebalances are missing`);
@@ -265,6 +355,7 @@ export async function rebalanceCosts(lnd: AuthenticatedLnd, log: RebalanceLog, s
     amountSats,
     perChannel: [...per.values()].sort((a, b) => b.feeSats - a.feeSats),
     notLogged,
+    beforeLog,
     logOnly: logOnly.length + summed,
     logTrackedSince,
     note: notes.length ? notes.join("; ") : null,

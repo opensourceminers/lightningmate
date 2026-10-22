@@ -3,6 +3,7 @@ import { getChannelsView } from "./channels.js";
 import { getNodeSummary } from "./node.js";
 import { storeIncidents, type StoreIncident } from "../store.js";
 import type { ServiceFeeLedger } from "./serviceFee.js";
+import type { MagmaRefusal } from "./magmaDesk.js";
 
 export interface Alert {
   level: "warn" | "info";
@@ -31,6 +32,7 @@ const RESET_CONSEQUENCE: Record<string, string> = {
     "The daily sums of rebalancing fees older than 400 days are gone: P&L counts those LND's payment history still lists, and no others.",
   "close-txs.json":
     "LightningMate's copy of your close transactions is gone: a close whose transactions LND's wallet has since forgotten shows its cost as unknown in P&L.",
+  "decision-log.json": "The record of when each autopilot area's decision changed starts afresh; each area's current decision is kept.",
   "magma-orders.json":
     "Magma orders in progress lost their record, and with it what claims their held payments. No channel is opened " +
     "for such an order: when Amboss asks for one, its held payment is released back to the buyer instead (LND releases " +
@@ -79,14 +81,23 @@ export function stateAlerts(dataDir: string): Alert[] {
   }));
 }
 
+/** What to do about a turned-down order, by what it was refused for. Only a
+ *  cap or the wallet can be changed to serve orders like it; for anything
+ *  else (an unreachable buyer, an asset or a fee Amboss didn't report, an
+ *  accept Amboss refused, a deadline) more capital would not have helped, and
+ *  the alert used to say it would. */
+const REFUSAL_ADVICE: Record<MagmaRefusal["kind"], string> = {
+  cap: "If you want orders like it, raise the caps on Autopilot → Magma; see Market → Orders.",
+  capital: "If you want orders like it, add on-chain funds to the wallet (or lower the reserve on Autopilot → Magma); see Market → Orders.",
+  other: "See Market → Orders for the order.",
+};
+
 /** Magma orders the order lane turned down (cap, capital, an unreachable
  *  buyer …), until dismissed — each one a sale this node didn't make. */
-export function magmaRefusalAlerts(desk: { refusals(): { orderId: string; sizeSats: number; reason: string }[] }): Alert[] {
+export function magmaRefusalAlerts(desk: { refusals(): Pick<MagmaRefusal, "orderId" | "sizeSats" | "reason" | "kind">[] }): Alert[] {
   return desk.refusals().map((r) => ({
     level: "warn" as const,
-    message:
-      `A ${Math.round(r.sizeSats).toLocaleString("en-US")} sat Magma order was turned down: ${r.reason}. ` +
-      "If you want orders like it, raise the caps or fund the wallet (Autopilot → Magma); see Market → Orders.",
+    message: `A ${Math.round(r.sizeSats).toLocaleString("en-US")} sat Magma order was turned down: ${r.reason}. ${REFUSAL_ADVICE[r.kind] ?? REFUSAL_ADVICE.other}`,
     id: `magma:${r.orderId}`,
   }));
 }

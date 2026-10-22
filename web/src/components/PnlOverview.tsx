@@ -3,7 +3,7 @@ import { api } from "../api";
 import type { PnlSummary, PriceInfo } from "../types";
 import { fiat, sats } from "../format";
 import { useCountUp } from "../useCountUp";
-import { pnlCostParts } from "../analyticsView";
+import { pnlCostParts, pnlSpendLines } from "../analyticsView";
 import { Skeleton } from "./Skeleton";
 
 const WINDOWS: { label: string; days: number }[] = [
@@ -128,11 +128,11 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
             ))}
           </div>
 
-          {data.otherChainFeesSats > 0 ? (
-            <p className="pnl-foot muted">
-              + {sats(data.otherChainFeesSats)} sat other on-chain fees (sends), not counted in net
+          {pnlSpendLines(data).map((line) => (
+            <p className="pnl-foot muted" key={line}>
+              {line}
             </p>
-          ) : null}
+          ))}
           {(data.notes ?? []).map((n) => (
             <p className="pnl-foot muted" key={n}>
               {n}

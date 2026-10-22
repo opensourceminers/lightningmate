@@ -4,6 +4,7 @@ import type {
   CloseCandidatesResponse,
   CloseChannelResult,
   AutopilotChange,
+  AutomationSwitch,
   AutopilotConfigPatch,
   AutopilotRun,
   AutopilotState,
@@ -176,6 +177,11 @@ export const api = {
   autopilotSet: (patch: AutopilotConfigPatch) => post<AutopilotState>("/autopilot", patch),
   autopilotRun: () =>
     post<{ run: AutopilotRun; state: AutopilotState }>("/autopilot/run", {}),
+  /** "Pause all automation": every switch off, what was on kept for Resume. */
+  autopilotPause: () => post<AutopilotState>("/autopilot/pause", {}),
+  /** Switch back on what was on before the pause — never selling (D9). */
+  autopilotResume: () =>
+    post<{ resumed: AutomationSwitch[]; sellingWasOn: boolean; state: AutopilotState }>("/autopilot/resume", {}),
   /** A refill by hand. It counts toward the daily rebalance budget: its fee
    *  is capped at what is left (and at maxFeeSats, what the confirm dialog
    *  promised); with nothing left — or a payment still in flight through one
@@ -329,6 +335,24 @@ export const api = {
   ambossOpenOrder: (id: string) => post<DeskResult>("/amboss/order/open", { id }),
   ambossRejectOrder: (id: string) => post<DeskResult>("/amboss/order/reject", { id }),
   backupStatus: () => get<BackupStatus>("/backup/status"),
+  /** "Download diagnostics": the server's JSON report, saved as a file. */
+  diagnosticsDownload: async (): Promise<void> => {
+    const res = await fetch("/api/diagnostics", { headers: authHeaders() });
+    if (!res.ok) {
+      if (res.status === 401) onUnauthorized?.();
+      throw new Error(`Diagnostics failed (${res.status}).`);
+    }
+    const blob = await res.blob();
+    const name = /filename="([^"]+)"/.exec(res.headers.get("content-disposition") ?? "")?.[1] ?? "lightningmate-diagnostics.json";
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
   // Download the channel backup with the auth header, then trigger a browser
   // download of a `channel.backup` file from the response blob.
   backupExport: async (): Promise<void> => {

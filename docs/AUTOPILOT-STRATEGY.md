@@ -285,9 +285,31 @@ every switch off.
 
 ## 3. Strategy — one goal, cascaded (`AutopilotPanel.tsx`)
 
-At the top of the Autopilot tab are three one-click presets. Picking one **writes the whole
-fee curve AND which of the routing sub-autopilots run**, so the parts pull the same way. The
-detailed per-subtab controls below still override anything afterwards.
+At the top of the Autopilot tab are three presets. Picking one shows **exactly what it
+changes** — the switches it turns on that move capital (channel opens from on-chain funds,
+refills paid in routing fees, a bigger refill budget) first — and, once confirmed, **writes the
+whole fee curve AND which of the routing sub-autopilots run**, so the parts pull the same way.
+The detailed per-subtab controls below still override anything afterwards. **Pause all
+automation** switches every automation off at once and remembers which were on — a run
+already in progress asks the live switch before each fee write, refill payment, channel open,
+max-HTLC update, offer write and Magma order accept — after every read that step waits for, so
+nothing is awaited between the check and the step — and starts nothing new after the pause (the
+step under way finishes; Magma orders already taken on are carried to their end; an accept whose
+hold invoice was made but not yet sent is withdrawn, its coins freed). **Resume** switches those
+back on — Liquidity provision excepted, whose switch-on is its own decision with the selling
+check in front of you (D9). LSP mode (Settings) is no switch of the autopilot's: the pause leaves
+it on — it keeps answering wallet orders and opening their channels — and the pause dialog, the
+paused banner and the Overview say so while it is on.
+
+Each area keeps its **last decision and why** (D16): acted, nothing to do, waiting (a
+cooldown, the hours, the budget, the fee rate, the funds, a switch turned off during the run),
+deferred (capital left for Magma), blocked (no Amboss key or one Amboss rejects, write mode
+off, selling on with no offer and auto-pricing off) or error — and "not run yet" for an area
+switched on that hasn't decided anything — shown at the top of its sub-tab and, compactly, on
+the Overview, and logged with its time when it changes. The same standing decision again only
+counts up ("waiting ×48 since 08:00"); each action is a decision of its own. Waits and
+deferrals are never failed runs; a stage that fails the same way run after run is one line of
+history, but every one of those runs reports it (the Overview, "Run once now").
 
 Each preset sets the full fee curve, its **behaviour** (protect floor, profit-floor margin,
 how fast idle channels get cheaper, how aggressive the explore-lower cut is) AND the

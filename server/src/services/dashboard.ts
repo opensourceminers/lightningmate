@@ -86,16 +86,38 @@ export interface DashboardData {
     rebalance: boolean;
     channel: boolean;
     sell: boolean;
+    /** The main run's last pass … */
     lastRunAt: string | null;
-    lastApplied: number;
-    lastAttempted: number;
+    /** … and what THAT pass did — never an older run's counts (review
+     *  a6-ux:numbers-mislead: "Autopilot 3m ago: 2 fees adjusted" paired a
+     *  fresh time with the last run that did something, days old maybe, and
+     *  counted only successes). Null: no pass on record since the upgrade. */
+    lastRun: {
+      applied: number;
+      attempted: number;
+      failed: number;
+      feeChanges: number;
+      rebalances: number;
+      sells: number;
+      opens: number;
+      maxHtlc: number;
+      /** Stages that threw in that pass. */
+      errors: string[];
+    } | null;
+    /** When the autopilot itself last changed something — a run, the order
+     *  lane, a sold channel's fee promise kept; never a fee set by hand
+     *  (autopilot.ts lastAutopilotActionAt) — said as its own item. */
+    lastActionAt: string | null;
     /** Minutes between runs — lets the UI show "next run in ~X min". */
     intervalMinutes: number;
-    /** Last run, summarised for the Overview digest. */
-    lastFeeChanges: number;
-    lastRebalances: number;
-    lastSells: number;
-    lastOpens: number;
+    /** "Pause all automation" in force since (null: not paused). */
+    pausedAt: string | null;
+    /** LSP mode (Settings) answering wallet orders — not one of the
+     *  autopilot's switches, so a pause leaves it on: the digest says so
+     *  rather than "nothing new starts on its own" (review of P7). */
+    lspModeOn: boolean;
+    /** Per area: the last decision, or off / blocked (D16, compact). */
+    status: Record<string, { state: string; text: string; at: string | null }>;
     /** Magma orders the lane turned down in the last two days (not dismissed). */
     magmaRefusals: number;
     magmaRefusalReason: string | null;
@@ -111,7 +133,17 @@ interface RebalanceSummary {
  *  with their sweeps — so the feed says what each on-chain line was. */
 export interface ChannelTxids {
   opens: ReadonlySet<string>;
+  /** Closing transactions (of closed channels, and of channels still
+   *  closing) and the sweeps LND names for them. */
   closes: ReadonlySet<string>;
+  /** The closing transactions of channels STILL closing (LND's pending
+   *  channels): a transaction that spends one of their outputs that was no
+   *  wallet coin — the anchor, the to_local or an HTLC output — is that
+   *  close's fee bump or sweep, before LND names it. */
+  closingNow?: ReadonlySet<string>;
+  /** Whose close each of them is: txid → the line's title (the peer's
+   *  alias, "… — sweep" for a sweep). */
+  closeTitles?: ReadonlyMap<string, string>;
 }
 
 interface AutopilotState {
@@ -123,14 +155,24 @@ interface AutopilotState {
     intervalMinutes: number;
   };
   lastRunAt: string | null;
-  history: {
-    applied: number;
+  /** The main run's last pass (autopilot.ts RunSummary). */
+  lastRun?: {
+    at: string;
     attempted: number;
-    changes?: { ok: boolean }[];
-    rebalances?: { ok: boolean }[];
-    sells?: { ok: boolean }[];
-    channels?: { ok: boolean }[];
-  }[];
+    applied: number;
+    failed: number;
+    feeChanges: { ok: number };
+    rebalances: { ok: number };
+    opens: { ok: number };
+    sells: { ok: number };
+    maxHtlc: { ok: number };
+    errors: string[];
+  } | null;
+  /** autopilot.ts getState().lastActionAt (null: none on record). */
+  lastActionAt?: string | null;
+  paused?: { at: string } | null;
+  status?: Record<string, { state: string; text: string; at: string | null }>;
+  history?: unknown[];
 }
 
 export function buildDashboard(
@@ -149,6 +191,8 @@ export function buildDashboard(
     /** This node's key: a payment to it is a rebalance. */
     ownPubkey?: string;
     channelTxids?: ChannelTxids;
+    /** LSP mode is on (and can run: write access). */
+    lspModeOn?: boolean;
   } = { ownCapitalSats: totalCapacitySats, rebalanceFeesSats: 0, leaseBenchmark: { status: "unknown", grossAprPct: null, sales: null, windowDays: null, text: "" }, magmaRefusals: [] },
 ): DashboardData {
   const activity: ActivityItem[] = [];
@@ -189,17 +233,35 @@ export function buildDashboard(
       feeSats: p.feeSats,
     });
   }
+  const txids = extra.channelTxids;
   for (const t of onchain) {
     // Funding and closing transactions say so: they were "On-chain send" and
-    // "On-chain receive" like any payment.
-    const kind: ActivityKind = extra.channelTxids?.opens.has(t.id)
+    // "On-chain receive" like any payment. A force close's fee bump (anchor
+    // CPFP) or sweep is part of that close too, though LND names it only once
+    // it lists the channel as closed (review of P6: until then it read
+    // "On-chain send"): it spends an output of the closing transaction that
+    // was no wallet coin (the anchor, the to_local, an HTLC). Only for a
+    // channel still closing — after that LND names its sweeps (closes) — and
+    // never by a wallet coin: a cooperative close pays our balance to an
+    // ordinary wallet address, and a later send funded by that coin is a
+    // send, not "a fee bump or sweep" of the close (review of P7). (Nor by
+    // the amounts: btcwallet reports no fee for a transaction with an input
+    // that isn't the wallet's, so a CPFP's amount is not minus its fee.)
+    const spent = txids?.closes.has(t.id) ? undefined : t.spendsNonWallet?.find((id) => txids?.closingNow?.has(id));
+    const kind: ActivityKind = txids?.opens.has(t.id)
       ? "channel_open"
-      : extra.channelTxids?.closes.has(t.id)
+      : txids?.closes.has(t.id) || spent
         ? "channel_close"
         : t.isOutgoing
           ? "onchain_out"
           : "onchain_in";
-    const title = kind === "channel_open" ? "Channel open" : kind === "channel_close" ? "Channel close" : t.isOutgoing ? "On-chain send" : "On-chain receive";
+    const closeTitle = (): string => {
+      const own = txids?.closeTitles?.get(t.id);
+      if (own) return own;
+      const of = spent ? txids?.closeTitles?.get(spent) : undefined;
+      return spent ? `${of ?? "Channel close"} — fee bump or sweep` : "Channel close";
+    };
+    const title = kind === "channel_open" ? "Channel open" : kind === "channel_close" ? closeTitle() : t.isOutgoing ? "On-chain send" : "On-chain receive";
     activity.push({
       at: t.createdAt,
       kind,
@@ -211,8 +273,9 @@ export function buildDashboard(
 
   activity.sort((a, b) => b.at.localeCompare(a.at));
 
-  const last = autopilot.history[0];
-  const okCount = (xs?: { ok: boolean }[]) => (xs ?? []).filter((x) => x.ok).length;
+  // The pass lastRunAt names — only when its summary is that pass's (a
+  // summary from before an upgrade has none).
+  const run = autopilot.lastRun && autopilot.lastRun.at === autopilot.lastRunAt ? autopilot.lastRun : null;
   // On THIS node's capital (its side of the open channels): the peers'
   // balances and channels still opening earn this node nothing.
   const perYear = (sats: number) =>
@@ -243,13 +306,24 @@ export function buildDashboard(
       channel: autopilot.config.channelEnabled,
       sell: autopilot.config.sellEnabled,
       lastRunAt: autopilot.lastRunAt,
-      lastApplied: last?.applied ?? 0,
-      lastAttempted: last?.attempted ?? 0,
+      lastRun: run
+        ? {
+            applied: run.applied,
+            attempted: run.attempted,
+            failed: run.failed,
+            feeChanges: run.feeChanges.ok,
+            rebalances: run.rebalances.ok,
+            sells: run.sells.ok,
+            opens: run.opens.ok,
+            maxHtlc: run.maxHtlc.ok,
+            errors: run.errors,
+          }
+        : null,
+      lastActionAt: autopilot.lastActionAt ?? null,
       intervalMinutes: autopilot.config.intervalMinutes,
-      lastFeeChanges: okCount(last?.changes),
-      lastRebalances: okCount(last?.rebalances),
-      lastSells: okCount(last?.sells),
-      lastOpens: okCount(last?.channels),
+      pausedAt: autopilot.paused?.at ?? null,
+      lspModeOn: extra.lspModeOn ?? false,
+      status: Object.fromEntries(Object.entries(autopilot.status ?? {}).map(([k, v]) => [k, { state: v.state, text: v.text, at: v.at }])),
       magmaRefusals: extra.magmaRefusals.length,
       magmaRefusalReason: extra.magmaRefusals[0]?.reason ?? null,
     },

@@ -147,7 +147,11 @@ test("the engine recommends the standard lease and the promise, and says when an
   assert.equal(r0.recommended.baseFeeCapSats, 1);
   assert.equal(rec.sell.standardLeaseBlocks, 4320);
   // Before: warned only about a LONGER lease.
-  assert.ok(rec.sell.warnings.some((w) => /4032-block lease — a length almost no order uses; the standard is 4320/.test(w)), rec.sell.warnings.join(" | "));
+  assert.ok(r0.warnings.some((w) => /4032-block lease — a length almost no order uses; the standard is 4320/.test(w)), r0.warnings.join(" | "));
+  // Once: Market → Sell shows the report's warnings and the offer's own card
+  // together — the lease warning was in both (review of P1b).
+  const leaseWarnings = [...rec.sell.warnings, ...r0.warnings].filter((w) => /4032-block lease/.test(w));
+  assert.equal(leaseWarnings.length, 1, leaseWarnings.join(" | "));
   assert.ok(r0.warnings.some((w) => /no routing-fee cap/.test(w)), r0.warnings.join(" | "));
   // Nothing claims size is what keeps the offer idle any more (D19).
   assert.ok(![...rec.sell.warnings, ...rec.sell.reasons, ...r0.warnings, ...r0.reasons].some((w) => /size, not price/.test(w)));

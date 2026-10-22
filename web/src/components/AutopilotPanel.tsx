@@ -1,56 +1,45 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type {
-  AutopilotConfig,
-  AutopilotConfigPatch,
-  AutopilotRun,
-  AutopilotState,
-  FeePolicy,
-  MagmaV2Report,
-  NumberBounds,
-  SellDiagnostics,
-} from "../types";
+import type { AreaStatus, AutopilotConfigPatch, AutopilotRun, AutopilotState, DecisionArea, MagmaV2Report, SellDiagnostics } from "../types";
 import { satsCompact, timeAgo } from "../format";
-import { parseNumField } from "../numField";
+import { rangeText } from "../numField";
 import { runProgress } from "../statusNotes";
-import { buildPresets, matchesPreset as presetMatches } from "../presets";
+import { buildPresets, matchesPreset as presetMatches, type Preset } from "../presets";
 import { NEUTRAL_PPM_HINT, historyFeeLine } from "../feeView";
 import { OFFER_AUTOMATION_HINT, PRICING_MODES } from "../magmaView";
-import { REBALANCE_POLICY_FIELDS, REMOVED_SETTINGS_NOTE, budgetLine, decisionLine } from "../rebalanceView";
+import { REBALANCE_POLICY_FIELDS, REMOVED_SETTINGS_NOTE, budgetLine } from "../rebalanceView";
+import {
+  AREA_LABEL,
+  allAutomationOff,
+  areaStatusView,
+  pauseHint,
+  pausedText,
+  pausedToast,
+  presetChanges,
+  resumeLines,
+  runResultLine,
+} from "../autopilotView";
+import { EMPTY_DRAFT, boundsFor, checkDraft, draftIsEmpty, draftStore, savedNum, type Draft, type FlagKey, type NumKey, type NumPath } from "../autopilotForm";
+import { forgetMagmaReport, sharedMagmaReport } from "../magmaReport";
+import { useVisibleInterval } from "../usePolledData";
+import { ApiError } from "../apiError";
 import { RunState, Switch } from "./Switch";
 import { useUi } from "./Overlay";
 import { goTo } from "../nav";
 import { SellDiagnosticsCard } from "./MagmaSellInfo";
-import { turnSellingOff, turnSellingOn } from "./SellingSwitch";
+import { pauseAllAutomation, turnSellingOff, turnSellingOn } from "./SellingSwitch";
 import { FeeRecommendations } from "./FeeRecommendations";
 import { RebalanceRecommendations } from "./RebalanceRecommendations";
-import { SuggestionsPanel } from "./SuggestionsPanel";
+import { InfoTip } from "./InfoTip";
 
 type Sub = "fees" | "rebalancing" | "channels" | "magma" | "history";
-type NumKey =
-  | "intervalMinutes"
-  | "cooldownMinutes"
-  | "maxChangesPerRun"
-  | "maxRebalancesPerRun"
-  | "rebalanceCooldownMinutes"
-  | "rebalanceDailyBudgetSats"
-  | "rebalanceHourStart"
-  | "rebalanceHourEnd"
-  | "channelReserveSats"
-  | "channelSizeSats"
-  | "channelCooldownMinutes"
-  | "channelMaxFeeRate"
-  | "sellMaxDeploySats"
-  | "sellReserveSats"
-  | "sellMaxChannelSats";
-type RebKey = keyof AutopilotConfig["rebalancePolicy"];
 
 const FEE_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "intervalMinutes", label: "Run every (min)" },
   { key: "cooldownMinutes", label: "Fee cooldown (min)" },
   { key: "maxChangesPerRun", label: "Max fee changes / run" },
 ];
-const POLICY_FIELDS: { key: keyof AutopilotConfig["policy"]; label: string; hint?: string }[] = [
+const POLICY_FIELDS: { key: keyof AutopilotState["config"]["policy"]; label: string; hint?: string }[] = [
   { key: "minPpm", label: "Min ppm (full)" },
   { key: "neutralPpm", label: "Neutral ppm (balanced)", hint: NEUTRAL_PPM_HINT },
   { key: "maxPpm", label: "Max ppm (drained)" },
@@ -81,7 +70,8 @@ export const CHANNEL_OPEN_HINT =
   "than a month, with at least 10 forwards or 1,000 sat earned in 30 days; with less, only the maximum applies). It walks " +
   "down the suggestions: a peer that refused an open waits 1 day, then 7, then 30; one that takes bigger channels than your " +
   "fixed size is skipped (auto size meets its minimum, up to a third of the node's capital); a peer closed within 90 days, " +
-  "rated poorly on LN+, without an address, of low usefulness or marked “never auto” is never opened to automatically. " +
+  "rated poorly on LN+, of low usefulness or marked “never auto” is never opened to automatically, nor one that advertises " +
+  "no address to dial unless it is connected already. " +
   "When the open fails on this node's side — LND's wallet not synced or short of confirmed coins, or no connection to any " +
   "peer — no peer is held back for it, and the next run tries again. An open that ends unclearly starts the cooldown, as " +
   "an open does.";
@@ -101,35 +91,61 @@ const LABELS: Partial<Record<string, string>> = Object.fromEntries([
   ...REB_POLICY_FIELDS.map((f) => [`rebalancePolicy.${f.key}`, f.label]),
 ]);
 
-/** Numeric edits are keyed by path: "intervalMinutes", "policy.minPpm", … */
-type NumPath = NumKey | `policy.${keyof FeePolicy}` | `rebalancePolicy.${RebKey}`;
+/** The Magma settings whose save changes what the Magma report shows. */
+const SELL_KEYS = ["sellMaxDeploySats", "sellMaxChannelSats", "sellReserveSats", "sellAutoReprice", "sellAutoSize", "sellPricingMode"] as const;
 
-function boundsFor(state: AutopilotState, path: NumPath): NumberBounds | undefined {
-  const [section, key] = path.split(".") as [string, string | undefined];
-  if (key === undefined) return state.bounds?.config[section as NumKey];
-  if (section === "policy") return state.bounds?.policy[key as keyof FeePolicy];
-  return state.bounds?.rebalancePolicy[key as RebKey];
+/** An area's last decision, at the top of its sub-tab (D16): what it did, or
+ *  why it did nothing — amber for a wait or a deferral, red only for an
+ *  error (D15). */
+export function StatusLine({ area, status }: { area: DecisionArea; status: AreaStatus | undefined }) {
+  const v = areaStatusView(status);
+  if (!v) return null;
+  return (
+    <div className="ap-status">
+      <span className="ap-status-area">{AREA_LABEL[area]}</span>
+      <span className={`ap-state t-${v.tone}`}>{v.chip}</span>
+      <span className="ap-status-text">{v.text}</span>
+      {v.when ? <span className="ap-status-when">{v.when}</span> : null}
+      {v.lastError ? <span className="ap-status-err">{v.lastError}</span> : null}
+    </div>
+  );
 }
 
-function savedValue(config: AutopilotConfig, path: NumPath): number | null {
-  const [section, key] = path.split(".") as [string, string | undefined];
-  if (key === undefined) return config[section as NumKey];
-  if (section === "policy") return config.policy[key as keyof FeePolicy];
-  return config.rebalancePolicy[key as RebKey];
+/** A preset's confirmation: every change it makes, those that move capital
+ *  first — and that selling is never touched (D9). */
+export function PresetPreview({ preset, config }: { preset: Preset; config: AutopilotState["config"] }) {
+  const changes = presetChanges(config, preset.cfg);
+  const ordered = [...changes.filter((c) => c.capital), ...changes.filter((c) => !c.capital)];
+  return (
+    <>
+      <p className="modal-msg">{preset.desc}</p>
+      <ul className="preset-changes">
+        {ordered.map((c) => (
+          <li key={c.label} className={c.capital ? "capital" : undefined}>
+            {c.label}: {c.from} → <strong>{c.to}</strong>
+            {c.capital ? ` — ${c.capital}` : ""}
+          </li>
+        ))}
+      </ul>
+      <p className="modal-msg muted">Liquidity provision (Magma selling) is never changed by a preset.</p>
+    </>
+  );
 }
 
 export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   const [server, setServer] = useState<AutopilotState | null>(null);
-  // Unsaved numeric edits, as typed. Everything else (switches, tiles,
-  // checkboxes, presets) saves at once and sends ONLY its own field — a toggle
-  // can no longer save, or wipe, a half-typed number somewhere else.
-  const [edits, setEdits] = useState<Partial<Record<NumPath, string>>>({});
+  const [loadError, setLoadError] = useState<string | null>(null);
+  // The unsaved settings: kept outside the panel, so leaving the tab no
+  // longer drops them (autopilotForm.ts).
+  const [draft, setDraftState] = useState<Draft>(() => draftStore.get());
+  const setDraft = (d: Draft) => {
+    draftStore.set(d);
+    setDraftState(d);
+  };
   const [busy, setBusy] = useState(false);
-  const [sub, setSub] = useState<Sub>(
-    initialSub && (SUBS as string[]).includes(initialSub) ? (initialSub as Sub) : "fees",
-  );
+  const [sub, setSub] = useState<Sub>(initialSub && (SUBS as string[]).includes(initialSub) ? (initialSub as Sub) : "fees");
   const [lastRun, setLastRun] = useState<AutopilotRun | null>(null);
-  // Market reality for the caps section. Needs no Amboss key.
+  // Market reality for the caps section — the shared report (magmaReport.ts).
   const [magma, setMagma] = useState<MagmaV2Report | null>(null);
   const [error, setError] = useState<string | null>(null);
   const ui = useUi();
@@ -143,47 +159,62 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       return n;
     });
 
-  useEffect(() => {
-    api.magmaRecommendations().then(setMagma).catch(() => setMagma(null));
-  }, []);
+  const loadMagma = () => {
+    void sharedMagmaReport()
+      .then(setMagma)
+      .catch(() => setMagma(null));
+  };
+  useEffect(loadMagma, []);
 
   // The same "why don't I sell?" checklist as Market → Sell, on the Magma
-  // settings — read when that sub-tab is opened.
+  // settings — read when that sub-tab is opened, and after a save there.
   const [diag, setDiag] = useState<SellDiagnostics | null>(null);
+  const loadDiag = () => {
+    void api.sellDiagnostics().then(setDiag).catch(() => setDiag(null));
+  };
   useEffect(() => {
-    if (sub !== "magma") return;
-    api.sellDiagnostics().then(setDiag).catch(() => setDiag(null));
+    if (sub === "magma") loadDiag();
   }, [sub]);
 
+  // Every 15 s while the page is visible. A failed first load is said, with a
+  // retry — it used to leave "Loading autopilot…" up for good.
+  const load = () =>
+    api
+      .autopilotGet()
+      .then((s) => {
+        setServer(s);
+        setLoadError(null);
+      })
+      .catch((e) => setLoadError(e instanceof Error ? e.message : String(e)));
   useEffect(() => {
-    let cancelled = false;
-    const load = () =>
-      api
-        .autopilotGet()
-        .then((s) => {
-          if (!cancelled) setServer(s);
-        })
-        .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)));
-    load();
-    const id = setInterval(load, 15_000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
+    void load();
   }, []);
+  useVisibleInterval(() => void load(), 15_000);
 
   if (!server) {
-    return <section className="panel"><p className="muted empty">Loading autopilot…</p></section>;
+    return (
+      <section className="panel">
+        {loadError ? (
+          <p className="banner error">
+            Couldn't load the autopilot: {loadError}{" "}
+            <button className="linklike" onClick={() => void load()}>
+              Try again
+            </button>
+          </p>
+        ) : (
+          <p className="muted empty">Loading autopilot…</p>
+        )}
+      </section>
+    );
   }
   const writeOff = !server.canWrite;
   const config = server.config;
-
-  /** What a numeric field shows: the unsaved text, else the saved value. */
-  const shownNum = (path: NumPath): number | null => {
-    const text = edits[path];
-    if (text !== undefined && text.trim() !== "" && Number.isFinite(Number(text))) return Number(text);
-    return savedValue(config, path);
-  };
+  const status = server.status;
+  const paused = server.paused ?? null;
+  // LSP mode (Settings) is not paused with the rest: said wherever the pause is.
+  const lspModeOn = server.lspModeOn ?? false;
+  const check = checkDraft(draft, config, server.bounds, LABELS);
+  const unsaved = !draftIsEmpty(draft);
 
   const save = async (patch: AutopilotConfigPatch, successMsg?: string): Promise<boolean> => {
     setBusy(true);
@@ -191,6 +222,13 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     try {
       setServer(await api.autopilotSet(patch));
       if (successMsg) toast(successMsg, "success");
+      // The caps, the pricing level, auto-price or auto-size changed: the
+      // Magma report shows them — read it afresh (it went stale).
+      if (SELL_KEYS.some((k) => k in patch)) {
+        forgetMagmaReport();
+        loadMagma();
+        if (sub === "magma") loadDiag();
+      }
       return true;
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -200,30 +238,19 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     }
   };
 
-  /** "Save settings": validate every edited number first — a blank or
-   *  out-of-range field is reported, never sent (and never sent as 0). */
-  const saveNumbers = async () => {
-    const patch: AutopilotConfigPatch = {};
-    const errors: string[] = [];
-    for (const [path, text] of Object.entries(edits) as [NumPath, string][]) {
-      const parsed = parseNumField(text, boundsFor(server, path), LABELS[path] ?? path);
-      if (!parsed.ok) {
-        errors.push(parsed.error);
-        continue;
-      }
-      const [section, key] = path.split(".") as [string, string | undefined];
-      if (key === undefined) Object.assign(patch, { [section]: parsed.value });
-      else if (section === "policy") patch.policy = { ...patch.policy, [key]: parsed.value };
-      else patch.rebalancePolicy = { ...patch.rebalancePolicy, [key]: parsed.value };
-    }
-    if (errors.length) {
-      setError(errors.join(" · "));
+  /** "Save changes": every setting in the draft, checked first — nothing
+   *  is sent while a field is wrong (and nothing is ever sent as 0). */
+  const saveDraft = async () => {
+    if (check.errors.length) {
+      setError(check.errors.join(" · "));
       return;
     }
-    if (Object.keys(patch).length === 0) return;
-    if (await save(patch, "Settings saved")) setEdits({});
+    if (Object.keys(check.patch).length === 0) {
+      setDraft(EMPTY_DRAFT);
+      return;
+    }
+    if (await save(check.patch, "Settings saved")) setDraft(EMPTY_DRAFT);
   };
-  const unsaved = Object.keys(edits).length > 0;
 
   const runNow = async () => {
     setBusy(true);
@@ -233,9 +260,65 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       setLastRun(run);
       setServer(state);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      // 409: a run is already in progress — its result shows when it ends.
+      if (e instanceof ApiError && e.status === 409) toast(e.message, "info");
+      else setError(e instanceof Error ? e.message : String(e));
     } finally {
       setBusy(false);
+    }
+  };
+
+  /** A preset applies only after its preview: what it changes, and what of
+   *  that moves capital (review a6-ux:presets-unconfirmed-capital). */
+  const applyPreset = async (p: Preset) => {
+    if (presetChanges(config, p.cfg).length === 0) {
+      toast(`“${p.label}” is what you have already`, "info");
+      return;
+    }
+    const ok = await ui.confirm({ title: `Apply “${p.label}”?`, body: <PresetPreview preset={p} config={config} />, confirmLabel: "Apply" });
+    if (ok) await save(p.cfg, `Strategy applied: ${p.label}`);
+  };
+
+  const pauseAll = async () => {
+    await pauseAllAutomation({
+      config,
+      lspModeOn,
+      confirm: ui.confirm,
+      offers: () => api.ambossMyOffers().then((r) => r.offers),
+      disableOffer: (id: string) => api.ambossToggleOffer(id, "DISABLED"),
+      toast,
+      pause: async () => {
+        try {
+          const next = await api.autopilotPause();
+          setServer(next);
+          toast(pausedToast(next.lspModeOn ?? false), "success");
+          return true;
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e));
+          return false;
+        }
+      },
+    });
+  };
+
+  const resume = async () => {
+    if (!paused) return;
+    const { lines, sellingNote } = resumeLines(paused.was);
+    const capital = paused.was.some((k) => k === "channelEnabled" || k === "rebalanceEnabled")
+      ? " The channel autopilot and auto-rebalance spend on-chain funds and routing fees again, within their settings."
+      : "";
+    const ok = await ui.confirm({
+      title: "Resume automation?",
+      message: `${lines.length ? `Switches back on: ${lines.join(", ")}.` : "Nothing to switch back on."}${capital}${sellingNote ? ` ${sellingNote}` : ""}`,
+      confirmLabel: "Resume",
+    });
+    if (!ok) return;
+    try {
+      const res = await api.autopilotResume();
+      setServer(res.state);
+      toast(res.resumed.length ? "Automation resumed" : "Pause ended", "success");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
   };
 
@@ -276,35 +359,60 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     await (on ? turnSellingOn(deps) : turnSellingOff(deps));
   };
 
-  const numInput = (path: NumPath, label: string, step?: number, hint?: string) => {
-    const b = boundsFor(server, path);
-    const saved = savedValue(config, path);
+  // ── the draft's controls ──────────────────────────────────────────────────
+
+  const setNum = (path: NumPath, text: string) => {
+    const nums = { ...draft.nums };
+    // Typed back to what is saved: nothing unsaved there any more.
+    if (text.trim() !== "" && Number(text) === savedNum(config, path)) delete nums[path];
+    else nums[path] = text;
+    setDraft({ ...draft, nums });
+  };
+  const setFlag = (key: FlagKey, v: boolean) => {
+    const flags = { ...draft.flags };
+    if (v === config[key]) delete flags[key];
+    else flags[key] = v;
+    setDraft({ ...draft, flags });
+  };
+  const flagShown = (key: FlagKey) => draft.flags[key] ?? config[key];
+
+  /** A number field: its range under it (or what is wrong with it), and its
+   *  explanation behind an (i) that works on a tap — not a hover tooltip. */
+  const numInput = (path: NumPath, label: string, opts: { step?: number; hint?: string } = {}) => {
+    const b = boundsFor(server.bounds, path);
+    const text = draft.nums[path];
+    const err = check.fieldErrors[path];
     return (
-      <label key={path} className="policy-field">
-        <span title={hint}>{label}</span>
-        <input
-          type="number"
-          min={b?.min}
-          max={b?.max}
-          step={step ?? (b && !b.integer ? "any" : 1)}
-          title={b ? `${b.min}–${b.max}` : undefined}
-          value={edits[path] ?? (saved ?? "")}
-          onChange={(e) => {
-            const text = e.target.value;
-            setEdits((ed) => ({ ...ed, [path]: text }));
-          }}
-        />
-      </label>
+      <div key={path} className={`policy-field ${text !== undefined ? "changed" : ""}`}>
+        <label>
+          <span>{label}</span>
+          <input
+            type="number"
+            min={b?.min}
+            max={b?.max}
+            step={opts.step ?? (b && !b.integer ? "any" : 1)}
+            value={text ?? (savedNum(config, path) ?? "")}
+            aria-invalid={err ? true : undefined}
+            disabled={writeOff}
+            onChange={(e) => setNum(path, e.target.value)}
+          />
+        </label>
+        {opts.hint ? <InfoTip text={opts.hint} label={`About ${label}`} /> : null}
+        {err ? <span className="field-error">{err}</span> : b ? <span className="field-hint">{rangeText(b)}</span> : null}
+      </div>
     );
   };
 
+  const budgetNoLimit = draft.noBudgetLimit ?? config.rebalanceDailyBudgetSats === null;
   const numFields = (fields: { key: NumKey; label: string }[]) =>
     fields.map((f) =>
-      f.key === "rebalanceDailyBudgetSats" && config.rebalanceDailyBudgetSats === null && edits[f.key] === undefined ? (
-        <label key={f.key} className="policy-field">
-          <span>{f.label}</span>
-          <input type="text" value="No limit" disabled />
-        </label>
+      f.key === "rebalanceDailyBudgetSats" && budgetNoLimit ? (
+        <div key={f.key} className="policy-field">
+          <label>
+            <span>{f.label}</span>
+            <input type="text" value="No limit" disabled />
+          </label>
+        </div>
       ) : (
         numInput(f.key, f.label)
       ),
@@ -315,29 +423,50 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     <label className="check ap-check">
       <input
         type="checkbox"
-        checked={config.rebalanceDailyBudgetSats === null}
+        checked={budgetNoLimit}
         disabled={busy || writeOff}
         onChange={(e) => {
-          setEdits((ed) => {
-            const next = { ...ed };
-            delete next.rebalanceDailyBudgetSats;
-            return next;
-          });
-          void save({ rebalanceDailyBudgetSats: e.target.checked ? null : 10_000 });
+          const on = e.target.checked;
+          const nums = { ...draft.nums };
+          const savedNoLimit = config.rebalanceDailyBudgetSats === null;
+          if (on) delete nums.rebalanceDailyBudgetSats;
+          // Unticked from "no limit": a limit to start from, to edit.
+          else if (savedNoLimit && nums.rebalanceDailyBudgetSats === undefined) nums.rebalanceDailyBudgetSats = "10000";
+          setDraft({ ...draft, nums, noBudgetLimit: on === savedNoLimit ? undefined : on });
         }}
       />
       No daily limit on rebalance fees (each move must still pass the profit check)
     </label>
   );
 
-  const saveRow = (
-    <div className="apply-row">
-      <button className="primary-btn" disabled={busy || !unsaved} onClick={() => void saveNumbers()}>
-        Save settings
-      </button>
-      {unsaved ? <span className="muted">Unsaved changes</span> : null}
-    </div>
+  const flagBox = (key: FlagKey, text: string) => (
+    <label className="check ap-check">
+      <input type="checkbox" checked={flagShown(key)} disabled={busy || writeOff} onChange={(e) => setFlag(key, e.target.checked)} />
+      {text}
+    </label>
   );
+
+  /** What is unsaved — on every sub-tab, so nothing is lost or saved unseen. */
+  const unsavedBar = unsaved ? (
+    <div className="ap-unsaved" role="region" aria-label="Unsaved settings">
+      <span className="ap-unsaved-what">
+        <strong>Unsaved changes:</strong> {check.changes.length ? check.changes.join(", ") : "none left"}
+      </span>
+      <button className="primary-btn" disabled={busy || writeOff || check.errors.length > 0} onClick={() => void saveDraft()}>
+        Save changes
+      </button>
+      <button className="reset" disabled={busy} onClick={() => setDraft(EMPTY_DRAFT)}>
+        Discard
+      </button>
+      {check.errors.length ? (
+        <ul className="ap-unsaved-errors">
+          {check.errors.map((e) => (
+            <li key={e}>{e}</li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  ) : null;
 
   const TABS: { id: Sub; label: string }[] = [
     { id: "fees", label: "Fees" },
@@ -350,29 +479,30 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   // The Strategy presets (presets.ts) — none of them touches Magma selling.
   const PRESETS = buildPresets(config);
   const matchesPreset = (p: AutopilotConfigPatch) => presetMatches(config, p);
+  const allOff = allAutomationOff(config);
+  const shownMax = (path: NumPath) => {
+    const text = draft.nums[path];
+    return text !== undefined && text.trim() !== "" && Number.isFinite(Number(text)) ? Number(text) : (savedNum(config, path) ?? 0);
+  };
+  const feeDraftOpen = FEE_NUM_FIELDS.some((f) => draft.nums[f.key] !== undefined) || POLICY_FIELDS.some((f) => draft.nums[`policy.${f.key}`] !== undefined);
 
   return (
     <div>
       <div className="ap-strategy">
         <div className="ap-strategy-head">
           <span className="ap-strategy-title">Strategy</span>
-          <span className="muted">one click — applied instantly, no Save needed</span>
-          {!PRESETS.some((p) => matchesPreset(p.cfg)) ? (
-            <span className="preset-custom-chip" title="Your settings differ from every preset — pick one to snap everything back to a coherent goal">
-              Custom settings active
-            </span>
+          <span className="muted">applies after you confirm what it changes</span>
+          {paused ? null : allOff ? (
+            <span className="preset-off-chip">Autopilot off — no automation is switched on</span>
+          ) : !PRESETS.some((p) => matchesPreset(p.cfg)) ? (
+            <span className="preset-custom-chip">Custom settings</span>
           ) : null}
         </div>
         <div className="ap-preset-grid">
           {PRESETS.map((p) => {
             const active = matchesPreset(p.cfg);
             return (
-              <button
-                key={p.id}
-                className={`preset-opt ${active ? "active" : ""}`}
-                disabled={busy || writeOff}
-                onClick={() => void save(p.cfg, `Strategy applied: ${p.label}`)}
-              >
+              <button key={p.id} className={`preset-opt ${active ? "active" : ""}`} disabled={busy || writeOff} onClick={() => void applyPreset(p)}>
                 <span className="preset-opt-label">
                   {p.label}
                   {active ? <span className="preset-opt-badge">✓ active</span> : null}
@@ -382,6 +512,22 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
             );
           })}
         </div>
+        {paused ? (
+          <div className="ap-paused">
+            ⏸ All automation paused {timeAgo(paused.at)} — {pausedText(lspModeOn)}. Magma orders already taken on are still
+            carried to their end.{" "}
+            <button className="primary-btn" disabled={busy || writeOff} onClick={() => void resume()}>
+              Resume
+            </button>
+          </div>
+        ) : !allOff ? (
+          <div className="ap-pause-row">
+            <button className="reset" disabled={busy || writeOff} onClick={() => void pauseAll()}>
+              ⏸ Pause all automation
+            </button>
+            <span className="muted">{pauseHint(lspModeOn)}</span>
+          </div>
+        ) : null}
       </div>
 
       <div className="subnav">
@@ -400,6 +546,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
         </div>
       ) : null}
       {error ? <p className="banner error">{error}</p> : null}
+      {loadError ? <p className="banner error">Couldn't refresh the autopilot's state ({loadError}) — what you see may be out of date.</p> : null}
       {(() => {
         // A main run that takes far longer than usual is stuck on something
         // (a payment, a call to the node): say so, on every tab.
@@ -409,17 +556,19 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
 
       {sub === "fees" ? (
         <>
+          <StatusLine area="fees" status={status?.fees} />
+          {config.maxHtlcEnabled ? <StatusLine area="maxHtlc" status={status?.maxHtlc} /> : null}
           {toggleRow("enabled", "Fee automation", "Apply the recommended fees below automatically, on a schedule")}
           {toggleRow(
             "maxHtlcEnabled",
             "Advertise routable size",
             "Keep each channel's max HTLC just under its spendable balance (rounded to powers of two) — senders skip depleted channels, so fewer forwards fail through you",
           )}
-          <details className="ap-customize">
+          <details className="ap-customize" open={feeDraftOpen || undefined}>
             <summary>Customize fee policy</summary>
             <div className="policy-controls">
               {numFields(FEE_NUM_FIELDS)}
-              {POLICY_FIELDS.map((f) => numInput(`policy.${f.key}`, f.label, undefined, f.hint))}
+              {POLICY_FIELDS.map((f) => numInput(`policy.${f.key}`, f.label, { hint: f.hint }))}
             </div>
             <p className="muted ap-hint">
               Each update moves a fee by at most two “Round to” steps up (up to three where a learned elasticity says
@@ -429,38 +578,29 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
               only: an idle channel dropping to the price that last won it flow or to the market’s price into its
               peer, a pinned fee, a new channel’s protected fee, a broken lease promise, and a fee outside Min/Max ppm
               (a fee below Min goes to Min first, then steps). “Min change” only skips fees already that close to
-              where the engine is heading — never an idle channel’s step or jump down, nor a fee brought into Min/Max.{" "}
-              {NEUTRAL_PPM_HINT}
+              where the engine is heading — never an idle channel’s step or jump down, nor a fee brought into Min/Max.
             </p>
             <div className="ap-checks">
-              <label className="check ap-check">
-                <input
-                  type="checkbox"
-                  checked={config.feeFloorAboveMax}
-                  disabled={busy || writeOff}
-                  onChange={(e) => void save({ feeFloorAboveMax: e.target.checked })}
-                />
-                Let a channel’s refill cost (profit floor) lift its fee above Max ppm — off: the floor stops at Max ppm
-              </label>
+              {flagBox("feeFloorAboveMax", "Let a channel’s refill cost (profit floor) lift its fee above Max ppm — off: the floor stops at Max ppm")}
             </div>
-            {saveRow}
           </details>
+          {unsavedBar}
           <FeeRecommendations />
         </>
       ) : sub === "rebalancing" ? (
         <>
+          <StatusLine area="rebalance" status={status?.rebalance} />
           {toggleRow(
             "rebalanceEnabled",
             "Auto-rebalance",
             "Run the refills below that pass the profit check, within the daily fee budget — on a small node with low fees, that is rarely",
           )}
           {budgetLine(server.rebalanceBudget) ? <p className="muted ap-hint">{budgetLine(server.rebalanceBudget)}</p> : null}
-          {decisionLine(server.decisions?.rebalance) ? <p className="muted ap-hint">{decisionLine(server.decisions?.rebalance)}</p> : null}
           <details className="ap-customize">
             <summary>Customize rebalance policy</summary>
             <div className="policy-controls">
               {numFields(REB_NUM_FIELDS)}
-              {REB_POLICY_FIELDS.map((f) => numInput(`rebalancePolicy.${f.key}`, f.label, f.step, f.hint))}
+              {REB_POLICY_FIELDS.map((f) => numInput(`rebalancePolicy.${f.key}`, f.label, { step: f.step, hint: f.hint }))}
             </div>
             <div className="ap-checks">{noBudgetLimit}</div>
             <p className="muted ap-hint">
@@ -468,28 +608,41 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
               it nets at least the minimum, and pays back in time — its payment can't pay more than that, nor more than is
               left of today's budget. The hours and the budget's day are UTC. {REMOVED_SETTINGS_NOTE}
             </p>
-            {saveRow}
           </details>
+          {unsavedBar}
           <RebalanceRecommendations />
         </>
       ) : sub === "channels" ? (
         <>
+          <StatusLine area="channels" status={status?.channels} />
           {toggleRow(
             "channelEnabled",
             "Channel autopilot",
-            "Opens a channel to the best suggestion below that it can actually open — the peer's minimum size, earlier refusals, a recent close and on-chain fees checked — when on-chain funds allow",
+            "Opens a channel to the best suggestion it can actually open — the peer's minimum size, earlier refusals, a recent close and on-chain fees checked — when on-chain funds allow",
           )}
-          {decisionLine(server.decisions?.channels) ? <p className="muted ap-hint">{decisionLine(server.decisions?.channels)}</p> : null}
           <details className="ap-customize">
             <summary>Customize channel policy</summary>
             <div className="policy-controls">{numFields(CHANNEL_NUM_FIELDS)}</div>
             <p className="muted ap-hint">{CHANNEL_OPEN_HINT}</p>
-            {saveRow}
           </details>
-          <SuggestionsPanel />
+          {unsavedBar}
+          <p className="muted ap-hint">
+            The peers it would open to — and opening one by hand — are on{" "}
+            <button className="linklike" onClick={() => goTo("channels", "open")}>
+              Channels → To open
+            </button>
+            , next to closing.
+          </p>
         </>
       ) : sub === "magma" ? (
         <section className="panel">
+          <StatusLine area="magma" status={status?.magma} />
+          {server.magmaLane?.lastTickAt ? (
+            <p className="muted ap-hint">
+              Order lane: checked {timeAgo(server.magmaLane.lastTickAt)}
+              {server.magmaLane.ok === false ? ` — ${server.magmaLane.error ?? "failed"}` : server.magmaLane.idle ? ` — ${server.magmaLane.idle}` : ""}
+            </p>
+          ) : null}
           <SellDiagnosticsCard d={diag} onFix={(tab, s) => goTo(tab, s)} />
           {toggleRow(
             "sellEnabled",
@@ -497,11 +650,6 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
             "Advanced: sells inbound on Amboss Magma — accepts orders with a hold invoice, opens channels to buyers, rejects what it can't serve, within your caps. Amboss decides who gets orders.",
             (v) => void setSelling(v),
           )}
-          {server.decisions?.magma ? (
-            <p className="muted ap-hint">
-              Last decision ({timeAgo(server.decisions.magma.at)}): {server.decisions.magma.text}
-            </p>
-          ) : null}
 
           <h3 className="sub">Offer pricing</h3>
           <p className="muted ap-hint">
@@ -509,37 +657,32 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
             below — never below your profit floor. (Price is not what gets a seller picked; it decides what a sale earns.)
           </p>
           <div className="mode-select">
-            {PRICING_MODES.map(({ id, label, desc }) => (
-              <button
-                key={id}
-                className={`mode-opt ${config.sellPricingMode === id ? "active" : ""}`}
-                disabled={busy || writeOff}
-                onClick={() => void save({ sellPricingMode: id })}
-              >
-                <span className="mode-opt-label">{label}</span>
-                <span className="mode-opt-desc">{desc}</span>
-              </button>
-            ))}
+            {PRICING_MODES.map(({ id, label, desc }) => {
+              const shown = (draft.pricingMode ?? config.sellPricingMode) === id;
+              return (
+                <button
+                  key={id}
+                  className={`mode-opt ${shown ? "active" : ""}`}
+                  aria-pressed={shown}
+                  disabled={busy || writeOff}
+                  onClick={() => setDraft({ ...draft, pricingMode: id === config.sellPricingMode ? undefined : id })}
+                >
+                  <span className="mode-opt-label">{label}</span>
+                  <span className="mode-opt-desc">{desc}</span>
+                </button>
+              );
+            })}
           </div>
 
           <h3 className="sub">Automation</h3>
           <div className="ap-checks">
-            <label className="check ap-check">
-              <input type="checkbox" checked={config.sellAutoReprice} disabled={busy || writeOff} onChange={(e) => void save({ sellAutoReprice: e.target.checked })} />
-              Auto-price the enabled offer from what buyers actually paid (at the level above, floor-protected)
-            </label>
-            <label className="check ap-check">
-              <input type="checkbox" checked={config.sellAutoSize} disabled={busy || writeOff} onChange={(e) => void save({ sellAutoSize: e.target.checked })} />
-              Auto-size the offer: the standard 30-day lease, the routing-fee promise, and a window from the smallest channel that pays for itself up to what can be funded
-            </label>
-            <label className="check ap-check">
-              <input type="checkbox" checked={config.sellAutoRelist} disabled={busy || writeOff} onChange={(e) => void save({ sellAutoRelist: e.target.checked })} />
-              Auto-relist a depleted offer (top it back up within your caps)
-            </label>
-            <label className="check ap-check">
-              <input type="checkbox" checked={config.sellAutoClose} disabled={busy || writeOff} onChange={(e) => void save({ sellAutoClose: e.target.checked })} />
-              Auto-close channels after the lease ends (reclaim the capital on-chain)
-            </label>
+            {flagBox("sellAutoReprice", "Auto-price the enabled offer from what buyers actually paid (at the level above, floor-protected)")}
+            {flagBox(
+              "sellAutoSize",
+              "Auto-size the offer: the standard 30-day lease, the routing-fee promise, and a window from the smallest channel that pays for itself up to what can be funded",
+            )}
+            {flagBox("sellAutoRelist", "Auto-relist a depleted offer (top it back up within your caps)")}
+            {flagBox("sellAutoClose", "Auto-close channels after the lease ends (reclaim the capital on-chain)")}
           </div>
           <p className="muted ap-hint">{OFFER_AUTOMATION_HINT}</p>
 
@@ -556,38 +699,45 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
               promised to other orders) — a capital limit, not a settings one.
             </div>
           ) : null}
-          {(shownNum("sellMaxChannelSats") ?? 0) > (shownNum("sellMaxDeploySats") ?? 0) ? (
+          {shownMax("sellMaxChannelSats") > shownMax("sellMaxDeploySats") ? (
             <div className="sug-warn">
-              ⚠ Max channel size ({satsCompact(shownNum("sellMaxChannelSats") ?? 0)}) is above your capital cap (
-              {satsCompact(shownNum("sellMaxDeploySats") ?? 0)}), so an order that big can never be served. The smaller
-              number is what actually applies.
+              ⚠ Max channel size ({satsCompact(shownMax("sellMaxChannelSats"))}) is above your capital cap (
+              {satsCompact(shownMax("sellMaxDeploySats"))}), so an order that big can never be served. The smaller number is what
+              actually applies.
             </div>
           ) : null}
-          {saveRow}
+          {unsavedBar}
         </section>
       ) : (
         <section className="panel">
           <div className="apply-row">
-            <button className="reset" disabled={busy || !!server.runningSince} onClick={runNow}>Run once now</button>
+            <button className="reset" disabled={busy || !!server.runningSince || writeOff} onClick={runNow}>
+              Run once now
+            </button>
             <span className="muted">{server.lastRunAt ? `last run ${timeAgo(server.lastRunAt)}` : "never run"}</span>
             {(() => {
               const run = runProgress(server.runningSince, Date.now());
               return run && !run.stuck ? <span className="muted">· {run.text}</span> : null;
             })()}
           </div>
-          {lastRun ? (
-            <p className="muted">
-              Last run: {lastRun.applied} applied, {lastRun.failed} failed of {lastRun.attempted} attempted.
-            </p>
-          ) : null}
+          {lastRun ? <p className="muted">{runResultLine(lastRun)}</p> : null}
+
+          <h3 className="sub">What each area decided last</h3>
+          <div className="ap-status-list">
+            {(["fees", "rebalance", "channels", "magma", "maxHtlc"] as DecisionArea[]).map((a) => (
+              <StatusLine key={a} area={a} status={status?.[a]} />
+            ))}
+          </div>
+          {unsavedBar}
 
           <h3 className="sub">History</h3>
+          <p className="muted ap-hint">What the autopilot changed — waits and deferrals are in each area's decision above, not here.</p>
           {server.history.length === 0 ? (
-            <p className="muted empty">No runs yet.</p>
+            <p className="muted empty">No changes yet.</p>
           ) : (
             <ul className="ap-history">
               {server.history.map((run, i) => {
-                const items: { ok: boolean; label: string; why?: string; error?: string }[] = [
+                const items: { ok: boolean; pending?: boolean; label: string; why?: string; error?: string }[] = [
                   ...(run.changes ?? []).map((c) => ({
                     ok: c.ok,
                     // Every change says why (the engine's reason, a lease
@@ -596,7 +746,13 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                     why: [c.why, c.clampedBy].filter(Boolean).join(" · ") || undefined,
                     error: c.error,
                   })),
-                  ...(run.rebalances ?? []).map((r) => ({ ok: r.ok, label: `Rebalance · ${r.alias}${r.ok ? ` — ${r.feeSats} sat` : ""}`, error: r.error })),
+                  ...(run.rebalances ?? []).map((r) => ({
+                    ok: r.ok,
+                    // Still in flight: not a failure (yet) — amber, not a red ✗.
+                    pending: r.inFlight,
+                    label: `Rebalance · ${r.alias}${r.ok ? ` — ${r.feeSats} sat` : r.inFlight ? " — still in flight" : ""}`,
+                    error: r.error,
+                  })),
                   ...(run.channels ?? []).map((c) => ({ ok: c.ok, label: `Open · ${c.alias}${c.ok ? ` — ${satsCompact(c.sizeSats)}` : ""}`, error: c.error })),
                   ...(run.sells ?? []).map((s) => ({ ok: s.ok, label: `Magma ${s.action} · ${satsCompact(s.sizeSats)}`, error: s.error })),
                   ...(run.maxHtlc ?? []).map((m) => ({
@@ -622,14 +778,18 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                           const key = `${run.at}:${j}`;
                           const expandable = !it.ok && !!it.error;
                           const isOpen = openItems.has(key);
+                          const mark = it.ok ? "✓" : it.pending ? "⋯" : "✗";
                           return (
                             <div key={j} className="ap-line">
                               {expandable ? (
-                                <button className="ap-line-btn" onClick={() => toggleItem(key)}>
-                                  <span className="ap-caret">{isOpen ? "▾" : "▸"}</span>✗ {it.label}
+                                <button className="ap-line-btn" aria-expanded={isOpen} onClick={() => toggleItem(key)}>
+                                  <span className="ap-caret">{isOpen ? "▾" : "▸"}</span>
+                                  {mark} {it.label}
                                 </button>
                               ) : (
-                                <span className={it.ok ? "ap-line-ok" : "ap-line-fail"}>{it.ok ? "✓" : "✗"} {it.label}</span>
+                                <span className={it.ok ? "ap-line-ok" : it.pending ? "ap-line-wait" : "ap-line-fail"}>
+                                  {mark} {it.label}
+                                </span>
                               )}
                               {it.why ? <div className="muted small ap-why">{it.why}</div> : null}
                               {expandable && isOpen ? <div className="ap-err-msg">{it.error}</div> : null}

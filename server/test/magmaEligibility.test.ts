@@ -241,6 +241,8 @@ test("D10: the open waits for Magma only where selling is realistic AND the expe
   // A deferral is the channel stage's decision, not a failed run (D15).
   assert.deepEqual(run.channels, []);
   assert.match(s.autopilot.getState().decisions.channels?.text ?? "", /^deferred: selling on Magma is expected to earn more on this capital \(~\d+ ppm\/yr: offers like yours fill ~[\d.]+ times a year\) than a new routing channel \(~0 ppm\/yr: what the median month-old channel here earned\)/);
+  // D15/D16: amber "deferred" on the Autopilot tab — never a red failure.
+  assert.equal(s.autopilot.getState().status.channels.state, "deferred");
   assert.equal(s.node.callsTo("default.openChannel").length, 0);
 });
 

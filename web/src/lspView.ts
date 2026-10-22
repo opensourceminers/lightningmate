@@ -24,6 +24,15 @@ export function lspReachText(uris: readonly string[]): string {
   const http =
     "Wallets that order LSPS1 over HTTPS — ZEUS on a remote node or over LNC, LDK-based wallets — can't order here: " +
     "LightningMate answers LSPS1 only over Lightning peer messages.";
+  if (uris.length === 0) {
+    // Not "reachable over Tor only": with no address announced at all — not
+    // even a .onion one — a wallet has nothing to dial (review of P5).
+    return (
+      "This node announces no address — not even a .onion one — so a buyer's wallet has nothing to dial: only a wallet " +
+      "already connected to this node could order here. Announcing the node's Tor address in LND makes it reachable over " +
+      `Tor. ${http} Expect no orders — LSP mode is experimental.`
+    );
+  }
   if (isTorOnly(uris)) {
     return (
       "This node is reachable over Tor only, so very few wallets can order here. A buyer's wallet has to order over " +

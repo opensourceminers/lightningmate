@@ -26,6 +26,9 @@ export interface ChannelView {
   status: ChannelStatus;
   /** Force-close in progress: blocks until time-locked funds are spendable. */
   timelockBlocks?: number;
+  /** A channel still closing: its closing (or commitment) transaction, once
+   *  LND has one — the activity feed names it as this channel's close. */
+  closeTransactionId?: string;
   /** Open channels: how long a force-close would lock our funds (LND's
    *  local CSV delay, blocks) and the commitment transaction's fee as LND
    *  last signed it (sat) — what the close dialog states before a force-close. */
@@ -119,6 +122,7 @@ export async function getChannelsView(
           unsettled: 0,
           status: p.is_closing ? "pending_close" : "pending_open",
           timelockBlocks: p.timelock_blocks,
+          ...(p.is_closing && p.close_transaction_id ? { closeTransactionId: p.close_transaction_id } : {}),
           role: classify(p.sent, p.received),
         };
       }),

@@ -202,7 +202,3 @@ export function afterRefillText(r: Pick<RebalanceRecommendation, "postRefillPpm"
     : `after the refill: kept at ≥ ${r.expectedRevenuePpm} ppm until the refilled sats have routed out`;
 }
 
-/** The last rebalance decision, as the tab shows it. */
-export function decisionLine(d: { at: string; text: string } | undefined): string | null {
-  return d ? `Last decision (${timeAgo(d.at)}): ${d.text}` : null;
-}

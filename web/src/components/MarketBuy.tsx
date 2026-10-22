@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { pageHidden } from "../usePolledData";
 import type { BuyOffer, BuyOffersResponse, OrderState } from "../types";
 import { satsCompact } from "../format";
 import { Scanning } from "./Scanning";
@@ -60,6 +61,8 @@ export function MarketBuy() {
     let alive = true;
     let iv: ReturnType<typeof setInterval> | undefined;
     const tick = async () => {
+      // (Not in a background tab — the server follows the purchase itself.)
+      if (pageHidden()) return;
       try {
         const s = await api.ambossOrder(orderId);
         if (!alive) return;

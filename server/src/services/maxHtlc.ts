@@ -72,11 +72,16 @@ export function decideMaxHtlc(
  * back as `failures`, not as an error: each is recorded as failed, and the
  * channel is left alone for MAX_HTLC_BACKOFF_MS (`backoff`: channel id →
  * when it was refused, kept by the caller).
+ *
+ * `shouldStop`: asked right before each update — once it says yes, the pass
+ * ends there and writes nothing more (the switch went off, or all
+ * automation was paused, while it ran — review of P7).
  */
 export async function runMaxHtlcPass(
   readLnd: AuthenticatedLnd,
   writeLnd: AuthenticatedLnd,
   backoff: Map<string, number> = new Map(),
+  opts: { shouldStop?: () => boolean } = {},
 ): Promise<MaxHtlcChange[]> {
   const [{ channels }, mine] = await Promise.all([getChannels({ lnd: readLnd }), getOwnPubkey(readLnd)]);
   const out: MaxHtlcChange[] = [];
@@ -106,6 +111,7 @@ export async function runMaxHtlcPass(
     const currentMaxSat = current.max_htlc_mtokens ? Math.floor(Number(current.max_htlc_mtokens) / 1000) : null;
     const { change, toSat } = decideMaxHtlc(spendable, currentMaxSat);
     if (!change) continue;
+    if (opts.shouldStop?.()) break;
 
     try {
       const res = await updateRoutingFees({

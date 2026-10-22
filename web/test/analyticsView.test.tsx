@@ -11,6 +11,7 @@
 import "./helpers/browserGlobals";
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   ACTIVITY_LABEL,
@@ -19,8 +20,11 @@ import {
   closeNote,
   flowHint,
   forwardsReadNote,
+  magmaLeasesKpi,
+  magmaLeasesSub,
   noForwardsIn7d,
   pnlCostParts,
+  pnlSpendLines,
   rebalanceCostSub,
   rebalanceRoiKpi,
   rebalanceSummaryLine,
@@ -32,7 +36,7 @@ import {
 import { satsCompact } from "../src/format";
 import { ChannelProfitability } from "../src/components/AnalyticsPanel";
 import { tzOffsetMin } from "../src/api";
-import type { ChannelForwardStat, ForwardsReport, OutcomesReport, PnlSummary, RebalanceCostsResponse } from "../src/types";
+import type { ChannelForwardStat, ForwardsReport, MagmaV2Report, OutcomesReport, PnlSummary, RebalanceCostsResponse } from "../src/types";
 
 const stat = (id: string, o: Partial<ChannelForwardStat> = {}): ChannelForwardStat => ({
   channelId: id,
@@ -77,6 +81,7 @@ const costs = (perChannel: RebalanceCostsResponse["perChannel"], o: Partial<Reba
   amountSats: 0,
   perChannel,
   notLogged: 0,
+  beforeLog: 0,
   logOnly: 0,
   logTrackedSince: null,
   note: null,
@@ -105,6 +110,57 @@ test("channel profitability lists a channel that only brought flow in, credits i
     ],
   );
   assert.equal(rows.find((r) => r.channelId === "gone")?.status, "closed");
+});
+
+// Review of P6: a channel refilled in the window with no forward in it was
+// labelled "closed" under its bare id — the forwards report lists only
+// channels seen in a forward (PROBE-CLOSED-LABEL).
+test("a channel with only a rebalancing cost takes its alias and status from the channel list — 'closed' only when it is not in it", () => {
+  const list = [
+    { id: "850000x1x0", peerAlias: "ACINQ", status: "open" as const },
+    { id: "850001x1x0", peerAlias: "opening-peer", status: "pending_open" as const },
+  ];
+  const rows = channelPnlRows(
+    report([]),
+    costs([
+      { channelId: "850000x1x0", feeSats: 300, count: 1 },
+      { channelId: "850001x1x0", feeSats: 20, count: 1 },
+      { channelId: "850009x1x0", feeSats: 50, count: 1, alias: "old-peer", status: "closed" },
+      { channelId: "850010x1x0", feeSats: 10, count: 1 },
+    ]),
+    list,
+  );
+  const by = Object.fromEntries(rows.map((r) => [r.channelId, [r.alias, r.status]]));
+  assert.deepEqual(by["850000x1x0"], ["ACINQ", "open"]);
+  assert.deepEqual(by["850001x1x0"], ["opening-peer", "pending"]);
+  assert.deepEqual(by["850009x1x0"], ["old-peer", "closed"], "closed: named as the server knows it");
+  assert.deepEqual(by["850010x1x0"], ["850010x1x0", "closed"]);
+  const html = renderToStaticMarkup(<ChannelProfitability rows={rows} />);
+  assert.match(html, /<td class="an-alias">ACINQ<\/td>/);
+  assert.doesNotMatch(html, /850000x1x0<span class="muted"> · closed/);
+  assert.match(html, /old-peer<span class="muted"> · closed<\/span>/);
+  // No channel list yet: the server's word stands — an open channel is not
+  // taken for closed while the list loads.
+  const early = channelPnlRows(report([]), costs([{ channelId: "850000x1x0", feeSats: 300, count: 1, alias: "ACINQ", status: "open" }]), null);
+  assert.deepEqual([early[0].alias, early[0].status], ["ACINQ", "open"]);
+});
+
+// Review of P6: on a node upgraded from 0.7.x, LightningMate's own older
+// refills (dropped by the old 200-record cap) read "made outside LightningMate".
+test("rebalances from before LightningMate's log began are said apart — never 'made outside LightningMate'", () => {
+  assert.equal(rebalanceCostSub(costs([], { count: 3, notLogged: 0, beforeLog: 1, logTrackedSince: "2026-10-12T08:00:00.000Z" })), "3 runs · 1 from before its log began (2026-10-12) — LightningMate's or another tool's");
+  assert.equal(rebalanceCostSub(costs([], { count: 3, notLogged: 2, beforeLog: 0 })), "3 runs · 2 made outside LightningMate");
+  const rebal = pnlCostParts(pnl({ rebalanceCostSats: 120, rebalanceNotLogged: 0, rebalanceBeforeLog: 1, rebalanceLogSince: "2026-10-12T08:00:00.000Z" })).find((c) => c.key === "rebal");
+  assert.equal(rebal?.note, "incl. 1 from before its log began (2026-10-12) — LightningMate's or another tool's");
+  assert.doesNotMatch(rebal?.note ?? "", /made outside/);
+});
+
+test("P&L lists the routing fees of the Lightning payments sent beside the on-chain sends' fees — each apart, not in net", () => {
+  assert.deepEqual(pnlSpendLines(pnl({ otherChainFeesSats: 400, lightningPaymentFeesSats: 12, lightningPaymentCount: 2 })), [
+    "+ 400 sat other on-chain fees (sends), not counted in net",
+    "+ 12 sat routing fees of 2 Lightning payments you sent (not rebalancing, Magma purchases or the service fee), not counted in net",
+  ]);
+  assert.deepEqual(pnlSpendLines(pnl({})), []);
 });
 
 test("the Overview's top channels rank what they earned plus what they brought in", () => {
@@ -157,6 +213,8 @@ const pnl = (o: Partial<PnlSummary> = {}): PnlSummary => ({
   rebalanceCount: 0,
   rebalanceSource: "lnd",
   rebalanceNotLogged: 0,
+  rebalanceBeforeLog: 0,
+  rebalanceLogSince: null,
   channelOpenCostSats: 0,
   channelCloseCostSats: 0,
   channelCloseCount: 0,
@@ -164,6 +222,8 @@ const pnl = (o: Partial<PnlSummary> = {}): PnlSummary => ({
   inboundPurchaseCostSats: 0,
   inboundPurchaseCount: 0,
   otherChainFeesSats: 0,
+  lightningPaymentFeesSats: 0,
+  lightningPaymentCount: 0,
   serviceFeePaidSats: 0,
   totalCostSats: 0,
   netProfitSats: 0,
@@ -241,4 +301,31 @@ test("the feed names a rebalance, a channel open and a close — and every kind 
 
 test("the viewer's time zone goes with the daily series' requests (minutes east of UTC)", () => {
   assert.equal(tzOffsetMin(), -new Date().getTimezoneOffset());
+});
+
+// Review a6-ux:numbers-mislead: the Magma tile showed all-time net profit
+// (on-chain costs estimated at today's rate) under the 30d/90d selector.
+test("the Analytics Magma tile says it is all time, net with estimated on-chain costs — not the window's", () => {
+  assert.equal(magmaLeasesSub(3), "3 sold since the start · net, on-chain costs estimated — the window's lease income is in P&L");
+  assert.equal(magmaLeasesSub(0), "none sold yet");
+  const panel = readFileSync(new URL("../src/components/AnalyticsPanel.tsx", import.meta.url), "utf8");
+  assert.match(panel, /label="Magma leases · all time"/);
+});
+
+// Review of P7: with the Magma report not loaded — or its read failed — the
+// tile read "none sold yet", as if the node had never sold.
+test("the Analytics Magma tile says 'unknown' when the Magma report couldn't be read — never 'none sold yet' for a report that never came", () => {
+  const report = (sold: number, net: number) => ({ analytics: { filledOrdersAllTime: sold, netProfitSat: net } }) as Pick<MagmaV2Report, "analytics">;
+  assert.deepEqual(magmaLeasesKpi(null, "Bad Gateway"), { value: "—", sub: "unknown — the Magma report couldn't be read (Bad Gateway)" });
+  assert.deepEqual(magmaLeasesKpi(null, null), { value: "—", sub: "loading…" });
+  assert.deepEqual(magmaLeasesKpi(report(0, 0), null), { value: "—", sub: "none sold yet" });
+  assert.deepEqual(magmaLeasesKpi(report(2, 12_345), null), {
+    value: "+12,345",
+    unit: "sat",
+    tone: "green",
+    sub: "2 sold since the start · net, on-chain costs estimated — the window's lease income is in P&L",
+  });
+  const panel = readFileSync(new URL("../src/components/AnalyticsPanel.tsx", import.meta.url), "utf8");
+  assert.match(panel, /magmaTile: magmaLeasesKpi\(magma, magmaError\)/);
+  assert.match(panel, /\.catch\(\(e\) => setMagmaError\(/);
 });

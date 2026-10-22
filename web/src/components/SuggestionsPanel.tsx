@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
 import { api } from "../api";
+import { caretButtonProps } from "../a11y";
 import type {
   ChannelSuggestion,
   NodeNeed,
@@ -11,7 +12,7 @@ import type {
 import { sats, satsCompact } from "../format";
 import { fastRateHint } from "../onchainView";
 import { openLines, startingFeeText } from "../openView";
-import { promisedSpend, spendPromisedQuestion } from "../statusNotes";
+import { WRITE_MODE_HINT, promisedSpend, spendPromisedQuestion } from "../statusNotes";
 import { Scanning } from "./Scanning";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
@@ -183,7 +184,7 @@ export function SuggestionsPanel() {
     <section className="panel">
       <div className="panel-head">
         <h2>
-          Channel suggestions <span className="v2-badge">v2</span>
+          Channel suggestions
         </h2>
         {data ? <span className="muted">graph age {Math.round(data.graphAgeSec / 60)}m</span> : null}
       </div>
@@ -195,7 +196,7 @@ export function SuggestionsPanel() {
         {canWrite ? (
           <> Hit <strong>Open</strong> to fund a channel at the suggested size (editable).</>
         ) : (
-          <> Opening is <strong>disabled</strong> (read-only) — enable writes in the Autopilot tab.</>
+          <> Opening is <strong>disabled</strong> — {WRITE_MODE_HINT}.</>
         )}
       </div>
 
@@ -258,7 +259,9 @@ export function SuggestionsPanel() {
             return (
               <Fragment key={s.pubkey}>
                 <tr className="feerec-row" onClick={() => toggle(s.pubkey)}>
-                  <td className="feerec-caret">{isOpen ? "▾" : "▸"}</td>
+                  <td className="feerec-caret">
+                    <button {...caretButtonProps(isOpen, () => toggle(s.pubkey), `Details: ${s.alias || s.pubkey.slice(0, 12)}`)}>{isOpen ? "▾" : "▸"}</button>
+                  </td>
                   <td className="num strong">
                     <span className={`sug-score u-${s.usefulness}`}>{s.score}</span>
                   </td>

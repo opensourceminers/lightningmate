@@ -7,6 +7,7 @@ import { computeNodeNeed, type NodeNeed } from "./suggestRecommend.js";
 import { saleFeeConfig } from "./serviceFee.js";
 import { getMarket, type MagmaOffer } from "./amboss.js";
 import { getMyOffers, getMyOrders, type MyOffer, type MyOrder } from "./magmaApi.js";
+import { errorText as errorMessage } from "./errorText.js";
 import {
   clearingFor,
   demandFit,
@@ -228,6 +229,9 @@ export interface MagmaV2Report {
   nodeNeedReason: string;
   hasRoutingData: boolean;
   satsPerUsd: number | null;
+  /** Reads that failed (Amboss: your offers or orders; LND: forwards) — said
+   *  first among sell.warnings too. The figures they feed are partial. */
+  readProblems: string[];
   sell: {
     state:
       | "good_to_sell"
@@ -342,13 +346,32 @@ export async function getMagmaRecommendations(
   // against listed asks and say so.
   // Only this node's offers and sales (one Amboss account can sell for several nodes).
   const ownKey = await getOwnPubkey(lnd);
+  // A read that fails is said (readProblems, first among the warnings), never
+  // turned into plausible data (review a8: an Amboss error read as "no offers,
+  // no orders" — the page then recommended creating a second offer — and an
+  // LND error as 0 sat on chain: "not enough idle capital"). Without a key
+  // there is nothing of yours to read: no problem. LND's on-chain balance is
+  // what every capital figure stands on: without it there is no report.
+  const readProblems: string[] = [];
+  const failedRead = <T>(what: string, fallback: T) => (err: unknown): T => {
+    readProblems.push(`${what} (${errorMessage(err)})`);
+    return fallback;
+  };
   const [market, myOffers, myOrdersView, channels, chain, flow, oc] = await Promise.all([
     getMarket(),
-    getMyOffers(apiKey, ownKey).catch(() => [] as MyOffer[]),
-    getMyOrders(apiKey, ownKey).catch(() => ({ orders: [] as MyOrder[], pendingSeller: 0 })),
+    getMyOffers(apiKey, ownKey).catch(
+      apiKey ? failedRead("your offers couldn't be read from Amboss — the page can't tell whether you have one", [] as MyOffer[]) : () => [] as MyOffer[],
+    ),
+    getMyOrders(apiKey, ownKey).catch(
+      apiKey
+        ? failedRead("your orders couldn't be read from Amboss — pending orders and your sales aren't counted", { orders: [] as MyOrder[], pendingSeller: 0 })
+        : () => ({ orders: [] as MyOrder[], pendingSeller: 0 }),
+    ),
     getChannelsView(lnd),
-    getChainBalance({ lnd }).catch(() => ({ chain_balance: 0 })),
-    getFlowSummary(lnd, 30).catch(() => null),
+    getChainBalance({ lnd }).catch((err: unknown) => {
+      throw new Error(`LND's on-chain balance couldn't be read (${errorMessage(err)}) — the capital this node could sell is unknown`);
+    }),
+    getFlowSummary(lnd, 30).catch(failedRead("LND's forwards couldn't be read — the routing benchmark is the default one", null)),
     onchainCosts(lnd, cfg.openTxVbytes, cfg.closeTxVbytes),
     refreshMagmaHistory(),
   ]);
@@ -646,7 +669,7 @@ export async function getMagmaRecommendations(
         ? `per sale, a lease at this price nets ~${recommended.leaseApy}%/yr (after on-chain costs and the service fee) — above your routing benchmark of ${(adjustedRouting / 10000).toFixed(2)}%/yr`
         : `per sale, a lease at this price nets ~${recommended.leaseApy}%/yr (after on-chain costs and the service fee) — below your routing benchmark: routing this capital may earn more`,
     );
-    if (!hasRoutingData) warnings.push("no routing history yet — using a default routing benchmark; treat the %/yr comparison loosely");
+    if (!hasRoutingData && flow !== null) warnings.push("no routing history yet — using a default routing benchmark; treat the %/yr comparison loosely");
     warnings.push("on-chain open/close cost is estimated; high mempool fees can erase lease profit");
 
     // State machine.
@@ -933,16 +956,10 @@ export async function getMagmaRecommendations(
   const recommendedMinSizeSat = sellWindow.min;
   const minViableSizeSat = sellWindow.minViable;
 
-  // The lease length we advertise has to be one buyers actually use: 4032
-  // blocks was our old default and appears on exactly one of ~99 live
-  // offers, while the market trades 4320 / 8640 / 12960 / 25920. A shorter or
-  // odd lease is flagged as well as a longer one (before, only longer was).
-  if (primary && primary.minBlockLength !== standardLease)
-    sellWarnings.push(
-      primary.minBlockLength < standardLease || !COMMON_LEASES.has(primary.minBlockLength)
-        ? `your offer promises a ${primary.minBlockLength}-block lease — a length almost no order uses; the standard is ${standardLease} blocks`
-        : `your offer demands at least ${primary.minBlockLength} blocks; most buyers ask for ${standardLease}`,
-    );
+  // (An odd lease — 4032 blocks was our old default, the market trades 4320 /
+  // 8640 / 12960 / 25920 — is flagged on each offer's own recommendation, the
+  // card Market → Sell shows for it. It was flagged here too, for the first
+  // offer: the page showed the same warning twice — review of P1b.)
 
   if (reportClearing && marketActivity()) {
     const act = marketActivity()!;
@@ -988,7 +1005,8 @@ export async function getMagmaRecommendations(
       historyAgeHours: magmaHistoryAgeHours(),
       popularLeaseBlocks: popularLease,
       reasons: sellReasons,
-      warnings: sellWarnings,
+      // What couldn't be read comes first: every figure below stands on it.
+      warnings: [...readProblems, ...sellWarnings],
       recommendations,
     },
     buy: {
@@ -1000,5 +1018,6 @@ export async function getMagmaRecommendations(
       ranked: ranked.slice(0, 50),
     },
     analytics,
+    readProblems,
   };
 }

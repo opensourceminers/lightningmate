@@ -51,6 +51,13 @@ export async function getForwardEvents(lnd: AuthenticatedLnd, windowDays: number
   return (await fetchForwards(lnd, windowDays)).events;
 }
 
+/** The same read, with whether it got them all: `complete` false when LND
+ *  holds more forwards in the window than are read — the NEWEST are then the
+ *  ones missing (LND pages oldest first). */
+export async function readForwardEvents(lnd: AuthenticatedLnd, windowDays: number, nowMs = Date.now()): Promise<{ events: ForwardEvent[]; complete: boolean }> {
+  return fetchForwards(lnd, windowDays, nowMs);
+}
+
 /** Pull every forwarding event in the window, paging through the LND cursor
  *  — from the window's start onwards (ForwardingHistory pages by index,
  *  oldest first): a read cut short at MAX_PAGES misses the newest. */

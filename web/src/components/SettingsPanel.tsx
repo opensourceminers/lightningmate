@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { pageHidden } from "../usePolledData";
 import type { AmbossKeyCheck, AppSettings, FiatCurrency, LspStatus, PrivacyInfo, TorRoute } from "../types";
 import { CLEARNET_WARNING, lspBuyerGuide, lspIgnoredLine, lspReachText, lspRecoveryLine, lspRefusalLines, lspServedLine } from "../lspView";
 import { TOR_ROUTES, destinationLine, privacySummary } from "../privacyView";
@@ -20,6 +21,7 @@ const CURRENCIES: { value: FiatCurrency; label: string }[] = [
 ];
 
 export function SettingsPanel({ onChange, version }: { onChange: () => void; version?: string }) {
+  const [diagError, setDiagError] = useState<string | null>(null);
   const ui = useUi();
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [busy, setBusy] = useState(false);
@@ -161,7 +163,8 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
   useEffect(() => {
     if (!lsp?.enabled) return;
     const t = setInterval(() => {
-      api.lspStatus().then(setLsp).catch(() => undefined);
+      // (Not in a background tab: nobody is watching.)
+      if (!pageHidden()) api.lspStatus().then(setLsp).catch(() => undefined);
     }, 10_000);
     return () => clearInterval(t);
   }, [lsp?.enabled]);
@@ -510,6 +513,21 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
         Lightning Mate <strong>{formatVersion(version) || "version unknown"}</strong> — include this when
         you report a problem.
       </p>
+      <div className="apply-row">
+        <button
+          className="reset"
+          onClick={() => {
+            setDiagError(null);
+            api.diagnosticsDownload().catch((e) => setDiagError(e instanceof Error ? e.message : String(e)));
+          }}
+        >
+          Download diagnostics
+        </button>
+        <span className="muted small">
+          What the autopilot decided and why, its settings and history, and how the Magma lane stands — no keys or secrets.
+        </span>
+      </div>
+      {diagError ? <p className="banner error">{diagError}</p> : null}
     </section>
 
     <BackupCard />

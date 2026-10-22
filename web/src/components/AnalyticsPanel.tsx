@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../api";
+import { sharedMagmaReport } from "../magmaReport";
 import type { BoughtInboundResponse, ChannelView, ForwardsReport, MagmaV2Report, OutcomesReport, RebalanceCostsResponse } from "../types";
 import { sats, satsCompact, timeAgo } from "../format";
 import { routingYield } from "../yieldView";
 import { feeTuningKpi } from "../feeView";
-import { CHANNEL_PNL_CAPTION, channelPnlRows, forwardsReadNote, rebalanceCostSub, rebalanceRoiKpi, trendBadge, type ChannelPnlRow } from "../analyticsView";
+import { CHANNEL_PNL_CAPTION, channelPnlRows, forwardsReadNote, magmaLeasesKpi, rebalanceCostSub, rebalanceRoiKpi, trendBadge, type ChannelPnlRow } from "../analyticsView";
 import { SkeletonPanel } from "./Skeleton";
 import { ForwardsPanel } from "./ForwardsPanel";
 import { Sparkline } from "./Sparkline";
@@ -190,7 +191,7 @@ function RefillsTable({ outcomes }: { outcomes: OutcomesReport }) {
   );
 }
 
-function BoughtInbound({ data }: { data: BoughtInboundResponse }) {
+export function BoughtInbound({ data }: { data: BoughtInboundResponse }) {
   if (data.items.length === 0) return null;
   return (
     <section className="panel">
@@ -221,8 +222,9 @@ function BoughtInbound({ data }: { data: BoughtInboundResponse }) {
               <td className="num cost">−{sats(p.costSats)}</td>
               <td className="num">{p.inboundForwards}</td>
               <td className="num green">{sats(p.inboundFeesSats)}</td>
-              <td className={`num net ${p.roiPct === null ? "muted" : p.roiPct >= 100 ? "green" : "cost"}`}>
+              <td className={`num net ${p.roiPct === null ? "muted" : p.roiPct >= 100 ? "green" : "cost"}`} title={p.roiPct === null ? (p.roiNote ?? "no channel to follow") : undefined}>
                 {p.roiPct === null ? "—" : `${p.roiPct}%${p.running ? " so far" : ""}`}
+                {p.roiPct === null && p.roiNote ? <small className="muted"> not measured</small> : null}
               </td>
             </tr>
           ))}
@@ -237,8 +239,11 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
   const [days, setDays] = useState(30);
   const [fr, setFr] = useState<ForwardsReport | null>(null);
   const [costs, setCosts] = useState<RebalanceCostsResponse | null>(null);
-  const [channels, setChannels] = useState<ChannelView[]>([]);
+  // null until loaded: a cost-only row then keeps the server's status.
+  const [channels, setChannels] = useState<ChannelView[] | null>(null);
   const [magma, setMagma] = useState<MagmaV2Report | null>(null);
+  // Why the Magma report couldn't be read (its tile says "unknown", not "none sold").
+  const [magmaError, setMagmaError] = useState<string | null>(null);
   const [outcomes, setOutcomes] = useState<OutcomesReport | null>(null);
   const [bought, setBought] = useState<BoughtInboundResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -267,11 +272,13 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
 
   useEffect(() => {
     api.channels().then((c) => setChannels(c)).catch(() => {});
-    api.magmaRecommendations().then(setMagma).catch(() => {});
+    sharedMagmaReport()
+      .then(setMagma)
+      .catch((e) => setMagmaError(e instanceof Error ? e.message : String(e)));
     api.autopilotOutcomes().then(setOutcomes).catch(() => {});
   }, []);
 
-  const pnl = useMemo(() => (fr ? channelPnlRows(fr, costs) : []), [fr, costs]);
+  const pnl = useMemo(() => (fr ? channelPnlRows(fr, costs, channels) : []), [fr, costs, channels]);
 
   const kpis = useMemo(() => {
     if (!fr) return null;
@@ -279,11 +286,9 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
     const revenue = fr.totalFeesEarnedSats;
     const net = revenue - rebalCost;
     // On the node's own capital in open channels, gross and net (a5).
-    const nodeYield = routingYield(channels, revenue, rebalCost, days);
-    const magmaNet = magma?.analytics.netProfitSat ?? 0;
-    const magmaSold = magma?.analytics.filledOrdersAllTime ?? 0;
-    return { revenue, rebalCost, net, nodeYield, magmaNet, magmaSold };
-  }, [fr, costs, channels, magma, days]);
+    const nodeYield = routingYield(channels ?? [], revenue, rebalCost, days);
+    return { revenue, rebalCost, net, nodeYield, magmaTile: magmaLeasesKpi(magma, magmaError) };
+  }, [fr, costs, channels, magma, magmaError, days]);
 
   const roi = rebalanceRoiKpi(outcomes);
 
@@ -360,12 +365,14 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
                 title="What inbound bought on Magma cost, the part of each lease that falls in this window. P&L books the whole purchase when it was paid."
               />
             ) : null}
+            {/* All time, said so: it stood under the 30d/90d selector as if it
+                were the window's (review a6-ux:numbers-mislead). */}
             <Kpi
-              label="Magma leases"
-              value={kpis.magmaSold > 0 || kpis.magmaNet !== 0 ? `${kpis.magmaNet >= 0 ? "+" : "−"}${sats(Math.abs(kpis.magmaNet))}` : "—"}
-              unit={kpis.magmaSold > 0 || kpis.magmaNet !== 0 ? "sat" : undefined}
-              tone={kpis.magmaSold > 0 || kpis.magmaNet !== 0 ? "green" : undefined}
-              sub={kpis.magmaSold > 0 ? `${kpis.magmaSold} sold · net` : "none sold yet"}
+              label="Magma leases · all time"
+              value={kpis.magmaTile.value}
+              unit={kpis.magmaTile.unit}
+              tone={kpis.magmaTile.tone}
+              sub={kpis.magmaTile.sub}
             />
           </div>
           {costs?.note ? <p className="muted small">{costs.note}</p> : null}

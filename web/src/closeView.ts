@@ -43,14 +43,18 @@ const daysText = (blocks: number) => {
   return `~${d} day${d === 1 ? "" : "s"}`;
 };
 
-/** "~41 d left", "~5 h left" — or that the funding hasn't confirmed. */
-export function leaseLeft(l: Pick<ChannelLease, "blocksLeft" | "reportedByAmboss" | "reportedAt">, nowMs = Date.now()): string {
+/** "~41 d left", "~5 h left" — or that the funding hasn't confirmed, or (its
+ *  end known) that only the current block height couldn't be read. */
+export function leaseLeft(
+  l: Pick<ChannelLease, "blocksLeft" | "reportedByAmboss" | "reportedAt"> & Partial<Pick<ChannelLease, "untilHeight">>,
+  nowMs = Date.now(),
+): string {
   if (l.reportedByAmboss) {
     // A listing older than a day says from when it is.
     const at = l.reportedAt ? Date.parse(l.reportedAt) : NaN;
     return Number.isFinite(at) && nowMs - at > 86_400_000 ? `running (per Amboss, ${new Date(at).toISOString().slice(0, 10)})` : "running (per Amboss)";
   }
-  if (l.blocksLeft === null) return "funding not confirmed yet";
+  if (l.blocksLeft === null) return l.untilHeight != null ? "time left unknown (block height not read)" : "funding not confirmed yet";
   const hours = (Math.max(0, l.blocksLeft) * 10) / 60;
   return hours >= 48 ? `~${Math.round(hours / 24)} d left` : `~${Math.max(1, Math.round(hours))} h left`;
 }

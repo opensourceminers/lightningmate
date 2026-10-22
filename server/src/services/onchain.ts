@@ -114,6 +114,13 @@ export interface OnchainTx {
   isConfirmed: boolean;
   isOutgoing: boolean;
   createdAt: string;
+  /** The transactions whose outputs it spends (LND > 0.15 lists them). */
+  spends?: string[];
+  /** Those of them whose spent output was no coin of the wallet's — an
+   *  anchor, a commitment's to_local or HTLC output: how a closing channel's
+   *  fee bump (anchor CPFP) or sweep is told from a payment, which spends
+   *  only wallet coins (a cooperative close's payout among them). */
+  spendsNonWallet?: string[];
 }
 
 export async function getOnchainTxs(lnd: AuthenticatedLnd, limit = 25): Promise<OnchainTx[]> {
@@ -129,6 +136,8 @@ export async function getOnchainTxs(lnd: AuthenticatedLnd, limit = 25): Promise<
         isConfirmed: t.is_confirmed,
         isOutgoing: t.is_outgoing,
         createdAt: t.created_at,
+        ...(t.inputs?.length ? { spends: [...new Set(t.inputs.map((i) => i.transaction_id))] } : {}),
+        ...(t.inputs?.some((i) => !i.is_local) ? { spendsNonWallet: [...new Set(t.inputs.filter((i) => !i.is_local).map((i) => i.transaction_id))] } : {}),
       };
     })
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))

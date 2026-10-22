@@ -77,9 +77,20 @@ standalone via Docker.
   orders named. "Send everything" empties the wallet (LND keeps
   its anchor reserve).
 - **Routing** — a full forwards report (per-channel, daily, recent events).
-- **Autopilot** — a one-click **Strategy** (Max routing / Balanced / Max profit)
-  tunes fees, rebalancing and channel opening together; no preset ever touches
-  Magma selling, which stays your own explicit decision. Fees are volume-first
+- **Autopilot** — a **Strategy** preset (Max routing / Balanced / Max profit)
+  tunes fees, rebalancing and channel opening together — it shows exactly what
+  it changes (what moves capital first) and applies after you confirm;
+  no preset ever touches Magma selling, which stays your own explicit decision.
+  **Pause all automation** switches every automation off at once — a run in
+  progress starts no further fee write, refill, open, offer change or Magma
+  order accept (a payment or open already under way finishes, and Magma
+  orders already taken on are carried to their end); Resume brings back what
+  was on, selling excepted. LSP mode (Settings) is not part of the pause:
+  while it is on it keeps answering wallet orders and opening their channels,
+  and the pause says so. Each area — fees, rebalancing, channels, Magma —
+  says what it last decided and why (acted, nothing to do, waiting, deferred,
+  blocked, error), on its sub-tab and on the Overview; settings below the
+  switches are saved together, after a check of every value. Fees are volume-first
   (competitive, zero base fee) with profit floors so a channel never routes
   below its refill cost — and every channel sold through Magma or LSPS1 is kept
   within the routing-fee cap its buyer was promised, for the lease; rebalances

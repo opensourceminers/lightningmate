@@ -41,6 +41,13 @@ export type MagmaPhase =
 
 export const TERMINAL_PHASES: ReadonlySet<MagmaPhase> = new Set(["settled", "cancelled", "rejected", "failed"]);
 
+/** What an order the lane turned down was refused for: the operator's caps
+ *  (max channel size, deploy cap), the wallet (not enough on-chain capital),
+ *  or anything else — an unreachable buyer, an asset or a fee Amboss didn't
+ *  report, an accept Amboss kept refusing, a deadline. Only the first two are
+ *  helped by raising the caps or funding the wallet. */
+export type RefusalKind = "cap" | "capital" | "other";
+
 /** Phases whose order still needs coins from the wallet: accepted (or being
  *  accepted) but not yet funded. */
 const RESERVING_PHASES: ReadonlySet<MagmaPhase> = new Set(["accepting", "accepted", "held", "opening"]);
@@ -105,6 +112,9 @@ export interface MagmaJournalEntry {
   /** Why the order ended the way it did (reject/cancel/fail), or why the lane
    *  is not acting on it (skip). Shown in the UI. */
   reason?: string;
+  /** A rejected order: what it was refused for (RefusalKind). Absent on
+   *  records from before it was kept. */
+  refusalKind?: RefusalKind;
   /** The lane's latest decision about this order, with its reason. */
   decision?: { at: string; action: string; reason: string };
   lastStatus?: string;

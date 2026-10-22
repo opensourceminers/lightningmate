@@ -11,7 +11,7 @@ import type { RebalanceLog } from "./rebalanceLog.js";
 import type { EarningsLog } from "./earningsLog.js";
 import type { ServiceFeeLedger } from "./serviceFee.js";
 import type { MagmaPurchases } from "./magmaPurchases.js";
-import { rebalanceCosts } from "./rebalanceCosts.js";
+import { lightningPaymentFees, rebalanceCosts } from "./rebalanceCosts.js";
 import { closeCostTxids, closeCostsFrom, closedFactsOf, walletTxsOf, type CloseCost, type WalletTx } from "./closeCosts.js";
 import { closeSeeds, type CloseTxArchive } from "./closeTxArchive.js";
 
@@ -52,9 +52,13 @@ export interface PnlSummary {
   /** "lnd": LND's payment history (every tool's rebalances); "log":
    *  LightningMate's own log only (LND couldn't be read). */
   rebalanceSource: "lnd" | "log";
-  /** Of rebalanceCount, those LightningMate didn't make (another tool, or
-   *  before its log existed). */
+  /** Of rebalanceCount, those LightningMate didn't make: from when its log
+   *  covers rebalances on, with no record in it (another tool). */
   rebalanceNotLogged: number;
+  /** Of rebalanceCount, those from before LightningMate's log began
+   *  (rebalanceLogSince) — whose they were can't be told. */
+  rebalanceBeforeLog: number;
+  rebalanceLogSince: string | null;
   channelOpenCostSats: number;
   channelCloseCostSats: number;
   /** Channels whose close falls in the window … */
@@ -66,6 +70,12 @@ export interface PnlSummary {
   inboundPurchaseCostSats: number;
   inboundPurchaseCount: number;
   otherChainFeesSats: number;
+  /** The routing fees of the Lightning payments this node sent over the
+   *  window — its own sends, not rebalances, Magma purchases or the service
+   *  fee (each counted as its own cost). Shown apart, not counted in net:
+   *  like otherChainFeesSats, a cost of spending, not of running the node. */
+  lightningPaymentFeesSats: number;
+  lightningPaymentCount: number;
   /** Service fees actually paid out over the window, incl. the routing fee to
    *  deliver them. */
   serviceFeePaidSats: number;
@@ -78,8 +88,8 @@ export interface PnlSummary {
 export interface PnlSources {
   rebalanceLog: RebalanceLog;
   earnings: Pick<EarningsLog, "recent">;
-  serviceFees?: Pick<ServiceFeeLedger, "paidSince">;
-  purchases?: Pick<MagmaPurchases, "paidCosts">;
+  serviceFees?: Pick<ServiceFeeLedger, "paidSince"> & Partial<Pick<ServiceFeeLedger, "entries">>;
+  purchases?: Pick<MagmaPurchases, "paidCosts"> & Partial<Pick<MagmaPurchases, "list">>;
   /** LightningMate's copy of the close transactions LND's wallet forgets
    *  at a restart (closeTxArchive.ts). */
   closeTxs?: Pick<CloseTxArchive, "update">;
@@ -169,10 +179,17 @@ export function purchaseCostsSince(purchases: Pick<MagmaPurchases, "paidCosts"> 
 export async function getPnl(lnd: AuthenticatedLnd, src: PnlSources, windowDays: number, nowMs = Date.now()): Promise<PnlSummary> {
   const cutoff = nowMs - windowDays * 86_400_000;
 
-  const [flows, facts, rebalancing] = await Promise.all([
+  // Payments P&L counts under their own cost: a Magma purchase's invoice
+  // (inbound bought) and a service fee — not again as a Lightning send.
+  const counted = new Set<string>([
+    ...(src.purchases?.list?.() ?? []).map((p) => p.paymentHash),
+    ...(src.serviceFees?.entries?.() ?? []).flatMap((e) => (e.paymentHash ? [e.paymentHash] : [])),
+  ]);
+  const [flows, facts, rebalancing, sends] = await Promise.all([
     getFlowSummary(lnd, windowDays),
     readChainFacts(lnd, nowMs, src.closeTxs),
     rebalanceCosts(lnd, src.rebalanceLog, cutoff, nowMs),
+    lightningPaymentFees(lnd, cutoff, counted, nowMs),
   ]);
   const chain = chainCostsSince(facts, cutoff);
   const bought = purchaseCostsSince(src.purchases, cutoff);
@@ -199,6 +216,7 @@ export async function getPnl(lnd: AuthenticatedLnd, src: PnlSources, windowDays:
   if (rebalancing.note) notes.push(rebalancing.note);
   // LND hands forwards over oldest first: a read cut short misses the newest.
   if (flows.complete === false) notes.push("Routing revenue: only the first 100,000 forwards of this window were read — the most recent are missing");
+  if (sends === null) notes.push("The routing fees of Lightning payments sent couldn't be read from LND");
 
   return {
     windowDays,
@@ -210,6 +228,8 @@ export async function getPnl(lnd: AuthenticatedLnd, src: PnlSources, windowDays:
     rebalanceCount: rebalancing.count,
     rebalanceSource: rebalancing.source,
     rebalanceNotLogged: rebalancing.notLogged,
+    rebalanceBeforeLog: rebalancing.beforeLog,
+    rebalanceLogSince: rebalancing.logTrackedSince,
     channelOpenCostSats: chain.openCostSats,
     channelCloseCostSats: chain.closeCostSats,
     channelCloseCount: chain.closeCount,
@@ -217,6 +237,8 @@ export async function getPnl(lnd: AuthenticatedLnd, src: PnlSources, windowDays:
     inboundPurchaseCostSats: bought.sats,
     inboundPurchaseCount: bought.count,
     otherChainFeesSats: chain.otherChainFeesSats,
+    lightningPaymentFeesSats: sends?.feeSats ?? 0,
+    lightningPaymentCount: sends?.count ?? 0,
     serviceFeePaidSats,
     totalCostSats,
     netProfitSats: routingRevenueSats + magmaRevenueSats - totalCostSats,

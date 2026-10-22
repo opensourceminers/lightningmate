@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { api } from "../api";
+import { WRITE_MODE_HINT } from "../statusNotes";
 import type { CreatedInvoice, DecodedRequest, LnActivity, PriceInfo } from "../types";
 import { fiat, sats, timeAgo } from "../format";
 import { useUi } from "./Overlay";
@@ -110,8 +111,8 @@ export function PaymentsPanel({ price }: { price?: PriceInfo | null }) {
     <div className="pay">
       {!canWrite ? (
         <div className="dryrun-banner">
-          Sending and creating invoices are <strong>disabled</strong> (read-only macaroon). You can
-          still decode requests and view history. Enable writes to send & receive.
+          Sending and creating invoices are <strong>disabled</strong> — {WRITE_MODE_HINT}. You can still decode
+          requests and view history.
         </div>
       ) : null}
 

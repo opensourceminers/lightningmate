@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import type { ConfirmOpts } from "./Overlay";
-import type { AutopilotConfigPatch, Eligibility, MyOffer } from "../types";
+import type { AutomationSwitch, AutopilotConfig, AutopilotConfigPatch, Eligibility, MyOffer } from "../types";
 import { disableSellingMessage, enableSellingMessage, enableSellingPendingMessage } from "../magmaView";
+import { LSP_NOT_PAUSED, pauseLines } from "../autopilotView";
 
 /**
  * Switching Liquidity provision on and off (D9) — the decisions behind the
@@ -119,4 +120,94 @@ export async function turnSellingOff(d: SellingSwitchDeps): Promise<boolean> {
     return d.save({ sellEnabled: false }, "Liquidity provision is off (offers still listed)");
   }
   return false;
+}
+
+
+/** The "Pause all automation" confirmation: what stops, and what doesn't —
+ *  LSP mode included, which is no switch of the autopilot's (LSP_NOT_PAUSED). */
+export function PauseBody({ lines, lspModeOn = false }: { lines: string[]; lspModeOn?: boolean }) {
+  return (
+    <>
+      <p className="modal-msg">This switches off at once:</p>
+      <ul className="preset-changes">
+        {lines.map((l) => (
+          <li key={l}>{l}</li>
+        ))}
+      </ul>
+      {lspModeOn ? <p className="modal-msg">{LSP_NOT_PAUSED}</p> : null}
+      <p className="modal-msg muted">
+        What is already under way ends on record, and a sold channel's promised fee cap is still kept. “Resume” switches back on
+        what was on — Liquidity provision excepted, which you switch on yourself.
+      </p>
+    </>
+  );
+}
+
+/**
+ * "Pause all automation" (review a6-ux:presets-unconfirmed-capital: there was
+ * no global off — five switches on four sub-tabs). After a confirmation that
+ * says what stops — and, with Liquidity provision on and offers listed, the
+ * same question as switching selling off: disable them too, or keep them
+ * listed with their orders waiting for a decision nobody makes (D6).
+ */
+export async function pauseAllAutomation(
+  d: Pick<SellingSwitchDeps, "confirm" | "offers" | "disableOffer" | "toast"> & {
+    config: Pick<AutopilotConfig, AutomationSwitch>;
+    /** LSP mode (Settings) is on: the pause leaves it on, and says so. */
+    lspModeOn?: boolean;
+    pause: () => Promise<boolean>;
+  },
+): Promise<boolean> {
+  const lines = pauseLines(d.config);
+  if (lines.length === 0) return false;
+  const ok = await d.confirm({
+    title: "Pause all automation?",
+    body: <PauseBody lines={lines} lspModeOn={d.lspModeOn} />,
+    confirmLabel: "Pause all",
+    danger: true,
+  });
+  if (!ok) return false;
+  if (d.config.sellEnabled) {
+    const listed = await d
+      .offers()
+      .then((os) => os.filter((o) => o.status === "ENABLED"))
+      .catch(() => null);
+    if (listed === null) {
+      const go = await d.confirm({
+        title: "Your Magma offers",
+        message:
+          "Your offers could not be read from Amboss right now. If one is still listed, its new orders wait for your decision on " +
+          "Market → Orders — and Amboss counts an order nobody decides against your seller score. Pause anyway?",
+        confirmLabel: "Pause anyway",
+        danger: true,
+      });
+      if (!go) return false;
+    } else if (listed.length > 0) {
+      if (await d.confirm({ title: "Your Magma offers", message: disableSellingMessage(listed.length), confirmLabel: "Disable offers too", danger: true })) {
+        const stillListed: string[] = [];
+        for (const o of listed) {
+          try {
+            const r = await d.disableOffer(o.id);
+            if (r.status === "ENABLED") stillListed.push(short(o.id));
+          } catch (e) {
+            stillListed.push(`${short(o.id)} (${e instanceof Error ? e.message : String(e)})`);
+          }
+        }
+        if (stillListed.length) {
+          // Paused with an offer listed nobody decides on: not without asking.
+          d.toast(`Not paused: offer ${stillListed.join(", ")} could not be disabled and is still listed. Try again, or disable it on Market → Sell.`, "error");
+          return false;
+        }
+      } else if (
+        !(await d.confirm({
+          title: "Pause with your offers still listed?",
+          message: "Your offers stay listed on Amboss, and their orders wait for your decision on Market → Orders.",
+          confirmLabel: "Pause, keep offers listed",
+        }))
+      ) {
+        return false;
+      }
+    }
+  }
+  return d.pause();
 }

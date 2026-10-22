@@ -15,7 +15,9 @@ import { SkeletonPanel } from "./components/Skeleton";
 import { TabIcon } from "./components/TabIcon";
 import { WalletPanel } from "./components/WalletPanel";
 import { usePolledData } from "./usePolledData";
-import { useAppVersion } from "./useAppVersion";
+import { useHealthInfo } from "./useAppVersion";
+import { nodeErrorHint } from "./statusNotes";
+import { draftIsEmpty, draftStore } from "./autopilotForm";
 
 type Tab = "overview" | "channels" | "market" | "wallet" | "analytics" | "autopilot" | "settings";
 
@@ -33,7 +35,12 @@ export function App() {
   const node = usePolledData(api.node, 15_000);
   const channels = usePolledData(api.channels, 30_000);
   const price = usePolledData(api.price, 300_000);
-  const version = useAppVersion();
+  const health = useHealthInfo();
+  // Unsaved autopilot settings outlive the tab (autopilotForm.ts): its label
+  // says so, wherever the operator is.
+  const [apUnsaved, setApUnsaved] = useState(() => !draftIsEmpty(draftStore.get()));
+  useEffect(() => draftStore.subscribe((d) => setApUnsaved(!draftIsEmpty(d))), []);
+  const version = health?.version ?? "";
   const [tab, setTab] = useState<Tab>("overview");
   // Sub-tab to open when navigating from an Overview tile (e.g. Channels → suggestions).
   const [pendingSub, setPendingSub] = useState<string | undefined>(undefined);
@@ -96,17 +103,19 @@ export function App() {
           >
             <TabIcon id={t.id} />
             {t.label}
+            {t.id === "autopilot" && apUnsaved ? (
+              <span className="tab-dot" title="Unsaved settings" aria-label="unsaved settings">
+                •
+              </span>
+            ) : null}
           </button>
         ))}
       </nav>
 
       {anyError ? (
-        <div className="banner error">
-          Couldn’t reach the node: {anyError}
-          <div className="banner-sub">
-            Check <code>LND_SOCKET</code>, cert and read-only macaroon in your
-            <code> .env</code>, and that the backend is running.
-          </div>
+        <div className="banner error" role="alert">
+          LND isn’t answering: {anyError}
+          <div className="banner-sub">{nodeErrorHint(health?.platform)}</div>
         </div>
       ) : null}
 
@@ -124,7 +133,7 @@ export function App() {
 
         {tab === "channels" ? (
           channels.data ? (
-            <ChannelsPanel channels={channels.data} initialSub={pendingSub} />
+            <ChannelsPanel key={subKey} channels={channels.data} initialSub={pendingSub} />
           ) : (
             <SkeletonPanel rows={6} />
           )

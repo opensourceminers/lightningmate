@@ -340,10 +340,72 @@ test("upgrading never loosens a safety limit: 'no fee changes' and large reserve
   assert.equal(ok({ channelReserveSats: 0 }).ok, false, "the reserve floor still holds");
 });
 
+// Review of P0: a 0.7.7 autopilot.json made by direct API calls can hold its
+// numbers as text. 0.7.7's arithmetic read "5000000" as 5,000,000 (balance −
+// reserve, "0" > 0, slice(0, "0")); the repair read it as "not a number" and
+// fell back to the DEFAULT, with automation left on.
+test("a number stored as text counts as that number: a big reserve, 'no fee changes' and a too-big channel size keep doing what they did", () => {
+  const { config, repairs } = sanitizePersistedConfig({
+    enabled: true,
+    channelEnabled: true,
+    rebalanceEnabled: true,
+    channelReserveSats: "5000000",
+    sellReserveSats: " 3000000 ",
+    maxChangesPerRun: "0",
+    channelSizeSats: "2000000000",
+    intervalMinutes: "1e4",
+    policy: { minPpm: "100", maxPpm: "900" },
+    rebalancePolicy: { econRatio: "0.3" },
+  });
+  // Before: 50,000 (the default) — the channel autopilot could spend 4.95M
+  // more of the wallet than the stored reserve let it.
+  assert.equal(config.channelReserveSats, 5_000_000);
+  assert.equal(config.sellReserveSats, 3_000_000);
+  // Before: 5 (the default) — fee automation, kept on, started changing fees.
+  assert.equal(config.maxChangesPerRun, 0);
+  assert.equal(config.enabled, true);
+  // Before: 0 = "auto", the suggestion's full size, with the channel
+  // autopilot on. Now: above the 10 BTC ceiling, so it is switched off —
+  // 0.7.7 opened nothing until the wallet held 20 BTC to spare.
+  assert.equal(config.channelSizeSats, 1_000_000_000);
+  assert.equal(config.channelEnabled, false);
+  assert.ok(repairs.some((r) => /^channelEnabled: switched off — the stored channel size of 2000000000 sat is above/.test(r)), JSON.stringify(repairs));
+  assert.equal(config.intervalMinutes, 10_000);
+  assert.deepEqual([config.policy.minPpm, config.policy.maxPpm], [100, 900]);
+  // A valid ratio as text is that ratio: rebalancing stays on, as it ran.
+  assert.equal(config.rebalancePolicy.econRatio, 0.3);
+  assert.equal(config.rebalanceEnabled, true);
+  // Each conversion is said, so the operator learns the file was repaired.
+  for (const field of ["channelReserveSats", "sellReserveSats", "maxChangesPerRun", "channelSizeSats", "intervalMinutes", "policy.minPpm", "rebalancePolicy.econRatio"]) {
+    assert.ok(repairs.some((r) => r.startsWith(`${field}: `) && /stored as text — read as the number/.test(r)), `${field}: ${JSON.stringify(repairs)}`);
+  }
+  // Text that is no number still falls back to the default — and is said.
+  const blank = sanitizePersistedConfig({ channelReserveSats: "", maxChangesPerRun: "five" });
+  assert.equal(blank.config.channelReserveSats, DEFAULT_CONFIG.channelReserveSats);
+  assert.ok(blank.repairs.includes('channelReserveSats: "" is not a number — using 50000'), JSON.stringify(blank.repairs));
+  // A switch written as text is no switch: it goes off, as before.
+  assert.equal(sanitizePersistedConfig({ enabled: "true" }).config.enabled, false);
+});
+
+test("a stored sub-minimum size or a never-open hour window written as text still switches that automation off", () => {
+  const small = sanitizePersistedConfig({ channelEnabled: true, channelSizeSats: "15000" });
+  assert.deepEqual([small.config.channelSizeSats, small.config.channelEnabled], [20_000, false]);
+  const never = sanitizePersistedConfig({ rebalanceEnabled: true, rebalanceHourStart: "25", rebalanceHourEnd: "26" });
+  assert.equal(never.config.rebalanceEnabled, false);
+  assert.ok(never.repairs.some((r) => /hour window 25→26 never opened/.test(r)), JSON.stringify(never.repairs));
+  const zeroRatio = sanitizePersistedConfig({ rebalanceEnabled: true, rebalancePolicy: { econRatio: "0" } });
+  assert.equal(zeroRatio.config.rebalanceEnabled, false);
+  assert.ok(zeroRatio.repairs.some((r) => /^rebalanceEnabled: switched off — the stored econ ratio 0 is below/.test(r)), JSON.stringify(zeroRatio.repairs));
+  // A legacy "0" budget (= no cap) is the explicit "no limit" it meant.
+  assert.equal(sanitizePersistedConfig({ rebalanceDailyBudgetSats: "0" }).config.rebalanceDailyBudgetSats, null);
+});
+
 test("upgrading never lets a stored value that kept rebalancing idle start it", () => {
   // A blank "Econ ratio" field saved 0 in 0.7.7: every rebalance's cost cap
   // was 0. Raised to the 0.05 minimum, rebalances would start paying fees.
-  for (const econRatio of [0, 0.01, -1, null, "0.3"]) {
+  // (A number written as text counts as that number — "0" below; "0.3" is a
+  // valid ratio and keeps rebalancing on, see the next test.)
+  for (const econRatio of [0, 0.01, -1, null, "0", "abc"]) {
     const { config, repairs } = sanitizePersistedConfig({ rebalanceEnabled: true, rebalancePolicy: { econRatio } });
     const what = `econRatio ${JSON.stringify(econRatio)}`;
     assert.equal(config.rebalanceEnabled, false, `${what}: rebalancing is switched off, not started`);

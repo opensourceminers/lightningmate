@@ -1,11 +1,13 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
+import { sharedMagmaReport } from "../magmaReport";
+import { useVisibleInterval } from "../usePolledData";
 import type { LspOrder, MagmaPurchase, MagmaV2Report, MyOrder, MyOrdersView } from "../types";
 import { sats, satsCompact } from "../format";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
 import { awaitsYourDecision, laneBanner } from "../statusNotes";
-import { localLabel, purchaseLabel } from "../magmaView";
+import { localLabel, orderStatusLabel, purchaseLabel } from "../magmaView";
 import { lspOrderLabel } from "../lspView";
 
 /** Why the order is where it is: the reason, the lane's last decision, or the
@@ -45,14 +47,16 @@ export function MarketOrders() {
     }
     if (!conn) return;
     api.ambossMyOrders().then(setData).catch(() => {});
-    api.magmaRecommendations().then(setRec).catch(() => {});
+    // Shared with the other views (one fetch a minute at most, however
+    // often this tab reloads).
+    sharedMagmaReport().then(setRec).catch(() => {});
   };
 
   useEffect(() => {
     void load();
-    const iv = setInterval(() => void load(), 30_000);
-    return () => clearInterval(iv);
   }, []);
+  // Every 30 s while the page is visible — paused in a background tab.
+  useVisibleInterval(() => void load(), 30_000);
 
   const accept = async (o: MyOrder) => {
     const fee = o.feeSats > 0 ? `${o.feeSats.toLocaleString()} sat ` : "";
@@ -273,9 +277,11 @@ export function MarketOrders() {
                 <td className="muted">{new Date(o.createdAt).toLocaleString()}</td>
                 <td className="num">{satsCompact(o.sizeSats)}</td>
                 <td className="num">{o.feeSats > 0 ? o.feeSats.toLocaleString() : "—"}</td>
-                <td title={localDetail(o)}>
-                  {o.status}
+                <td title={`${o.status}${localDetail(o) ? ` · ${localDetail(o)}` : ""}`}>
+                  {orderStatusLabel(o.status, o.side)}
                   {o.local ? <span className="muted"> · {localLabel(o.local)}</span> : null}
+                  {/* Why — on the page, not only in a tooltip (a11y). */}
+                  {localDetail(o) ? <div className="muted small">{localDetail(o)}</div> : null}
                 </td>
                 <td className="muted">{o.channelId ? `${o.channelId.slice(0, 12)}…` : "—"}</td>
                 <td>

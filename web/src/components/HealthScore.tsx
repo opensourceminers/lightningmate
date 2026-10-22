@@ -1,5 +1,6 @@
-import { useEffect, useState } from "react";
 import { api } from "../api";
+import { usePolledData } from "../usePolledData";
+import { InfoTip } from "./InfoTip";
 import type { NodeScore } from "../types";
 import { useCountUp } from "../useCountUp";
 import { scoreBar } from "../analyticsView";
@@ -20,23 +21,8 @@ const R = 52;
 const CIRC = 2 * Math.PI * R;
 
 export function HealthScore() {
-  const [data, setData] = useState<NodeScore | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = () =>
-      api
-        .score()
-        .then((s) => !cancelled && (setData(s), setError(null)))
-        .catch((e) => !cancelled && setError(e instanceof Error ? e.message : String(e)));
-    load();
-    const id = setInterval(load, 60_000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, []);
+  // Every minute while the page is visible (30 days of forwards each time).
+  const { data, error, updatedAt } = usePolledData<NodeScore>(api.score, 60_000);
 
   const animated = useCountUp(data?.score ?? 0);
   const color = data ? GRADE_COLOR[data.grade] ?? "#f7931a" : "#f7931a";
@@ -52,7 +38,11 @@ export function HealthScore() {
         ) : null}
       </div>
 
-      {error ? <p className="banner error">{error}</p> : null}
+      {error ? (
+        <p className="banner error">
+          {data && updatedAt ? `Couldn't refresh the score (${error}) — showing the one from ${new Date(updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.` : error}
+        </p>
+      ) : null}
 
       {data ? (
         <>
@@ -89,9 +79,12 @@ export function HealthScore() {
                 // no bar at all — never an empty one that reads as "0".
                 const bar = scoreBar(c);
                 return (
-                  <div className="cat-row" key={c.key} title={c.hint}>
+                  <div className="cat-row" key={c.key}>
                     <div className="cat-head">
-                      <span className="cat-label">{c.label}</span>
+                      <span className="cat-label">
+                        {c.label}
+                        {c.hint ? <InfoTip text={c.hint} label={`About ${c.label}`} /> : null}
+                      </span>
                       <span className="cat-detail">{c.detail}</span>
                     </div>
                     {bar.graded ? (

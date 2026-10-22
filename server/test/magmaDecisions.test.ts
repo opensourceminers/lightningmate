@@ -7,6 +7,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { JsonStore } from "../src/store.js";
+import { magmaRefusalAlerts } from "../src/services/alerts.js";
+import { refusalKindOf } from "../src/services/magmaDesk.js";
 import { internalError } from "./helpers/magma.js";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
 import {
@@ -108,6 +110,54 @@ test("orders outside the caps, or to an unreachable buyer, are rejected too — 
   assert.match(reason(big.id), /above your max channel size/);
   assert.match(reason(far.id), /unreachable/);
   assert.match(reason(over.id), /deploy cap reached/);
+});
+
+// Review of P1b: the alert for every turned-down order advised "raise the caps
+// or fund the wallet" — also for an unreachable buyer, an asset channel, a fee
+// Amboss didn't report: refusals more capital can't help.
+test("each refusal records what it was about, and only a cap or the wallet gets the 'raise the caps / fund the wallet' advice", async (t) => {
+  quiet(t);
+  const unreachable = "02" + "ee".repeat(32);
+  const { autopilot, node, magma, dir } = sellerSetup(t, { chainBalance: 6_000_000, config: { sellMaxChannelSats: 4_000_000, sellMaxDeploySats: 5_000_000 } });
+  node.override("default.connectPeer", (a, cb) => {
+    const pk = (a.addr as { pubkey: string }).pubkey;
+    if (pk === unreachable) return cb({ details: "dial tcp: i/o timeout" });
+    if (!node.peers.includes(pk)) node.peers.push(pk);
+    cb(null, {});
+  });
+  const big = magma.addSale({ buyerPubkey: BUYER, sizeSats: 4_500_000 });
+  const far = magma.addSale({ buyerPubkey: unreachable, sizeSats: 1_000_000 });
+  const asset = magma.addSale({ buyerPubkey: BUYER, assetType: "TAPROOT_ASSET" });
+  await autopilot.pollSellOrders();
+  // The wallet short: the next order can't be funded.
+  node.chainBalance = 500_000;
+  const poor = magma.addSale({ buyerPubkey: BUYER, sizeSats: 2_000_000 });
+  await autopilot.pollSellOrders();
+  for (const s of [big, far, asset, poor]) assert.equal(magma.sales.get(s.id)?.status, "SELLER_REJECTED", s.id);
+  const kinds = Object.fromEntries(autopilot.magma.refusals().map((r) => [r.orderId, r.kind]));
+  assert.deepEqual(
+    [kinds[big.id], kinds[far.id], kinds[asset.id], kinds[poor.id]],
+    ["cap", "other", "other", "capital"],
+    JSON.stringify(autopilot.magma.refusals()),
+  );
+  assert.equal(entryOnDisk(dir, big.id)?.refusalKind, "cap", "kept on the order's record");
+  const alerts = Object.fromEntries(magmaRefusalAlerts(autopilot.magma).map((a) => [a.id, a.message]));
+  assert.match(alerts[`magma:${big.id}`], /above your max channel size .* If you want orders like it, raise the caps on Autopilot → Magma/);
+  assert.match(alerts[`magma:${poor.id}`], /not enough on-chain capital.* If you want orders like it, add on-chain funds to the wallet/);
+  for (const id of [far.id, asset.id]) {
+    // Before: "If you want orders like it, raise the caps or fund the wallet".
+    assert.doesNotMatch(alerts[`magma:${id}`], /raise the caps|fund the wallet|on-chain funds/, alerts[`magma:${id}`]);
+    assert.match(alerts[`magma:${id}`], /See Market → Orders for the order\.$/);
+  }
+});
+
+test("a refusal recorded before its kind was kept still gets the right advice, from its reason", () => {
+  assert.equal(refusalKindOf("deploy cap reached (2,000,000 sat already sold or promised, cap 2,000,000 sat)"), "cap");
+  assert.equal(refusalKindOf("above your max channel size (3,000,000 > 2,000,000 sat)"), "cap");
+  assert.equal(refusalKindOf("not enough on-chain capital: 10,000 sat spendable after a 60,000 sat reserve"), "capital");
+  for (const r of ["the buyer's node is unreachable", "Amboss reported no fee for this order", "Amboss refused the accept 3 times", "not a bitcoin channel (TAPROOT_ASSET)"]) {
+    assert.equal(refusalKindOf(r), "other", r);
+  }
 });
 
 test("an order for a Taproot Assets channel is rejected at once — no HODL invoice, no accept", async (t) => {

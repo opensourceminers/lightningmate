@@ -40,6 +40,8 @@ export interface ChannelView {
   status: "open" | "pending_close" | "pending_open";
   /** Force-close in progress: blocks until time-locked funds are spendable. */
   timelockBlocks?: number;
+  /** A channel still closing: its closing (or commitment) transaction. */
+  closeTransactionId?: string;
   role: ChannelRole;
   /** What it charges now (GET /channels; null: not known, e.g. pending). */
   feeRatePpm?: number | null;
@@ -362,6 +364,8 @@ export interface AutopilotRebalance {
   costPpm: number | null;
   ok: boolean;
   error?: string;
+  /** Sent, and LND hasn't said how it ended yet: no failure (yet). */
+  inFlight?: boolean;
 }
 
 export interface AutopilotChannelOpen {
@@ -407,7 +411,9 @@ export interface AutopilotRun {
   channels: AutopilotChannelOpen[];
   sells: AutopilotSell[];
   maxHtlc?: MaxHtlcChange[];
-  /** Stages that threw (each stage is isolated; the others still ran). */
+  /** Stages that threw (each stage is isolated; the others still ran). A
+   *  run as "Run once now" answers it lists every one; a line of the run
+   *  history only those that are news (not the same failure again). */
   errors?: { stage: string; error: string }[];
 }
 
@@ -440,6 +446,8 @@ export interface AutopilotBounds {
   config: Partial<Record<keyof AutopilotConfig, NumberBounds>>;
   policy: Record<keyof FeePolicy, NumberBounds>;
   rebalancePolicy: Record<keyof RebalancePolicy, NumberBounds>;
+  /** The rules that span fields (the form checks them before sending). */
+  rules?: { channelSizeMinSats: number };
 }
 
 /** A settings update: any subset of fields; the policies merge field by field. */
@@ -447,6 +455,56 @@ export type AutopilotConfigPatch = Partial<Omit<AutopilotConfig, "policy" | "reb
   policy?: Partial<FeePolicy>;
   rebalancePolicy?: Partial<RebalancePolicy>;
 };
+
+/** The areas of the autopilot that keep a "last decision" (D16). */
+export type DecisionArea = "fees" | "rebalance" | "channels" | "magma" | "maxHtlc";
+
+/** What an area did with its last chance to act (server: autopilot.ts):
+ *  acted, idle (nothing needed doing), waiting (held back until a condition
+ *  passes), deferred (left for something else on purpose), blocked (needs
+ *  the operator), error. Waiting and deferred are never failures (D15). */
+export type DecisionState = "acted" | "idle" | "waiting" | "deferred" | "blocked" | "error";
+
+export interface AreaDecision {
+  at: string;
+  /** Absent on decisions stored before states were kept. */
+  state?: DecisionState;
+  text: string;
+  since?: string;
+  repeats?: number;
+  lastError?: { at: string; text: string };
+}
+
+/** An area as the UI shows it: its last decision — or off, or blocked now. */
+export interface AreaStatus {
+  /** "not_run": switched on, and no decision made yet. */
+  state: DecisionState | "off" | "not_run";
+  text: string;
+  /** null: no decision yet. */
+  at: string | null;
+  since?: string;
+  repeats?: number;
+  lastError?: { at: string; text: string };
+  /** Off or blocked: what it decided while it last ran. */
+  last?: AreaDecision;
+}
+
+/** The main run's last pass in numbers (every pass, no-op ones too). */
+export interface RunSummary {
+  at: string;
+  attempted: number;
+  applied: number;
+  failed: number;
+  feeChanges: { ok: number; failed: number };
+  rebalances: { ok: number; failed: number; inFlight: number };
+  opens: { ok: number; failed: number };
+  sells: { ok: number; failed: number };
+  maxHtlc: { ok: number; failed: number };
+  errors: string[];
+}
+
+/** The switches "Pause all automation" turns off. */
+export type AutomationSwitch = "enabled" | "rebalanceEnabled" | "channelEnabled" | "maxHtlcEnabled" | "sellEnabled";
 
 export interface AutopilotState {
   canWrite: boolean;
@@ -458,8 +516,20 @@ export interface AutopilotState {
   /** The main run in progress, if any: since when. */
   runningSince?: string | null;
   magmaLane?: MagmaLaneStatus;
-  /** Per area, the latest decision not to act and why. */
-  decisions?: Partial<Record<"magma" | "channels" | "rebalance", { at: string; text: string }>>;
+  /** Per area, the latest decision and why (as stored). */
+  decisions?: Partial<Record<DecisionArea, AreaDecision>>;
+  /** Per area, what to show: the last decision, or off / blocked. */
+  status?: Record<DecisionArea, AreaStatus>;
+  /** The main run's last pass in numbers. */
+  lastRun?: RunSummary | null;
+  /** When the autopilot itself last changed something (a run, the lane, a
+   *  sold channel's fee promise kept — never a fee set by hand). */
+  lastActionAt?: string | null;
+  /** "Pause all automation" in force: since when, and what was on. */
+  paused?: { at: string; was: AutomationSwitch[] } | null;
+  /** LSP mode (Settings) answering wallet orders. Not one of the autopilot's
+   *  switches: "Pause all automation" leaves it on, and says so while it is. */
+  lspModeOn?: boolean;
   /** Today's rebalance fee budget (UTC day) — autopilot and manual runs together. */
   rebalanceBudget?: RebalanceBudget;
 }
@@ -599,9 +669,15 @@ export interface RebalanceCostsResponse {
   feeSats: number;
   count: number;
   amountSats: number;
-  perChannel: { channelId: string; feeSats: number; count: number }[];
-  /** Rebalances LND lists that LightningMate didn't make. */
+  /** By refilled channel, with who it is with and whether it is still
+   *  there (absent where the server doesn't know). */
+  perChannel: { channelId: string; feeSats: number; count: number; alias?: string; status?: "open" | "pending" | "closed" }[];
+  /** Rebalances LND lists, from when LightningMate's log covers them on,
+   *  that it didn't make (another tool). */
   notLogged: number;
+  /** Rebalances LND lists from before LightningMate's log began — its own
+   *  older ones among them: whose they were can't be told. */
+  beforeLog: number;
   logOnly: number;
   logTrackedSince: string | null;
   note: string | null;
@@ -841,6 +917,8 @@ export interface HealthInfo {
   service: string;
   /** Image version (git tag, e.g. "v0.7.8"), or "dev". */
   version: string;
+  /** Running as the Umbrel app, or on its own (LND settings in .env). */
+  platform?: "umbrel" | "standalone";
 }
 
 export interface CloseChannelResult {
@@ -1051,6 +1129,11 @@ export interface OnchainTx {
   isConfirmed: boolean;
   isOutgoing: boolean;
   createdAt: string;
+  /** The transactions whose outputs it spends (when LND lists them). */
+  spends?: string[];
+  /** Those of them whose spent output was no wallet coin (an anchor, a
+   *  commitment's output): a closing channel's fee bump or sweep. */
+  spendsNonWallet?: string[];
 }
 
 export interface NewAddress {
@@ -1116,14 +1199,33 @@ export interface DashboardData {
     rebalance: boolean;
     channel: boolean;
     sell: boolean;
+    /** The main run's last pass … */
     lastRunAt: string | null;
-    lastApplied: number;
-    lastAttempted: number;
+    /** … and what THAT pass did (null: no summary of it on record). */
+    lastRun: {
+      applied: number;
+      attempted: number;
+      /** Everything that failed in it, each stage that threw included. */
+      failed: number;
+      feeChanges: number;
+      rebalances: number;
+      sells: number;
+      opens: number;
+      maxHtlc: number;
+      /** The stages that threw in it, by name. */
+      errors: string[];
+    } | null;
+    /** When the autopilot itself last changed something — never a fee set
+     *  by hand (its own item). */
+    lastActionAt: string | null;
     intervalMinutes: number;
-    lastFeeChanges: number;
-    lastRebalances: number;
-    lastSells: number;
-    lastOpens: number;
+    /** "Pause all automation" in force since (null: not paused). */
+    pausedAt?: string | null;
+    /** LSP mode (Settings) answering wallet orders — no switch of the
+     *  autopilot's: a pause leaves it on, and the digest says so. */
+    lspModeOn?: boolean;
+    /** Per area: the last decision, or off / blocked (compact). */
+    status: Partial<Record<DecisionArea, { state: AreaStatus["state"]; text: string; at: string | null }>>;
     /** Magma orders the lane turned down in the last two days (not dismissed). */
     magmaRefusals?: number;
     magmaRefusalReason?: string | null;
@@ -1428,8 +1530,13 @@ export interface PnlSummary {
   rebalanceCount: number;
   /** "lnd": every tool's rebalances (LND's payments); "log": LightningMate's own only. */
   rebalanceSource: "lnd" | "log";
-  /** Of rebalanceCount, those made outside LightningMate. */
+  /** Of rebalanceCount, those made outside LightningMate (another tool),
+   *  from when its log covers rebalances on. */
   rebalanceNotLogged: number;
+  /** Of rebalanceCount, those from before LightningMate's log began
+   *  (rebalanceLogSince): whose they were can't be told. */
+  rebalanceBeforeLog: number;
+  rebalanceLogSince: string | null;
   channelOpenCostSats: number;
   channelCloseCostSats: number;
   channelCloseCount: number;
@@ -1439,6 +1546,10 @@ export interface PnlSummary {
   inboundPurchaseCostSats: number;
   inboundPurchaseCount: number;
   otherChainFeesSats: number;
+  /** Routing fees of the Lightning payments this node sent (not rebalances,
+   *  Magma purchases or the service fee) — shown apart, not counted in net. */
+  lightningPaymentFeesSats: number;
+  lightningPaymentCount: number;
   serviceFeePaidSats: number;
   totalCostSats: number;
   netProfitSats: number;
@@ -2019,7 +2130,10 @@ export interface BoughtInboundRoi {
   inboundForwards: number;
   routedInSats: number;
   inboundFeesSats: number;
+  /** null: no channel to follow, or the forwards read doesn't cover the lease. */
   roiPct: number | null;
+  /** Why roiPct is null with a channel found (the "—" cell's title). */
+  roiNote: string | null;
 }
 
 export interface BoughtInboundResponse {
@@ -2027,6 +2141,8 @@ export interface BoughtInboundResponse {
   /** The window's share of what inbound bought cost, spread over each lease. */
   windowDays: number;
   amortizedSats: number;
+  /** False when LND holds more forwards than were read (the newest missing). */
+  forwardsComplete?: boolean;
   items: BoughtInboundRoi[];
 }
 
@@ -2035,6 +2151,9 @@ export interface MagmaV2Report {
   nodeNeedReason: string;
   hasRoutingData: boolean;
   satsPerUsd: number | null;
+  /** Reads that failed (your offers or orders on Amboss, LND's forwards) —
+   *  also first among sell.warnings. */
+  readProblems?: string[];
   sell: {
     state:
       | "good_to_sell"

@@ -1,16 +1,19 @@
+import { readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
 import { Router, type Request, type Response, type NextFunction } from "express";
 import { getClosedChannels, getFeeRates, getWalletInfo, signMessage, type AuthenticatedLnd, type GetClosedChannelsResult } from "lightning";
 import { getNodeScore } from "../services/score.js";
 import type { Config } from "../config.js";
 import { getNodeSummary, getOwnPubkey } from "../services/node.js";
 import { getChannelsView } from "../services/channels.js";
-import { getFlowSummary, getForwardEvents, getForwardsReport, parseTzOffset } from "../services/forwards.js";
+import { getFlowSummary, getForwardsReport, parseTzOffset, readForwardEvents } from "../services/forwards.js";
 import { getFeePreview, type FeeApplyItem, type FeePolicy } from "../services/fees.js";
 import { type SuggestionPolicy } from "../services/suggestions.js";
 import { getChannelSuggestionsV2, getCloseSuggestionsV2 } from "../services/suggestRecommend.js";
 import { channelLeases, leaseProtection, standardChannelId } from "../services/leases.js";
 import { BOUGHT_INBOUND_METHOD, amortizedPurchaseCost, boughtInboundRoi } from "../services/inboundRoi.js";
-import { rebalanceCosts } from "../services/rebalanceCosts.js";
+import { labelCostChannels, rebalanceCosts } from "../services/rebalanceCosts.js";
+import { getAlias } from "../services/aliases.js";
 import type { LnPlusStore } from "../services/lnplusStore.js";
 import { checkSwapEligibility, getPoolNodes, getSwaps, type NodeFacts } from "../services/lnplus.js";
 import { getMagmaRecommendations } from "../services/magmaRecommend.js";
@@ -164,6 +167,40 @@ function describeError(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** A state file in the data directory, for "Download diagnostics": its size
+ *  and age — or why it could not be looked at. Never its contents. */
+export interface StateFileInfo {
+  file: string;
+  bytes?: number;
+  modifiedAt?: string;
+  error?: string;
+}
+
+/**
+ * The data directory's state files, for diagnostics. The directory is busy:
+ * every save writes "<name>.tmp-<pid>-<n>" and renames it over the file a
+ * moment later (store.ts), and the autopilot saves on every run and every
+ * decision change. A temp file is no state of its own and is left out, and a
+ * file gone between the listing and its look is skipped — before, either
+ * failed the whole download with HTTP 502 "node_request_failed", which reads
+ * as an LND failure (review of P7, round 2). A file that is there but can't
+ * be looked at is listed with the reason: worth knowing when helping.
+ */
+export function stateFileList(dir: string): StateFileInfo[] {
+  const out: StateFileInfo[] = [];
+  for (const f of readdirSync(dir, { withFileTypes: true })) {
+    if (!f.isFile() || f.name.includes(".tmp-")) continue;
+    try {
+      const s = statSync(join(dir, f.name));
+      out.push({ file: f.name, bytes: s.size, modifiedAt: s.mtime.toISOString() });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; // gone since the listing
+      out.push({ file: f.name, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return out.sort((a, b) => a.file.localeCompare(b.file));
+}
+
 export function createApiRouter(
   lnd: AuthenticatedLnd,
   writeLnd: AuthenticatedLnd | undefined,
@@ -246,7 +283,14 @@ export function createApiRouter(
   });
 
   router.get("/health", (_req, res) => {
-    res.json({ ok: true, service: "lightningmate", version: process.env.APP_VERSION ?? "dev" });
+    res.json({
+      ok: true,
+      service: "lightningmate",
+      version: process.env.APP_VERSION ?? "dev",
+      // Umbrel hands the app its LND through APP_LIGHTNING_NODE_IP (config.ts):
+      // the UI's words for "LND unreachable" differ (no .env to check there).
+      platform: process.env.APP_LIGHTNING_NODE_IP?.trim() ? "umbrel" : "standalone",
+    });
   });
 
   // Umbrel home-screen widget (four-stats). Polled by umbreld; cached briefly so
@@ -606,9 +650,18 @@ export function createApiRouter(
     }),
   );
 
+  // LSP mode (Settings) is no switch of the autopilot's: "Pause all
+  // automation" leaves it on — it keeps answering wallet orders and opening
+  // their channels — and while it is on, the pause says so (review of P7,
+  // round 2: "every automation off at once" and "nothing new starts on its
+  // own" were untrue with it on). It runs only with write access.
+  const lspModeOn = (): boolean => settings.get().lspModeEnabled && !!writeLnd;
+  /** The autopilot's state as the pages get it. */
+  const autopilotView = () => ({ ...autopilot.getState(), lspModeOn: lspModeOn() });
+
   // Autopilot status/config.
   router.get("/autopilot", (_req, res) => {
-    res.json(autopilot.getState());
+    res.json(autopilotView());
   });
 
   // Update autopilot config (enable/disable, interval, cooldown, policy). Every
@@ -624,7 +677,72 @@ export function createApiRouter(
       }
       throw err;
     }
-    res.json(autopilot.getState());
+    res.json(autopilotView());
+  });
+
+  // "Download diagnostics" (review a8-engineering:autopilot-decisions-
+  // invisible): what someone helping needs to see why the autopilot did or
+  // didn't act — the version, the settings (they hold no secret; the Amboss
+  // key is never in it), each area's status and when its decision changed,
+  // the run history, the Magma lane and offer sync, and each state file's
+  // size and age (names and times only, never contents). Reads nothing new
+  // from Amboss: the Magma report is included only when the pages have it.
+  router.get(
+    "/diagnostics",
+    wrap(async (_req, res) => {
+      const st = autopilot.getState();
+      const files = stateFileList(config.dataDir);
+      const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+      res.setHeader("Content-Disposition", `attachment; filename="lightningmate-diagnostics-${stamp}.json"`);
+      res.json({
+        generatedAt: new Date().toISOString(),
+        app: {
+          version: process.env.APP_VERSION ?? "dev",
+          // The commit (Dockerfile ARG APP_REVISION, from CI); empty in a
+          // local build — null then.
+          revision: process.env.APP_REVISION?.trim() || null,
+          platform: process.env.APP_LIGHTNING_NODE_IP?.trim() ? "umbrel" : "standalone",
+          node: process.version,
+          writeEnabled: !!writeLnd,
+        },
+        autopilot: {
+          config: st.config,
+          status: st.status,
+          lastRunAt: st.lastRunAt,
+          runningSince: st.runningSince,
+          lastRun: st.lastRun,
+          paused: st.paused,
+          lspModeOn: lspModeOn(),
+          decisionLog: autopilot.decisionLog(),
+          history: st.history,
+          rebalanceBudget: st.rebalanceBudget,
+        },
+        magma: {
+          key: amboss.status(),
+          lane: st.magmaLane,
+          offerSync: autopilot.offerSyncStatus(),
+          recentOrders: autopilot.magma.recentOrders(20),
+          refusals: autopilot.magma.refusals(),
+          eligibility: autopilot.lastEligibility,
+          report: await autopilot.cachedPageReport(),
+        },
+        alerts: stateAlerts(config.dataDir),
+        stateFiles: files,
+      });
+    }),
+  );
+
+  // "Pause all automation": every switch off at once, what was on kept for
+  // "Resume" — which switches them back on, Liquidity provision excepted
+  // (switching selling on is its own decision, with the selling check, D9).
+  // LSP mode is not among them (lspModeOn above).
+  router.post("/autopilot/pause", (_req, res) => {
+    autopilot.pauseAll();
+    res.json(autopilotView());
+  });
+  router.post("/autopilot/resume", (_req, res) => {
+    const { resumed, sellingWasOn } = autopilot.resumeAll();
+    res.json({ resumed, sellingWasOn, state: autopilotView() });
   });
 
   // Trigger one autopilot run immediately.
@@ -635,7 +753,20 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      res.json({ run: await autopilot.runOnce(), state: autopilot.getState() });
+      const run = await autopilot.runOnceNow();
+      if (!run) {
+        // A run in progress (the schedule's, or a click before): this click
+        // starts nothing — it no longer answers an empty run as if a run had
+        // found nothing to do.
+        const since = autopilot.getState().runningSince;
+        res.status(409).json({
+          error: "busy",
+          message: `A run is already in progress${since ? ` (since ${since.slice(11, 16)} UTC)` : ""} — its result shows here when it ends.`,
+          runningSince: since,
+        });
+        return;
+      }
+      res.json({ run, state: autopilotView() });
     }),
   );
 
@@ -760,7 +891,21 @@ export function createApiRouter(
         return;
       }
       const nowMs = Date.now();
-      res.json({ windowDays: days, ...(await rebalanceCosts(lnd, rebalanceLog, nowMs - days * 86_400_000, nowMs)) });
+      const [costs, channels, closed] = await Promise.all([
+        rebalanceCosts(lnd, rebalanceLog, nowMs - days * 86_400_000, nowMs),
+        getChannelsView(lnd).catch(() => null),
+        getClosedChannels({ lnd }).catch((): GetClosedChannelsResult => ({ channels: [] })),
+      ]);
+      // A channel closed since: named by the log's record of its refills,
+      // else by its peer (LND's closed channels).
+      const logged = new Map<string, string>();
+      for (const r of rebalanceLog.successes()) if (r.targetAlias && !logged.has(r.targetId)) logged.set(r.targetId, r.targetAlias);
+      const peerOfClosed = new Map(closed.channels.filter((c) => c.id).map((c) => [c.id as string, c.partner_public_key]));
+      for (const c of costs.perChannel) {
+        const peer = peerOfClosed.get(c.channelId);
+        if (c.channelId && !logged.has(c.channelId) && peer) logged.set(c.channelId, await getAlias(lnd, peer));
+      }
+      res.json({ windowDays: days, ...costs, perChannel: labelCostChannels(costs.perChannel, channels, (id) => logged.get(id)) });
     }),
   );
 
@@ -825,7 +970,7 @@ export function createApiRouter(
       }
       const oldest = Math.min(...purchases.map((p) => Date.parse(p.paidAt as string)).filter((t) => Number.isFinite(t)));
       const days = Math.min(400, Math.max(1, Math.ceil((nowMs - oldest) / 86_400_000) + 1));
-      const [channels, height, events] = await Promise.all([getChannelsView(lnd), currentHeight(), getForwardEvents(lnd, days)]);
+      const [channels, height, forwards] = await Promise.all([getChannelsView(lnd), currentHeight(), readForwardEvents(lnd, days, nowMs)]);
       const leases = channelLeases(channels, autopilot.leaseSources(), height, nowMs);
       const aliasById = new Map(channels.map((c) => [c.id, c.peerAlias]));
       const byOrder = new Map<string, string>();
@@ -835,7 +980,14 @@ export function createApiRouter(
         const id = byOrder.get(p.orderId) ?? standardChannelId(p.channelId);
         return id ? { channelId: id, alias: aliasById.get(id) ?? "" } : null;
       };
-      res.json({ method: BOUGHT_INBOUND_METHOD, windowDays, amortizedSats, items: boughtInboundRoi(purchases, channelOf, events, nowMs) });
+      res.json({
+        method: BOUGHT_INBOUND_METHOD,
+        windowDays,
+        amortizedSats,
+        // Whether the read got every forward: a read cut short misses the newest.
+        forwardsComplete: forwards.complete,
+        items: boughtInboundRoi(purchases, channelOf, forwards.events, nowMs, { fromMs: nowMs - days * 86_400_000, complete: forwards.complete }),
+      });
     }),
   );
 
@@ -860,13 +1012,32 @@ export function createApiRouter(
       const since = nowMs - report.windowDays * 86_400_000;
       const rebalancing = await rebalanceCosts(lnd, rebalanceLog, since, nowMs);
       // The feed's on-chain lines: funding transactions, and closing ones
-      // with the sweeps LND names for them.
+      // with the sweeps LND names for them — of closed channels and of
+      // channels still closing (whose fee bumps and sweeps the feed tells by
+      // what they spend), each named by its peer.
       const opens = new Set<string>([...channels.map((c) => c.transactionId), ...closed.channels.map((c) => c.transaction_id)]);
       const closes = new Set<string>();
+      // Closing transactions of channels still closing: what spends their
+      // non-wallet outputs is their fee bump or sweep (buildDashboard).
+      const closingNow = new Set<string>();
+      const closeTitles = new Map<string, string>();
+      const inFeed = new Set(onchain.flatMap((t) => [t.id, ...(t.spends ?? [])]));
+      for (const c of channels) {
+        if (c.status !== "pending_close" || !c.closeTransactionId) continue;
+        closes.add(c.closeTransactionId);
+        closingNow.add(c.closeTransactionId);
+        closeTitles.set(c.closeTransactionId, c.peerAlias);
+      }
       for (const c of closed.channels) {
-        for (const id of [c.close_transaction_id, c.close_balance_spent_by, c.anchor_spent_by, ...c.close_payments.map((p) => p.spent_by)]) {
-          if (id) closes.add(id);
-        }
+        const ids = [c.close_transaction_id, c.close_balance_spent_by, c.anchor_spent_by, ...c.close_payments.map((p) => p.spent_by)].filter(
+          (id): id is string => !!id,
+        );
+        for (const id of ids) closes.add(id);
+        // Named only when one of its transactions is in the feed (an alias
+        // is a graph lookup).
+        if (!ids.some((id) => inFeed.has(id))) continue;
+        const alias = await getAlias(lnd, c.partner_public_key);
+        for (const id of ids) closeTitles.set(id, id === c.close_transaction_id ? alias : `${alias} — sweep`);
       }
       res.json(
         buildDashboard(
@@ -883,7 +1054,8 @@ export function createApiRouter(
             leaseBenchmark,
             magmaRefusals: autopilot.magma.refusals(),
             ownPubkey,
-            channelTxids: { opens, closes },
+            channelTxids: { opens, closes, closingNow, closeTitles },
+            lspModeOn: lspModeOn(),
           },
         ),
       );
@@ -1940,7 +2112,8 @@ export function createApiRouter(
       // empty page instead. The engine already tolerates a missing key: your own
       // offers and orders simply come back empty.
       // The autopilot's own call, with its inputs (a8: one builder for both).
-      res.json(await autopilot.magmaReport(amboss.getKey()));
+      // Shared with the other pages for a minute (magmaReportShared).
+      res.json(await autopilot.magmaReportShared(amboss.getKey()));
     }),
   );
 
@@ -1991,7 +2164,7 @@ export function createApiRouter(
         );
       const [offers, rec, sales, eligibility, channels] = await Promise.all([
         keyed ? settle(withAmboss(() => getMyOffers(amboss.getKey(), own))) : Promise.resolve({ err: "no Amboss key" } as const),
-        settle(autopilot.magmaReport(amboss.getKey())),
+        settle(autopilot.magmaReportShared(amboss.getKey())),
         keyed ? getMyOrders(amboss.getKey(), own).then((v) => v.orders, () => null) : Promise.resolve(null),
         autopilot.magmaEligibility().catch(() => autopilot.lastEligibility),
         getChannelsView(lnd).catch(() => null),

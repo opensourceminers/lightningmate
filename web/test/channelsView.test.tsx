@@ -110,7 +110,12 @@ test("the docs say what the channel autopilot and the close list do now — no '
 test("the channel autopilot: its fee cap is a setting, how it decides is said under its settings, and its last decision is shown", () => {
   const panel = readFileSync(new URL("../src/components/AutopilotPanel.tsx", import.meta.url), "utf8");
   assert.match(panel, /\{ key: "channelMaxFeeRate", label: "Max on-chain fee for opens \(sat\/vB\)" \}/);
-  assert.match(panel, /decisionLine\(server\.decisions\?\.channels\)/);
+  // Its last decision, with its state (D16): the status line at the top of the sub-tab.
+  assert.match(panel, /<StatusLine area="channels" status=\{status\?\.channels\} \/>/);
   assert.match(CHANNEL_OPEN_HINT, /paid back within a year/);
   assert.match(CHANNEL_OPEN_HINT, /refused an open waits 1 day, then 7, then 30/);
+  // Review of P4: "without an address … is never opened to" — but a peer
+  // that is connected already is (planOpen dials only peers it must reach).
+  assert.doesNotMatch(CHANNEL_OPEN_HINT, /without an address, of low usefulness/);
+  assert.match(CHANNEL_OPEN_HINT, /nor one that advertises no address to dial unless it is connected already/);
 });

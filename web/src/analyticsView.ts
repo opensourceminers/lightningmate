@@ -1,8 +1,10 @@
 import type {
   ActivityItem,
   ChannelForwardStat,
+  ChannelView,
   DashboardData,
   ForwardsReport,
+  MagmaV2Report,
   OutcomesReport,
   PnlSummary,
   RebalanceCostsResponse,
@@ -40,13 +42,36 @@ export interface ChannelPnlRow {
 }
 
 /**
+ * Who a channel that only shows up with a rebalancing cost is, and whether it
+ * is still there (review of P6: every such channel read "closed" under its
+ * bare id — the forwards report lists only channels seen in a forward, so an
+ * open channel refilled in the window but idle since was taken for closed):
+ * one in the node's channel list is open, or pending while it opens or
+ * closes; only one missing from it is closed, named as the server knows it.
+ * Without a channel list yet (null), the server's own word stands.
+ */
+function costOnlyChannel(
+  c: RebalanceCostsResponse["perChannel"][number],
+  channels: readonly Pick<ChannelView, "id" | "peerAlias" | "status">[] | null,
+): Pick<ChannelPnlRow, "alias" | "status"> {
+  const listed = channels?.find((ch) => ch.id === c.channelId);
+  if (listed) return { alias: listed.peerAlias || c.alias || c.channelId, status: listed.status === "open" ? "open" : "pending" };
+  return { alias: c.alias || c.channelId, status: channels ? "closed" : (c.status ?? "closed") };
+}
+
+/**
  * Per-channel profitability for a window: the forwards report and what
  * rebalancing cost (GET /rebalance/costs — every refill of the window, not
  * the newest 50 records). A channel that only ever brought flow in is listed
  * with what it assisted (review a5: such channels vanished from the list,
  * looking worthless), and channels rank by their contribution both ways.
+ * `channels`: the node's channel list (null while it hasn't loaded).
  */
-export function channelPnlRows(fr: ForwardsReport, costs: RebalanceCostsResponse | null): ChannelPnlRow[] {
+export function channelPnlRows(
+  fr: ForwardsReport,
+  costs: RebalanceCostsResponse | null,
+  channels: readonly Pick<ChannelView, "id" | "peerAlias" | "status">[] | null = null,
+): ChannelPnlRow[] {
   const rows = new Map<string, ChannelPnlRow>();
   for (const c of fr.perChannel) {
     rows.set(c.channelId, {
@@ -70,8 +95,7 @@ export function channelPnlRows(fr: ForwardsReport, costs: RebalanceCostsResponse
       rows.get(c.channelId) ??
       ({
         channelId: c.channelId,
-        alias: c.channelId,
-        status: "closed",
+        ...costOnlyChannel(c, channels),
         forwardCount: 0,
         routedOutSats: 0,
         feesEarnedSats: 0,
@@ -199,6 +223,28 @@ export function activitySub(a: ActivityItem, compact: (n: number) => string): st
   return "invoice";
 }
 
+/** The Analytics "Magma leases" tile's sub-line: what its figure is — every
+ *  sale so far (not the window's), net of the service fee and of on-chain
+ *  costs estimated at today's fee rate (magmaRecommend.ts analytics). */
+export function magmaLeasesSub(sold: number): string {
+  return sold > 0 ? `${sold} sold since the start · net, on-chain costs estimated — the window's lease income is in P&L` : "none sold yet";
+}
+
+/**
+ * The "Magma leases · all time" tile — or that it isn't known: `report` is
+ * null while the Magma report loads, or when its read failed (`error`).
+ * Review of P7: the tile read "none sold yet" for a report that never came.
+ */
+export function magmaLeasesKpi(
+  report: Pick<MagmaV2Report, "analytics"> | null,
+  error: string | null,
+): { value: string; unit?: string; tone?: "green"; sub: string } {
+  if (!report) return { value: "—", sub: error ? `unknown — the Magma report couldn't be read (${error})` : "loading…" };
+  const { filledOrdersAllTime: sold, netProfitSat: net } = report.analytics;
+  if (sold === 0 && net === 0) return { value: "—", sub: magmaLeasesSub(0) };
+  return { value: `${net >= 0 ? "+" : "−"}${sats(Math.abs(net))}`, unit: "sat", tone: "green", sub: magmaLeasesSub(sold) };
+}
+
 // ── Rebalancing ──────────────────────────────────────────────────────────────
 
 /** "4 done in 30 d · 120 sat fees · avg 300 ppm" — the window said, and
@@ -210,12 +256,29 @@ export function rebalanceSummaryLine(s: RebalanceLogSummary, trackedSince?: stri
   return `${s.count} done ${window} · ${sats(s.totalFeeSats)} sat fees · avg ${s.avgCostPpm} ppm`;
 }
 
+/**
+ * Whose the rebalances were, as far as LightningMate's log can tell: those
+ * from when it covers rebalances on with no record in it were made with
+ * another tool; those from before it began can't be told apart — on a node
+ * upgraded from 0.7.x, its own older refills are among them (0.7.x kept its
+ * newest 200 records), and they read "made outside LightningMate" (review
+ * of P6). Null: nothing to say.
+ */
+export function rebalanceWhoseNote(notLogged: number, beforeLog: number | undefined, logSince: string | null | undefined): string | null {
+  const parts = [
+    notLogged > 0 ? `${notLogged} made outside LightningMate` : null,
+    beforeLog ? `${beforeLog} from before its log began${logSince ? ` (${logSince.slice(0, 10)})` : ""} — LightningMate's or another tool's` : null,
+  ].filter((p): p is string => p !== null);
+  return parts.length ? parts.join(" · ") : null;
+}
+
 /** The Analytics "Rebalancing" figure's sub-line: how many, and whose. */
 export function rebalanceCostSub(c: RebalanceCostsResponse | null): string {
   if (!c) return "";
   const runs = `${c.count} run${c.count === 1 ? "" : "s"}`;
   if (c.source === "log") return `${runs} · LightningMate's own log (LND unreadable)`;
-  return c.notLogged > 0 ? `${runs} · ${c.notLogged} made outside LightningMate` : runs;
+  const whose = rebalanceWhoseNote(c.notLogged, c.beforeLog, c.logTrackedSince);
+  return whose ? `${runs} · ${whose}` : runs;
 }
 
 /** The "Rebalance ROI" figure: each refill credited only with the forwards
@@ -257,7 +320,10 @@ export function pnlCostParts(p: PnlSummary): PnlCostPart[] {
       label: "Rebalance",
       sats: p.rebalanceCostSats,
       cls: "c-rebal",
-      note: p.rebalanceNotLogged > 0 ? `incl. ${p.rebalanceNotLogged} made outside LightningMate` : undefined,
+      note: (() => {
+        const whose = rebalanceWhoseNote(p.rebalanceNotLogged, p.rebalanceBeforeLog, p.rebalanceLogSince);
+        return whose ? `incl. ${whose}` : undefined;
+      })(),
     },
     { key: "close", label: "Closes", sats: p.channelCloseCostSats, cls: "c-close", note: closeNote(p) },
   ];
@@ -272,6 +338,25 @@ export function pnlCostParts(p: PnlSummary): PnlCostPart[] {
   }
   if (p.serviceFeePaidSats > 0) parts.push({ key: "fee", label: "Fee", sats: p.serviceFeePaidSats, cls: "c-fee" });
   return parts;
+}
+
+/**
+ * The P&L's lines under the bars: what the node spent that is not a cost of
+ * running it — on-chain sends' fees, and the routing fees of the Lightning
+ * payments it sent (review of P6: those were shown nowhere) — each apart,
+ * and not counted in net.
+ */
+export function pnlSpendLines(p: Pick<PnlSummary, "otherChainFeesSats" | "lightningPaymentFeesSats" | "lightningPaymentCount">): string[] {
+  const lines: string[] = [];
+  if (p.otherChainFeesSats > 0) lines.push(`+ ${sats(p.otherChainFeesSats)} sat other on-chain fees (sends), not counted in net`);
+  if ((p.lightningPaymentFeesSats ?? 0) > 0) {
+    const n = p.lightningPaymentCount ?? 0;
+    lines.push(
+      `+ ${sats(p.lightningPaymentFeesSats)} sat routing fees of ${n} Lightning payment${n === 1 ? "" : "s"} you sent ` +
+        "(not rebalancing, Magma purchases or the service fee), not counted in net",
+    );
+  }
+  return lines;
 }
 
 /** "2 closes · cost unknown for 1" / "1 close" / "no closes" — and, for a

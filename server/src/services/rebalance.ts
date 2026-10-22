@@ -219,9 +219,11 @@ export interface RebalanceExecResult {
   /** Sources that were tried and paid nothing (no route within the cap) —
    *  each pair backs off on its own. */
   failedSourceIds?: string[];
-  /** The refill stopped before its next attempt because the process is
-   *  shutting down (opts.shouldStop): a skip, not a failure — nothing more was
-   *  sent. A source whose attempts failed before it is in failedSourceIds. */
+  /** The refill stopped before its next attempt (opts.shouldStop): the
+   *  process is shutting down, or the operator switched auto-rebalance off
+   *  (or paused all automation) while it ran — a skip, not a failure: nothing
+   *  more was sent. A source whose attempts failed before it is in
+   *  failedSourceIds; the error says why it stopped. */
   stopped?: boolean;
 }
 
@@ -271,11 +273,13 @@ export interface RebalanceExecOptions extends RefillHooks {
   /** Wall-clock limit for the whole rebalance (default REBALANCE_HARD_TIMEOUT_MS). */
   hardTimeoutMs?: number;
   /** Asked right before each attempt is sent: true (the process is shutting
-   *  down) stops the refill there — no smaller size, no other source. One
-   *  refill may try up to 3 sources × 3 sizes, and the caller can only check
-   *  between refills: without this, an update's shutdown window saw new
-   *  payments start (review of P3). */
-  shouldStop?: () => boolean;
+   *  down) — or a reason, in words ("auto-rebalance was switched off during
+   *  the run") — stops the refill there: no smaller size, no other source.
+   *  One refill may try up to 3 sources × 3 sizes, and the caller can only
+   *  check between refills: without this, an update's shutdown window saw new
+   *  payments start (review of P3), and so did a pause clicked while a refill
+   *  ran (review of P7). */
+  shouldStop?: () => boolean | string;
 }
 
 /**
@@ -320,8 +324,8 @@ function describePayError(err: unknown, budgetPpm: number): string {
  * than it is worth — and never more than `maxFeeSats` (the daily budget left)
  * — at any of the fallback sizes. If no route fits, nothing is paid. Each
  * attempt goes through the caller's books (opts.onSend / onEnd) before it is
- * sent and when it ends, and none starts once opts.shouldStop says the
- * process is shutting down.
+ * sent and when it ends, and none starts once opts.shouldStop says to stop
+ * (the process is shutting down, or rebalancing was switched off).
  */
 export async function executeRebalance(
   readLnd: AuthenticatedLnd,
@@ -397,12 +401,14 @@ export async function executeRebalance(
     let triedHere = false;
     // A payment from this source was sent and failed (what a stop reports).
     let sentAndFailedHere = false;
-    // Shutting down: no new payment starts — only the one already under way
-    // was awaited. A source one of whose payments failed is reported (it
-    // backs off); the sources not tried yet are not.
-    const stop = (): RebalanceExecResult => {
+    // Told to stop (shutting down, or switched off): no new payment starts —
+    // only the one already under way was awaited. A source one of whose
+    // payments failed is reported (it backs off); the sources not tried yet
+    // are not.
+    const stop = (why: string | true): RebalanceExecResult => {
       if (sentAndFailedHere) failedSourceIds.push(spec.id);
-      return { ...withTarget, failedSourceIds, stopped: true, error: "skipped: shutting down — no further attempt was sent" };
+      const reason = why === true ? "shutting down" : why;
+      return { ...withTarget, failedSourceIds, stopped: true, error: `skipped: ${reason} — no further attempt was sent` };
     };
     for (const amount of adaptiveAmounts(Math.min(params.amountSats, spare))) {
       const left = deadline - Date.now();
@@ -416,7 +422,8 @@ export async function executeRebalance(
         lastErr ??= new Error(`no fee room at ${Math.round(amount / 1000)}k: the profit check or the daily budget leaves less than 1 sat`);
         continue;
       }
-      if (opts.shouldStop?.()) return stop();
+      const halt = opts.shouldStop?.();
+      if (halt) return stop(halt);
       triedHere = true;
       tried = true;
       let sent: string | null = null;
@@ -426,7 +433,8 @@ export async function executeRebalance(
         const decoded = await decodePaymentRequest({ lnd: readLnd, request: invoice.request });
         // Asked again right before it goes out: the signal may have come
         // while the invoice was made (it stays unpaid and expires).
-        if (opts.shouldStop?.()) return stop();
+        const late = opts.shouldStop?.();
+        if (late) return stop(late);
         // On the caller's books before it is sent (write-ahead). If it can't
         // be recorded, it is not sent — nor is anything else of this refill.
         try {

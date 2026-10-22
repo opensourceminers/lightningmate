@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { ActivityItem, ChannelView, DashboardData, NodeSummary, PriceInfo } from "../types";
+import type { ActivityItem, ChannelView, DashboardData, DecisionArea, NodeSummary, PriceInfo } from "../types";
 import { fiat, sats, satsCompact, timeAgo } from "../format";
+import { usePolledData } from "../usePolledData";
+import { AREA_LABEL, STATE_CHIP, autopilotDigest, autopilotTileFoot } from "../autopilotView";
+import { InfoTip } from "./InfoTip";
 import { SummaryBar } from "./SummaryBar";
 import { HealthScore } from "./HealthScore";
 import { PnlOverview } from "./PnlOverview";
@@ -68,8 +70,9 @@ function KpiRow({ d, price }: { d: DashboardData; price?: PriceInfo | null }) {
           {d.netYieldPpmYear !== undefined && d.rebalanceFeesSats ? ` · ${pctFromPpm(d.netYieldPpmYear)}% after rebalancing` : ""}
         </div>
         {bench ? (
-          <div className="kpi-sub kpi-bench" title={d.leaseBenchmark?.text}>
+          <div className="kpi-sub kpi-bench">
             {bench}
+            {d.leaseBenchmark?.text && d.leaseBenchmark.text !== bench ? <InfoTip text={d.leaseBenchmark.text} label="About this comparison" /> : null}
           </div>
         ) : null}
       </div>
@@ -116,29 +119,13 @@ function DigestStrip({
   onNavigate?: (tab: string, sub?: string) => void;
 }) {
   const a = d.autopilot;
-  const anyOn = a.fees || a.rebalance || a.channel || a.sell;
   const pendingOpen = channels?.filter((c) => c.status === "pending_open").length ?? 0;
   const pendingClose = channels?.filter((c) => c.status === "pending_close").length ?? 0;
 
   const items: { key: string; text: string; warn?: boolean; tab: string; sub?: string }[] = [];
-  if (anyOn && a.lastRunAt) {
-    const parts = [
-      a.lastFeeChanges > 0 ? `${a.lastFeeChanges} fee${a.lastFeeChanges > 1 ? "s" : ""} adjusted` : null,
-      a.lastRebalances > 0 ? `${a.lastRebalances} rebalance${a.lastRebalances > 1 ? "s" : ""}` : null,
-      a.lastSells > 0 ? `${a.lastSells} Magma action${a.lastSells > 1 ? "s" : ""}` : null,
-      a.lastOpens > 0 ? `${a.lastOpens} channel${a.lastOpens > 1 ? "s" : ""} opened` : null,
-    ].filter(Boolean);
-    const nextMin = Math.max(
-      0,
-      Math.round((new Date(a.lastRunAt).getTime() + a.intervalMinutes * 60_000 - Date.now()) / 60_000),
-    );
-    items.push({
-      key: "ap",
-      text: `Autopilot ${timeAgo(a.lastRunAt)}: ${parts.length ? parts.join(" · ") : "nothing needed changing"} — next run in ~${nextMin} min`,
-      tab: "autopilot",
-      sub: "history",
-    });
-  }
+  // The last run with what THAT run did (failures too), the last change as
+  // its own item, and any area in error or blocked (autopilotView.ts).
+  for (const it of autopilotDigest(a)) items.push({ ...it, tab: "autopilot" });
   if (noForwardsIn7d(d)) {
     items.push({
       key: "noflow",
@@ -179,11 +166,28 @@ function DigestStrip({
   );
 }
 
+/** What the Overview says when its data couldn't be loaded — with what it
+ *  still shows, and from when. */
+export function dashStaleText(error: string, updatedAt: number | null): string {
+  return updatedAt
+    ? `Couldn't refresh the overview (${error}) — the figures below are from ${new Date(updatedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}.`
+    : `Couldn't load the overview's figures (${error}).`;
+}
+
 function ApBadge({ on }: { on: boolean }) {
   return <span className={`ap-badge ${on ? "on" : "off"}`}>{on ? "ON" : "OFF"}</span>;
 }
 
+/** The Autopilot tile: each area on or off and, compactly, what it last
+ *  decided (D16) — "waiting", "deferred", "blocked" in words, not only a
+ *  badge; the full reason is one click away on the Autopilot tab. */
 function AutopilotStatus({ a, onOpen }: { a: DashboardData["autopilot"]; onOpen?: () => void }) {
+  const rows: [DecisionArea, boolean][] = [
+    ["fees", a.fees],
+    ["rebalance", a.rebalance],
+    ["channels", a.channel],
+    ["magma", a.sell],
+  ];
   return (
     <section
       className="panel mini clickable"
@@ -195,16 +199,24 @@ function AutopilotStatus({ a, onOpen }: { a: DashboardData["autopilot"]; onOpen?
     >
       <div className="panel-head"><h2>Autopilot</h2><span className="tile-go" aria-hidden>↗</span></div>
       <div className="ap-rows">
-        <div className="ap-row"><span>Fee automation</span><ApBadge on={a.fees} /></div>
-        <div className="ap-row"><span>Auto-rebalance</span><ApBadge on={a.rebalance} /></div>
-        <div className="ap-row"><span>Channel autopilot</span><ApBadge on={a.channel} /></div>
-        <div className="ap-row"><span>Liquidity provision</span><ApBadge on={a.sell} /></div>
+        {rows.map(([area, on]) => {
+          // What it decided — for an area that is on (an area that is off
+          // just says OFF).
+          const s = on ? a.status?.[area] : undefined;
+          const chip = s && s.state !== "off" ? STATE_CHIP[s.state] : null;
+          return (
+            <div className="ap-row" key={area}>
+              <span>{AREA_LABEL[area]}</span>
+              <span className="ap-row-state">
+                {chip ? <span className={`ap-state t-${chip.tone}`}>{chip.label}</span> : null}
+                <ApBadge on={on} />
+              </span>
+              {s && s.state !== "off" && s.state !== "idle" && s.state !== "not_run" ? <span className="ap-row-why">{s.text}</span> : null}
+            </div>
+          );
+        })}
       </div>
-      <div className="ap-foot">
-        {a.lastRunAt
-          ? `Last run ${timeAgo(a.lastRunAt)} · ${a.lastApplied}/${a.lastAttempted} applied`
-          : "Has not run yet"}
-      </div>
+      <div className="ap-foot">{autopilotTileFoot(a)}</div>
     </section>
   );
 }
@@ -220,22 +232,22 @@ export function Overview({
   price?: PriceInfo | null;
   onNavigate?: (tab: string, sub?: string) => void;
 }) {
-  const [dash, setDash] = useState<DashboardData | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    const load = () => api.dashboard().then((d) => !cancelled && setDash(d)).catch(() => {});
-    load();
-    const id = setInterval(load, 60_000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, []);
+  // Every minute while the page is visible. A failed load is said — the
+  // KPIs, digest and activity no longer vanish without a word.
+  const polled = usePolledData(api.dashboard, 60_000);
+  const dash = polled.data;
 
   return (
     <div className="overview">
       <SummaryBar node={node} price={price} />
+      {polled.error ? (
+        <p className="banner error">
+          {dashStaleText(polled.error, polled.updatedAt)}{" "}
+          <button className="linklike" onClick={polled.refresh}>
+            Try again
+          </button>
+        </p>
+      ) : null}
       {dash ? <KpiRow d={dash} price={price} /> : null}
       {dash ? <DigestStrip d={dash} channels={channels} onNavigate={onNavigate} /> : null}
       <div className="hero-row">
@@ -248,7 +260,7 @@ export function Overview({
           <RecentActivity items={dash.activity} />
           <div className="stack-col">
             <TopChannelsTile onOpen={() => onNavigate?.("analytics", "pnl")} />
-            <SuggestedPeersTile onOpen={() => onNavigate?.("autopilot", "channels")} />
+            <SuggestedPeersTile onOpen={() => onNavigate?.("channels", "open")} />
             <AutopilotStatus a={dash.autopilot} onOpen={() => onNavigate?.("autopilot")} />
           </div>
         </div>

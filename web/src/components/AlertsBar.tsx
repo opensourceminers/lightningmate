@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 import { api } from "../api";
-import type { Alert } from "../types";
+import { usePolledData } from "../usePolledData";
 
 /**
  * Node alerts come and go with the node's state. Alerts with an `id` (a damaged
@@ -8,27 +8,16 @@ import type { Alert } from "../types";
  * they report something that already happened and must not go unnoticed.
  */
 export function AlertsBar() {
-  const [alerts, setAlerts] = useState<Alert[]>([]);
+  // Every 30 s while the page is visible (paused in a background tab).
+  const polled = usePolledData(api.alerts, 30_000);
+  const alerts = polled.data ?? [];
   const [busyId, setBusyId] = useState<string | null>(null);
-
-  const load = useCallback(() => api.alerts().then(setAlerts).catch(() => {}), []);
-
-  useEffect(() => {
-    let cancelled = false;
-    const tick = () => api.alerts().then((a) => !cancelled && setAlerts(a)).catch(() => {});
-    tick();
-    const id = setInterval(tick, 30_000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, []);
 
   const dismiss = async (id: string) => {
     setBusyId(id);
     try {
       await api.alertAck(id);
-      await load();
+      polled.refresh();
     } catch {
       // keep it visible; the next poll retries the list
     } finally {

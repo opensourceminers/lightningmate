@@ -33,6 +33,13 @@ test("on a Tor-only node the card says how few wallets can order — and propose
   assert.equal(isTorOnly([ONION]), true);
   assert.equal(isTorOnly([]), true, "no address announced at all: nobody dials it but over a peer it already has");
   assert.equal(isTorOnly([ONION, CLEAR]), false);
+  // Review of P5: a node that announces no address at all was called
+  // "reachable over Tor only" — it is reachable over nothing.
+  const none = lspReachText([]);
+  assert.match(none, /^This node announces no address — not even a \.onion one — so a buyer's wallet has nothing to dial/);
+  assert.doesNotMatch(none, /reachable over Tor only/);
+  assert.match(none, /Expect no orders — LSP mode is experimental\.$/);
+  assert.doesNotMatch(none, /announce a clearnet|clearnet address/i, "no clearnet proposal");
   const tor = lspReachText([ONION]);
   assert.match(tor, /^This node is reachable over Tor only, so very few wallets can order here\./);
   assert.match(tor, /ZEUS with its embedded node and ZEUS's embedded Tor switched on \(it is off by default\)/);

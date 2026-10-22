@@ -33,6 +33,7 @@ import { runMaxHtlcPass, type MaxHtlcChange } from "./maxHtlc.js";
 import { saleFeeConfig, type ServiceFeeLedger } from "./serviceFee.js";
 import type { AmbossStore } from "./ambossStore.js";
 import { errorText } from "./errorText.js";
+import { logLine } from "./log.js";
 import { getOwnPubkey } from "./node.js";
 import { torVia } from "./http.js";
 import { getChannelSuggestionsV2, type SuggestionV2 } from "./suggestRecommend.js";
@@ -246,6 +247,9 @@ export interface AutopilotRebalance {
   costPpm: number | null;
   ok: boolean;
   error?: string;
+  /** Sent, and LND hasn't said how it ended yet: no failure (yet) — the run
+   *  counts it as neither applied nor failed, and a later run books it. */
+  inFlight?: boolean;
 }
 
 export interface AutopilotChannelOpen {
@@ -271,7 +275,9 @@ export interface AutopilotRun {
   /** Advertised-max_htlc bucket moves (present on newer runs only). */
   maxHtlc?: MaxHtlcChange[];
   /** Stages that threw. Each stage is isolated: one failing (say the fee
-   *  engine) no longer skips the others, Magma offer upkeep included. */
+   *  engine) no longer skips the others, Magma offer upkeep included. The
+   *  run runOnce returns lists every one; its line in the run history only
+   *  those that are news (the same failure again is not). */
   errors?: { stage: string; error: string }[];
 }
 
@@ -459,8 +465,16 @@ interface PersistedState {
   offerCuts?: Record<string, OfferCut>;
   /** Per offer: who owns its terms (see OfferControl). */
   offerControl?: Record<string, OfferControl>;
-  /** Per area: the latest decision not to act, and why (decisionNote). */
-  decisions?: Partial<Record<DecisionArea, { at: string; text: string }>>;
+  /** Per area: its latest decision and why (decisionNote) — what it did, or
+   *  why it did nothing (D16). */
+  decisions?: Partial<Record<DecisionArea, AreaDecision>>;
+  /** What the main run's last pass did — every pass, the ones that did
+   *  nothing too (the run history keeps only those that did something). */
+  lastRun?: RunSummary;
+  /** "Pause all automation": when, and which switches were on then — what
+   *  "Resume" switches back on (selling excepted, see resumeAll). Cleared by
+   *  a resume, or once the operator switches anything on by hand. */
+  paused?: { at: string; was: AutomationSwitch[] } | null;
   /** Peers that refused an automatic open, by pubkey: each waits out its
    *  back-off, and the size limits its refusal named are met next time
    *  (openPlan.ts). A successful open forgets the record. */
@@ -471,8 +485,220 @@ interface PersistedState {
   history: AutopilotRun[];
 }
 
-/** The areas with a "last decision" status (D16; the full status is P7's). */
-type DecisionArea = "magma" | "channels" | "rebalance";
+/** The switches that make the autopilot act on its own — every one of them
+ *  "Pause all automation" turns off. */
+export const AUTOMATION_SWITCHES = ["enabled", "rebalanceEnabled", "channelEnabled", "maxHtlcEnabled", "sellEnabled"] as const;
+export type AutomationSwitch = (typeof AUTOMATION_SWITCHES)[number];
+
+/** Each switch in words, for "… was switched off during the run". */
+const SWITCH_WORDS: Record<AutomationSwitch, string> = {
+  enabled: "fee automation",
+  rebalanceEnabled: "auto-rebalance",
+  channelEnabled: "the channel autopilot",
+  maxHtlcEnabled: "advertising routable size",
+  sellEnabled: "Liquidity provision",
+};
+
+/**
+ * A "Pause all automation" record as it was saved, made safe: only the
+ * known switches, each once, and a time that parses — or null. "Resume"
+ * switches on exactly what this lists, so a file edited by hand (or left
+ * half-written by another version) must not name config keys of its own.
+ */
+export function sanitizePaused(raw: unknown): { at: string; was: AutomationSwitch[] } | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as { at?: unknown; was?: unknown };
+  if (typeof r.at !== "string" || !Number.isFinite(Date.parse(r.at))) return null;
+  const listed = Array.isArray(r.was) ? r.was : [];
+  const was = AUTOMATION_SWITCHES.filter((k) => listed.includes(k));
+  return { at: r.at, was };
+}
+
+/** The areas of the autopilot that keep a "last decision" (D16). */
+export type DecisionArea = "fees" | "rebalance" | "channels" | "magma" | "maxHtlc";
+
+/**
+ * What an area did with its last chance to act:
+ *  - acted: it changed something (a fee, a refill, an open, an offer);
+ *  - idle: it looked, and nothing needed doing;
+ *  - waiting: there is something to do, held back until a condition passes
+ *    (a cooldown, the hours, the budget, the fee rate, the funds);
+ *  - deferred: deliberately left for something else (capital left for Magma);
+ *  - blocked: it can't act until the operator does something (no Amboss key;
+ *    selling on with no offer and auto-pricing off — none will be listed);
+ *  - error: it failed (the node or Amboss didn't answer, every attempt failed).
+ * Waiting and deferred are information, never failures (D15).
+ */
+export type DecisionState = "acted" | "idle" | "waiting" | "deferred" | "blocked" | "error";
+
+export interface AreaDecision {
+  /** When it was made — the latest time, for a decision made again. */
+  at: string;
+  state: DecisionState;
+  text: string;
+  /** The same decision run after run (numbers aside): since when, and how
+   *  many times — "waiting ×48 since 08:00", not 48 lines. */
+  since?: string;
+  repeats?: number;
+  /** The area's latest error, kept after the next decision (24 h shown). */
+  lastError?: { at: string; text: string };
+}
+
+/** What the UI shows for an area: its last decision — or that it is off, or
+ *  blocked right now (write mode off, no Amboss key), whatever it last did. */
+export interface AreaStatus {
+  /** "not_run": switched on, and no decision made yet. */
+  state: DecisionState | "off" | "not_run";
+  text: string;
+  /** null: no decision yet (never run since it was switched on). */
+  at: string | null;
+  since?: string;
+  repeats?: number;
+  lastError?: { at: string; text: string };
+  /** An area that is off or blocked: what it decided while it last ran. */
+  last?: AreaDecision;
+}
+
+/** One change of an area's decision (the decision log, for diagnostics). */
+export interface DecisionLogEntry {
+  at: string;
+  area: DecisionArea;
+  state: DecisionState;
+  text: string;
+}
+
+/** How many decision changes the decision log keeps (newest first). */
+export const DECISION_LOG_KEPT = 500;
+
+/** The main run's last pass in numbers — kept for every pass (the Overview
+ *  pairs the run's time with these, never with an older run's counts). */
+export interface RunSummary {
+  at: string;
+  attempted: number;
+  applied: number;
+  /** Everything that failed in the pass — its fee writes, refills, opens,
+   *  offer writes and max_htlc updates, and each stage that threw (errors),
+   *  also when that failure is no news for the run history. */
+  failed: number;
+  feeChanges: { ok: number; failed: number };
+  rebalances: { ok: number; failed: number; inFlight: number };
+  opens: { ok: number; failed: number };
+  sells: { ok: number; failed: number };
+  maxHtlc: { ok: number; failed: number };
+  /** Stages that threw, by name. */
+  errors: string[];
+}
+
+/**
+ * The fee stage's decision (D16): what it changed — or, when it changed
+ * nothing, why, counted over every channel: already where the engine wants
+ * it, or held by a guard (the cooldown, the once-a-day pacing of lowerings,
+ * a change too small to send, the per-run limit, a pin or an exclusion, an
+ * update LND refused). Before, a run that changed nothing left no trace.
+ */
+export function feeDecision(
+  recs: readonly Pick<FeeRecommendation, "alias" | "currentPpm" | "targetPpm" | "wouldApply" | "blockedByGuards">[],
+  eligible: number,
+  changes: readonly Pick<AutopilotChange, "alias" | "fromPpm" | "toPpm" | "ok" | "error">[],
+): { text: string; state: DecisionState } {
+  const ok = changes.filter((c) => c.ok);
+  const failed = changes.filter((c) => !c.ok);
+  // A failure LND repeats on a channel is left out of the run history
+  // (quietRepeats) — still a failure here.
+  const quiet = Math.max(0, eligible - changes.length);
+  const refused = failed.length + quiet;
+  const refusedText = refused
+    ? `${refused} update${refused === 1 ? "" : "s"} LND refused (${failed[0]?.error ?? "the same refusal as before — not retried for 6 h"})`
+    : "";
+  if (ok.length) {
+    const shown = ok.slice(0, 3).map((c) => `${c.alias} ${c.fromPpm}→${c.toPpm} ppm`);
+    return {
+      text:
+        `${ok.length} fee update${ok.length === 1 ? "" : "s"} applied: ${shown.join(", ")}${ok.length > 3 ? `, and ${ok.length - 3} more` : ""}` +
+        (refusedText ? ` · ${refusedText}` : ""),
+      state: "acted",
+    };
+  }
+  if (refused) return { text: refusedText, state: "error" };
+  if (recs.length === 0) return { text: "no channel to price (no active channel)", state: "idle" };
+  // Why each channel kept its fee: at its target, or the first guard.
+  const counts = new Map<string, number>();
+  const bump = (why: string) => counts.set(why, (counts.get(why) ?? 0) + 1);
+  for (const r of recs) {
+    const guard = r.blockedByGuards?.[0];
+    if (guard) bump(guardWords(guard));
+    else if (r.targetPpm === r.currentPpm) bump("already at their target");
+    else bump("other");
+  }
+  const parts = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([why, n]) => `${n} ${why}`);
+  return { text: `no fee needed changing — ${recs.length} channel${recs.length === 1 ? "" : "s"} checked: ${parts.join(", ")}`, state: "idle" };
+}
+
+/** A fee guard, as the fee decision counts it. */
+function guardWords(guard: string): string {
+  if (/cooldown|pacing/.test(guard)) return "held by the cooldown or the once-a-day pacing of lowerings";
+  if (/below threshold/.test(guard)) return "a change too small to send";
+  if (/max changes per run/.test(guard)) return "over the per-run limit (next run)";
+  if (/excluded/.test(guard)) return "excluded by you";
+  if (/inactive/.test(guard)) return "inactive";
+  if (/last fee update failed/.test(guard)) return "waiting after an update LND refused";
+  return guard;
+}
+
+/** The max_htlc pass's decision (D16). `stopped`: why the pass ended early
+ *  (the switch went off, all automation was paused) — what it moved before
+ *  still counts; nothing after was sent. */
+export function maxHtlcDecision(
+  moved: readonly Pick<MaxHtlcChange, "alias" | "ok" | "error">[],
+  stopped: string | null = null,
+): { text: string; state: DecisionState } {
+  const ok = moved.filter((m) => m.ok).length;
+  const failed = moved.filter((m) => !m.ok);
+  const halt = stopped ? `${stopped} — no further update was sent` : "";
+  if (!moved.length) {
+    return stopped ? { text: halt, state: "waiting" } : { text: "every channel's advertised size is current — nothing to gossip", state: "idle" };
+  }
+  const refused = failed.length ? `${failed.length} refused by LND (${failed[0].error ?? "refused"})` : "";
+  if (!ok) return { text: [refused, halt].filter(Boolean).join(" · "), state: "error" };
+  return { text: [`${ok} channel${ok === 1 ? "'s" : "s'"} advertised size moved`, refused, halt].filter(Boolean).join(" · "), state: "acted" };
+}
+
+/**
+ * When the autopilot itself last changed something: the newest line of the
+ * run history with an action that landed and was not the operator's — a fee
+ * set or applied by hand on the Fees tab is recorded there too (via
+ * "manual"), and the Overview's "Last change by the autopilot 2m ago" said so
+ * of it (review of P7). A line whose every attempt failed changed nothing.
+ */
+export function lastAutopilotActionAt(
+  history: readonly Pick<AutopilotRun, "at" | "changes" | "rebalances" | "channels" | "sells" | "maxHtlc">[],
+): string | null {
+  const landed = (xs: readonly { ok: boolean }[] | undefined) => (xs ?? []).some((x) => x.ok);
+  const line = history.find(
+    (r) =>
+      (r.changes ?? []).some((c) => c.ok && c.via !== "manual") ||
+      landed(r.rebalances) ||
+      landed(r.channels) ||
+      landed(r.sells) ||
+      landed(r.maxHtlc),
+  );
+  return line?.at ?? null;
+}
+
+/** What an offer write did, in the Magma decision ("repriced offer 1a2b…"). */
+const OFFER_VERB: Partial<Record<SellActionKind, string>> = {
+  reprice: "repriced",
+  resize: "resized",
+  relist: "topped up",
+  terms: "set the standard lease and fee promise of",
+  enable: "listed again",
+  disable: "disabled",
+};
+
+/** Two decisions are the same when only their numbers differ ("1,949,000
+ *  sat spendable" vs "1,948,000") — a wait, a deferral, a look that found
+ *  nothing, an error. Never an action: each is news of its own (decisionNote). */
+const decisionSig = (state: string, text: string): string => `${state}:${text.replace(/\d[\d,.]*/g, "#")}`;
 
 /** Today's rebalance fee budget (UTC day): what was spent — every fee paid,
  *  the autopilot's and manual refills alike, and the maximum fee of every
@@ -508,6 +734,8 @@ const errText = errorText;
 /** How long the Overview's lease benchmark looks at a public-book fetch it
  *  had to start (nothing cached yet) before it answers "being read". */
 export const BENCHMARK_WAIT_MS = 750;
+/** How long the pages share one read of the Magma report (magmaReportShared). */
+export const MAGMA_REPORT_SHARE_MS = 60_000;
 /** How many purchase reads run at once. (No cap per pass: every purchase
  *  still followed converges to an end — LND confirms or never knew the
  *  payment, Amboss ends the order — so the set empties; a cap only starved
@@ -580,10 +808,38 @@ function sellable(sp: Spendable, headroomSat: number, maxChannelSats: number): P
 
 const fmtSat = (n: number): string => Math.round(n).toLocaleString("en-US");
 
+/**
+ * The channel note's word on the peers that refused an open this run: one
+ * that refused for good reason waits out its back-off (1, 7, then 30 days);
+ * one that only refused the SIZE — it named its minimum or maximum — is
+ * tried again next run at a size within it. (Review of P4: the note said
+ * "each waits before it is tried again" of both.)
+ */
+export function refusalNote(refused: readonly { alias: string; days: number; sizeLimit: boolean }[]): string {
+  const list = (xs: readonly { alias: string }[]) => xs.map((x) => x.alias).join(", ");
+  const waiting = refused.filter((r) => !r.sizeLimit);
+  const resized = refused.filter((r) => r.sizeLimit);
+  const parts: string[] = [];
+  if (waiting.length) {
+    const days = [...new Set(waiting.map((r) => r.days))];
+    const wait = days.length === 1 ? `${days[0]} day${days[0] === 1 ? "" : "s"}` : "1, 7 or 30 days by how often it refused";
+    parts.push(`${list(waiting)} refused an open (${waiting.length === 1 ? "it waits" : "each waits"} ${wait} before it is tried again)`);
+  }
+  if (resized.length) {
+    parts.push(
+      `${list(resized)} refused the size — ${resized.length === 1 ? "it is" : "they are"} tried again next run, at a size within the limit ${resized.length === 1 ? "it" : "each"} named`,
+    );
+  }
+  return parts.join(" · ");
+}
+
 /** The channel stage's run-history key for failures of this node's own (its
  *  wallet, its chain, its connection) — one line while the cause stays the
  *  same, whichever peer the open was meant for (channelNews). */
 const SELF_NEWS_KEY = "self";
+
+/** The channel decision when the stage was told to stop (stopWhy). */
+const openStopped = (why: string): string => `stopped: ${why} — no open was started`;
 
 /**
  * The status capital safety wants for an offer now, or null for none:
@@ -740,6 +996,9 @@ export class Autopilot {
   /** Per order, the last failed lane action written to the run history —
    *  the same failure again is not news (laneNews). */
   private readonly laneLast = new Map<string, string>();
+  /** Per stage, the failure last written to the run history — the same one
+   *  again is not news (it counts up on the area's status instead). */
+  private readonly stageLast = new Map<string, string>();
   /** Per peer, the last failed automatic open written to the run history —
    *  the same failure again is not news (channelNews). */
   private readonly channelLast = new Map<string, string>();
@@ -770,6 +1029,15 @@ export class Autopilot {
   private followingPurchases = false;
   /** Per offer: the status change under way (withOffer). */
   private readonly offerChains = new Map<string, Promise<void>>();
+  /**
+   * When each area's decision CHANGED — newest first, at most
+   * DECISION_LOG_KEPT (review a8: no record of when the autopilot started
+   * waiting, or failing). A decision made again only counts up on the area
+   * (decisionNote), so this holds months of a quiet node. Its own file, written
+   * only on a change: the run state is saved far more often.
+   */
+  private readonly decisionLogStore: JsonStore<DecisionLogEntry[]>;
+  private decisionLogEntries: DecisionLogEntry[];
   /** Whether the stored fee policy carried a balanced level of its own. Policies
    *  saved before that setting existed get the default from the volume
    *  migration in start() — after sanitizing, a filled-in default can no longer
@@ -818,6 +1086,9 @@ export class Autopilot {
     this.uptime = new ChannelUptime(dataDir);
     this.closeTxs = new CloseTxArchive(dataDir);
     this.feeLog = new FeeChangeLog(dataDir);
+    this.decisionLogStore = new JsonStore<DecisionLogEntry[]>(dataDir, "decision-log.json");
+    const logged = this.decisionLogStore.read([]);
+    this.decisionLogEntries = Array.isArray(logged) ? logged.slice(0, DECISION_LOG_KEPT) : [];
     this.state = this.store.read({
       config: DEFAULT_CONFIG,
       lastRunAt: null,
@@ -850,6 +1121,8 @@ export class Autopilot {
     this.state.config = config;
     this.reportRepairs(repairs);
     this.state.history = Array.isArray(this.state.history) ? this.state.history : [];
+    // What "Resume" may switch on: the known switches only (sanitizePaused).
+    this.state.paused = sanitizePaused(this.state.paused);
     // Upgrading to the fee-change log: the fee changes still in the run
     // history move into it (once), so what was measurable stays measurable.
     this.feeLog.seed(
@@ -1101,10 +1374,28 @@ export class Autopilot {
   async feeElasticityModifiers(): Promise<Map<string, number>> {
     try {
       const el = await getFeeElasticity(this.readLnd, this.feeLog.all());
+      this.logChange("elasticity", null);
       return new Map([...el].map(([id, e]) => [id, e.modifier]));
-    } catch {
+    } catch (err) {
+      // The fee engine works without it (no channel gets a learned
+      // modifier) — said in the log once, not every run (it was silent).
+      this.logChange("elasticity", `[autopilot] fees: the elasticity learner couldn't read the forwards (${errText(err)}) — fees are set without it`);
       return new Map();
     }
+  }
+
+  /** What was last logged per key: a failure is logged when it starts or
+   *  changes, not on every run while it lasts (null: none now). */
+  private readonly loggedProblems = new Map<string, string>();
+  private logChange(key: string, text: string | null): void {
+    if (text === null) {
+      this.loggedProblems.delete(key);
+      return;
+    }
+    const sig = text.replace(/\d[\d,.]*/g, "#");
+    if (this.loggedProblems.get(key) === sig) return;
+    this.loggedProblems.set(key, sig);
+    logLine("warn", text);
   }
 
   /** Every applied fee change (for the outcomes report). */
@@ -1124,8 +1415,18 @@ export class Autopilot {
       runningSince: this.runningSince,
       /** The Magma order lane: when it last ran, and whether that worked. */
       magmaLane: this.magma.laneStatus(),
-      /** Per area, the latest decision not to act and why. */
+      /** Per area, the latest decision and why (raw, as stored). */
       decisions: this.state.decisions ?? {},
+      /** Per area, what the UI shows: the last decision, or off / blocked. */
+      status: this.areaStatus(),
+      /** The main run's last pass in numbers, no-op passes too. */
+      lastRun: this.state.lastRun ?? null,
+      /** When the autopilot last changed something itself (lastActionAt):
+       *  a run, the order lane, a sold channel's fee promise kept — never a
+       *  fee set or applied by hand — null: nothing on record. */
+      lastActionAt: lastAutopilotActionAt(this.state.history),
+      /** "Pause all automation" in force: since when, and what was on. */
+      paused: this.state.paused ?? null,
       /** Today's rebalance fee budget — autopilot and manual runs together. */
       rebalanceBudget: this.rebalanceBudget(),
       // Only surface runs that did something; hide any older "0 applied" no-ops.
@@ -1294,8 +1595,69 @@ export class Autopilot {
       this.state.config.channelEnabled = false;
       this.state.config.maxHtlcEnabled = false;
     }
+    // A switch turned on by hand ends a pause: the operator is choosing
+    // switch by switch now, and "Resume" would switch on what they left off.
+    if (AUTOMATION_SWITCHES.some((k) => result.patch[k] === true)) this.state.paused = null;
     this.persist();
     this.reschedule();
+  }
+
+  /**
+   * "Pause all automation" (review a6-ux:presets-unconfirmed-capital: there
+   * was no global off — stopping everything took five switches on four
+   * sub-tabs). Every switch goes off at once, and which ones were on is kept
+   * for "Resume". A run in progress starts no further step: each fee write,
+   * refill payment, channel open, max_htlc update, offer write and order
+   * accept asks the live switch right before it starts, with nothing awaited
+   * between that check and the step (stopWhy; the order lane's accept asks
+   * the same switch in MagmaDesk.acceptOrder). The step already under way —
+   * a payment sent, an open being broadcast — finishes, and the Magma orders
+   * already taken on are carried to their end; a sold channel's fee promise
+   * is still kept. Listed Magma offers are the operator's call (the UI asks
+   * before it pauses). LSP mode is a setting, not one of these switches: the
+   * pause leaves it on, and the pages say so (api.ts lspModeOn).
+   */
+  pauseAll(): void {
+    const c = this.state.config;
+    const was = AUTOMATION_SWITCHES.filter((k) => c[k]);
+    if (was.length === 0) return;
+    this.state.paused = { at: new Date().toISOString(), was };
+    for (const k of AUTOMATION_SWITCHES) c[k] = false;
+    this.persist();
+    this.reschedule();
+  }
+
+  /**
+   * "Resume": the switches that were on before the pause, on again — except
+   * Liquidity provision: switching selling on is its own decision, made with
+   * the live selling check in front of the operator (D9). Returns what was
+   * switched on, and whether selling was on before the pause.
+   */
+  resumeAll(): { resumed: AutomationSwitch[]; sellingWasOn: boolean } {
+    const p = this.state.paused;
+    if (!p) return { resumed: [], sellingWasOn: false };
+    const resumed = this.canWrite ? p.was.filter((k) => k !== "sellEnabled") : [];
+    for (const k of resumed) this.state.config[k] = true;
+    this.state.paused = null;
+    this.persist();
+    this.reschedule();
+    return { resumed, sellingWasOn: p.was.includes("sellEnabled") };
+  }
+
+  /**
+   * Why a stage must start no further step now — null: go on. Asked right
+   * before every fee write, refill payment, channel open, max_htlc update and
+   * offer write, from the LIVE settings — not only once, when the stage
+   * begins (review of P7: "Pause all automation" clicked while a run was
+   * under way still paid the next planned refill, opened to the next peer and
+   * sent the fee writes already planned; the offer upkeep could still list an
+   * offer). The step already under way finishes; none starts after the switch
+   * went off, or after the shutdown signal.
+   */
+  private stopWhy(sw: AutomationSwitch): string | null {
+    if (this.shuttingDown) return "shutting down";
+    if (this.state.config[sw]) return null;
+    return this.state.paused ? "all automation was paused during the run" : `${SWITCH_WORDS[sw]} was switched off during the run`;
   }
 
   private kick(fn: () => Promise<unknown>, delayMs: number): void {
@@ -1403,7 +1765,27 @@ export class Autopilot {
     const eligible = report.recommendations.filter(
       (r) => r.wouldApply && r.transactionId !== null && r.transactionVout !== null,
     );
-    return this.writeFees(writeLnd, eligible.map((r) => recommendationWrite(r)), "autopilot", { quietRepeats: true });
+    const unsent = (n: number, why: string) => `${why} — ${n} planned fee update${n === 1 ? " was" : "s were"} not sent`;
+    // The plan took a while (the forwards, the graph): fee automation may
+    // have been switched off — or everything paused — meanwhile. Then nothing
+    // is written; inside the batch, each write asks again (writeFees).
+    const off = eligible.length ? this.stopWhy("enabled") : null;
+    if (off) {
+      this.decisionNote("fees", unsent(eligible.length, off), "waiting");
+      return [];
+    }
+    const { changes, notSent } = await this.writeFees(writeLnd, eligible.map((r) => recommendationWrite(r)), "autopilot", {
+      quietRepeats: true,
+      shouldStop: () => this.stopWhy("enabled") !== null,
+    });
+    this.explain("fees", () => {
+      const d = feeDecision(report.recommendations, eligible.length - notSent, changes);
+      if (notSent === 0) return d;
+      const stopped = unsent(notSent, this.stopWhy("enabled") ?? "stopped during the run");
+      // What was sent still counts (applied, or refused); none sent: a wait.
+      return d.state === "acted" || d.state === "error" ? { text: `${d.text} · ${stopped}`, state: d.state } : { text: stopped, state: "waiting" };
+    });
+    return changes;
   }
 
   /**
@@ -1478,18 +1860,25 @@ export class Autopilot {
    * `quietRepeats` (the autopilot's own passes) the same failure again on a
    * channel is left out of the result, i.e. the run history: the first one
    * is on record, and the Fees tab shows the channel held.
+   *
+   * `shouldStop` (the fee autopilot's batch): asked before each write — the
+   * writes after it says yes are not sent; `notSent` counts them. Nothing
+   * is booked for them (no cooldown, no back-off): they were never written.
    */
   private async writeFees(
     writeLnd: AuthenticatedLnd,
     writes: FeeWrite[],
     via: NonNullable<AutopilotChange["via"]>,
-    opts: { quietRepeats?: boolean } = {},
-  ): Promise<AutopilotChange[]> {
-    if (writes.length === 0) return [];
+    opts: { quietRepeats?: boolean; shouldStop?: () => boolean } = {},
+  ): Promise<{ changes: AutopilotChange[]; notSent: number }> {
+    if (writes.length === 0) return { changes: [], notSent: 0 };
     const results = await this.feeApply(
       writeLnd,
       writes.map(({ id, transactionId, transactionVout, feeRatePpm, baseFeeMsat }) => ({ id, transactionId, transactionVout, feeRatePpm, baseFeeMsat })),
+      opts.shouldStop ? { shouldStop: opts.shouldStop } : {},
     );
+    const answered = new Set((results as FeeApplyResult[]).map((r) => r.id));
+    const notSent = writes.filter((w) => !answered.has(w.id)).length;
     const byId = new Map(writes.map((w) => [w.id, w]));
     const fa = (this.state.perChannelFlowAnchor ??= {});
     const nowMs = Date.now();
@@ -1540,7 +1929,7 @@ export class Autopilot {
     }
     this.feeLog.append(logged);
     this.persist();
-    return changes;
+    return { changes, notSent };
   }
 
   /**
@@ -1588,7 +1977,9 @@ export class Autopilot {
    * sold channel's promise to the cap its order locked — nothing else.
    */
   private async keepLeasePromises(writeLnd: AuthenticatedLnd): Promise<AutopilotChange[]> {
-    return this.writeFees(writeLnd, await this.leaseBreaches(), "lease", { quietRepeats: true });
+    // Never stopped by a switch: a promise to a buyer holds whatever the
+    // automation switches say (also while everything is paused).
+    return (await this.writeFees(writeLnd, await this.leaseBreaches(), "lease", { quietRepeats: true })).changes;
   }
 
   /**
@@ -1635,7 +2026,7 @@ export class Autopilot {
       const eligible = report.recommendations.filter(
         (r) => r.wouldApply && r.transactionId !== null && r.transactionVout !== null && (!wanted || wanted.has(r.channelId)),
       );
-      const changes = await this.writeFees(this.writeLnd, eligible.map((r) => recommendationWrite(r)), "manual");
+      const { changes } = await this.writeFees(this.writeLnd, eligible.map((r) => recommendationWrite(r)), "manual");
       if (changes.length) this.recordRun({ changes });
       return changes;
     } finally {
@@ -1691,7 +2082,7 @@ export class Autopilot {
           why: "set by hand",
         });
       }
-      const changes = await this.writeFees(this.writeLnd, writes, "manual");
+      const { changes } = await this.writeFees(this.writeLnd, writes, "manual");
       if (changes.length) this.recordRun({ changes });
       const results: FeeApplyResult[] = changes.map((c) => ({
         id: c.id,
@@ -1760,11 +2151,11 @@ export class Autopilot {
   private async runRebalances(writeLnd: AuthenticatedLnd): Promise<AutopilotRebalance[]> {
     const { rebalanceHourStart, rebalanceHourEnd } = this.state.config;
     if (!this.inRebalanceWindow()) {
-      this.decisionNote("rebalance", `outside the rebalance hours (${rebalanceHourStart}–${rebalanceHourEnd} UTC) — no refills now`);
+      this.decisionNote("rebalance", `outside the rebalance hours (${rebalanceHourStart}–${rebalanceHourEnd} UTC) — no refills now`, "waiting");
       return [];
     }
     if (this.refilling) {
-      this.decisionNote("rebalance", "a manual refill is under way — the autopilot's refills wait for the next run");
+      this.decisionNote("rebalance", "a manual refill is under way — the autopilot's refills wait for the next run", "waiting");
       return [];
     }
     this.refilling = true;
@@ -1817,11 +2208,15 @@ export class Autopilot {
     const budgetSkips = plan.skipped.map((s) => `${s.rec.alias} (~${s.rec.estimatedRouteFeeSats ?? 0} sat)`);
     const out: AutopilotRebalance[] = [];
 
+    // Why the executor stopped a refill, when it did (its last ask).
+    const halted: { why: string | null } = { why: null };
     for (const r of plan.run) {
-      // Shutdown: the payment already under way finishes (it is being awaited
-      // right here); none of the moves planned after it starts.
-      if (this.shuttingDown) {
-        waiting.push(`${r.alias}: skipped, shutting down`);
+      // Shutdown, or auto-rebalance switched off (all automation paused)
+      // since the stage began: the payment already under way finishes (it is
+      // being awaited right here); none of the moves planned after it starts.
+      const stop = this.stopWhy("rebalanceEnabled");
+      if (stop) {
+        waiting.push(`${r.alias}: skipped, ${stop}`);
         continue;
       }
       // Actual-spend backstop: an earlier move's real fee may exceed its
@@ -1856,15 +2251,18 @@ export class Autopilot {
               ? { gate: { revenuePpm: r.expectedRevenuePpm, demandSats: r.earningDemandSats, minNetSats: r.minNetProfitSats } }
               : {}),
           },
-          // Inside the refill too, no attempt starts after the shutdown signal.
-          { ...hooks, shouldStop: () => this.shuttingDown },
+          // Inside the refill too, no attempt starts after the shutdown
+          // signal — or once auto-rebalance is off.
+          { ...hooks, shouldStop: () => (halted.why = this.stopWhy("rebalanceEnabled")) ?? false },
         ),
       );
       if (res.stopped) {
         // A deliberate skip (D15), like the moves planned after it: a source
         // whose attempt failed before the signal backs off (refillBooks).
         const failed = res.failedSourceIds?.length ?? 0;
-        waiting.push(`${r.alias}: skipped, shutting down${failed ? ` (after ${failed === 1 ? "a source" : `${failed} sources`} found no route)` : ""}`);
+        waiting.push(
+          `${r.alias}: skipped, ${halted.why ?? "shutting down"}${failed ? ` (after ${failed === 1 ? "a source" : `${failed} sources`} found no route)` : ""}`,
+        );
         continue;
       }
       if (res.inFlight) {
@@ -1872,7 +2270,7 @@ export class Autopilot {
         // counts as spent (pendingRebalances), and the books are settled when
         // a later run learns how it ended.
         inFlight.add(res.targetId).add(res.sourceId);
-        out.push({ alias: res.targetAlias, amountSats: res.amountSats, feeSats: null, costPpm: null, ok: false, error: res.error });
+        out.push({ alias: res.targetAlias, amountSats: res.amountSats, feeSats: null, costPpm: null, ok: false, inFlight: true, error: res.error });
         continue;
       }
       out.push({
@@ -1885,21 +2283,29 @@ export class Autopilot {
       });
     }
 
-    this.decisionNote("rebalance", this.rebalanceDecision(report.recommendations, out, plan.later, budgetSkips, waiting));
+    this.explain("rebalance", () => this.rebalanceDecision(report.recommendations, out, plan.later, budgetSkips, waiting));
     return out;
   }
 
   /** The rebalance stage's decision, said plainly (D16): what ran, what waits
-   *  and why — or why nothing qualifies. */
+   *  and why — or why nothing qualifies. Refills sent: acted (all of them
+   *  failing: an error; one still in flight is no failure yet); moves left for
+   *  the budget, the per-run limit or a busy channel: waiting; nothing that
+   *  clears the profit check: idle. */
   private rebalanceDecision(
     recs: Pick<RebalanceRecommendation, "state">[],
     ran: AutopilotRebalance[],
     later: RebalanceRecommendation[],
     budgetSkips: string[],
     waiting: string[],
-  ): string {
+  ): { text: string; state: DecisionState } {
     const parts: string[] = [];
-    if (ran.length) parts.push(`${ran.filter((r) => r.ok).length} of ${ran.length} refill${ran.length === 1 ? "" : "s"} paid`);
+    const inFlight = ran.filter((r) => r.inFlight).length;
+    if (ran.length) {
+      parts.push(
+        `${ran.filter((r) => r.ok).length} of ${ran.length} refill${ran.length === 1 ? "" : "s"} paid` + (inFlight ? ` (${inFlight} still in flight)` : ""),
+      );
+    }
     if (budgetSkips.length) {
       const b = this.rebalanceBudget();
       parts.push(
@@ -1909,11 +2315,21 @@ export class Autopilot {
     }
     if (later.length) parts.push(`${later.length} more wait${later.length === 1 ? "s" : ""} for the next run (at most ${this.state.config.maxRebalancesPerRun} per run)`);
     if (waiting.length) parts.push(waiting.join("; "));
-    if (parts.length) return parts.join(" · ");
+    if (parts.length) {
+      const state: DecisionState = ran.length
+        ? ran.some((r) => r.ok || r.inFlight)
+          ? "acted"
+          : "error"
+        : "waiting";
+      return { text: parts.join(" · "), state };
+    }
     const drained = recs.filter((r) => r.state !== "not_needed").length;
-    return drained
-      ? `no refill clears the profit check right now (${drained} drained channel${drained === 1 ? "" : "s"} watched — see what each would need on the Rebalancing tab)`
-      : "no channel needs a refill";
+    return {
+      text: drained
+        ? `no refill clears the profit check right now (${drained} drained channel${drained === 1 ? "" : "s"} watched — see what each would need on the Rebalancing tab)`
+        : "no channel needs a refill",
+      state: "idle",
+    };
   }
 
   /** A finished rebalance as the log keeps it. A refill that passed the
@@ -2303,7 +2719,7 @@ export class Autopilot {
    */
   private async runChannels(writeLnd: AuthenticatedLnd): Promise<AutopilotChannelOpen[]> {
     const cfg = this.state.config;
-    const note = (text: string) => this.decisionNote("channels", text);
+    const note = (text: string, state: DecisionState) => this.decisionNote("channels", text, state);
 
     // Respect the cooldown between auto-opens — after an open, and after one
     // that ended unclearly (it may have opened a channel).
@@ -2315,6 +2731,7 @@ export class Autopilot {
           unclear
             ? `the open to ${unclear} ${Math.round(elapsedMin)} min ago ended unclearly — it may have opened a channel; the next open waits for the ${cfg.channelCooldownMinutes}-minute cooldown`
             : `a channel was opened ${Math.round(elapsedMin)} min ago — the next open waits for the ${cfg.channelCooldownMinutes}-minute cooldown`,
+          "waiting",
         );
         return [];
       }
@@ -2330,6 +2747,7 @@ export class Autopilot {
       note(
         `nothing to open with: ${fmtSat(pre.chainSat)} sat on chain, all of it needed for the reserve (${fmtSat(pre.reserve.totalSat)} sat)` +
           (pre.reservedSat > 0 ? ` and the ${fmtSat(pre.reservedSat)} sat promised to sold channels` : ""),
+        "waiting",
       );
       return [];
     }
@@ -2339,11 +2757,11 @@ export class Autopilot {
     // no open (LND would have to guess the fee itself).
     const rate = await this.openFeeRate();
     if (rate === null) {
-      note("LND gave no on-chain fee estimate — no channel is opened until it does");
+      note("LND gave no on-chain fee estimate — no channel is opened until it does", "waiting");
       return [];
     }
     if (rate > cfg.channelMaxFeeRate) {
-      note(`on-chain fees are ${rate} sat/vB at the economy rate — above your ${cfg.channelMaxFeeRate} sat/vB maximum for opens; waiting for cheaper fees`);
+      note(`on-chain fees are ${rate} sat/vB at the economy rate — above your ${cfg.channelMaxFeeRate} sat/vB maximum for opens; waiting for cheaper fees`, "waiting");
       return [];
     }
 
@@ -2358,11 +2776,14 @@ export class Autopilot {
       let deferral: string | null = null;
       try {
         deferral = await this.leaveForMagma();
-      } catch {
-        // No answer: no deferral — the open goes ahead.
+      } catch (err) {
+        // No answer: no deferral — the open goes ahead. Said in the log (it
+        // was silent): the comparison it skipped is the one that holds
+        // capital back for Magma.
+        logLine("warn", `[autopilot] channels: the Magma comparison couldn't be made (${errText(err)}) — an open is not held back for it`);
       }
       if (deferral) {
-        note(deferral);
+        note(deferral, "deferred");
         return [];
       }
     }
@@ -2374,8 +2795,11 @@ export class Autopilot {
       this.openEconomics(),
       this.connectedPeers(),
     ]);
-    if (this.shuttingDown) {
-      note("stopped: shutting down — no open was started");
+    // The reads above take a while: the shutdown signal, or the switch going
+    // off (all automation paused), may have come meanwhile.
+    const halt = this.stopWhy("channelEnabled");
+    if (halt) {
+      note(openStopped(halt), "waiting");
       return [];
     }
     // This node's own connection first: LND keeps a few peers connected for
@@ -2384,15 +2808,15 @@ export class Autopilot {
     // a good peer (a day's back-off, then a week's). Nobody is dialed, and
     // nobody held back, until LND is connected again.
     if (connected === null) {
-      note("LND didn't list its connected peers — no peer is dialed this run (and none is held back for it)");
+      note("LND didn't list its connected peers — no peer is dialed this run (and none is held back for it)", "error");
       return [];
     }
     if (connected.size === 0) {
-      note("this node is connected to no peer at all right now (Tor or the internet down?) — no peer is dialed, and none is held back for it, until it is");
+      note("this node is connected to no peer at all right now (Tor or the internet down?) — no peer is dialed, and none is held back for it, until it is", "error");
       return [];
     }
     if (suggestions.length === 0) {
-      note("no peer to suggest right now (no candidate in the graph passes the filters)");
+      note("no peer to suggest right now (no candidate in the graph passes the filters)", "idle");
       return [];
     }
     const ctx: OpenContext = {
@@ -2408,14 +2832,18 @@ export class Autopilot {
     };
 
     const skipped: string[] = [];
-    const refused: string[] = [];
+    const refused: { alias: string; days: number; sizeLimit: boolean }[] = [];
     const out: AutopilotChannelOpen[] = [];
     let tries = 0;
     const dialsFrom = Date.now();
     for (const s of suggestions) {
       if (tries >= MAX_OPEN_TRIES_PER_RUN || (tries > 0 && Date.now() - dialsFrom > OPEN_DIAL_BUDGET_MS)) break;
-      if (this.shuttingDown) {
-        note("stopped: shutting down — no open was started");
+      // Before each peer: an open to the one before may have taken a minute
+      // and a half (a slow dial over Tor) — time enough for a pause.
+      const stop = this.stopWhy("channelEnabled");
+      if (stop) {
+        this.persist();
+        note([refusalNote(refused), openStopped(stop)].filter(Boolean).join(" · "), "waiting");
         return out;
       }
       const plan = planOpen(s, ctx);
@@ -2439,14 +2867,16 @@ export class Autopilot {
         note(
           `opened ${fmtSat(plan.sizeSats)} sat to ${s.alias} at ${rate} sat/vB${plan.why ? ` (${plan.why})` : ""}` +
             (unchecked ? ` — no payback check: ${unchecked}` : ""),
+          "acted",
         );
         this.persist();
         return [...out, { alias: s.alias, sizeSats: plan.sizeSats, ok: true, transactionId: res.transactionId }];
       }
       if (res.kind === "deferred") {
-        // The final capital check (inside the mutex) or the shutdown: not
-        // the peer's doing — nothing to remember about it.
-        note(res.reason);
+        // The final capital check (inside the mutex), the shutdown or the
+        // switch going off: not the peer's doing — nothing to remember about
+        // it. (Earlier peers' refusals this run are said too.)
+        note([refusalNote(refused), res.reason].filter(Boolean).join(" · "), "waiting");
         return out;
       }
       // This node's own doing — its wallet, its chain, its connection — is
@@ -2463,14 +2893,14 @@ export class Autopilot {
         note(
           `no channel opened — ${own}: the open to ${s.alias} failed (${res.error.replace(/^\w+: /, "")}), not by the peer's doing — ` +
             "no peer is held back for it, and the next run tries again",
+          "error",
         );
         this.persist();
         return out;
       }
       // The node itself was fine: its next trouble is news again.
       this.channelLast.delete(SELF_NEWS_KEY);
-      this.notePeerRefusal(s, res.error, plan.sizeSats);
-      refused.push(s.alias);
+      refused.push({ alias: s.alias, ...this.notePeerRefusal(s, res.error, plan.sizeSats) });
       if (this.channelNews(s.pubkey, res.error)) out.push({ alias: s.alias, sizeSats: plan.sizeSats, ok: false, error: res.error });
       if (!res.preBroadcast) {
         // The outcome is unclear (a dropped stream, a timeout): the funding
@@ -2480,16 +2910,17 @@ export class Autopilot {
         // beside the one that may exist, whatever the operator's cooldown.
         this.state.lastChannelOpenAt = new Date().toISOString();
         this.state.lastChannelOpenUnclear = s.alias;
-        note(`the open to ${s.alias} ended unclearly (${res.error}) — it may have opened a channel: no other open this run, and the next waits for the cooldown`);
+        note(`the open to ${s.alias} ended unclearly (${res.error}) — it may have opened a channel: no other open this run, and the next waits for the cooldown`, "error");
         this.persist();
         return out;
       }
     }
     this.persist();
     // (Every refusal counts here, also one not repeated in the run history.)
-    const tried = refused.length ? `${refused.join(", ")} refused an open (each waits before it is tried again)` : "";
     const why = skipped.slice(0, 3).join("; ") + (skipped.length > 3 ? `; and ${skipped.length - 3} more` : "");
-    note(`no channel opened — ${[tried, why].filter(Boolean).join(" · ") || "no suggestion qualified"}`);
+    // A refusal or a peer waiting out its back-off or the funds: waiting;
+    // only nothing to open at all is idle.
+    note(`no channel opened — ${[refusalNote(refused), why].filter(Boolean).join(" · ") || "no suggestion qualified"}`, refused.length || skipped.length ? "waiting" : "idle");
     return out;
   }
 
@@ -2582,9 +3013,11 @@ export class Autopilot {
     const connected = await connectForOpen(writeLnd, { pubkey: s.pubkey, sockets });
     if (!connected.ok) return { kind: "refused", error: connected.error, preBroadcast: true };
     return this.capital.mutex.run("autopilot open", async () => {
-      // The reads and the dial take a while. A shutdown signal that arrived
-      // meanwhile must not be followed by a funding broadcast.
-      if (this.shuttingDown) return { kind: "deferred" as const, reason: "stopped: shutting down — no open was started" };
+      // The reads, the dial and the wait for the mutex take a while. A
+      // shutdown signal — or the switch going off — that came meanwhile must
+      // not be followed by a funding broadcast.
+      const halt = this.stopWhy("channelEnabled");
+      if (halt) return { kind: "deferred" as const, reason: openStopped(halt) };
       // Authoritative check with a fresh balance: a Magma order accepted since
       // the look above has its coins reserved, and they are not ours to spend
       // — nor what its own open will need on top: its funding fee, its step
@@ -2597,7 +3030,8 @@ export class Autopilot {
           reason: `deferred: only ${sp.spendableSat} sat spendable after the reserve and ${sp.reservedSat} sat promised to sold channels — ${s.alias} needs ${sizeSats}`,
         };
       }
-      if (this.shuttingDown) return { kind: "deferred" as const, reason: "stopped: shutting down — no open was started" };
+      const late = this.stopWhy("channelEnabled");
+      if (late) return { kind: "deferred" as const, reason: openStopped(late) };
       const routing = this.initialRoutingFee();
       const res = await fundChannel(writeLnd, {
         pubkey: s.pubkey,
@@ -2636,8 +3070,8 @@ export class Autopilot {
 
   /** A peer refused an open (or couldn't be reached): remember it, with a
    *  back-off — none when it told its size limits: the next plan meets them
-   *  (or skips the peer, saying why). */
-  private notePeerRefusal(s: Pick<SuggestionV2, "pubkey" | "alias">, error: string, sizeSats: number): void {
+   *  (or skips the peer, saying why). Returns the wait, for the note. */
+  private notePeerRefusal(s: Pick<SuggestionV2, "pubkey" | "alias">, error: string, sizeSats: number): { days: number; sizeLimit: boolean } {
     const peers = (this.state.peerOpenFailures ??= {});
     const prev = peers[s.pubkey];
     const fails = (prev?.fails ?? 0) + 1;
@@ -2660,6 +3094,7 @@ export class Autopilot {
     if (keys.length > PEER_RECORDS_KEPT) {
       for (const k of keys.sort((a, b) => Date.parse(peers[a].lastAt) - Date.parse(peers[b].lastAt)).slice(0, keys.length - PEER_RECORDS_KEPT)) delete peers[k];
     }
+    return { days: backoffDays, sizeLimit };
   }
 
   /** Whether a failed open is news for the run history: the first of a run
@@ -2691,14 +3126,20 @@ export class Autopilot {
    */
   private async runSell(): Promise<AutopilotSell[]> {
     const cfg = this.state.config;
-    if (!cfg.sellEnabled || !this.amboss.hasKey() || this.shuttingDown) return [];
+    if (!cfg.sellEnabled || this.shuttingDown) return [];
+    if (!this.amboss.hasKey()) {
+      this.decisionNote("magma", "no Amboss API key — connect one in Settings: no offer is kept and no order is taken", "blocked");
+      return [];
+    }
     const key = this.amboss.getKey();
     const out: AutopilotSell[] = [];
+    // What the upkeep left as it is, and why (the offer notes).
+    const notes: string[] = [];
     const sync = this.syncState();
     sync.managed = true;
     const failed = (message: string): AutopilotSell[] => {
       sync.lastError = { at: new Date().toISOString(), message };
-      console.warn(`[autopilot] Magma offers: ${message}`);
+      this.decisionNote("magma", `offer upkeep failed: ${message}`, "error");
       return [...out, { orderId: "offers", action: "error", sizeSats: 0, ok: false, error: message }];
     };
 
@@ -2838,13 +3279,17 @@ export class Autopilot {
 
     const entries: OfferSyncEntry[] = [];
     for (const off of offers) {
-      if (this.shuttingDown) {
-        // Offer upkeep can wait for the next start; its Amboss calls must not
-        // use up the shutdown grace that the order lane may still need.
-        entries.push(this.syncEntry(off, null));
+      // Shutting down: offer upkeep can wait for the next start (its Amboss
+      // calls must not use up the shutdown grace the order lane may still
+      // need). Liquidity provision switched off — or all automation paused —
+      // since the stage began: the offers are the operator's again, left
+      // exactly as they are (the pause asked them about listed offers).
+      const stop = this.stopWhy("sellEnabled");
+      if (stop) {
+        entries.push(this.syncEntry(off, null, undefined, this.shuttingDown ? undefined : `left as it is: ${stop}`));
         continue;
       }
-      entries.push(await this.upkeepOffer(key, off, ctx, out, readAt));
+      entries.push(await this.upkeepOffer(key, off, ctx, out, readAt, notes));
     }
     // Cut memories of offers that are gone have nothing left to give back,
     // and their ownership records nothing left to own.
@@ -2865,15 +3310,26 @@ export class Autopilot {
     const canCreate =
       !this.shuttingDown && cfg.sellAutoReprice && offers.length === 0 && rec?.sell.state === "good_to_sell" && !!createRec;
     const realistic = canCreate ? await this.sellingRealistic() : null;
-    if (canCreate && realistic && !realistic.ok) {
-      this.decisionNote("magma", `no offer listed automatically: ${realistic.why}`);
-    }
+    let noOffer: { text: string; state: DecisionState } | null = null;
+    if (offers.length === 0) noOffer = this.whyNoOffer(rec, createRec !== undefined, realistic);
     if (canCreate && rec && createRec && realistic?.ok) {
       const viable = rec.sell.minViableSizeSat ?? 1_000_000;
       const minCh = Math.min(viable, ctx.maxOrder(viable));
       const maxCh = ctx.maxOrder(minCh);
       const listed = ctx.listable(minCh);
-      if (minCh > 0 && listed >= minCh && maxCh >= minCh) {
+      if (!(minCh > 0 && listed >= minCh && maxCh >= minCh)) {
+        noOffer = {
+          text: `no offer listed: only ${fmtSat(listed)} sat could be listed after the reserve, promised orders and the deploy cap — below the smallest channel worth selling (${fmtSat(viable)} sat)`,
+          state: "waiting",
+        };
+      }
+      // The selling check above reads Amboss's public book (it can take a
+      // while): the switch is asked again here — which spares the key read
+      // below — and once more after that read, right before the create.
+      const stop = this.stopWhy("sellEnabled");
+      if (stop && minCh > 0 && listed >= minCh && maxCh >= minCh) {
+        noOffer = { text: `no offer listed: ${stop}`, state: "waiting" };
+      } else if (minCh > 0 && listed >= minCh && maxCh >= minCh) {
         const terms: OfferTerms = {
           totalSizeSats: listed,
           minSizeSats: minCh,
@@ -2895,12 +3351,21 @@ export class Autopilot {
         };
         try {
           const pubkey = (await getWalletInfo({ lnd: this.readLnd })).public_key;
-          const id = await createOffer(key, pubkey, terms);
-          write.ok = true;
-          const created = await getMyOffer(key, id).catch(() => null);
-          write.verified = created ? termsMatch(created, terms) : undefined;
-          if (created) entries.push(this.syncEntry(created, fieldsOf(created), write));
-          out.push({ orderId: id, action: "create", sizeSats: terms.totalSizeSats, ok: true });
+          // That read is awaited too: the switch, once more — with nothing
+          // awaited between this check and the create (review of P7, round
+          // 2: a pause that landed during the key read still listed the
+          // offer, with nobody fulfilling its orders).
+          const late = this.stopWhy("sellEnabled");
+          if (late) {
+            noOffer = { text: `no offer listed: ${late}`, state: "waiting" };
+          } else {
+            const id = await createOffer(key, pubkey, terms);
+            write.ok = true;
+            const created = await getMyOffer(key, id).catch(() => null);
+            write.verified = created ? termsMatch(created, terms) : undefined;
+            if (created) entries.push(this.syncEntry(created, fieldsOf(created), write));
+            out.push({ orderId: id, action: "create", sizeSats: terms.totalSizeSats, ok: true });
+          }
         } catch (err) {
           write.error = errText(err);
           out.push({ orderId: "new-offer", action: "create", sizeSats: terms.totalSizeSats, ok: false, error: write.error });
@@ -2910,9 +3375,19 @@ export class Autopilot {
     }
     sync.offers = entries;
     sync.at = new Date().toISOString();
+    // Switched off (or paused) during the run: whatever was written before
+    // stands; nothing was written after — said, and a wait (not "nothing to
+    // do") when nothing was written at all.
+    const halted = this.shuttingDown ? null : this.stopWhy("sellEnabled");
+    if (halted && !noOffer?.text.endsWith(halted)) notes.push(`${halted} — no further offer change was made`);
+    this.explain("magma", () => {
+      const d = this.upkeepDecision(offers, entries, out, notes, noOffer, cfg);
+      return halted && d.state === "idle" ? { text: d.text, state: "waiting" } : d;
+    });
 
-    // Lease over (Amboss: CHANNEL_MONITORING_FINISHED): close to reclaim the capital.
-    if (cfg.sellAutoClose && !this.shuttingDown) {
+    // Lease over (Amboss: CHANNEL_MONITORING_FINISHED): close to reclaim the
+    // capital — not once the switch is off (stopWhy).
+    if (cfg.sellAutoClose && !this.stopWhy("sellEnabled")) {
       try {
         out.push(...(await this.magma.closeFinishedLeases()));
       } catch (err) {
@@ -2922,8 +3397,94 @@ export class Autopilot {
     return out;
   }
 
+  /**
+   * Why the autopilot lists no offer, with none on Amboss (D16: "Magma — no
+   * offer listed: auto-pricing is off" was silent). Listing means choosing a
+   * price, which only auto-pricing may do; then the market must pay above
+   * this node's profit floor, there must be capital to list, and selling must
+   * be realistic for this node (D8).
+   */
+  private whyNoOffer(
+    rec: MagmaV2Report | null,
+    canPrice: boolean,
+    realistic: { ok: boolean; why: string } | null,
+  ): { text: string; state: DecisionState } | null {
+    const cfg = this.state.config;
+    // Blocked, not idle: with selling on, nothing will ever be listed until
+    // the operator acts — the Overview showed "Liquidity provision ON ·
+    // nothing to do" (review of P7).
+    if (!cfg.sellAutoReprice) {
+      return { text: "no offer listed — auto-pricing is off, so the autopilot lists none: create one on Market → Sell, or turn auto-pricing on", state: "blocked" };
+    }
+    if (!rec) return { text: "no offer listed: the market recommendation could not be worked out this run (see Market → Sell)", state: "error" };
+    const st = rec.sell.state;
+    if (st === "insufficient_capital") {
+      return { text: `no offer listed: ${rec.sell.reasons[0] ?? "not enough on-chain capital to list one"}`, state: "waiting" };
+    }
+    if (st !== "good_to_sell") {
+      return { text: `no offer listed automatically: ${rec.sell.reasons[0] ?? "leasing doesn't beat routing at today's prices"}`, state: "idle" };
+    }
+    if (!canPrice) return { text: "no offer listed: the engine has no price to list one at", state: "idle" };
+    if (realistic && !realistic.ok) return { text: `no offer listed automatically: ${realistic.why}`, state: "idle" };
+    return null;
+  }
+
+  /**
+   * The offer upkeep's decision (D16), said plainly: what it wrote to Amboss,
+   * or why it left the offers as they are — or why there is none.
+   */
+  private upkeepDecision(
+    offers: MyOffer[],
+    entries: OfferSyncEntry[],
+    out: AutopilotSell[],
+    notes: string[],
+    noOffer: { text: string; state: DecisionState } | null,
+    cfg: AutopilotConfig,
+  ): { text: string; state: DecisionState } {
+    const writes = out.filter((a) => a.action !== "error" && a.action !== "skip" && a.action !== "close");
+    const done = writes.filter((a) => a.ok);
+    const bad = writes.filter((a) => !a.ok);
+    const extra = notes.length ? ` · ${notes.join(" · ")}` : "";
+    if (bad.length && !done.length) return { text: `an offer change Amboss didn't take: ${bad[0].error ?? "failed"}${extra}`, state: "error" };
+    if (done.length) {
+      const what = done.map((a) =>
+        a.action === "create"
+          ? "listed a new offer"
+          : `${OFFER_VERB[a.action] ?? a.action} offer ${a.orderId.slice(0, 8)}…${a.action === "disable" && a.error ? ` (${a.error})` : ""}`,
+      );
+      return {
+        text: `${what.join(", ")}${bad.length ? ` — ${bad.length} change${bad.length === 1 ? "" : "s"} failed (${bad[0].error ?? "failed"})` : ""}${extra}`,
+        state: "acted",
+      };
+    }
+    if (offers.length === 0) return noOffer ? { text: noOffer.text + extra, state: noOffer.state } : { text: `no offer listed${extra}`, state: "idle" };
+    const listed = offers.filter((o) => o.status === "ENABLED");
+    const enabled = listed.length;
+    const disabled = offers.length - enabled;
+    const terms = !cfg.sellAutoReprice && !cfg.sellAutoSize ? " — their terms are yours; the autopilot only keeps them fundable" : "";
+    const inSync = entries.every((e) => e.wanted === null || e.inSync);
+    // What is on Amboss, so "nothing to change" says what it left as it is.
+    const shown = listed
+      .slice(0, 2)
+      .map((o) => `${o.id.slice(0, 8)}… ${fmtSat(o.minSizeSats)}–${fmtSat(o.maxSizeSats)} sat at ${fmtSat(o.feeRatePpm)} ppm + ${fmtSat(o.baseFeeSats)} sat`);
+    return {
+      text:
+        `${enabled} offer${enabled === 1 ? "" : "s"} listed${shown.length ? ` (${shown.join("; ")}${enabled > 2 ? "; …" : ""})` : ""}` +
+        `${disabled ? `, ${disabled} not (${offers.filter((o) => o.status !== "ENABLED").map((o) => o.status.toLowerCase()).join(", ")})` : ""}` +
+        `${inSync ? ", nothing to change" : ""}${terms}${extra}`,
+      state: "idle",
+    };
+  }
+
   /** One offer's upkeep: listed only while fundable, then its terms. */
-  private async upkeepOffer(key: string, off: MyOffer, ctx: OfferCtx, out: AutopilotSell[], readAt: number): Promise<OfferSyncEntry> {
+  private async upkeepOffer(
+    key: string,
+    off: MyOffer,
+    ctx: OfferCtx,
+    out: AutopilotSell[],
+    readAt: number,
+    notes: string[] = [],
+  ): Promise<OfferSyncEntry> {
     if (off.status === "ADMIN_DISABLED") {
       return this.syncEntry(off, null, undefined, "disabled by Amboss support — only Amboss can enable it again");
     }
@@ -2948,6 +3509,8 @@ export class Autopilot {
     const wantStatus = capitalStatus(off.status, fundable, control);
     if (wantStatus) {
       const r = await this.capitalToggle(key, off, wantStatus, { fundable, sellableNow }, out);
+      // Switched off before the flip: nothing was sent.
+      if (r.stopped) return this.syncEntry(r.offer, null, undefined, `left as it is: ${r.stopped}`);
       control = this.offerControlOf(off.id);
       const wanted = r.write ? { ...fieldsOf(r.offer), status: wantStatus } : null;
       if (r.unresolved) {
@@ -2965,7 +3528,7 @@ export class Autopilot {
     if (off.status !== "ENABLED") return this.syncEntry(off, null, undefined, disabledWhy(off.status));
 
     const want = this.wantedTerms(off, ctx, !!control.manual);
-    if (want.notes.length) this.decisionNote("magma", `offer ${off.id.slice(0, 8)}…: ${want.notes.join("; ")}`);
+    if (want.notes.length) notes.push(`offer ${off.id.slice(0, 8)}…: ${want.notes.join("; ")}`);
     const update = termsUpdate(off, want.fields);
     if (!update) {
       // Amboss already has exactly this: the cut memory matches it as is.
@@ -2988,10 +3551,14 @@ export class Autopilot {
     // it now is; the next run starts from it. (Review of P1b: the manual
     // write and this one crossed, the later one won, and the other's
     // read-back reported "not stored".)
-    const changed = await this.withOffer(off.id, async (): Promise<MyOffer | null> => {
+    const outcome = await this.withOffer(off.id, async (): Promise<{ changed: MyOffer } | { stopped: string } | null> => {
       const fresh = await getMyOffer(key, off.id).catch(() => null);
       const takenOver = !control.manual && !!this.offerControlOf(off.id).manual;
-      if (takenOver || (fresh && !sameTerms(fresh, off))) return fresh ?? off;
+      if (takenOver || (fresh && !sameTerms(fresh, off))) return { changed: fresh ?? off };
+      // Right before the write, the switch — live (stopWhy): the reads before
+      // it, and the wait for another write to this offer, take a while.
+      const stop = this.stopWhy("sellEnabled");
+      if (stop) return { stopped: stop };
       try {
         write.ok = await updateOffer(key, off.id, update);
         if (!write.ok) write.error = "Amboss did not apply the update (success: false)";
@@ -3009,8 +3576,14 @@ export class Autopilot {
       }
       return null;
     });
-    if (changed) {
-      return this.syncEntry(changed, null, undefined, "the offer changed while this run priced it (an edit on Market → Sell or on amboss.tech) — left as it is now; the next run starts from it");
+    if (outcome && "stopped" in outcome) return this.syncEntry(off, want.fields, undefined, [...want.notes, `not changed: ${outcome.stopped}`]);
+    if (outcome) {
+      return this.syncEntry(
+        outcome.changed,
+        null,
+        undefined,
+        "the offer changed while this run priced it (an edit on Market → Sell or on amboss.tech) — left as it is now; the next run starts from it",
+      );
     }
     const ok = write.ok && write.verified !== false;
     out.push({ orderId: off.id, action: want.kind, sizeSats: want.fields.maxSizeSats, ok, ...(ok ? {} : { error: write.error }) });
@@ -3087,7 +3660,7 @@ export class Autopilot {
     want: "ENABLED" | "DISABLED",
     cap: { fundable: boolean; sellableNow: number },
     out: AutopilotSell[],
-  ): Promise<{ offer: MyOffer; write: OfferWrite | null; unresolved?: boolean }> {
+  ): Promise<{ offer: MyOffer; write: OfferWrite | null; unresolved?: boolean; stopped?: string }> {
     return this.withOffer(off.id, async () => {
       const action = want === "ENABLED" ? "enable" : "disable";
       const reason =
@@ -3107,6 +3680,12 @@ export class Autopilot {
       // Changed since the listing was read (a click, amboss.tech): decided
       // afresh at the next run, on what Amboss shows then.
       if (capitalStatus(fresh.status, cap.fundable, this.offerControlOf(off.id)) !== want) return { offer: fresh, write: null };
+      // Liquidity provision switched off (or all automation paused) since the
+      // run began: no flip — the operator was asked what to do with listed
+      // offers when they paused, and an offer is listed again only while
+      // selling is on.
+      const stop = this.stopWhy("sellEnabled");
+      if (stop) return { offer: fresh, write: null, stopped: stop };
       if (want === "DISABLED") {
         this.setOfferControl(off.id, { ...this.offerControlOf(off.id), autoDisablingAt: write.at });
         this.persist();
@@ -3299,6 +3878,7 @@ export class Autopilot {
    *  terms are theirs until they hand it back (resumeOfferAutomation). Who
    *  disabled it, if anyone, is unchanged — an edit is not a status click. */
   pauseOfferAutomation(offerId: string, why: string): void {
+    this.forgetPageReport();
     this.setOfferControl(offerId, { ...this.offerControlOf(offerId), manual: { since: new Date().toISOString(), why } });
     this.persist();
   }
@@ -3307,6 +3887,7 @@ export class Autopilot {
    *  again (with Liquidity provision on), from the next run. A disable by
    *  hand still stands. */
   resumeOfferAutomation(offerId: string): void {
+    this.forgetPageReport();
     this.setOfferControl(offerId, { ...this.offerControlOf(offerId), manual: undefined });
     this.persist();
   }
@@ -3315,6 +3896,7 @@ export class Autopilot {
    *  turning Liquidity provision off): the listing is theirs — a disable
    *  sticks, an enable lists it — and the terms stay with whoever had them. */
   offerStatusSetByHand(offerId: string, status: string): void {
+    this.forgetPageReport();
     const control = this.offerControlOf(offerId);
     this.setOfferControl(offerId, {
       ...control,
@@ -3355,6 +3937,40 @@ export class Autopilot {
    *  Market page and the offer upkeep share (a8: they used to differ). */
   magmaReport(key: string = this.amboss.getKey()): Promise<MagmaV2Report> {
     return getMagmaRecommendations(this.readLnd, key, this.magmaOverrides());
+  }
+
+  /** The report the pages read — shared (see magmaReportShared). */
+  private pageReport: { at: number; sig: string; report: Promise<MagmaV2Report> } | null = null;
+
+  /**
+   * The Magma report for the pages, read once and shared for
+   * MAGMA_REPORT_SHARE_MS (review a6-ux:polling-and-stale-data: each read
+   * is four Amboss calls plus LND's channels, chain and 30 days of flow, and
+   * seven views asked for it — Market → Orders every 30 s: ~600 Amboss calls
+   * an hour). Concurrent asks share one read; a different key or different
+   * engine inputs (a settings change) read afresh, and so does the first ask
+   * after an offer was written or taken over by hand (forgetPageReport). A
+   * failed read is not kept. The autopilot's own offer upkeep always reads
+   * fresh (magmaReport).
+   */
+  magmaReportShared(key: string = this.amboss.getKey()): Promise<MagmaV2Report> {
+    const sig = JSON.stringify([key, this.magmaOverrides()]);
+    const now = Date.now();
+    const hit = this.pageReport;
+    if (hit && hit.sig === sig && now - hit.at < MAGMA_REPORT_SHARE_MS) return hit.report;
+    const report = this.magmaReport(key);
+    const entry = { at: now, sig, report };
+    this.pageReport = entry;
+    report.catch(() => {
+      if (this.pageReport === entry) this.pageReport = null;
+    });
+    return report;
+  }
+
+  /** Something the pages' report shows changed (an offer written or taken
+   *  over by hand): the next ask reads afresh. */
+  forgetPageReport(): void {
+    this.pageReport = null;
   }
 
   /** What this node could list on Magma now: the coins after the effective
@@ -3520,10 +4136,108 @@ export class Autopilot {
   /** The latest eligibility the autopilot computed (null until it has). */
   lastEligibility: Eligibility | null = null;
 
-  /** The latest decision NOT to act, per area, with its reason (D16; the
-   *  full per-area status is a later package's — this is its seed). */
-  private decisionNote(area: DecisionArea, text: string): void {
-    (this.state.decisions ??= {})[area] = { at: new Date().toISOString(), text };
+  /**
+   * The area's latest decision, with its reason (D16): what it did, or why it
+   * did nothing — visible on the Autopilot tab and the Overview, and logged
+   * once when it changes (the same decision again only counts up, never a
+   * new line: a standing wait used to be logged, and shown, every 30 minutes).
+   * An error is also kept as the area's last error.
+   */
+  private decisionNote(area: DecisionArea, text: string, state: DecisionState): void {
+    const nowIso = new Date().toISOString();
+    const prev = this.state.decisions?.[area];
+    // An action is never "the same again": "opened 2,000,000 sat to X" today
+    // and "… to Y" next week differ only in numbers and names the signature
+    // can't tell apart — the second was neither logged nor in the decision
+    // log (review of P7). Only standing states count up.
+    const same = !!prev && state !== "acted" && decisionSig(prev.state ?? "waiting", prev.text) === decisionSig(state, text);
+    const next: AreaDecision = {
+      at: nowIso,
+      state,
+      text,
+      since: same ? (prev.since ?? prev.at) : nowIso,
+      repeats: same ? (prev.repeats ?? 1) + 1 : 1,
+      ...(prev?.lastError ? { lastError: prev.lastError } : {}),
+    };
+    if (state === "error") next.lastError = { at: nowIso, text };
+    (this.state.decisions ??= {})[area] = next;
+    if (!same) {
+      logLine(state === "error" ? "warn" : "info", `[autopilot] ${area}: ${state} — ${text}`);
+      this.decisionLogEntries = [{ at: nowIso, area, state, text }, ...this.decisionLogEntries].slice(0, DECISION_LOG_KEPT);
+      this.decisionLogStore.write(this.decisionLogEntries);
+    }
+  }
+
+  /** When each area's decision changed, newest first (diagnostics). */
+  decisionLog(): DecisionLogEntry[] {
+    return [...this.decisionLogEntries];
+  }
+
+  /** The Magma report the pages last read, if it is at hand — never a new
+   *  read (diagnostics must not wait for Amboss). */
+  async cachedPageReport(): Promise<MagmaV2Report | null> {
+    const hit = this.pageReport;
+    if (!hit) return null;
+    return hit.report.catch(() => null);
+  }
+
+  /** Record an area's decision worked out by `make` — never at the cost of
+   *  the stage's own result: what it did is already done, and must reach the
+   *  run history whatever goes wrong in saying why. */
+  private explain(area: DecisionArea, make: () => { text: string; state: DecisionState }): void {
+    try {
+      const d = make();
+      this.decisionNote(area, d.text, d.state);
+    } catch (err) {
+      logLine("warn", `[autopilot] ${area}: the decision could not be worded (${errText(err)})`);
+    }
+  }
+
+  /**
+   * Each area's status as the UI shows it (D16): its last decision — unless
+   * it is off, or blocked right now whatever it last decided: write mode off
+   * (nothing can run), or for selling no Amboss key / a key Amboss rejects.
+   * A decision from before states were kept reads as "waiting" (they were
+   * all notes on why nothing was done).
+   */
+  areaStatus(): Record<DecisionArea, AreaStatus> {
+    const c = this.state.config;
+    const stored = this.state.decisions ?? {};
+    const last = (area: DecisionArea): AreaDecision | undefined => {
+      const d = stored[area];
+      return d ? { ...d, state: d.state ?? "waiting" } : undefined;
+    };
+    const status = (area: DecisionArea, on: boolean, offText: string): AreaStatus => {
+      const d = last(area);
+      if (!this.canWrite) {
+        return { state: "blocked", text: "write mode is off (LM_ENABLE_WRITE) — the autopilot can't change anything on the node", at: null, ...(d ? { last: d } : {}) };
+      }
+      if (!on) return { state: "off", text: offText, at: null, ...(d ? { last: d } : {}) };
+      if (area === "magma") {
+        if (!this.amboss.hasKey()) {
+          return { state: "blocked", text: "no Amboss API key — connect one in Settings: no offer is kept and no order is taken", at: null, ...(d ? { last: d } : {}) };
+        }
+        if (this.amboss.getValidity() === false) {
+          return {
+            state: "blocked",
+            text: "Amboss rejects your API key (expired or revoked) — connect a fresh one in Settings; orders in flight are still carried to their end",
+            at: null,
+            ...(d ? { last: d } : {}),
+          };
+        }
+      }
+      // Switched on, not decided yet: its own state — "nothing to do" said
+      // something nobody had checked (review of P7).
+      if (!d) return { state: "not_run", text: "not run yet since it was switched on — the next run decides", at: null };
+      return { ...d };
+    };
+    return {
+      fees: status("fees", c.enabled, "fee automation is off — fees change only when you set them (a sold channel's promised fee cap is still kept)"),
+      rebalance: status("rebalance", c.rebalanceEnabled, "auto-rebalance is off — refills run only when you start one"),
+      channels: status("channels", c.channelEnabled, "the channel autopilot is off — channels open only when you open them"),
+      magma: status("magma", c.sellEnabled, "Liquidity provision is off — no offer is kept and no new order is taken (orders already taken on are carried to their end)"),
+      maxHtlc: status("maxHtlc", c.maxHtlcEnabled, "advertising routable size is off"),
+    };
   }
 
   private syncState(): OfferSyncStatus {
@@ -3571,6 +4285,7 @@ export class Autopilot {
   /** A manual offer write (Market → Sell): kept with the sync status, so the
    *  last result of every write is visible, whoever made it. */
   recordOfferWrite(off: MyOffer | null, offerId: string, write: OfferWrite): void {
+    this.forgetPageReport();
     // The operator chose new terms: those are the offer's intent now. If they
     // exceed what can be funded, the next upkeep cuts them — and remembers
     // them as what to give back.
@@ -3713,6 +4428,18 @@ export class Autopilot {
     return news;
   }
 
+  /**
+   * "Run once now": a run — or null when one is under way already (or the
+   * process is shutting down, or nothing can be written). runOnce answers an
+   * empty run then, which the tab showed as "0 applied, 0 failed of 0
+   * attempted" — as if a run had found nothing to do.
+   */
+  async runOnceNow(): Promise<AutopilotRun | null> {
+    // (No await before runOnce takes its lock: nothing can slip in between.)
+    if (this.running || this.shuttingDown || !this.writeLnd) return null;
+    return this.runOnce();
+  }
+
   /** Run the autopilot once: fees, then rebalances, then channel opens, then
    *  Magma offer upkeep (each if enabled). */
   async runOnce(): Promise<AutopilotRun> {
@@ -3735,19 +4462,34 @@ export class Autopilot {
     this.running = true;
     this.runningSince = new Date().toISOString();
     const writeLnd = this.writeLnd;
+    // Every stage that threw in this pass — and which of those failures are
+    // news for the run history (the same failure again is not).
     const errors: { stage: string; error: string }[] = [];
+    const news = new Set<string>();
 
     // After a shutdown signal no further stage starts; inside a stage, every
-    // payment, channel open and offer write checks again before it begins.
+    // fee write, payment, channel open, max_htlc update and offer write asks
+    // again before it begins — the shutdown, and the stage's switch as it is
+    // NOW (stopWhy: a pause mid-run starts nothing new).
     // Each stage stands alone: one that throws is recorded and the others
     // still run (before, a failing fee stage also skipped Magma offer upkeep).
-    const stage = async <T>(name: string, on: boolean, run: () => Promise<T[]>): Promise<T[]> => {
+    // A stage's failure is its area's decision (D16) — and a line of the run
+    // history only when it is news: the same failure again (LND down for an
+    // hour) counts up on the area's status instead of filling the history.
+    const stage = async <T>(name: string, area: DecisionArea, on: boolean, run: () => Promise<T[]>): Promise<T[]> => {
       if (!on || this.shuttingDown) return [];
       try {
-        return await run();
+        const res = await run();
+        this.stageLast.delete(name);
+        return res;
       } catch (err) {
-        console.error(`[autopilot] ${name} stage failed:`, err);
-        errors.push({ stage: name, error: errText(err) });
+        const error = errText(err);
+        logLine("error", `[autopilot] ${name} stage failed: ${error}`);
+        this.decisionNote(area, `the ${name} stage failed: ${error}`, "error");
+        const sig = error.replace(/\d[\d,.]*/g, "#");
+        if (this.stageLast.get(name) !== sig) news.add(name);
+        this.stageLast.set(name, sig);
+        errors.push({ stage: name, error });
         return [];
       }
     };
@@ -3758,27 +4500,36 @@ export class Autopilot {
       // rebalance stage this ran only within the window, with rebalancing on:
       // a payment left in flight could stay unreconciled, its maximum fee
       // charged to the budget, for as long as rebalancing stayed off.)
-      await stage("rebalance bookkeeping", (this.state.pendingRebalances ?? []).length > 0, async () => {
+      await stage("rebalance bookkeeping", "rebalance", (this.state.pendingRebalances ?? []).length > 0, async () => {
         await this.reconcilePendingRebalances();
         return [];
       });
       const changes = [
-        ...(await stage("fees", this.state.config.enabled, () => this.runFees(writeLnd))),
+        ...(await stage("fees", "fees", this.state.config.enabled, () => this.runFees(writeLnd))),
         // D7 with fee automation off: the routing-fee promises of sold
         // channels are still kept — LND's default fee or a change made with
         // another tool can sit above a cap. Only a breach is touched, and only
         // lowered to the cap; every other fee stays the operator's.
-        ...(await stage("lease promises", !this.state.config.enabled && this.capital.leaseCaps().length > 0, () =>
+        ...(await stage("lease promises", "fees", !this.state.config.enabled && this.capital.leaseCaps().length > 0, () =>
           this.keepLeasePromises(writeLnd),
         )),
       ];
-      const rebalances = await stage("rebalancing", this.state.config.rebalanceEnabled, () => this.runRebalances(writeLnd));
-      const channels = await stage("channels", this.state.config.channelEnabled, () => this.runChannels(writeLnd));
-      const sells = await stage("magma", true, () => this.runSell());
+      const rebalances = await stage("rebalancing", "rebalance", this.state.config.rebalanceEnabled, () => this.runRebalances(writeLnd));
+      const channels = await stage("channels", "channels", this.state.config.channelEnabled, () => this.runChannels(writeLnd));
+      const sells = await stage("magma", "magma", true, () => this.runSell());
       // Advertised-size upkeep: only gossips when a channel's bucket moved.
-      const maxHtlc = await stage("max_htlc", this.state.config.maxHtlcEnabled, () =>
-        runMaxHtlcPass(this.readLnd, writeLnd, this.maxHtlcBackoff).catch(() => [] as MaxHtlcChange[]),
-      );
+      // (Its failure used to be swallowed — `.catch(() => [])` — so LND not
+      // answering it left no trace; now it is the area's error.)
+      const maxHtlc = await stage("max_htlc", "maxHtlc", this.state.config.maxHtlcEnabled, async () => {
+        // Each update asks the live switch first (stopWhy): the pass reads
+        // every channel's policy from the graph, which takes a while.
+        const halted: { why: string | null } = { why: null };
+        const moved = await runMaxHtlcPass(this.readLnd, writeLnd, this.maxHtlcBackoff, {
+          shouldStop: () => (halted.why = this.stopWhy("maxHtlcEnabled")) !== null,
+        });
+        this.explain("maxHtlc", () => maxHtlcDecision(moved, halted.why));
+        return moved;
+      });
       // "skip" entries are non-actions (cap/reserve) — don't count them as
       // attempts. And offer upkeep that fails the same way every run (Amboss
       // down, a write it keeps refusing) is one line of history, not one per
@@ -3786,35 +4537,64 @@ export class Autopilot {
       // status keeps its last error either way).
       const acted = this.laneNews(sells.filter((s) => s.action !== "skip"));
 
-      const run: AutopilotRun = {
-        at: new Date().toISOString(),
-        attempted: changes.length + rebalances.length + channels.length + acted.length + maxHtlc.length + errors.length,
+      // A refill still in flight is no failure (not yet): counted neither way.
+      const refillsFailed = rebalances.filter((r) => !r.ok && !r.inFlight).length;
+      const items = changes.length + rebalances.length + channels.length + acted.length + maxHtlc.length;
+      const itemsFailed =
+        changes.filter((c) => !c.ok).length +
+        refillsFailed +
+        channels.filter((c) => !c.ok).length +
+        acted.filter((s) => !s.ok).length +
+        maxHtlc.filter((m) => !m.ok).length;
+      const at = new Date().toISOString();
+      const lineOf = (stageErrors: { stage: string; error: string }[]): AutopilotRun => ({
+        at,
+        attempted: items + stageErrors.length,
         applied:
           changes.filter((c) => c.ok).length +
           rebalances.filter((r) => r.ok).length +
           channels.filter((c) => c.ok).length +
           acted.filter((s) => s.ok).length +
           maxHtlc.filter((m) => m.ok).length,
-        failed:
-          changes.filter((c) => !c.ok).length +
-          rebalances.filter((r) => !r.ok).length +
-          channels.filter((c) => !c.ok).length +
-          acted.filter((s) => !s.ok).length +
-          maxHtlc.filter((m) => !m.ok).length +
-          errors.length,
+        failed: itemsFailed + stageErrors.length,
         changes,
         rebalances,
         channels,
         sells: acted,
         maxHtlc,
-        ...(errors.length ? { errors } : {}),
-      };
+        ...(stageErrors.length ? { errors: stageErrors } : {}),
+      });
+      // What THIS pass did, every stage that failed in it included — what
+      // "Run once now" answers and the Overview counts. (Review of P7: a
+      // stage failing the same way again was left out of the pass's own
+      // result too, and the Overview read "nothing needed changing" right
+      // above "Fee automation failed".) The run history gets the failure only
+      // when it is news: LND down for an hour is one line there, not two a
+      // run.
+      const run = lineOf(errors);
+      const line = lineOf(errors.filter((e) => news.has(e.stage)));
 
       this.state.lastRunAt = run.at;
+      // Every pass in numbers — the ones that did nothing too: the Overview
+      // pairs this run's time with these counts (it paired it with the last
+      // run that did something, days old maybe — review a6-ux:numbers-mislead).
+      const tally = (xs: readonly { ok: boolean }[]) => ({ ok: xs.filter((x) => x.ok).length, failed: xs.filter((x) => !x.ok).length });
+      this.state.lastRun = {
+        at: run.at,
+        attempted: run.attempted,
+        applied: run.applied,
+        failed: run.failed,
+        feeChanges: tally(changes),
+        rebalances: { ok: rebalances.filter((r) => r.ok).length, failed: refillsFailed, inFlight: rebalances.filter((r) => r.inFlight).length },
+        opens: tally(channels),
+        sells: tally(acted),
+        maxHtlc: tally(maxHtlc),
+        errors: errors.map((e) => e.stage),
+      };
       // Only record runs that actually did something (applied or failed) — skip the
       // hourly no-op runs so the history shows changes, not "0 applied" every hour.
-      if (run.attempted > 0) {
-        this.state.history.unshift(run);
+      if (line.attempted > 0) {
+        this.state.history.unshift(line);
         this.state.history = this.state.history.slice(0, HISTORY_LIMIT);
       }
       return run;
@@ -3847,9 +4627,9 @@ export class Autopilot {
       marketWaitMs !== undefined ? { marketWaitMs } : {},
     );
   }
-  private feeApply(writeLnd: AuthenticatedLnd, items: FeeApplyItem[]) {
+  private feeApply(writeLnd: AuthenticatedLnd, items: FeeApplyItem[], opts: { shouldStop?: () => boolean } = {}) {
     // The last gate: a sold channel's fee never leaves its lease promise.
-    return applyFees(this.readLnd, writeLnd, items, this.capital.leaseCaps());
+    return applyFees(this.readLnd, writeLnd, items, this.capital.leaseCaps(), opts);
   }
   /** The rebalance plan, from the same fee-engine inputs the fee stage
    *  uses — so the fee the gate expects after a refill is the one the

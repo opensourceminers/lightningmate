@@ -46,6 +46,25 @@ export function awaitsYourDecision(o: Pick<MyOrder, "side" | "status" | "local">
   return !o.local || o.local.phase === "seen" || (o.local.phase === "failed" && !o.local.fundingOutpoint);
 }
 
+/**
+ * What the app says when LND doesn't answer, for where it runs (review
+ * a6-ux:nav-a11y-copy: Umbrel users were told to check LND_SOCKET, a cert and
+ * a read-only macaroon in a .env — there is no .env on Umbrel). Unknown
+ * (health not read yet): the Umbrel words first, the standalone ones after.
+ */
+export function nodeErrorHint(platform: "umbrel" | "standalone" | undefined): string {
+  const umbrel = "Is the Lightning Node app running and fully synced? LightningMate keeps trying every 15 seconds.";
+  const standalone = "Check that LND is running and that LND_SOCKET, the TLS cert and the macaroon in your settings (.env) point at it.";
+  if (platform === "umbrel") return umbrel;
+  if (platform === "standalone") return standalone;
+  return `${umbrel} (Running LightningMate on its own? ${standalone})`;
+}
+
+/** Where write mode comes from, for the views it disables (it was "enable
+ *  writes in the Autopilot tab" — which has no such switch). */
+export const WRITE_MODE_HINT =
+  "write mode is off: it needs LM_ENABLE_WRITE=true and an admin macaroon (on Umbrel both are set up by the app — off there means LND's admin macaroon wasn't found)";
+
 /** A main autopilot run this long is not normal: a payment or a call is stuck. */
 export const RUN_STUCK_MINUTES = 10;
 

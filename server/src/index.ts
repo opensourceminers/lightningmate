@@ -1,5 +1,6 @@
 import type { Server } from "node:http";
 import { loadConfig } from "./config.js";
+import { timestampConsole } from "./services/log.js";
 import { getLnd, getWriteLnd } from "./lnd.js";
 import { createApiRouter } from "./routes/api.js";
 import { createHttpApp } from "./app.js";
@@ -24,6 +25,9 @@ import {
   startHtlcTelemetry,
   stopHtlcTelemetry,
 } from "./services/htlcTelemetry.js";
+
+// Every log line with its time (log.ts) — before anything logs.
+timestampConsole();
 
 // Never let a startup error vanish silently — print it so it's diagnosable.
 process.on("uncaughtException", (err) => {
