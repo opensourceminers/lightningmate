@@ -46,9 +46,11 @@ jobs:
 
       # One set of payload types for the server and the web: every body a
       # route builds is checked against server/src/apiTypes.ts where it is
-      # sent, the web type-checks against those same types, and each answer
-      # the web reads is paired with what its route sends — so a shape that
-      # drifts fails here, and no hand-kept copy creeps back.
+      # sent, the web type-checks against those same types, each answer the
+      # web reads is paired with what its route sends, and each request body
+      # and query string the web sends with the contract type its route reads
+      # it as — so a shape that drifts fails here, in either direction, and
+      # no hand-kept copy creeps back.
       - name: API contract (shared payload types)
         run: npm run check:api-types
 

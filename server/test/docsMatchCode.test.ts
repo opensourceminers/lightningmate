@@ -22,6 +22,7 @@ import { DEFAULT_CONFIG } from "../src/services/autopilotConfig.js";
 import { DEFAULT_POLICY } from "../src/services/fees.js";
 import { LOOPBACK_HOSTS } from "../src/exposure.js";
 import { SHUTDOWN_GRACE_MS, SHUTDOWN_WAIT_MS } from "../src/shutdown.js";
+import { MANUAL_ACCEPT_SKIP } from "../src/services/magmaDesk.js";
 import { autopilotWith } from "./helpers/autopilot.js";
 import { quiet } from "./helpers/lifecycle.js";
 
@@ -186,6 +187,72 @@ test("the store manifest here is the next release's: category bitcoin, and relea
   const releasing = read("docs/RELEASING.md");
   assert.match(releasing, /set `category: bitcoin`/);
   assert.match(releasing, /say why in the\s+PR body/);
+});
+
+// Review of P8, final round: the docs said only that a manual reject raises
+// no alert — while the lane could accept an order whose reject by hand
+// failed, or turn down one whose accept by hand failed. The code now carries
+// out the operator's decision (magmaByHand.test.ts); the docs say so, and
+// quote the reason the Orders tab shows as the code words it.
+test("the docs say a decision made by hand wins over the Magma order lane, for an order the lane isn't working on — a reject Amboss didn't confirm is sent again, an accept that didn't go through leaves the order to the operator, a click mid-step waits", () => {
+  const prose = (doc: string) => doc.replace(/\s+/g, " ");
+  const readme = prose(read("README.md"));
+  const security = prose(read("SECURITY.md"));
+  const strategyProse = prose(strategy);
+  const desk = read("server/src/services/magmaDesk.ts");
+  for (const [name, doc] of [["README.md", readme], ["SECURITY.md", security], ["AUTOPILOT-STRATEGY.md", strategyProse]] as const) {
+    // Review of P9, round 3: "always wins" — while a click that comes as the
+    // lane is deciding or acting on that same order waits for that step (one
+    // action per order at a time), and finds the order accepted or rejected:
+    // refused (magmaByHand.test.ts pins it). The docs claim it for an order
+    // the lane isn't working on, and say what happens to the other clicks.
+    assert.doesNotMatch(doc, /always wins/, name);
+    assert.match(doc, /decision (you make|made) by hand (on Market → Orders )?wins over the (lane|autopilot), for an order the \3 isn't working on at that moment/, name);
+    const steps = /A click that arrives while the (lane|autopilot) is already deciding or acting on that same order — ([^—]+) — waits for that step to finish/.exec(doc)?.[2] ?? "";
+    assert.ok(steps, `${name}: a click that comes while the lane is working on the order waits for that step`);
+    for (const step of [/capital/, /(dialing|dial of) the buyer \(up to about a minute and a half over Tor\)/, /its own accept or reject/, /earlier reject of (yours|the operator's)/]) {
+      assert.match(steps, step, `${name}: the steps a click waits for`);
+    }
+    assert.match(doc, /if the order was accepted or rejected meanwhile, the click is refused and says so \("Order is /, name);
+    // What the refused click says, as the code words it (the status is the
+    // order's own, read once the click has its turn).
+    for (const [, said] of doc.matchAll(/"(Order is [A-Z_]+[^"]*)"/g)) {
+      const template = said.replace(/^Order is [A-Z_]+/, () => "Order is ${order.status}");
+      assert.ok(desk.includes(`message: \`${template}`), `${name} quotes "${said}" — no click says that (magmaDesk.ts)`);
+    }
+    assert.match(doc, /reject Amboss didn't confirm (\(an error, a refusal\) )?is sent again/, name);
+    // Review of P9, round 2: "a click on Accept or Reject makes the order
+    // yours, whatever becomes of the click" — while a click that couldn't
+    // read the order recorded nothing. It now takes an order the lane has on
+    // record as awaiting approval (unreadClick, magmaByHand.test.ts); any
+    // other is still left as it was, and the docs say so.
+    assert.doesNotMatch(doc, /a click on Accept or Reject makes the order/, name);
+    assert.match(doc, /(click that finds neither \(Amboss or LND not answering\)|otherwise it) records nothing/, name);
+    assert.match(doc, /with Liquidity provision on, the (lane|autopilot) may decide that order/, name);
+  }
+  // The desk's own account of it (its header comment) claims no more than
+  // the docs.
+  const deskComments = prose(desk.replace(/^\s*\* ?/gm, ""));
+  assert.doesNotMatch(deskComments, /always wins/, "magmaDesk.ts");
+  assert.match(deskComments, /wins over the lane \(byHand\): .* That holds for an order the lane isn't working on when the click comes\./, "magmaDesk.ts");
+  assert.match(
+    readme,
+    /A click that can't read the order \(Amboss or LND not answering\) counts too once the autopilot has the order on record as awaiting your decision/,
+  );
+  for (const [name, doc] of [["SECURITY.md", security], ["AUTOPILOT-STRATEGY.md", strategyProse]] as const) {
+    assert.match(
+      doc,
+      /a click on Accept or Reject that finds the order — Amboss shows it as this node's, awaiting approval, or the lane has it on record as awaiting approval( \([^)]*\))? — makes the order (yours|the operator's), whatever becomes of the click/,
+      name,
+    );
+  }
+  assert.match(strategyProse, /the lane never accepts that order/);
+  // Review of P9: with selling off, the resend waited for a read of the order
+  // that worked; it no longer does (magmaByHand.test.ts).
+  assert.match(strategyProse, /whatever the selling switch says and even while Amboss won't show the order/);
+  const quoted = /\("(your accept didn't go through)"\)/.exec(strategyProse)?.[1] ?? "";
+  assert.ok(quoted && MANUAL_ACCEPT_SKIP.startsWith(quoted), `the strategy doc quotes "${quoted}" — the Orders tab shows "${MANUAL_ACCEPT_SKIP}"`);
+  assert.match(prose(read("docs/E2E-TESTING.md")), /the lane sends the reject again on its next pass — selling on or off — and never accepts the order/);
 });
 
 test("the manual end-to-end procedures cover the two paths no automated test can: Magma selling with a second node (the hold invoice's amount included) and an LSPS1 buy from ZEUS's embedded node over Tor", () => {

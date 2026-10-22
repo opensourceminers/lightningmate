@@ -99,7 +99,9 @@ status and each area's last decision without exposing the Amboss key.
 **7. The other paths (a second, smaller order each)**
 
 - **Reject by hand**: Market → Orders → Reject. Amboss `SELLER_REJECTED`;
-  no "turned down" alert (it was your decision).
+  no "turned down" alert (it was your decision). Should the click fail
+  ("Your reject stands: …"), the lane sends the reject again on its next pass
+  — selling on or off — and never accepts the order.
 - **Pause while an order waits**: Autopilot → "Pause all automation", then
   place an order. The paused lane neither accepts nor rejects it: it stays
   "Waiting for you to accept" on Market → Orders, nothing is promised — accept

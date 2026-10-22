@@ -77,7 +77,7 @@ export function readsHang(
 }
 
 /** An external step of the Magma desk a test can make "kill the process". */
-export type Seam = "lndCreateHodl" | "ambossAccept" | "lndOpen" | "ambossAddTx" | "lndSettle";
+export type Seam = "lndCreateHodl" | "ambossAccept" | "lndOpen" | "ambossAddTx" | "lndSettle" | "ambossReject" | "lndConnect";
 
 /** Make one external step "kill the process": the step's side effect happens
  *  (when `after`), then nothing of ours ever runs again in that process.

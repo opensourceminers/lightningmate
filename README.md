@@ -52,8 +52,23 @@ standalone via Docker.
   confirms the channel (any failure refunds the buyer automatically), every
   step is recorded in a per-order journal before it happens (a crash or a lost
   answer never leads to a second channel), and orders the node can't serve are
-  rejected at once instead of being left to time out. Amboss decides which
-  seller gets matched; the app makes the sell path correct and reliable.
+  rejected at once instead of being left to time out. A decision you make by
+  hand on Market → Orders wins over the autopilot, for an order the autopilot
+  isn't working on at that moment: a reject Amboss didn't confirm is sent
+  again until it is (that order is never accepted), and an order whose accept
+  didn't go through waits for your decision — the autopilot neither accepts
+  nor rejects it. A click that arrives while the autopilot is already deciding
+  or acting on that same order — checking capital, dialing the buyer (up to
+  about a minute and a half over Tor), sending its own accept or reject, or
+  sending an earlier reject of yours again — waits for that step to finish;
+  if the order was accepted or rejected meanwhile, the click is refused and
+  says so ("Order is WAITING_FOR_BUYER_PAYMENT — only orders awaiting approval
+  can be rejected"). A click that can't read the order (Amboss or LND not
+  answering) counts too once the autopilot has the order on record as
+  awaiting your decision; otherwise it records nothing — try it again (with
+  Liquidity provision on, the autopilot may decide that order first). Amboss
+  decides which seller gets matched; the app makes the sell path correct and
+  reliable.
 - **LSP mode (experimental)** — sell inbound channels **directly to wallets**
   speaking the open LSPS1 standard (bLIP-51) over Lightning peer messages, with
   no marketplace in between: orders are priced by the same profit-aware engine

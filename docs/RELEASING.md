@@ -12,8 +12,10 @@ public repo `github.com/opensourceminers/lightningmate` and its image
   vulnerability in a production dependency fails), type-check of server, web
   and tests, the API contract check (`npm run check:api-types`: every body a
   route builds is checked against the one set of payload types, the web
-  type-checks against the same types, and every answer the web reads must be
-  what its route sends), the test suites and the build.
+  type-checks against the same types, every answer the web reads must be
+  what its route sends, and every request body and query string the web
+  sends must be the contract type its route reads them as), the test suites
+  and the build.
 - **Images are immutable.** The image workflow
   (`.github/workflows/build-image.yml`) refuses to publish a tag the registry
   already has, and a manual run can publish only test tags (`dev-…`), never a

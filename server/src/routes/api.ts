@@ -218,8 +218,11 @@ function bodyOf<T extends object>(req: Request): Fields<T> {
   return (req.body ?? {}) as Fields<T>;
 }
 
-/** A query string's parameters the same way (the one the web sends as an
- *  object: GET /onchain/send-preview). */
+/** A query string's parameters the same way, for every route that reads one
+ *  (web/test/apiContract.test.tsx holds them to that, and pairs each with the
+ *  contract type the web's get<…, Q>() names). Every value arrives as text:
+ *  the web sends a number in decimal and a flag as "true" or "false"
+ *  (web/src/api.ts, queryString) — the route's own checks parse them. */
 function queryOf<T extends object>(req: Request): Fields<T> {
   return req.query as Fields<T>;
 }
@@ -1786,8 +1789,9 @@ export function createApiRouter(
   // sats (LND's own size of the transaction at the chosen rate), LND's
   // next-block rate to compare with, the reserve and the promised coins that
   // stay, and what needs a second yes (review a4-lsp-payments:onchain-send-
-  // guardrails). `max=1`: the most that can go while all of that stays;
-  // `all=1`: every coin (LND keeps its anchor reserve).
+  // guardrails). `max`: the most that can go while all of that stays;
+  // `all`: every coin (LND keeps its anchor reserve) — each a flag, "true"
+  // as the web sends it, or "1" (curl).
   router.get(
     "/onchain/send-preview",
     wrap(async (req, res) => {

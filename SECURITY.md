@@ -78,9 +78,27 @@ security@opensourceminers.de (please don't open a public issue first).
   can't be saved is not sent at all: its invoice is released, and the order
   is decided again — a running lane rejects it rather than leave it to time
   out when its approval deadline is close; a paused lane leaves it to the
-  operator. Switched off — or with
-  all automation paused — the order lane neither accepts nor turns down a new
-  order: it is the operator's to decide. Every channel open and
+  operator — as either does an order whose accept you clicked. Switched
+  off — or with all automation paused — the order lane neither accepts nor
+  turns down a new order: it is the operator's to decide. A decision you make
+  by hand wins over the lane, for an order the lane isn't working on at that
+  moment: a click on Accept or Reject that finds the order — Amboss shows it
+  as this node's, awaiting approval, or the lane has it on record as awaiting
+  approval — makes the order yours, whatever becomes of the click. A reject
+  Amboss didn't confirm is sent again on every pass — paused or not — until
+  Amboss confirms it or the order ends, and that order is never accepted;
+  after an accept that didn't go through, the lane neither accepts the order
+  nor turns it down. A click that finds neither (Amboss or LND not answering)
+  records nothing: with Liquidity provision on, the lane may decide that order
+  before you try again. A click that arrives while the lane is already
+  deciding or acting on that same order — its capital check, its dial of the
+  buyer (up to about a minute and a half over Tor), its own accept or reject,
+  or the resend of an earlier reject of yours — waits for that step to
+  finish; if the order was accepted or rejected meanwhile, the click is
+  refused and says so ("Order is WAITING_FOR_BUYER_PAYMENT — only orders
+  awaiting approval can be rejected", "Order is SELLER_REJECTED, not awaiting
+  approval").
+  Every channel open and
   every on-chain send takes one on-chain lock; Magma, LSPS1 and autopilot opens
   share one capital budget, and a manual open or send may not spend the coins
   promised to buyers (accepted Magma orders, paid LSPS1 orders) unless you

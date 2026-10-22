@@ -222,10 +222,12 @@ test("a 'seen' order with no approval deadline on record that Amboss keeps refus
   quiet(t);
   const { autopilot, magma, dir } = sellerSetup(t, { config: { sellEnabled: false } });
   // Two clicks Amboss refuses (success:false): on record as "seen", with no
-  // deadline — no read of the lane has got through yet.
+  // deadline — Amboss gave these orders none, and no read of the lane has got
+  // through yet. (A click keeps the deadline Amboss gives: such an order ends
+  // shortly after it — magmaByHand.test.ts.)
   magma.behave.AcceptOrder = (n) => (n < 2 ? "false" : "ok");
-  const a = magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
-  const b = magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  const a = magma.addSale({ buyerPubkey: BUYER, timeout: null });
+  const b = magma.addSale({ buyerPubkey: BUYER, timeout: null });
   for (const s of [a, b]) assert.equal((await autopilot.magma.accept(s.id)).ok, false);
   let refusing = true;
   magma.saleRead = () => (refusing ? forbidden("Sale") : null);

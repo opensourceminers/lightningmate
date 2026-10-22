@@ -13,7 +13,7 @@ import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
-import { FakeMagma, internalError } from "./helpers/magma.js";
+import { FakeMagma, internalError, resolverFailed } from "./helpers/magma.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { IN_AN_HOUR, entryOnDisk, quiet } from "./helpers/lifecycle.js";
 
@@ -93,6 +93,34 @@ test("Accept, Open channel and Reject refuse another node's order — nothing is
     assert.match(r.message, /another node of your Amboss account/, what);
   }
   assert.equal(magma.calls.length, 0, "no mutation at all");
+});
+
+// Review of P9, round 2: a click that can't read an order the lane has on
+// record takes the order into the operator's hands, and the lane sends their
+// reject without reading the order first (unreadClick). Amboss answering
+// that the order is another node's is no failed read: such a click takes
+// nothing over. Nothing pinned that: without the check, every test stayed
+// green.
+test("Reject on an order this node recorded before orders were told apart, which Amboss now shows as another node's: refused — the click takes nothing over, and the lane never sends a reject for it", async (t) => {
+  quiet(t);
+  const { autopilot, magma, dir } = sellerSetup(t);
+  // Amboss hasn't reported its fee: the lane records the order and waits.
+  const sale = magma.addSale({ buyerPubkey: BUYER, feeSeller: "0", timeout: IN_AN_HOUR() });
+  await autopilot.pollSellOrders();
+  assert.deepEqual([entryOnDisk(dir, sale.id)?.phase, entryOnDisk(dir, sale.id)?.via], ["seen", "autopilot"]);
+  // As an older version saw it: it is the other node's (Amboss: source.pubkey).
+  magma.sales.get(sale.id)!.sellerPubkey = OTHER_NODE;
+  autopilot.setConfig({ sellEnabled: false });
+  const r = await autopilot.magma.reject(sale.id);
+  assert.deepEqual([r.ok, r.code], [false, "bad_status"], r.message);
+  assert.match(r.message, /another node of your Amboss account .*this node's orders\.$/);
+  const e = entryOnDisk(dir, sale.id);
+  assert.deepEqual([e?.via, e?.decision?.action], ["autopilot", "skip"], "not marked as the operator's reject");
+  // Amboss won't show it to the lane now, and with selling off there is no
+  // listing to tell: a reject on record would be sent on its id alone.
+  magma.saleRead = (id) => (id === sale.id ? resolverFailed() : null);
+  await autopilot.pollSellOrders();
+  assert.equal(magma.count("RejectOrder"), 0, "another node's order is never turned down from here");
 });
 
 test("over HTTP: a click on another node's order is a 409, and the Orders view lists only this node's sales", async (t) => {

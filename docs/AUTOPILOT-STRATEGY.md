@@ -302,13 +302,16 @@ step under way finishes; Magma orders already taken on are carried to their end;
 hold invoice was made but not yet sent is withdrawn, its coins freed). A paused order lane
 neither accepts nor turns down a new order — before deciding, and again after its capital
 check and its dial of the buyer, it asks the switch: the order waits for the operator on
-Market → Orders. (D6's immediate reject of an order the node can't serve is a running lane's.)
+Market → Orders. (D6's immediate reject of an order the node can't serve is a running lane's. A
+reject the operator clicked is theirs, not the lane's: one Amboss didn't confirm is sent again,
+paused or not.)
 After a crash, an accept is completed only if it may have gone out (it is marked on disk
 before it is sent); the lane's own accept that never left is withdrawn when selling is off by
 then (one the operator clicked is theirs and goes out). An accept whose mark can't be saved
 (a full disk) is never sent: its invoice is released and the order is decided again — a running
 lane rejects it when its approval deadline is close, never leaving it to time out; a paused lane
-leaves it to the operator. **Resume** switches those
+leaves it to the operator — as either lane does an order whose accept the operator clicked.
+**Resume** switches those
 back on — Liquidity provision excepted, whose switch-on is its own decision with the selling
 check in front of you (D9). LSP mode (Settings) is no switch of the autopilot's: the pause leaves
 it on — it keeps answering wallet orders and opening their channels — and the pause dialog, the
@@ -457,10 +460,29 @@ Amboss confirms it and rejects at once what it can't serve — every step record
 per-order journal first. It decides on new orders only while Liquidity provision is on (a
 paused lane neither accepts nor rejects one); an order it accepted itself it carries to its
 end either way, and with selling on it also opens the channel of an order accepted by hand
-(Market → Orders says who opens a paid order's channel). An order the operator rejects is
-their decision: no "turned down" alert. The **offer upkeep** (`runSell`, in the main run, only with
-Liquidity provision on) keeps each offer fundable (cut, disabled while its smallest channel
-can't be funded, listed again once it can), gives it the standard 4,320-block lease and the
+(Market → Orders says who opens a paid order's channel). A decision made by hand wins over the
+lane, for an order the lane isn't working on at that moment: a click on Accept or Reject that
+finds the order — Amboss shows it as this node's, awaiting approval, or the lane has it on record
+as awaiting approval (then even a click that can't read it) — makes the order the operator's,
+whatever becomes of the click, and their latest click stands. A click that finds neither (Amboss
+or LND not answering) records nothing: with Liquidity provision on, the lane may decide that
+order before the operator tries again. A click that arrives while the lane is already deciding
+or acting on that same order — its capital check, its dial of the buyer (up to about a minute and
+a half over Tor), its own accept or reject, or the resend of an earlier reject of the
+operator's — waits for that step to finish (one action per order at a time, the lane's or a
+click's); if the order was accepted or rejected meanwhile, the click is refused and says so
+("Order is WAITING_FOR_BUYER_PAYMENT — only orders awaiting approval can be rejected", "Order is
+SELLER_REJECTED, not awaiting approval"), and the order stays as the lane left it (a reject of
+the lane's own raises its "turned down" alert). An order the operator rejects is their
+decision — no "turned down" alert — and a reject Amboss didn't confirm (an error, a refusal) is
+sent again on every pass, whatever the selling switch says and even while Amboss won't show the
+order (a reject needs only its id), until Amboss confirms it or the order ends; the lane never
+accepts that order. An order whose accept by hand didn't go through stays theirs to
+decide ("your accept didn't go through"): the lane neither accepts it nor turns it down — not
+for its caps, which don't bind a manual pick, nor near its deadline. The **offer upkeep**
+(`runSell`, in the main run, only with Liquidity provision on) keeps each offer fundable (cut,
+disabled while its smallest channel can't be funded, listed again once it can), gives it the
+standard 4,320-block lease and the
 routing-fee promise (with auto-size), and prices it per `sellPricingMode` (with
 auto-price): `fast` = the 25th percentile of what buyers actually paid, `balanced` = their
 median, `premium` = their 75th percentile, `auto` = between the 25th and 75th percentile,

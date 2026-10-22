@@ -215,6 +215,31 @@ test("send everything: a sweep (LND keeps its anchor reserve as change), its fee
   assert.deepEqual([sent.send_all, sent.amount, Number(sent.sat_per_vbyte)], [true, undefined, 2], "LND sends all: no amount");
 });
 
+// Review of P8, final round: the web sends a query's flags as "true" and
+// "false" (web/src/api.ts, queryString) — the wallet's "Max" and "send
+// everything" previews go out as max=true and all=true — but every preview
+// here was asked the curl way (max=1, all=1). With the parser's "true"
+// dropped, both buttons got a 400 and every check stayed green (mutant K25).
+test("the preview takes Max and 'send everything' as the web sends them — max=true, all=true — and a flag sent as false beside an amount is no flag; curl's =1 works too", async (t) => {
+  const { preview } = await wallet(t, { chainBalance: 1_000_000, rates: { 6: 2 } });
+  const max = await preview({ max: "true", feeRate: 2 });
+  assert.equal(max.status, 200, JSON.stringify(max.body));
+  assert.equal(max.body.mode, "max");
+  // 1,000,000 − the 50,000 sat reserve setting − 282 fee (141 vbytes × 2).
+  assert.equal(max.body.amountSats, 949_718);
+  const all = await preview({ all: "true", feeRate: 2 });
+  assert.equal(all.status, 200, JSON.stringify(all.body));
+  assert.equal(all.body.mode, "all");
+  for (const flag of ["max", "all"]) {
+    const amount = await preview({ tokens: 50_000, [flag]: "false", feeRate: 2 });
+    assert.equal(amount.status, 200, `${flag}=false: ${JSON.stringify(amount.body)}`);
+    assert.deepEqual([amount.body.mode, amount.body.amountSats], ["amount", 50_000], `${flag}=false`);
+  }
+  const curl = await preview({ max: 1, feeRate: 2 });
+  assert.equal(curl.status, 200, JSON.stringify(curl.body));
+  assert.deepEqual([curl.body.mode, curl.body.amountSats], ["max", 949_718]);
+});
+
 test("a send the wallet can't cover is refused with the reason, and every request names exactly one way to send", async (t) => {
   const { api, node, preview } = await wallet(t, { chainBalance: 100_000 });
   const p = await preview({ tokens: 99_900, feeRate: 10 });
