@@ -106,6 +106,10 @@ export interface ChannelFlow {
   routedIn: number;
   feesEarned: number;
   forwardCount: number;
+  /** Fees of the forwards that came in through this channel (earned on
+   *  their outgoing channel). */
+  inboundFeesEarned: number;
+  inboundForwardCount: number;
 }
 
 export interface ForwardEvent {
@@ -123,6 +127,8 @@ export interface FlowSummary {
   totalFeesEarnedSats: number;
   perChannel: ChannelFlow[];
   recent: ForwardEvent[];
+  /** False when LND had more forwards than were read: the most recent are missing. */
+  complete: boolean;
 }
 
 export type ChannelFlowDirection = "draining" | "filling" | "balanced";
@@ -134,8 +140,14 @@ export interface ChannelForwardStat {
   routedOutSats: number;
   routedInSats: number;
   feesEarnedSats: number;
+  /** Forwards that came in through this channel, and the fees they earned
+   *  (on their outgoing channel): what it brought in. */
+  inboundForwardCount: number;
+  inboundFeesSats: number;
   localRatio: number;
   capacity: number;
+  /** "closed": no longer one of the node's channels. */
+  status: "open" | "pending" | "closed";
   flow: ChannelFlowDirection;
   spark: number[];
 }
@@ -165,6 +177,12 @@ export interface ResolvedForward {
   fee: number;
 }
 
+export interface RollingTotals {
+  forwards: number;
+  routedSats: number;
+  feesSats: number;
+}
+
 export interface ForwardsReport {
   windowDays: number;
   totalForwards: number;
@@ -175,8 +193,16 @@ export interface ForwardsReport {
   busiestDay: string | null;
   perChannel: ChannelForwardStat[];
   corridors: RoutingCorridor[];
+  /** One bucket per local day the window touches (first and last partial). */
   daily: DailyBucket[];
   recent: ResolvedForward[];
+  /** The last 24 h and 7 days, rolling — ending now. */
+  rolling: { last24h: RollingTotals; last7d: RollingTotals };
+  /** The most recent half of the window against the half before it. */
+  trend: { halfDays: number; recentFeesSats: number; priorFeesSats: number; growthPct: number | null };
+  tzOffsetMin: number;
+  /** False when LND had more forwards than were read: the most recent are missing. */
+  complete: boolean;
 }
 
 export interface FeePolicy {
@@ -549,6 +575,8 @@ export interface RebalanceRecord {
 }
 
 export interface RebalanceLogSummary {
+  /** The window the totals cover (days). */
+  windowDays: number;
   count: number;
   failed: number;
   totalFeeSats: number;
@@ -559,6 +587,24 @@ export interface RebalanceLogSummary {
 export interface RebalanceLogResponse {
   summary: RebalanceLogSummary;
   records: RebalanceRecord[];
+  /** Since when LightningMate's log covers rebalances (null: none yet). */
+  trackedSince?: string | null;
+}
+
+/** What rebalancing cost over a window, per refilled channel (GET /rebalance/costs). */
+export interface RebalanceCostsResponse {
+  windowDays: number;
+  /** "lnd": LND's payments (every tool's rebalances); "log": LightningMate's own log only. */
+  source: "lnd" | "log";
+  feeSats: number;
+  count: number;
+  amountSats: number;
+  perChannel: { channelId: string; feeSats: number; count: number }[];
+  /** Rebalances LND lists that LightningMate didn't make. */
+  notLogged: number;
+  logOnly: number;
+  logTrackedSince: string | null;
+  note: string | null;
 }
 
 export interface SuggestionPolicy {
@@ -651,7 +697,10 @@ export interface CloseCandidate {
   inboundLiquidityLostSats: number;
   closeScore: number;
   pnl30dSats: number;
+  /** 60 days: fees earned + fees of the forwards it brought in − rebalancing. */
   pnl60dSats: number;
+  /** Of that, the fees of the forwards that came in through it. */
+  assisted60dSats?: number;
   flow60dSats: number;
   forwards60d: number;
   ageDays: number | null;
@@ -1015,7 +1064,15 @@ export interface OnchainSendResult {
 }
 
 // ── Overview dashboard ────────────────────────────────────────────────────────
-export type ActivityKind = "forward" | "received" | "sent" | "onchain_in" | "onchain_out";
+export type ActivityKind =
+  | "forward"
+  | "received"
+  | "sent"
+  | "rebalance"
+  | "onchain_in"
+  | "onchain_out"
+  | "channel_open"
+  | "channel_close";
 
 export interface ActivityItem {
   at: string;
@@ -1031,6 +1088,11 @@ export interface DashboardData {
   earnedSats: number;
   forwardCount: number;
   routedSats: number;
+  /** The last 24 h and 7 days, rolling (the sparklines end in a partial day). */
+  rolling: { last24h: RollingTotals; last7d: RollingTotals };
+  /** False when LND had more forwards in the window than were read: the most
+   *  recent are missing, `rolling` with them. */
+  forwardsComplete: boolean;
   feesSpark: number[];
   forwardsSpark: number[];
   routedSpark: number[];
@@ -1045,6 +1107,7 @@ export interface DashboardData {
   /** The same after the window's rebalancing fees. */
   netYieldPpmYear?: number;
   rebalanceFeesSats?: number;
+  rebalanceSource?: "lnd" | "log";
   /** What leasing out on Magma would earn this node — live (D12). */
   leaseBenchmark?: LeaseBenchmark;
   activity: ActivityItem[];
@@ -1086,7 +1149,8 @@ export interface NetworkRank {
 export interface ScoreCategory {
   key: string;
   label: string;
-  score: number;
+  /** null: not enough data to judge — left out of the overall score. */
+  score: number | null;
   weight: number;
   detail: string;
   hint: string;
@@ -1097,6 +1161,8 @@ export interface NodeScore {
   grade: string;
   categories: ScoreCategory[];
   rank: NetworkRank | null;
+  /** Why the grade is provisional (a category not graded yet), or null. */
+  provisional: string | null;
 }
 
 export type FeeRecState =
@@ -1355,16 +1421,29 @@ export interface PnlSummary {
   windowDays: number;
   routingRevenueSats: number;
   forwardCount: number;
+  /** Lease income: Magma and LSPS1 sales. */
   magmaRevenueSats: number;
   magmaSaleCount: number;
   rebalanceCostSats: number;
   rebalanceCount: number;
+  /** "lnd": every tool's rebalances (LND's payments); "log": LightningMate's own only. */
+  rebalanceSource: "lnd" | "log";
+  /** Of rebalanceCount, those made outside LightningMate. */
+  rebalanceNotLogged: number;
   channelOpenCostSats: number;
   channelCloseCostSats: number;
+  channelCloseCount: number;
+  /** Closes in the window whose cost couldn't all be worked out. */
+  channelCloseUnknownCount: number;
+  /** Inbound bought on Magma (invoice + routing fee). */
+  inboundPurchaseCostSats: number;
+  inboundPurchaseCount: number;
   otherChainFeesSats: number;
   serviceFeePaidSats: number;
   totalCostSats: number;
   netProfitSats: number;
+  /** What the figures can't see, in words. */
+  notes: string[];
 }
 
 export interface OfferCondition {
@@ -1880,11 +1959,18 @@ export interface RebalanceOutcome {
   targetId: string;
   alias: string;
   at: string;
+  amountSats: number;
   costSats: number;
-  revenueAfterSats: number;
+  /** Its sats that routed out (first in, first out), and what those forwards earned. */
+  routedOutSats: number;
+  earnedSats: number;
+  /** Its sats that left by a payment, not a forward (no fee). */
+  otherOutSats: number;
+  remainingSats: number;
   earnedBackPct: number;
   netSats: number;
   paidBack: boolean;
+  status: "measured" | "measuring";
 }
 export interface OutcomesReport {
   measureWindowDays: number;
@@ -1905,7 +1991,11 @@ export interface OutcomesReport {
     items: FeeOutcome[];
   };
   rebalances: {
+    /** How a refill is credited, in words. */
+    method: string;
+    measureDays: number;
     measured: number;
+    measuring: number;
     totalCostSats: number;
     totalEarnedBackSats: number;
     avgEarnedBackPct: number | null;
@@ -1913,6 +2003,31 @@ export interface OutcomesReport {
     netSats: number;
     items: RebalanceOutcome[];
   };
+}
+
+/** Inbound bought on Magma, set against the forwards it brought in (GET /analytics/bought-inbound). */
+export interface BoughtInboundRoi {
+  orderId: string;
+  channelId: string | null;
+  alias: string;
+  sizeSats: number;
+  costSats: number;
+  paidAt: string;
+  leaseDays: number;
+  leaseEndsAt: string;
+  running: boolean;
+  inboundForwards: number;
+  routedInSats: number;
+  inboundFeesSats: number;
+  roiPct: number | null;
+}
+
+export interface BoughtInboundResponse {
+  method: string;
+  /** The window's share of what inbound bought cost, spread over each lease. */
+  windowDays: number;
+  amortizedSats: number;
+  items: BoughtInboundRoi[];
 }
 
 export interface MagmaV2Report {

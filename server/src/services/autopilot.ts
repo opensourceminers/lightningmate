@@ -26,6 +26,7 @@ import { assessEligibility, cachedPublicBook, publicBook, publicBookFailure, typ
 import type { LeaseBenchmark } from "./dashboard.js";
 import { MagmaPurchases, type MagmaPurchase, type PaymentReport } from "./magmaPurchases.js";
 import { ChannelUptime } from "./channelUptime.js";
+import { CloseTxArchive } from "./closeTxArchive.js";
 import type { LeaseSources } from "./leases.js";
 import { getOrder } from "./amboss.js";
 import { runMaxHtlcPass, type MaxHtlcChange } from "./maxHtlc.js";
@@ -760,6 +761,11 @@ export class Autopilot {
    *  close list and the close dialog read it. Observed every 10 minutes from
    *  start() — a read, so also on a read-only node. */
   readonly uptime: ChannelUptime;
+  /** LightningMate's copy of the transactions close costs are worked out
+   *  from (closeTxArchive.ts): LND's wallet forgets a force close's
+   *  commitment at its next restart. Kept current every hour from start() —
+   *  a read, so also on a read-only node — and by every read of the books. */
+  readonly closeTxs: CloseTxArchive;
   /** A purchase follow-up is under way (its own flag, not the lane's). */
   private followingPurchases = false;
   /** Per offer: the status change under way (withOffer). */
@@ -810,6 +816,7 @@ export class Autopilot {
     initMagmaHistory(dataDir);
     this.purchases = new MagmaPurchases(dataDir);
     this.uptime = new ChannelUptime(dataDir);
+    this.closeTxs = new CloseTxArchive(dataDir);
     this.feeLog = new FeeChangeLog(dataDir);
     this.state = this.store.read({
       config: DEFAULT_CONFIG,
@@ -1181,8 +1188,12 @@ export class Autopilot {
     this.migrateOutOfRangePins();
     this.reschedule();
     this.startOrderLane();
-    // Offline durations accrue whatever the switches say (a read).
-    if (!this.shuttingDown) this.uptime.start(this.readLnd);
+    // Offline durations accrue whatever the switches say (a read); so does
+    // the copy of the close transactions the books need (a read too).
+    if (!this.shuttingDown) {
+      this.uptime.start(this.readLnd);
+      this.closeTxs.start(this.readLnd);
+    }
   }
 
   /**
@@ -1240,6 +1251,7 @@ export class Autopilot {
     if (this.leaseTimer) clearInterval(this.leaseTimer);
     this.leaseTimer = undefined;
     this.uptime.stop();
+    this.closeTxs.stop();
     this.stop();
   }
 

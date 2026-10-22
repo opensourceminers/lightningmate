@@ -27,6 +27,10 @@ const RESET_CONSEQUENCE: Record<string, string> = {
   "service-fees.json": "Pending service-fee records were lost.",
   "magma-purchases.json":
     "The record of inbound you bought on Magma was lost — the channels are not affected; P&L no longer shows those purchases.",
+  "rebalance-totals.json":
+    "The daily sums of rebalancing fees older than 400 days are gone: P&L counts those LND's payment history still lists, and no others.",
+  "close-txs.json":
+    "LightningMate's copy of your close transactions is gone: a close whose transactions LND's wallet has since forgotten shows its cost as unknown in P&L.",
   "magma-orders.json":
     "Magma orders in progress lost their record, and with it what claims their held payments. No channel is opened " +
     "for such an order: when Amboss asks for one, its held payment is released back to the buyer instead (LND releases " +

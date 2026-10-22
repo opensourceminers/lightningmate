@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
-import type { ChannelForwardStat, DailyBucket, ForwardsReport, UnservedDemandReport } from "../types";
-import { sats, satsCompact, timeAgo, percent } from "../format";
+import type { DailyBucket, ForwardsReport, UnservedDemandReport } from "../types";
+import { sats, satsCompact, timeAgo } from "../format";
 import { MIN_DEMAND_DAYS, demandHeadline, demandSummary } from "../feeView";
+import { flowHint, forwardsReadNote } from "../analyticsView";
 import { Sparkline } from "./Sparkline";
 
 const WINDOWS = [7, 30, 90];
@@ -15,21 +16,6 @@ const METRICS: { key: Metric; label: string }[] = [
 
 function metricValue(d: DailyBucket, m: Metric): number {
   return m === "fees" ? d.feesSats : m === "volume" ? d.routedSats : d.forwards;
-}
-
-/** Flow label + the action it implies. "draining" with little local balance
- *  left is the urgent case — the channel will soon stop routing. */
-function flowHint(c: ChannelForwardStat): { label: string; cls: string; urgent: boolean } {
-  if (c.flow === "draining") {
-    const urgent = c.localRatio <= 0.15;
-    return {
-      label: urgent ? `draining · ${percent(c.localRatio)} left` : "draining",
-      cls: urgent ? "flow-drain-urgent" : "flow-drain",
-      urgent,
-    };
-  }
-  if (c.flow === "filling") return { label: "filling", cls: "flow-fill", urgent: false };
-  return { label: "balanced", cls: "flow-balanced", urgent: false };
 }
 
 function Stat({ label, value, unit, sub, tone }: { label: string; value: string; unit?: string; sub?: string; tone?: "green" }) {
@@ -88,6 +74,7 @@ export function ForwardsPanel() {
       </div>
 
       {error ? <p className="banner error">{error}</p> : null}
+      {data && forwardsReadNote(data) ? <p className="muted small">{forwardsReadNote(data)}</p> : null}
 
       <div className="an-card-grid">
         <Stat label="Forwards" value={String(data?.totalForwards ?? 0)} sub={data?.busiestDay ? `busiest ${data.busiestDay.slice(5)}` : " "} />
@@ -189,6 +176,7 @@ export function ForwardsPanel() {
             <th className="num">Routed out</th>
             <th className="num">Routed in</th>
             <th className="num">Fees</th>
+            <th className="num" title="Fees of the forwards that came IN through this channel (earned on their outgoing channel)">Brought in</th>
             <th className="spark-col">Trend</th>
             <th className="share-col">Share</th>
           </tr>
@@ -204,6 +192,7 @@ export function ForwardsPanel() {
                 <td className="num">{satsCompact(c.routedOutSats)}</td>
                 <td className="num">{satsCompact(c.routedInSats)}</td>
                 <td className="num earned">{sats(c.feesEarnedSats)}</td>
+                <td className="num muted">{c.inboundFeesSats ? sats(c.inboundFeesSats) : "—"}</td>
                 <td className="spark-col"><Sparkline data={c.spark} color="var(--green)" /></td>
                 <td className="share-col">
                   <div className="share-bar">

@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import type { NodeScore } from "../types";
 import { useCountUp } from "../useCountUp";
+import { scoreBar } from "../analyticsView";
 import { Skeleton } from "./Skeleton";
 
 const GRADE_COLOR: Record<string, string> = {
@@ -75,27 +76,34 @@ export function HealthScore() {
                 <span className="ring-num" style={{ color }}>
                   {Math.round(animated)}
                 </span>
-                <span className="ring-grade" style={{ color }}>
+                <span className="ring-grade" style={{ color }} title={data.provisional ?? undefined}>
                   Grade {data.grade}
+                  {data.provisional ? " · provisional" : ""}
                 </span>
               </div>
             </div>
 
             <div className="score-cats">
-              {data.categories.map((c) => (
-                <div className="cat-row" key={c.key} title={c.hint}>
-                  <div className="cat-head">
-                    <span className="cat-label">{c.label}</span>
-                    <span className="cat-detail">{c.detail}</span>
+              {data.categories.map((c) => {
+                // Not enough data (a node too young to judge its earnings):
+                // no bar at all — never an empty one that reads as "0".
+                const bar = scoreBar(c);
+                return (
+                  <div className="cat-row" key={c.key} title={c.hint}>
+                    <div className="cat-head">
+                      <span className="cat-label">{c.label}</span>
+                      <span className="cat-detail">{c.detail}</span>
+                    </div>
+                    {bar.graded ? (
+                      <div className="cat-track">
+                        <div className="cat-fill" style={{ width: `${bar.widthPct}%`, background: barColor(c.score ?? 0) }} />
+                      </div>
+                    ) : (
+                      <span className="cat-na">{bar.label}</span>
+                    )}
                   </div>
-                  <div className="cat-track">
-                    <div
-                      className="cat-fill"
-                      style={{ width: `${Math.round(c.score * 100)}%`, background: barColor(c.score) }}
-                    />
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </>

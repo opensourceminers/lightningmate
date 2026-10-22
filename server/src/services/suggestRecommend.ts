@@ -799,7 +799,13 @@ export interface CloseSuggestion {
   inboundLiquidityLostSats: number;
   closeScore: number;
   pnl30dSats: number;
+  /** 60 days: fees earned on it + fees of the forwards it brought in −
+   *  rebalancing into it. */
   pnl60dSats: number;
+  /** Of that, the fees of the forwards that came in through it (review
+   *  a5-analytics:inbound-channels-invisible: a channel that only brings
+   *  flow in earned "nothing", yet closing it kills every route through it). */
+  assisted60dSats: number;
   flow60dSats: number;
   forwards60d: number;
   ageDays: number | null;
@@ -868,7 +874,9 @@ export interface CloseContext {
 export interface CloseInput {
   channels: ChannelView[];
   feeById: ReadonlyMap<string, FeeRecommendation>;
-  flow60ById: ReadonlyMap<string, { routedOut: number; routedIn: number; forwardCount: number; feesEarned: number }>;
+  /** 60 days of flow per channel: out (fees earned on it) and in (the fees
+   *  forwards that came in through it earned on their way out). */
+  flow60ById: ReadonlyMap<string, { routedOut: number; routedIn: number; forwardCount: number; feesEarned: number; inboundFeesEarned?: number }>;
   /** Per channel: the 2-hop nodes only its peer reaches. */
   uniqueReachByChan: ReadonlyMap<string, number>;
   opportunity: { alias: string; score: number; sizeSats: number }[];
@@ -936,8 +944,12 @@ export function rankCloseCandidates(input: CloseInput): CloseV2Report {
     const lifetime = c.totalSent + c.totalReceived;
     const rev30 = m?.revenue30d ?? 0;
     const rev60 = f60?.feesEarned ?? 0;
+    // What it brought in counts for it too: the fees of the forwards that
+    // entered through it (earned on their outgoing channel). Never lowers a
+    // channel's P&L — it can only keep a source channel off the list.
+    const assisted60 = f60?.inboundFeesEarned ?? 0;
     const pnl30 = rev30 - rebalCost(c.id, 30);
-    const pnl60 = rev60 - rebalCost(c.id, 60);
+    const pnl60 = rev60 + assisted60 - rebalCost(c.id, 60);
     const ageDays = m?.channelAgeDays ?? null;
     const uniqueReach = input.uniqueReachByChan.get(c.id) ?? 0;
     const reachContribution = uniqueReach / maxUniqueReach;
@@ -1012,7 +1024,9 @@ export function rankCloseCandidates(input: CloseInput): CloseV2Report {
     else if (idle60) reasons.push("No forwards in 60d.");
     if (losing)
       reasons.push(
-        `Negative P&L: -${Math.round(-pnl60)} sat over 60d (earned ${Math.round(rev60)} - rebalancing ${Math.round(rebalCost(c.id, 60))}).`,
+        `Negative P&L: -${Math.round(-pnl60)} sat over 60d (earned ${Math.round(rev60)}` +
+          (assisted60 > 0 ? ` + ${Math.round(assisted60)} on forwards it brought in` : "") +
+          ` - rebalancing ${Math.round(rebalCost(c.id, 60))}).`,
       );
     if (feeState === "close_candidate") reasons.push("Fee autopilot flags this peer as a close candidate.");
     if (reachContribution < 0.15) reasons.push("Adds little unique reach — other channels already cover the same nodes.");
@@ -1067,6 +1081,7 @@ export function rankCloseCandidates(input: CloseInput): CloseV2Report {
       closeScore,
       pnl30dSats: Math.round(pnl30),
       pnl60dSats: Math.round(pnl60),
+      assisted60dSats: Math.round(assisted60),
       flow60dSats: routed60,
       forwards60d: forwards60,
       ageDays,

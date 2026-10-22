@@ -57,6 +57,8 @@ import type {
   RebalanceExecRequest,
   RebalanceExecResult,
   RebalanceLogResponse,
+  RebalanceCostsResponse,
+  BoughtInboundResponse,
   RebalanceRecReport,
   BackupStatus,
   SuggestionPolicy,
@@ -121,9 +123,14 @@ async function del<T>(path: string): Promise<T> {
   return handle<T>(await fetch(`/api${path}`, { method: "DELETE", headers: authHeaders() }));
 }
 
+/** The viewer's time zone, minutes east of UTC: the server buckets daily
+ *  series in the viewer's own days (a UTC day ends at 01:00 or 02:00 in
+ *  Europe — "today" was half an hour old at 02:30). */
+export const tzOffsetMin = (): number => -new Date().getTimezoneOffset();
+
 export const api = {
   node: () => get<NodeSummary>("/node"),
-  dashboard: () => get<DashboardData>("/dashboard"),
+  dashboard: () => get<DashboardData>(`/dashboard?tz=${tzOffsetMin()}`),
   channels: () => get<ChannelView[]>("/channels"),
   flows: (days?: number) => get<FlowSummary>(days ? `/flows?days=${days}` : "/flows"),
   pnl: (days: number) => get<PnlSummary>(`/pnl?days=${days}`),
@@ -149,7 +156,7 @@ export const api = {
   /** Dial a channel's peer again (the close dialog's first offer for a peer that is away). */
   peerConnect: (pubkey: string, socket?: string) => post<{ ok: boolean; error?: string }>("/peers/connect", { pubkey, ...(socket ? { socket } : {}) }),
   feeEstimates: () => get<FeeEstimates>("/chain/fee-estimates"),
-  forwardsReport: (days: number) => get<ForwardsReport>(`/forwards/report?days=${days}`),
+  forwardsReport: (days: number) => get<ForwardsReport>(`/forwards/report?days=${days}&tz=${tzOffsetMin()}`),
   feesPreview: (policy?: Partial<FeePolicy>) => {
     const qs = policy
       ? "?" + new URLSearchParams(
@@ -175,6 +182,10 @@ export const api = {
    *  of its channels — the server answers 409. */
   rebalanceExecute: (params: RebalanceExecRequest) => post<RebalanceExecResult>("/rebalance/execute", params),
   rebalanceLog: () => get<RebalanceLogResponse>("/rebalance/log"),
+  /** What rebalancing cost over a window, per refilled channel — every tool's. */
+  rebalanceCosts: (days: number) => get<RebalanceCostsResponse>(`/rebalance/costs?days=${days}`),
+  /** Inbound bought on Magma against the forwards it brought in. */
+  boughtInbound: (days = 30) => get<BoughtInboundResponse>(`/analytics/bought-inbound?days=${days}`),
   rebalanceRecommendations: () => get<RebalanceRecReport>("/rebalance/recommendations"),
   suggestions: (policy?: Partial<SuggestionPolicy>) => {
     const qs = policy

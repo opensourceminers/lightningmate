@@ -84,8 +84,11 @@ export interface FakePendingChannel {
   localBalance?: number;
   transactionId: string;
   transactionVout: number;
-  /** "opening" (default) or a cooperative/force close waiting to confirm. */
-  state?: "opening" | "waiting_close";
+  /** "opening" (default), a cooperative/force close waiting to confirm, or a
+   *  force close whose commitment confirmed (its outputs still timelocked). */
+  state?: "opening" | "waiting_close" | "force_closing";
+  /** The closing transaction's id (a close; default: a random one). */
+  closingTxid?: string;
   /** Opened by the peer, not by this node (default: by this node). */
   partnerInitiated?: boolean;
   /** The description the open gave it (LND's memo; default none). */
@@ -550,6 +553,7 @@ export class FakeLnd {
   private pendingRpc() {
     const opening = this.pending.filter((p) => (p.state ?? "opening") === "opening");
     const closing = this.pending.filter((p) => p.state === "waiting_close");
+    const forceClosing = this.pending.filter((p) => p.state === "force_closing");
     return {
       total_limbo_balance: "0",
       pending_open_channels: opening.map((p) => ({
@@ -563,10 +567,19 @@ export class FakeLnd {
       waiting_close_channels: closing.map((p) => ({
         channel: this.pendingChannelRpc(p),
         limbo_balance: String(pendingLocal(p)),
-        closing_txid: rand32(),
+        closing_txid: p.closingTxid ?? rand32(),
         closing_tx_hex: "",
       })),
-      pending_force_closing_channels: [],
+      pending_force_closing_channels: forceClosing.map((p) => ({
+        channel: this.pendingChannelRpc(p),
+        closing_txid: p.closingTxid ?? rand32(),
+        limbo_balance: String(pendingLocal(p)),
+        maturity_height: 860_144,
+        blocks_til_maturity: 144,
+        recovered_balance: "0",
+        pending_htlcs: [],
+        anchor: "LIMBO",
+      })),
     };
   }
 
@@ -574,7 +587,7 @@ export class FakeLnd {
   private backupsRpc() {
     const population = [
       ...this.channels.map((c) => ({ txid: c.transactionId, vout: c.transactionVout })),
-      ...this.pending.map((p) => ({ txid: p.transactionId, vout: p.transactionVout })),
+      ...this.pending.filter((p) => p.state !== "force_closing").map((p) => ({ txid: p.transactionId, vout: p.transactionVout })),
     ];
     return {
       multi_chan_backup: {

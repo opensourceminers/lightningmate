@@ -1,14 +1,16 @@
 import { Router, type Request, type Response, type NextFunction } from "express";
-import { getFeeRates, getWalletInfo, signMessage, type AuthenticatedLnd } from "lightning";
+import { getClosedChannels, getFeeRates, getWalletInfo, signMessage, type AuthenticatedLnd, type GetClosedChannelsResult } from "lightning";
 import { getNodeScore } from "../services/score.js";
 import type { Config } from "../config.js";
 import { getNodeSummary, getOwnPubkey } from "../services/node.js";
 import { getChannelsView } from "../services/channels.js";
-import { getFlowSummary, getForwardsReport } from "../services/forwards.js";
+import { getFlowSummary, getForwardEvents, getForwardsReport, parseTzOffset } from "../services/forwards.js";
 import { getFeePreview, type FeeApplyItem, type FeePolicy } from "../services/fees.js";
 import { type SuggestionPolicy } from "../services/suggestions.js";
 import { getChannelSuggestionsV2, getCloseSuggestionsV2 } from "../services/suggestRecommend.js";
-import { channelLeases, leaseProtection } from "../services/leases.js";
+import { channelLeases, leaseProtection, standardChannelId } from "../services/leases.js";
+import { BOUGHT_INBOUND_METHOD, amortizedPurchaseCost, boughtInboundRoi } from "../services/inboundRoi.js";
+import { rebalanceCosts } from "../services/rebalanceCosts.js";
 import type { LnPlusStore } from "../services/lnplusStore.js";
 import { checkSwapEligibility, getPoolNodes, getSwaps, type NodeFacts } from "../services/lnplus.js";
 import { getMagmaRecommendations } from "../services/magmaRecommend.js";
@@ -325,13 +327,14 @@ export function createApiRouter(
     }),
   );
 
-  // Forwards report (Thunderhub-style) — daily series + per-channel + recent.
+  // Forwards report (Thunderhub-style) — daily series + per-channel + recent,
+  // bucketed in the viewer's local days (`tz`: minutes east of UTC).
   router.get(
     "/forwards/report",
     wrap(async (req, res) => {
       const days = Number(req.query.days ?? 30);
       const windowDays = Math.min(90, Math.max(1, Number.isFinite(days) ? days : 30));
-      res.json(await getForwardsReport(lnd, windowDays));
+      res.json(await getForwardsReport(lnd, windowDays, { tzOffsetMin: parseTzOffset(req.query.tz) }));
     }),
   );
 
@@ -739,27 +742,54 @@ export function createApiRouter(
     }),
   );
 
-  // Rebalance accounting log + totals.
+  // Rebalance accounting log + totals over a stated window (the Rebalance
+  // tab's "N done · X sat fees" covered an unlabelled 200 attempts).
   router.get("/rebalance/log", (_req, res) => {
-    res.json({ summary: rebalanceLog.summary(), records: rebalanceLog.recent() });
+    res.json({ summary: rebalanceLog.summary(30), records: rebalanceLog.recent(), trackedSince: rebalanceLog.trackedSince() });
   });
 
-  // Node health score (A–F) + network rank.
+  // What rebalancing cost over a window, per refilled channel — from LND's
+  // payments (every tool's rebalances), not a capped log: the Analytics tab
+  // read the newest 50 records for 30 and 90 days.
   router.get(
-    "/score",
-    wrap(async (_req, res) => {
-      res.json(await getNodeScore(lnd));
+    "/rebalance/costs",
+    wrap(async (req, res) => {
+      const days = intIn(req.query.days ?? 30, 1, 36_500);
+      if (days === null) {
+        res.status(400).json({ error: "bad_request", message: "days must be 1–36500." });
+        return;
+      }
+      const nowMs = Date.now();
+      res.json({ windowDays: days, ...(await rebalanceCosts(lnd, rebalanceLog, nowMs - days * 86_400_000, nowMs)) });
     }),
   );
 
+  // Node health score (A–F) + network rank — net of what the node spends,
+  // and with what its sales earned (lease income, as in P&L).
+  router.get(
+    "/score",
+    wrap(async (_req, res) => {
+      res.json(
+        await getNodeScore(lnd, {
+          rebalanceLog,
+          purchases: autopilot.purchases,
+          earnings,
+          serviceFees,
+          soldLeases: () => autopilot.capital.soldLeases(),
+          closeTxs: autopilot.closeTxs,
+        }),
+      );
+    }),
+  );
 
-  // Profit & loss over a window — routing revenue vs channel/rebalance costs.
+  // Profit & loss over a window — routing revenue and lease income vs every
+  // cost: opens, closes, rebalancing, inbound bought, the service fee.
   router.get(
     "/pnl",
     wrap(async (req, res) => {
       const days = Number(req.query.days ?? config.flowWindowDays);
       const windowDays = Number.isFinite(days) && days > 0 ? days : config.flowWindowDays;
-      res.json(await getPnl(lnd, rebalanceLog, earnings, windowDays, serviceFees));
+      res.json(await getPnl(lnd, { rebalanceLog, earnings, serviceFees, purchases: autopilot.purchases, closeTxs: autopilot.closeTxs }, windowDays));
     }),
   );
 
@@ -768,8 +798,44 @@ export function createApiRouter(
     "/autopilot/outcomes",
     wrap(async (_req, res) => {
       // The fee-change log (D15) — every applied change, for a year — not
-      // the run history's last 20 runs.
-      res.json(await getAutopilotOutcomes(lnd, autopilot.feeChanges(), rebalanceLog.recent(200)));
+      // the run history's last 20 runs; and every successful refill of the
+      // window, not the newest 200 records of successes and failures mixed.
+      res.json(await getAutopilotOutcomes(lnd, autopilot.feeChanges(), rebalanceLog.successes(Date.now() - 400 * 86_400_000)));
+    }),
+  );
+
+  // What inbound bought on Magma brought in: per purchase, the fees of the
+  // forwards that came in through its channel during the lease, against what
+  // it cost.
+  router.get(
+    "/analytics/bought-inbound",
+    wrap(async (req, res) => {
+      const windowDays = intIn(req.query.days ?? 30, 1, 36_500);
+      if (windowDays === null) {
+        res.status(400).json({ error: "bad_request", message: "days must be 1–36500." });
+        return;
+      }
+      const nowMs = Date.now();
+      // The window's share of what inbound bought cost, spread over each lease.
+      const amortizedSats = amortizedPurchaseCost(autopilot.purchases.paidCosts(), windowDays, nowMs);
+      const purchases = autopilot.purchases.list().filter((p) => p.state === "channel_open" && p.paidAt);
+      if (purchases.length === 0) {
+        res.json({ method: BOUGHT_INBOUND_METHOD, windowDays, amortizedSats, items: [] });
+        return;
+      }
+      const oldest = Math.min(...purchases.map((p) => Date.parse(p.paidAt as string)).filter((t) => Number.isFinite(t)));
+      const days = Math.min(400, Math.max(1, Math.ceil((nowMs - oldest) / 86_400_000) + 1));
+      const [channels, height, events] = await Promise.all([getChannelsView(lnd), currentHeight(), getForwardEvents(lnd, days)]);
+      const leases = channelLeases(channels, autopilot.leaseSources(), height, nowMs);
+      const aliasById = new Map(channels.map((c) => [c.id, c.peerAlias]));
+      const byOrder = new Map<string, string>();
+      for (const [channelId, l] of leases) if (l.kind === "magma_purchase") byOrder.set(l.orderId, channelId);
+      const channelOf = (p: (typeof purchases)[number]) => {
+        // The lease registry's match first; a channel closed since: the one Amboss named.
+        const id = byOrder.get(p.orderId) ?? standardChannelId(p.channelId);
+        return id ? { channelId: id, alias: aliasById.get(id) ?? "" } : null;
+      };
+      res.json({ method: BOUGHT_INBOUND_METHOD, windowDays, amortizedSats, items: boughtInboundRoi(purchases, channelOf, events, nowMs) });
     }),
   );
 
@@ -777,26 +843,49 @@ export function createApiRouter(
   // autopilot summary, assembled from a single forwards pull.
   router.get(
     "/dashboard",
-    wrap(async (_req, res) => {
-      const [report, ln, onchain, channels, leaseBenchmark] = await Promise.all([
-        getForwardsReport(lnd, 30),
+    wrap(async (req, res) => {
+      const nowMs = Date.now();
+      const [report, ln, onchain, channels, leaseBenchmark, ownPubkey, closed] = await Promise.all([
+        getForwardsReport(lnd, 30, { tzOffsetMin: parseTzOffset(req.query.tz), nowMs }),
         getLnActivity(lnd, 10),
         getOnchainTxs(lnd, 10),
         getChannelsView(lnd),
         autopilot.leaseBenchmark(),
+        getOwnPubkey(lnd).catch(() => undefined),
+        getClosedChannels({ lnd }).catch((): GetClosedChannelsResult => ({ channels: [] })),
       ]);
       const totalCapacitySats = channels.reduce((s, c) => s + c.capacity, 0);
       // This node's own capital in its channels (pending ones earn nothing yet).
       const ownCapitalSats = channels.filter((c) => c.status === "open").reduce((s, c) => s + c.localBalance, 0);
-      const since = Date.now() - report.windowDays * 86_400_000;
-      const rebalanceFeesSats = rebalanceLog.successes(since).reduce((s, r) => s + (r.feeSats ?? 0), 0);
+      const since = nowMs - report.windowDays * 86_400_000;
+      const rebalancing = await rebalanceCosts(lnd, rebalanceLog, since, nowMs);
+      // The feed's on-chain lines: funding transactions, and closing ones
+      // with the sweeps LND names for them.
+      const opens = new Set<string>([...channels.map((c) => c.transactionId), ...closed.channels.map((c) => c.transaction_id)]);
+      const closes = new Set<string>();
+      for (const c of closed.channels) {
+        for (const id of [c.close_transaction_id, c.close_balance_spent_by, c.anchor_spent_by, ...c.close_payments.map((p) => p.spent_by)]) {
+          if (id) closes.add(id);
+        }
+      }
       res.json(
-        buildDashboard(report, ln, onchain, rebalanceLog.summary(), autopilot.getState(), totalCapacitySats, {
-          ownCapitalSats,
-          rebalanceFeesSats,
-          leaseBenchmark,
-          magmaRefusals: autopilot.magma.refusals(),
-        }),
+        buildDashboard(
+          report,
+          ln,
+          onchain,
+          { count: rebalancing.count, totalAmountSats: rebalancing.amountSats },
+          autopilot.getState(),
+          totalCapacitySats,
+          {
+            ownCapitalSats,
+            rebalanceFeesSats: rebalancing.feeSats,
+            rebalanceSource: rebalancing.source,
+            leaseBenchmark,
+            magmaRefusals: autopilot.magma.refusals(),
+            ownPubkey,
+            channelTxids: { opens, closes },
+          },
+        ),
       );
     }),
   );

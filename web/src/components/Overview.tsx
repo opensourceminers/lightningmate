@@ -10,15 +10,8 @@ import { Sparkline } from "./Sparkline";
 import { TopChannelsTile } from "./TopChannelsTile";
 import { leaseBenchmarkLine, refusalDigest } from "../magmaView";
 import { pctFromPpm } from "../yieldView";
+import { ACTIVITY_LABEL, activitySub, noForwardsIn7d, rollingForwardsLine } from "../analyticsView";
 import { SuggestedPeersTile } from "./SuggestedPeersTile";
-
-const KIND_LABEL: Record<ActivityItem["kind"], string> = {
-  forward: "Routed",
-  received: "Received",
-  sent: "Sent",
-  onchain_in: "On-chain in",
-  onchain_out: "On-chain out",
-};
 
 function signed(value: number): string {
   return `${value < 0 ? "−" : "+"}${sats(Math.abs(value))}`;
@@ -29,9 +22,10 @@ function KpiRow({ d, price }: { d: DashboardData; price?: PriceInfo | null }) {
   // D12: what leasing on Magma would earn THIS node, live — or that it can't
   // sell there yet. Never a constant.
   const bench = leaseBenchmarkLine(d.leaseBenchmark);
-  // Routing-alive signal: a collapse shows up immediately as 24h/7d going to zero.
-  const last24h = d.forwardsSpark.length ? d.forwardsSpark[d.forwardsSpark.length - 1] : 0;
-  const last7d = d.forwardsSpark.slice(-7).reduce((s, v) => s + v, 0);
+  // Routing-alive signal: a collapse shows up immediately as 24h/7d going to
+  // zero — rolling windows from the server, not the sparkline's last
+  // (partial, calendar) days: at 02:30 "in 24h" was half an hour.
+  const quiet = noForwardsIn7d(d);
   return (
     <div className="kpi-row">
       <div className="kpi">
@@ -42,8 +36,20 @@ function KpiRow({ d, price }: { d: DashboardData; price?: PriceInfo | null }) {
       </div>
       <div className="kpi">
         <div className="kpi-label">Forwards · {d.windowDays}d</div>
-        <div className="kpi-value">{d.forwardCount}</div>
-        <div className={`kpi-sub ${last7d === 0 ? "kpi-alert" : ""}`}>{last24h} in 24h · {last7d} in 7d</div>
+        <div className="kpi-value">
+          {d.forwardCount}
+          {d.forwardsComplete === false ? "+" : ""}
+        </div>
+        <div
+          className={`kpi-sub ${quiet ? "kpi-alert" : ""}`}
+          title={
+            d.forwardsComplete === false
+              ? `LND holds more forwards in this window than are read (${d.forwardCount.toLocaleString("en-US")}). It hands them over oldest first, so the newest are the ones missing — the window's totals read low too.`
+              : undefined
+          }
+        >
+          {rollingForwardsLine(d)}
+        </div>
         <div className="kpi-spark"><Sparkline data={d.forwardsSpark} width={150} height={30} /></div>
       </div>
       <div className="kpi">
@@ -71,12 +77,6 @@ function KpiRow({ d, price }: { d: DashboardData; price?: PriceInfo | null }) {
   );
 }
 
-function subOf(a: ActivityItem): string {
-  if (a.kind === "forward") return `${satsCompact(a.routedSats ?? 0)} sat routed`;
-  if (a.kind === "sent") return a.feeSats ? `fee ${a.feeSats} sat` : "payment";
-  if (a.kind === "onchain_in" || a.kind === "onchain_out") return a.feeSats ? `fee ${a.feeSats} sat` : "on-chain";
-  return "invoice";
-}
 
 function RecentActivity({ items }: { items: ActivityItem[] }) {
   return (
@@ -90,8 +90,8 @@ function RecentActivity({ items }: { items: ActivityItem[] }) {
             <div className="feed-row" key={`${a.at}-${i}`}>
               <span className={`feed-dot k-${a.kind}`} />
               <div className="feed-main">
-                <span className="feed-title">{KIND_LABEL[a.kind]} · {a.title}</span>
-                <span className="feed-sub">{subOf(a)}</span>
+                <span className="feed-title">{ACTIVITY_LABEL[a.kind] ?? a.kind} · {a.title}</span>
+                <span className="feed-sub">{activitySub(a, satsCompact)}</span>
               </div>
               <span className={`feed-amt ${a.amountSats >= 0 ? "pos" : "neg"}`}>{signed(a.amountSats)}</span>
               <span className="feed-time">{timeAgo(a.at)}</span>
@@ -117,7 +117,6 @@ function DigestStrip({
 }) {
   const a = d.autopilot;
   const anyOn = a.fees || a.rebalance || a.channel || a.sell;
-  const last7d = d.forwardsSpark.slice(-7).reduce((s, v) => s + v, 0);
   const pendingOpen = channels?.filter((c) => c.status === "pending_open").length ?? 0;
   const pendingClose = channels?.filter((c) => c.status === "pending_close").length ?? 0;
 
@@ -140,7 +139,7 @@ function DigestStrip({
       sub: "history",
     });
   }
-  if (last7d === 0) {
+  if (noForwardsIn7d(d)) {
     items.push({
       key: "noflow",
       text: "No forwards in 7 days — check fees & liquidity",

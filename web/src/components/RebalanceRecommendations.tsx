@@ -12,6 +12,7 @@ import type {
 } from "../types";
 import { sats, satsCompact, timeAgo } from "../format";
 import { demandSummary } from "../feeView";
+import { rebalanceSummaryLine } from "../analyticsView";
 import {
   afterRefillText,
   budgetBlocked,
@@ -364,9 +365,7 @@ export function RebalanceRecommendations() {
         <div className="rbr-log">
           <div className="panel-head">
             <h2>Recent rebalances</h2>
-            <span className="muted">
-              {log.summary.count} done · {sats(log.summary.totalFeeSats)} sat fees · avg {log.summary.avgCostPpm} ppm
-            </span>
+            <span className="muted">{rebalanceSummaryLine(log.summary, log.trackedSince)}</span>
           </div>
           <div className="feed">
             {log.records.slice(0, 8).map((r, i) => (

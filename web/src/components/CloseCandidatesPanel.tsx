@@ -116,7 +116,10 @@ export function CloseCandidatesPanel() {
                     </td>
                     <td className="num strong">{satsCompact(c.capitalFreedSats)}</td>
                     <td className="num">{c.inboundLiquidityLostSats > 0 ? satsCompact(c.inboundLiquidityLostSats) : "—"}</td>
-                    <td className={`num ${c.pnl60dSats < 0 ? "cost" : c.pnl60dSats > 0 ? "green" : ""}`}>
+                    <td
+                      className={`num ${c.pnl60dSats < 0 ? "cost" : c.pnl60dSats > 0 ? "green" : ""}`}
+                      title={c.assisted60dSats ? `incl. ${c.assisted60dSats} sat in fees of the forwards it brought in` : undefined}
+                    >
                       {c.pnl60dSats === 0 ? "—" : `${c.pnl60dSats > 0 ? "+" : ""}${c.pnl60dSats}`}
                     </td>
                     <td>

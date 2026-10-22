@@ -74,7 +74,8 @@ test("full lifecycle: HODL accept → payment held → open → add_transaction 
   await autopilot.pollSellOrders();
   assert.equal(node.invoices.get(inv.id)?.state, "SETTLED", "settled on VALID_CHANNEL_OPENING");
   assert.equal(entryOnDisk(dir, sale.id)?.phase, "settled");
-  assert.deepEqual(earnings.recent().map((r) => [r.orderId, r.leaseSats]), [[sale.id, 12_345]]);
+  // The sale carries the order's lease: the health score spreads its income over it.
+  assert.deepEqual(earnings.recent().map((r) => [r.orderId, r.leaseSats, r.leaseBlocks]), [[sale.id, 12_345, 4_320]]);
   assert.deepEqual(fees.entries().map((e) => [e.key, e.feeSats]), [[`magma:${sale.id}`, 123]]);
 
   // Amboss keeps reporting the order (and later CHANNEL_MONITORING_FINISHED).

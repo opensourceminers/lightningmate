@@ -630,11 +630,17 @@ export class ServiceFeeLedger {
   }
 
   private save(): void {
-    // Keep every unresolved entry; trim only settled history.
+    // Keep every unresolved entry, and every paid one — what was paid is
+    // P&L's service-fee cost for every window, "All" included (review
+    // a8-engineering:pnl-accounting-truncated). Only skipped and given-up
+    // entries beyond ENTRIES_KEPT are trimmed, the oldest first.
     if (this.list.length > ENTRIES_KEPT) {
-      const open = this.list.filter((e) => e.state === "pending" || e.state === "inflight");
-      const done = this.list.filter((e) => e.state !== "pending" && e.state !== "inflight");
-      this.list = [...open, ...done.slice(0, Math.max(0, ENTRIES_KEPT - open.length))];
+      const kept = (e: ServiceFeeEntry) => e.state === "pending" || e.state === "inflight" || e.state === "paid";
+      const trimmable = this.list.filter((e) => !kept(e));
+      const room = Math.max(0, ENTRIES_KEPT - (this.list.length - trimmable.length));
+      // Newest first: the ones past the room go.
+      const keepTrimmable = new Set(trimmable.slice(0, room));
+      this.list = this.list.filter((e) => kept(e) || keepTrimmable.has(e));
     }
     this.store.write(this.list);
   }

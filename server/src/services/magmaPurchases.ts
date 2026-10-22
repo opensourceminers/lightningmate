@@ -89,7 +89,17 @@ export type PaymentReport =
   /** LND has no payment with this hash. */
   | { status: "not_found" };
 
+/** Purchases that carry no cost and no lease (quotes declined or never paid,
+ *  orders that failed) are kept up to this many; one that was paid — a cost
+ *  in P&L for every window, "All" included — or may still be, is never
+ *  dropped (review a8-engineering:pnl-accounting-truncated: every record
+ *  past the newest 300 went, paid ones too). */
 const KEPT = 300;
+
+/** A record P&L or a lease still needs: paid, opened, or a payment that may
+ *  still be moving. */
+const carriesCost = (p: MagmaPurchase): boolean =>
+  p.state === "paid" || p.state === "channel_open" || PAYMENT_OPEN(p) || !!p.paidAt;
 
 /**
  * What the order says that the record doesn't yet: a dollar buy
@@ -139,7 +149,8 @@ export class MagmaPurchases {
   recordQuote(p: Omit<MagmaPurchase, "createdAt" | "updatedAt" | "state" | "routingFeeSats" | "orderStatus" | "channelId">): MagmaPurchase {
     const at = new Date().toISOString();
     const rec: MagmaPurchase = { ...p, createdAt: at, updatedAt: at, state: "quoted", routingFeeSats: null, orderStatus: null, channelId: null };
-    this.items = [rec, ...this.items.filter((x) => x.orderId !== p.orderId)].slice(0, KEPT);
+    this.items = [rec, ...this.items.filter((x) => x.orderId !== p.orderId)];
+    this.trim();
     this.save();
     return rec;
   }
@@ -253,6 +264,12 @@ export class MagmaPurchases {
         sizeSats: p.sizeSats,
         leaseBlocks: p.leaseBlocks,
       }));
+  }
+
+  /** Drop the oldest records that carry no cost, beyond KEPT (newest first). */
+  private trim(): void {
+    let free = 0;
+    this.items = this.items.filter((p) => carriesCost(p) || ++free <= KEPT);
   }
 
   private save(): void {

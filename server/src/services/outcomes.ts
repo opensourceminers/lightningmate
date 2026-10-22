@@ -1,4 +1,4 @@
-import { type AuthenticatedLnd } from "lightning";
+import { getChannels, type AuthenticatedLnd } from "lightning";
 import { getForwardEvents, type ForwardEvent } from "./forwards.js";
 import type { RebalanceRecord } from "./rebalanceLog.js";
 import type { FeeChangeRecord } from "./feeChangeLog.js";
@@ -55,12 +55,25 @@ export interface FeeOutcome {
 export interface RebalanceOutcome {
   targetId: string;
   alias: string;
+  /** When the refill was sent. */
   at: string;
+  amountSats: number;
   costSats: number;
-  revenueAfterSats: number;
+  /** Its sats that routed out since — first in, first out — and the fees
+   *  the forwards that carried them earned (msat-exact, rounded at the end). */
+  routedOutSats: number;
+  earnedSats: number;
+  /** Its sats that left the channel other than by a forward (a payment):
+   *  used up, earning nothing. */
+  otherOutSats: number;
+  /** Its sats still in the channel. */
+  remainingSats: number;
   earnedBackPct: number;
   netSats: number;
   paidBack: boolean;
+  /** "measured": its sats have all left, or REFILL_MEASURE_DAYS passed;
+   *  "measuring": neither yet — not in the headline. */
+  status: "measured" | "measuring";
 }
 
 export interface OutcomesReport {
@@ -86,7 +99,13 @@ export interface OutcomesReport {
     items: FeeOutcome[];
   };
   rebalances: {
+    /** How a refill is credited, in words (the Analytics tab shows it). */
+    method: string;
+    /** A refill is judged once its sats have all left, or after this long. */
+    measureDays: number;
     measured: number;
+    /** Refills too recent to judge (counted nowhere in the headline). */
+    measuring: number;
     totalCostSats: number;
     totalEarnedBackSats: number;
     avgEarnedBackPct: number | null;
@@ -260,54 +279,197 @@ export function measureFeeChanges(
   };
 }
 
+// ── Rebalance ROI ─────────────────────────────────────────────────────────────
+
+/** A refill is judged once its sats have all routed out — or after this long
+ *  with what it earned by then. */
+export const REFILL_MEASURE_DAYS = 14;
+
+export const REFILL_ROI_METHOD =
+  "Each refill is credited with the fees of the forwards that carried its sats out of the channel, first in, first out — " +
+  "the way the profit floor retires refills: a forward draws on the oldest refill still in the channel, so no forward counts " +
+  "for two refills and none beyond the sats a refill moved. Sats that left by a payment instead of a forward earn nothing. " +
+  `A refill is judged once its sats have all routed out, or after ${REFILL_MEASURE_DAYS} days. It is an upper bound on what ` +
+  "the refill added: some of those forwards might have found liquidity anyway.";
+
+interface Lot {
+  r: RebalanceRecord;
+  t: number;
+  left: number;
+  routedOut: number;
+  earnedMsat: number;
+  otherOut: number;
+}
+
+/**
+ * What each refill earned back — review a5-analytics:rebalance-roi-
+ * overcredit, a2-rebalance:roi-overcredited.
+ *
+ * Before, every refill was credited with ALL the fees its target channel
+ * earned in the 14 days after it: not capped at what the refill moved, and
+ * two refills a day apart (the autopilot may refill a channel every 12 h)
+ * each claimed the same days — two 300-sat refills of a channel earning
+ * 100 sat a day read "467% back, 2/2 paid back" while the channel earned
+ * ~1,500 sat in all.
+ *
+ * Now the refilled sats are followed out of the channel first in, first out,
+ * the way the profit floor retires them (feeRecommend.ts refillLots): each
+ * forward out of the target draws on the oldest refill whose sats are still
+ * there, and its fee goes to that refill in proportion to the sats it took
+ * (a forward spanning two refills is split). A refill gets nothing beyond
+ * its own amount, and no forward counts twice. LND's "sent" counter, kept
+ * with each refill (targetSentBefore), shows what left between two refills
+ * and since the last one: what the forwards don't account for left by
+ * payments — it uses refills up too, earning nothing. The profit floor is
+ * not touched by any of this.
+ *
+ * `records`: successful refills (any order); `events`: forwards since at
+ * least the oldest of them; `sentNow`: each channel's sent counter now.
+ */
+export function measureRefills(
+  records: readonly RebalanceRecord[],
+  events: readonly ForwardEvent[],
+  sentNow: ReadonlyMap<string, number>,
+  nowMs: number,
+): Map<RebalanceRecord, Omit<Lot, "r" | "t">> {
+  const byTarget = new Map<string, Lot[]>();
+  for (const r of records) {
+    if (!r.ok || !(r.amountSats > 0)) continue;
+    const t = Date.parse(r.startedAt ?? r.at);
+    if (!Number.isFinite(t) || t > nowMs) continue;
+    const lots = byTarget.get(r.targetId) ?? [];
+    lots.push({ r, t, left: r.amountSats, routedOut: 0, earnedMsat: 0, otherOut: 0 });
+    byTarget.set(r.targetId, lots);
+  }
+  const outOf = new Map<string, { t: number; tokens: number; feeMsat: number }[]>();
+  for (const e of events) {
+    if (!byTarget.has(e.outgoingChannel)) continue;
+    const t = Date.parse(e.createdAt);
+    if (!Number.isFinite(t)) continue;
+    const list = outOf.get(e.outgoingChannel) ?? [];
+    list.push({ t, tokens: e.tokens, feeMsat: e.feeMsat });
+    outOf.set(e.outgoingChannel, list);
+  }
+
+  const out = new Map<RebalanceRecord, Omit<Lot, "r" | "t">>();
+  for (const [target, lots] of byTarget) {
+    lots.sort((a, b) => a.t - b.t);
+    const forwards = (outOf.get(target) ?? []).sort((a, b) => a.t - b.t);
+    /** Take `sats` from the refills in the channel, oldest first. */
+    const draw = (sats: number, upTo: number, feeMsat: number | null) => {
+      let rest = sats;
+      for (let k = 0; k <= upTo && rest > 0; k++) {
+        const lot = lots[k];
+        if (lot.left <= 0) continue;
+        const take = Math.min(lot.left, rest);
+        lot.left -= take;
+        rest -= take;
+        if (feeMsat === null) lot.otherOut += take;
+        else {
+          lot.routedOut += take;
+          lot.earnedMsat += (feeMsat * take) / sats;
+        }
+      }
+    };
+    let f = 0;
+    for (let i = 0; i < lots.length; i++) {
+      const until = i + 1 < lots.length ? lots[i + 1].t : nowMs;
+      // Forwards out before the next refill draw on this one and the older.
+      let forwarded = 0;
+      for (; f < forwards.length && forwards[f].t < until; f++) {
+        const fw = forwards[f];
+        if (fw.t < lots[i].t) continue; // before any refill: not a refill's
+        forwarded += fw.tokens;
+        draw(fw.tokens, i, fw.feeMsat);
+      }
+      // What else left meanwhile, by LND's sent counter (when both ends of
+      // the interval have it): payments, not forwards — no fee.
+      const from = lots[i].r.targetSentBefore;
+      const to = i + 1 < lots.length ? lots[i + 1].r.targetSentBefore : sentNow.get(target);
+      if (typeof from === "number" && typeof to === "number" && Number.isFinite(from) && Number.isFinite(to)) {
+        const other = to - from - forwarded;
+        if (other > 0) draw(other, i, null);
+      }
+    }
+    for (const lot of lots) {
+      out.set(lot.r, { left: lot.left, routedOut: lot.routedOut, earnedMsat: lot.earnedMsat, otherOut: lot.otherOut });
+    }
+  }
+  return out;
+}
+
+/** The rebalance half of the report — pure, for tests. Refills sent within
+ *  the last `lookbackDays` are listed; older ones still hold their place in
+ *  the first-in-first-out order. */
+export function measureRebalances(
+  records: readonly RebalanceRecord[],
+  events: readonly ForwardEvent[],
+  sentNow: ReadonlyMap<string, number>,
+  nowMs: number,
+  lookbackDays = LOOKBACK_DAYS,
+): OutcomesReport["rebalances"] {
+  const lots = measureRefills(records, events, sentNow, nowMs);
+  const items: RebalanceOutcome[] = [];
+  for (const [r, lot] of lots) {
+    if (!r.feeSats || r.feeSats <= 0) continue; // nothing to earn back
+    const t = Date.parse(r.startedAt ?? r.at);
+    if (nowMs - t > lookbackDays * DAY) continue;
+    const earned = lot.earnedMsat / 1000;
+    items.push({
+      targetId: r.targetId,
+      alias: r.targetAlias || r.targetId,
+      at: r.startedAt ?? r.at,
+      amountSats: r.amountSats,
+      costSats: r.feeSats,
+      routedOutSats: lot.routedOut,
+      earnedSats: Math.round(earned),
+      otherOutSats: lot.otherOut,
+      remainingSats: lot.left,
+      earnedBackPct: Math.round((earned / r.feeSats) * 100),
+      netSats: Math.round(earned - r.feeSats),
+      paidBack: earned >= r.feeSats,
+      status: lot.left <= 0 || nowMs - t >= REFILL_MEASURE_DAYS * DAY ? "measured" : "measuring",
+    });
+  }
+  items.sort((a, b) => b.at.localeCompare(a.at));
+  const measured = items.filter((i) => i.status === "measured");
+  const totalCostSats = measured.reduce((s, r) => s + r.costSats, 0);
+  const totalEarnedBackSats = measured.reduce((s, r) => s + r.earnedSats, 0);
+  return {
+    method: REFILL_ROI_METHOD,
+    measureDays: REFILL_MEASURE_DAYS,
+    measured: measured.length,
+    measuring: items.length - measured.length,
+    totalCostSats,
+    totalEarnedBackSats,
+    avgEarnedBackPct: totalCostSats > 0 ? Math.round((totalEarnedBackSats / totalCostSats) * 100) : null,
+    paidBackCount: measured.filter((r) => r.paidBack).length,
+    netSats: totalEarnedBackSats - totalCostSats,
+    items: items.slice(0, 30),
+  };
+}
+
 export async function getAutopilotOutcomes(
   lnd: AuthenticatedLnd,
   feeChanges: FeeChangeRecord[],
   rebalanceRecords: RebalanceRecord[],
-  opts: { rebalanceWindowDays?: number; lookbackDays?: number } = {},
 ): Promise<OutcomesReport> {
-  const rebWin = opts.rebalanceWindowDays ?? 14;
-  const lookback = (opts.lookbackDays ?? LOOKBACK_DAYS) * DAY;
-  // 60 days of changes, each measured against up to 14 days before it.
-  const events = await getForwardEvents(lnd, LOOKBACK_DAYS + FEE_WINDOW_DAYS + 1);
+  // 60 days of changes, each measured against up to 14 days before it — and
+  // refills of the same 60 days followed out of their channels.
+  const [events, channels] = await Promise.all([
+    getForwardEvents(lnd, LOOKBACK_DAYS + FEE_WINDOW_DAYS + 1),
+    getChannels({ lnd }).catch(() => ({ channels: [] })),
+  ]);
   const now = Date.now();
   const measuredFees = measureFeeChanges(feeChanges, events, now);
   const fees = { ...measuredFees, items: measuredFees.items.slice(0, 50) };
-
-  // ── Rebalance realized ROI ──
-  const { byChannel } = seriesOf(events);
-  const rebItems: RebalanceOutcome[] = [];
-  for (const r of rebalanceRecords) {
-    if (!r.ok || !r.feeSats || r.feeSats <= 0) continue;
-    const at = new Date(r.at).getTime();
-    // Require a full after-window before judging.
-    if (now - at < rebWin * DAY || now - at > lookback) continue;
-    const revenueAfter = (byChannel.get(r.targetId)?.over(at, at + rebWin * DAY).msat ?? 0) / 1000;
-    rebItems.push({
-      targetId: r.targetId,
-      alias: r.targetAlias || r.targetId,
-      at: r.at,
-      costSats: r.feeSats,
-      revenueAfterSats: Math.round(revenueAfter),
-      earnedBackPct: Math.round((revenueAfter / r.feeSats) * 100),
-      netSats: Math.round(revenueAfter - r.feeSats),
-      paidBack: revenueAfter >= r.feeSats,
-    });
-  }
-  rebItems.sort((a, b) => b.at.localeCompare(a.at));
-  const totalCostSats = rebItems.reduce((s, r) => s + r.costSats, 0);
-  const totalEarnedBackSats = rebItems.reduce((s, r) => s + r.revenueAfterSats, 0);
-  const rebalances = {
-    measured: rebItems.length,
-    totalCostSats,
-    totalEarnedBackSats,
-    avgEarnedBackPct: totalCostSats > 0 ? Math.round((totalEarnedBackSats / totalCostSats) * 100) : null,
-    paidBackCount: rebItems.filter((r) => r.paidBack).length,
-    netSats: totalEarnedBackSats - totalCostSats,
-    items: rebItems.slice(0, 30),
-  };
-
-  return { measureWindowDays: rebWin, fees, rebalances };
+  // Refills older than the forwards read can't be followed: left out of the
+  // order (their sats have long gone, or are none of these forwards').
+  const horizon = now - (LOOKBACK_DAYS + FEE_WINDOW_DAYS + 1) * DAY;
+  const inReach = rebalanceRecords.filter((r) => Date.parse(r.startedAt ?? r.at) >= horizon);
+  const sentNow = new Map(channels.channels.map((c) => [c.id, c.sent]));
+  const rebalances = measureRebalances(inReach, events, sentNow, now);
+  return { measureWindowDays: REFILL_MEASURE_DAYS, fees, rebalances };
 }
 
 // ── Elasticity learner ────────────────────────────────────────────────────────

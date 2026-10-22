@@ -1406,6 +1406,20 @@ export class Lsps1Service {
         `this LSP leases channels for 1 to ${LSPS1_LIMITS.maxChannelExpiryBlocks} blocks (about ${Math.round(LSPS1_LIMITS.maxChannelExpiryBlocks / 4_380)} months)`,
       );
     }
+    // The operator's per-channel limit (sellMaxChannelSats, shared with
+    // Magma selling). get_info's maximum is clamped up to the 1M minimum so
+    // min ≤ max holds, and the size checks above compare with that clamped
+    // figure: with the limit set below 1M (0 included), a 1M order was
+    // quoted and, once paid, a 1M channel opened — against the limit the
+    // docs promise. Refused here, before any capital look or LND read.
+    const perChannel = this.caps().maxChannelSats;
+    if (lspBalanceSat > perChannel) {
+      return refused(
+        perChannel < LSPS1_LIMITS.minChannelSat
+          ? "this LSP is not selling channels right now"
+          : `this LSP is not selling channels of this size right now (its per-channel limit is ${perChannel} sat)`,
+      );
+    }
     // Aggregate deploy cap (shared with Magma selling): reject up front rather
     // than refunding a paid order later.
     const atCap = () => refused("this LSP is at its capital deployment cap — try again later");
@@ -1420,8 +1434,15 @@ export class Lsps1Service {
     // with a fresh read, still decides: a figure too high here only lets the
     // request on to it; one too low (coins that arrived since) refuses until
     // the next read, at most CHAIN_READS_FRESH_MS later.
+    // Below the smallest channel sold there is no smaller one to suggest — and
+    // the exact coins on chain below 1M are nobody's business (get_info
+    // shows what is fundable from 1M up, never less).
     const noCapital = (availableSat: number) =>
-      refused(`this LSP has no on-chain capital for a channel this size right now (${availableSat} sat available) — try a smaller channel or later`);
+      refused(
+        availableSat < LSPS1_LIMITS.minChannelSat
+          ? "this LSP has no on-chain capital for a channel right now — try again later"
+          : `this LSP has no on-chain capital for a channel this size right now (${availableSat} sat available) — try a smaller channel or later`,
+      );
     if (lspBalanceSat > offer.deployableSat) return noCapital(offer.deployableSat);
 
     // Pricing may ask Amboss for the market — never while holding the mutex.
@@ -1948,6 +1969,11 @@ export class Lsps1Service {
     if (this.capital.deployedSat() + order.lspBalanceSat > this.caps().maxDeploySats) {
       return { done: false, error: "capital deployment cap reached", retry: false };
     }
+    // The per-channel limit likewise: lowered below this order's size since
+    // it was quoted, the channel is not sold — the payment goes back.
+    if (order.lspBalanceSat > this.caps().maxChannelSats) {
+      return { done: false, error: `the per-channel limit (${this.caps().maxChannelSats} sat) is below this order's ${order.lspBalanceSat} sat`, retry: false };
+    }
     const preExisting = (await channelsWith(this.writeLnd!, order.peer)).map((c) => c.outpoint);
     // Check again: the reads above waited on LND, and a shutdown that began
     // meanwhile has already been told "no open in flight" (the count below is
@@ -2166,6 +2192,7 @@ export class Lsps1Service {
       via: "lsps1",
       orderId: order.orderId,
       leaseSats: order.feeTotalSat,
+      ...(order.channelExpiryBlocks > 0 ? { leaseBlocks: order.channelExpiryBlocks } : {}),
     });
     this.serviceFees.enqueue({ source: "lsps1", orderId: order.orderId, earnedSats: order.feeTotalSat });
   }

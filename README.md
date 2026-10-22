@@ -10,11 +10,19 @@ standalone via Docker.
 
 ## Features
 
-- **Overview** — a node **health score** (six categories on a score ring), an
-  outbound/inbound **liquidity meter**, KPIs (earned / forwards with 24h·7d at a
-  glance / routed / **yield on capital**), a **Profit & Loss** view (routing
-  revenue vs channel-open and rebalancing costs), a liquidity map, recent
-  activity, your **top earning channels** and graph-based **peer suggestions**.
+- **Overview** — a node **health score** (six categories on a score ring;
+  channels still opening or closing are left out, and Earnings are judged net
+  of rebalancing, on-chain and inbound costs, with lease income counted as in
+  P&L — a node too young to judge gets a provisional grade), an
+  outbound/inbound **liquidity meter**, KPIs (earned /
+  forwards with rolling 24h·7d / routed / **yield on capital**), a **Profit &
+  Loss** view (routing revenue and lease income vs every cost: channel opens,
+  channel closes — worked out from the closing transactions and sweeps
+  themselves —, rebalancing by any tool, from LND's own payment history,
+  inbound bought on Magma, and the service fee), a liquidity map, recent
+  activity (a rebalance as one line, channel opens and closes named), your
+  **top channels** (fees earned out plus those of the flow they brought in)
+  and graph-based **peer suggestions**.
 - **Channels** — live balance bars with source / sink / router roles, scored
   peer suggestions, and close candidates — never a channel still opening or
   closing, or one inside its lease (sold on Magma or over LSPS1, or bought on

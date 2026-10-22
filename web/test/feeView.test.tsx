@@ -166,7 +166,7 @@ test("an updated install: the sorted window and the 3-day gate count from when s
 const outcomes = (fees: Partial<OutcomesReport["fees"]>): OutcomesReport => ({
   measureWindowDays: 14,
   fees: { windowDays: 14, measured: 0, measurable: 0, pending: 0, tooClose: 0, raises: 0, cuts: 0, avgRevenueDeltaPct: null, minMeasured: 5, confidence: "none", note: "", items: [], ...fees },
-  rebalances: { measured: 0, totalCostSats: 0, totalEarnedBackSats: 0, avgEarnedBackPct: null, paidBackCount: 0, netSats: 0, items: [] },
+  rebalances: { method: "", measureDays: 14, measured: 0, measuring: 0, totalCostSats: 0, totalEarnedBackSats: 0, avgEarnedBackPct: null, paidBackCount: 0, netSats: 0, items: [] },
 });
 
 test("the fee-tuning figure: a coloured number only over enough changes, always how many it rests on", () => {

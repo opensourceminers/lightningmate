@@ -8,7 +8,18 @@ import type { OnchainTx } from "./onchain.js";
  * activity feed (forwards + Lightning + on-chain) and an autopilot summary.
  */
 
-export type ActivityKind = "forward" | "received" | "sent" | "onchain_in" | "onchain_out";
+export type ActivityKind =
+  | "forward"
+  | "received"
+  | "sent"
+  /** A payment to this node itself: one row for the rebalance, its fee the cost. */
+  | "rebalance"
+  | "onchain_in"
+  | "onchain_out"
+  /** A funding transaction of one of this node's channels. */
+  | "channel_open"
+  /** A channel's closing transaction, or a sweep of a force close. */
+  | "channel_close";
 
 export interface ActivityItem {
   at: string;
@@ -44,9 +55,17 @@ export interface DashboardData {
   earnedSats: number;
   forwardCount: number;
   routedSats: number;
+  /** Forwards, fees and volume of the last 24 hours and 7 days — rolling,
+   *  ending now (the sparklines' last bucket is a partial day). */
+  rolling: ForwardsReport["rolling"];
+  /** False when LND had more forwards in the window than were read: the
+   *  most recent are the ones missing, so `rolling` reads too low — the
+   *  Overview says so instead of "no forwards in 7 days". */
+  forwardsComplete: boolean;
   feesSpark: number[];
   forwardsSpark: number[];
   routedSpark: number[];
+  /** Rebalances over the window (windowDays), whichever tool made them. */
   rebalancedCount: number;
   rebalancedSats: number;
   /** Total channel capacity (sats), peers' sides and pending channels included. */
@@ -58,6 +77,8 @@ export interface DashboardData {
   /** The same after the rebalancing fees paid in the window (ppm/year). */
   netYieldPpmYear: number;
   rebalanceFeesSats: number;
+  /** Where the rebalancing figures come from (pnl.ts PnlSummary). */
+  rebalanceSource: "lnd" | "log";
   leaseBenchmark: LeaseBenchmark;
   activity: ActivityItem[];
   autopilot: {
@@ -84,6 +105,13 @@ export interface DashboardData {
 interface RebalanceSummary {
   count: number;
   totalAmountSats: number;
+}
+
+/** The transactions of this node's channels: funding ones, and closing ones
+ *  with their sweeps — so the feed says what each on-chain line was. */
+export interface ChannelTxids {
+  opens: ReadonlySet<string>;
+  closes: ReadonlySet<string>;
 }
 
 interface AutopilotState {
@@ -115,11 +143,20 @@ export function buildDashboard(
   extra: {
     ownCapitalSats: number;
     rebalanceFeesSats: number;
+    rebalanceSource?: "lnd" | "log";
     leaseBenchmark: LeaseBenchmark;
     magmaRefusals: { reason: string }[];
+    /** This node's key: a payment to it is a rebalance. */
+    ownPubkey?: string;
+    channelTxids?: ChannelTxids;
   } = { ownCapitalSats: totalCapacitySats, rebalanceFeesSats: 0, leaseBenchmark: { status: "unknown", grossAprPct: null, sales: null, windowDays: null, text: "" }, magmaRefusals: [] },
 ): DashboardData {
   const activity: ActivityItem[] = [];
+  // A rebalance is a payment to this node's own invoice: before, the feed
+  // showed it twice — "Received · Lightning invoice +N" and "Sent · <own
+  // key>… −N" — and neither said it was a rebalance or what it cost. Now one
+  // row, its fee the amount.
+  const selfPaid = new Set(ln.payments.filter((p) => extra.ownPubkey && p.destination === extra.ownPubkey).map((p) => p.id));
 
   for (const f of report.recent) {
     activity.push({
@@ -131,7 +168,7 @@ export function buildDashboard(
     });
   }
   for (const i of ln.invoices) {
-    if (!i.isPaid) continue;
+    if (!i.isPaid || selfPaid.has(i.id)) continue;
     activity.push({
       at: i.createdAt,
       kind: "received",
@@ -140,6 +177,10 @@ export function buildDashboard(
     });
   }
   for (const p of ln.payments) {
+    if (selfPaid.has(p.id)) {
+      activity.push({ at: p.createdAt, kind: "rebalance", title: `${p.tokens.toLocaleString("en-US")} sat moved`, amountSats: -p.feeSats, feeSats: p.feeSats });
+      continue;
+    }
     activity.push({
       at: p.createdAt,
       kind: "sent",
@@ -149,10 +190,20 @@ export function buildDashboard(
     });
   }
   for (const t of onchain) {
+    // Funding and closing transactions say so: they were "On-chain send" and
+    // "On-chain receive" like any payment.
+    const kind: ActivityKind = extra.channelTxids?.opens.has(t.id)
+      ? "channel_open"
+      : extra.channelTxids?.closes.has(t.id)
+        ? "channel_close"
+        : t.isOutgoing
+          ? "onchain_out"
+          : "onchain_in";
+    const title = kind === "channel_open" ? "Channel open" : kind === "channel_close" ? "Channel close" : t.isOutgoing ? "On-chain send" : "On-chain receive";
     activity.push({
       at: t.createdAt,
-      kind: t.isOutgoing ? "onchain_out" : "onchain_in",
-      title: t.isOutgoing ? "On-chain send" : "On-chain receive",
+      kind,
+      title,
       amountSats: t.amountSats,
       feeSats: t.feeSats || undefined,
     });
@@ -171,6 +222,8 @@ export function buildDashboard(
     earnedSats: report.totalFeesEarnedSats,
     forwardCount: report.totalForwards,
     routedSats: report.totalRoutedSats,
+    rolling: report.rolling ?? { last24h: { forwards: 0, routedSats: 0, feesSats: 0 }, last7d: { forwards: 0, routedSats: 0, feesSats: 0 } },
+    forwardsComplete: report.complete !== false,
     feesSpark: report.daily.map((d) => d.feesSats),
     forwardsSpark: report.daily.map((d) => d.forwards),
     routedSpark: report.daily.map((d) => d.routedSats),
@@ -181,6 +234,7 @@ export function buildDashboard(
     yieldPpmYear: perYear(report.totalFeesEarnedSats),
     netYieldPpmYear: perYear(report.totalFeesEarnedSats - extra.rebalanceFeesSats),
     rebalanceFeesSats: extra.rebalanceFeesSats,
+    rebalanceSource: extra.rebalanceSource ?? "log",
     leaseBenchmark: extra.leaseBenchmark,
     activity: activity.slice(0, 14),
     autopilot: {

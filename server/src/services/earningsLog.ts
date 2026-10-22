@@ -16,15 +16,22 @@ export interface SaleRecord {
    *  service-fee ledger existed. Newer records omit it; P&L reads paid fees
    *  from the ledger instead. */
   feePaidSats?: number;
+  /** The lease the buyer paid for, in blocks (the order's; absent on older
+   *  records). The health score spreads the income over it. */
+  leaseBlocks?: number;
 }
-
-const LIMIT = 500;
 
 /** Magma sales can be completed by the autopilot or by hand — one order is
  *  one sale whichever path got there first. */
-const saleKind = (via: SaleRecord["via"]): "magma" | "lsps1" => (via === "lsps1" ? "lsps1" : "magma");
+export const saleKind = (via: SaleRecord["via"]): "magma" | "lsps1" => (via === "lsps1" ? "lsps1" : "magma");
 
-/** Append-only log of completed sales. */
+/**
+ * Append-only log of completed sales — never trimmed: it is P&L's lease
+ * income for every window, "All" included (review a8-engineering:pnl-
+ * accounting-truncated — it kept the newest 500, and a sale past them would
+ * have left the books). A sale is a few dozen bytes, and even a busy seller
+ * makes a few a week.
+ */
 export class EarningsLog {
   private readonly store: JsonStore<SaleRecord[]>;
   private records: SaleRecord[];
@@ -44,12 +51,12 @@ export class EarningsLog {
     const kind = saleKind(rec.via);
     if (this.records.some((r) => r.orderId === rec.orderId && saleKind(r.via) === kind)) return false;
     this.records.unshift(rec);
-    this.records = this.records.slice(0, LIMIT);
     this.store.write(this.records);
     return true;
   }
 
-  recent(n = LIMIT): SaleRecord[] {
+  /** The newest `n` sales (all of them by default). */
+  recent(n = Infinity): SaleRecord[] {
     return this.records.slice(0, n);
   }
 

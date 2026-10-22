@@ -3,6 +3,7 @@ import { api } from "../api";
 import type { PnlSummary, PriceInfo } from "../types";
 import { fiat, sats } from "../format";
 import { useCountUp } from "../useCountUp";
+import { pnlCostParts } from "../analyticsView";
 import { Skeleton } from "./Skeleton";
 
 const WINDOWS: { label: string; days: number }[] = [
@@ -36,10 +37,10 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
   const routing = data?.routingRevenueSats ?? 0;
   const magma = data?.magmaRevenueSats ?? 0;
   const revenue = routing + magma;
-  const opens = data?.channelOpenCostSats ?? 0;
-  const rebal = data?.rebalanceCostSats ?? 0;
-  const closes = data?.channelCloseCostSats ?? 0;
-  const svcFee = data?.serviceFeePaidSats ?? 0;
+  // Every cost the window had: opens, rebalancing (every tool's), closes
+  // (worked out from the transactions — they read 0 for every node),
+  // inbound bought on Magma and the service fee.
+  const costParts = data ? pnlCostParts(data) : [];
   const totalCost = data?.totalCostSats ?? 0;
   const max = Math.max(1, revenue, totalCost);
   const pct = (v: number) => `${(v / max) * 100}%`;
@@ -85,6 +86,7 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
               ) : null}
               <span className="pnl-meta">{data.forwardCount} forwards</span>
               <span className="pnl-meta">{data.rebalanceCount} rebalances</span>
+              <span className="pnl-meta">{data.channelCloseCount ?? 0} closes</span>
             </div>
           </div>
 
@@ -100,10 +102,14 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
             <div className="pnl-bar-row">
               <span className="pnl-bar-tag">Costs</span>
               <div className="pnl-track">
-                <div className="pnl-seg c-open" style={{ width: pct(opens) }} title={`Channel opens · ${sats(opens)} sat`} />
-                <div className="pnl-seg c-rebal" style={{ width: pct(rebal) }} title={`Rebalancing · ${sats(rebal)} sat`} />
-                <div className="pnl-seg c-close" style={{ width: pct(closes) }} title={`Channel closes · ${sats(closes)} sat`} />
-                <div className="pnl-seg c-fee" style={{ width: pct(svcFee) }} title={`Sales service fee · ${sats(svcFee)} sat`} />
+                {costParts.map((c) => (
+                  <div
+                    key={c.key}
+                    className={`pnl-seg ${c.cls}`}
+                    style={{ width: pct(c.sats) }}
+                    title={`${c.label} · ${sats(c.sats)} sat${c.note ? ` · ${c.note}` : ""}`}
+                  />
+                ))}
               </div>
               <span className="pnl-bar-val cost">{totalCost > 0 ? `−${sats(totalCost)}` : "0"}</span>
             </div>
@@ -111,11 +117,15 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
 
           <div className="pnl-legend">
             <span className="pnl-leg"><i className="pnl-d rev" />Routing<b>{sats(routing)}</b></span>
-            {magma > 0 ? <span className="pnl-leg"><i className="pnl-d rev-magma" />Magma<b>{sats(magma)}</b></span> : null}
-            <span className="pnl-leg"><i className="pnl-d c-open" />Opens<b>{sats(opens)}</b></span>
-            <span className="pnl-leg"><i className="pnl-d c-rebal" />Rebalance<b>{sats(rebal)}</b></span>
-            <span className="pnl-leg"><i className="pnl-d c-close" />Closes<b>{sats(closes)}</b></span>
-            {svcFee > 0 ? <span className="pnl-leg"><i className="pnl-d c-fee" />Fee<b>{sats(svcFee)}</b></span> : null}
+            {magma > 0 ? <span className="pnl-leg"><i className="pnl-d rev-magma" />Leases<b>{sats(magma)}</b></span> : null}
+            {costParts.map((c) => (
+              <span className="pnl-leg" key={c.key} title={c.note}>
+                <i className={`pnl-d ${c.cls}`} />
+                {c.label}
+                <b>{sats(c.sats)}</b>
+                {c.key === "close" && c.note ? <small>{c.note}</small> : null}
+              </span>
+            ))}
           </div>
 
           {data.otherChainFeesSats > 0 ? (
@@ -123,6 +133,11 @@ export function PnlOverview({ price }: { price?: PriceInfo | null }) {
               + {sats(data.otherChainFeesSats)} sat other on-chain fees (sends), not counted in net
             </p>
           ) : null}
+          {(data.notes ?? []).map((n) => (
+            <p className="pnl-foot muted" key={n}>
+              {n}
+            </p>
+          ))}
         </>
       ) : error ? null : (
         <>

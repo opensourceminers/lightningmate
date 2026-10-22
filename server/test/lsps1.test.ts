@@ -157,6 +157,11 @@ test("a ZEUS order goes through end to end over BOLT8: client_info accepted and 
     [[`lsps1:${order.order_id}`, "lsps1"]],
     "the disclosed 1% goes through the service-fee ledger",
   );
+  assert.deepEqual(
+    lsp.earnings.recent().map((s) => [s.orderId, s.leaseBlocks]),
+    [[order.order_id, 13_140]],
+    "the sale carries its lease: the health score spreads its income over it",
+  );
 
   // The Settings card: what each method was asked, and who asked.
   const status = await lsp.svc.status();
@@ -289,10 +294,7 @@ test("lease length: ZEUS's 1- and 3-month presets are taken, 6 months is refused
 
 // An empty wallet, and one with less than the smallest channel (1M) to
 // spend: 500,000 − 51,000 (the 50,000 sell reserve and a funding fee).
-for (const [chainBalance, availableSat] of [
-  [0, 0],
-  [500_000, 449_000],
-] as const) {
+for (const chainBalance of [0, 500_000]) {
   test(`${chainBalance.toLocaleString("en")} sat on chain: get_info still answers (min = max, as the spec wants), but every create_order is refused at once with the reason — no invoice the buyer could pay, no turn of the on-chain mutex, one LND read for all of them`, async (t) => {
     silence(t);
     const buyers = [BUYER, buyerN(31), buyerN(32), buyerN(33)];
@@ -313,11 +315,11 @@ for (const [chainBalance, availableSat] of [
       )
     ).flat();
     assert.equal(answers.length, 28);
+    // Below the smallest channel there is no smaller one to suggest, and
+    // the coins on chain are not told to any peer (P5 review: "try a smaller
+    // channel", with "(449000 sat available)").
     for (const a of answers) {
-      assert.deepEqual(
-        [a.error?.code, a.error?.data.message],
-        [1, `this LSP has no on-chain capital for a channel this size right now (${availableSat} sat available) — try a smaller channel or later`],
-      );
+      assert.deepEqual([a.error?.code, a.error?.data.message], [1, "this LSP has no on-chain capital for a channel right now — try again later"]);
     }
     assert.equal(lsp.node.callsTo("invoices.addHoldInvoice").length, 0, "no invoice the buyer could pay");
     // Before: get_info's maximum, clamped up to the 1M minimum, let each of
@@ -350,16 +352,26 @@ test("the first look refuses only what the check that decides would: exactly the
   assert.equal((await w.call("lsps1.get_info", {})).result.max_channel_balance_sat, "2949000");
   lsp.node.chainBalance = 500_000;
   const late = await w.call("lsps1.create_order", zeusOrder());
-  assert.deepEqual(
-    [late.error?.code, late.error?.data.message],
-    [1, "this LSP has no on-chain capital for a channel this size right now (449000 sat available) — try a smaller channel or later"],
-  );
+  assert.deepEqual([late.error?.code, late.error?.data.message], [1, "this LSP has no on-chain capital for a channel right now — try again later"]);
   assert.equal(turns(), 1, "the last read let it on to the check inside the mutex");
   assert.equal(lsp.node.callsTo("invoices.addHoldInvoice").length, 0, "no quote on coins that are gone");
-  // That check's read is the last read now.
+  // That check's read is the last read now: refused before the mutex.
   const next = await lspsWallet(lsp.node, buyerN(35)).call("lsps1.create_order", zeusOrder());
-  assert.match(next.error?.data.message ?? "", /\(449000 sat available\)/);
+  assert.equal(next.error?.data.message, "this LSP has no on-chain capital for a channel right now — try again later");
   assert.equal(turns(), 1, "refused before the mutex");
+  // With room for a smaller channel than asked for (the fresh read inside
+  // the mutex finds 1.5M where get_info had 2.9M), the refusal says how much
+  // there is and suggests one.
+  const room = lspNode(t, { node: new FakeLnd({ chainBalance: 3_000_000, peers: [BUYER] }) });
+  room.svc.start();
+  const rw = lspsWallet(room.node, BUYER);
+  await rw.call("lsps1.get_info", {});
+  room.node.chainBalance = 1_551_000;
+  const big = await rw.call("lsps1.create_order", zeusOrder({ lsp_balance_sat: "2000000" }));
+  assert.equal(
+    big.error?.data.message,
+    "this LSP has no on-chain capital for a channel this size right now (1500000 sat available) — try a smaller channel or later",
+  );
 });
 
 test("orders that cross are counted again inside the on-chain mutex: two buyers at once, each asking for a channel that fits alone but not beside the other — one is made, the other refused for the coins, or for the deploy cap", async (t) => {
@@ -1411,4 +1423,161 @@ test("an open whose outcome was unclear never adopts a channel another order's o
   await lsp.seams.fulfill(again);
   assert.equal(again.channel?.fundingOutpoint, `${"bb".repeat(32)}:0`);
   assert.equal(node.callsTo("default.openChannel").length, 1, "no second open");
+});
+
+// ── P5's final review, carried into P6 ───────────────────────────────────────
+
+for (const maxChannelSats of [500_000, 0]) {
+  test(`the operator's per-channel limit holds below LSPS1's 1M minimum (${maxChannelSats.toLocaleString("en")} sat): a 1M order is refused at once — no invoice, no turn of the on-chain mutex, no channel`, async (t) => {
+    silence(t);
+    const lsp = lspNode(t, { caps: { maxChannelSats, reserveSats: 50_000, maxDeploySats: 50_000_000 } });
+    lsp.svc.start();
+    const turns = orderTurns(lsp);
+    const w = lspsWallet(lsp.node, lsp.buyer);
+    // get_info keeps min ≤ max (clamped up to the 1M minimum) …
+    const info = await w.call("lsps1.get_info", {});
+    assert.equal(info.result.max_initial_lsp_balance_sat, "1000000");
+    // … and create_order no longer sells what the clamp lets through (before:
+    // the 1M order was quoted and, once paid, a 1M channel opened).
+    const res = await w.call("lsps1.create_order", zeusOrder());
+    assert.deepEqual([res.error?.code, res.error?.data?.message], [1, "this LSP is not selling channels right now"]);
+    assert.equal(lsp.node.callsTo("invoices.addHoldInvoice").length, 0, "no invoice the buyer could pay");
+    assert.equal(turns(), 0, "no turn of the on-chain mutex");
+    assert.equal(lsp.node.callsTo("default.openChannel").length, 0);
+  });
+}
+
+test("a per-channel limit of exactly 1,000,000 sat still sells a 1M channel — the limit is the largest size sold, not one below it", async (t) => {
+  silence(t);
+  const lsp = lspNode(t, { caps: { maxChannelSats: 1_000_000, reserveSats: 50_000, maxDeploySats: 50_000_000 } });
+  lsp.svc.start();
+  const res = await lspsWallet(lsp.node, lsp.buyer).call("lsps1.create_order", zeusOrder());
+  assert.equal(res.error, undefined, JSON.stringify(res.error));
+  assert.deepEqual([res.result.lsp_balance_sat, res.result.payment.bolt11.state], ["1000000", "EXPECT_PAYMENT"]);
+  assert.equal(lsp.node.callsTo("invoices.addHoldInvoice").length, 1, "quoted: one invoice to pay");
+});
+
+test("the per-channel limit is checked on its own, not only through get_info's maximum: a size above it is refused with the limit named", async (t) => {
+  silence(t);
+  const caps = { maxChannelSats: 1_200_000, reserveSats: 50_000, maxDeploySats: 50_000_000 };
+  const lsp = lspNode(t, { caps });
+  lsp.svc.start();
+  // An offer whose maximum is above the limit — as the clamp up to the 1M
+  // minimum makes it below 1M: the size check against that figure alone
+  // would let the order through.
+  const svc = lsp.svc as unknown as { offerView: (except?: string) => Promise<Record<string, number>> };
+  const real = svc.offerView.bind(lsp.svc);
+  svc.offerView = async (except) => ({ ...(await real(except)), maxChannelSat: 5_000_000 });
+  const res = await lspsWallet(lsp.node, lsp.buyer).call("lsps1.create_order", zeusOrder({ lsp_balance_sat: "2000000" }));
+  assert.deepEqual(
+    [res.error?.code, res.error?.data?.message],
+    [1, "this LSP is not selling channels of this size right now (its per-channel limit is 1200000 sat)"],
+  );
+  assert.equal(lsp.node.callsTo("invoices.addHoldInvoice").length, 0);
+});
+
+test("a paid order above a per-channel limit lowered since it was quoted is refunded at open time — never opened", async (t) => {
+  silence(t);
+  const caps = { maxChannelSats: 10_000_000, reserveSats: 50_000, maxDeploySats: 50_000_000 };
+  const lsp = lspNode(t, { caps });
+  lsp.svc.start();
+  const order = (await lspsWallet(lsp.node, lsp.buyer).call("lsps1.create_order", zeusOrder({ lsp_balance_sat: "2000000" }))).result;
+  caps.maxChannelSats = 1_500_000; // the operator lowers it before the buyer pays
+  lsp.node.payHoldInvoice(hashOf(order));
+  await until(() => view(lsp, order.order_id)?.orderState === "FAILED", "refunded");
+  assert.equal(view(lsp, order.order_id)?.paymentState, "REFUNDED");
+  assert.equal(lsp.node.invoices.get(hashOf(order))?.state, "CANCELED", "the buyer gets the payment back");
+  assert.equal(lsp.node.callsTo("default.openChannel").length, 0, "no channel above the limit");
+  assert.match(view(lsp, order.order_id)?.error ?? "", /per-channel limit \(1500000 sat\) is below this order's 2000000 sat/);
+});
+
+// PROBE-F18 of P5's final review: the buyer's payment of quote A lands while
+// its own new request is replacing A — LND's lookup inside supersede already
+// says "held" (the invoice watch saw it first, its fulfill kept off by
+// `fulfilling`). Without supersede's finally, A was followed by nothing: the
+// payment stayed held until LND released it near its CLTV expiry.
+test("a quote found paid while its buyer's new request replaces it is opened: the request is refused, the quote completes with one channel", async (t) => {
+  silence(t);
+  const lsp = lspNode(t);
+  lsp.svc.start();
+  const w = lspsWallet(lsp.node, lsp.buyer);
+  const a = (await w.call("lsps1.create_order", sized(0))).result;
+  await w.call("lsps1.create_order", sized(1)); // the buyer is at its two-order cap
+  age(lsp, 61_000);
+  const aHash = hashOf(a);
+  lsp.seams.lndConnect = async () => true;
+  const lookup = lsp.seams.lndInvoice.bind(lsp.svc);
+  let armed = true;
+  lsp.seams.lndInvoice = async (id: string) => {
+    if (armed && id === aHash) {
+      armed = false;
+      lsp.node.payHoldInvoice(aHash);
+      await new Promise((r) => setTimeout(r, 100)); // the watch sees it held; its fulfill is kept off
+    }
+    return lookup(id);
+  };
+  const c = await w.call("lsps1.create_order", sized(2));
+  assert.equal(c.error?.data?.message, "your earlier order was just paid — its channel is being opened; wait for it before ordering again");
+  await until(() => view(lsp, a.order_id)?.orderState === "COMPLETED", "A opens", 5_000);
+  assert.equal(lsp.node.callsTo("default.openChannel").length, 1);
+  assert.equal(lsp.node.invoices.get(aHash)?.state, "SETTLED");
+});
+
+// PROBE-F21 of P5's final review: LND doesn't answer the invoice lookup
+// (holdLeft "unknown") while the rest of LND does.
+test("while LND can't say a paid order's payment is still held: no open on its word and no refund either — once it answers, the channel opens", async (t) => {
+  silence(t);
+  const lsp = lspNode(t);
+  lsp.svc.start();
+  const order = (await lspsWallet(lsp.node, lsp.buyer).call("lsps1.create_order", zeusOrder())).result;
+  const hash = hashOf(order);
+  lsp.seams.openRetryDelayMs = 5;
+  lsp.seams.lndConnect = async () => true;
+  const lookup = lsp.seams.lndInvoice.bind(lsp.svc);
+  let answering = false;
+  let refused = 0;
+  lsp.seams.lndInvoice = async (id: string) => {
+    if (!answering && id === hash) {
+      refused += 1;
+      throw [503, "UnexpectedLookupInvoiceErr", { err: { details: "invoices subserver busy" } }];
+    }
+    return lookup(id);
+  };
+  lsp.node.payHoldInvoice(hash);
+  await until(() => refused >= 5, "LND refused the lookup five times");
+  const during = view(lsp, order.order_id);
+  assert.equal(lsp.node.callsTo("default.openChannel").length, 0, "no open on a payment LND can't vouch for");
+  assert.deepEqual([during?.orderState, during?.paymentState], ["CREATED", "HOLD"], "and no refund on a passing hiccup");
+  assert.equal(lsp.node.invoices.get(hash)?.state, "ACCEPTED", "the payment stays held");
+  answering = true;
+  await until(() => view(lsp, order.order_id)?.orderState === "COMPLETED", "opens once LND answers", 5_000);
+  assert.equal(lsp.node.callsTo("default.openChannel").length, 1);
+});
+
+test("an order whose open came out unclear three times is refunded, not tried a fourth time — under the bound it is still opened", async (t) => {
+  silence(t);
+  const node = new FakeLnd({ chainBalance: 20_000_000, peers: [BUYER] });
+  const lsp = lspNode(t, { node });
+  const unclear = (orderId: string, unclearOpens: number) =>
+    storedOrder(node, {
+      orderId,
+      paid: true,
+      unclearOpens,
+      // The last open's outcome was unclear 11 minutes ago — past the grace:
+      // LND shows no channel for it, so it counts as a third unclear open.
+      opening: { startedAt: new Date(Date.now() - 11 * 60_000).toISOString(), preExisting: [], unclear: "stream dropped" },
+    });
+  const third = await unclear("unclear-3", 2);
+  lsp.seams.orders.unshift(third);
+  await lsp.seams.fulfill(third);
+  assert.equal(node.callsTo("default.openChannel").length, 0, "no fourth open");
+  assert.deepEqual([third.orderState, third.paymentState], ["FAILED", "REFUNDED"]);
+  assert.match(third.error ?? "", /the channel open failed 3 times without a clear answer from LND/);
+  assert.equal(node.invoices.get(third.invoiceId)?.state, "CANCELED");
+
+  const second = await unclear("unclear-2", 1);
+  lsp.seams.orders.unshift(second);
+  await lsp.seams.fulfill(second);
+  assert.equal(node.callsTo("default.openChannel").length, 1, "under the bound: opened");
+  assert.equal(second.orderState, "COMPLETED");
 });

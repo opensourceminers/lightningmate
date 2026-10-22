@@ -21,6 +21,11 @@ export interface ChannelFlow {
   /** Fees we earned on forwards leaving via this channel, in sats. */
   feesEarned: number;
   forwardCount: number;
+  /** Fees of the forwards that ENTERED through this channel (earned on
+   *  their outgoing channel): what it brought in — review a5-analytics:
+   *  inbound-channels-invisible. */
+  inboundFeesEarned: number;
+  inboundForwardCount: number;
 }
 
 export interface FlowSummary {
@@ -30,27 +35,36 @@ export interface FlowSummary {
   totalFeesEarnedSats: number;
   perChannel: ChannelFlow[];
   recent: ForwardEvent[];
+  /** False when LND had more forwards than were read (MAX_PAGES): LND hands
+   *  them over oldest first, so the MOST RECENT of the window are missing. */
+  complete: boolean;
 }
 
+/** At most this many pages of 1,000 forwards are read (100,000). */
 const MAX_PAGES = 100;
+const DAY_MS = 86_400_000;
 
 /** Every forward of the last `windowDays`, with its exact fee in msat — for
  *  measurements over arbitrary intervals (fee outcomes), where per-day sums
  *  rounded to whole sats would drown a small channel's revenue. */
-export function getForwardEvents(lnd: AuthenticatedLnd, windowDays: number): Promise<ForwardEvent[]> {
-  return fetchForwards(lnd, windowDays);
+export async function getForwardEvents(lnd: AuthenticatedLnd, windowDays: number): Promise<ForwardEvent[]> {
+  return (await fetchForwards(lnd, windowDays)).events;
 }
 
-/** Pull every forwarding event in the window, paging through the LND cursor. */
+/** Pull every forwarding event in the window, paging through the LND cursor
+ *  — from the window's start onwards (ForwardingHistory pages by index,
+ *  oldest first): a read cut short at MAX_PAGES misses the newest. */
 async function fetchForwards(
   lnd: AuthenticatedLnd,
   windowDays: number,
-): Promise<ForwardEvent[]> {
-  const after = new Date(Date.now() - windowDays * 86_400_000).toISOString();
-  const before = new Date().toISOString();
+  nowMs = Date.now(),
+): Promise<{ events: ForwardEvent[]; complete: boolean }> {
+  const after = new Date(nowMs - windowDays * DAY_MS).toISOString();
+  const before = new Date(nowMs).toISOString();
 
   const events: ForwardEvent[] = [];
   let token: string | undefined;
+  let complete = false;
 
   for (let page = 0; page < MAX_PAGES; page++) {
     // First page seeds the query; later pages must use the cursor token alone.
@@ -73,24 +87,27 @@ async function fetchForwards(
       });
     }
 
-    if (!res.next) break;
+    if (!res.next) {
+      complete = true;
+      break;
+    }
     token = res.next;
   }
 
-  return events;
+  return { events, complete };
 }
 
 export async function getFlowSummary(
   lnd: AuthenticatedLnd,
   windowDays: number,
 ): Promise<FlowSummary> {
-  const events = await fetchForwards(lnd, windowDays);
+  const { events, complete } = await fetchForwards(lnd, windowDays);
 
   const byChannel = new Map<string, ChannelFlow>();
   const ensure = (channelId: string): ChannelFlow => {
     let flow = byChannel.get(channelId);
     if (!flow) {
-      flow = { channelId, routedOut: 0, routedIn: 0, feesEarned: 0, forwardCount: 0 };
+      flow = { channelId, routedOut: 0, routedIn: 0, feesEarned: 0, forwardCount: 0, inboundFeesEarned: 0, inboundForwardCount: 0 };
       byChannel.set(channelId, flow);
     }
     return flow;
@@ -99,6 +116,7 @@ export async function getFlowSummary(
   let totalRouted = 0;
   let totalFeeMsat = 0;
   const feeMsatByChannel = new Map<string, number>();
+  const inboundMsatByChannel = new Map<string, number>();
 
   for (const e of events) {
     const out = ensure(e.outgoingChannel);
@@ -106,16 +124,19 @@ export async function getFlowSummary(
     out.forwardCount += 1;
     feeMsatByChannel.set(e.outgoingChannel, (feeMsatByChannel.get(e.outgoingChannel) ?? 0) + e.feeMsat);
 
-    ensure(e.incomingChannel).routedIn += e.tokens;
+    const inbound = ensure(e.incomingChannel);
+    inbound.routedIn += e.tokens;
+    inbound.inboundForwardCount += 1;
+    inboundMsatByChannel.set(e.incomingChannel, (inboundMsatByChannel.get(e.incomingChannel) ?? 0) + e.feeMsat);
 
     totalRouted += e.tokens;
     totalFeeMsat += e.feeMsat;
   }
 
   // Convert accumulated millisats → sats once, at the end.
-  for (const [id, msat] of feeMsatByChannel) {
-    const flow = byChannel.get(id);
-    if (flow) flow.feesEarned = Math.round(msat / 1000);
+  for (const flow of byChannel.values()) {
+    flow.feesEarned = Math.round((feeMsatByChannel.get(flow.channelId) ?? 0) / 1000);
+    flow.inboundFeesEarned = Math.round((inboundMsatByChannel.get(flow.channelId) ?? 0) / 1000);
   }
 
   const perChannel = [...byChannel.values()].sort(
@@ -134,6 +155,7 @@ export async function getFlowSummary(
     totalFeesEarnedSats: Math.round(totalFeeMsat / 1000),
     perChannel,
     recent,
+    complete,
   };
 }
 
@@ -152,9 +174,19 @@ export interface ChannelForwardStat {
   routedOutSats: number;
   routedInSats: number;
   feesEarnedSats: number;
-  /** Current outbound share (local / (local+remote)), 0..1 — for urgency. */
+  /** Forwards that ENTERED through this channel, and the fees they earned
+   *  (on their outgoing channel): its part as the source of a route. A
+   *  channel that only ever brought flow in earned nothing itself, yet
+   *  closing it kills every route through it. */
+  inboundForwardCount: number;
+  inboundFeesSats: number;
+  /** Current outbound share (local / (local+remote)), 0..1 — for urgency
+   *  (0 for a channel no longer open: see `status`). */
   localRatio: number;
   capacity: number;
+  /** "closed": not among the node's channels any more — its flow is history,
+   *  never "draining · 0% left". */
+  status: "open" | "pending" | "closed";
   flow: ChannelFlowDirection;
   /** Daily fees earned, aligned to the report's `daily` dates (for sparklines). */
   spark: number[];
@@ -188,6 +220,12 @@ export interface ResolvedForward {
   fee: number;
 }
 
+export interface RollingTotals {
+  forwards: number;
+  routedSats: number;
+  feesSats: number;
+}
+
 export interface ForwardsReport {
   windowDays: number;
   totalForwards: number;
@@ -198,21 +236,58 @@ export interface ForwardsReport {
   busiestDay: string | null;
   perChannel: ChannelForwardStat[];
   corridors: RoutingCorridor[];
+  /** One bucket per local day the window touches — its first and last day
+   *  partial — so every forward in the totals is in a bucket. */
   daily: DailyBucket[];
   recent: ResolvedForward[];
+  /** The last 24 hours and 7 days, ending now — rolling, never calendar
+   *  days (review a5-analytics:utc-day-windows: "in 24h" read the current
+   *  UTC day's bucket, half an hour of data at 00:30 UTC). */
+  rolling: { last24h: RollingTotals; last7d: RollingTotals };
+  /** Fees of the most recent half of the window against the half before
+   *  it: equal spans ending now, so a partial day never tilts the trend. */
+  trend: { halfDays: number; recentFeesSats: number; priorFeesSats: number; growthPct: number | null };
+  /** The days are this many minutes east of UTC (the viewer's time zone). */
+  tzOffsetMin: number;
+  /** False when LND had more forwards than were read: the most recent of
+   *  the window are missing — the rolling 24 h and 7 d figures with them. */
+  complete: boolean;
+}
+
+/** A time zone offset the API accepts: whole minutes, −14 h … +14 h. */
+export function parseTzOffset(raw: unknown): number {
+  const n = Number(raw);
+  return Number.isInteger(n) && n >= -840 && n <= 840 ? n : 0;
 }
 
 export async function getForwardsReport(
   lnd: AuthenticatedLnd,
   windowDays: number,
+  opts: { tzOffsetMin?: number; nowMs?: number } = {},
 ): Promise<ForwardsReport> {
-  const [events, channels] = await Promise.all([
-    fetchForwards(lnd, windowDays),
+  const nowMs = opts.nowMs ?? Date.now();
+  const tz = opts.tzOffsetMin ?? 0;
+  const [{ events, complete }, channels] = await Promise.all([
+    fetchForwards(lnd, windowDays, nowMs),
     getChannelsView(lnd),
   ]);
+  return buildForwardsReport(events, channels, windowDays, { nowMs, tzOffsetMin: tz, complete });
+}
+
+/** The report from the forwards and the channels — pure, for tests. */
+export function buildForwardsReport(
+  events: ForwardEvent[],
+  channels: { id: string; peerAlias: string; localRatio: number; capacity: number; status: "open" | "pending_open" | "pending_close" }[],
+  windowDays: number,
+  opts: { nowMs: number; tzOffsetMin: number; complete?: boolean },
+): ForwardsReport {
+  const { nowMs } = opts;
+  const tz = opts.tzOffsetMin;
   const aliasById = new Map(channels.map((c) => [c.id, c.peerAlias]));
-  const chanInfo = new Map(channels.map((c) => [c.id, { localRatio: c.localRatio, capacity: c.capacity }]));
+  const chanInfo = new Map(channels.map((c) => [c.id, { localRatio: c.localRatio, capacity: c.capacity, status: c.status }]));
   const name = (id: string): string => aliasById.get(id) ?? id;
+  /** The viewer's local calendar day of a moment. */
+  const localDay = (ms: number): string => new Date(ms + tz * 60_000).toISOString().slice(0, 10);
 
   const byChannel = new Map<string, ChannelForwardStat>();
   const ensure = (id: string): ChannelForwardStat => {
@@ -226,8 +301,11 @@ export async function getForwardsReport(
         routedOutSats: 0,
         routedInSats: 0,
         feesEarnedSats: 0,
+        inboundForwardCount: 0,
+        inboundFeesSats: 0,
         localRatio: info?.localRatio ?? 0,
         capacity: info?.capacity ?? 0,
+        status: !info ? "closed" : info.status === "open" ? "open" : "pending",
         flow: "balanced",
         spark: [],
       };
@@ -242,23 +320,47 @@ export async function getForwardsReport(
   const dayMap = new Map<string, DailyBucket>();
   const dayFeeMsat = new Map<string, number>(); // date -> fee msat
   const chanFeeMsat = new Map<string, number>(); // channel -> fee msat
+  const chanInboundMsat = new Map<string, number>(); // channel (as incoming) -> fee msat
   const perChanDayMsat = new Map<string, Map<string, number>>(); // channel -> date -> fee msat
   let totalRouted = 0;
   let totalFeeMsat = 0;
   let maxForward = 0;
+  const roll = (fromMs: number) => {
+    const r = { forwards: 0, routedSats: 0, feeMsat: 0 };
+    return { r, fromMs };
+  };
+  const last24h = roll(nowMs - DAY_MS);
+  const last7d = roll(nowMs - 7 * DAY_MS);
+  const halfDays = Math.max(1, Math.floor(windowDays / 2));
+  let recentMsat = 0;
+  let priorMsat = 0;
 
   for (const e of events) {
+    const t = Date.parse(e.createdAt);
     const out = ensure(e.outgoingChannel);
     out.routedOutSats += e.tokens;
     out.forwardCount += 1;
     chanFeeMsat.set(e.outgoingChannel, (chanFeeMsat.get(e.outgoingChannel) ?? 0) + e.feeMsat);
-    ensure(e.incomingChannel).routedInSats += e.tokens;
+    const inbound = ensure(e.incomingChannel);
+    inbound.routedInSats += e.tokens;
+    inbound.inboundForwardCount += 1;
+    chanInboundMsat.set(e.incomingChannel, (chanInboundMsat.get(e.incomingChannel) ?? 0) + e.feeMsat);
 
     totalRouted += e.tokens;
     totalFeeMsat += e.feeMsat;
     if (e.tokens > maxForward) maxForward = e.tokens;
 
-    const date = e.createdAt.slice(0, 10);
+    for (const w of [last24h, last7d]) {
+      if (t > w.fromMs && t <= nowMs) {
+        w.r.forwards += 1;
+        w.r.routedSats += e.tokens;
+        w.r.feeMsat += e.feeMsat;
+      }
+    }
+    if (t > nowMs - halfDays * DAY_MS) recentMsat += e.feeMsat;
+    else if (t > nowMs - 2 * halfDays * DAY_MS) priorMsat += e.feeMsat;
+
+    const date = Number.isFinite(t) ? localDay(t) : e.createdAt.slice(0, 10);
     const bucket = dayMap.get(date) ?? { date, forwards: 0, routedSats: 0, feesSats: 0 };
     bucket.forwards += 1;
     bucket.routedSats += e.tokens;
@@ -284,6 +386,8 @@ export async function getForwardsReport(
   for (const s of byChannel.values()) {
     const msat = chanFeeMsat.get(s.channelId);
     if (msat) s.feesEarnedSats = Math.round(msat / 1000);
+    const inMsat = chanInboundMsat.get(s.channelId);
+    if (inMsat) s.inboundFeesSats = Math.round(inMsat / 1000);
     const total = s.routedOutSats + s.routedInSats;
     s.flow =
       total === 0
@@ -311,16 +415,17 @@ export async function getForwardsReport(
     .sort((a, b) => b.feesSats - a.feesSats)
     .slice(0, 8);
 
-  // Continuous daily series (fill gaps with zeros) for the chart.
+  // A continuous daily series (gaps filled with zeros), one bucket for every
+  // local day the window touches: the first and the last are partial. Before,
+  // the series ended with today's partial UTC day and skipped the window's
+  // first day — whose forwards counted in the totals but in no bucket.
   const daily: DailyBucket[] = [];
-  for (let i = windowDays - 1; i >= 0; i--) {
-    const date = new Date(Date.now() - i * 86_400_000).toISOString().slice(0, 10);
+  const lastDay = localDay(nowMs);
+  for (let d = Date.parse(`${localDay(nowMs - windowDays * DAY_MS)}T00:00:00Z`); ; d += DAY_MS) {
+    const date = new Date(d).toISOString().slice(0, 10);
     const b = dayMap.get(date);
-    daily.push(
-      b
-        ? { ...b, feesSats: Math.round((dayFeeMsat.get(date) ?? 0) / 1000) }
-        : { date, forwards: 0, routedSats: 0, feesSats: 0 },
-    );
+    daily.push(b ? { ...b, feesSats: Math.round((dayFeeMsat.get(date) ?? 0) / 1000) } : { date, forwards: 0, routedSats: 0, feesSats: 0 });
+    if (date >= lastDay || daily.length > windowDays + 2) break;
   }
   const busiestDay =
     daily.reduce<DailyBucket | null>((best, d) => (d.forwards > (best?.forwards ?? -1) ? d : best), null)
@@ -332,7 +437,7 @@ export async function getForwardsReport(
     stat.spark = daily.map((d) => Math.round((days?.get(d.date) ?? 0) / 1000));
   }
 
-  const perChannel = [...byChannel.values()].sort((a, b) => b.feesEarnedSats - a.feesEarnedSats);
+  const perChannel = [...byChannel.values()].sort((a, b) => b.feesEarnedSats + b.inboundFeesSats - (a.feesEarnedSats + a.inboundFeesSats));
 
   const recent: ResolvedForward[] = [...events]
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
@@ -345,6 +450,9 @@ export async function getForwardsReport(
       fee: e.fee,
     }));
 
+  const totals = (w: typeof last24h): RollingTotals => ({ forwards: w.r.forwards, routedSats: w.r.routedSats, feesSats: Math.round(w.r.feeMsat / 1000) });
+  const recentFeesSats = Math.round(recentMsat / 1000);
+  const priorFeesSats = Math.round(priorMsat / 1000);
   return {
     windowDays,
     totalForwards: events.length,
@@ -357,5 +465,14 @@ export async function getForwardsReport(
     corridors,
     daily,
     recent,
+    rolling: { last24h: totals(last24h), last7d: totals(last7d) },
+    trend: {
+      halfDays,
+      recentFeesSats,
+      priorFeesSats,
+      growthPct: priorMsat > 0 ? Math.round(((recentMsat - priorMsat) / priorMsat) * 100) : null,
+    },
+    tzOffsetMin: tz,
+    complete: opts.complete ?? true,
   };
 }

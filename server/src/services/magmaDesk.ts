@@ -1903,6 +1903,7 @@ export class MagmaDesk {
         via: entry.via === "manual" ? "manual" : "autopilot",
         orderId: entry.orderId,
         leaseSats: earned,
+        ...(entry.leaseBlocks && entry.leaseBlocks > 0 ? { leaseBlocks: entry.leaseBlocks } : {}),
       });
       if (inlineFee > 0) {
         this.journal.event(entry, `service fee already paid by an earlier version (${inlineFee} sat) — not charged again`);
