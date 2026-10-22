@@ -673,6 +673,12 @@ test("'Last change by the autopilot' is the autopilot's: a fee set by hand since
   assert.equal(lastAutopilotActionAt([{ at, changes: [{ id: "a", alias: "a", fromPpm: 1, toPpm: 2, ok: false }], rebalances: [], channels: [], sells: [] }]), null);
   assert.equal(lastAutopilotActionAt([{ at, changes: [{ id: "a", alias: "a", fromPpm: 9, toPpm: 2, ok: true, via: "lease" }], rebalances: [], channels: [], sells: [] }]), at);
   assert.equal(lastAutopilotActionAt([{ at, changes: [], rebalances: [], channels: [], sells: [{ orderId: "o", action: "accept", sizeSats: 1, ok: true }] }]), at);
+  // The order lane carrying out the operator's own decision (their reject
+  // sent again, their accept completed) is theirs, not the autopilot's
+  // (review of P9, final round; magmaByHand.test.ts).
+  for (const action of ["reject", "accept"] as const) {
+    assert.equal(lastAutopilotActionAt([{ at, changes: [], rebalances: [], channels: [], sells: [{ orderId: "o", action, sizeSats: 1, ok: true, via: "manual" }] }]), null, action);
+  }
 });
 
 test("each action is a decision of its own — two fee runs that act are two entries of the decision log, never 'acted ×2'", async (t) => {

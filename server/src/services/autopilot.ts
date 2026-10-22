@@ -676,7 +676,12 @@ export function maxHtlcDecision(
  * run history with an action that landed and was not the operator's — a fee
  * set or applied by hand on the Fees tab is recorded there too (via
  * "manual"), and the Overview's "Last change by the autopilot 2m ago" said so
- * of it (review of P7). A line whose every attempt failed changed nothing.
+ * of it (review of P7). So is a Magma accept or reject the order lane sends
+ * for the operator, carrying out a decision they made by hand (via "manual":
+ * their reject sent again, their accept completed) — not one of its own
+ * (review of P9, final round: the resend of their reject, once Amboss
+ * confirmed it, read as the autopilot's latest change). A line whose every
+ * attempt failed changed nothing.
  */
 export function lastAutopilotActionAt(
   history: readonly Pick<AutopilotRun, "at" | "changes" | "rebalances" | "channels" | "sells" | "maxHtlc">[],
@@ -687,7 +692,7 @@ export function lastAutopilotActionAt(
       (r.changes ?? []).some((c) => c.ok && c.via !== "manual") ||
       landed(r.rebalances) ||
       landed(r.channels) ||
-      landed(r.sells) ||
+      (r.sells ?? []).some((s) => s.ok && s.via !== "manual") ||
       landed(r.maxHtlc),
   );
   return line?.at ?? null;

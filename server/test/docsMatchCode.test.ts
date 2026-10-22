@@ -22,7 +22,7 @@ import { DEFAULT_CONFIG } from "../src/services/autopilotConfig.js";
 import { DEFAULT_POLICY } from "../src/services/fees.js";
 import { LOOPBACK_HOSTS } from "../src/exposure.js";
 import { SHUTDOWN_GRACE_MS, SHUTDOWN_WAIT_MS } from "../src/shutdown.js";
-import { MANUAL_ACCEPT_SKIP } from "../src/services/magmaDesk.js";
+import { MANUAL_ACCEPT_SKIP, NOT_REJECTED_ACCEPT_SENT } from "../src/services/magmaDesk.js";
 import { autopilotWith } from "./helpers/autopilot.js";
 import { quiet } from "./helpers/lifecycle.js";
 
@@ -194,7 +194,7 @@ test("the store manifest here is the next release's: category bitcoin, and relea
 // failed, or turn down one whose accept by hand failed. The code now carries
 // out the operator's decision (magmaByHand.test.ts); the docs say so, and
 // quote the reason the Orders tab shows as the code words it.
-test("the docs say a decision made by hand wins over the Magma order lane, for an order the lane isn't working on — a reject Amboss didn't confirm is sent again, an accept that didn't go through leaves the order to the operator, a click mid-step waits", () => {
+test("the docs say a decision made by hand wins over the Magma order lane, for an order the lane isn't working on — a reject Amboss didn't confirm is sent again, an accept that didn't go through leaves the order to the operator, a click mid-step waits, and an accept already sent is completed first", () => {
   const prose = (doc: string) => doc.replace(/\s+/g, " ");
   const readme = prose(read("README.md"));
   const security = prose(read("SECURITY.md"));
@@ -213,12 +213,41 @@ test("the docs say a decision made by hand wins over the Magma order lane, for a
     for (const step of [/capital/, /(dialing|dial of) the buyer \(up to about a minute and a half over Tor\)/, /its own accept or reject/, /earlier reject of (yours|the operator's)/]) {
       assert.match(steps, step, `${name}: the steps a click waits for`);
     }
-    assert.match(doc, /if the order was accepted or rejected meanwhile, the click is refused and says so \("Order is /, name);
+    // Review of P9, final round: a click that finds the order as it asked —
+    // rejected by the lane's resend of the operator's own reject, accepted
+    // by the lane — is told it is done, not refused; only one asking for the
+    // other is refused (magmaByHand.test.ts pins both).
+    assert.match(
+      doc,
+      /if the order was accepted or rejected meanwhile, the click says so — done, if that is what it asked for \("Order is already accepted\.", "Order is already rejected\."\); refused, if it asked for the other \("Order is /,
+      name,
+    );
     // What the refused click says, as the code words it (the status is the
     // order's own, read once the click has its turn).
     for (const [, said] of doc.matchAll(/"(Order is [A-Z_]+[^"]*)"/g)) {
       const template = said.replace(/^Order is [A-Z_]+/, () => "Order is ${order.status}");
       assert.ok(desk.includes(`message: \`${template}`), `${name} quotes "${said}" — no click says that (magmaDesk.ts)`);
+    }
+    // ...and what the other answers say, word for word.
+    for (const [, said] of doc.matchAll(/"((?:Order is already (?:accepted|rejected)|Not rejected:)[^"]*)"/g)) {
+      assert.ok(desk.includes(`"${said}"`), `${name} quotes "${said}" — no click says that (magmaDesk.ts)`);
+    }
+    // Review of P9, final round: "makes the order yours, whatever becomes of
+    // the click", "their latest click stands" — while an accept already sent
+    // whose answer was lost ("accepting") is completed first, the lane's or
+    // the operator's, and a Reject meanwhile is refused, though Amboss still
+    // shows the order awaiting approval (magmaByHand.test.ts pins it). Each
+    // doc says so, quoting the refusal as the code words it, and every such
+    // claim is qualified in its own sentence.
+    assert.match(
+      doc,
+      /an accept already sent whose answer was lost \([^)]*"accepting[^)]*\), (yours|the operator's) or the (lane's|autopilot's): an accept that may have reached Amboss is completed first/,
+      name,
+    );
+    const refused = /a Reject meanwhile is refused \("(Not rejected: [^"]*)"\), though Amboss may still show the order awaiting approval/.exec(doc)?.[1];
+    assert.equal(refused, NOT_REJECTED_ACCEPT_SENT, `${name}: the refusal, as the click words it`);
+    for (const [claim] of doc.matchAll(/(whatever becomes of the click|their latest click stands)[^.]*/g)) {
+      assert.match(claim, /except for an accept already sent whose answer was lost/, `${name}: "${claim.slice(0, 60)}…" is qualified`);
     }
     assert.match(doc, /reject Amboss didn't confirm (\(an error, a refusal\) )?is sent again/, name);
     // Review of P9, round 2: "a click on Accept or Reject makes the order
@@ -235,6 +264,25 @@ test("the docs say a decision made by hand wins over the Magma order lane, for a
   const deskComments = prose(desk.replace(/^\s*\* ?/gm, ""));
   assert.doesNotMatch(deskComments, /always wins/, "magmaDesk.ts");
   assert.match(deskComments, /wins over the lane \(byHand\): .* That holds for an order the lane isn't working on when the click comes\./, "magmaDesk.ts");
+  // Review of P9, final round: the header and byHand's own account of the
+  // rule state its exception too.
+  assert.match(
+    deskComments,
+    /Nor does a click take back an accept already sent whose answer was lost \("accepting"\), the lane's or the operator's: an accept that may have reached Amboss is completed first, and a Reject meanwhile is refused, saying why\./,
+    "magmaDesk.ts",
+  );
+  const byHandDoc = prose((/\/\*\*((?:(?!\*\/)[\s\S])*)\*\/\s*private byHand\(/.exec(desk)?.[1] ?? "").replace(/^\s*\* ?/gm, ""));
+  assert.match(
+    byHandDoc,
+    /their latest click is what stands: .* an accept already sent whose answer was lost \("accepting"\), the lane's or theirs: an accept that may have reached Amboss is completed first \(resumeAccept\), and a Reject meanwhile is refused/,
+    "byHand's docblock",
+  );
+  // Review of P9, final round: the lane's resend of the operator's reject,
+  // once Amboss confirmed it, read as "Last change by the autopilot".
+  assert.match(
+    strategyProse,
+    /The lane carrying out the operator's decision \(their reject sent again, their accept completed\) is recorded as theirs \(the run history's `via: "manual"`\): the Overview's "Last change by the autopilot" leaves it out\./,
+  );
   assert.match(
     readme,
     /A click that can't read the order \(Amboss or LND not answering\) counts too once the autopilot has the order on record as awaiting your decision/,

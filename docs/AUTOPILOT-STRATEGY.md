@@ -464,23 +464,32 @@ end either way, and with selling on it also opens the channel of an order accept
 lane, for an order the lane isn't working on at that moment: a click on Accept or Reject that
 finds the order — Amboss shows it as this node's, awaiting approval, or the lane has it on record
 as awaiting approval (then even a click that can't read it) — makes the order the operator's,
-whatever becomes of the click, and their latest click stands. A click that finds neither (Amboss
-or LND not answering) records nothing: with Liquidity provision on, the lane may decide that
-order before the operator tries again. A click that arrives while the lane is already deciding
-or acting on that same order — its capital check, its dial of the buyer (up to about a minute and
-a half over Tor), its own accept or reject, or the resend of an earlier reject of the
-operator's — waits for that step to finish (one action per order at a time, the lane's or a
-click's); if the order was accepted or rejected meanwhile, the click is refused and says so
-("Order is WAITING_FOR_BUYER_PAYMENT — only orders awaiting approval can be rejected", "Order is
-SELLER_REJECTED, not awaiting approval"), and the order stays as the lane left it (a reject of
+whatever becomes of the click, and their latest click stands — except for an accept already sent
+whose answer was lost (the record says "accepting"), the operator's or the lane's: an accept that
+may have reached Amboss is completed first, whatever the selling switch says, and a Reject
+meanwhile is refused ("Not rejected: the earlier accept of this order was already sent and is
+being confirmed with Amboss, so it can't be withdrawn."), though Amboss may still show the order
+awaiting approval. A click that finds neither (Amboss or LND not answering) records nothing:
+with Liquidity provision on, the lane may decide that order before the operator tries again. A
+click that arrives while the lane is already deciding or acting on that same order — its capital
+check, its dial of the buyer (up to about a minute and a half over Tor), its own accept or
+reject, or the resend of an earlier reject of the operator's — waits for that step to finish
+(one action per order at a time, the lane's or a click's); if the order was accepted or rejected
+meanwhile, the click says so — done, if that is what it asked for ("Order is already accepted.",
+"Order is already rejected."); refused, if it asked for the other ("Order is
+WAITING_FOR_BUYER_PAYMENT — only orders awaiting approval can be rejected", "Order is
+SELLER_REJECTED, not awaiting approval") — and the order stays as the lane left it (a reject of
 the lane's own raises its "turned down" alert). An order the operator rejects is their
 decision — no "turned down" alert — and a reject Amboss didn't confirm (an error, a refusal) is
 sent again on every pass, whatever the selling switch says and even while Amboss won't show the
 order (a reject needs only its id), until Amboss confirms it or the order ends; the lane never
 accepts that order. An order whose accept by hand didn't go through stays theirs to
 decide ("your accept didn't go through"): the lane neither accepts it nor turns it down — not
-for its caps, which don't bind a manual pick, nor near its deadline. The **offer upkeep**
-(`runSell`, in the main run, only with Liquidity provision on) keeps each offer fundable (cut,
+for its caps, which don't bind a manual pick, nor near its deadline. The lane carrying out the
+operator's decision (their reject sent again, their accept completed) is recorded as theirs (the
+run history's `via: "manual"`): the Overview's "Last change by the autopilot" leaves it out. The
+**offer upkeep** (`runSell`, in the main run, only with Liquidity provision on) keeps each offer
+fundable (cut,
 disabled while its smallest channel can't be funded, listed again once it can), gives it the
 standard 4,320-block lease and the
 routing-fee promise (with auto-size), and prices it per `sellPricingMode` (with

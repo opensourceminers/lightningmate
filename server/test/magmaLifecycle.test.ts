@@ -427,7 +427,10 @@ test("restart after a crash (a click's accept applied by Amboss, answer lost): A
     const res = await p2.magma.accept(sale.id);
     assert.equal(invoice(), "OPEN", `${disk}: the invoice the buyer is to pay stays open`);
     assert.equal(s.magma.count("AcceptOrder"), 1, `${disk}: no second accept`);
-    assert.deepEqual([res.ok, res.code], [false, "bad_status"], `${disk}: ${res.message}`);
+    // Amboss took the earlier accept: what the click asks for is done — told
+    // so, not refused (review of P9, final round: "Order is
+    // WAITING_FOR_BUYER_PAYMENT, not awaiting approval.").
+    assert.deepEqual([res.ok, res.code, res.message], [true, undefined, "Order is already accepted."], `${disk}: ${res.message}`);
     const e = entryOnDisk(s.dir, sale.id);
     assert.deepEqual([e?.phase, e?.invoice?.id], ["accepting", before?.invoice?.id], `${disk}: the journal is as it was`);
   }

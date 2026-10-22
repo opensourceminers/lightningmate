@@ -55,20 +55,27 @@ standalone via Docker.
   rejected at once instead of being left to time out. A decision you make by
   hand on Market → Orders wins over the autopilot, for an order the autopilot
   isn't working on at that moment: a reject Amboss didn't confirm is sent
-  again until it is (that order is never accepted), and an order whose accept
-  didn't go through waits for your decision — the autopilot neither accepts
-  nor rejects it. A click that arrives while the autopilot is already deciding
-  or acting on that same order — checking capital, dialing the buyer (up to
-  about a minute and a half over Tor), sending its own accept or reject, or
-  sending an earlier reject of yours again — waits for that step to finish;
-  if the order was accepted or rejected meanwhile, the click is refused and
-  says so ("Order is WAITING_FOR_BUYER_PAYMENT — only orders awaiting approval
-  can be rejected"). A click that can't read the order (Amboss or LND not
-  answering) counts too once the autopilot has the order on record as
-  awaiting your decision; otherwise it records nothing — try it again (with
-  Liquidity provision on, the autopilot may decide that order first). Amboss
-  decides which seller gets matched; the app makes the sell path correct and
-  reliable.
+  again until it is or the order ends (that order is never accepted), and an
+  order whose accept didn't go through waits for your decision — the
+  autopilot neither accepts nor rejects it. The one exception is an accept
+  already sent whose answer was lost (the order shows "accepting…"), yours or
+  the autopilot's: an accept that may have reached Amboss is completed first,
+  and a Reject meanwhile is refused ("Not rejected: the earlier accept of this
+  order was already sent and is being confirmed with Amboss, so it can't be
+  withdrawn."), though Amboss may still show the order awaiting approval. A
+  click that arrives while the autopilot is already deciding or acting on that
+  same order — checking capital, dialing the buyer (up to about a minute and a
+  half over Tor), sending its own accept or reject, or sending an earlier
+  reject of yours again — waits for that step to finish; if the order was
+  accepted or rejected meanwhile, the click says so — done, if that is what it
+  asked for ("Order is already accepted.", "Order is already rejected.");
+  refused, if it asked for the other ("Order is WAITING_FOR_BUYER_PAYMENT —
+  only orders awaiting approval can be rejected"). A click that can't read the
+  order (Amboss or LND not answering) counts too once the autopilot has the
+  order on record as awaiting your decision; otherwise it records nothing —
+  try it again (with Liquidity provision on, the autopilot may decide that
+  order first). Amboss decides which seller gets matched; the app makes the
+  sell path correct and reliable.
 - **LSP mode (experimental)** — sell inbound channels **directly to wallets**
   speaking the open LSPS1 standard (bLIP-51) over Lightning peer messages, with
   no marketplace in between: orders are priced by the same profit-aware engine

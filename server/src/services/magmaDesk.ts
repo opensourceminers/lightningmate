@@ -91,15 +91,19 @@ import type { SoldLease } from "./leaseCaps.js";
  * by a click that finds the order — Amboss shows it as this node's, awaiting
  * approval, or the lane has it on record as awaiting approval (unreadClick) —
  * wins over the lane (byHand): a reject Amboss hasn't confirmed is sent again
- * on every pass until it is, and an order whose accept by hand didn't go
- * through is left to the operator — the lane never accepts or rejects an
- * order the operator is deciding. That holds for an order the lane isn't
- * working on when the click comes. The click waits for the order's turn
+ * on every pass until it is or the order ends, and an order whose accept by
+ * hand didn't go through is left to the operator — the lane never accepts or
+ * rejects an order the operator is deciding. That holds for an order the lane
+ * isn't working on when the click comes. The click waits for the order's turn
  * (withOrder): a step the lane has begun on it — its capital check, its dial
  * of the buyer (up to ~90 s over Tor), its own accept or reject, the resend
  * of the operator's earlier reject — finishes first, and a click that then
- * finds the order accepted or rejected is refused and says so, changing
- * nothing (README, SECURITY.md; magmaByHand.test.ts pins it).
+ * finds the order accepted or rejected says so, changing nothing: done, if
+ * that is what it asked for; refused, if it asked for the other (README,
+ * SECURITY.md; magmaByHand.test.ts pins it). Nor does a click take back an
+ * accept already sent whose answer was lost ("accepting"), the lane's or the
+ * operator's: an accept that may have reached Amboss is completed first, and
+ * a Reject meanwhile is refused, saying why.
  */
 
 /** Amboss: the HODL invoice "must expire in at least 48 hours". */
@@ -127,6 +131,12 @@ export const OPENING_GRACE_MS = 10 * 60_000;
  *  own listing of the orders waiting on us leaves the order out — before an
  *  order with nothing of ours tied to it is dropped. */
 const MAX_REFUSALS = 3;
+/** How the note of a failed read of an order starts (unreadable,
+ *  couldNotRead) — and that of a key Amboss refused while the lane worked on
+ *  the order (advance). Each is stale once Amboss shows the order again, and
+ *  goes then (advance). Any other error stays: it is about a step — an accept
+ *  Amboss refused, an open LND left unclear — not about reading the order. */
+const READ_FAILED = /^(could not read the order from Amboss|Amboss refused to show this order|Amboss refused the key)/;
 /** Without Amboss, an order paid outside a HODL invoice (accepted before the
  *  journal) keeps its reservation until its open deadline, or this long. */
 const LEGACY_HOLD_MS = 48 * 3_600_000;
@@ -152,8 +162,30 @@ const ACCEPTED_BY_YOU = "accepted by you";
 const REJECTED_BY_YOU = "rejected by you";
 /** What a click's reject that didn't go through is told — Amboss didn't
  *  confirm it, or the click couldn't read an order the lane has on record
- *  (unreadClick). */
-const REJECT_STANDS = "Your reject stands: the order lane sends it again until Amboss confirms it, and won't accept this order.";
+ *  (unreadClick). The resends stop once Amboss confirms it or the order ends
+ *  (advance, couldNotRead) — the click is told both (review of P9, final
+ *  round: it said only the first). */
+const REJECT_STANDS = "Your reject stands: the order lane sends it again until Amboss confirms it or the order ends, and won't accept this order.";
+/** A click asking for what the order already is — accepted here, or
+ *  rejected — is told so: done, not refused. Review of P9, final round: a
+ *  Reject clicked while the lane sent the operator's own reject again was
+ *  refused ("Order is SELLER_REJECTED — only orders awaiting approval can be
+ *  rejected."), and an Accept clicked while the lane accepted that order
+ *  ("Order is WAITING_FOR_BUYER_PAYMENT, not awaiting approval."), each order
+ *  ending as the click asked. */
+const ALREADY_ACCEPTED = "Order is already accepted.";
+const ALREADY_REJECTED = "Order is already rejected.";
+/** Why a Reject can't turn down an order with an accept of ours under way
+ *  ("accepting") — the lane's or the operator's. Sent, its answer lost: it
+ *  may have reached Amboss, and is completed (resumeAccept), though Amboss
+ *  may still show the order awaiting approval. Cut short by a stop before it
+ *  was sent: the lane's next pass completes it — or withdraws one of its own
+ *  with selling off. (Review of P9, final round: "Order is already accepting
+ *  here.") */
+export const NOT_REJECTED_ACCEPT_SENT =
+  "Not rejected: the earlier accept of this order was already sent and is being confirmed with Amboss, so it can't be withdrawn.";
+const NOT_REJECTED_ACCEPT_UNSENT =
+  "Not rejected: an accept of this order was under way when LightningMate stopped — the order lane completes or withdraws it on its next pass.";
 /** A click's answer, a second sentence added: the first one's own closing
  *  period (Amboss's "Unexpected error.", say) isn't doubled. */
 const thenSay = (first: string, second: string): string => `${first.replace(/\.+$/, "")}. ${second}`;
@@ -217,6 +249,11 @@ export interface MagmaSellAction {
   ok: boolean;
   transactionId?: string;
   error?: string;
+  /** "manual": an accept or reject that carries out a decision the operator
+   *  made by hand (byHand) — their reject sent again, their accept completed
+   *  — not one of the lane's own. Absent: the lane's or the offer upkeep's
+   *  own (on older runs too). */
+  via?: "manual";
 }
 
 export interface MagmaDeskConfig {
@@ -348,6 +385,13 @@ const phaseOf = (e: MagmaJournalEntry): MagmaPhase => e.phase;
  *  their decision stands — the lane sends the reject again on every pass
  *  until Amboss confirms it or the order ends (advance, couldNotRead). */
 const rejectByHand = (e: MagmaJournalEntry): boolean => e.phase === "seen" && e.via === "manual" && e.decision?.action === "reject";
+/** An accept or reject of an order the operator took into their own hands
+ *  (byHand) carries out their decision — the lane decides none of those
+ *  (decide) — and its run-history line says so: the Overview's "Last change
+ *  by the autopilot" leaves it out (autopilot.ts, lastAutopilotActionAt).
+ *  Review of P9, final round: the lane's resend of the operator's reject,
+ *  once Amboss confirmed it, read as the autopilot's latest change. */
+const theirs = (e: MagmaJournalEntry): Pick<MagmaSellAction, "via"> => (e.via === "manual" ? { via: "manual" } : {});
 /** Open failures worth retrying while there is time. "Too many pending
  *  channels" too: the buyer's LND takes one at a time by default (two orders
  *  from one buyer), and it clears once the earlier channel confirms. */
@@ -842,7 +886,7 @@ export class MagmaDesk {
   private revive(entry: MagmaJournalEntry | undefined, status: string): boolean {
     if (!entry || entry.phase !== "failed" || entry.invoice || entry.fundingOutpoint) return false;
     if (status !== "WAITING_FOR_SELLER_APPROVAL") return false;
-    entry.phase = "seen";
+    this.backToSeen(entry);
     entry.reason = undefined;
     entry.refusals = undefined;
     entry.notFound = undefined;
@@ -906,6 +950,19 @@ export class MagmaDesk {
       entry.timeout = order.timeout;
       entry.refusals = undefined;
       entry.notFound = undefined;
+      // Amboss has just shown the order: a failed read on record — Amboss
+      // down, refusing to show the order, or refusing the key — no longer
+      // holds, and goes (saved with the journal's next write, as lastStatus
+      // is). What the record says next is this pass's. Review of P10, round
+      // 2: nothing cleared it. With selling off — no listing: every order on
+      // record is read on its own — an outage of more than one pass left
+      // "could not read the order from Amboss" on Market → Orders and in the
+      // recent orders, over MANUAL_ACCEPT_SKIP or SELLING_OFF_SKIP, until the
+      // order timed out on the operator.
+      if (entry.lastError && READ_FAILED.test(entry.lastError)) {
+        entry.lastError = undefined;
+        entry.lastErrorAt = undefined;
+      }
     }
     const out: MagmaSellAction[] = [];
     try {
@@ -943,7 +1000,14 @@ export class MagmaDesk {
           // A new order is the lane's to decide while Liquidity provision is
           // on. One the operator is deciding is taken up whatever the switch
           // says — only to say so on its record: decide() leaves it to them.
-          else if ((!entry || entry.phase === "seen") && (cfg.sellEnabled || entry?.via === "manual")) {
+          // So is one whose accept by the lane was handed back (its invoice
+          // released, the accept refused or never sent: backToSeen) and that
+          // nothing has decided since: with selling off, only for its record
+          // to say that the order is the operator's now (SELLING_OFF_SKIP).
+          // Review of P10: a paused lane left that record alone — Market →
+          // Orders said "within your caps and capital" under an order nothing
+          // of ours was tied to, until it timed out on the operator.
+          else if ((!entry || entry.phase === "seen") && (cfg.sellEnabled || entry?.via === "manual" || entry?.decision?.action === "accept")) {
             out.push(...(await this.decide(order, pass)));
           }
           break;
@@ -1085,8 +1149,9 @@ export class MagmaDesk {
    * An order Amboss would not show this pass, for a reason of its own — or
    * as the first read of the pass to fail as if Amboss were down (see
    * unreadable): the pass goes on with the other orders. Never silently:
-   *  - the error is on the order's record, in the run history (once, when
-   *    the order becomes unreadable) and in the lane's status;
+   *  - the error is on the order's record (until Amboss shows the order
+   *    again: advance), in the run history (once, when the order becomes
+   *    unreadable) and in the lane's status;
    *  - a new order Amboss lists as waiting for our approval gets a record
    *    ("seen", from the listing), so the Orders tab shows it, and why;
    *  - once its approval deadline is close, it is rejected — a reject needs
@@ -1203,7 +1268,7 @@ export class MagmaDesk {
       if (isAuthError(err)) await this.keyStillValid(pass);
       else if (isQueryRejected(err)) pass.problem ??= queryRejectedText(err);
       this.noteError(entry, `Amboss would not show this order (${detail}), and rejecting it failed: ${msg(err)}`);
-      return [{ orderId: entry.orderId, action: "reject", sizeSats: entry.sizeSats, ok: false, error: entry.lastError }];
+      return [{ orderId: entry.orderId, action: "reject", sizeSats: entry.sizeSats, ok: false, error: entry.lastError, ...theirs(entry) }];
     }
   }
 
@@ -1268,10 +1333,13 @@ export class MagmaDesk {
       const st = await this.lndHodlStatus(inv.id);
       if (entry.phase === "accepting" && (st.state === "missing" || st.state === "canceled")) {
         // No invoice the buyer could pay: nothing of ours is out there. The
-        // order goes back to "seen" (its reservation ends); with Amboss back,
-        // the lane decides on it afresh.
-        entry.phase = "seen";
-        entry.invoice = null;
+        // order goes back to "seen" (its reservation ends) — without the
+        // accept's "checking with Amboss on the next pass", which no longer
+        // holds (backToSeen). With Amboss back, the lane takes it up afresh
+        // (advance, decide): a running lane decides on it again; one the
+        // operator accepted, or the lane's own with selling off, is left to
+        // the operator — and its record says so.
+        this.backToSeen(entry);
         this.journal.event(entry, `its invoice is ${st.state} in LND — nothing was offered; the reservation ends`);
         this.journal.note(entry);
         return [];
@@ -1447,7 +1515,10 @@ export class MagmaDesk {
    * Never an order the operator took into their own hands (byHand): theirs
    * to decide, whatever the switch says — advance() brings one here only so
    * its record says so (MANUAL_ACCEPT_SKIP); their reject is carried out
-   * before it gets here (advance).
+   * before it gets here (advance). With selling off, advance() and
+   * resumeAccept bring here the lane's own accept that was handed back, too
+   * — only so its record says that the order is the operator's now
+   * (SELLING_OFF_SKIP), not "within your caps and capital" (review of P10).
    */
   private async decide(order: SaleOrderDetail, pass: LanePass): Promise<MagmaSellAction[]> {
     const entry =
@@ -1554,7 +1625,7 @@ export class MagmaDesk {
     via: "autopilot" | "manual",
     pass: LanePass | null,
   ): Promise<MagmaSellAction[]> {
-    const fail = (error: string): MagmaSellAction => ({ orderId: entry.orderId, action: "accept", sizeSats: entry.sizeSats, ok: false, error });
+    const fail = (error: string): MagmaSellAction => ({ orderId: entry.orderId, action: "accept", sizeSats: entry.sizeSats, ok: false, error, ...theirs(entry) });
     // The lane's accept is selling's: it goes on only while Liquidity
     // provision is on, asked after every wait and read — so that nothing is
     // awaited between the last check and the step it guards (review of P7,
@@ -1607,8 +1678,7 @@ export class MagmaDesk {
         } catch (err) {
           // Not on disk: nothing is reserved and nothing created — undone
           // before the mutex is released, so no other check sees it reserved.
-          entry.phase = "seen";
-          entry.invoice = null;
+          this.backToSeen(entry);
           return { unsaved: msg(err) };
         }
         return null;
@@ -1644,8 +1714,9 @@ export class MagmaDesk {
    */
   private async withdrawAccept(entry: MagmaJournalEntry): Promise<MagmaSellAction> {
     const inv = entry.invoice;
-    entry.phase = "seen";
-    entry.invoice = null;
+    // An error of an earlier attempt (an accept Amboss refused, a read that
+    // failed) goes with it: what holds the order now is SELLING_OFF_SKIP.
+    this.backToSeen(entry);
     // Never sent: the count of accepts Amboss refused stays true (MAX_ACCEPT_ATTEMPTS).
     entry.acceptAttempts = Math.max(0, entry.acceptAttempts - 1);
     this.journal.event(entry, "Liquidity provision was switched off before the accept was sent — its invoice was released, nothing promised");
@@ -1677,7 +1748,7 @@ export class MagmaDesk {
    */
   private async invoiceFailed(entry: MagmaJournalEntry, order: SaleOrder, pass: LanePass | null): Promise<MagmaSellAction[]> {
     const error = entry.lastError ?? "could not create the HODL invoice";
-    const failed: MagmaSellAction = { orderId: entry.orderId, action: "accept", sizeSats: entry.sizeSats, ok: false, error };
+    const failed: MagmaSellAction = { orderId: entry.orderId, action: "accept", sizeSats: entry.sizeSats, ok: false, error, ...theirs(entry) };
     if (!pass) return [failed];
     if (entry.via === "manual") {
       this.skip(entry, MANUAL_ACCEPT_SKIP);
@@ -1721,8 +1792,7 @@ export class MagmaDesk {
     } catch (err) {
       // Nothing was promised to Amboss yet: drop the invoice and start over.
       await this.lndCancel(inv.id).catch(() => undefined);
-      entry.phase = "seen";
-      entry.invoice = null;
+      this.backToSeen(entry);
       this.noteError(entry, `could not create the HODL invoice: ${msg(err)}`);
       return false;
     }
@@ -1740,7 +1810,7 @@ export class MagmaDesk {
    */
   private async sendAccept(entry: MagmaJournalEntry, order: SaleOrder, pass: LanePass | null): Promise<MagmaSellAction[]> {
     const inv = entry.invoice!;
-    const base = { orderId: entry.orderId, action: "accept" as const, sizeSats: entry.sizeSats };
+    const base = { orderId: entry.orderId, action: "accept" as const, sizeSats: entry.sizeSats, ...theirs(entry) };
     const sentBefore = entry.acceptSentAt;
     entry.acceptSentAt = now();
     this.journal.event(entry, "sending the accept");
@@ -1767,8 +1837,7 @@ export class MagmaDesk {
     }
     // Refused: release the unused invoice; the lane may try again (bounded).
     await this.lndCancel(inv.id).catch(() => undefined);
-    entry.phase = "seen";
-    entry.invoice = null;
+    this.backToSeen(entry);
     this.noteError(entry, "Amboss refused the accept");
     if (entry.acceptAttempts >= MAX_ACCEPT_ATTEMPTS && entry.via === "autopilot") {
       // Paused while the accept was out: no reject of the lane's own — the
@@ -1821,8 +1890,7 @@ export class MagmaDesk {
     resent: boolean,
   ): Promise<MagmaSellAction[]> {
     const inv = entry.invoice;
-    entry.phase = "seen";
-    entry.invoice = null;
+    this.backToSeen(entry);
     if (!resent) entry.acceptAttempts = Math.max(0, entry.acceptAttempts - 1);
     this.noteError(entry, `cannot save the order journal (${error}) — the accept was not sent and its invoice was released`);
     if (inv) await this.lndCancel(inv.id).catch(() => undefined);
@@ -1852,15 +1920,22 @@ export class MagmaDesk {
     const inv = entry.invoice;
     if (!inv || Date.parse(inv.expiresAt) - Date.now() < MIN_INVOICE_LIFE_MS) {
       if (inv) await this.lndCancel(inv.id).catch(() => undefined);
-      entry.phase = "seen";
-      entry.invoice = null;
+      // Nothing checks this accept again: its "checking with Amboss on the
+      // next pass" goes with it (backToSeen). Review of P9, final round: it
+      // stayed, shown before MANUAL_ACCEPT_SKIP on Market → Orders and in
+      // the recent orders, while the order waited for the operator.
+      this.backToSeen(entry);
       this.journal.event(entry, "earlier accept never confirmed; its invoice was released");
       this.journal.note(entry);
-      // The lane's pass takes the order up afresh, as advance() does: one of
-      // the operator's goes back to them, said on its record (decide) —
-      // whatever the switch says; a click repeats its accept itself.
+      // The lane's pass takes the order up afresh, as advance() does
+      // (decide): a running lane decides on it again; one of the operator's
+      // goes back to them, and so does one of the lane's own with selling
+      // off — each said on its record (MANUAL_ACCEPT_SKIP, SELLING_OFF_SKIP).
+      // A click repeats its accept itself. (Review of P10: with selling off,
+      // the lane's own kept "within your caps and capital" for an order
+      // nothing of ours was tied to.)
       if (!pass) return [];
-      return entry.via === "manual" || this.deps.config().sellEnabled ? this.decide(order, pass) : [];
+      return this.decide(order, pass);
     }
     // The lane's own accept that never went out, with selling off by now.
     const toWithdraw = () => !entry.acceptSentAt && entry.via === "autopilot" && pass !== null && !this.deps.config().sellEnabled;
@@ -1878,7 +1953,7 @@ export class MagmaDesk {
    *  buyer, an asset or a fee Amboss didn't report, a deadline: more capital
    *  wouldn't have helped, and the alert doesn't say it would). */
   private async rejectOrder(entry: MagmaJournalEntry, reason: string, kind: RefusalKind = "other"): Promise<MagmaSellAction[]> {
-    const base = { orderId: entry.orderId, action: "reject" as const, sizeSats: entry.sizeSats };
+    const base = { orderId: entry.orderId, action: "reject" as const, sizeSats: entry.sizeSats, ...theirs(entry) };
     entry.decision = { at: now(), action: "reject", reason };
     let ok: boolean;
     try {
@@ -2563,12 +2638,24 @@ export class MagmaDesk {
   }
 
   /** Accept an order by hand: same journal, same HODL invoice, same capital
-   *  check as the lane (the autopilot's caps don't bind a manual pick). */
+   *  check as the lane (the autopilot's caps don't bind a manual pick). An
+   *  order accepted already, with an accept of ours under way here, is
+   *  answered as done. */
   accept(id: string): Promise<DeskResult> {
     return this.manual(id, async () => {
       const order = await this.readForManual(id);
       if ("ok" in order) return this.unreadClick(id, "accept", order);
       if (order.status !== "WAITING_FOR_SELLER_APPROVAL") {
+        // Accepted already, with an accept of ours under way here — the
+        // lane's, made while this click waited for the order's turn, or an
+        // earlier click's whose answer was lost: what the click asks for is
+        // done (ALREADY_ACCEPTED). Not an order accepted outside
+        // LightningMate (no accept of ours on record): no channel of this
+        // app's follows that one (acceptedElsewhere).
+        const ours = this.journal.get(id);
+        if (PAST_APPROVAL.has(order.status) && ours && !ours.external && ours.phase !== "seen" && !TERMINAL_PHASES.has(ours.phase)) {
+          return { ok: true, phase: ours.phase, message: ALREADY_ACCEPTED };
+        }
         return { ok: false, code: "bad_status", message: `Order is ${order.status}, not awaiting approval.` };
       }
       const entry = this.journal.get(id);
@@ -2702,16 +2789,30 @@ export class MagmaDesk {
 
   /** Reject an order by hand (only while it waits for approval). One Amboss
    *  doesn't confirm stands: the lane sends it again (advance) — as it does
-   *  one whose read of an order the lane has on record failed (unreadClick). */
+   *  one whose read of an order the lane has on record failed (unreadClick).
+   *  An order Amboss shows rejected already is answered as done; one with an
+   *  accept of ours under way is refused, saying why. */
   reject(id: string): Promise<DeskResult> {
     return this.manual(id, async () => {
       const order = await this.readForReject(id);
       if ("ok" in order) return this.unreadClick(id, "reject", order);
+      // Rejected already — by the lane's resend of an earlier reject of
+      // yours while this click waited for the order's turn, say: what the
+      // click asks for is done (ALREADY_REJECTED). Nothing changes.
+      if (order.status === "SELLER_REJECTED") return { ok: true, message: ALREADY_REJECTED };
       if (order.status !== "WAITING_FOR_SELLER_APPROVAL") {
         return { ok: false, code: "bad_status", message: `Order is ${order.status} — only orders awaiting approval can be rejected.` };
       }
       const entry = this.journal.get(id);
       this.revive(entry, order.status); // as in accept
+      // An accept of ours under way, though Amboss still shows the order
+      // awaiting approval: completed first — one that may have reached Amboss
+      // is never withdrawn (resumeAccept). Refused, as before — now saying
+      // why (review of P9, final round: "Order is already accepting here.").
+      if (entry?.phase === "accepting") {
+        const message = entry.acceptSentAt ? NOT_REJECTED_ACCEPT_SENT : NOT_REJECTED_ACCEPT_UNSENT;
+        return { ok: false, code: "bad_status", phase: entry.phase, message };
+      }
       if (entry && entry.phase !== "seen") {
         return { ok: false, code: "bad_status", phase: entry.phase, message: `Order is already ${entry.phase} here.` };
       }
@@ -2744,8 +2845,13 @@ export class MagmaDesk {
    * read the order at all takes one the lane has on record the same way:
    * unreadClick.) A click is taken up once it has the order's turn
    * (withOrder): a step the lane had begun on the order finishes first, and
-   * a click that then finds it accepted or rejected is refused before it gets
-   * here — the lane's decision stands.
+   * a click that then finds it accepted or rejected says so before it gets
+   * here (done, if that is what it asked for; refused, if not) — the lane's
+   * decision stands. Nor does a click get here for an order with an accept
+   * already sent whose answer was lost ("accepting"), the lane's or theirs:
+   * an accept that may have reached Amboss is completed first (resumeAccept),
+   * and a Reject meanwhile is refused (NOT_REJECTED_ACCEPT_SENT) — their
+   * latest click does not stand against it.
    *
    * Review of P8, final round: a click whose call failed on a transient error
    * (Amboss HTTP 502, an LND blink) left the order to the lane's next pass,
@@ -2980,6 +3086,27 @@ export class MagmaDesk {
     this.journal.note(entry);
   }
 
+  /**
+   * Back to "seen" — every path that hands an order back goes through here:
+   * nothing of ours is tied to it any more (its invoice released, or never
+   * made), and it is to be decided again, by the lane or by the operator.
+   * An error on record was about what ends here, and goes with it. Market →
+   * Orders shows an order's last error before its decision, and the recent
+   * orders (recentOrders) before all but its reason: a stale one hid what
+   * holds the order now — "your accept didn't go through" (MANUAL_ACCEPT_SKIP),
+   * "switched off before it was accepted" (SELLING_OFF_SKIP) — and said
+   * "checking with Amboss on the next pass" while nothing would check, so
+   * the order could time out on the operator (review of P9, final round). A
+   * hand-back for an error of its own notes that error right after. Saved by
+   * the caller.
+   */
+  private backToSeen(entry: MagmaJournalEntry): void {
+    entry.phase = "seen";
+    entry.invoice = null;
+    entry.lastError = undefined;
+    entry.lastErrorAt = undefined;
+  }
+
   private noteError(entry: MagmaJournalEntry | undefined, error: string): void {
     if (!entry) return;
     entry.lastError = error;
@@ -2992,9 +3119,11 @@ export class MagmaDesk {
    *  order they ask. A click that comes while the lane is deciding or acting
    *  on the order waits for that step — the capital check, the dial (up to
    *  ~90 s over Tor), the accept or reject — and then reads the order afresh:
-   *  one accepted or rejected meanwhile is refused. So a decision made by
-   *  hand wins over the lane only for an order the lane isn't working on —
-   *  the limit the docs state (magmaByHand.test.ts pins it). */
+   *  one accepted or rejected meanwhile is answered as it is — done, for a
+   *  click that asked for that; refused, for one that asked for the other.
+   *  So a decision made by hand wins over the lane only for an order the lane
+   *  isn't working on — the limit the docs state (magmaByHand.test.ts pins
+   *  it). */
   private async withOrder<T>(id: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.orderChains.get(id) ?? Promise.resolve();
     let release!: () => void;

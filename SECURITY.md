@@ -84,18 +84,25 @@ security@opensourceminers.de (please don't open a public issue first).
   by hand wins over the lane, for an order the lane isn't working on at that
   moment: a click on Accept or Reject that finds the order — Amboss shows it
   as this node's, awaiting approval, or the lane has it on record as awaiting
-  approval — makes the order yours, whatever becomes of the click. A reject
-  Amboss didn't confirm is sent again on every pass — paused or not — until
-  Amboss confirms it or the order ends, and that order is never accepted;
-  after an accept that didn't go through, the lane neither accepts the order
-  nor turns it down. A click that finds neither (Amboss or LND not answering)
-  records nothing: with Liquidity provision on, the lane may decide that order
-  before you try again. A click that arrives while the lane is already
-  deciding or acting on that same order — its capital check, its dial of the
-  buyer (up to about a minute and a half over Tor), its own accept or reject,
-  or the resend of an earlier reject of yours — waits for that step to
-  finish; if the order was accepted or rejected meanwhile, the click is
-  refused and says so ("Order is WAITING_FOR_BUYER_PAYMENT — only orders
+  approval — makes the order yours, whatever becomes of the click — except
+  for an accept already sent whose answer was lost (the record says
+  "accepting"), yours or the lane's: an accept that may have reached Amboss
+  is completed first, and a Reject meanwhile is refused ("Not rejected: the
+  earlier accept of this order was already sent and is being confirmed with
+  Amboss, so it can't be withdrawn."), though Amboss may still show the order
+  awaiting approval. A reject Amboss didn't confirm is sent again on every
+  pass — paused or not — until Amboss confirms it or the order ends, and that
+  order is never accepted; after an accept that didn't go through, the lane
+  neither accepts the order nor turns it down. A click that finds neither
+  (Amboss or LND not answering) records nothing: with Liquidity provision on,
+  the lane may decide that order before you try again. A click that arrives
+  while the lane is already deciding or acting on that same order — its
+  capital check, its dial of the buyer (up to about a minute and a half over
+  Tor), its own accept or reject, or the resend of an earlier reject of
+  yours — waits for that step to finish; if the order was accepted or
+  rejected meanwhile, the click says so — done, if that is what it asked for
+  ("Order is already accepted.", "Order is already rejected."); refused, if
+  it asked for the other ("Order is WAITING_FOR_BUYER_PAYMENT — only orders
   awaiting approval can be rejected", "Order is SELLER_REJECTED, not awaiting
   approval").
   Every channel open and

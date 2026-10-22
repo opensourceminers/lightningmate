@@ -567,6 +567,37 @@ test("a key Amboss revokes while the lane checks an order's capital (the listing
   assert.match(e?.lastError ?? "", /^Amboss refused the key \(Forbidden resource\)$/);
 });
 
+// Review of P10, round 2: a failed read or a refused key noted on an order's
+// record stayed once Amboss showed the order again. With Liquidity provision
+// switched off, a paused lane decides nothing that would replace it: Market →
+// Orders and the recent orders said the key was refused — for a key that
+// works — until the order timed out on the operator.
+test("a key Amboss refused while the lane checked an order's capital, Liquidity provision switched off since: once the key works and Amboss shows the order again, its record no longer says the key is refused", async (t) => {
+  quiet(t);
+  const { autopilot, magma, dir, amboss } = sellerSetup(t);
+  const sale = magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  magma.salesList = (f) => {
+    if (!f.status) return null;
+    magma.keyValid = false;
+    return forbidden("Sales");
+  };
+  await autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(dir, sale.id)?.lastError, "Amboss refused the key (Forbidden resource)");
+  // The operator switches selling off, and the key works again.
+  autopilot.setConfig({ sellEnabled: false });
+  magma.salesList = null;
+  magma.keyValid = true;
+  assert.equal(await amboss.checkValidity(true), true);
+  await autopilot.pollSellOrders();
+  assert.equal(autopilot.getState().magmaLane.ok, true, "a pass that read the order");
+  const local = autopilot.magma.localView(sale.id);
+  // Before: "Amboss refused the key (Forbidden resource)", on both.
+  assert.deepEqual([local?.phase, local?.lastError], ["seen", null]);
+  const recent = autopilot.magma.recentOrders().find((o) => o.orderId === sale.id);
+  assert.deepEqual([recent?.action, recent?.reason], ["seen", null]);
+  assert.deepEqual([magma.count("AcceptOrder"), magma.count("RejectOrder")], [0, 0], "a paused lane decides nothing");
+});
+
 test("a new order Amboss lists as waiting for approval but won't show: it is on record and its error is shown — and it is rejected before its deadline, not left to time out", async (t) => {
   quiet(t);
   const { autopilot, node, magma, dir } = sellerSetup(t);

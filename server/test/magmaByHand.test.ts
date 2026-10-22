@@ -3,8 +3,10 @@
  * lane (review of P8, final round) — for an order the lane isn't working on
  * when the click comes: one action per order at a time, so a click that comes
  * while the lane is deciding or acting on that order waits for that step, and
- * is refused if the order was accepted or rejected meanwhile (review of P9,
- * round 3: the docs said "always"; the last tests pin the limit they state).
+ * is refused if the order was accepted or rejected meanwhile against what it
+ * asked for — told it is done if that is what it asked for (review of P9,
+ * round 3: the docs said "always"; the last tests pin the limit they state;
+ * final round: a click finding its own wish done was refused too).
  *
  * Before, a click whose call failed on a transient error left the order
  * "seen", marked as the operator's ("manual") — and the lane took it for its
@@ -23,18 +25,21 @@
  * ends — and leaves an order whose accept by hand didn't go through to the
  * operator: the lane neither accepts nor rejects it. The operator's latest
  * click is what stands — also a click that can't read the order (Amboss or
- * LND not answering), once the lane has it on record (review of P9, round 2).
+ * LND not answering), once the lane has it on record (review of P9, round 2)
+ * — except for an accept already sent whose answer was lost ("accepting"):
+ * an accept that may have reached Amboss is completed first, and a Reject
+ * meanwhile is refused, saying why (review of P9, final round).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { MANUAL_ACCEPT_SKIP, type DeskResult } from "../src/services/magmaDesk.js";
+import { MANUAL_ACCEPT_SKIP, SELLING_OFF_SKIP, type DeskResult, type MagmaOrderLocal } from "../src/services/magmaDesk.js";
 import type { MagmaJournalEntry } from "../src/services/magmaJournal.js";
 import { magmaRefusalAlerts } from "../src/services/alerts.js";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
-import { resolverFailed } from "./helpers/magma.js";
-import { IN_AN_HOUR, crashAt, entryOnDisk, journalOnDisk, quiet, sleep } from "./helpers/lifecycle.js";
+import { forbidden, resolverFailed } from "./helpers/magma.js";
+import { IN_AN_HOUR, crashAt, entryOnDisk, historyFor, journalOnDisk, quiet, sleep } from "./helpers/lifecycle.js";
 import { until } from "./helpers/wait.js";
 
 type Setup = ReturnType<typeof sellerSetup>;
@@ -63,7 +68,7 @@ async function rejectFails(s: Setup, id: string): Promise<void> {
   s.magma.behave.RejectOrder = (n) => (n === calls ? "throw" : "ok");
   const click = await s.desk.reject(id);
   assert.deepEqual([click.ok, click.code], [false, "amboss"], click.message);
-  assert.match(click.message, /Your reject stands: the order lane sends it again until Amboss confirms it, and won't accept this order\.$/);
+  assert.match(click.message, /Your reject stands: the order lane sends it again until Amboss confirms it or the order ends, and won't accept this order\.$/);
   const e = entryOnDisk(s.dir, id);
   assert.deepEqual([e?.phase, e?.via, e?.decision?.action], ["seen", "manual", "reject"]);
   assert.match(e?.lastError ?? "", /^reject not confirmed \(Amboss HTTP 502\) — will try again$/);
@@ -91,6 +96,44 @@ function leftToThem(
   assert.equal([...s.node.invoices.values()].filter((i) => i.state === "OPEN").length, 0, `${what}: no invoice of ours payable`);
   assert.equal(ap.capital.reservedSat(), 0, `${what}: no coins promised`);
   assert.deepEqual(magmaRefusalAlerts(ap.magma), [], what);
+}
+
+/** The line Market → Orders shows under an order, computed as the web
+ *  computes it (MarketOrders.tsx, localDetail — pinned below): its last
+ *  error, else its reason, else its decision's reason. */
+const ordersDetail = (l: MagmaOrderLocal | null): string | undefined => (l ? (l.lastError ?? l.reason ?? l.decision?.reason ?? undefined) : undefined);
+
+test("the Orders detail these tests read is the one Market → Orders shows: the last error first", () => {
+  const web = readFileSync(new URL("../../web/src/components/MarketOrders.tsx", import.meta.url), "utf8");
+  assert.match(web, /function localDetail\(o: MyOrder\): string \| undefined \{\s*const l = o\.local;\s*if \(!l\) return undefined;\s*return l\.lastError \?\? l\.reason \?\? l\.decision\?\.reason \?\? undefined;\s*\}/);
+});
+
+/** An order whose accept was handed back to the operator, as its record
+ *  shows it: no error on record that no longer holds — the accept's
+ *  "checking with Amboss on the next pass" (nothing checks that accept
+ *  again), or a failed read of an order Amboss has shown since — and Market →
+ *  Orders and the recent orders (recentOrders: the selling diagnostics, the
+ *  diagnostics download) say the order is theirs to decide, and why (`why`):
+ *  an accept of theirs that didn't go through (MANUAL_ACCEPT_SKIP), or the
+ *  lane's own with selling off (SELLING_OFF_SKIP). Review of P9, final round:
+ *  that line stayed, shown before MANUAL_ACCEPT_SKIP, while the order could
+ *  time out on the operator; review of P10, round 2: so did a failed read. */
+function saysTheirs(ap: Process, id: string, what: string, why: string = MANUAL_ACCEPT_SKIP): void {
+  const local = ap.magma.localView(id);
+  assert.equal(local?.lastError, null, `${what}: no stale error on record`);
+  assert.equal(ordersDetail(local), why, `${what}: Market → Orders`);
+  const recent = ap.magma.recentOrders().find((o) => o.orderId === id);
+  assert.deepEqual([recent?.action, recent?.reason], ["skip", why], `${what}: the recent orders`);
+}
+
+/** The order's accept on disk with less than Amboss's 48 h left on its
+ *  invoice (47 h): too old to be sent again — the next process's pass
+ *  (resumeAccept) releases it. */
+function ageInvoice(s: Setup, id: string): void {
+  const entries = journalOnDisk(s.dir).map((e: MagmaJournalEntry) =>
+    e.orderId === id ? { ...e, invoice: { ...e.invoice!, expiresAt: new Date(Date.now() + 47 * 3_600_000).toISOString() } } : e,
+  );
+  writeFileSync(join(s.dir, "magma-orders.json"), JSON.stringify(entries));
 }
 
 // ── a reject the operator clicked that Amboss didn't confirm ─────────────────
@@ -333,10 +376,7 @@ async function staleManualAccept(s: Setup): Promise<{ id: string; p2: Process }>
   assert.equal(click.ok, false, click.message);
   const sent = entryOnDisk(s.dir, sale.id);
   assert.deepEqual([sent?.phase, sent?.via], ["accepting", "manual"]);
-  const entries = journalOnDisk(s.dir).map((e: MagmaJournalEntry) =>
-    e.orderId === sale.id ? { ...e, invoice: { ...e.invoice!, expiresAt: new Date(Date.now() + 47 * 3_600_000).toISOString() } } : e,
-  );
-  writeFileSync(join(s.dir, "magma-orders.json"), JSON.stringify(entries));
+  ageInvoice(s, sale.id);
   const p2 = s.restart();
   await p2.pollSellOrders();
   return { id: sale.id, p2 };
@@ -349,6 +389,9 @@ function releasedAndLeftToThem(s: Setup, id: string, p2: Process, what: string):
   assert.deepEqual([e?.phase, e?.via, e?.invoice, e?.decision?.reason], ["seen", "manual", null, MANUAL_ACCEPT_SKIP], what);
   assert.equal([...s.node.invoices.values()].filter((i) => i.state === "OPEN").length, 0, `${what}: its invoice released`);
   assert.equal(p2.capital.reservedSat(), 0, `${what}: no coins promised`);
+  // Before: "accept not confirmed (Amboss HTTP 502) — checking with Amboss on
+  // the next pass", on both — nothing checked it again.
+  saysTheirs(p2, id, what);
 }
 
 test("selling on: an accept by hand Amboss never confirmed, its invoice grown too old to resend — released, and the order left to the operator in the same pass, not decided by the lane", async (t) => {
@@ -368,6 +411,223 @@ test("selling off: an accept by hand Amboss never confirmed, its invoice grown t
   // Before: the record kept "accepted by you" for an order back at "seen".
   releasedAndLeftToThem(s, id, p2, "selling off");
 });
+
+// Review of P9, final round: the other hand-back of an accept — LND has
+// cancelled (or lost) the invoice of an accept whose answer was lost, while
+// the lane can't ask Amboss (maintainFromLnd) — kept the accept's "checking
+// with Amboss on the next pass" too: after that pass, and after every pass
+// that could read Amboss again, shown before "your accept didn't go
+// through".
+test("the operator's accept, its answer lost, its invoice cancelled in LND during a pass that can't ask Amboss: handed back without the accept's 'checking with Amboss' — and the next pass that reads Amboss says the order is theirs", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  // Sent, its answer lost (an HTTP error): Amboss didn't take it.
+  s.magma.behave.AcceptOrder = "throw";
+  assert.equal((await s.desk.accept(sale.id)).ok, false);
+  const sent = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([sent?.phase, sent?.via], ["accepting", "manual"]);
+  assert.equal(sent?.lastError, "accept not confirmed (Amboss HTTP 502) — checking with Amboss on the next pass");
+  // LND cancels the order's invoice while Amboss is down: the pass runs on LND alone.
+  s.node.expireHoldInvoice(sent!.invoice!.id);
+  s.magma.readBehaviour = "throw";
+  await s.autopilot.pollSellOrders();
+  assert.match(s.autopilot.getState().magmaLane.error ?? "", /^Amboss unreachable/, "a pass on LND alone");
+  const back = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([back?.phase, back?.invoice, back?.lastError], ["seen", null, undefined], "handed back, its error gone with the accept");
+  s.magma.readBehaviour = "ok";
+  await s.autopilot.pollSellOrders();
+  leftToThem(s, sale.id, "the pass that reads Amboss again", { accepts: 1 });
+  saysTheirs(s.autopilot, sale.id, "the pass that reads Amboss again");
+});
+
+// Review of P10: the same two hand-backs of an accept of the LANE's own, with
+// Liquidity provision switched off since — its answer lost, its invoice grown
+// too old to send again (resumeAccept), or cancelled in LND during a pass that
+// couldn't read the order (maintainFromLnd). The paused lane left the record
+// alone: Market → Orders said "Waiting for you to accept · seen" with "within
+// your caps and capital" under it, and the recent orders "accept" — for an
+// order nothing of ours was tied to, until it timed out on the operator.
+
+/** The lane's own accept, sent with selling on, its answer lost (an HTTP
+ *  error: Amboss didn't take it) — then Liquidity provision is switched off. */
+async function laneAcceptLost(s: Setup): Promise<string> {
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  s.magma.behave.AcceptOrder = "throw";
+  await s.autopilot.pollSellOrders();
+  const sent = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual(
+    [sent?.phase, sent?.via, sent?.lastError],
+    ["accepting", "autopilot", "accept not confirmed (Amboss HTTP 502) — checking with Amboss on the next pass"],
+  );
+  s.autopilot.setConfig({ sellEnabled: false });
+  return sale.id;
+}
+
+/** The lane's own accept, released with selling off: nothing of ours is tied
+ *  to the order any more, nothing is sent for it, and its record says that
+ *  the order is the operator's (SELLING_OFF_SKIP). */
+function releasedToOperator(s: Setup, id: string, ap: Process, what: string): void {
+  assert.deepEqual([s.magma.count("AcceptOrder"), s.magma.count("RejectOrder")], [1, 0], `${what}: nothing sent since the lane's accept`);
+  assert.equal(s.magma.sales.get(id)?.status, "WAITING_FOR_SELLER_APPROVAL", what);
+  const e = entryOnDisk(s.dir, id);
+  assert.deepEqual([e?.phase, e?.via, e?.invoice], ["seen", "autopilot", null], what);
+  assert.equal([...s.node.invoices.values()].filter((i) => i.state === "OPEN").length, 0, `${what}: its invoice released`);
+  assert.equal(ap.capital.reservedSat(), 0, `${what}: no coins promised`);
+  assert.deepEqual(magmaRefusalAlerts(ap.magma), [], `${what}: nothing turned down`);
+  // Before: "within your caps and capital" on both — and "accept" in the
+  // recent orders.
+  saysTheirs(ap, id, what, SELLING_OFF_SKIP);
+}
+
+test("selling switched off since: the lane's own accept Amboss never confirmed, its invoice grown too old to send again — released, and its record says the order is the operator's now", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const id = await laneAcceptLost(s);
+  ageInvoice(s, id);
+  const p2 = s.restart();
+  await p2.pollSellOrders();
+  releasedToOperator(s, id, p2, "the releasing pass");
+  await p2.pollSellOrders();
+  releasedToOperator(s, id, p2, "the pass after");
+});
+
+test("selling switched off since: the lane's own accept, its answer lost, its invoice cancelled in LND during a pass that can't read the order — the next pass that reads it says the order is the operator's now; switched on again, the lane decides it afresh", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const id = await laneAcceptLost(s);
+  s.node.expireHoldInvoice(entryOnDisk(s.dir, id)!.invoice!.id);
+  s.magma.readBehaviour = "throw";
+  await s.autopilot.pollSellOrders();
+  const back = entryOnDisk(s.dir, id);
+  assert.deepEqual([back?.phase, back?.invoice, back?.lastError], ["seen", null, undefined], "handed back, its error gone with the accept");
+  s.magma.readBehaviour = "ok";
+  await s.autopilot.pollSellOrders();
+  releasedToOperator(s, id, s.autopilot, "the pass that reads Amboss again");
+  // Only said on its record: with selling on again, the order is the lane's
+  // to decide once more.
+  s.magma.behave.AcceptOrder = "ok";
+  s.autopilot.setConfig({ sellEnabled: true });
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual([s.magma.count("AcceptOrder"), s.magma.sales.get(id)?.status], [2, "WAITING_FOR_BUYER_PAYMENT"]);
+  const again = entryOnDisk(s.dir, id);
+  assert.deepEqual([again?.phase, again?.via, again?.decision?.reason], ["accepted", "autopilot", "within your caps and capital"]);
+});
+
+// The other side of the same step (resumeAccept → decide): with selling on,
+// the released order is the lane's to decide again, in the same pass.
+test("selling on: the lane's own accept Amboss never confirmed, its invoice grown too old to send again — released, and decided afresh in the same pass: a fresh invoice, a fresh accept", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  s.magma.behave.AcceptOrder = (n) => (n === 0 ? "throw" : "ok");
+  await s.autopilot.pollSellOrders();
+  const first = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([first?.phase, first?.via], ["accepting", "autopilot"]);
+  ageInvoice(s, sale.id);
+  const p2 = s.restart();
+  await p2.pollSellOrders();
+  assert.deepEqual([s.magma.count("AcceptOrder"), s.magma.count("RejectOrder")], [2, 0]);
+  assert.equal(s.magma.sales.get(sale.id)?.status, "WAITING_FOR_BUYER_PAYMENT");
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.via, e?.decision?.reason], ["accepted", "autopilot", "within your caps and capital"]);
+  assert.notEqual(e?.invoice?.id, first?.invoice?.id, "a fresh invoice");
+  assert.equal(s.node.invoices.get(first!.invoice!.id)?.state, "CANCELED", "the old one released");
+});
+
+// Review of P10, round 2: Amboss down for more than one pass. With selling off
+// there is no listing — each pass reads every order on record on its own, and
+// a read that fails is noted on the order's record, on one handed back to the
+// operator too. Nothing cleared that note once the order read again, and the
+// pass that then said the order was theirs (decide, skip) kept it: Market →
+// Orders and the recent orders said "could not read the order from Amboss"
+// over MANUAL_ACCEPT_SKIP or SELLING_OFF_SKIP, pass after pass, until the
+// order timed out on the operator.
+
+/** Amboss down for three passes, LND cancelling the order's invoice after the
+ *  first: the second hands the accept back (maintainFromLnd), the third notes
+ *  its failed read on the "seen" record. Then Amboss answers again, for one
+ *  pass. */
+async function handedBackDuringOutage(s: Setup, id: string): Promise<void> {
+  s.magma.readBehaviour = "throw";
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, id)?.phase, "accepting", "nothing to hand back yet: its invoice is open");
+  s.node.expireHoldInvoice(entryOnDisk(s.dir, id)!.invoice!.id);
+  await s.autopilot.pollSellOrders();
+  const back = entryOnDisk(s.dir, id);
+  assert.deepEqual([back?.phase, back?.invoice, back?.lastError], ["seen", null, undefined], "handed back");
+  await s.autopilot.pollSellOrders();
+  assert.equal(s.desk.localView(id)?.lastError, "could not read the order from Amboss: Amboss HTTP 502", "true while Amboss is down");
+  s.magma.readBehaviour = "ok";
+  await s.autopilot.pollSellOrders();
+}
+
+test("selling off: the operator's accept, its answer lost, handed back while Amboss is down for several passes — the first pass that reads the order again says it is theirs, not that it can't be read", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t, { config: { sellEnabled: false } });
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  s.magma.behave.AcceptOrder = "throw";
+  assert.equal((await s.desk.accept(sale.id)).ok, false);
+  await handedBackDuringOutage(s, sale.id);
+  // Before: "could not read the order from Amboss: Amboss HTTP 502" on both.
+  leftToThem(s, sale.id, "the pass that reads Amboss again", { accepts: 1 });
+  saysTheirs(s.autopilot, sale.id, "the pass that reads Amboss again");
+});
+
+test("selling switched off since: the lane's own accept, its answer lost, handed back while Amboss is down for several passes — the first pass that reads the order again says it is the operator's now", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const id = await laneAcceptLost(s);
+  await handedBackDuringOutage(s, id);
+  // Before: "could not read the order from Amboss: Amboss HTTP 502" on both.
+  releasedToOperator(s, id, s.autopilot, "the pass that reads Amboss again");
+});
+
+// The same for an order the operator is deciding whose read fails for a pass —
+// Amboss down, or refusing to show that one order with the key fine — and then
+// works again. Only what the failed read noted goes: an error of their accept
+// itself stays, as a read doesn't make it stale.
+for (const c of [
+  {
+    name: "Amboss down",
+    unreadable: (s: Setup) => {
+      s.magma.readBehaviour = "throw";
+    },
+    readable: (s: Setup) => {
+      s.magma.readBehaviour = "ok";
+    },
+    noted: "could not read the order from Amboss: Amboss HTTP 502",
+  },
+  {
+    name: "Amboss refusing to show the order, the key fine",
+    unreadable: (s: Setup) => {
+      s.magma.saleRead = () => forbidden("Sale");
+    },
+    readable: (s: Setup) => {
+      s.magma.saleRead = null;
+    },
+    noted: "Amboss refused to show this order (Forbidden resource)",
+  },
+]) {
+  test(`selling off: an order the operator is deciding whose read fails for a pass (${c.name}) — once it reads again, its record says it is theirs, not that it can't be read`, async (t) => {
+    quiet(t);
+    const s = sellerSetup(t, { config: { sellEnabled: false } });
+    const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+    s.magma.behave.AcceptOrder = "false";
+    const click = await s.desk.accept(sale.id);
+    assert.deepEqual([click.ok, click.message], [false, "Amboss refused the accept"]);
+    await s.autopilot.pollSellOrders();
+    assert.equal(s.desk.localView(sale.id)?.lastError, "Amboss refused the accept", "about their accept, not the read: a read keeps it");
+    c.unreadable(s);
+    await s.autopilot.pollSellOrders();
+    assert.equal(s.desk.localView(sale.id)?.lastError, c.noted, "true while the order can't be read");
+    c.readable(s);
+    await s.autopilot.pollSellOrders();
+    // Before: the failed read's note on both, pass after pass.
+    leftToThem(s, sale.id, c.name, { accepts: 1 });
+    saysTheirs(s.autopilot, sale.id, c.name);
+  });
+}
 
 // Review of P9: sendAccept's guard — the lane's bound on accepts Amboss
 // refuses is for its own accepts only — had no test: without it, every test
@@ -503,7 +763,7 @@ for (const c of [
     assert.deepEqual([click.ok, click.code], [false, "amboss"], click.message);
     assert.equal(
       click.message,
-      `${c.said} Your reject stands: the order lane sends it again until Amboss confirms it, and won't accept this order.`,
+      `${c.said} Your reject stands: the order lane sends it again until Amboss confirms it or the order ends, and won't accept this order.`,
     );
     const marked = entryOnDisk(s.dir, sale.id);
     assert.deepEqual(
@@ -592,6 +852,61 @@ test("a click that can't read an order the lane is already accepting changes not
   assert.equal(s.magma.sales.get(sale.id)?.status, "WAITING_FOR_BUYER_PAYMENT");
   const done = entryOnDisk(s.dir, sale.id);
   assert.deepEqual([done?.phase, done?.via, done?.decision?.reason], ["accepted", "autopilot", "within your caps and capital"]);
+});
+
+// ── an accept already sent: completed first ──────────────────────────────────
+
+// Review of P9, final round: the docs said a click "makes the order yours,
+// whatever becomes of the click", and that "their latest click stands". Not
+// for an order with an accept already sent whose answer was lost: an accept
+// that may have reached Amboss is completed first (resumeAccept — whatever the
+// switch says), and a Reject meanwhile is refused — said "Order is already
+// accepting here.", though Amboss still showed the order awaiting approval.
+// The behaviour stays; the docs say so now, and the refusal says why.
+for (const sellEnabled of [true, false]) {
+  test(`selling ${sellEnabled ? "on" : "off"}: the operator's accept went out and its answer was lost — their Reject is refused, saying why, and the next pass completes the accept`, async (t) => {
+    quiet(t);
+    const s = sellerSetup(t, { config: { sellEnabled } });
+    const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+    s.magma.behave.AcceptOrder = (n) => (n === 0 ? "throw" : "ok");
+    const accepted = await s.desk.accept(sale.id);
+    assert.deepEqual([accepted.ok, accepted.phase], [false, "accepting"], accepted.message);
+    assert.equal(s.magma.sales.get(sale.id)?.status, "WAITING_FOR_SELLER_APPROVAL", "Amboss shows it awaiting approval still");
+    const click = await s.desk.reject(sale.id);
+    assert.deepEqual(click, {
+      ok: false,
+      code: "bad_status",
+      phase: "accepting",
+      message: "Not rejected: the earlier accept of this order was already sent and is being confirmed with Amboss, so it can't be withdrawn.",
+    });
+    await s.autopilot.pollSellOrders();
+    assert.deepEqual([s.magma.count("AcceptOrder"), s.magma.count("RejectOrder")], [2, 0]);
+    assert.equal(s.magma.sales.get(sale.id)?.status, "WAITING_FOR_BUYER_PAYMENT");
+    const e = entryOnDisk(s.dir, sale.id);
+    assert.deepEqual([e?.phase, e?.via, e?.decision?.reason], ["accepted", "manual", "accepted by you"]);
+  });
+}
+
+test("the operator's accept cut short by a stop before it was sent: a Reject clicked before the restarted lane's first pass is refused, saying so — and that pass completes the accept", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  const died = crashAt(s.desk, "lndCreateHodl", "before");
+  void s.desk.accept(sale.id);
+  await until(died, "the invoice was being made");
+  assert.deepEqual([entryOnDisk(s.dir, sale.id)?.phase, entryOnDisk(s.dir, sale.id)?.acceptSentAt], ["accepting", undefined], "never sent");
+  const p2 = s.restart();
+  const click = await p2.magma.reject(sale.id);
+  // Not "already sent": it never left.
+  assert.deepEqual(click, {
+    ok: false,
+    code: "bad_status",
+    phase: "accepting",
+    message: "Not rejected: an accept of this order was under way when LightningMate stopped — the order lane completes or withdraws it on its next pass.",
+  });
+  await p2.pollSellOrders();
+  assert.deepEqual([s.magma.count("AcceptOrder"), s.magma.count("RejectOrder")], [1, 0]);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted");
 });
 
 // ── a click under way when the process dies ──────────────────────────────────
@@ -697,8 +1012,11 @@ test("the lane's own reject that Amboss didn't confirm is not sent again once se
 // click comes. One action per order at a time (withOrder): a click that comes
 // while the lane is deciding or acting on that order waits for that step to
 // finish, and is refused, saying so, if the order was accepted or rejected
-// meanwhile — the order stays as the lane left it. The docs now state that
-// limit (docsMatchCode.test.ts); these tests pin it.
+// meanwhile against what it asked for — the order stays as the lane left it.
+// The docs now state that limit (docsMatchCode.test.ts); these tests pin it.
+// Final round: a click that finds the order as it asked — rejected by the
+// lane's resend of the operator's own reject, accepted by the lane — is told
+// it is done, not refused.
 
 /** The lane's pass is held part-way through a step on an order — `hold` arms
  *  the hold on `gate` and says when the step is reached — and the operator
@@ -723,16 +1041,17 @@ async function clickMidStep(s: Setup, hold: (gate: Promise<void>) => () => boole
   return clicked;
 }
 
-/** Amboss holds the lane's RejectOrder — not answering — until the gate opens. */
-const rejectHeld = (s: Setup) => (gate: Promise<void>) => {
+/** Amboss holds the lane's `mutation` — not answering — until the gate opens. */
+const mutationHeld = (s: Setup, mutation: "RejectOrder" | "AcceptOrder") => (gate: Promise<void>) => {
   let held = false;
   s.magma.holdMutation = (op) => {
-    if (op !== "RejectOrder") return null;
+    if (op !== mutation) return null;
     held = true;
     return gate;
   };
   return () => held;
 };
+const rejectHeld = (s: Setup) => mutationHeld(s, "RejectOrder");
 
 test("selling on: a Reject clicked while the lane dials the buyer waits for that step — the lane's accept goes out first, and the click is refused, saying so", async (t) => {
   quiet(t);
@@ -789,4 +1108,137 @@ test("the operator's reject didn't go through; their Accept, clicked while the l
   assert.deepEqual(click, { ok: false, code: "bad_status", message: "Order is SELLER_REJECTED, not awaiting approval." });
   assert.equal(s.magma.count("RejectOrder"), 2, "the click's, and the pass's");
   rejectedByThem(s, sale.id, "the resend under way");
+});
+
+test("the operator's reject didn't go through; their Reject, clicked again while the lane sends it again, waits for that step — and is told the order is rejected: done, not refused", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  await rejectFails(s, sale.id);
+  const click = await clickMidStep(s, rejectHeld(s), () => s.desk.reject(sale.id));
+  // Before: refused (409), "Order is SELLER_REJECTED — only orders awaiting
+  // approval can be rejected." — for an order rejected as the click asked.
+  assert.deepEqual(click, { ok: true, message: "Order is already rejected." });
+  assert.equal(s.magma.count("RejectOrder"), 2, "the first click's, and the pass's: the second click sends none");
+  rejectedByThem(s, sale.id, "the resend under way");
+});
+
+test("selling on: an Accept clicked while the lane accepts the same order waits for that step — and is told the order is accepted: done, not refused; one accepted outside LightningMate is still refused", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  const click = await clickMidStep(s, mutationHeld(s, "AcceptOrder"), () => s.desk.accept(sale.id));
+  // Before: "Order is WAITING_FOR_BUYER_PAYMENT, not awaiting approval." —
+  // for an order accepted as the click asked.
+  assert.deepEqual(click, { ok: true, phase: "accepted", message: "Order is already accepted." });
+  assert.deepEqual([s.magma.count("AcceptOrder"), s.magma.count("RejectOrder")], [1, 0], "the lane's accept: the click sends none");
+  assert.equal(s.node.callsTo("invoices.addHoldInvoice").length, 1, "one invoice");
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.via, e?.decision?.reason], ["accepted", "autopilot", "within your caps and capital"], "the click changed nothing");
+  // An order accepted outside LightningMate has no accept of ours behind it:
+  // no channel of this app's follows (acceptedElsewhere) — not "done".
+  const elsewhere = s.magma.addSale({ buyerPubkey: BUYER, status: "WAITING_FOR_BUYER_PAYMENT" });
+  assert.deepEqual(await s.desk.accept(elsewhere.id), { ok: false, code: "bad_status", message: "Order is WAITING_FOR_BUYER_PAYMENT, not awaiting approval." });
+});
+
+// Review of P10: the guards of those "done" answers had no test — with any one
+// of them dropped, every test stayed green, and a click asking for what the
+// order is NOT was told it was done (the web then says "Order rejected." or
+// "Order accepted — …"). A click that asks for something else is refused, as
+// before.
+test("'done' only for what the order is: a Reject on an order that timed out, and an Accept on one Amboss ended, on one only seen here or on one ended here, are refused as before", async (t) => {
+  quiet(t);
+  {
+    // Timed out on Amboss: failed, not rejected.
+    const s = sellerSetup(t, { config: { sellEnabled: false } });
+    const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+    s.magma.setStatus(sale.id, "SELLER_FAILED_TO_REACT");
+    assert.deepEqual(
+      await s.desk.reject(sale.id),
+      { ok: false, code: "bad_status", message: "Order is SELLER_FAILED_TO_REACT — only orders awaiting approval can be rejected." },
+      "a Reject on an order that timed out",
+    );
+  }
+  {
+    // An accept of ours went out, its answer lost — and Amboss ended the
+    // order: not accepted, whatever is under way here.
+    const s = sellerSetup(t, { config: { sellEnabled: false } });
+    const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+    s.magma.behave.AcceptOrder = "throw";
+    assert.equal((await s.desk.accept(sale.id)).ok, false);
+    assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepting");
+    s.magma.setStatus(sale.id, "SELLER_FAILED_TO_REACT");
+    assert.deepEqual(
+      await s.desk.accept(sale.id),
+      { ok: false, code: "bad_status", message: "Order is SELLER_FAILED_TO_REACT, not awaiting approval." },
+      "an Accept on an order with an accept of ours under way, ended by Amboss",
+    );
+  }
+  {
+    // Only seen here — the lane waits for Amboss to report its fee — and
+    // accepted on amboss.tech: no accept of ours behind it.
+    const s = sellerSetup(t);
+    const sale = s.magma.addSale({ buyerPubkey: BUYER, feeSeller: "0", timeout: IN_AN_HOUR() });
+    await s.autopilot.pollSellOrders();
+    const seen = entryOnDisk(s.dir, sale.id);
+    assert.deepEqual([seen?.phase, seen?.decision?.reason], ["seen", "waiting for Amboss to report the order's fee"]);
+    s.magma.setStatus(sale.id, "WAITING_FOR_BUYER_PAYMENT");
+    assert.deepEqual(
+      await s.desk.accept(sale.id),
+      { ok: false, code: "bad_status", message: "Order is WAITING_FOR_BUYER_PAYMENT, not awaiting approval." },
+      "an Accept on an order only seen here, accepted elsewhere",
+    );
+  }
+  {
+    // Ended here — its invoice cancelled before the buyer paid — while Amboss
+    // shows it paid: nothing of ours carries it on.
+    const s = sellerSetup(t, { config: { sellEnabled: false } });
+    const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+    const accepted = await s.desk.accept(sale.id);
+    assert.equal(accepted.ok, true, accepted.message);
+    s.node.expireHoldInvoice(entryOnDisk(s.dir, sale.id)!.invoice!.id);
+    await s.autopilot.pollSellOrders();
+    assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "cancelled");
+    s.magma.setStatus(sale.id, "WAITING_FOR_CHANNEL_OPEN");
+    assert.deepEqual(
+      await s.desk.accept(sale.id),
+      { ok: false, code: "bad_status", message: "Order is WAITING_FOR_CHANNEL_OPEN, not awaiting approval." },
+      "an Accept on an order ended here",
+    );
+  }
+});
+
+// ── the run history: whose change it was ─────────────────────────────────────
+
+// Review of P9, final round: the lane's resend of the operator's own reject,
+// once Amboss confirmed it, read as "Last change by the autopilot" on the
+// Overview — lastAutopilotActionAt counted every sell action that landed.
+// The lane carrying out a decision made by hand is the operator's change.
+test("the lane carrying out the operator's decision is not 'Last change by the autopilot' — their reject sent again, their accept completed; the lane's own reject is", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t, { config: { sellMaxChannelSats: 5_000_000 } });
+  const verdicts = (id: string) => historyFor(s.autopilot, id).map((a) => [a.action, a.ok, a.via]);
+  // Their reject, its click failing: the next pass sends it again, and Amboss takes it.
+  const theirReject = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  await rejectFails(s, theirReject.id);
+  await s.autopilot.pollSellOrders();
+  rejectedByThem(s, theirReject.id, "their reject, sent again");
+  assert.deepEqual(verdicts(theirReject.id), [["reject", true, "manual"]]);
+  // Before: the time of that pass.
+  assert.equal(s.autopilot.getState().lastActionAt, null, "their reject sent again");
+  // Their accept, its answer lost: the next pass sends it again, and Amboss takes it.
+  const theirAccept = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
+  s.magma.behave.AcceptOrder = (n) => (n === 0 ? "throw" : "ok");
+  assert.equal((await s.desk.accept(theirAccept.id)).ok, false);
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, theirAccept.id)?.phase, "accepted");
+  assert.deepEqual(verdicts(theirAccept.id), [["accept", true, "manual"]]);
+  assert.equal(s.autopilot.getState().lastActionAt, null, "their accept completed");
+  // The lane's own decision — an order above its caps, turned down — is its change.
+  const lanes = s.magma.addSale({ buyerPubkey: BUYER, sizeSats: 8_000_000, timeout: IN_AN_HOUR() });
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(verdicts(lanes.id), [["reject", true, undefined]]);
+  const line = s.autopilot.getState().history.find((r) => r.sells.some((a) => a.orderId === lanes.id));
+  assert.ok(line, "the lane's reject is in the run history");
+  assert.equal(s.autopilot.getState().lastActionAt, line.at);
 });

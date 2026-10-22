@@ -902,6 +902,12 @@ test("the mark is per attempt: an earlier accept Amboss refused leaves no mark o
   // Before: attempt 1's mark made attempt 2 look sent — completed after the pause.
   assert.equal(s.magma.count("AcceptOrder"), 1);
   assert.deepEqual([entryOnDisk(s.dir, sale.id)?.phase, entryOnDisk(s.dir, sale.id)?.decision?.reason], ["seen", SELLING_OFF_SKIP]);
+  // Attempt 1's "Amboss refused the accept" went with the withdrawn attempt:
+  // Market → Orders shows an order's last error first, and that one hid why
+  // the order now waits for the operator (review of P9, final round: no path
+  // that hands an order back to "seen" keeps a stale error).
+  const local = p2.magma.localView(sale.id);
+  assert.deepEqual([local?.lastError, local?.reason, local?.decision?.reason], [null, null, SELLING_OFF_SKIP]);
 });
 
 // Review of P8, round 2: two ways a paused lane still acted on its own.
