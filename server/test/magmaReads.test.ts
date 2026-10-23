@@ -74,7 +74,7 @@ test("one hiccup on an order's read (a resolver error inside an HTTP 200) doesn'
   }
 
   // Amboss reports the fees now, and answers again.
-  magma.sales.get(servable.id)!.feeSeller = "1234";
+  magma.sales.get(servable.id)!.feeSeller = "4435"; // above what opening and closing its channel costs (minSaleFeeSats)
   magma.sales.get(tooBig.id)!.feeSeller = "5678";
   await autopilot.pollSellOrders();
   assert.equal(magma.sales.get(servable.id)?.status, "WAITING_FOR_BUYER_PAYMENT", "accepted");

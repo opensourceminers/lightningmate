@@ -97,7 +97,7 @@ test("Amboss mutations get their own, longer deadline", async (t) => {
     await new Promise((r) => setTimeout(r, 200)); // slower than a read may take
     return { data: { market: { offer: { update: { success: true } } } } };
   });
-  const offer = { totalSizeSats: 2e6, minSizeSats: 1e6, maxSizeSats: 2e6, feeRatePpm: 500, baseFeeSats: 1, minBlockLength: 4320 };
+  const offer = { totalSizeSats: 2e6, minSizeSats: 1e6, maxSizeSats: 2e6, feeRatePpm: 500, baseFeeSats: 1, minBlockLength: 4320, feeRateCapPpm: null, baseFeeCapSats: null, conditions: [], onchainPriority: null, onchainMultiplier: null };
   assert.equal(await updateOffer("key", "offer-1", offer), true);
 });
 

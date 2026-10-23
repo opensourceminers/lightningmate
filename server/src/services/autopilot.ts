@@ -13,7 +13,7 @@ import {
   peerMinChannelFromError,
 } from "./channelOps.js";
 import { isAuthError } from "./amboss.js";
-import { createOffer, getMyOffer, getMyOffers, toggleOffer, updateOffer, type MyOffer, type OfferTerms } from "./magmaApi.js";
+import { NO_EXTRA_TERMS, createOffer, getMyOffer, getMyOffers, termsOf, toggleOffer, updateOffer, type MyOffer, type OfferTerms } from "./magmaApi.js";
 import { MagmaDesk, type MagmaSellAction, type SellActionKind } from "./magmaDesk.js";
 import { CapitalLedger, listableSat, spendableOnchain, type Spendable } from "./capital.js";
 import {
@@ -56,8 +56,8 @@ import {
   type YieldEvidence,
 } from "./openPlan.js";
 import type { LnPlusStore } from "./lnplusStore.js";
-import { getMagmaRecommendations, type MagmaV2Report } from "./magmaRecommend.js";
-import { onchainCosts } from "./nodeEconomics.js";
+import { getMagmaRecommendations, saleCostFloorSats, type MagmaV2Report } from "./magmaRecommend.js";
+import { CLOSE_TX_VBYTES, OPEN_TX_VBYTES, onchainCosts } from "./nodeEconomics.js";
 import { getFeeElasticity } from "./outcomes.js";
 import { DEFAULT_POLICY, applyFees, type FeeApplyItem, type FeeApplyResult } from "./fees.js";
 import {
@@ -335,6 +335,10 @@ export interface OfferControl {
   autoDisablingAt?: string;
   /** The operator disabled it by hand: it stays disabled until they enable it. */
   disabledByHandAt?: string;
+  /** The autopilot took it off the market because Amboss listed it for free
+   *  (0 ppm + 0 sat) with no price of its own to put back: it stays disabled
+   *  until the operator gives it a price and lists it again. */
+  freeDisabledAt?: string;
 }
 
 /** The last write to an offer (autopilot or manual) and what came of it. */
@@ -342,11 +346,14 @@ export interface OfferWrite {
   at: string;
   by: "autopilot" | "manual";
   action: "create" | "update" | "enable" | "disable";
-  /** The fields sent, as Amboss names them. */
+  /** The fields sent, as Amboss names them — for a terms write, all of them
+   *  (updateOffer: Amboss resets what an update leaves out). */
   fields: Record<string, number | string>;
+  /** Of those, the ones this write changed (a terms update by the autopilot). */
+  changed?: string[];
   ok: boolean;
   error?: string;
-  /** Re-read afterwards: did Amboss really store what was sent? */
+  /** Re-read afterwards: does Amboss hold every term that was sent? */
   verified?: boolean;
   reason?: string;
 }
@@ -471,6 +478,9 @@ interface PersistedState {
   pendingRebalances?: PendingRebalance[];
   /** Offer sync status (engine's wishes vs Amboss), see OfferSyncStatus. */
   offerSync?: OfferSyncStatus;
+  /** Each offer's last price that wasn't free (0 ppm + 0 sat), as read or
+   *  written — what is put back when Amboss lists it for free (rememberPrice). */
+  offerPrices?: Record<string, { feeRatePpm: number; baseFeeSats: number; at: string }>;
   /** Per offer: what a capital cut took, to give back (see OfferCut). */
   offerCuts?: Record<string, OfferCut>;
   /** Per offer: who owns its terms (see OfferControl). */
@@ -731,6 +741,11 @@ export interface RebalanceBudget {
 const HISTORY_LIMIT = 50;
 /** The Magma order lane's cadence (D4): independent of the main run. */
 export const ORDER_LANE_INTERVAL_MS = 45_000;
+/** How often the order lane reads the listed offers to catch one priced below
+ *  what the autopilot set, or listed for free (guardOfferPrices). */
+export const OFFER_GUARD_INTERVAL_MS = 2 * 60_000;
+/** How long the order lane's accept floor (saleFeeFloorSats) is reused. */
+const SALE_FLOOR_TTL_MS = 10 * 60_000;
 /** How often the routing-fee promises of sold channels are checked (D7) —
  *  whatever the autopilot switches say (keepLeasePromisesNow). */
 export const LEASE_PROMISE_CHECK_MS = 10 * 60_000;
@@ -866,7 +881,7 @@ const openStopped = (why: string): string => `stopped: ${why} — no open was st
  */
 function capitalStatus(status: string, fundable: boolean, control: OfferControl): "ENABLED" | "DISABLED" | null {
   if (status === "ENABLED" && !fundable) return "DISABLED";
-  if (status === "DISABLED" && fundable && !!control.autoDisabledAt && !control.disabledByHandAt) return "ENABLED";
+  if (status === "DISABLED" && fundable && !!control.autoDisabledAt && !control.disabledByHandAt && !control.freeDisabledAt) return "ENABLED";
   return null;
 }
 
@@ -925,45 +940,139 @@ function sameTerms(a: MyOffer, b: MyOffer): boolean {
   return (Object.keys(x) as (keyof OfferFields)[]).every((k) => k === "availableSats" || x[k] === y[k]);
 }
 
-/** The fields to send to bring `have` to `want` (null = nothing to change). */
-function termsUpdate(have: MyOffer, want: OfferFields): Partial<OfferTerms> | null {
-  const p: Partial<OfferTerms> = {};
-  if (want.feeRatePpm !== have.feeRatePpm) p.feeRatePpm = want.feeRatePpm;
-  if (want.baseFeeSats !== have.baseFeeSats) p.baseFeeSats = want.baseFeeSats;
-  if (want.minSizeSats !== have.minSizeSats) p.minSizeSats = want.minSizeSats;
-  if (want.maxSizeSats !== have.maxSizeSats) p.maxSizeSats = want.maxSizeSats;
-  if (want.minBlockLength !== have.minBlockLength) p.minBlockLength = want.minBlockLength;
-  if (want.totalSizeSats !== have.totalSizeSats) p.totalSizeSats = want.totalSizeSats;
-  if (want.feeRateCapPpm !== null && want.feeRateCapPpm !== have.feeRateCapPpm) p.feeRateCapPpm = want.feeRateCapPpm;
-  if (want.baseFeeCapSats !== null && want.baseFeeCapSats !== have.baseFeeCapSats) p.baseFeeCapSats = want.baseFeeCapSats;
-  return Object.keys(p).length > 0 ? p : null;
+/** The terms that differ between what Amboss has and what is wanted, under
+ *  Amboss's names (empty: nothing to change). Only for deciding whether to
+ *  write and for saying what changed: a write always sends every term
+ *  (fullTerms), as Amboss resets the ones an update leaves out. */
+function termsChanges(have: MyOffer, want: OfferFields): string[] {
+  const changed: string[] = [];
+  if (want.feeRatePpm !== have.feeRatePpm) changed.push("fee_rate");
+  if (want.baseFeeSats !== have.baseFeeSats) changed.push("base_fee");
+  if (want.minSizeSats !== have.minSizeSats) changed.push("min_size");
+  if (want.maxSizeSats !== have.maxSizeSats) changed.push("max_size");
+  if (want.minBlockLength !== have.minBlockLength) changed.push("min_block_length");
+  if (want.totalSizeSats !== have.totalSizeSats) changed.push("total_size");
+  if (want.feeRateCapPpm !== null && want.feeRateCapPpm !== have.feeRateCapPpm) changed.push("fee_rate_cap");
+  if (want.baseFeeCapSats !== null && want.baseFeeCapSats !== have.baseFeeCapSats) changed.push("base_fee_cap");
+  return changed;
 }
 
-/** Did Amboss store every field that was sent? */
-export function termsMatch(read: MyOffer, sent: Partial<OfferTerms>): boolean {
-  return (
-    (sent.feeRatePpm === undefined || read.feeRatePpm === sent.feeRatePpm) &&
-    (sent.baseFeeSats === undefined || read.baseFeeSats === sent.baseFeeSats) &&
-    (sent.minSizeSats === undefined || read.minSizeSats === sent.minSizeSats) &&
-    (sent.maxSizeSats === undefined || read.maxSizeSats === sent.maxSizeSats) &&
-    (sent.minBlockLength === undefined || read.minBlockLength === sent.minBlockLength) &&
-    (sent.totalSizeSats === undefined || read.totalSizeSats === sent.totalSizeSats) &&
-    (sent.feeRateCapPpm === undefined || read.feeRateCapPpm === sent.feeRateCapPpm) &&
-    (sent.baseFeeCapSats === undefined || read.baseFeeCapSats === sent.baseFeeCapSats)
-  );
+/** Every term to send for `want`. A promise the autopilot doesn't set (null)
+ *  is the one Amboss has: left out, Amboss would clear it. */
+function fullTerms(want: OfferFields, have: MyOffer): OfferTerms {
+  return {
+    totalSizeSats: want.totalSizeSats,
+    minSizeSats: want.minSizeSats,
+    maxSizeSats: want.maxSizeSats,
+    feeRatePpm: want.feeRatePpm,
+    baseFeeSats: want.baseFeeSats,
+    minBlockLength: want.minBlockLength,
+    feeRateCapPpm: want.feeRateCapPpm ?? have.feeRateCapPpm,
+    baseFeeCapSats: want.baseFeeCapSats ?? have.baseFeeCapSats,
+    // Not the autopilot's to set — sent back as Amboss has them.
+    conditions: have.conditions,
+    onchainPriority: have.onchainPriority,
+    onchainMultiplier: have.onchainMultiplier,
+  };
 }
 
-/** Offer fields under the names Amboss uses (for the write record). */
-export function ambossFields(p: Partial<OfferTerms>): Record<string, number> {
-  const out: Record<string, number> = {};
-  if (p.totalSizeSats !== undefined) out.total_size = p.totalSizeSats;
-  if (p.minSizeSats !== undefined) out.min_size = p.minSizeSats;
-  if (p.maxSizeSats !== undefined) out.max_size = p.maxSizeSats;
-  if (p.feeRatePpm !== undefined) out.fee_rate = p.feeRatePpm;
-  if (p.baseFeeSats !== undefined) out.base_fee = p.baseFeeSats;
-  if (p.minBlockLength !== undefined) out.min_block_length = p.minBlockLength;
-  if (p.feeRateCapPpm !== undefined) out.fee_rate_cap = p.feeRateCapPpm;
-  if (p.baseFeeCapSats !== undefined) out.base_fee_cap = p.baseFeeCapSats;
+/** Does Amboss hold exactly these terms — every one, the price and the
+ *  promise included? Before, only the fields a write had sent were compared:
+ *  the write that sent only the caps read back "verified" while Amboss had
+ *  reset the fee rate to 0. */
+export function termsMatch(read: MyOffer, sent: OfferTerms): boolean {
+  return termsMismatch(read, sent).length === 0;
+}
+
+/** The terms Amboss holds differently from `sent`, said plainly — the listed
+ *  total against `totalRange`: what was sent, or less only where a sale
+ *  completed in between (writeTerms says by how much at most). Above it, the
+ *  offer advertises capital a cut took out; below it, a raise — a cut given
+ *  back — didn't land. */
+export function termsMismatch(
+  read: MyOffer,
+  sent: OfferTerms,
+  totalRange: [number, number] = [sent.totalSizeSats, sent.totalSizeSats],
+): string[] {
+  const conditions = (c: OfferTerms["conditions"]) =>
+    c.length ? c.map((x) => `${x.condition} ${x.operator} ${x.value}`).sort().join(", ") : "none";
+  const pairs: [string, number | string | null, number | string | null][] = [
+    ["fee rate (ppm)", read.feeRatePpm, sent.feeRatePpm],
+    ["base fee (sat)", read.baseFeeSats, sent.baseFeeSats],
+    ["min channel (sat)", read.minSizeSats, sent.minSizeSats],
+    ["max channel (sat)", read.maxSizeSats, sent.maxSizeSats],
+    ["min lease (blocks)", read.minBlockLength, sent.minBlockLength],
+    ["routing fee-rate cap (ppm)", read.feeRateCapPpm, sent.feeRateCapPpm],
+    ["routing base-fee cap (sat)", read.baseFeeCapSats, sent.baseFeeCapSats],
+    ["buyer conditions", conditions(read.conditions), conditions(sent.conditions)],
+    ["on-chain priority", read.onchainPriority, sent.onchainPriority],
+    ["on-chain multiplier", read.onchainMultiplier, sent.onchainMultiplier],
+  ];
+  const out = pairs.filter(([, have, want]) => have !== want).map(([label, have, want]) => `${label}: Amboss has ${have}, sent ${want}`);
+  if (read.totalSizeSats < totalRange[0] || read.totalSizeSats > totalRange[1]) {
+    out.push(`listed total (sat): Amboss has ${read.totalSizeSats}, sent ${sent.totalSizeSats}`);
+  }
+  return out;
+}
+
+/** An offer's full terms under the names Amboss uses (for the write record). */
+export function ambossFields(p: OfferTerms): Record<string, number | string> {
+  const out: Record<string, number | string> = {
+    total_size: p.totalSizeSats,
+    min_size: p.minSizeSats,
+    max_size: p.maxSizeSats,
+    fee_rate: p.feeRatePpm,
+    base_fee: p.baseFeeSats,
+    min_block_length: p.minBlockLength,
+  };
+  if (p.feeRateCapPpm !== null) out.fee_rate_cap = p.feeRateCapPpm;
+  if (p.baseFeeCapSats !== null) out.base_fee_cap = p.baseFeeCapSats;
+  if (p.conditions.length) out.conditions = p.conditions.map((c) => `${c.condition} ${c.operator} ${c.value}`).join("; ");
+  if (p.onchainPriority !== null) out.onchain_priority = p.onchainPriority;
+  if (p.onchainMultiplier !== null) out.onchain_multiplier = p.onchainMultiplier;
+  return out;
+}
+
+/** Listed for free: no fee rate and no base fee. Never what LightningMate
+ *  lists (the engine prices at its profit floor at least; a manual offer
+ *  needs a base fee above 0) — Amboss matched such an offer at 0 sats. */
+const listedForFree = (o: Pick<MyOffer, "feeRatePpm" | "baseFeeSats">): boolean => o.feeRatePpm <= 0 && o.baseFeeSats <= 0;
+
+/** Why an offer listed for free was taken off the market (disableFree). */
+const FREE_DISABLE_REASON = "Amboss listed it for free (0 ppm + 0 sat), and there is no price of its own to put back";
+const FREE_DISABLED_WHY =
+  "disabled by the autopilot: Amboss listed it for free (0 ppm + 0 sat) — set its price on Market → Sell, then enable it";
+
+type OfferPrices = NonNullable<PersistedState["offerPrices"]>;
+
+/** A price as stored: two finite, non-negative numbers, not both 0. */
+function soundPrice(p: unknown): { feeRatePpm: number; baseFeeSats: number } | null {
+  if (!p || typeof p !== "object") return null;
+  const { feeRatePpm, baseFeeSats } = p as Record<string, unknown>;
+  if (typeof feeRatePpm !== "number" || typeof baseFeeSats !== "number") return null;
+  if (!Number.isFinite(feeRatePpm) || !Number.isFinite(baseFeeSats) || feeRatePpm < 0 || baseFeeSats < 0) return null;
+  return listedForFree({ feeRatePpm, baseFeeSats }) ? null : { feeRatePpm, baseFeeSats };
+}
+
+/**
+ * The price memory as loaded: what it holds, if sound — and, for an offer it
+ * has nothing for, the last price wanted for it, else the last one read,
+ * while not free (0.8.0 kept no memory; its partial writes left offers at
+ * 0 ppm + 0 sat half the time, and the run after the upgrade must give such
+ * an offer its price back, not take it off the market).
+ */
+function seedOfferPrices(prices: unknown, sync: OfferSyncStatus | undefined): OfferPrices {
+  const out: OfferPrices = {};
+  for (const [id, p] of Object.entries(prices && typeof prices === "object" ? (prices as Record<string, unknown>) : {})) {
+    const price = soundPrice(p);
+    const at = (p as { at?: unknown }).at;
+    if (price) out[id] = { ...price, at: typeof at === "string" ? at : new Date(0).toISOString() };
+  }
+  for (const e of Array.isArray(sync?.offers) ? sync.offers : []) {
+    if (!e || typeof e.offerId !== "string" || out[e.offerId]) continue;
+    const price = soundPrice(e.wanted) ?? soundPrice(e.amboss);
+    if (price) out[e.offerId] = { ...price, at: typeof e.checkedAt === "string" ? e.checkedAt : new Date(0).toISOString() };
+  }
   return out;
 }
 
@@ -1093,6 +1202,7 @@ export class Autopilot {
           sellReserveSats: c.sellReserveSats,
         };
       },
+      saleFloorSats: () => this.saleFeeFloorSats(),
     });
     initMagmaHistory(dataDir);
     this.purchases = new MagmaPurchases(dataDir);
@@ -1133,6 +1243,12 @@ export class Autopilot {
     const { config, repairs } = sanitizePersistedConfig(this.state.config);
     this.state.config = config;
     this.reportRepairs(repairs);
+    // The price memory, sound — and seeded on the upgrade from 0.8.0 (which
+    // kept none): each offer's last wanted price, else its last read, while
+    // not free. Its partial writes left offers at 0 ppm + 0 sat half the time;
+    // without this the first run would take such an offer off the market
+    // instead of giving it its price back.
+    this.state.offerPrices = seedOfferPrices(this.state.offerPrices, this.state.offerSync);
     this.state.history = Array.isArray(this.state.history) ? this.state.history : [];
     // What "Resume" may switch on: the known switches only (sanitizePaused).
     this.state.paused = sanitizePaused(this.state.paused);
@@ -1584,7 +1700,7 @@ export class Autopilot {
    *  has a recorded state by then (a refill payment from before it was sent). */
   async waitIdle(timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
-    while (this.running || this.refilling || this.magma.isBusy() || this.capital.mutex.busy || this.reconciling) {
+    while (this.running || this.refilling || this.magma.isBusy() || this.capital.mutex.busy || this.reconciling || this.guarding) {
       if (Date.now() >= deadline) return false;
       await new Promise((r) => setTimeout(r, 100));
     }
@@ -1675,6 +1791,12 @@ export class Autopilot {
     if (this.shuttingDown) return "shutting down";
     if (this.state.config[sw]) return null;
     return this.state.paused ? "all automation was paused during the run" : `${SWITCH_WORDS[sw]} was switched off during the run`;
+  }
+
+  /** The autopilot acts on offers now: Liquidity provision on, not paused,
+   *  write access (what the offer alerts may promise). */
+  actsOnOffers(): boolean {
+    return this.canWrite && this.amboss.hasKey() && !this.stopWhy("sellEnabled");
   }
 
   private kick(fn: () => Promise<unknown>, delayMs: number): void {
@@ -3320,9 +3442,7 @@ export class Autopilot {
       // has to come from that price — otherwise sizing could open the window to
       // orders that lose money at the price actually listed.
       const floorAtOwnPrice = (): number => {
-        const cost =
-          (sell.onchainOpenCostSat + sell.onchainCloseCostSat + sell.minNetLeaseProfitSat) /
-          Math.max(0.01, 1 - sell.serviceFeeRate);
+        const cost = saleCostFloorSats(sell);
         const stillNeeded = cost - off.baseFeeSats; // what the rate must earn on top of the base
         if (stillNeeded <= 0) return 0; // the base fee alone covers any size
         if (off.feeRatePpm <= 0) return Number.POSITIVE_INFINITY;
@@ -3367,6 +3487,9 @@ export class Autopilot {
     for (const id of Object.keys(this.state.offerControl ?? {})) {
       if (!offers.some((o) => o.id === id)) delete this.state.offerControl?.[id];
     }
+    for (const id of Object.keys(this.state.offerPrices ?? {})) {
+      if (!offers.some((o) => o.id === id)) delete this.state.offerPrices?.[id];
+    }
 
     // Auto-list idle capital: no offer at all, leasing beats routing, and
     // auto-pricing on (listing means choosing a price, which only that switch
@@ -3408,6 +3531,7 @@ export class Autopilot {
           // The routing-fee promise, always (D7) — kept by the fee autopilot.
           feeRateCapPpm: ctx.caps.feeRateCapPpm,
           baseFeeCapSats: ctx.caps.baseFeeCapSats,
+          ...NO_EXTRA_TERMS,
         };
         const write: OfferWrite = {
           at: new Date().toISOString(),
@@ -3431,7 +3555,9 @@ export class Autopilot {
             write.ok = true;
             const created = await getMyOffer(key, id).catch(() => null);
             write.verified = created ? termsMatch(created, terms) : undefined;
-            if (created) entries.push(this.syncEntry(created, fieldsOf(created), write));
+            this.rememberPrice({ id, ...terms });
+            // What is wanted for it is what was sent — not what Amboss shows.
+            if (created) entries.push(this.syncEntry(created, { ...fieldsOf(created), ...terms }, write));
             out.push({ orderId: id, action: "create", sizeSats: terms.totalSizeSats, ok: true });
           }
         } catch (err) {
@@ -3556,6 +3682,7 @@ export class Autopilot {
     if (off.status === "ADMIN_DISABLED") {
       return this.syncEntry(off, null, undefined, "disabled by Amboss support — only Amboss can enable it again");
     }
+    this.rememberPrice(off);
     let control = this.settleStatusRecords(off, readAt);
     const sellableNow = ctx.maxOrder(off.minSizeSats);
     const fundable = sellableNow >= Math.max(1, off.minSizeSats);
@@ -3565,7 +3692,11 @@ export class Autopilot {
     const unanswered =
       "the autopilot disabled it for lack of capital, and Amboss's answer never came — the next read of the offer tells whether the disable landed";
     const disabledWhy = (status: string): string =>
-      control.disabledByHandAt
+      control.freeDisabledAt
+        ? !control.manual && this.state.config.sellAutoReprice
+          ? "disabled by the autopilot: Amboss listed it for free (0 ppm + 0 sat) — it is priced and listed again once there is a price for it (auto-pricing), or set one on Market → Sell"
+          : FREE_DISABLED_WHY
+        : control.disabledByHandAt
         ? "disabled by you — the autopilot leaves it disabled; enable it on Market → Sell to list it again"
         : control.autoDisabledAt
           ? lackOfCapital()
@@ -3593,21 +3724,61 @@ export class Autopilot {
       if (r.offer.status !== "ENABLED") return this.syncEntry(r.offer, wanted, r.write ?? undefined, disabledWhy(r.offer.status));
       off = r.offer;
     }
+    // Taken off the market for being free, its price the autopilot's
+    // (auto-pricing on, terms not the operator's): its price goes back on and
+    // it is listed again once there is one — as capital safety lists again
+    // what it disabled. (On the upgrade from 0.8.0, an offer the first run
+    // found at 0 ppm + 0 sat with the market report down would otherwise
+    // have stayed off for good.)
+    if (off.status === "DISABLED" && control.freeDisabledAt && !control.manual && this.state.config.sellAutoReprice && fundable) {
+      const listed = await this.relistFree(key, off, ctx, out);
+      if (listed) {
+        off = listed;
+        control = this.offerControlOf(off.id);
+      }
+    }
     if (off.status !== "ENABLED") return this.syncEntry(off, null, undefined, disabledWhy(off.status));
 
     const want = this.wantedTerms(off, ctx, !!control.manual);
+    if (listedForFree(want.fields)) {
+      // Never a price of nothing — not kept as the wanted price, never sent.
+      // (A run that keeps "what Amboss has" kept 0 ppm + 0 sat: 0.8.0's
+      // partial writes left offers there.) The price the offer last had goes
+      // back on; with none known — or one the operator owns — it is taken off
+      // the market until it has a price.
+      const last = control.manual ? null : this.priceForFree(off, ctx, want.fields.minBlockLength);
+      if (!last) {
+        const r = await this.disableFree(key, off, out);
+        return this.syncEntry(
+          r.offer,
+          null,
+          r.write ?? undefined,
+          r.offer.status === "ENABLED" ? `listed for free (0 ppm + 0 sat) and not yet taken off the market: ${r.write?.error ?? "left for the next check"}` : FREE_DISABLED_WHY,
+        );
+      }
+      want.fields.feeRatePpm = last.feeRatePpm;
+      want.fields.baseFeeSats = last.baseFeeSats;
+      want.reasons.push(
+        `${last.engine ? "priced at the engine's" : "price put back to the last one it had,"} ${fmtSat(last.feeRatePpm)} ppm + ${fmtSat(last.baseFeeSats)} sat (Amboss listed it at 0 ppm + 0 sat)`,
+      );
+    }
     if (want.notes.length) notes.push(`offer ${off.id.slice(0, 8)}…: ${want.notes.join("; ")}`);
-    const update = termsUpdate(off, want.fields);
-    if (!update) {
+    const changed = termsChanges(off, want.fields);
+    if (changed.length === 0) {
       // Amboss already has exactly this: the cut memory matches it as is.
       this.keepCut(off.id, want.cut);
       return this.syncEntry(off, want.fields, undefined, want.notes);
     }
+    // Every term is sent, the unchanged ones too: Amboss resets what an update
+    // leaves out (updateOffer) — sending only the new caps once listed this
+    // node's offer at 0 ppm.
+    const terms = fullTerms(want.fields, off);
     const write: OfferWrite = {
       at: new Date().toISOString(),
       by: "autopilot",
       action: "update",
-      fields: ambossFields(update),
+      fields: ambossFields(terms),
+      changed,
       ok: false,
       reason: want.reasons.join("; "),
     };
@@ -3627,21 +3798,12 @@ export class Autopilot {
       // it, and the wait for another write to this offer, take a while.
       const stop = this.stopWhy("sellEnabled");
       if (stop) return { stopped: stop };
-      try {
-        write.ok = await updateOffer(key, off.id, update);
-        if (!write.ok) write.error = "Amboss did not apply the update (success: false)";
-      } catch (err) {
-        write.error = errText(err);
-      }
-      if (write.ok) {
-        // Read it back: "success" is Amboss's word; the stored offer is the proof.
-        const read = await getMyOffer(key, off.id).catch(() => null);
-        if (read) {
-          after = read;
-          write.verified = termsMatch(read, update);
-          if (!write.verified) write.error = "Amboss answered success, but the offer reads back different";
-        }
-      }
+      // What LightningMate doesn't set, as Amboss has it now: an edit of a
+      // buyer condition on amboss.tech since this run read the offer stands.
+      const now = fresh ? { ...terms, conditions: fresh.conditions, onchainPriority: fresh.onchainPriority, onchainMultiplier: fresh.onchainMultiplier } : terms;
+      write.fields = ambossFields(now);
+      const read = await this.writeTerms(key, off.id, now, write, fresh ?? off);
+      if (read) after = read;
       return null;
     });
     if (outcome && "stopped" in outcome) return this.syncEntry(off, want.fields, undefined, [...want.notes, `not changed: ${outcome.stopped}`]);
@@ -3659,11 +3821,74 @@ export class Autopilot {
     // landed (a failed one left the offer — and the old memory — as it was).
     if (ok) this.keepCut(off.id, want.cut);
     if (ok) {
-      console.log(`[autopilot] updated offer ${off.id}: ${Object.entries(write.fields).map(([k, v]) => `${k}=${v}`).join(", ")} (${write.reason})`);
+      console.log(`[autopilot] updated offer ${off.id}: ${changed.map((k) => `${k}=${write.fields[k]}`).join(", ")} (${write.reason})`);
     } else {
       console.warn(`[autopilot] offer ${off.id} update failed: ${write.error}`);
     }
     return this.syncEntry(after, want.fields, write, want.notes);
+  }
+
+  /**
+   * Send an offer's full terms and read them back (inside withOffer). Amboss's
+   * "success" is its word; the stored offer is the proof, compared on EVERY
+   * term. Held differently, the same terms go out once more at once — not at
+   * the next run half an hour later, while the offer may be listed at a price
+   * nobody chose. Still different: the write is unverified, with the
+   * differences named (the offer upkeep's alert, offerAlerts). Returns the
+   * offer as read back last (null: it couldn't be read).
+   */
+  private async writeTerms(
+    key: string,
+    offerId: string,
+    terms: OfferTerms,
+    write: OfferWrite,
+    before?: Pick<MyOffer, "lockedSats" | "filledOrders">,
+  ): Promise<MyOffer | null> {
+    if (listedForFree(terms)) {
+      // Never sent, whoever asks: it would list the offer for free.
+      write.ok = false;
+      write.error = "not sent: a price of 0 ppm + 0 sat would list the offer for free";
+      return null;
+    }
+    let read: MyOffer | null = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        write.ok = await updateOffer(key, offerId, terms);
+        write.error = write.ok ? undefined : "Amboss did not apply the update (success: false)";
+      } catch (err) {
+        write.ok = false;
+        write.error = errText(err);
+      }
+      if (!write.ok) return read;
+      read = await getMyOffer(key, offerId).catch(() => null);
+      if (!read) {
+        write.verified = undefined;
+        return null;
+      }
+      // The total comes back as sent — a new order's lock, or one released
+      // without a sale, moves only what is available — unless a sale
+      // completed in between (Amboss counts it filled): then it may be lower,
+      // by up to what was locked before, and is never resent higher.
+      const sale = before !== undefined && read.filledOrders > before.filledOrders;
+      const lowest = sale && before ? Math.max(0, terms.totalSizeSats - before.lockedSats) : terms.totalSizeSats;
+      const off = termsMismatch(read, terms, [lowest, terms.totalSizeSats]);
+      write.verified = off.length === 0;
+      if (write.verified) {
+        this.rememberPrice(read);
+        if (attempt > 1) write.reason = `${write.reason ? `${write.reason} — ` : ""}stored on the second try (the first read back different)`;
+        return read;
+      }
+      write.error = `Amboss answered success, but the offer reads back different: ${off.join("; ")}`;
+      // The switch, live, before the second send (the reads take a while).
+      if (attempt === 1 && this.stopWhy("sellEnabled")) return read;
+      // Once more: a cut that didn't land is sent again, and so is a cut given
+      // back — but after a sale never more than Amboss lists now, so what
+      // went into a channel is not listed back in.
+      terms = { ...terms, totalSizeSats: sale ? Math.min(terms.totalSizeSats, read.totalSizeSats) : terms.totalSizeSats };
+      before = { lockedSats: read.lockedSats, filledOrders: read.filledOrders };
+    }
+    console.warn(`[autopilot] offer ${offerId}: ${write.error}`);
+    return read;
   }
 
   /**
@@ -3690,11 +3915,13 @@ export class Autopilot {
     if (off.status === "ENABLED") {
       if (older(next.autoDisabledAt)) next.autoDisabledAt = undefined;
       if (older(next.disabledByHandAt)) next.disabledByHandAt = undefined;
+      if (older(next.freeDisabledAt)) next.freeDisabledAt = undefined;
     }
     const changed =
       next.autoDisabledAt !== control.autoDisabledAt ||
       next.disabledByHandAt !== control.disabledByHandAt ||
-      next.autoDisablingAt !== control.autoDisablingAt;
+      next.autoDisablingAt !== control.autoDisablingAt ||
+      next.freeDisabledAt !== control.freeDisabledAt;
     if (changed) this.setOfferControl(off.id, next);
     return this.offerControlOf(off.id);
   }
@@ -3748,6 +3975,11 @@ export class Autopilot {
       // Changed since the listing was read (a click, amboss.tech): decided
       // afresh at the next run, on what Amboss shows then.
       if (capitalStatus(fresh.status, cap.fundable, this.offerControlOf(off.id)) !== want) return { offer: fresh, write: null };
+      // Never listed again without a price (listedForFree): it stays disabled
+      // until it has one — the operator's to set on Market → Sell.
+      if (want === "ENABLED" && listedForFree(fresh)) {
+        return { offer: fresh, write: null, stopped: "it has no price on Amboss (0 ppm + 0 sat) — listed again once it has one" };
+      }
       // Liquidity provision switched off (or all automation paused) since the
       // run began: no flip — the operator was asked what to do with listed
       // offers when they paused, and an offer is listed again only while
@@ -3937,6 +4169,7 @@ export class Autopilot {
       ...(control.autoDisabledAt ? { autoDisabledAt: control.autoDisabledAt } : {}),
       ...(control.autoDisablingAt ? { autoDisablingAt: control.autoDisablingAt } : {}),
       ...(control.disabledByHandAt ? { disabledByHandAt: control.disabledByHandAt } : {}),
+      ...(control.freeDisabledAt ? { freeDisabledAt: control.freeDisabledAt } : {}),
     };
     if (Object.keys(clean).length) (this.state.offerControl ??= {})[offerId] = clean;
     else if (this.state.offerControl) delete this.state.offerControl[offerId];
@@ -3972,6 +4205,7 @@ export class Autopilot {
       // by the click.
       autoDisabledAt: undefined,
       autoDisablingAt: undefined,
+      freeDisabledAt: undefined,
       disabledByHandAt: status === "DISABLED" ? new Date().toISOString() : undefined,
     });
     this.persist();
@@ -4391,7 +4625,292 @@ export class Autopilot {
     }
     if (sells) this.recordLanePass(sells);
     // After the pass is on record, never inside it (see followPurchases).
+    await this.guardOfferPrices();
     await this.followPurchases();
+  }
+
+  /** The order lane's accept floor, cached (saleFeeFloorSats). */
+  private saleFloor: { at: number; sats: number } | null = null;
+
+  /**
+   * The smallest fee the order lane accepts an order for: what opening and
+   * closing its channel cost on chain right now, after the service fee — an
+   * order that pays less loses money, however it came to be priced so. Not the
+   * minimum profit on top: that is the engine's pricing floor, and refusing a
+   * profitable order inside the offer's own window costs seller score. Live
+   * from LND's fee estimate (cached ten minutes, whatever the switches say);
+   * without one, at the minimum relay fee — a floor no real order is below.
+   */
+  async saleFeeFloorSats(): Promise<number> {
+    if (this.saleFloor && Date.now() - this.saleFloor.at < SALE_FLOOR_TTL_MS) return this.saleFloor.sats;
+    const oc = await onchainCosts(this.readLnd);
+    const perVbyte = oc.feePerVbyte !== null && Number.isFinite(oc.feePerVbyte) && oc.feePerVbyte > 0 ? oc.feePerVbyte : 1;
+    const sats = saleCostFloorSats({
+      onchainOpenCostSat: Math.ceil(perVbyte * OPEN_TX_VBYTES),
+      onchainCloseCostSat: Math.ceil(perVbyte * CLOSE_TX_VBYTES),
+      minNetLeaseProfitSat: 0,
+      serviceFeeRate: saleFeeConfig().bps / 10_000,
+    });
+    if (oc.feePerVbyte !== null) this.saleFloor = { at: Date.now(), sats };
+    return sats;
+  }
+
+  /** An offer's price, kept while it isn't free — what goes back on when
+   *  Amboss lists it for free (the upkeep and the order lane's guard). */
+  private rememberPrice(o: Pick<MyOffer, "id" | "feeRatePpm" | "baseFeeSats">): void {
+    if (listedForFree(o)) return;
+    const prev = this.state.offerPrices?.[o.id];
+    if (prev && prev.feeRatePpm === o.feeRatePpm && prev.baseFeeSats === o.baseFeeSats) return;
+    this.state.offerPrices = { ...(this.state.offerPrices ?? {}), [o.id]: { feeRatePpm: o.feeRatePpm, baseFeeSats: o.baseFeeSats, at: new Date().toISOString() } };
+  }
+
+  /**
+   * The price for an offer Amboss lists for free, its terms not the
+   * operator's: the engine's (auto-pricing on) whether or not it calls it a
+   * move — it never does for an offer it judges unlisted or not worth moving —
+   * when it is for the offer's lease; else the price the offer last had.
+   * Null: none known (it is taken off the market then).
+   */
+  private priceForFree(off: MyOffer, ctx: OfferCtx, leaseBlocks: number): { feeRatePpm: number; baseFeeSats: number; engine: boolean } | null {
+    const t = ctx.target(off);
+    if (t && !listedForFree({ feeRatePpm: t.fee, baseFeeSats: t.base }) && priceFitsLease(t.lease, leaseBlocks)) {
+      return { feeRatePpm: t.fee, baseFeeSats: t.base, engine: true };
+    }
+    const last = this.state.offerPrices?.[off.id];
+    return last ? { feeRatePpm: last.feeRatePpm, baseFeeSats: last.baseFeeSats, engine: false } : null;
+  }
+
+  /**
+   * An offer the autopilot took off the market for being free, priced by the
+   * autopilot: once there is a price for it (the engine's, else the one it
+   * last had), every term is written — read back, checked — and only then is
+   * it listed again, its record cleared. Null: it stays off (no price yet, a
+   * write Amboss didn't keep, the flip not landing, or the switch going off).
+   */
+  private async relistFree(key: string, off: MyOffer, ctx: OfferCtx, out: AutopilotSell[]): Promise<MyOffer | null> {
+    const want = this.wantedTerms(off, ctx, false);
+    if (listedForFree(want.fields)) {
+      const price = this.priceForFree(off, ctx, want.fields.minBlockLength);
+      if (!price) return null;
+      want.fields.feeRatePpm = price.feeRatePpm;
+      want.fields.baseFeeSats = price.baseFeeSats;
+    }
+    return this.withOffer(off.id, async () => {
+      const fresh = await getMyOffer(key, off.id).catch(() => null);
+      const control = this.offerControlOf(off.id);
+      if (!fresh || fresh.status !== "DISABLED" || !control.freeDisabledAt || control.manual || this.stopWhy("sellEnabled")) return null;
+      const terms = fullTerms(want.fields, fresh);
+      const write: OfferWrite = {
+        at: new Date().toISOString(),
+        by: "autopilot",
+        action: "update",
+        fields: ambossFields(terms),
+        changed: termsChanges(fresh, want.fields),
+        ok: false,
+        reason: `its price, ${fmtSat(terms.feeRatePpm)} ppm + ${fmtSat(terms.baseFeeSats)} sat, back on — it was taken off the market for being listed for free`,
+      };
+      const read = await this.writeTerms(key, off.id, terms, write, fresh);
+      const priced = write.ok && write.verified === true;
+      out.push({ orderId: off.id, action: "reprice", sizeSats: terms.maxSizeSats, ok: priced, ...(priced ? {} : { error: write.error }) });
+      if (!priced || this.stopWhy("sellEnabled")) return null;
+      // Listed meanwhile (a click, amboss.tech): the toggle would turn it off.
+      if (read?.status === "ENABLED") {
+        this.setOfferControl(off.id, { ...this.offerControlOf(off.id), freeDisabledAt: undefined });
+        return read;
+      }
+      let status: string | null;
+      try {
+        status = await toggleOffer(key, off.id);
+      } catch (err) {
+        status = (await getMyOffer(key, off.id).catch(() => null))?.status ?? null;
+        if (status !== "ENABLED") out.push({ orderId: off.id, action: "enable", sizeSats: terms.totalSizeSats, ok: false, error: errText(err) });
+      }
+      if (status !== "ENABLED") return null;
+      this.setOfferControl(off.id, { ...this.offerControlOf(off.id), freeDisabledAt: undefined });
+      out.push({ orderId: off.id, action: "enable", sizeSats: terms.totalSizeSats, ok: true });
+      console.log(`[autopilot] offer ${off.id} listed again: ${write.reason}`);
+      return { ...(read ?? fresh), status: "ENABLED" };
+    });
+  }
+
+  /**
+   * Take an offer Amboss lists for free off the market — whoever owns its
+   * terms: like capital safety, a change of its status, never of its terms. It
+   * is not listed again by the autopilot (freeDisabledAt); the operator gives
+   * it a price and enables it (an enable of a free offer is refused). Amboss's
+   * toggle flips whatever the status is, so it is sent only on a fresh read
+   * inside the offer's lock that still shows it listed and free.
+   */
+  private disableFree(key: string, off: MyOffer, out: AutopilotSell[]): Promise<{ offer: MyOffer; write: OfferWrite | null }> {
+    return this.withOffer(off.id, async () => {
+      const fresh = await getMyOffer(key, off.id).catch(() => null);
+      if (!fresh || fresh.status !== "ENABLED" || !listedForFree(fresh)) return { offer: fresh ?? off, write: null };
+      if (this.stopWhy("sellEnabled")) return { offer: fresh, write: null };
+      const write: OfferWrite = {
+        at: new Date().toISOString(),
+        by: "autopilot",
+        action: "disable",
+        fields: { offer_id: off.id },
+        ok: false,
+        reason: FREE_DISABLE_REASON,
+      };
+      // The intent first: should the answer — and the read after it — be
+      // lost, the record still says why it is off; a later read that shows it
+      // listed clears it (settleStatusRecords).
+      this.setOfferControl(off.id, { ...this.offerControlOf(off.id), freeDisabledAt: write.at });
+      this.persist();
+      let status: string | null;
+      try {
+        status = await toggleOffer(key, off.id);
+      } catch (err) {
+        write.error = errText(err);
+        status = (await getMyOffer(key, off.id).catch(() => null))?.status ?? null;
+      }
+      write.ok = status === "DISABLED";
+      write.verified = status === null ? undefined : write.ok;
+      if (status === "ENABLED") {
+        // It didn't land: no record of a disable that didn't happen.
+        this.setOfferControl(off.id, { ...this.offerControlOf(off.id), freeDisabledAt: undefined });
+      }
+      if (write.ok) {
+        write.error = undefined;
+        console.warn(`[autopilot] offer ${off.id} disabled: ${FREE_DISABLE_REASON}`);
+      } else if (!write.error) {
+        // Another flip crossed this one: nothing more is sent now — the next
+        // check reads it again.
+        write.error = `Amboss reports the offer ${status ?? "unknown"}, not DISABLED`;
+      }
+      out.push({ orderId: off.id, action: "disable", sizeSats: fresh.totalSizeSats, ok: write.ok, error: write.ok ? FREE_DISABLE_REASON : write.error });
+      this.persist();
+      return { offer: { ...fresh, status: status ?? fresh.status }, write };
+    });
+  }
+
+  /** When guardOfferPrices last read the listed offers (ms). */
+  private offerGuardAt = 0;
+  /** guardOfferPrices is reading or writing an offer (waitIdle waits for it). */
+  private guarding = false;
+
+  /**
+   * Between the half-hourly runs, every couple of minutes from the order lane:
+   * a listed offer of this node that Amboss shows for FREE (0 ppm + 0 sat) is
+   * dealt with at once, not at the next run. (On 2026-10-23 an offer Amboss
+   * held at 0 ppm stayed listed for half an hour, and an order was matched to
+   * it at 0 sats.) The price it last had goes back on — onto the sizes Amboss
+   * has now — unless the operator owns its terms or no price is known: then it
+   * is taken off the market (disableFree). Any other change of price is left
+   * to the next run, which decides as it always does — the guard never
+   * rewrites a price someone chose (an edit on amboss.tech included). Not
+   * while a run is under way (it writes the offers itself), with selling off
+   * or all automation paused (nothing is written then — the alert says it),
+   * or without a key.
+   */
+  private async guardOfferPrices(): Promise<void> {
+    if (this.guarding || this.shuttingDown || this.running || !this.writeLnd || !this.amboss.hasKey()) return;
+    if (Date.now() - this.offerGuardAt < OFFER_GUARD_INTERVAL_MS) return;
+    if (this.stopWhy("sellEnabled")) return;
+    const listed = (this.state.offerSync?.offers ?? []).filter((e) => e.amboss.status === "ENABLED");
+    if (listed.length === 0) return;
+    this.offerGuardAt = Date.now();
+    this.guarding = true;
+    try {
+      const key = this.amboss.getKey();
+      for (const e of listed) {
+        if (this.shuttingDown || this.running) return;
+        try {
+          await this.guardOfferPrice(key, e.offerId);
+        } catch (err) {
+          console.warn(`[autopilot] offer ${e.offerId}: price check failed: ${errText(err)}`);
+        }
+      }
+    } finally {
+      this.guarding = false;
+    }
+  }
+
+  private async guardOfferPrice(key: string, offerId: string): Promise<void> {
+    const live = await getMyOffer(key, offerId);
+    this.rememberPrice(live);
+    this.noteOfferRead(live);
+    if (live.status !== "ENABLED" || !listedForFree(live)) return;
+    // The price to put back: the one wanted for it, else the one it last had
+    // — never for an offer whose terms the operator owns.
+    const priceOf = (): { feeRatePpm: number; baseFeeSats: number } | null => {
+      if (this.offerControlOf(offerId).manual) return null;
+      // The price it last had — every read and verified write refresh it, so
+      // a change made since the last run (on amboss.tech, say) is the one
+      // put back; the run's wish only where none is known.
+      const last = this.state.offerPrices?.[offerId];
+      if (last) return last;
+      const wanted = this.state.offerSync?.offers.find((x) => x.offerId === offerId)?.wanted ?? null;
+      return wanted && !listedForFree(wanted) ? wanted : null;
+    };
+    const out: AutopilotSell[] = [];
+    const price = priceOf();
+    if (!price) {
+      const r = await this.disableFree(key, live, out);
+      this.noteOfferRead(r.offer, r.write ?? undefined);
+      if (out.length) this.recordLanePass(out);
+      return;
+    }
+    let putBack = false;
+    await this.withOffer(offerId, async () => {
+      // Afresh, inside the lock: an edit or another write may have landed.
+      const fresh = await getMyOffer(key, offerId).catch(() => null);
+      if (!fresh) return;
+      if (fresh.status !== "ENABLED" || !listedForFree(fresh)) {
+        this.noteOfferRead(fresh);
+        return;
+      }
+      if (this.running || this.stopWhy("sellEnabled")) return;
+      // The autopilot's promise too, when it gives one (Amboss drops it with the price).
+      const wanted = this.state.offerSync?.offers.find((x) => x.offerId === offerId)?.wanted ?? null;
+      const terms: OfferTerms = {
+        ...termsOf(fresh),
+        feeRatePpm: price.feeRatePpm,
+        baseFeeSats: price.baseFeeSats,
+        feeRateCapPpm: wanted?.feeRateCapPpm ?? fresh.feeRateCapPpm,
+        baseFeeCapSats: wanted?.baseFeeCapSats ?? fresh.baseFeeCapSats,
+      };
+      const write: OfferWrite = {
+        at: new Date().toISOString(),
+        by: "autopilot",
+        action: "update",
+        fields: ambossFields(terms),
+        changed: termsChanges(fresh, { ...fieldsOf(fresh), ...terms }),
+        ok: false,
+        reason: `Amboss listed it for free (0 ppm + 0 sat) — its price, ${fmtSat(price.feeRatePpm)} ppm + ${fmtSat(price.baseFeeSats)} sat, put back at once`,
+      };
+      const read = await this.writeTerms(key, offerId, terms, write, fresh);
+      this.noteOfferRead(read ?? fresh, write);
+      putBack = write.ok && write.verified === true;
+      out.push({ orderId: offerId, action: "reprice", sizeSats: fresh.maxSizeSats, ok: putBack, ...(putBack ? {} : { error: write.error }) });
+      if (putBack) console.log(`[autopilot] offer ${offerId}: ${write.reason}`);
+    });
+    if (!putBack) {
+      // Couldn't be put back: off the market rather than listed for free.
+      const now = await getMyOffer(key, offerId).catch(() => null);
+      if (now && now.status === "ENABLED" && listedForFree(now) && !this.running && !this.stopWhy("sellEnabled")) {
+        const r = await this.disableFree(key, now, out);
+        this.noteOfferRead(r.offer, r.write ?? undefined);
+      }
+    }
+    if (out.length) this.recordLanePass(out);
+  }
+
+  /** A fresh read of an offer (and the write that led to it) into its sync
+   *  record — what the alerts and Market → Sell show — keeping what is wanted
+   *  for it. Saved only when something changed. */
+  private noteOfferRead(off: MyOffer, write?: OfferWrite): void {
+    const sync = this.state.offerSync;
+    const i = sync?.offers.findIndex((x) => x.offerId === off.id) ?? -1;
+    if (!sync || i < 0) return;
+    const before = sync.offers[i];
+    const entry = this.syncEntry(off, before.wanted, write);
+    if (!write && JSON.stringify(entry.amboss) === JSON.stringify(before.amboss)) return;
+    sync.offers[i] = { ...entry, checkedAt: new Date().toISOString() };
+    this.forgetPageReport();
+    this.persist();
   }
 
   /** The lane pass's line in the run history. Skips are explained on each

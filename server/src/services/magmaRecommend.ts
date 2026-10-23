@@ -336,6 +336,18 @@ const NEED_MULTIPLIER: Record<NodeNeed, number> = {
   balanced: 1,
 };
 
+/** The smallest lease fee a sale pays for itself with: opening and closing the
+ *  channel plus the minimum profit, after the service fee. The size floor at a
+ *  given price and the order lane's accept floor both come from it. */
+export function saleCostFloorSats(c: {
+  onchainOpenCostSat: number;
+  onchainCloseCostSat: number;
+  minNetLeaseProfitSat: number;
+  serviceFeeRate: number;
+}): number {
+  return Math.ceil((c.onchainOpenCostSat + c.onchainCloseCostSat + c.minNetLeaseProfitSat) / Math.max(0.01, 1 - c.serviceFeeRate));
+}
+
 export async function getMagmaRecommendations(
   lnd: AuthenticatedLnd,
   apiKey: string,

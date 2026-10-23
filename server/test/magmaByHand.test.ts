@@ -314,7 +314,7 @@ test("an order the lane recorded first, then accepted by hand with the accept fa
   const sale = s.magma.addSale({ buyerPubkey: BUYER, sizeSats: 8_000_000, feeSeller: "0" });
   await s.autopilot.pollSellOrders();
   const first = entryOnDisk(s.dir, sale.id);
-  assert.deepEqual([first?.via, first?.decision?.reason], ["autopilot", "waiting for Amboss to report the order's fee"]);
+  assert.deepEqual([first?.via, first?.decision?.reason], ["autopilot", "Amboss reports no fee for this order yet — looked at again in a minute"]);
   s.magma.sales.get(sale.id)!.feeSeller = "12345";
   s.node.failNext("default.walletBalance", "transport is closing");
   assert.equal((await s.desk.accept(sale.id)).ok, false);
@@ -1181,7 +1181,7 @@ test("'done' only for what the order is: a Reject on an order that timed out, an
     const sale = s.magma.addSale({ buyerPubkey: BUYER, feeSeller: "0", timeout: IN_AN_HOUR() });
     await s.autopilot.pollSellOrders();
     const seen = entryOnDisk(s.dir, sale.id);
-    assert.deepEqual([seen?.phase, seen?.decision?.reason], ["seen", "waiting for Amboss to report the order's fee"]);
+    assert.deepEqual([seen?.phase, seen?.decision?.reason], ["seen", "Amboss reports no fee for this order yet — looked at again in a minute"]);
     s.magma.setStatus(sale.id, "WAITING_FOR_BUYER_PAYMENT");
     assert.deepEqual(
       await s.desk.accept(sale.id),

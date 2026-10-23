@@ -65,6 +65,10 @@ export interface FakeOfferState {
   minBlockLength: number;
   feeRateCap: string | null;
   baseFeeCap: string | null;
+  /** Buyer conditions and on-chain settings (set on amboss.tech). */
+  conditions?: { condition: string; operator: string; value: string }[];
+  onchainPriority?: string | null;
+  onchainMultiplier?: number | null;
 }
 
 /** What a mutation does. "throw": HTTP 502. "hang": no answer (the caller's
@@ -414,6 +418,9 @@ export class FakeMagma {
               minBlockLength: Number(input.min_block_length),
               feeRateCap: input.fee_rate_cap === undefined ? null : String(input.fee_rate_cap),
               baseFeeCap: input.base_fee_cap === undefined ? null : String(input.base_fee_cap),
+              conditions: Array.isArray(input.conditions) ? (input.conditions as FakeOfferState["conditions"]) : [],
+              onchainPriority: input.onchain_priority === undefined ? null : String(input.onchain_priority),
+              onchainMultiplier: input.onchain_multiplier === undefined ? null : Number(input.onchain_multiplier),
             });
             this.lastCreated = created.id;
             return true;
@@ -429,11 +436,19 @@ export class FakeMagma {
             if (input.total_size !== undefined) o.totalSats = Number(input.total_size);
             if (input.min_size !== undefined) o.minSats = Number(input.min_size);
             if (input.max_size !== undefined) o.maxSats = Number(input.max_size);
-            if (input.fee_rate !== undefined) o.feeRatePpm = Number(input.fee_rate);
-            if (input.base_fee !== undefined) o.baseFeeSats = Number(input.base_fee);
             if (input.min_block_length !== undefined) o.minBlockLength = Number(input.min_block_length);
-            if (input.fee_rate_cap !== undefined) o.feeRateCap = String(input.fee_rate_cap);
-            if (input.base_fee_cap !== undefined) o.baseFeeCap = String(input.base_fee_cap);
+            // The price and the promise are NOT kept when left out — as live
+            // Amboss does (2026-10-23): an update with only the caps set the
+            // fee rate to 0, one with the fee rate cleared the caps.
+            o.feeRatePpm = input.fee_rate === undefined ? 0 : Number(input.fee_rate);
+            o.baseFeeSats = input.base_fee === undefined ? 0 : Number(input.base_fee);
+            o.feeRateCap = input.fee_rate_cap === undefined ? null : String(input.fee_rate_cap);
+            o.baseFeeCap = input.base_fee_cap === undefined ? null : String(input.base_fee_cap);
+            // Assumed to behave like the price and the promise (not seen live):
+            // left out, they are gone — so LightningMate must send them back.
+            o.conditions = Array.isArray(input.conditions) ? (input.conditions as FakeOfferState["conditions"]) : [];
+            o.onchainPriority = input.onchain_priority === undefined ? null : String(input.onchain_priority);
+            o.onchainMultiplier = input.onchain_multiplier === undefined ? null : Number(input.onchain_multiplier);
             return true;
           },
           (ok) => ({ market: { offer: { update: { success: ok } } } }),
@@ -620,6 +635,9 @@ export class FakeMagma {
       locked_amount: size(o.lockedSats),
       fees: { fixed: sats(o.baseFeeSats), variable: sats(o.feeRatePpm) },
       promises: { min_block_length: o.minBlockLength, fee_rate_cap: o.feeRateCap, base_fee_cap: o.baseFeeCap },
+      conditions: o.conditions ?? [],
+      onchain_priority: o.onchainPriority ?? null,
+      onchain_multiplier: o.onchainMultiplier ?? null,
     };
   }
 }

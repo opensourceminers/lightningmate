@@ -70,8 +70,21 @@ export interface MyOffer {
   /** Routing-fee caps promised for the lease (null = none promised). */
   feeRateCapPpm: number | null;
   baseFeeCapSats: number | null;
+  /** Conditions a buyer's node must meet (set on amboss.tech; LightningMate
+   *  keeps them as they are). */
+  conditions: OfferCondition[];
+  /** On-chain fee settings of the offer (amboss.tech; kept as they are). */
+  onchainPriority: string | null;
+  onchainMultiplier: number | null;
   filledOrders: number;
   createdAt: string;
+}
+
+/** One buyer condition of an offer (Amboss's OfferConditionsInput). */
+export interface OfferCondition {
+  condition: string;
+  operator: string;
+  value: string;
 }
 
 export const MY_OFFER_IDS_QUERY = `query MyOfferIds($page: PageInput) {
@@ -88,6 +101,8 @@ export const MY_OFFER_QUERY = `query MyOffer($id: String!) {
     locked_amount { satoshi { sats } }
     fees { fixed { sats } variable { sats } }
     promises { min_block_length fee_rate_cap base_fee_cap }
+    conditions { condition operator value }
+    onchain_priority onchain_multiplier
   } } } }
 }`;
 
@@ -104,6 +119,9 @@ interface RawMyOffer {
   locked_amount: Sats;
   fees: { fixed: { sats: string }; variable: { sats: string } };
   promises: { min_block_length: number; fee_rate_cap: string | null; base_fee_cap: string | null };
+  conditions?: OfferCondition[] | null;
+  onchain_priority?: string | null;
+  onchain_multiplier?: number | null;
 }
 
 function toMyOffer(o: RawMyOffer): MyOffer {
@@ -123,6 +141,9 @@ function toMyOffer(o: RawMyOffer): MyOffer {
     minBlockLength: Number(o.promises.min_block_length) || 0,
     feeRateCapPpm: numOrNull(o.promises.fee_rate_cap),
     baseFeeCapSats: numOrNull(o.promises.base_fee_cap),
+    conditions: (o.conditions ?? []).map((c) => ({ condition: c.condition, operator: c.operator, value: String(c.value) })),
+    onchainPriority: o.onchain_priority ?? null,
+    onchainMultiplier: typeof o.onchain_multiplier === "number" && Number.isFinite(o.onchain_multiplier) ? o.onchain_multiplier : null,
     filledOrders: Number(o.filled_orders) || 0,
     createdAt: o.created_at,
   };
@@ -171,7 +192,7 @@ export async function getMyOffers(apiKey: string, ownPubkey?: string): Promise<M
 }
 
 /** The offer fields this app sets. Sizes in sats, fee rate in ppm, base fee
- *  in sats, lease in blocks. */
+ *  in sats, lease in blocks. Every write sends all of them (see updateOffer). */
 export interface OfferTerms {
   totalSizeSats: number;
   minSizeSats: number;
@@ -179,21 +200,52 @@ export interface OfferTerms {
   feeRatePpm: number;
   baseFeeSats: number;
   minBlockLength: number;
-  /** Routing-fee caps promised for the lease (optional). */
-  feeRateCapPpm?: number;
-  baseFeeCapSats?: number;
+  /** Routing-fee caps promised for the lease (null: none promised). */
+  feeRateCapPpm: number | null;
+  baseFeeCapSats: number | null;
+  /** What LightningMate doesn't set but must send back as it is (an update
+   *  that leaves a term out may reset it): buyer conditions, on-chain fee
+   *  settings. None / null for an offer it creates. */
+  conditions: OfferCondition[];
+  onchainPriority: string | null;
+  onchainMultiplier: number | null;
 }
 
-const offerInput = (p: Partial<OfferTerms>): Record<string, number> => {
-  const out: Record<string, number> = {};
-  if (p.totalSizeSats !== undefined) out.total_size = p.totalSizeSats;
-  if (p.minSizeSats !== undefined) out.min_size = p.minSizeSats;
-  if (p.maxSizeSats !== undefined) out.max_size = p.maxSizeSats;
-  if (p.feeRatePpm !== undefined) out.fee_rate = p.feeRatePpm;
-  if (p.baseFeeSats !== undefined) out.base_fee = p.baseFeeSats;
-  if (p.minBlockLength !== undefined) out.min_block_length = p.minBlockLength;
-  if (p.feeRateCapPpm !== undefined) out.fee_rate_cap = p.feeRateCapPpm;
-  if (p.baseFeeCapSats !== undefined) out.base_fee_cap = p.baseFeeCapSats;
+/** The terms LightningMate leaves as they are, for an offer it creates. */
+export const NO_EXTRA_TERMS = { conditions: [] as OfferCondition[], onchainPriority: null, onchainMultiplier: null };
+
+/** An offer's complete terms as Amboss has them now — the starting point of
+ *  any write that changes some of them. */
+export const termsOf = (o: MyOffer): OfferTerms => ({
+  totalSizeSats: o.totalSizeSats,
+  minSizeSats: o.minSizeSats,
+  maxSizeSats: o.maxSizeSats,
+  feeRatePpm: o.feeRatePpm,
+  baseFeeSats: o.baseFeeSats,
+  minBlockLength: o.minBlockLength,
+  feeRateCapPpm: o.feeRateCapPpm,
+  baseFeeCapSats: o.baseFeeCapSats,
+  conditions: o.conditions.map((c) => ({ ...c })),
+  onchainPriority: o.onchainPriority,
+  onchainMultiplier: o.onchainMultiplier,
+});
+
+const offerInput = (p: OfferTerms): Record<string, unknown> => {
+  const out: Record<string, unknown> = {
+    total_size: p.totalSizeSats,
+    min_size: p.minSizeSats,
+    max_size: p.maxSizeSats,
+    fee_rate: p.feeRatePpm,
+    base_fee: p.baseFeeSats,
+    min_block_length: p.minBlockLength,
+  };
+  // No promise is sent as none: Amboss clears a cap an update leaves out.
+  if (p.feeRateCapPpm !== null) out.fee_rate_cap = p.feeRateCapPpm;
+  if (p.baseFeeCapSats !== null) out.base_fee_cap = p.baseFeeCapSats;
+  // Sent back as they are (none: left out, as an offer that has none).
+  if (p.conditions.length) out.conditions = p.conditions.map((c) => ({ condition: c.condition, operator: c.operator, value: c.value }));
+  if (p.onchainPriority !== null) out.onchain_priority = p.onchainPriority;
+  if (p.onchainMultiplier !== null) out.onchain_multiplier = p.onchainMultiplier;
   return out;
 };
 
@@ -219,14 +271,22 @@ export const UPDATE_OFFER_MUTATION = `mutation UpdateOffer($input: UpdateOfferIn
   market { offer { update(input: $input) { success } } }
 }`;
 
-/** Change an offer. Only the fields given are sent (the Magma API updates
- *  partially). True only when Amboss reports success. */
-export async function updateOffer(apiKey: string, offerId: string, p: Partial<OfferTerms>): Promise<boolean> {
+/**
+ * Replace an offer's terms. ALL of them are sent, every time — Amboss's update
+ * is not partial, whatever its optional inputs suggest. Seen live on
+ * 2026-10-23: an update that sent only the routing-fee caps set the fee rate
+ * to 0 (the offer was listed for free for half an hour, and Amboss matched a
+ * 1.95M sat order to it at 0 sats), and the next one, sending the fee rate,
+ * cleared the caps. Hence `terms` is complete by type (termsOf for the rest).
+ * True only when Amboss reports success; the caller reads the offer back and
+ * compares every field (termsMatch) to know the terms hold.
+ */
+export async function updateOffer(apiKey: string, offerId: string, terms: OfferTerms): Promise<boolean> {
   const data = await ambossGql<{ market: { offer: { update: { success: boolean } } } }>(
     MAGMA_URL,
     UPDATE_OFFER_MUTATION,
     apiKey,
-    { input: { offer_id: offerId, ...offerInput(p) } },
+    { input: { offer_id: offerId, ...offerInput(terms) } },
   );
   return data.market.offer.update.success === true;
 }

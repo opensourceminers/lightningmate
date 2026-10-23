@@ -135,7 +135,7 @@ import { getBtcPrice } from "../services/price.js";
 import { outboundRouting, setOutboundRouting, viaTor, type TorRoute } from "../services/http.js";
 import type { FiatCurrency, SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, FeeMode, OverridesStore } from "../services/overrides.js";
-import { getAlerts, magmaRefusalAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
+import { getAlerts, magmaRefusalAlerts, offerPriceAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
 import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
 import { SlidingWindowLimiter } from "../services/rateLimit.js";
 import { acknowledgeStoreIncident } from "../store.js";
@@ -145,6 +145,7 @@ import { rankBuyOffers, type BuyerFacts } from "../services/magmaBuy.js";
 import { feeTiers, publicBook } from "../services/magmaEligibility.js";
 import {
   checkKey,
+  NO_EXTRA_TERMS,
   createOffer,
   getMyOffer,
   getMyOffers,
@@ -621,7 +622,12 @@ export function createApiRouter(
     "/alerts",
     wrap(async (_req, res) => {
       res.json(
-        await getAlerts(lnd, [...stateAlerts(config.dataDir), ...serviceFeeAlerts(serviceFees), ...magmaRefusalAlerts(autopilot.magma)]),
+        await getAlerts(lnd, [
+          ...stateAlerts(config.dataDir),
+          ...serviceFeeAlerts(serviceFees),
+          ...magmaRefusalAlerts(autopilot.magma),
+          ...offerPriceAlerts(autopilot.offerSyncStatus(), autopilot.actsOnOffers()),
+        ]),
       );
     }),
   );
@@ -2422,7 +2428,11 @@ export function createApiRouter(
   };
 
   /** Offer terms from a request body (sizes in sats, rate in ppm, lease in blocks). */
-  const parseOfferTerms = (b: Fields<OfferTermsRequest>, res: Response): OfferTerms | null => {
+  // The operator's terms; the routing-fee promise is added by the route (D7).
+  const parseOfferTerms = (
+    b: Fields<OfferTermsRequest>,
+    res: Response,
+  ): Omit<OfferTerms, "feeRateCapPpm" | "baseFeeCapSats" | "conditions" | "onchainPriority" | "onchainMultiplier"> | null => {
     const terms = {
       totalSizeSats: Math.floor(Number(b.totalSizeSats)),
       minSizeSats: Math.floor(Number(b.minSizeSats)),
@@ -2461,7 +2471,7 @@ export function createApiRouter(
       if (!parsed) return;
       // Every offer carries the routing-fee promise (D7) — kept by the fee
       // autopilot for each channel sold.
-      const terms: OfferTerms = { ...parsed, ...autopilot.offerFeeCaps() };
+      const terms: OfferTerms = { ...parsed, ...autopilot.offerFeeCaps(), ...NO_EXTRA_TERMS };
       const write: OfferWrite = { at: new Date().toISOString(), by: "manual", action: "create", fields: ambossFields(terms), ok: false };
       let offerId: string;
       try {
@@ -2495,8 +2505,17 @@ export function createApiRouter(
       }
       const parsed = parseOfferTerms(b, res);
       if (!parsed) return;
-      if (!(await ownOffer(id, res))) return;
-      const terms: OfferTerms = { ...parsed, ...autopilot.offerFeeCaps() };
+      const current = await ownOffer(id, res);
+      if (!current) return;
+      // Every term goes out (updateOffer): the buyer conditions and on-chain
+      // settings the form doesn't show, as the offer has them.
+      const terms: OfferTerms = {
+        ...parsed,
+        ...autopilot.offerFeeCaps(),
+        conditions: current.conditions,
+        onchainPriority: current.onchainPriority,
+        onchainMultiplier: current.onchainMultiplier,
+      };
       const write: OfferWrite = { at: new Date().toISOString(), by: "manual", action: "update", fields: ambossFields(terms), ok: false };
       // One write per offer at a time (withOffer), as the autopilot's own
       // terms writes and status flips: this edit and its read-back never
@@ -2504,6 +2523,15 @@ export function createApiRouter(
       // land between this one and its read-back — the edit reported "not
       // stored" — or after it, undoing it.
       const read = await autopilot.withOffer(id, async (): Promise<MyOffer | null | undefined> => {
+        // What the form doesn't set, as Amboss has it now (inside the lock:
+        // an edit on amboss.tech since `current` was read stands).
+        const now = await getMyOffer(amboss.getKey(), id).catch(() => null);
+        if (now) {
+          terms.conditions = now.conditions;
+          terms.onchainPriority = now.onchainPriority;
+          terms.onchainMultiplier = now.onchainMultiplier;
+          write.fields = ambossFields(terms);
+        }
         try {
           write.ok = await withAmboss(() => updateOffer(amboss.getKey(), id, terms));
           if (!write.ok) write.error = "Amboss did not apply the update (success: false)";
@@ -2566,6 +2594,16 @@ export function createApiRouter(
         // it disabled" on an offer the autopilot had just disabled for lack of
         // capital is the operator's decision now — it is not listed again
         // when capital returns.
+        // Never listed without a price: Amboss matches orders to an offer at
+        // 0 ppm + 0 sat at 0 sats for the seller (2026-10-23).
+        const listing = want === "ENABLED" || (!want && offer.status === "DISABLED");
+        if (listing && offer.status !== "ENABLED" && offer.feeRatePpm <= 0 && offer.baseFeeSats <= 0) {
+          res.status(409).json({
+            error: "no_price",
+            message: "This offer has no price (0 ppm + 0 sat): set its price before you list it — buyers would get a channel for free.",
+          });
+          return;
+        }
         if (want && offer.status !== (want === "ENABLED" ? "DISABLED" : "ENABLED")) {
           if (offer.status === want) autopilot.offerStatusSetByHand(id, want);
           res.json({ status: offer.status, changed: false } satisfies OfferToggleResult);

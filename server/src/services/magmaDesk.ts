@@ -148,6 +148,11 @@ const OPEN_RETRY_WINDOW_MS = 30 * 60_000;
 const MAX_ACCEPT_ATTEMPTS = 3;
 /** Reject (rather than wait) once the approval deadline is this close. */
 const REJECT_MARGIN_MS = 2 * 60_000;
+/** An order Amboss reports no fee for is looked at once more this long after
+ *  it was placed before it is turned down (a fee filled in right after the
+ *  match is not missed). It does not stay 0 "until settled": the order of
+ *  2026-10-23 read 0 in every fee part from its first read to its end. */
+const ZERO_FEE_GRACE_MS = 60_000;
 /** An order the lane was deciding when selling was switched off (or all
  *  automation paused): nothing was promised — it is the operator's now. */
 export const SELLING_OFF_SKIP =
@@ -272,6 +277,10 @@ export interface MagmaDeskDeps {
   earnings: EarningsLog;
   serviceFees: ServiceFeeLedger;
   config: () => MagmaDeskConfig;
+  /** The smallest fee the lane accepts an order for: what opening and closing
+   *  its channel costs on chain now, after the service fee
+   *  (Autopilot.saleFeeFloorSats). Without it, no floor beyond "not 0". */
+  saleFloorSats?: () => Promise<number>;
 }
 
 /** Outcome of a manual action, for the API route. */
@@ -1383,9 +1392,10 @@ export class MagmaDesk {
 
   // ── deciding on a new order (D6) ───────────────────────────────────────────
 
-  /** The HODL invoice amount: what the seller earns. `fees.seller` can read 0
-   *  before Amboss has settled it; its parts (fixed + variable) are the
-   *  seller's fee too — the buyer pays those plus Amboss's own fee. */
+  /** The HODL invoice amount: what the seller earns, `fees.seller`. Should it
+   *  read 0 while its parts (fixed + variable — the buyer pays those plus
+   *  Amboss's own fee) don't, the parts are billed. (Not seen live: the 0
+   *  order of 2026-10-23 had every part at 0 — nothing to bill, see decide.) */
   private invoiceMsat(order: SaleOrder): bigint {
     const seller = msatOf(order.fees.seller) ?? 0n;
     if (seller > 0n) return seller;
@@ -1551,9 +1561,29 @@ export class MagmaDesk {
     if (order.sizeSats <= 0) return this.rejectOrder(entry, "the order has no channel size");
     const fee = this.invoiceMsat(order);
     if (fee <= 0n) {
-      if (this.nearDeadline(order, REJECT_MARGIN_MS)) return this.rejectOrder(entry, "Amboss reported no fee for this order");
-      return [this.skip(entry, "waiting for Amboss to report the order's fee")];
+      // Amboss can match an order to this node at 0 sats (2026-10-23: a
+      // 1.95M sat order, every fee part 0, while a partial offer update had
+      // left the fee rate at 0). Nothing to earn: turned down at once (D6) —
+      // after one more look a minute in — not left waiting for its deadline.
+      const placed = Date.parse(order.createdAt);
+      if (Number.isFinite(placed) && Date.now() - placed < ZERO_FEE_GRACE_MS && !this.nearDeadline(order, REJECT_MARGIN_MS)) {
+        return [this.skip(entry, "Amboss reports no fee for this order yet — looked at again in a minute")];
+      }
+      return this.rejectOrder(entry, "Amboss priced it at 0 sats for this node — there is nothing to earn");
     }
+    // Never at a loss, however the order came to be priced so (an offer listed
+    // too low for a while, a price set elsewhere): what it pays must at least
+    // cover opening and closing its channel on chain.
+    const floor = this.deps.saleFloorSats ? await this.deps.saleFloorSats() : 0;
+    const floorSats = Number.isFinite(floor) && floor > 0 ? Math.ceil(floor) : 0;
+    if (fee < BigInt(floorSats) * 1000n) {
+      return this.rejectOrder(
+        entry,
+        `it pays ${(Number(fee) / 1000).toLocaleString("en-US")} sat — less than opening and closing its channel costs on chain now (${floorSats.toLocaleString("en-US")} sat)`,
+      );
+    }
+    // That read is awaited: the switch, again.
+    if (sellingOff()) return [this.skip(entry, SELLING_OFF_SKIP)];
     // Cheap capital check first: no point dialing a buyer we must turn down.
     let lacking: Lacking | null;
     try {
@@ -2674,7 +2704,19 @@ export class MagmaDesk {
       const mine = this.byHand(entry, order, "accept");
       try {
         const fee = this.invoiceMsat(order);
-        if (fee <= 0n) return { ok: false, code: "amboss", message: "Amboss reports no fee for this order yet — try again in a minute." };
+        if (fee <= 0n) {
+          // Within the minute after it was placed, Amboss may still fill the
+          // fee in; after that it is an order at 0 sats.
+          const placed = Date.parse(order.createdAt);
+          const fresh = Number.isFinite(placed) && Date.now() - placed < ZERO_FEE_GRACE_MS;
+          return {
+            ok: false,
+            code: "amboss",
+            message: fresh
+              ? "Amboss reports no fee for this order yet — try again in a minute."
+              : "Amboss priced this order at 0 sats for this node — there is nothing to earn. Reject it rather than let it time out.",
+          };
+        }
         const reached = await this.connectBuyer(order);
         if (!reached.ok && reached.blocked) {
           // This node's setup, not the buyer: nothing to reject the order for

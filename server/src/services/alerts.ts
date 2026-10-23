@@ -115,6 +115,60 @@ export function magmaRefusalAlerts(desk: { refusals(): Pick<MagmaRefusal, "order
   }));
 }
 
+/** A listed offer of this node that is priced wrong: listed for free, or
+ *  holding terms other than the ones LightningMate last wrote — and one the
+ *  autopilot took off the market for being free. Derived from the offer sync
+ *  record (the order lane re-reads listed offers every two minutes), so each
+ *  goes once the offer is right again. What it says LightningMate does is
+ *  only what it will do: with selling on, a free offer's price goes back on
+ *  (one the autopilot manages, its price known) or it is taken off the market;
+ *  with selling off or paused, nothing changes it. */
+export function offerPriceAlerts(
+  sync: {
+    offers: {
+      offerId: string;
+      amboss: { status: string; feeRatePpm: number; baseFeeSats: number };
+      inSync: boolean;
+      lastWrite: { ok: boolean; verified?: boolean; error?: string } | null;
+      /** Set when the operator owns the offer's terms, or when the autopilot
+       *  took it off the market for being free. */
+      control?: { manual?: unknown; freeDisabledAt?: string };
+    }[];
+  },
+  /** Liquidity provision on and not paused: the autopilot acts on offers. */
+  selling: boolean,
+): Alert[] {
+  const alerts: Alert[] = [];
+  for (const e of sync.offers) {
+    const id = `${e.offerId.slice(0, 8)}…`;
+    const free = e.amboss.feeRatePpm <= 0 && e.amboss.baseFeeSats <= 0;
+    if (e.amboss.status === "ENABLED" && free) {
+      alerts.push({
+        level: "warn",
+        message:
+          `Your Magma offer ${id} is listed at 0 ppm + 0 sat: Amboss can match orders to it at 0 sats for you. ` +
+          (selling
+            ? (e.control?.manual
+                ? "Its terms are yours, so LightningMate takes it off the market within minutes; set its price on Market → Sell, then enable it."
+                : "LightningMate puts its last price back within minutes, or takes it off the market if it knows none.") +
+              " Orders that don't cover their channel's on-chain cost are turned away meanwhile."
+            : "Liquidity provision is off (or paused), so nothing changes it: set its price on Market → Sell or disable it, and reject any order it gets."),
+      });
+    } else if (e.amboss.status !== "ENABLED" && e.control?.freeDisabledAt && free) {
+      alerts.push({
+        level: "warn",
+        message: `Your Magma offer ${id} was taken off the market: Amboss listed it for free (0 ppm + 0 sat). Set its price on Market → Sell and enable it — with auto-pricing on, LightningMate lists it again itself once it has a price.`,
+      });
+    } else if (e.lastWrite?.ok && e.lastWrite.verified === false && !e.inSync) {
+      alerts.push({
+        level: "warn",
+        message: `Amboss doesn't hold the terms LightningMate set for offer ${id} (${e.lastWrite.error ?? "it reads back different"}). Check it on Market → Sell.`,
+      });
+    }
+  }
+  return alerts;
+}
+
 /** Service fees that need a human: given up, or refused for safety. */
 export function serviceFeeAlerts(ledger: Pick<ServiceFeeLedger, "problems">): Alert[] {
   return ledger.problems().map((e) => ({

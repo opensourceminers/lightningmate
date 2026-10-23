@@ -327,7 +327,7 @@ test("an order whose fee Amboss never reports is rejected before its approval de
   const sale = magma.addSale({ buyerPubkey: BUYER, feeSeller: "0", timeout: new Date(Date.now() + 60_000).toISOString() });
   await autopilot.pollSellOrders();
   assert.equal(magma.sales.get(sale.id)?.status, "SELLER_REJECTED");
-  assert.match(entryOnDisk(dir, sale.id)?.reason ?? "", /no fee/);
+  assert.match(entryOnDisk(dir, sale.id)?.reason ?? "", /priced it at 0 sats/);
   assert.equal(node.callsTo("invoices.addHoldInvoice").length, 0, "never an invoice for 0 sat");
 });
 

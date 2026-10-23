@@ -29,6 +29,9 @@ const offer = (id: string, status = "ENABLED"): MyOffer => ({
   minBlockLength: 4320,
   feeRateCapPpm: 2200,
   baseFeeCapSats: 1,
+  conditions: [],
+  onchainPriority: null,
+  onchainMultiplier: null,
   filledOrders: 0,
   createdAt: "2026-10-01T00:00:00.000Z",
 });
