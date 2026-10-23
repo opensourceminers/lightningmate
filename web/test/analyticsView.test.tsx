@@ -355,3 +355,33 @@ test("the Analytics Magma tile says 'unknown' when the Magma report couldn't be 
   assert.match(panel, /magmaTile: magmaLeasesKpi\(magma, magmaError\)/);
   assert.match(panel, /\.catch\(\(e\) => setMagmaError\(/);
 });
+
+test("the Overview's activity folds a run of forwards over one route into a row — eleven '+1 sat' lines hid everything else", async () => {
+  const { foldActivity, activitySub } = await import("../src/analyticsView");
+  const fwd = (at: string, title: string, fee: number, routed: number) => ({ at, kind: "forward" as const, title, amountSats: fee, routedSats: routed });
+  const items = [
+    { at: "2026-10-23T01:00:00Z", kind: "received" as const, title: "Paid to Bitaxe.de", amountSats: 216_117 },
+    fwd("2026-10-20T10:00:00Z", "okx → flashsats.xyz", 0, 1),
+    fwd("2026-10-18T10:00:00Z", "node8153 → rspbltz", 1, 27_800),
+    fwd("2026-10-18T09:00:00Z", "node8153 → rspbltz", 1, 33_400),
+    fwd("2026-10-18T08:00:00Z", "node8153 → rspbltz", 1, 20_000),
+    fwd("2026-10-17T08:00:00Z", "Sally Acorn → rspbltz", 4, 128_700),
+    fwd("2026-10-17T07:00:00Z", "Sally Acorn → rspbltz", 5, 154_500),
+  ];
+  const rows = foldActivity(items, 10);
+  assert.deepEqual(
+    rows.map((r) => [r.title, r.count, r.amountSats, r.routedSats ?? null, r.at]),
+    [
+      ["Paid to Bitaxe.de", 1, 216_117, null, "2026-10-23T01:00:00Z"],
+      ["okx → flashsats.xyz", 1, 0, 1, "2026-10-20T10:00:00Z"],
+      ["node8153 → rspbltz", 3, 3, 81_200, "2026-10-18T10:00:00Z"],
+      ["Sally Acorn → rspbltz", 2, 9, 283_200, "2026-10-17T08:00:00Z"],
+    ],
+  );
+  assert.equal(activitySub(rows[2], satsCompact), "81.2k sat routed in 3 forwards");
+  assert.equal(activitySub(rows[1], satsCompact), "1 sat routed");
+  assert.equal(foldActivity(items, 2).length, 2, "at most `max` rows");
+  // Only consecutive forwards over the same route fold: the order stays the feed's.
+  const split = foldActivity([fwd("3", "a → b", 1, 1), fwd("2", "c → d", 1, 1), fwd("1", "a → b", 1, 1)], 10);
+  assert.deepEqual(split.map((r) => [r.title, r.count]), [["a → b", 1], ["c → d", 1], ["a → b", 1]]);
+});

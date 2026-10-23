@@ -12,7 +12,8 @@ export function SuggestedPeersTile({ onOpen }: { onOpen?: () => void }) {
     let cancelled = false;
     api
       .suggestions()
-      .then((r) => !cancelled && setRows(r.suggestions.slice(0, 5)))
+      // The five picks (chosen for reach that overlaps least), shown by score.
+      .then((r) => !cancelled && setRows(r.suggestions.slice(0, 5).sort((a, b) => b.score - a.score)))
       .catch(() => !cancelled && setRows([]));
     return () => {
       cancelled = true;

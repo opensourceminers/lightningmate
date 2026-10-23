@@ -25,7 +25,6 @@ import type {
 } from "../types";
 import { sats, satsCompact } from "../format";
 import { EmptyState } from "./Skeleton";
-import { InfoTip } from "./InfoTip";
 import { useUi } from "./Overlay";
 import { failedOfferWrite } from "../statusNotes";
 import { EligibilityCard, HowAmbossPicks, OfferPromiseNote, SellDiagnosticsCard } from "./MagmaSellInfo";
@@ -91,6 +90,8 @@ export function MarketSell() {
   const [error, setError] = useState<string | null>(null);
   const [togglingId, setTogglingId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
+  /** "Create another offer" pressed: the form for a second offer is open. */
+  const [showForm, setShowForm] = useState(false);
   // The report, when it was read (its "as of" — the server's and the views'
   // shared copies make that up to ~2 min before this view got it), and why
   // the last refresh failed — a failure keeps the report it had (the engine
@@ -317,6 +318,10 @@ export function MarketSell() {
   // Expected value, not the margin of one sale (m4: the per-sale view made a
   // ≈0-sales feature look profitable): sales a year × what one nets.
   const evPerYear = r0 && elig?.expectedSalesPerYear != null ? Math.round(elig.expectedSalesPerYear * r0.economics.netLeaseProfitSat) : null;
+  // The offer form only when it is wanted: editing, a price button pressed,
+  // no offer yet, or "Create another offer" (it sat open under everything,
+  // with a paragraph of fine print, on every visit).
+  const formOpen = editingId !== null || draft !== null || showForm || (connected !== null && offers.length === 0);
 
   return (
     <section className="panel">
@@ -344,245 +349,23 @@ export function MarketSell() {
       {cfg?.sellEnabled && failedOfferWrite(sync) ? (
         <p className="banner error">The autopilot could not update your offer on Amboss: {failedOfferWrite(sync)}</p>
       ) : null}
-      <div className="dryrun-banner">
-        <strong>Selling is an advanced feature.</strong> Amboss decides which seller gets an order — mostly sellers with a track
-        record. LightningMate makes selling correct and reliable (hold invoices, prompt accepts and rejects, offers it can fund);
-        it cannot make Amboss pick you. For most small nodes, a routing channel earns more on the same capital.
-      </div>
-      {feeBps > 0 ? (
-        <p className="fee-note">A {feeBps / 100}% service fee on completed sales supports Lightning Mate’s development.</p>
-      ) : null}
-
-      <EligibilityCard e={elig} busy={eligBusy} onRefresh={() => loadEligibility(true)} />
-      <SellDiagnosticsCard d={diag} onFix={(tab, sub) => goTo(tab, sub)} />
-      {recView.error ? <p className="banner error">{reportErrorText(recView)}</p> : null}
-      <HowAmbossPicks usdOrderSat={elig?.usdOrders?.minOrderSat ?? null} usdAtOwnPriceSat={elig?.usdOrders?.atOwnPriceSat ?? null} feeTiers={elig?.feeTiers ?? null} />
-
-      {rec && summary ? (
-        <div className="magma-v2">
-          <div className="sug-need">
-            <span
-              className={`sug-need-tag ${
-                summary.good
-                  ? "need-balanced"
-                  : rec.sell.state === "insufficient_capital" || rec.sell.state === "market_too_cheap"
-                    ? "need-need_inbound"
-                    : ""
-              }`}
-              title="Whether a sale at today's prices would beat routing this capital — per sale, not whether a sale will come"
-            >
-              {summary.label}
-            </span>
-            <InfoTip text="Whether a sale at today's prices would beat routing this capital — per sale, not whether a sale will come." />
-            <span className="muted">{summary.line}</span>
-          </div>
-          {rec.sell.reasons.length > 1 || rec.sell.warnings.length ? (
-            <div className="magma-warns">
-              {rec.sell.reasons.slice(1).map((w, i) => (
-                <div key={`r${i}`} className="muted">• {w}</div>
-              ))}
-              {rec.sell.warnings.map((w, i) => (
-                <div key={`w${i}`} className="sug-warn">⚠ {w}</div>
-              ))}
-            </div>
-          ) : null}
-
-          {rec.sell.pendingSellerOrders > 0 ? (
-            <div className="magma-warn-banner">
-              ⚠ {rec.sell.pendingSellerOrders} order{rec.sell.pendingSellerOrders === 1 ? "" : "s"} waiting on you — accept or
-              reject in time (Market → Orders), or Amboss counts it against your seller score.
-            </div>
-          ) : null}
-
-          <div className="magma-substats muted">
-            {rec.sell.projectedMonthlySat > 0 ? (
-              <>
-                ≈ <b>{sats(rec.sell.projectedMonthlySat)}</b> sat/mo from your own sales of the last 30 days ·{" "}
-              </>
-            ) : null}
-            {rec.sell.medianOrderSat ? (
-              <>
-                median real order <b>{satsCompact(rec.sell.medianOrderSat)}</b> ·{" "}
-              </>
-            ) : null}
-            standard lease <b>{rec.sell.standardLeaseBlocks} blocks</b> · ~{rec.sell.onchainOpenCostSat} sat to open on-chain
-            {recAt ? <> · as of {new Date(recAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</> : null}
-            {rec.sell.pricingMode === "auto" ? (
-              <>
-                {" "}
-                · auto level <b>{Math.round(rec.sell.adaptiveLevel * 100)}%</b>
-              </>
-            ) : null}
-          </div>
-
-          {r0 ? (
-            <>
-              <div className="magma-compare">
-                <div className="magma-stat">
-                  <span className="magma-stat-label">Routing yield</span>
-                  <span className="magma-stat-val">
-                    {asPct(rec.sell.adjustedRoutingPpmPerYear)} <span className="muted">/yr on capital</span>
-                  </span>
-                </div>
-                <span className="magma-vs">vs</span>
-                <div className={`magma-stat ${r0.economics.beatsRouting ? "good" : ""}`}>
-                  <span className="magma-stat-label">One sale at this price</span>
-                  <span className="magma-stat-val">
-                    {r0.economics.leaseApy}% <span className="muted">/yr net · {sats(r0.economics.netLeaseProfitSat)} sat net per sale</span>
-                  </span>
-                </div>
-                <span className={`magma-verdict ${evPerYear !== null && evPerYear > 0 ? "win" : "lose"}`} title="Expected sales a year (offers like yours) × what one sale nets">
-                  {evPerYear === null ? "per sale only" : `expected ≈ ${sats(evPerYear)} sat/yr`}
-                </span>
-                <InfoTip text="Expected sales a year (offers like yours, from the selling check) × what one sale nets. 'Per sale only': the check has no estimate." />
-              </div>
-
-              <div className="magma-price-card">
-                <div className="magma-price-head">
-                  <span className={`feerec-state ${SELL_STATE_CLASS[r0.state]}`}>{SELL_STATE_LABEL[r0.state]}</span>
-                  {r0.current ? (
-                    <span>
-                      current <b>{r0.current.effectiveFeePpm}</b> →{" "}
-                      <b className={r0.recommended.effectiveFeePpm > r0.current.effectiveFeePpm ? "delta-up" : r0.recommended.effectiveFeePpm < r0.current.effectiveFeePpm ? "delta-down" : ""}>
-                        {r0.recommended.effectiveFeePpm}
-                      </b>{" "}
-                      ppm effective
-                    </span>
-                  ) : (
-                    <span>
-                      recommended <b>{r0.recommended.effectiveFeePpm} ppm</b> effective ({r0.recommended.feeRatePpm} + {r0.recommended.baseFeeSat} base)
-                    </span>
-                  )}
-                  {r0.market.myRank ? <span className="muted">your rank #{r0.market.myRank} of {r0.market.segmentCount}</span> : null}
-                </div>
-                <div className="magma-price-meta muted">
-                  {clearing ? (
-                    <>
-                      {r0.market.sizeBand} band · <b>{clearing.count} real sales</b> in {clearing.windowDays}d paid{" "}
-                      {clearing.p25Ppm}–{clearing.p75Ppm} ppm, median {clearing.medianPpm} for a {leaseDays}-day lease · floor{" "}
-                      {r0.economics.profitFloorEffectivePpm}
-                    </>
-                  ) : (
-                    <>
-                      {r0.market.sizeBand} band · no sale history, using LISTED asks (as {leaseDays}-day prices) · p25 {r0.market.p25} · median{" "}
-                      {r0.market.median} · p75 {r0.market.p75} ppm · floor {r0.economics.profitFloorEffectivePpm}
-                    </>
-                  )}
-                  {r0.recommended.feeRateCapPpm !== null ? ` · fee promise ≤ ${r0.recommended.feeRateCapPpm} ppm + ${r0.recommended.baseFeeCapSats} sat` : ""}
-                </div>
-                {(() => {
-                  const m = r0.market;
-                  const cur = r0.current?.effectiveFeePpm ?? null;
-                  const recv = r0.recommended.effectiveFeePpm;
-                  const floor = r0.economics.profitFloorEffectivePpm;
-                  const lo = Math.min(m.p10, floor, cur ?? recv) * 0.95;
-                  const hi = Math.max(m.p75, recv, cur ?? 0) * 1.05;
-                  const span = Math.max(1, hi - lo);
-                  const pos = (v: number) => Math.min(100, Math.max(0, ((v - lo) / span) * 100));
-                  return (
-                    <div className="magma-slider">
-                      <div className="magma-slider-track" title={`market p25–p75: ${m.p25}–${m.p75} ppm · median ${m.median}`}>
-                        <div className="magma-slider-band" style={{ left: `${pos(m.p25)}%`, width: `${Math.max(1, pos(m.p75) - pos(m.p25))}%` }} />
-                        <i className="magma-tick floor" style={{ left: `${pos(floor)}%` }} title={`profit floor ${floor} ppm`} />
-                        <i className="magma-tick median" style={{ left: `${pos(m.median)}%` }} title={`market median ${m.median} ppm`} />
-                        {cur != null ? <i className="magma-pin cur" style={{ left: `${pos(cur)}%` }} title={`your current ${cur} ppm`} /> : null}
-                        <i className="magma-pin rec" style={{ left: `${pos(recv)}%` }} title={`recommended ${recv} ppm`} />
-                      </div>
-                      <div className="magma-slider-legend">
-                        <span className="muted">cheap</span>
-                        <span className="magma-leg"><i className="magma-dot band" />market</span>
-                        <span className="magma-leg"><i className="magma-dot median" />median {m.median}</span>
-                        {cur != null ? <span className="magma-leg"><i className="magma-dot cur" />you {cur}</span> : null}
-                        <span className="magma-leg"><i className="magma-dot rec" />rec {recv}</span>
-                        <span className="muted">dear</span>
-                      </div>
-                    </div>
-                  );
-                })()}
-                <div className="magma-price-buttons">
-                  {(
-                    [
-                      ["Low", r0.pricing.fast, "the 25th percentile of what buyers paid (never below your floor)"],
-                      ["Median", r0.pricing.balanced, "the median of what buyers paid"],
-                      ["High", r0.pricing.premium, "the 75th percentile of what buyers paid"],
-                      ["Profit floor", r0.pricing.profitFloor, "the lowest price that still beats routing"],
-                    ] as [string, PricePoint, string][]
-                  ).map(([label, p, title]) => (
-                    <button
-                      key={label}
-                      className="row-btn"
-                      disabled={managedPrice}
-                      title={`${title} — for a ${leaseDays}-day lease`}
-                      onClick={() => applyPrice(p, r0.recommended.minBlockLength)}
-                    >
-                      {label}
-                    </button>
-                  ))}
-                  <button
-                    className="row-btn primary"
-                    disabled={managedPrice}
-                    title={
-                      mine
-                        ? `The recommended price, the ${leaseDays}-day lease it is for and the engine's window (within what can be funded) — into your offer's edit form`
-                        : undefined
-                    }
-                    onClick={() => applyPrice(r0.recommended, r0.recommended.minBlockLength, true)}
-                  >
-                    {mine ? "Apply recommended to my offer" : "Use recommended"}
-                  </button>
-                </div>
-                {managedPrice && !failedOfferWrite(sync) ? (
-                  <p className="magma-ap-note muted">
-                    The autopilot prices this offer (Auto-price is on).{" "}
-                    <button className="linklike" onClick={() => goTo("autopilot", "magma")}>
-                      Untick Auto-price
-                    </button>{" "}
-                    — or edit the offer below to take it over — to price it by hand.
-                  </p>
-                ) : null}
-                {r0.warnings.length || r0.reasons.length ? (
-                  <div className="magma-warns">
-                    {r0.warnings.map((w, i) => (
-                      <div key={`w${i}`} className="sug-warn">⚠ {w}</div>
-                    ))}
-                    {r0.reasons.map((w, i) => (
-                      <div key={`r${i}`} className="muted">• {w}</div>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
-            </>
-          ) : null}
+      {rec && rec.sell.pendingSellerOrders > 0 ? (
+        <div className="magma-warn-banner">
+          ⚠ {rec.sell.pendingSellerOrders} order{rec.sell.pendingSellerOrders === 1 ? "" : "s"} waiting on you — accept or reject in
+          time (Market → Orders), or Amboss counts it against your seller score.
         </div>
       ) : null}
+      <p className="sell-lede muted">
+        Amboss decides who gets an order — mostly sellers with a track record. LightningMate makes selling correct and reliable; it
+        can't make Amboss pick you.
+        {feeBps > 0 ? ` A ${feeBps / 100}% service fee on completed sales supports Lightning Mate’s development.` : ""}
+      </p>
 
-      <h3 className="sub">{editingId ? "Edit your offer" : offers.length ? "New offer (you have one already — this lists another)" : "New offer"}</h3>
-      <div className="policy-controls">
-        {FIELDS.map((f) => (
-          <label key={f.key} className="policy-field">
-            <span>{f.label}</span>
-            <input type="number" min={0} value={form[f.key]} onChange={(e) => setNum(f.key, Number(e.target.value))} />
-            {/* On the page, not only in a tooltip (touch screens have none). */}
-            <span className="field-hint">{f.hint}</span>
-          </label>
-        ))}
-        <button className="primary-btn" disabled={busy} onClick={() => void submit()}>
-          {busy ? (editingId ? "Saving…" : "Creating…") : editingId ? "Save changes" : offers.length ? "Create another offer" : "Create offer"}
-        </button>
-        {editingId || draft ? (
-          <button className="reset" disabled={busy} onClick={cancelEdit}>
-            {editingId ? "Cancel" : "Reset"}
-          </button>
-        ) : null}
-      </div>
-      {feeCaps ? <OfferPromiseNote caps={feeCaps} leaseBlocks={form.minBlockLength} standardLeaseBlocks={STANDARD_LEASE_BLOCKS} /> : null}
-      {sizeWarning ? <p className="sug-warn">⚠ {sizeWarning}</p> : null}
-      {error ? <p className="banner error">{error}</p> : null}
-
+      <h3 className="sub">{offers.length > 1 ? "Your offers" : "Your offer"}</h3>
       {connected === null ? (
         <p className="muted">Loading…</p>
       ) : offers.length === 0 ? (
-        <EmptyState icon="🏷️">No offers yet — create one above.</EmptyState>
+        <EmptyState icon="🏷️">No offer yet — create one below.</EmptyState>
       ) : (
         <table className="fee-table">
           <thead>
@@ -603,6 +386,7 @@ export function MarketSell() {
               const active = o.status === "ENABLED";
               const owner = ownerOf(o);
               const oddLease = leaseToKeep(o.minBlockLength, rec?.sell.standardLeaseBlocks ?? STANDARD_LEASE_BLOCKS) !== o.minBlockLength;
+              const free = o.feeRatePpm <= 0 && o.baseFeeSats <= 0;
               return (
                 <tr key={o.id} className={active ? "" : "inactive"}>
                   <td>{active ? "🟢 active" : `⚪ ${o.status.toLowerCase()}`}</td>
@@ -610,7 +394,9 @@ export function MarketSell() {
                     {satsCompact(o.minSizeSats)}–{satsCompact(o.maxSizeSats)}
                   </td>
                   <td className="num">{satsCompact(o.totalSizeSats)}</td>
-                  <td className="num">{o.feeRatePpm} ppm</td>
+                  <td className={`num ${free ? "delta-up" : ""}`} title={free ? "No price: buyers would get a channel for free" : undefined}>
+                    {o.feeRatePpm} ppm{free ? " ⚠" : ""}
+                  </td>
                   <td className="num">{o.baseFeeSats}</td>
                   <td className={`num ${oddLease ? "delta-up" : ""}`} title={`${o.minBlockLength} blocks${oddLease ? " — not the standard lease buyers use" : ""}`}>
                     {Math.round(o.minBlockLength / 144)}d{oddLease ? " ⚠" : ""}
@@ -624,7 +410,12 @@ export function MarketSell() {
                       <button className="row-btn ghost" disabled={busy} onClick={() => startEdit(o)}>
                         edit
                       </button>
-                      <button className="row-btn ghost" disabled={togglingId !== null} onClick={() => void toggle(o)}>
+                      <button
+                        className="row-btn ghost"
+                        disabled={togglingId !== null || (!active && free)}
+                        title={!active && free ? "Set a price first (edit): listed like this, buyers would get a channel for free" : undefined}
+                        onClick={() => void toggle(o)}
+                      >
                         {togglingId === o.id ? "…" : active ? "disable" : "enable"}
                       </button>
                       {owner.yours && cfg?.sellEnabled ? (
@@ -648,6 +439,220 @@ export function MarketSell() {
           </tbody>
         </table>
       )}
+
+      {formOpen ? (
+        <div className="offer-form">
+          <h4 className="sub">{editingId ? "Edit your offer" : offers.length ? "Another offer (it lists a second one)" : "New offer"}</h4>
+          <div className="policy-controls">
+            {FIELDS.map((f) => (
+              <label key={f.key} className="policy-field">
+                <span>{f.label}</span>
+                <input type="number" min={0} value={form[f.key]} onChange={(e) => setNum(f.key, Number(e.target.value))} />
+                {/* On the page, not only in a tooltip (touch screens have none). */}
+                <span className="field-hint">{f.hint}</span>
+              </label>
+            ))}
+            <button className="primary-btn" disabled={busy} onClick={() => void submit()}>
+              {busy ? (editingId ? "Saving…" : "Creating…") : editingId ? "Save changes" : offers.length ? "Create another offer" : "Create offer"}
+            </button>
+            {editingId || draft || showForm ? (
+              <button
+                className="reset"
+                disabled={busy}
+                onClick={() => {
+                  cancelEdit();
+                  setShowForm(false);
+                }}
+              >
+                Cancel
+              </button>
+            ) : null}
+          </div>
+          {feeCaps ? <OfferPromiseNote caps={feeCaps} leaseBlocks={form.minBlockLength} standardLeaseBlocks={STANDARD_LEASE_BLOCKS} /> : null}
+          {sizeWarning ? <p className="sug-warn">⚠ {sizeWarning}</p> : null}
+        </div>
+      ) : offers.length > 0 ? (
+        <button className="row-btn ghost add-offer" onClick={() => setShowForm(true)}>
+          + Create another offer
+        </button>
+      ) : null}
+      {error ? <p className="banner error">{error}</p> : null}
+
+      {rec && r0 ? (
+        <>
+          <h3 className="sub">Price</h3>
+          <div className="magma-price-card">
+            <div className="magma-price-head">
+              <span className={`feerec-state ${SELL_STATE_CLASS[r0.state]}`}>{SELL_STATE_LABEL[r0.state]}</span>
+              {r0.current ? (
+                <span>
+                  yours <b>{r0.current.effectiveFeePpm}</b> → recommended{" "}
+                  <b className={r0.recommended.effectiveFeePpm > r0.current.effectiveFeePpm ? "delta-up" : r0.recommended.effectiveFeePpm < r0.current.effectiveFeePpm ? "delta-down" : ""}>
+                    {r0.recommended.effectiveFeePpm}
+                  </b>{" "}
+                  ppm
+                </span>
+              ) : (
+                <span>
+                  recommended <b>{r0.recommended.effectiveFeePpm} ppm</b> ({r0.recommended.feeRatePpm} + {r0.recommended.baseFeeSat} base)
+                </span>
+              )}
+              {evPerYear !== null ? (
+                <span className={`magma-verdict ${evPerYear > 0 ? "win" : "lose"}`} title="Expected sales a year (offers like yours) × what one sale nets">
+                  expected ≈ {sats(evPerYear)} sat/yr
+                </span>
+              ) : null}
+            </div>
+            <div className="magma-price-meta muted">
+              {clearing
+                ? `buyers paid ${clearing.p25Ppm}–${clearing.p75Ppm} ppm (median ${clearing.medianPpm}) in ${clearing.count} sales of the last ${clearing.windowDays} days · one sale nets ~${sats(r0.economics.netLeaseProfitSat)} sat`
+                : `no sale history: priced against listed asks (median ${r0.market.median} ppm) · one sale nets ~${sats(r0.economics.netLeaseProfitSat)} sat`}
+            </div>
+            {(() => {
+              const m = r0.market;
+              const cur = r0.current?.effectiveFeePpm ?? null;
+              const recv = r0.recommended.effectiveFeePpm;
+              const floor = r0.economics.profitFloorEffectivePpm;
+              const lo = Math.min(m.p10, floor, cur ?? recv) * 0.95;
+              const hi = Math.max(m.p75, recv, cur ?? 0) * 1.05;
+              const span = Math.max(1, hi - lo);
+              const pos = (v: number) => Math.min(100, Math.max(0, ((v - lo) / span) * 100));
+              return (
+                <div className="magma-slider">
+                  <div className="magma-slider-track" title={`market p25–p75: ${m.p25}–${m.p75} ppm · median ${m.median}`}>
+                    <div className="magma-slider-band" style={{ left: `${pos(m.p25)}%`, width: `${Math.max(1, pos(m.p75) - pos(m.p25))}%` }} />
+                    <i className="magma-tick floor" style={{ left: `${pos(floor)}%` }} title={`profit floor ${floor} ppm`} />
+                    <i className="magma-tick median" style={{ left: `${pos(m.median)}%` }} title={`market median ${m.median} ppm`} />
+                    {cur != null ? <i className="magma-pin cur" style={{ left: `${pos(cur)}%` }} title={`your current ${cur} ppm`} /> : null}
+                    <i className="magma-pin rec" style={{ left: `${pos(recv)}%` }} title={`recommended ${recv} ppm`} />
+                  </div>
+                  <div className="magma-slider-legend">
+                    <span className="muted">cheap</span>
+                    <span className="magma-leg"><i className="magma-dot band" />market</span>
+                    <span className="magma-leg"><i className="magma-dot median" />listed median {m.median}</span>
+                    {cur != null ? <span className="magma-leg"><i className="magma-dot cur" />you {cur}</span> : null}
+                    <span className="magma-leg"><i className="magma-dot rec" />rec {recv}</span>
+                    <span className="muted">dear</span>
+                  </div>
+                </div>
+              );
+            })()}
+            <div className="magma-price-buttons">
+              {(
+                [
+                  ["Low", r0.pricing.fast, "the 25th percentile of what buyers paid (never below your floor)"],
+                  ["Median", r0.pricing.balanced, "the median of what buyers paid"],
+                  ["High", r0.pricing.premium, "the 75th percentile of what buyers paid"],
+                  ["Profit floor", r0.pricing.profitFloor, "the lowest price that still beats routing"],
+                ] as [string, PricePoint, string][]
+              ).map(([label, p, title]) => (
+                <button
+                  key={label}
+                  className="row-btn"
+                  disabled={managedPrice}
+                  title={`${title} — for a ${leaseDays}-day lease`}
+                  onClick={() => applyPrice(p, r0.recommended.minBlockLength)}
+                >
+                  {label}
+                </button>
+              ))}
+              <button
+                className="row-btn primary"
+                disabled={managedPrice}
+                title={
+                  mine
+                    ? `The recommended price, the ${leaseDays}-day lease it is for and the engine's window (within what can be funded) — into your offer's edit form`
+                    : undefined
+                }
+                onClick={() => applyPrice(r0.recommended, r0.recommended.minBlockLength, true)}
+              >
+                {mine ? "Apply recommended to my offer" : "Use recommended"}
+              </button>
+            </div>
+            {managedPrice && !failedOfferWrite(sync) ? (
+              <p className="magma-ap-note muted">
+                The autopilot prices this offer (Auto-price is on).{" "}
+                <button className="linklike" onClick={() => goTo("autopilot", "magma")}>
+                  Untick Auto-price
+                </button>{" "}
+                — or edit the offer to take it over — to price it by hand.
+              </p>
+            ) : null}
+            {r0.warnings.length ? (
+              <div className="magma-warns">
+                {r0.warnings.map((w, i) => (
+                  <div key={`w${i}`} className="sug-warn">⚠ {w}</div>
+                ))}
+              </div>
+            ) : null}
+            <details className="price-more">
+              <summary>Why this price</summary>
+              {summary ? (
+                <div className="sug-need">
+                  <span
+                    className={`sug-need-tag ${
+                      summary.good
+                        ? "need-balanced"
+                        : rec.sell.state === "insufficient_capital" || rec.sell.state === "market_too_cheap"
+                          ? "need-need_inbound"
+                          : ""
+                    }`}
+                    title="Whether a sale at today's prices would beat routing this capital — per sale, not whether a sale will come"
+                  >
+                    {summary.label}
+                  </span>
+                  <span className="muted">{summary.line}</span>
+                </div>
+              ) : null}
+              <div className="magma-compare">
+                <div className="magma-stat">
+                  <span className="magma-stat-label">Routing yield</span>
+                  <span className="magma-stat-val">
+                    {asPct(rec.sell.adjustedRoutingPpmPerYear)} <span className="muted">/yr on capital</span>
+                  </span>
+                </div>
+                <span className="magma-vs">vs</span>
+                <div className={`magma-stat ${r0.economics.beatsRouting ? "good" : ""}`}>
+                  <span className="magma-stat-label">One sale at this price</span>
+                  <span className="magma-stat-val">
+                    {r0.economics.leaseApy}% <span className="muted">/yr net · {sats(r0.economics.netLeaseProfitSat)} sat net per sale</span>
+                  </span>
+                </div>
+              </div>
+              <div className="magma-warns">
+                <div className="muted">
+                  • {r0.market.sizeBand} band · lease {leaseDays} days · profit floor {r0.economics.profitFloorEffectivePpm} ppm
+                  {r0.recommended.feeRateCapPpm !== null ? ` · fee promise ≤ ${r0.recommended.feeRateCapPpm} ppm + ${r0.recommended.baseFeeCapSats} sat` : ""}
+                  {r0.market.myRank ? ` · your rank #${r0.market.myRank} of ${r0.market.segmentCount}` : ""}
+                </div>
+                <div className="muted">
+                  • {rec.sell.medianOrderSat ? `median real order ${satsCompact(rec.sell.medianOrderSat)} · ` : ""}standard lease {rec.sell.standardLeaseBlocks} blocks · ~
+                  {rec.sell.onchainOpenCostSat} sat to open on-chain
+                  {rec.sell.projectedMonthlySat > 0 ? ` · ≈ ${sats(rec.sell.projectedMonthlySat)} sat/mo from your own sales of the last 30 days` : ""}
+                  {rec.sell.pricingMode === "auto" ? ` · auto level ${Math.round(rec.sell.adaptiveLevel * 100)}%` : ""}
+                  {recAt ? ` · as of ${new Date(recAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}
+                </div>
+                {[...rec.sell.reasons.slice(1), ...r0.reasons].map((w, i) => (
+                  <div key={`r${i}`} className="muted">• {w}</div>
+                ))}
+                {rec.sell.warnings.map((w, i) => (
+                  <div key={`sw${i}`} className="sug-warn">⚠ {w}</div>
+                ))}
+              </div>
+            </details>
+          </div>
+        </>
+      ) : rec && summary ? (
+        <div className="sug-need">
+          <span className="sug-need-tag">{summary.label}</span>
+          <span className="muted">{summary.line}</span>
+        </div>
+      ) : null}
+      {recView.error ? <p className="banner error">{reportErrorText(recView)}</p> : null}
+
+      <EligibilityCard e={elig} busy={eligBusy} onRefresh={() => loadEligibility(true)} />
+      <SellDiagnosticsCard d={diag} onFix={(tab, sub) => goTo(tab, sub)} />
+      <HowAmbossPicks usdOrderSat={elig?.usdOrders?.minOrderSat ?? null} usdAtOwnPriceSat={elig?.usdOrders?.atOwnPriceSat ?? null} feeTiers={elig?.feeTiers ?? null} />
     </section>
   );
 }

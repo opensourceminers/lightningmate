@@ -238,8 +238,37 @@ export const ACTIVITY_LABEL: Record<ActivityItem["kind"], string> = {
   channel_close: "Channel close",
 };
 
-export function activitySub(a: ActivityItem, compact: (n: number) => string): string {
-  if (a.kind === "forward") return `${compact(a.routedSats ?? 0)} sat routed`;
+/** One row of the Overview's activity feed: an item, or a run of forwards
+ *  over the same route folded into one (`count` of them, amounts summed, the
+ *  newest one's time). */
+export type ActivityRow = ActivityItem & { count: number };
+
+/**
+ * The newest activity, at most `max` rows, with each run of consecutive
+ * forwards over the same route folded into one row — a busy route filled the
+ * list with "+1 sat" lines, eleven of them, and hid everything else.
+ */
+export function foldActivity(items: ActivityItem[], max: number): ActivityRow[] {
+  const rows: ActivityRow[] = [];
+  for (const a of items) {
+    const last = rows[rows.length - 1];
+    if (last && a.kind === "forward" && last.kind === "forward" && a.title === last.title) {
+      last.count += 1;
+      last.amountSats += a.amountSats;
+      last.routedSats = (last.routedSats ?? 0) + (a.routedSats ?? 0);
+      continue;
+    }
+    if (rows.length === max) break;
+    rows.push({ ...a, count: 1 });
+  }
+  return rows;
+}
+
+export function activitySub(a: ActivityItem & { count?: number }, compact: (n: number) => string): string {
+  if (a.kind === "forward") {
+    const n = a.count ?? 1;
+    return `${compact(a.routedSats ?? 0)} sat routed${n > 1 ? ` in ${n} forwards` : ""}`;
+  }
   if (a.kind === "rebalance") return `fee ${a.feeSats ?? 0} sat`;
   if (a.kind === "sent") return a.feeSats ? `fee ${a.feeSats} sat` : "payment";
   if (a.kind === "onchain_in" || a.kind === "onchain_out" || a.kind === "channel_open" || a.kind === "channel_close") {

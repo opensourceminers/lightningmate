@@ -31,32 +31,37 @@ export function EligibilityCard({
     );
   }
   const v = VERDICT[e.verdict];
+  // The verdict and what to expect at a glance; the numbers behind it one
+  // click away (they filled half the page).
   return (
     <div className={`elig-card tone-${v.tone}`}>
       <div className="elig-head">
         <span className="elig-title">Can this node sell on Magma?</span>
         <span className={`elig-verdict tone-${v.tone}`}>{v.label}</span>
+        {e.expectedSalesPerYear !== null ? (
+          <span className="elig-expect">
+            about <b>{e.expectedSalesPerYear < 0.1 ? "no" : e.expectedSalesPerYear.toFixed(1)}</b> sale
+            {e.expectedSalesPerYear >= 0.95 && e.expectedSalesPerYear < 1.05 ? "" : "s"} a year with an offer like yours
+          </span>
+        ) : null}
         {onRefresh ? (
           <button className="linklike" disabled={busy} onClick={onRefresh}>
             {busy ? "checking…" : "check again"}
           </button>
         ) : null}
       </div>
-      <ul className="elig-reasons">
-        {e.reasons.map((r, i) => (
-          <li key={i}>{r}</li>
-        ))}
-      </ul>
-      {e.expectedSalesPerYear !== null ? (
-        <div className="elig-expect">
-          Expect about <b>{e.expectedSalesPerYear < 0.1 ? "no" : e.expectedSalesPerYear.toFixed(1)}</b> sale
-          {e.expectedSalesPerYear >= 0.95 && e.expectedSalesPerYear < 1.05 ? "" : "s"} a year with an offer like yours.
+      <details className="elig-more">
+        <summary>Why</summary>
+        <ul className="elig-reasons">
+          {e.reasons.map((r, i) => (
+            <li key={i}>{r}</li>
+          ))}
+        </ul>
+        <div className="muted elig-note">
+          Indicative: computed from Amboss's public offer book{e.bookFetchedAt ? ` (read ${new Date(e.bookFetchedAt).toLocaleString()})` : ""} —
+          Amboss's matching itself isn't public. {SELLER_SCORE_COPY}
         </div>
-      ) : null}
-      <div className="muted elig-note">
-        Indicative: computed from Amboss's public offer book{e.bookFetchedAt ? ` (read ${new Date(e.bookFetchedAt).toLocaleString()})` : ""} —
-        Amboss's matching itself isn't public. {SELLER_SCORE_COPY}
-      </div>
+      </details>
     </div>
   );
 }
@@ -70,31 +75,41 @@ export function SellDiagnosticsCard({
   onFix?: (tab: string, sub?: string) => void;
 }) {
   if (!d) return null;
-  const problems = d.checks.filter((c) => c.status === "problem").length;
+  const problems = d.checks.filter((c) => c.status === "problem");
+  const rest = d.checks.filter((c) => c.status !== "problem");
+  const row = (c: SellDiagnostics["checks"][number]) => (
+    <li key={c.id} className={`diag-row s-${c.status}`}>
+      <span className="diag-mark" aria-label={c.status}>
+        {CHECK_MARK[c.status]}
+      </span>
+      <span className="diag-label">{c.label}</span>
+      <span className="diag-detail">{c.detail}</span>
+      {c.fix && c.status === "problem" && onFix ? (
+        <button className="linklike" onClick={() => onFix(c.fix!.tab, c.fix!.sub)}>
+          {c.fix.label}
+        </button>
+      ) : null}
+    </li>
+  );
+  // Open on problems — and then the problems only; every other check one
+  // click further (all twelve, open, filled the page).
   return (
-    <details className="diag-card" open={problems > 0}>
+    <details className="diag-card" open={problems.length > 0}>
       <summary>
         <span className="diag-title">Selling diagnostics</span>{" "}
-        <span className={problems ? "diag-count bad" : "diag-count ok"}>
-          {problems ? `${problems} problem${problems === 1 ? "" : "s"}` : "no problem found"}
+        <span className={problems.length ? "diag-count bad" : "diag-count ok"}>
+          {problems.length ? `${problems.length} problem${problems.length === 1 ? "" : "s"}` : "no problem found"}
         </span>
       </summary>
-      <ul className="diag-list">
-        {d.checks.map((c) => (
-          <li key={c.id} className={`diag-row s-${c.status}`}>
-            <span className="diag-mark" aria-label={c.status}>
-              {CHECK_MARK[c.status]}
-            </span>
-            <span className="diag-label">{c.label}</span>
-            <span className="diag-detail">{c.detail}</span>
-            {c.fix && c.status === "problem" && onFix ? (
-              <button className="linklike" onClick={() => onFix(c.fix!.tab, c.fix!.sub)}>
-                {c.fix.label}
-              </button>
-            ) : null}
-          </li>
-        ))}
-      </ul>
+      {problems.length ? <ul className="diag-list">{problems.map(row)}</ul> : null}
+      {problems.length ? (
+        <details className="diag-more">
+          <summary>Other checks ({rest.length})</summary>
+          <ul className="diag-list">{rest.map(row)}</ul>
+        </details>
+      ) : (
+        <ul className="diag-list">{rest.map(row)}</ul>
+      )}
       {d.offers.map((o) => (
         <OfferTermsCompare key={o.offerId} o={o} />
       ))}

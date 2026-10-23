@@ -620,7 +620,7 @@ test("Market → Sell's 'as of' is when the report was READ on the server — no
   // A report without the time (an older server): as of when it came.
   assert.equal(reportLoaded({ sell: {} } as MagmaV2Report, gotAt).at, gotAt);
   const sell = readFileSync(new URL("../src/components/MarketSell.tsx", import.meta.url), "utf8");
-  assert.match(sell, /as of \{new Date\(recAt\)\.toLocaleTimeString/);
+  assert.match(sell, /as of \$?\{new Date\(recAt\)\.toLocaleTimeString/);
   assert.match(sell, /const takeReport = \(r: MagmaV2Report\) => setRecView\(reportLoaded\(r\)\);/);
 });
 

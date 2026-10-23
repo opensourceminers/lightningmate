@@ -1311,6 +1311,19 @@ tr.pending td { opacity: 0.9; }
 .kpi-spark { margin-top: 8px; min-height: 30px; }
 
 .feed { display: flex; flex-direction: column; }
+/* Overview: the activity feed across the full width, in two columns, newest
+   first down the left one (the rows per column are set inline). */
+.feed.cols { display: grid; grid-auto-flow: column; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 32px; }
+.feed-count { color: var(--muted); font-weight: 600; }
+@media (max-width: 900px) {
+  .feed.cols { grid-auto-flow: row; grid-template-columns: 1fr; grid-template-rows: none !important; }
+}
+
+/* Overview: the autopilot, top channels and suggested peers tiles side by
+   side, each as tall as the tallest. */
+.tile-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; align-items: stretch; }
+.app .tile-row > .panel { margin: 0; height: 100%; }
+@media (max-width: 900px) { .tile-row { grid-template-columns: 1fr; } }
 .feed-row {
   display: grid; grid-template-columns: auto 1fr auto auto; align-items: center; gap: 10px;
   padding: 9px 0; border-bottom: 1px solid var(--line-soft);
@@ -1518,3 +1531,14 @@ button:focus-visible, [role="button"]:focus-visible {
 .policy-field > label { display: flex; flex-direction: column; gap: 4px; }
 .ap-line-wait { color: #e0b341; }
 .tab-dot { color: var(--accent); margin-left: 2px; }
+
+/* ── Market → Sell, the lean layout: the offer first, details one click away ── */
+.sell-lede { margin: 2px 0 14px; font-size: 13px; line-height: 1.5; }
+.offer-form { margin-top: 14px; padding: 14px 16px; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--panel-2); }
+.offer-form h4.sub { margin: 0 0 10px; font-size: 13px; }
+.row-btn.add-offer { margin-top: 10px; }
+.price-more, .elig-more, .diag-more { margin-top: 10px; }
+.price-more > summary, .elig-more > summary, .diag-more > summary { cursor: pointer; font-size: 12.5px; color: var(--muted); font-weight: 600; }
+.price-more[open] > summary, .elig-more[open] > summary, .diag-more[open] > summary { margin-bottom: 8px; }
+.elig-head .elig-expect { margin: 0; color: var(--muted); font-size: 13px; }
+.magma-price-head .magma-verdict { margin-left: auto; }

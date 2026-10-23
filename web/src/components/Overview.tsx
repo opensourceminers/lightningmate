@@ -12,7 +12,7 @@ import { Sparkline } from "./Sparkline";
 import { TopChannelsTile } from "./TopChannelsTile";
 import { leaseBenchmarkLine, refusalDigest } from "../magmaView";
 import { pctFromPpm } from "../yieldView";
-import { ACTIVITY_LABEL, activitySub, noForwardsIn7d, rollingForwardsLine } from "../analyticsView";
+import { ACTIVITY_LABEL, activitySub, foldActivity, noForwardsIn7d, rollingForwardsLine } from "../analyticsView";
 import { SuggestedPeersTile } from "./SuggestedPeersTile";
 
 function signed(value: number): string {
@@ -81,19 +81,27 @@ function KpiRow({ d, price }: { d: DashboardData; price?: PriceInfo | null }) {
 }
 
 
+/** Rows the activity feed shows: two columns of five on a wide screen. */
+const ACTIVITY_ROWS = 10;
+
 function RecentActivity({ items }: { items: ActivityItem[] }) {
+  const rows = foldActivity(items, ACTIVITY_ROWS);
   return (
     <section className="panel">
       <div className="panel-head"><h2>Recent activity</h2></div>
-      {items.length === 0 ? (
+      {rows.length === 0 ? (
         <p className="muted empty">Nothing yet — forwards and payments will show here.</p>
       ) : (
-        <div className="feed">
-          {items.slice(0, 11).map((a, i) => (
+        // Newest first, down the left column, then the right one.
+        <div className="feed cols" style={{ gridTemplateRows: `repeat(${Math.ceil(rows.length / 2)}, auto)` }}>
+          {rows.map((a, i) => (
             <div className="feed-row" key={`${a.at}-${i}`}>
               <span className={`feed-dot k-${a.kind}`} />
               <div className="feed-main">
-                <span className="feed-title">{ACTIVITY_LABEL[a.kind] ?? a.kind} · {a.title}</span>
+                <span className="feed-title">
+                  {ACTIVITY_LABEL[a.kind] ?? a.kind} · {a.title}
+                  {a.count > 1 ? <span className="feed-count"> ×{a.count}</span> : null}
+                </span>
                 <span className="feed-sub">{activitySub(a, satsCompact)}</span>
               </div>
               <span className={`feed-amt ${a.amountSats >= 0 ? "pos" : "neg"}`}>{signed(a.amountSats)}</span>
@@ -256,14 +264,18 @@ export function Overview({
       </div>
       {channels ? <LiquidityMap channels={channels} /> : null}
       {dash ? (
-        <div className="hero-row">
-          <RecentActivity items={dash.activity} />
-          <div className="stack-col">
+        <>
+          {/* Three tiles side by side, the same height — the autopilot's status
+              first; the activity feed below, across the full width. (Before, a
+              tall feed of +1 sat forwards ran beside the three tiles stacked
+              in one column, the autopilot's at the bottom.) */}
+          <div className="tile-row">
+            <AutopilotStatus a={dash.autopilot} onOpen={() => onNavigate?.("autopilot")} />
             <TopChannelsTile onOpen={() => onNavigate?.("analytics", "pnl")} />
             <SuggestedPeersTile onOpen={() => onNavigate?.("channels", "open")} />
-            <AutopilotStatus a={dash.autopilot} onOpen={() => onNavigate?.("autopilot")} />
           </div>
-        </div>
+          <RecentActivity items={dash.activity} />
+        </>
       ) : null}
     </div>
   );
