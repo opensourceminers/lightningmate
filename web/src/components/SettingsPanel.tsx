@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { api } from "../api";
 import { pageHidden } from "../usePolledData";
-import type { AmbossKeyCheck, AppSettings, FiatCurrency, LspStatus, PrivacyInfo, TorRoute } from "../types";
-import { CLEARNET_WARNING, lspBuyerGuide, lspIgnoredLine, lspReachText, lspRecoveryLine } from "../lspView";
-import { TOR_ROUTES, destinationLine, privacySummary } from "../privacyView";
+import type { AmbossKeyCheck, AppSettings, FiatCurrency, LspStatus, PrivacyInfo } from "../types";
+import { lspBuyerGuide, lspIgnoredLine, lspReachText, lspRecoveryLine } from "../lspView";
+import { destinationLine, privacySummary } from "../privacyView";
 import { BackupCard } from "./BackupCard";
 import { AmbossKeyStatus } from "./AmbossKeyStatus";
 import { LspActivity } from "./LspActivity";
@@ -136,7 +136,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
     }
   };
 
-  const savePrivacy = async (patch: { lnplusLookups?: boolean; torRoute?: TorRoute }) => {
+  const savePrivacy = async (patch: { lnplusLookups?: boolean }) => {
     setBusy(true);
     setError(null);
     try {
@@ -190,34 +190,13 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
     setTimeout(() => setUriCopied(false), 1500);
   };
 
-  // Clearnet announcement (host:port) via the node API — Umbrel's own UI has
-  // no externalip field, so LightningMate keeps this announced for you.
-  const [clearnetInput, setClearnetInput] = useState("");
-  useEffect(() => {
-    if (settings) setClearnetInput(settings.lspClearnetAddress ?? "");
-  }, [settings?.lspClearnetAddress]);
-
-  const saveClearnet = async () => {
-    if (lspBusy) return;
-    setLspBusy(true);
-    setLspError(null);
-    try {
-      setSettings(await api.setSettings({ lspClearnetAddress: clearnetInput.trim() }));
-      setLsp(await api.lspStatus());
-    } catch (e) {
-      setLspError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setLspBusy(false);
-    }
-  };
-
   // Ready-to-share buyer instructions — the practical discovery channel while
   // graph crawlers catch up on the feature bit.
   const [guideCopied, setGuideCopied] = useState(false);
-  // The node's announced clearnet URI when it has one (a buyer without Tor
-  // can reach that one), else its .onion URI.
+  // The node's .onion URI: LSP mode is Tor-only, a buyer reaches it with no
+  // port opened anywhere. (Else whatever LND announces.)
   const preferredUri = (l: LspStatus) =>
-    l.uris.find((u) => !u.includes(".onion")) ?? l.uris[0] ?? l.pubkey;
+    l.uris.find((u) => u.includes(".onion")) ?? l.uris[0] ?? l.pubkey;
 
   const copyBuyerGuide = () => {
     if (!lsp) return;
@@ -279,23 +258,12 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
       <h3 className="sub">Privacy</h3>
       {privacy ? (
         <>
-          {/* Without a proxy every lookup leaves from the home IP: said up front. */}
-          {privacy.torProxy ? null : <div className="dryrun-banner">{privacySummary(privacy)}</div>}
+          {/* Without a proxy every lookup leaves from the home IP: a warning. */}
           {privacy.torProxy ? (
-            <div className="seg">
-              {TOR_ROUTES.map((r) => (
-                <button
-                  key={r.id}
-                  className={`seg-btn ${privacy.torRoute === r.id ? "active" : ""}`}
-                  disabled={busy}
-                  title={r.desc}
-                  onClick={() => void savePrivacy({ torRoute: r.id })}
-                >
-                  {r.label}
-                </button>
-              ))}
-            </div>
-          ) : null}
+            <p className="muted">{privacySummary(privacy)}</p>
+          ) : (
+            <div className="dryrun-banner">{privacySummary(privacy)}</div>
+          )}
           <div className="amboss-row" style={{ marginTop: 10 }}>
             <Switch
               checked={privacy.lnplusLookups}
@@ -307,7 +275,6 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
           </div>
           <details className="set-more">
             <summary>Where each lookup goes</summary>
-            {privacy.torProxy ? <p className="muted">{privacySummary(privacy)}</p> : null}
             <ul className="close-aside">
               {privacy.destinations.map((d) => (
                 <li key={d.service}>{destinationLine(d)}</li>
@@ -446,17 +413,11 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
               </div>
             );
           })()}
-          {/* A home IP in the public graph is never tucked away. */}
-          {lsp.announcedSocket.error ? (
-            <p className="banner error">{lsp.announcedSocket.error}</p>
-          ) : lsp.announcedSocket.address && lsp.announcedSocket.applied ? (
-            <p className="muted">Announcing {lsp.announcedSocket.address} in the node graph ✓</p>
-          ) : null}
         </>
       ) : null}
       {lsp ? (
         <details className="set-more">
-          <summary>{settings?.lspModeEnabled ? "Who can order, graph announcement, clearnet address" : "How it works, and who can order"}</summary>
+          <summary>{settings?.lspModeEnabled ? "Who can order, and the graph announcement" : "How it works, and who can order"}</summary>
           <p className="muted">
             Inbound channels sold directly to wallets speaking the open LSP standard (LSPS1 / bLIP-51) over Lightning
             peer messages, with no marketplace in between. Orders are priced by the same engine as Magma selling; the
@@ -466,38 +427,13 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
           {/* Who can order here — before the mode is switched on, too. */}
           <p className="muted">{lspReachText(lsp.uris)}</p>
           {settings?.lspModeEnabled ? (
-            <>
-              <p className="muted">
-                {lsp.featureBit.set
-                  ? "Announcing LSP support in the node graph (feature bit 729) — explorers and wallets can discover you."
-                  : lsp.featureBit.error
-                    ? `Graph announcement unavailable (${lsp.featureBit.error}) — share your URI directly instead.`
-                    : "Graph announcement pending…"}
-              </p>
-              <div className="dryrun-banner warn" style={{ marginTop: 10 }}>{CLEARNET_WARNING}</div>
-              <p className="muted">
-                Optional clearnet address (host:port, with port 9735 forwarded on your router). A DDNS
-                name is re-resolved hourly and kept announced across node restarts and IP changes:
-              </p>
-              <div className="amboss-row">
-                <input
-                  className="unlock-input amboss-key"
-                  value={clearnetInput}
-                  placeholder="mynode.example.com:9735 or 203.0.113.7:9735"
-                  onChange={(e) => setClearnetInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void saveClearnet();
-                  }}
-                />
-                <button
-                  className="primary-btn"
-                  disabled={lspBusy || clearnetInput.trim() === (settings?.lspClearnetAddress ?? "")}
-                  onClick={() => void saveClearnet()}
-                >
-                  {clearnetInput.trim() ? "Announce" : "Withdraw"}
-                </button>
-              </div>
-            </>
+            <p className="muted">
+              {lsp.featureBit.set
+                ? "Announcing LSP support in the node graph (feature bit 729) — explorers and wallets can discover you."
+                : lsp.featureBit.error
+                  ? `Graph announcement unavailable (${lsp.featureBit.error}) — share your URI directly instead.`
+                  : "Graph announcement pending…"}
+            </p>
           ) : null}
         </details>
       ) : null}

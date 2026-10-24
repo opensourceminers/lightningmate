@@ -21,7 +21,7 @@ export async function getBtcPrice(currency: FiatCurrency): Promise<number | null
     return cache.price;
   }
   try {
-    const res = await httpRequest("https://mempool.space/api/v1/prices", {}, HTTP_TIMEOUTS.priceMs, "price");
+    const res = await httpRequest("https://mempool.space/api/v1/prices", {}, HTTP_TIMEOUTS.priceMs);
     if (!res.ok) throw new Error(`price http ${res.status}`);
     const data = await res.json<Record<string, number>>();
     const price = data[currency];

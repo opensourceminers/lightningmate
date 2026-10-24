@@ -132,7 +132,7 @@ import { MIN_YIELD_EARNED_SAT, MIN_YIELD_FORWARDS, OPEN_PAYBACK_MONTHS } from ".
 import { saleFeeConfig, type ServiceFeeLedger } from "../services/serviceFee.js";
 import { floorWindowStart, getFeeRecommendations } from "../services/feeRecommend.js";
 import { getBtcPrice } from "../services/price.js";
-import { outboundRouting, setOutboundRouting, viaTor, type TorRoute } from "../services/http.js";
+import { outboundRouting, viaTor } from "../services/http.js";
 import type { FiatCurrency, SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, FeeMode, OverridesStore } from "../services/overrides.js";
 import { getAlerts, magmaRefusalAlerts, offerPriceAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
@@ -253,7 +253,6 @@ function isOneOf<T extends string>(value: unknown, options: readonly T[]): value
   return typeof value === "string" && (options as readonly string[]).includes(value);
 }
 const FIAT_CURRENCIES: readonly FiatCurrency[] = ["off", "USD", "EUR", "GBP", "CHF"];
-const TOR_ROUTES: readonly TorRoute[] = ["lookups", "all", "direct"];
 const FEE_MODES: readonly FeeMode[] = ["auto", "fixed", "exclude"];
 const isFeeMode = (v: unknown): v is FeeMode => isOneOf(v, FEE_MODES);
 /** Finite integer within [min, max], else null. */
@@ -1294,9 +1293,9 @@ export function createApiRouter(
       const me = await lnplus.lookup(ownKey).catch(() => null);
       res.json({
         enabled: lnplus.isEnabled(),
-        viaTor: viaTor("lnplus"),
-        // Whether the app has Umbrel's Tor proxy at all: "direct" with a
-        // proxy is the operator's route setting, not a missing proxy.
+        viaTor: viaTor(),
+        // Whether the app has Umbrel's Tor proxy at all (every request goes
+        // through it when it does).
         torProxy: !!outboundRouting().proxy,
         pubkey: ownKey,
         onLnPlus: !!me,
@@ -1489,7 +1488,7 @@ export function createApiRouter(
     res.json(settings.get());
   });
   router.post("/settings", (req, res) => {
-    const { fiatCurrency, lspModeEnabled, lnplusLookups, torRoute, lspClearnetAddress } = bodyOf<SettingsPatch>(req);
+    const { fiatCurrency, lspModeEnabled, lnplusLookups } = bodyOf<SettingsPatch>(req);
     const patch: Parameters<typeof settings.set>[0] = {};
     if (fiatCurrency !== undefined) {
       if (!isOneOf(fiatCurrency, FIAT_CURRENCIES)) {
@@ -1505,13 +1504,6 @@ export function createApiRouter(
       }
       patch.lnplusLookups = lnplusLookups;
     }
-    if (torRoute !== undefined) {
-      if (!isOneOf(torRoute, TOR_ROUTES)) {
-        res.status(400).json({ error: "bad_request", message: "torRoute must be lookups, all or direct." });
-        return;
-      }
-      patch.torRoute = torRoute;
-    }
     if (lspModeEnabled !== undefined) {
       if (typeof lspModeEnabled !== "boolean") {
         res.status(400).json({ error: "bad_request", message: "invalid lspModeEnabled" });
@@ -1523,78 +1515,54 @@ export function createApiRouter(
       }
       patch.lspModeEnabled = lspModeEnabled;
     }
-    if (lspClearnetAddress !== undefined) {
-      // host:port (IPv4 or domain), or "" to withdraw. Tor is announced by LND
-      // itself — .onion doesn't belong here.
-      const value = typeof lspClearnetAddress === "string" ? lspClearnetAddress.trim() : null;
-      const m = value != null ? /^([a-z0-9.-]+):(\d{1,5})$/i.exec(value) : null;
-      const okSocket =
-        value === "" ||
-        (m != null && !m[1].toLowerCase().endsWith(".onion") && Number(m[2]) >= 1 && Number(m[2]) <= 65535);
-      if (value == null || !okSocket) {
-        res.status(400).json({
-          error: "bad_request",
-          message: "invalid lspClearnetAddress — expected host:port (e.g. mynode.example.com:9735), not .onion",
-        });
-        return;
-      }
-      if (value && !writeLnd) {
-        res.status(400).json({ error: "read_only", message: WRITE_DISABLED_MSG });
-        return;
-      }
-      patch.lspClearnetAddress = value;
-    }
     const next = settings.set(patch);
-    setOutboundRouting({ route: next.torRoute });
     lsps1.applySettings();
     res.json(next);
   });
 
-  // Where LightningMate's own lookups go, and over which route — the
-  // Settings page's privacy card. The node is Tor-only; these lookups are the
-  // app's, from this server's internet connection unless Umbrel's Tor proxy
-  // carries them (review a3-channels:lnplus-clearnet-lookups).
+  // Where LightningMate's own lookups go, and how — the Settings page's
+  // privacy card. The node is Tor-only, and so are these lookups: through
+  // Umbrel's Tor proxy, every one (http.ts); without a proxy, from this
+  // server's internet connection (review a3-channels:lnplus-clearnet-lookups).
   router.get("/privacy", (_req, res) => {
     const s = settings.get();
     const proxy = outboundRouting().proxy;
     res.json({
       torProxy: proxy ? `${proxy.host}:${proxy.port}` : null,
-      torRoute: s.torRoute,
       lnplusLookups: s.lnplusLookups,
       destinations: [
         {
           service: "Amboss public market data (api.amboss.space, magma.amboss.tech)",
           // The public book (eligibility, the Overview's lease benchmark, buy
           // offers) asks for this node's own seller score — by its public
-          // key — with or without an Amboss key. Read without the key: a
-          // public lookup, through Tor on the default route (review of P4).
+          // key — with or without an Amboss key: a public lookup (review of P4).
           what: "Magma offers, recent sales and the dollar rate — your own node's public seller score included (by its public key), read without your API key",
           active: true,
-          viaTor: viaTor("amboss_public"),
+          viaTor: viaTor(),
         },
         {
           service: "Amboss account (magma.amboss.tech)",
           what: "with your API key: your offers, orders and purchases — tied to your Amboss account",
           active: amboss.hasKey(),
-          viaTor: viaTor("amboss"),
+          viaTor: viaTor(),
         },
         {
           service: "lightningnetwork.plus",
           what: "node reputations for peer picking, the Pool and Swaps views — your own node's public key included",
           active: s.lnplusLookups,
-          viaTor: viaTor("lnplus"),
+          viaTor: viaTor(),
         },
         {
           service: "mempool.space",
           what: "the BTC price, only while a fiat currency is chosen",
           active: s.fiatCurrency !== "off",
-          viaTor: viaTor("price"),
+          viaTor: viaTor(),
         },
         {
           service: "the service-fee lightning address",
           what: "an invoice for the 1 % fee after a completed sale",
           active: true,
-          viaTor: viaTor("lnurl"),
+          viaTor: viaTor(),
         },
       ],
     } satisfies PrivacyInfo);

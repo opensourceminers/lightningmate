@@ -216,7 +216,6 @@ export type {
   SuggestionPolicy,
   SuggestionsQuery,
   SuggestionsResponse,
-  TorRoute,
   TzQuery,
   UnservedDemandChannel,
   UnservedDemandReport,

@@ -7,7 +7,8 @@
  * requests (every ZEUS order was refused while it looked healthy), promised
  * that "any LSPS1-capable wallet" works, and told a Tor-only node to
  * "announce a clearnet address below to reach more wallets" — publishing
- * the home IP for good, against the node's Tor-only stance.
+ * the home IP for good, against the node's Tor-only stance. Since 0.8.5
+ * the mode is Tor-only: no clearnet address field, buyers get the .onion.
  */
 import "./helpers/browserGlobals";
 import { test } from "node:test";
@@ -16,7 +17,6 @@ import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { LspActivity } from "../src/components/LspActivity";
 import {
-  CLEARNET_WARNING,
   isTorOnly,
   lspBlockedLine,
   lspBuyerGuide,
@@ -49,15 +49,12 @@ test("on a Tor-only node the card says how few wallets can order — and propose
   assert.match(tor, /typed in by hand/);
   assert.match(tor, /Wallets that order LSPS1 over HTTPS — ZEUS on a remote node or over LNC, LDK-based wallets — can't order here/);
   assert.match(tor, /Expect few or no orders — LSP mode is experimental\.$/);
-  for (const text of [tor, lspReachText([CLEAR]), CLEARNET_WARNING, lspBuyerGuide(ONION)]) {
+  for (const text of [tor, lspReachText([CLEAR]), lspBuyerGuide(ONION)]) {
     assert.doesNotMatch(text, /announce a clearnet|reach more wallets|clearnet address below/i, "no clearnet proposal");
   }
-  assert.match(CLEARNET_WARNING, /publishes it in the public Lightning graph/);
-  assert.match(CLEARNET_WARNING, /your home IP address .* is tied to this node for good/);
-  assert.match(CLEARNET_WARNING, /Leave it empty to stay Tor-only\.$/);
 });
 
-test("the Settings card: experimental, the reach note and the clearnet warning shown — the old nudge and the get_info-only counter gone", () => {
+test("the Settings card: experimental, the reach note shown, Tor-only — no clearnet field, buyers get the .onion; the old nudge and the get_info-only counter gone", () => {
   const settings = readFileSync(new URL("../src/components/SettingsPanel.tsx", import.meta.url), "utf8");
   assert.match(settings, /<h3 className="sub">LSP mode \(experimental\)<\/h3>/);
   assert.doesNotMatch(settings, /LSP mode \(beta\)/);
@@ -65,13 +62,15 @@ test("the Settings card: experimental, the reach note and the clearnet warning s
   assert.doesNotMatch(settings, /get_info served/);
   assert.doesNotMatch(settings, /Any LSPS1-capable wallet/);
   assert.match(settings, /\{lspReachText\(lsp\.uris\)\}/);
-  assert.match(settings, /\{CLEARNET_WARNING\}/);
   // What it is doing — served, refused, why orders are turned away — is LspActivity's.
   assert.match(settings, /<LspActivity lsp=\{lsp\} \/>/);
   const activity = readFileSync(new URL("../src/components/LspActivity.tsx", import.meta.url), "utf8");
   assert.match(activity, /lspRefusalLines\(lsp\)\.map/);
-  // The field stays (community nodes with a static IP use it), behind the warning.
-  assert.match(settings, /placeholder="mynode\.example\.com:9735 or 203\.0\.113\.7:9735"/);
+  // 0.8.5: Tor-only. No clearnet address to announce (it took a port forwarded
+  // on the router and tied the home IP to the node for good) — and the URI
+  // buyers get is the .onion one, also where LND announces a clearnet one.
+  assert.doesNotMatch(settings, /lspClearnetAddress|mynode\.example\.com|CLEARNET_WARNING/);
+  assert.match(settings, /l\.uris\.find\(\(u\) => u\.includes\(".onion"\)\) \?\? l\.uris\[0\] \?\? l\.pubkey/);
 });
 
 const status = (o: Partial<LspStatus> = {}): Pick<LspStatus, "requests" | "ignoredParams" | "recovery"> => ({

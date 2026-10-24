@@ -29,39 +29,31 @@ export const HTTP_TIMEOUTS = {
   lnurlMs: 15_000,
 };
 
-/** What an outbound request is for — what decides its route.
- *  "amboss_public": an Amboss read made without the API key (the public
- *  market data, this node's own seller score by its public key);
- *  "amboss": a call with the key (offers, orders, purchases). */
-export type OutboundPurpose = "amboss" | "amboss_public" | "lnplus" | "price" | "lnurl";
-
 /**
- * Which outbound requests go through the Tor proxy (when one is available):
- *  - "lookups" (default): the third-party lookups that tie this server's IP
- *    to the node — LN+ (its own pubkey included), the BTC price and
- *    Amboss's public market data (this node's own seller score included);
- *  - "all": the Amboss calls made with the API key (offers, orders,
- *    purchases — tied to the Amboss account anyway; their orders have
- *    deadlines, and Tor is slower) and the service-fee LNURL too;
- *  - "direct": nothing (a lookup service that blocks Tor exits).
- * Without a proxy every request goes direct, and the Settings page says so.
- * (Review of P4: under "lookups" the keyless Amboss reads went direct too —
- * a node with no Amboss key linked its home IP to its public key at Amboss
- * about once a day.)
+ * Every outbound request goes through Umbrel's Tor proxy when the app has one
+ * (TOR_PROXY_IP / TOR_PROXY_PORT): LN+, the BTC price, Amboss — its public
+ * market data and the calls made with the API key — and the service-fee
+ * LNURL. None leaves from this server's IP address, and none needs a port
+ * opened anywhere. Without a proxy (outside Umbrel) every request goes
+ * direct, and the Settings page says so.
+ *
+ * Before (0.8.4), the operator chose a route: "Lookups via Tor", the default,
+ * sent the Amboss calls made with the key and the fee lookup direct, and
+ * "Direct" sent everything direct. On 2026-10-24 a provider's block of
+ * Amboss's addresses (during football matches) cut the direct calls off —
+ * "Amboss unreachable" for the offers and the orders, with their deadlines —
+ * while Tor reached Amboss in 1.4 s.
  */
-export type TorRoute = "lookups" | "all" | "direct";
-
 export interface OutboundRouting {
   /** Umbrel's Tor proxy (TOR_PROXY_IP / TOR_PROXY_PORT), or null. */
   proxy: SocksProxy | null;
-  route: TorRoute;
   /** Tests only: the CA a proxied TLS connection trusts. */
   tlsCa?: string | Buffer;
 }
 
-let routing: OutboundRouting = { proxy: torProxyFromEnv(), route: "lookups" };
+let routing: OutboundRouting = { proxy: torProxyFromEnv() };
 
-/** Change the routing (the operator's setting, or a test's proxy). */
+/** Change the routing (a test's proxy). */
 export function setOutboundRouting(patch: Partial<OutboundRouting>): void {
   routing = { ...routing, ...patch };
 }
@@ -71,23 +63,19 @@ export function outboundRouting(): Readonly<OutboundRouting> {
   return routing;
 }
 
-/** Whether a request for `purpose` goes through the Tor proxy right now. */
-export function viaTor(purpose: OutboundPurpose | undefined): boolean {
-  if (!routing.proxy || !purpose || routing.route === "direct") return false;
-  return routing.route === "all" || purpose === "lnplus" || purpose === "price" || purpose === "amboss_public";
+/** Whether outbound requests go through the Tor proxy: all of them, when
+ *  there is one. */
+export function viaTor(): boolean {
+  return !!routing.proxy;
 }
 
 /**
- * Said with a lookup that failed: ` through Tor (Settings → Privacy, Tor
- * route "…")` when requests for `purpose` go through Tor now, else "". A Tor
- * exit a service refuses is then not taken for the service being down, and
- * the operator sees which setting decides the route. (The labels are the
- * Settings card's — web/src/privacyView.ts TOR_ROUTES; a web test keeps the
- * two the same.)
+ * Said with a lookup that failed: " through Tor" when it went through Tor,
+ * else "" — a Tor exit a service refuses is then not taken for the service
+ * being down.
  */
-export function torVia(purpose: OutboundPurpose): string {
-  if (!viaTor(purpose)) return "";
-  return ` through Tor (Settings → Privacy, Tor route "${routing.route === "all" ? "Everything via Tor" : "Lookups via Tor"}")`;
+export function torVia(): string {
+  return viaTor() ? " through Tor" : "";
 }
 
 export class HttpTimeoutError extends Error {
@@ -114,7 +102,7 @@ export interface TimedResponse {
  * does not answer in time, and the returned body readers reject the same way
  * when the body stalls. Network errors are passed through unchanged.
  */
-export async function httpRequest(url: string, init: RequestInit, timeoutMs: number, purpose?: OutboundPurpose): Promise<TimedResponse> {
+export async function httpRequest(url: string, init: RequestInit, timeoutMs: number): Promise<TimedResponse> {
   const deadline = AbortSignal.timeout(timeoutMs);
   const signal = init.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
   // The signal also tells fetch to tear the connection down; the race makes the
@@ -138,7 +126,7 @@ export async function httpRequest(url: string, init: RequestInit, timeoutMs: num
         },
       );
     });
-  if (viaTor(purpose) && routing.proxy) {
+  if (routing.proxy) {
     // Through the Tor proxy, the same deadline over the whole exchange — and
     // never a quiet fallback to a direct connection.
     const proxied = await bounded(

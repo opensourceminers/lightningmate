@@ -30,16 +30,18 @@ security@opensourceminers.de (please don't open a public issue first).
 
   The route depends on whether Umbrel gives the app its Tor proxy
   (`TOR_PROXY_IP` / `TOR_PROXY_PORT`):
-  - **With the proxy**, LN+, the price lookup and Amboss's public market data
-    (this node's own seller score included) go through Tor by default
-    ("Lookups via Tor"). The Amboss calls made with your API key and the
-    LNURL lookup go through Tor only with "Everything via Tor", and "Direct"
-    sends nothing through it (Settings → Privacy). A lookup routed through
-    Tor never falls back to a direct connection: when Amboss can't be read
-    through Tor, the selling check and the Overview's lease benchmark say so
-    and name the route setting.
-  - **Without the proxy**, every one of them leaves from this server's
-    internet connection, which is your home IP address.
+  - **With the proxy** (every Umbrel install), every one of them goes through
+    Tor: LN+, the price lookup, Amboss's public market data (this node's own
+    seller score included), the Amboss calls made with your API key and the
+    LNURL lookup. None leaves from your home IP address, and none needs a port
+    opened on your router. No setting routes them around Tor (up to 0.8.4 one
+    did, and the Amboss calls made with the key and the LNURL lookup went
+    direct by default). A lookup never falls back to a direct connection:
+    when Amboss can't be read through Tor, the selling check and the
+    Overview's lease benchmark say so.
+  - **Without the proxy** (outside Umbrel), every one of them leaves from
+    this server's internet connection, which is your home IP address, and
+    Settings → Privacy says so.
 
   Settings → Privacy ("Where each lookup goes") lists each destination with
   the route it takes right now. Every outbound request has a hard deadline.

@@ -1,5 +1,4 @@
 import { JsonStore } from "../store.js";
-import type { TorRoute } from "./http.js";
 
 export type FiatCurrency = "off" | "USD" | "EUR" | "GBP" | "CHF";
 
@@ -10,14 +9,8 @@ export interface AppSettings {
    *  peer picking, the Pool and Swaps views. Off: no LN+ request at all
    *  (cached answers are still used). */
   lnplusLookups: boolean;
-  /** Which outbound requests go through Umbrel's Tor proxy when the app has
-   *  one (http.ts TorRoute). */
-  torRoute: TorRoute;
   /** LSP mode (experimental): answer LSPS1 (bLIP-51) requests from wallets. Off by default. */
   lspModeEnabled: boolean;
-  /** Clearnet address (host:port) to announce in the node graph, "" = none.
-   *  Applied via peersrpc at runtime — Umbrel's UI has no externalip field. */
-  lspClearnetAddress: string;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -25,19 +18,32 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // On, as since LN+ came in (0.7.4) — with Umbrel's Tor proxy its lookups
   // go through Tor; without one, Settings says they leave from this IP.
   lnplusLookups: true,
-  torRoute: "lookups",
   lspModeEnabled: false,
-  lspClearnetAddress: "",
 };
+
+/** What 0.8.4 and before kept beside the settings: a Tor route (every
+ *  request goes through Tor now, http.ts) and a clearnet address LSP mode
+ *  announced in the node graph (LSP mode is Tor-only now, lsps1.ts). */
+type StoredSettings = Partial<AppSettings> & { torRoute?: unknown; lspClearnetAddress?: unknown };
 
 /** Persisted user settings (currency, …). */
 export class SettingsStore {
   private readonly store: JsonStore<AppSettings>;
   private settings: AppSettings;
+  /** The clearnet address an older version announced ("" = none): withdrawn
+   *  once at start (Lsps1Service), then forgotten. */
+  private legacyClearnet: string;
 
   constructor(dataDir: string) {
     this.store = new JsonStore<AppSettings>(dataDir, "settings.json");
-    this.settings = { ...DEFAULT_SETTINGS, ...this.store.read(DEFAULT_SETTINGS) };
+    const stored: StoredSettings = this.store.read(DEFAULT_SETTINGS);
+    this.legacyClearnet = typeof stored.lspClearnetAddress === "string" ? stored.lspClearnetAddress.trim() : "";
+    // Only today's settings: an older version's leave the file at the next save.
+    this.settings = {
+      fiatCurrency: stored.fiatCurrency ?? DEFAULT_SETTINGS.fiatCurrency,
+      lnplusLookups: stored.lnplusLookups ?? DEFAULT_SETTINGS.lnplusLookups,
+      lspModeEnabled: stored.lspModeEnabled ?? DEFAULT_SETTINGS.lspModeEnabled,
+    };
   }
 
   get(): AppSettings {
@@ -48,5 +54,16 @@ export class SettingsStore {
     this.settings = { ...this.settings, ...partial };
     this.store.write(this.settings);
     return this.settings;
+  }
+
+  /** The clearnet address LSP mode announced before 0.8.5, "" when none. */
+  legacyClearnetAddress(): string {
+    return this.legacyClearnet;
+  }
+
+  /** It is withdrawn: forget it, in the file too. */
+  forgetLegacyClearnetAddress(): void {
+    this.legacyClearnet = "";
+    this.store.write(this.settings);
   }
 }

@@ -126,9 +126,11 @@ home-screen widget, which the official one doesn't).
    TOR_PROXY_PORT: "$TOR_PROXY_PORT"
    ```
 
-   Without them LightningMate has no Tor proxy on Umbrel: LN+ reputations
-   (this node's key included), the BTC price and Amboss's public market data
-   go out directly from the home connection, and Settings → Privacy says so.
+   Without them LightningMate has no Tor proxy on Umbrel: every lookup — LN+
+   reputations (this node's key included), the BTC price, Amboss with and
+   without the API key, the fee lookup — goes out directly from the home
+   connection, and Settings → Privacy says so. With them, every one goes
+   through Tor.
 3. Keep `LM_SELL_FEE_BPS: "100"` and `LM_SELL_FEE_ADDRESS` (the disclosed 1 %
    service fee on completed sales). Optional: `LM_SELL_FEE_PUBKEY` — the fee
    server's node id; with it, fee invoices to any other node are refused (D13).

@@ -1,6 +1,5 @@
 import {
   addAdvertisedFeature,
-  addExternalSocket,
   getChainFeeRate,
   getInvoice,
   getWalletInfo,
@@ -409,8 +408,6 @@ export interface Lsps1Status {
   serviceFeeBps: number;
   /** Graph discovery: feature bit 729 announced? null error = fine/unknown. */
   featureBit: { set: boolean; error: string | null };
-  /** Clearnet address announced via peersrpc ("" = none configured). */
-  announcedSocket: { address: string; applied: boolean; error: string | null };
   /** What `lsps1.get_info` currently answers — shown in the Settings card. */
   offer: {
     minChannelSat: number;
@@ -484,9 +481,6 @@ export class Lsps1Service {
   private featureBitError: string | null = null;
   /** Last applied toggle state — detects on→off transitions (withdraw the bit). */
   private lastEnabled: boolean | undefined;
-  /** Last clearnet socket applied via peersrpc; undefined = unknown (re-assert). */
-  private lastAppliedSocket: string | undefined;
-  private socketError: string | null = null;
 
   private readonly ordersStore: JsonStore<Lsps1Order[]>;
   private orders: Lsps1Order[];
@@ -498,7 +492,6 @@ export class Lsps1Service {
   private opensInFlight = 0;
   /** Set by stop(): no new channel open may begin. */
   private stopping = false;
-  private socketTimer: NodeJS.Timeout | undefined;
   /** "Look again for the interrupted open" timers — cleared by stop(). */
   private readonly resumeTimers = new Set<NodeJS.Timeout>();
   /** The on-chain budget shared with Magma selling and the channel autopilot. */
@@ -580,10 +573,7 @@ export class Lsps1Service {
     // the start, and no order is taken (createOrder).
     if (this.writeLnd) void checkPeerListing(this.writeLnd);
     void this.recoverOrders();
-    // Hourly re-check of the announced clearnet address: a DDNS name follows
-    // the home IP, so re-resolve and swap the announcement when it moved.
-    this.socketTimer = setInterval(() => void this.applyAnnouncedSocket(), 60 * 60_000);
-    this.socketTimer.unref?.();
+    void this.withdrawLegacyClearnet();
   }
 
   /**
@@ -595,8 +585,6 @@ export class Lsps1Service {
    */
   stop(): void {
     this.stopping = true;
-    if (this.socketTimer) clearInterval(this.socketTimer);
-    this.socketTimer = undefined;
     for (const t of this.resumeTimers) clearTimeout(t);
     this.resumeTimers.clear();
     if (this.retryTimer) clearTimeout(this.retryTimer);
@@ -624,8 +612,8 @@ export class Lsps1Service {
     return true;
   }
 
-  /** Call after the LSP-mode toggle or clearnet address changes — starts/stops
-   *  the subscription and keeps the graph announcements in sync. */
+  /** Call after the LSP-mode toggle changes — starts/stops the subscription
+   *  and keeps the feature bit in sync. */
   applySettings(): void {
     const enabled = this.settings.get().lspModeEnabled && !!this.writeLnd;
     if (enabled) {
@@ -637,51 +625,33 @@ export class Lsps1Service {
       if (this.lastEnabled) void this.advertiseFeature(false);
     }
     this.lastEnabled = enabled;
-    // The clearnet announcement is independent of the LSP toggle — reachability
-    // helps the node either way, and buyers may connect before enabling.
-    void this.applyAnnouncedSocket();
   }
 
-  /** Announce (or withdraw) the configured clearnet address via peersrpc.
-   *
-   *  LND resolves a hostname only ONCE when it's announced, so for DDNS names
-   *  (dynamic home IPs) we resolve ourselves, announce the IP literal, and
-   *  re-check hourly — when the IP behind the name changes, the stale address
-   *  is withdrawn and the new one announced. Runtime announcements also don't
-   *  survive an LND restart, so the reconnect path re-asserts too. */
-  private async applyAnnouncedSocket(): Promise<void> {
-    if (!this.writeLnd) return;
-    const desired = (this.settings.get().lspClearnetAddress ?? "").trim();
-    let target = ""; // the ip:port we actually announce ("" = withdraw)
+  /**
+   * LSP mode is Tor-only since 0.8.5: buyers reach the node at its .onion
+   * address, with no port opened on any router. Before, it could announce a
+   * clearnet address in the node graph (a DDNS name re-resolved hourly), which
+   * took a forwarded port and tied the home IP to the node for good. That
+   * announcement was made at runtime (peersrpc), so LND keeps it until its
+   * next restart: withdrawn here, once, then forgotten. An LND that can't take
+   * the withdrawal right after the app starts has usually just restarted
+   * itself — and dropped the address already; otherwise the log says so.
+   */
+  private async withdrawLegacyClearnet(): Promise<void> {
+    const old = this.settings.legacyClearnetAddress();
+    if (!old) return;
     try {
-      if (desired) {
-        const [host, port] = desired.split(":");
+      // (Without a write macaroon nothing was ever announced.)
+      if (this.writeLnd) {
+        const [host, port] = old.split(":");
         const ip = /^\d+\.\d+\.\d+\.\d+$/.test(host) ? host : (await lookup(host, { family: 4 })).address;
-        target = `${ip}:${port}`;
+        await this.lndRemoveSocket(`${ip}:${port}`);
+        console.log(`[lsps1] withdrew the clearnet address ${ip}:${port} (${old}) from the node graph — LSP mode is Tor-only`);
       }
-      if (this.lastAppliedSocket === target) {
-        this.socketError = null;
-        return; // same IP as announced — nothing to gossip
-      }
-      // IP changed / address cleared: withdraw the previous announcement (boot
-      // = unknown, nothing to withdraw — LND lost runtime updates on restart).
-      if (this.lastAppliedSocket) {
-        await this.lndRemoveSocket(this.lastAppliedSocket).catch(() => undefined);
-      }
-      if (target) await this.lndAddSocket(target);
-      this.lastAppliedSocket = target;
-      this.socketError = null;
-      if (target) console.log(`[lsps1] announcing clearnet address ${target} (${desired}) in the node graph`);
     } catch (err) {
-      const detail = lndErrorDetail(err);
-      // A no-op add means the address is already announced (e.g. via lnd.conf).
-      if (/already|no modification/i.test(detail)) {
-        this.lastAppliedSocket = target;
-        this.socketError = null;
-        return;
-      }
-      this.socketError = detail;
-      console.warn(`[lsps1] could not announce clearnet address "${desired}": ${detail}`);
+      console.warn(`[lsps1] could not withdraw the clearnet address "${old}" (${lndErrorDetail(err)}) — LND drops it at its next restart`);
+    } finally {
+      this.settings.forgetLegacyClearnetAddress();
     }
   }
 
@@ -824,11 +794,6 @@ export class Lsps1Service {
       earnedSat: completed.reduce((s, o) => s + o.feeTotalSat, 0),
       serviceFeeBps: saleFeeConfig().bps,
       featureBit: { set: this.featureBitSet, error: this.featureBitError },
-      announcedSocket: {
-        address: (this.settings.get().lspClearnetAddress ?? "").trim(),
-        applied: !!this.lastAppliedSocket && this.socketError == null,
-        error: this.socketError,
-      },
       offer,
     };
   }
@@ -850,11 +815,9 @@ export class Lsps1Service {
       this.lastError = null;
       this.retryMs = 10_000;
       console.log("[lsps1] LSP mode on — listening for LSPS peer messages (type 37913)");
-      // (Re)assert the graph announcements: an LND restart (the usual reason
-      // this stream reconnects) drops runtime announcement updates.
+      // (Re)assert the feature bit: an LND restart (the usual reason this
+      // stream reconnects) drops runtime announcement updates.
       void this.advertiseFeature(true);
-      this.lastAppliedSocket = undefined;
-      void this.applyAnnouncedSocket();
       // LND is back (or just switched on): every order not yet followed is
       // picked up now rather than at the recovery's next try; and a price is
       // ready before the first wallet asks.
@@ -1118,9 +1081,6 @@ export class Lsps1Service {
   }
   private lndFeeRate(confirmationTarget: number) {
     return getChainFeeRate({ lnd: this.writeLnd!, confirmation_target: confirmationTarget });
-  }
-  private lndAddSocket(socket: string) {
-    return addExternalSocket({ lnd: this.writeLnd!, socket });
   }
   private lndRemoveSocket(socket: string) {
     return removeExternalSocket({ lnd: this.writeLnd!, socket });

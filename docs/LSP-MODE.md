@@ -162,9 +162,11 @@ default, and this project's own choice) can then only be reached by ZEUS's
 embedded node with ZEUS's embedded Tor switched on (off by default), the
 buyer typing the node's key and .onion address in by hand. So the reachable
 market is close to nil: LSP mode stays **experimental** and off by default,
-and no further work goes into reach. The Settings card says so, and warns
-that the optional clearnet announcement publishes the address in the gossip
-graph for good. Offer size is capped by deployable on-chain capital, so a
+and no further work goes into reach. The Settings card says so. Since 0.8.5
+the mode is Tor-only: the optional clearnet announcement (which took a port
+forwarded on the router and published the home IP in the gossip graph for
+good) is gone, an address 0.8.4 announced is withdrawn once at start, and the
+URI and buyer guide give the .onion address. Offer size is capped by deployable on-chain capital, so a
 thin wallet advertises (and sells) little.
 
 Wallet compatibility (package P5 of the 2026-10 review):

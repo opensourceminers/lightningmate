@@ -13,7 +13,9 @@ import type { LspOrder, LspStatus } from "./types";
  * typing this node's key and .onion address in by hand. Before, the card
  * called the mode "beta", counted only get_info requests, promised that "any
  * LSPS1-capable wallet" works, and nudged a Tor-only node to announce a
- * clearnet address — which publishes the home IP for good.
+ * clearnet address — which publishes the home IP for good. Since 0.8.5 the
+ * mode is Tor-only: no clearnet address is announced, and buyers get the
+ * .onion one (Settings, the buyer guide).
  */
 
 /** The node announces only .onion addresses (or none): reachable over Tor only. */
@@ -46,12 +48,6 @@ export function lspReachText(uris: readonly string[]): string {
     `ZEUS with its embedded node, with this node's key and address typed in by hand. ${http} LSP mode is experimental.`
   );
 }
-
-/** What announcing a clearnet address gives away — shown above the field. */
-export const CLEARNET_WARNING =
-  "Announcing a clearnet address publishes it in the public Lightning graph: every node and explorer stores it with " +
-  "your node's key, so your home IP address (or the one your DDNS name points to) is tied to this node for good — " +
-  "withdrawing it later doesn't erase the copies others keep. Leave it empty to stay Tor-only.";
 
 const shortMethod = (m: string): string => m.replace(/^lsps\d\./, "");
 

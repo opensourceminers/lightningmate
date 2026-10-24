@@ -1,18 +1,20 @@
 /**
  * The real entry point applies the stored privacy settings at start-up
  * (review of P4). The API harness builds its own wiring, so a server
- * started without them passed every other test: dropping
- * setOutboundRouting(stored route) from index.ts let a stored "direct" (or
- * "all") silently become "lookups" after every restart, and building the
- * LN+ store without the switch made "LN+ lookups: off" do nothing.
+ * started without them passed every other test: building the LN+ store
+ * without the switch made "LN+ lookups: off" do nothing. Since 0.8.5 every
+ * lookup goes through Umbrel's Tor proxy — a route an older version stored
+ * ("direct") counts for nothing, and leaves the file with the clearnet
+ * address LSP mode no longer announces.
  *
  * Here src/index.ts runs as a child process on a data dir whose settings.json
- * says LN+ off and route "direct", with Umbrel's Tor proxy variables set.
+ * is 0.8.4's — LN+ off, route "direct", a clearnet address — with Umbrel's
+ * Tor proxy variables set.
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import net, { type AddressInfo } from "node:net";
 import { join } from "node:path";
 import { makeTempDir } from "./helpers/tmp.js";
@@ -26,12 +28,12 @@ const freePort = () =>
     });
   });
 
-test("after a restart the stored privacy settings are in force: route 'direct' with Umbrel's proxy present, LN+ lookups off", { timeout: 60_000 }, async (t) => {
+test("after a restart the stored privacy settings are in force — LN+ lookups off — and with Umbrel's proxy every lookup goes through Tor, whatever route 0.8.4 stored", { timeout: 60_000 }, async (t) => {
   const dataDir = makeTempDir(t);
   const port = await freePort();
   writeFileSync(
     join(dataDir, "settings.json"),
-    JSON.stringify({ fiatCurrency: "off", lnplusLookups: false, torRoute: "direct", lspModeEnabled: false, lspClearnetAddress: "" }),
+    JSON.stringify({ fiatCurrency: "off", lnplusLookups: false, torRoute: "direct", lspModeEnabled: false, lspClearnetAddress: "node.example.com:9735" }),
   );
   const child = spawn(process.execPath, ["--import", "tsx", "src/index.ts"], {
     cwd: join(import.meta.dirname, ".."),
@@ -70,20 +72,17 @@ test("after a restart the stored privacy settings are in force: route 'direct' w
 
   const privacy = (await (await fetch(`http://127.0.0.1:${port}/api/privacy`)).json()) as {
     torProxy: string | null;
-    torRoute: string;
     lnplusLookups: boolean;
     destinations: { service: string; viaTor: boolean }[];
   };
   assert.equal(privacy.torProxy, "127.0.0.1:9", "the proxy from TOR_PROXY_IP / TOR_PROXY_PORT");
-  assert.equal(privacy.torRoute, "direct");
   assert.equal(privacy.lnplusLookups, false);
-  // Without setOutboundRouting(stored route), LN+, price and Amboss's public
-  // data read "through Tor" here — the route quietly back to "lookups".
-  assert.deepEqual(
-    privacy.destinations.filter((d) => d.viaTor).map((d) => d.service),
-    [],
-    "route 'direct': nothing through Tor",
-  );
+  assert.equal("torRoute" in privacy, false);
+  // 0.8.4 applied the stored route here: "direct" sent nothing through Tor.
+  assert.ok(privacy.destinations.length > 0 && privacy.destinations.every((d) => d.viaTor), JSON.stringify(privacy.destinations));
+  // The old route and the clearnet address (read-only here: never announced)
+  // have left the file; the operator's own settings stayed.
+  assert.deepEqual(JSON.parse(readFileSync(join(dataDir, "settings.json"), "utf8")), { fiatCurrency: "off", lnplusLookups: false, lspModeEnabled: false });
   // Without the switch wired into the LN+ store, this asked LN+.
   const pool = await fetch(`http://127.0.0.1:${port}/api/lnplus/pool`);
   assert.equal(pool.status, 409);

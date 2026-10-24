@@ -208,7 +208,7 @@ export function assessEligibility(
     reasons: [],
   };
   if (!book || book.offers.length === 0) {
-    base.reasons.push(`Amboss's public offer book could not be read${torVia("amboss_public")} — no comparison is possible right now.`);
+    base.reasons.push(`Amboss's public offer book could not be read${torVia()} — no comparison is possible right now.`);
     return base;
   }
 
@@ -415,7 +415,7 @@ export async function publicBook(ownPubkey: string, force = false): Promise<Publ
         getNodeMarket(ownPubkey).catch((err: unknown) => ({
           sellerScore: null,
           confirmedSells: null,
-          lookupError: { error: err instanceof Error ? err.message : String(err), via: torVia("amboss_public") },
+          lookupError: { error: err instanceof Error ? err.message : String(err), via: torVia() },
         })),
         dollarRates(),
       ]);

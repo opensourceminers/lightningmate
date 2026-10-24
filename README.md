@@ -85,8 +85,8 @@ standalone via Docker.
   can order this way — as far as we know, ZEUS with its embedded node; wallets
   that order over HTTPS can't — and on a Tor-only node the buyer also needs
   Tor (ZEUS's embedded Tor, off by default). Includes graph discovery (feature
-  bit 729), a shareable buyer guide, and an optional clearnet-address
-  announcement (which publishes that address for good). Off by default.
+  bit 729) and a shareable buyer guide with the node's .onion address: Tor-only,
+  no port to open on any router. Off by default.
 - **Wallet** — Lightning + on-chain: receive, send, decode and pay invoices.
   An on-chain send is previewed first — its fee in sats from LND's own size
   of the transaction, LND's next-block rate beside it (its 2-block rate on

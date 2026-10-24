@@ -4852,7 +4852,7 @@ export class Autopilot {
         grossAprPct: null,
         sales: null,
         windowDays: null,
-        text: failed ? `the Magma market could not be read${torVia("amboss_public")} — asked again in a few minutes` : "the Magma market is being read",
+        text: failed ? `the Magma market could not be read${torVia()} — asked again in a few minutes` : "the Magma market is being read",
       };
     }
     if (e.verdict === "not_realistic") {

@@ -46,7 +46,6 @@ import type { OfflineInfo } from "./services/channelUptime.js";
 import type { BuyQuote, OrderState as AmbossOrderState } from "./services/amboss.js";
 import type { PayResult as LndPayResult } from "./services/payments.js";
 import type { FiatCurrency } from "./services/settings.js";
-import type { TorRoute } from "./services/http.js";
 import type { Lsps1OrderView, Lsps1Status } from "./services/lsps1.js";
 import type { LaneStatus, MagmaOrderLocal } from "./services/magmaDesk.js";
 import type { MyOffer, MyOrder as AmbossSale } from "./services/magmaApi.js";
@@ -108,7 +107,6 @@ export type {
   RollingTotals,
   RoutingCorridor,
 } from "./services/forwards.js";
-export type { TorRoute } from "./services/http.js";
 export type { BoughtInboundRoi } from "./services/inboundRoi.js";
 export type { ChannelLease } from "./services/leases.js";
 export type { LnPlusNode, LnPlusSwapParticipant } from "./services/lnplus.js";
@@ -274,11 +272,11 @@ export type ChannelSuggestion = SuggestionV2 & { neverOpen: boolean };
 /** GET /suggestions. */
 export type SuggestionsResponse = Omit<SuggestV2Report, "suggestions"> & { suggestions: ChannelSuggestion[] };
 
-/** Where LightningMate's own lookups go, and by which route (GET /privacy). */
+/** Where LightningMate's own lookups go (GET /privacy): all through Tor
+ *  when the app has Umbrel's proxy. */
 export interface PrivacyInfo {
   /** Umbrel's Tor proxy (host:port), or null: everything goes direct. */
   torProxy: string | null;
-  torRoute: TorRoute;
   lnplusLookups: boolean;
   destinations: { service: string; what: string; active: boolean; viaTor: boolean }[];
 }
@@ -396,8 +394,7 @@ export interface LnPlusStatus {
   enabled: boolean;
   /** LN+ lookups go through Umbrel's Tor proxy right now. */
   viaTor: boolean;
-  /** The app has Umbrel's Tor proxy (when it does and viaTor is false, the
-   *  Tor route is set to Direct). */
+  /** The app has Umbrel's Tor proxy (every request goes through it then). */
   torProxy: boolean;
   pubkey: string;
   onLnPlus: boolean;

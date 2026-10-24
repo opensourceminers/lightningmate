@@ -1581,3 +1581,34 @@ test("an order whose open came out unclear three times is refunded, not tried a 
   assert.equal(node.callsTo("default.openChannel").length, 1, "under the bound: opened");
   assert.equal(second.orderState, "COMPLETED");
 });
+
+// 0.8.5: LSP mode is Tor-only — buyers reach the node at its .onion address,
+// with no port opened on any router. Up to 0.8.4 it could announce a clearnet
+// address (at runtime, through peersrpc): LND keeps that until its next
+// restart, so the first start of 0.8.5 withdraws it, once.
+test("a clearnet address 0.8.4 announced is withdrawn once at start and leaves the settings — LSP mode announces none", async (t) => {
+  quiet(t);
+  const dir = makeTempDir(t);
+  writeFileSync(
+    join(dir, "settings.json"),
+    JSON.stringify({ fiatCurrency: "off", lnplusLookups: true, torRoute: "lookups", lspModeEnabled: true, lspClearnetAddress: "203.0.113.7:9735" }),
+  );
+  const lsp = lspNode(t, { dir });
+  lsp.node.override("peers.updateNodeAnnouncement", (_a, cb) => cb?.(null, {}));
+  const addressUpdates = () => lsp.node.callsTo("peers.updateNodeAnnouncement").filter((a) => a.address_updates);
+  lsp.svc.start();
+  await until(() => addressUpdates().length > 0, "the old address is withdrawn");
+  // REMOVE (1), never ADD (0): nothing is announced.
+  assert.deepEqual(addressUpdates().map((a) => a.address_updates), [[{ action: 1, address: "203.0.113.7:9735" }]]);
+  await until(() => !("lspClearnetAddress" in JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))), "forgotten");
+  assert.equal(lsp.settings.legacyClearnetAddress(), "");
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")), { fiatCurrency: "off", lnplusLookups: true, lspModeEnabled: true });
+  assert.equal("announcedSocket" in (await lsp.svc.status()), false);
+
+  // The next start has nothing to withdraw.
+  lsp.svc.stop();
+  const again = lspNode(t, { dir, node: lsp.node });
+  again.svc.start();
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(addressUpdates().length, 1);
+});
