@@ -78,9 +78,10 @@ maxChangesPerRun   5     # at most N fee changes applied per run — the autopil
 **Aim and move.** For each channel the engine derives an **aim** (where the fee should end
 up) and a **target** (this update's move toward it). Moves are small, bounded steps: a raise
 moves at most **2 steps** (on every channel, routing or not; a learned elasticity can widen
-the step to ×1.5 — **up to 3 steps** — never remove it); the protect and profit-floor ramps
-at most **4 steps**; **every lowering** at most the **idle-ratchet's steps** — idle, routing,
-new or drained. Only these move in one update, each for a reason of its own: an idle channel
+the step to ×1.5 — **up to 3 steps** — never remove it) — except the **demand ramp** of a
+drained channel that sold at the fee it charges now (a quarter of the fee a move, see 8
+below); the protect and profit-floor ramps at most **4 steps**; **every lowering** at most the
+**idle-ratchet's steps** — idle, routing, new or drained. Only these move in one update, each for a reason of its own: an idle channel
 dropping to its **flow-won price** or to the **market price** into its peer (evidence, not a
 guess — and nothing is at stake on a channel nobody routes through), a **pin** (the
 operator's value), the **new-channel floor**, a broken **lease promise**, and a fee outside
@@ -221,6 +222,28 @@ idle).
 8. **Bounded moves:** the target moves toward the aim by the steps above. **A drained channel
    nobody routes through is never raised** (it jumped to ~900 ppm in one update before), and
    lowered only by ratchet steps.
+   - **Demand ramp** (2026-10-24): a **drained channel with buyers** — under 10 % local (the
+     protect rule's "drained"), ≥ 3 forwards in 30 days, not refilled faster than it sells (14-day
+     outflow ≥ inflow), no measured elasticity below 1 — that **sold at the fee it charges now**
+     (three forwards out since that fee was set, by LightningMate's own stamp — the refill gate's
+     proof, too) is raised by
+     **a quarter of its fee per move** (rounded down onto the grid, at least the ordinary two
+     steps), **at most every 6 h** (the operator's cooldown if longer — and the operator's own,
+     shorter cadence while the move stays within a protect or profit-floor ramp's reach — a move
+     that would cross such a floor stops on it first), never past its aim. Two steps every 72 h took a drained top earner (1 % local, 151 forwards a
+     month) six weeks from 350 ppm to the ~640 a refill at the market's ~500 ppm route cost needs
+     — selling every sat that came back below what it costs to replace. With buyers at each price
+     the ramp goes 350 → 430 → 530 → 660 → 820 → 1000 in about a day; **each move waits for three
+     sales at the price before it**, so where nobody buys at the new price it stops one step above
+     the last price that sold (the ordinary steps go on; a detail line in the Why says the faster
+     raise waits for a sale). One sale per level ramped a price-sensitive channel to 880 ppm on
+     thin evidence and reset the count before a refill's proof could form (review 2). A channel with liquidity keeps the gentle steps. It leads the Why — the run history
+     and the fee-change log keep the first line: `demand: drained (…% local) and sold N times at
+     X ppm since it was set — raising a quarter of the fee per move (at least two steps), at most
+     every 6 h: a→b on the way to c ppm`. (Moves 6 h apart are too close for the elasticity
+     learner to measure; the sales each move needs are the ramp's check instead. A fee another
+     tool changed carries no stamp: sales at the old fee then count — the refill gate stays safe,
+     since it values at what was paid.)
 
 9. **Floors:**
    - new channel (<3 days, <3 forwards) → at least `newChannelMinPpm`
@@ -268,8 +291,10 @@ idle).
       changing, it is a pin, a lease promise is broken, or the move is the no-flow rule's own
       (a ratchet step or a jump) or starts from a fee outside the min/max range
     - **asymmetric pacing**: a **raise** waits `max(user cooldown, 72h)` since the last apply
-      (a ramp — protect or profit floor — steps at the user cooldown); a **lowering** steps at
-      most **once a day**. A channel with no prior change applies immediately either way.
+      (a ramp — protect or profit floor — steps at the user cooldown; the demand ramp at
+      `max(user cooldown, 6h)`, at the user cooldown while within a floor ramp's reach); a
+      **lowering** steps at most **once a day**. A channel with no prior change applies
+      immediately either way.
     - a channel whose last update failed (LND refused it, or it couldn't be sent) waits
       **6 hours** before it is tried again — a broken lease promise excepted;
     - at most `maxChangesPerRun` actual applies: broken lease promises first, then pins, then
@@ -379,7 +404,20 @@ only returns moves where the route cost is justified by what the refilled sats e
 channel earned, charges and is heading to — and of the fee the fee engine charges **after**
 the refill (asked of the engine itself, `feeAfterRefill`); the engine then **holds** that
 price while the refilled sats are in the channel (see the profit floor above), so the gate's
-estimate and the engine agree. A move passes only if its route costs at most `econRatio` of
+estimate and the engine agree. What it **earned** is the 30-day average at the fees it had —
+which lags a higher price that sells for a month — **or the price it was paid since its fee was
+set**: at least 3 forwards out at the fee it charges now (2026-10-24). Never a price nobody
+paid: a first version valued one refill at the untested fee, and the refill's hold kept that
+fee for up to 30 days where nobody bought (in a 60-day simulation it cut the channel's net from
+1,365 to 203 sat where demand stopped at 500 ppm). A refill valued at a proven price is **at most
+10× the sats that sold at it** (at least the 50k minimum): three 1k forwards don't carry a 443k
+refill whose hold then keeps the fee there. A pin or a floor's lift counts like any fee — only
+once three forwards were paid at it; until then the row says what would count. The **demand** the gate counts — the earnings cap and the refill's
+size — is, for a **drained** channel (under 10 % local) not refilling itself (14-day outflow ≥
+inflow), the larger of its 14-day outflow and half its 30-day one (net drain likewise); every
+other channel counts its 14 days. A drained channel can't route out, and its last 14 days
+understated it: a top earner at 1 % local had sold 2.4M in 30 days but 0.23M in 14, and every
+refill was sized and valued on the 0.23M. "What it would take" asks for the demand counted. A move passes only if its route costs at most `econRatio` of
 the expected earnings, it nets at least `minNetProfitSats` and pays back within
 `maxPaybackDays` — and **the payment's max fee is that same limit at every size it tries**
 (the smaller fallbacks too), never more than is left of today's budget. The sizes, per
@@ -566,7 +604,8 @@ write any `sell*` key.
    set-and-forget product? Note: over-automation previously caused an outage, so stability
    and explainability matter.
 
-6. ~~Oscillation / hysteresis.~~ **DONE** — lowers pace at 1/day, raises wait ≥72h, and the
+6. ~~Oscillation / hysteresis.~~ **DONE** — lowers pace at 1/day, raises wait ≥72h (the demand
+   ramp of a drained channel that sold at its fee: ≥6h, a quarter of the fee a move), and the
    engine now remembers each channel's "flow-won price" (the ppm at which routing returned
    after a no-flow lowering, kept 60 days) and jumps straight there on the next episode
    instead of re-exploring from scratch.

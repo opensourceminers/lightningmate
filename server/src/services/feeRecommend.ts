@@ -1,6 +1,6 @@
 import { getFeeRates, getWalletInfo, type AuthenticatedLnd } from "lightning";
 import { getChannelsView, type ChannelRole, type ChannelView } from "./channels.js";
-import { getForwardsReport } from "./forwards.js";
+import { getForwardsReport, readForwardEvents, type ForwardEvent } from "./forwards.js";
 import type { RebalanceRecord } from "./rebalanceLog.js";
 import type { ChannelOverride, OverrideMap } from "./overrides.js";
 import { activeCap, capText, clampToCap, type LeaseCap } from "./leaseCaps.js";
@@ -27,6 +27,15 @@ import { peerMarketFees, type MarketRef } from "./suggestions.js";
  *     little, never remove the bound) — on every channel, routing or not; a
  *     fee below the policy's min is brought up to the min first (the range
  *     rule), and raised from there by steps;
+ *   - except the demand ramp: a drained channel (under DEMAND_RAMP_LOCAL)
+ *     with buyers — forwards in 30 days, not refilled faster than it sells —
+ *     that sold DEMAND_RAMP_SALES times at the fee it charges now is raised
+ *     by a quarter of its fee per move (DEMAND_RAMP_SHARE, at least
+ *     RAISE_STEPS steps), at most every DEMAND_RAMP_HOURS — not by two steps
+ *     every 72 h, which took a drained top earner six weeks from 350 to the
+ *     price a refill needs; each move waits for those sales at the price
+ *     before it; never past its aim, nor past a floor whose own ramp lifts
+ *     the fee, and not where higher fees measurably cost flow;
  *   - the protect and profit-floor ramps move at most RAMP_STEPS steps;
  *   - a lowering moves at most the idle ratchet's steps — on every channel,
  *     idle or routing (the balance curve or an explore price no longer cut an
@@ -130,6 +139,23 @@ export const FEE_REC_DEFAULTS: FeeRecConfig = {
 export const RAISE_STEPS = 2;
 /** The protect and profit-floor ramps move at most this many steps. */
 export const RAMP_STEPS = 4;
+/** The demand ramp: a drained channel — under this local ratio, the protect
+ *  rule's "drained" — that routed DRAIN_MIN_FORWARDS times in 30 days, sold
+ *  at least DEMAND_RAMP_SALES times at the fee it charges now (since that
+ *  fee was set) and isn't being refilled faster than it sells (14 days). */
+export const DEMAND_RAMP_LOCAL = 0.1;
+/** Three, like the refill gate's proof (rebalanceRecommend PROVEN_SALES):
+ *  one sale per level ramped a price-sensitive channel to 880 ppm on thin
+ *  evidence, and each move reset the count before a refill's proof could
+ *  form (review 2). */
+export const DEMAND_RAMP_SALES = 3;
+/** Its raise per move: this share of the current fee (at least RAISE_STEPS
+ *  steps) — 350 → 430 → 530 → 660 on a 10-ppm grid, geometric like any
+ *  price discovery; each move waits for a sale at the price before it. */
+export const DEMAND_RAMP_SHARE = 0.25;
+/** …at most once per this many hours, or the operator's cadence if longer:
+ *  its moves are open-ended up to the aim, unlike the hard-capped ramps. */
+export const DEMAND_RAMP_HOURS = 6;
 /** Elasticity may widen a raise step by at most this factor. */
 const MAX_ELASTIC_STEP = 1.5;
 /** The profit floor comes from the autopilot's own refills of this window. */
@@ -280,6 +306,11 @@ export interface FeeRecMetrics {
   /** The least a refill of this channel costs on the market: one hop into
    *  the peer plus the peer's hop back to us (ppm). */
   replacementCostPpm: number | null;
+  /** What it routed out since its fee last changed (LightningMate's own
+   *  stamp; without one, the 30-day window) — every one of these sold at
+   *  the fee it charges now: the evidence the demand ramp and the refill
+   *  gate act on. */
+  soldSinceChange: { forwards: number; out: number; revenue: number };
   /** Draining, and its fee is below what replacing its outbound costs. */
   belowReplacement: boolean;
   /** This fee next to the market into the peer. */
@@ -393,6 +424,24 @@ export interface Flow {
   inn: number;
   revenue: number;
   forwards: number;
+}
+
+/** What `channelId` routed after `sinceMs` (its fee's last change): forwards
+ *  out at the fee it charges now, and what came in. */
+export function soldSince(events: readonly ForwardEvent[], channelId: string, sinceMs: number): Flow {
+  const flow: Flow = { out: 0, inn: 0, revenue: 0, forwards: 0 };
+  let revenueMsat = 0;
+  for (const e of events) {
+    if (!(Date.parse(e.createdAt) > sinceMs)) continue;
+    if (e.outgoingChannel === channelId) {
+      flow.out += e.tokens;
+      flow.forwards += 1;
+      revenueMsat += e.feeMsat;
+    }
+    if (e.incomingChannel === channelId) flow.inn += e.tokens;
+  }
+  flow.revenue = revenueMsat / 1000;
+  return flow;
 }
 function flowMap(perChannel: { channelId: string; routedOutSats: number; routedInSats: number; feesEarnedSats: number; forwardCount: number }[]): Map<string, Flow> {
   const m = new Map<string, Flow>();
@@ -687,12 +736,13 @@ export async function runFeeEngine(lnd: AuthenticatedLnd, inputs: FeeEngineInput
   const leaseCaps = inputs.leaseCaps ?? [];
   const signals = inputs.signals ?? {};
   const cfg = { ...FEE_REC_DEFAULTS, ...(inputs.configOverrides ?? {}) };
-  const [channels, rates, fw14, fw30, wallet] = await Promise.all([
+  const [channels, rates, fw14, fw30, wallet, recentEvents] = await Promise.all([
     getChannelsView(lnd),
     getFeeRates({ lnd }),
     getForwardsReport(lnd, cfg.flowWindowDays),
     getForwardsReport(lnd, cfg.benchmarkWindowDays),
     getWalletInfo({ lnd }),
+    readForwardEvents(lnd, cfg.benchmarkWindowDays),
   ]);
   const demand = signals.demand ?? servableDemand(DEMAND_WINDOW_DAYS);
   const fresh = signals.market ?? (await marketWithin(lnd, channels, signals.marketWaitMs ?? MARKET_WAIT_MS));
@@ -731,6 +781,13 @@ export async function runFeeEngine(lnd: AuthenticatedLnd, inputs: FeeEngineInput
 
   const enoughChannels = active.length >= 5;
 
+  // Since each channel's fee last changed (the cooldown's stamp; none: the
+  // window) — what sold at the fee it charges now.
+  const windowStart = nowMs - cfg.benchmarkWindowDays * DAY_MS;
+  const changedAt = (id: string): number => {
+    const t = Date.parse(cooldown?.lastApplied?.[id] ?? "");
+    return Number.isFinite(t) ? Math.max(t, windowStart) : windowStart;
+  };
   const contexts = new Map<string, BuildCtx>(
     channels.map((ch) => [
       ch.id,
@@ -740,6 +797,7 @@ export async function runFeeEngine(lnd: AuthenticatedLnd, inputs: FeeEngineInput
         override: channelOverrides[ch.id],
         f14: flowOf(f14, ch.id),
         f30: flowOf(f30, ch.id),
+        soldSinceChange: soldSince(recentEvents.events, ch.id, changedAt(ch.id)),
         currentBlock,
         records: rebalanceRecords,
         bench: nodeBenchmarks,
@@ -850,6 +908,8 @@ export interface BuildCtx {
   override: ChannelOverride | undefined;
   f14: Flow;
   f30: Flow;
+  /** Routed since its fee last changed (soldSince) — absent: none known. */
+  soldSinceChange?: Flow;
   currentBlock: number;
   records: RebalanceRecord[];
   bench: NodeBenchmarks;
@@ -871,8 +931,8 @@ export interface BuildCtx {
 
 /** Which rule set this update's move — it decides the pacing and which
  *  reason leads. "range": the policy's min/max moved it (a fee outside them
- *  is brought into them in one move). */
-type MoveKind = "free" | "raise_step" | "lower_step" | "ramp" | "ratchet" | "jump" | "floor" | "hold" | "range";
+ *  is brought into them in one move). "demand": the demand ramp raised it. */
+type MoveKind = "free" | "raise_step" | "lower_step" | "ramp" | "ratchet" | "jump" | "floor" | "hold" | "range" | "demand";
 
 /** One channel's recommendation — pure (exported for the engine's own
  *  simulation tests). */
@@ -1170,14 +1230,50 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // min first, by the range rule below.
   const from = currentPpm;
   const elasticStep = ctx.elasticityMod > 1 ? Math.min(MAX_ELASTIC_STEP, ctx.elasticityMod) : 1;
-  const raiseStep = RAISE_STEPS * step * elasticStep;
+  // The demand ramp (2026-10-24): drained, with buyers — it routed in 30
+  // days AND sold at the fee it charges now, since that fee was set — not
+  // refilled faster than it sells, and no measurement saying higher fees
+  // cost flow here. Two steps every 72 h took a drained top earner (1 %
+  // local, 151 forwards a month) six weeks from 350 ppm to the ~640 a
+  // refill at the market's ~500 ppm route cost needs, selling every sat that
+  // came back below what it costs to replace. A quarter of the fee per move,
+  // every DEMAND_RAMP_HOURS, gets it there in a day — but each move only
+  // after a sale at the price before it: where nobody buys at the new price,
+  // it stops one step above the last one that sold (the ordinary steps go
+  // on). Never past the aim; a channel with liquidity keeps the gentle steps.
+  const sold = ctx.soldSinceChange;
+  const drainedWithBuyers = ch.localRatio < DEMAND_RAMP_LOCAL && f30.forwards >= DRAIN_MIN_FORWARDS && f14.out >= f14.inn;
+  const demandRamp = drainedWithBuyers && (sold?.forwards ?? 0) >= DEMAND_RAMP_SALES && ctx.elasticityMod >= 1;
+  const ordinaryStep = RAISE_STEPS * step * elasticStep;
+  // (Rounded down onto the grid: "up to a quarter" holds — 25 % of 100 is a
+  // 20-ppm move on a 10-ppm grid, never 30.)
+  const raiseStep = demandRamp ? Math.max(ordinaryStep, Math.floor((from * DEMAND_RAMP_SHARE) / step) * step) : ordinaryStep;
   // The most any channel is lowered in one move: its ratchet's steps (at
   // least one).
   const lowerStep = Math.max(1, cfg.noFlowRatchetSteps) * step;
   if (target > from + raiseStep) {
     target = from + raiseStep;
-    kind = "raise_step";
+    kind = demandRamp ? "demand" : "raise_step";
     hiLimit = from + raiseStep;
+  } else if (demandRamp && target > from) {
+    // Its last move, onto the aim, keeps the ramp's pacing too (as "free" it
+    // would wait the 72 h raise pause behind the ramp's own previous move).
+    kind = "demand";
+  }
+  // Nor does it jump a floor whose own ramp lifts the fee this move (protect,
+  // the profit floor): it stops on it — at that ramp's cadence, the
+  // operator's — and goes on from there (review 2: with a 1 h cadence,
+  // 310 → 380 waited 6 h where 310 → 350 takes one).
+  let floorAhead = 0;
+  if (kind === "demand") {
+    const protectAhead = ch.localRatio < 0.1 && (f30.forwards > 0 || inDemand) ? cfg.protectPpm : 0;
+    const profitAhead = profitFloorPpm != null && refill && !idle ? profitFloorPpm : 0;
+    const ahead = Math.max(protectAhead, profitAhead);
+    if (ahead > from && target > ahead) {
+      floorAhead = ahead;
+      target = ahead;
+      hiLimit = Math.min(hiLimit, ahead);
+    }
   }
   // A move the step rules set never ends past its own bound or its aim —
   // also one within a single step ("free"), which the rounding below could
@@ -1237,9 +1333,14 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // below the policy's min goes to the min first (the range rule below).
   const liftTo = (floor: number): number =>
     floor > currentPpm ? Math.min(floor, currentPpm < cfg.minPpm ? cfg.minPpm : currentPpm + RAMP_STEPS * step) : floor;
+  // The highest floor (profit, protect) whose own ramp lifts the fee this
+  // move: a demand move up to it keeps the floor ramp's cadence — the
+  // operator's, which may be shorter than the demand ramp's 6 h.
+  let floorRampTo = 0;
   // (An idle channel's floor would be overridden by the no-flow rule below.)
   if (profitFloorPpm != null && refill && profitFloorPpm > target && !idle) {
     const ramped = liftTo(profitFloorPpm);
+    if (ramped > currentPpm) floorRampTo = Math.max(floorRampTo, profitFloorPpm);
     // It leads when its ramp IS this move. One below the current fee only
     // stops a lowering short of it — that lowering's own rule leads; one that
     // a bigger lift outdoes (the new-channel floor) is a note (it led with
@@ -1276,6 +1377,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     // per change (the old one-shot jump to protectPpm was the outage
     // mechanic in miniature).
     const ramped = liftTo(cfg.protectPpm);
+    if (ramped > currentPpm) floorRampTo = Math.max(floorRampTo, cfg.protectPpm);
     // It leads only when it lifts the fee (a fee above protectPpm walking
     // down the curve, or stopped at protectPpm on the way, is not "bumped").
     const lifts = ramped > target && ramped > currentPpm;
@@ -1436,6 +1538,22 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // Only when the step is what stops the move short of the aim: a fee held
   // at the max read "raising at most 22 ppm per move — 1000→1000 on the way
   // to 1000 ppm". (Taken back if a pin or a lease promise sets another move.)
+  // The demand ramp sets the size of the move, so it leads — the run
+  // history and the fee-change log keep the first reason (review: a +25 %
+  // move logged as "velocity: … small nudge up").
+  const localPct = Math.round(ch.localRatio * 100);
+  if (kind === "demand" && targetPpm > currentPpm) {
+    const n = sold?.forwards ?? 0;
+    const fact = `demand: drained (${localPct}% local) and sold ${n} time${n === 1 ? "" : "s"} at ${currentPpm} ppm since it was set`;
+    const hours = targetPpm <= floorRampTo ? (ctx.cooldown?.cooldownHours ?? 0) : Math.max(DEMAND_RAMP_HOURS, ctx.cooldown?.cooldownHours ?? 0);
+    const onFloor = floorAhead > 0 && targetPpm === floorAhead ? ` (onto its ${floorAhead} ppm floor first)` : "";
+    const move = targetPpm < aimPpm ? `${currentPpm}→${targetPpm}${onFloor} on the way to ${aimPpm} ppm` : `${currentPpm}→${targetPpm} ppm, its aim`;
+    dominant(claim(`${fact} — raising a quarter of the fee per move (at least two steps), at most every ${hours} h: ${move}`, fact, 1));
+  } else if (drainedWithBuyers && !demandRamp && ctx.elasticityMod >= 1 && targetPpm > currentPpm && aimPpm > currentPpm) {
+    // Drained with buyers, but nothing sold at this fee yet: the next ramp
+    // move waits for a sale; the ordinary step (or a floor's ramp) goes on.
+    reasons.push(claim(`demand: drained (${localPct}% local), but nothing sold at ${currentPpm} ppm since it was set — the faster raise waits for a sale`, null, 1));
+  }
   if (kind === "raise_step" && targetPpm > currentPpm && targetPpm < aimPpm) {
     reasons.push(claim(`guard: raising at most ${Math.round(raiseStep)} ppm per move — ${currentPpm}→${targetPpm} on the way to ${aimPpm} ppm`, null, 1));
   } else if (kind === "lower_step" && targetPpm < currentPpm && targetPpm > aimPpm) {
@@ -1465,7 +1583,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // cheaper market "market: …", a draining channel at or above its target
   // ratio raised "draining: …", a move by the balance curve alone says so; a
   // fee that stays, the hold that kept it.
-  if (kind === "free" || kind === "raise_step" || kind === "lower_step") {
+  if (kind === "free" || kind === "raise_step" || kind === "lower_step" || kind === "demand") {
     const dir = Math.sign(targetPpm - currentPpm);
     const pct = Math.round(ch.localRatio * 100);
     const over = ch.localRatio - targetLocalRatio > cfg.deadband;
@@ -1655,10 +1773,20 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
       // The protect and profit-floor ramps may step at the user's cadence —
       // they are hard-capped (protectPpm, the floor), unlike open-ended
       // raises, which wait the long pause. Only while a ramp sets the move.
+      // The demand ramp steps every DEMAND_RAMP_HOURS at most (or the user's
+      // cadence, if longer): the evidence it acts on — a sale at the price
+      // just set, off a drained channel — is there now, not in three days.
+      // Up to a floor whose own ramp lifts the fee this move, it keeps that
+      // ramp's cadence (the operator's, when shorter: review — a 1 h cadence
+      // took 3 h to protectPpm before, 12 h with the ramp in the way).
       const limitH = isRaise
         ? kind === "ramp"
           ? ctx.cooldown.cooldownHours
-          : Math.max(ctx.cooldown.cooldownHours, cfg.cooldownHours)
+          : kind === "demand"
+            ? targetPpm <= floorRampTo
+              ? ctx.cooldown.cooldownHours
+              : Math.max(ctx.cooldown.cooldownHours, DEMAND_RAMP_HOURS)
+            : Math.max(ctx.cooldown.cooldownHours, cfg.cooldownHours)
         : LOWER_PACING_HOURS;
       if (elapsedH < limitH) blockedByGuards.push(isRaise ? "raise cooldown active" : "lower pacing (1/day)");
     }
@@ -1725,6 +1853,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
       marketSeenAt: market && ctx.marketSeenAt != null ? new Date(ctx.marketSeenAt).toISOString() : null,
       peerFeeToUsPpm: market?.peerFeeToUsPpm ?? null,
       replacementCostPpm,
+      soldSinceChange: { forwards: sold?.forwards ?? 0, out: sold?.out ?? 0, revenue: sold?.revenue ?? 0 },
       belowReplacement,
       marketComparison,
       draining,

@@ -11,6 +11,8 @@ import {
   type RefillFeeCap,
 } from "./rebalance.js";
 import {
+  DEMAND_RAMP_LOCAL,
+  DEMAND_RAMP_SALES,
   feeAfterRefill,
   runFeeEngine,
   type BuildCtx,
@@ -200,7 +202,8 @@ export interface RebalanceRecommendation {
   revenuePpm14d: number | null;
   revenuePpm30d: number | null;
   /** The estimate before the refill (ppm): the lowest of what the channel
-   *  earned, charges and is heading to. */
+   *  earned (30 days, or what its sales at the fee it charges now paid —
+   *  PROVEN_SALES of them), charges and is heading to. */
   preRefillPpm: number | null;
   /** What the gate values the refilled sats at (ppm): the estimate before
    *  the refill — or, where the fee engine charges less after it (a pin, a
@@ -214,8 +217,12 @@ export interface RebalanceRecommendation {
   maxCostPpm: number | null;
   maxCostSatsByPayback: number | null;
   maxPaybackDays: number;
-  /** The gate's earnings are capped at this outflow (14 days, sat). */
+  /** The gate's earnings are capped at this outflow (sat): what it sold in
+   *  14 days — for a drained channel not refilling itself, half its 30-day
+   *  outflow when that is more (it couldn't sell while drained). */
   earningDemandSats: number;
+  /** The net drain the refill is sized on (sat), counted the same way. */
+  demandNetDrainSats: number;
   /** The gate's minimum expected net profit (sat). */
   minNetProfitSats: number;
   /** The most this move may pay in routing fees and still pass the gate
@@ -270,6 +277,15 @@ export interface RebalanceRecReport {
   refill: RefillNote;
   recommendations: RebalanceRecommendation[];
 }
+
+/** Drained, as the fee engine's protect rule and demand ramp mean it. */
+const DRAINED_LOCAL = DEMAND_RAMP_LOCAL;
+/** Forwards out at the fee a channel charges now (since it was set) that
+ *  prove the price for the refill gate. */
+export const PROVEN_SALES = DEMAND_RAMP_SALES;
+/** A refill valued at a proven price is at most this many times the sats
+ *  that sold at it (at least the minimum refill). */
+export const PROVEN_REFILL_MULTIPLE = 10;
 
 const clamp0 = (n: number) => Math.max(0, Math.round(n));
 const k = (n: number) => (n >= 1_000_000 ? `${Math.round(n / 10_000) / 100}M` : `${Math.round(n / 1000)}k`);
@@ -349,7 +365,20 @@ export function classify(ch: ChannelView, fee: FeeRecommendation | undefined, cf
   const amountToTarget = clamp0(targetLocalRatio * settled - ch.localBalance);
   const routedOut14d = m?.routedOut14d ?? 0;
   const routedIn14d = m?.routedIn14d ?? 0;
-  const expectedNetDrain14d = Math.max(0, routedOut14d - routedIn14d);
+  // What it sells while it has liquidity. A drained channel can't route out,
+  // so its last 14 days understate that: for one under DRAINED_LOCAL that
+  // isn't refilling itself (14-day net outflow ≥ 0), the larger of the
+  // 14-day figure and half the 30-day one (2026-10-24: a top earner at 1 %
+  // local had sold 2.4M in 30 days but 0.23M in the last 14, and every
+  // refill was sized and valued on the 0.23M it could no longer sell). A
+  // channel with liquidity, or one inflows are refilling, counts its last
+  // 14 days as before (review: half the 30 days counted demand that had
+  // ended — a 1M refill into a channel inflows were refilling for free).
+  const half30 = (n: number | undefined): number => Math.round((n ?? 0) / 2);
+  const net14 = routedOut14d - routedIn14d;
+  const drainedNow = ch.localRatio < DRAINED_LOCAL && net14 >= 0;
+  const sells14d = drainedNow ? Math.max(routedOut14d, half30(m?.routedOut30d)) : routedOut14d;
+  const expectedNetDrain14d = Math.max(0, drainedNow ? Math.max(net14, half30(m?.routedOut30d) - half30(m?.routedIn30d)) : net14);
   const demandSizedAmount = clamp0(
     Math.min(
       expectedNetDrain14d * cfg.demandCoverageMultiplier,
@@ -395,9 +424,11 @@ export function classify(ch: ChannelView, fee: FeeRecommendation | undefined, cf
     maxCostPpm: null,
     maxCostSatsByPayback: null,
     maxPaybackDays: cfg.maxPaybackDays,
-    // Earnings are capped at what the channel really routed out: refused
-    // HTLCs (possible demand, D20) are shown, never counted as income.
-    earningDemandSats: routedOut14d,
+    // Earnings are capped at what the channel really routed out (while it
+    // had liquidity, sells14d): refused HTLCs (possible demand, D20) are
+    // shown, never counted as income.
+    earningDemandSats: sells14d,
+    demandNetDrainSats: Math.round(expectedNetDrain14d),
     minNetProfitSats: cfg.minExpectedNetProfitSats,
     maxFeeSats: null,
     recommendedAmount: null,
@@ -475,9 +506,35 @@ export function classify(ch: ChannelView, fee: FeeRecommendation | undefined, cf
   // refill would be budgeted on a fee the channel is leaving. The aim is
   // where it ends up. (The probe then asks the engine where the fee goes
   // AFTER the refill, and values the moved sats at no more than that.)
-  const expectedRevenuePpm = Math.round(
-    Math.min(rec.revenuePpm30d, rec.currentPpm || rec.revenuePpm30d, fee?.targetPpm ?? Infinity, fee?.aimPpm ?? Infinity),
-  );
+  //
+  // What it earned, though, is a 30-day average at the fees it had: after
+  // the demand ramp raised a drained channel, that lags a price that sells
+  // for a month. So a price PROVEN since the fee was set counts too: at least
+  // PROVEN_SALES forwards out at the fee it charges now (fee.metrics.
+  // soldSinceChange), valued at what they paid. Never a price nobody paid:
+  // a refill valued at an untested fee held that fee for up to 30 days
+  // (review 2026-10-24: in a 60-day simulation it cut the channel's net
+  // from 1,365 to 203 sat where demand stopped at 500 ppm).
+  const sold = m?.soldSinceChange;
+  const provenPpm =
+    sold && sold.forwards >= PROVEN_SALES && sold.out > 0 ? Math.round((sold.revenue / sold.out) * 1_000_000) : null;
+  const earned = Math.max(rec.revenuePpm30d, provenPpm ?? 0);
+  const expectedRevenuePpm = Math.round(Math.min(earned, rec.currentPpm || earned, fee?.targetPpm ?? Infinity, fee?.aimPpm ?? Infinity));
+  // Valued at a proven price (it lifted the value): the refill is sized to
+  // what sold at it — at most PROVEN_REFILL_MULTIPLE times those sats (at
+  // least the minimum refill) — so three 1k forwards don't carry a 443k
+  // refill whose hold then keeps the fee there (review 2).
+  const valuedAtProven = provenPpm != null && expectedRevenuePpm > rec.revenuePpm30d;
+  const provenCap = valuedAtProven ? Math.max(cfg.minRebalanceAmount, PROVEN_REFILL_MULTIPLE * (sold?.out ?? 0)) : Infinity;
+  // (Said behind the line that names the candidate, below. A proven price
+  // within rounding of the 30-day one says nothing.)
+  const valueNote = valuedAtProven
+    ? provenPpm! >= rec.revenuePpm30d * 1.05
+      ? `valued at ${expectedRevenuePpm} ppm: it sold ${sold!.forwards} times at its fee since it was set (${provenPpm} ppm paid; ${rec.revenuePpm30d} ppm over 30 d) — a refill of at most ${k(provenCap)}, ${PROVEN_REFILL_MULTIPLE}× what sold at it`
+      : null
+    : rec.currentPpm > rec.revenuePpm30d * 1.05
+      ? `its fee now (${rec.currentPpm} ppm) counts once it sold ${PROVEN_SALES} times at it (now ${sold?.forwards ?? 0}) — until then the ${rec.revenuePpm30d} ppm it earned in 30 d decides`
+      : null;
   rec.preRefillPpm = expectedRevenuePpm;
   rec.expectedRevenuePpm = expectedRevenuePpm;
   rec.maxCostPpm = Math.round(expectedRevenuePpm * cfg.profitShare);
@@ -490,7 +547,7 @@ export function classify(ch: ChannelView, fee: FeeRecommendation | undefined, cf
   }
 
   // §5 demand-sized amount
-  const recommendedAmount = clamp0(Math.min(amountToTarget || demandSizedAmount, demandSizedAmount));
+  const recommendedAmount = clamp0(Math.min(amountToTarget || demandSizedAmount, demandSizedAmount, provenCap));
   if (recommendedAmount < cfg.minRebalanceAmount) {
     rec.state = "watching";
     rec.reasons.push(`demand too small (${Math.round(recommendedAmount / 1000)}k) for an economical rebalance`);
@@ -499,6 +556,7 @@ export function classify(ch: ChannelView, fee: FeeRecommendation | undefined, cf
   rec.recommendedAmount = recommendedAmount;
   rec.state = "profitable_rebalance_candidate";
   rec.reasons.push(`drained ${pct(ch.localRatio)} with proven demand and ${expectedRevenuePpm} ppm earnings — looking for a source and a route`);
+  if (valueNote) rec.reasons.push(valueNote);
   return rec;
 }
 
@@ -645,15 +703,21 @@ export function wouldTake(
   if (!(largest > 0)) return null;
   const c = rec.estimatedRouteCostPpm ?? replacementCostPpm;
   const head = `to clear the ${minNet} sat minimum`;
-  const routedOut = rec.routedOut14d ?? 0;
-  const drain = Math.max(0, routedOut - (rec.routedIn14d ?? 0));
+  // The demand the gate counted — not the raw 14 days: for a drained
+  // channel half its 30-day outflow can stand in (review: the line asked for
+  // "≥ 314k of 14-day outflow (now 230k)" where the gate had counted 1.2M).
+  const routedOut = rec.earningDemandSats ?? rec.routedOut14d ?? 0;
+  const drain = rec.demandNetDrainSats ?? Math.max(0, (rec.routedOut14d ?? 0) - (rec.routedIn14d ?? 0));
+  const halfOf30 = routedOut > (rec.routedOut14d ?? 0);
+  const outLabel = halfOf30 ? "outflow (half its 30 days, as it is drained)" : "14-day outflow";
+  const drainLabel = halfOf30 ? "net drain (half its 30 days, as it is drained)" : "14-day net drain";
   /** The demand a refill of `size` lacks: its earnings are capped at the
-   *  14-day outflow, and the planner sizes a refill by the net drain. */
+   *  outflow counted, and the planner sizes a refill by the net drain. */
   const unmetDemand = (size: number): string[] => {
     const need = Math.ceil(size / cfg.demandCoverageMultiplier);
     return [
-      ...(routedOut < size ? [`≥ ${k(size)} of 14-day outflow (now ${k(routedOut)})`] : []),
-      ...(drain < need ? [`≥ ${k(need)} of 14-day net drain (now ${k(drain)})`] : []),
+      ...(routedOut < size ? [`≥ ${k(size)} of ${outLabel} (now ${k(routedOut)})`] : []),
+      ...(drain < need ? [`≥ ${k(need)} of ${drainLabel} (now ${k(drain)})`] : []),
     ];
   };
   const withDemand = (text: string, size: number): string => {
