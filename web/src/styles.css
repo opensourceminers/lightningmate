@@ -1537,8 +1537,8 @@ button:focus-visible, [role="button"]:focus-visible {
 .offer-form { margin-top: 14px; padding: 14px 16px; border: 1px solid var(--line-soft); border-radius: var(--radius-sm); background: var(--panel-2); }
 .offer-form h4.sub { margin: 0 0 10px; font-size: 13px; }
 .row-btn.add-offer { margin-top: 10px; }
-.price-more, .elig-more, .diag-more { margin-top: 10px; }
-.price-more > summary, .elig-more > summary, .diag-more > summary { cursor: pointer; font-size: 12.5px; color: var(--muted); font-weight: 600; }
-.price-more[open] > summary, .elig-more[open] > summary, .diag-more[open] > summary { margin-bottom: 8px; }
+.price-more, .elig-more, .diag-more, .set-more { margin-top: 10px; }
+.price-more > summary, .elig-more > summary, .diag-more > summary, .set-more > summary { cursor: pointer; font-size: 12.5px; color: var(--muted); font-weight: 600; }
+.price-more[open] > summary, .elig-more[open] > summary, .diag-more[open] > summary, .set-more[open] > summary { margin-bottom: 8px; }
 .elig-head .elig-expect { margin: 0; color: var(--muted); font-size: 13px; }
 .magma-price-head .magma-verdict { margin-left: auto; }

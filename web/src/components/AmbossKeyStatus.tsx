@@ -60,19 +60,21 @@ function KeyState(props: {
 }) {
   const { keyValid, keyCheck, lastError, busy, onRecheck, onRemove } = props;
   if (keyCheck === "unreachable") {
+    // The reason without the "Amboss unreachable:" the row already says.
+    const why = lastError?.replace(/^Amboss unreachable:\s*/, "") ?? "";
     return (
       <>
         <div className="amboss-row">
           <span className="conn">
-            <i /> Amboss unreachable — retrying{keyValid === true ? " (your key was valid at the last check)" : ""}
+            <i /> Amboss unreachable — retrying
           </span>
           <button className="reset" disabled={busy} onClick={onRecheck}>
             {busy ? "…" : "Re-check"}
           </button>
         </div>
         <p className="muted">
-          Amboss didn't answer{lastError ? ` (${lastError})` : ""}. That says nothing about your key, which stays
-          connected — buying and selling resume as soon as Amboss answers again.
+          {why ? `${why.charAt(0).toUpperCase()}${why.slice(1)} — y` : "Y"}our key stays connected
+          {keyValid === true ? " (valid at the last check)" : ""}; buying and selling resume once Amboss answers.
         </p>
       </>
     );

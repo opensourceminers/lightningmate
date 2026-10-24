@@ -258,12 +258,9 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
     <section className="panel">
       <div className="panel-head"><h2>Settings</h2></div>
 
+      {/* Each section shows its switches and its state; what explains them
+          is one click away (2026-10-24: the page ran to 815 words). */}
       <h3 className="sub">Fiat currency</h3>
-      <div className="dryrun-banner">
-        Show a fiat estimate next to sat amounts. <strong>Off by default</strong> — when
-        enabled, LightningMate fetches the BTC price from mempool.space (see <strong>Privacy</strong> below
-        for every lookup the app makes, and its route).
-      </div>
       <div className="seg">
         {CURRENCIES.map((c) => (
           <button
@@ -282,12 +279,8 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
       <h3 className="sub">Privacy</h3>
       {privacy ? (
         <>
-          <div className="dryrun-banner">{privacySummary(privacy)}</div>
-          <ul className="close-aside">
-            {privacy.destinations.map((d) => (
-              <li key={d.service}>{destinationLine(d)}</li>
-            ))}
-          </ul>
+          {/* Without a proxy every lookup leaves from the home IP: said up front. */}
+          {privacy.torProxy ? null : <div className="dryrun-banner">{privacySummary(privacy)}</div>}
           {privacy.torProxy ? (
             <div className="seg">
               {TOR_ROUTES.map((r) => (
@@ -310,26 +303,23 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
               onChange={(v) => void savePrivacy({ lnplusLookups: v })}
               label="LN+ lookups"
             />
-            <span className="muted">
-              LN+ lookups (lightningnetwork.plus): peer reputations for picking peers, and the Pool and Swaps views — your
-              own node's public key included. Off: nothing is asked of LN+; what is cached is still used.
-            </span>
+            <span className="muted">LN+ lookups: peer reputations from lightningnetwork.plus — your node's own key included</span>
           </div>
+          <details className="set-more">
+            <summary>Where each lookup goes</summary>
+            {privacy.torProxy ? <p className="muted">{privacySummary(privacy)}</p> : null}
+            <ul className="close-aside">
+              {privacy.destinations.map((d) => (
+                <li key={d.service}>{destinationLine(d)}</li>
+              ))}
+            </ul>
+          </details>
         </>
       ) : (
         <p className="muted">Loading…</p>
       )}
 
       <h3 className="sub">Amboss Magma</h3>
-      <div className="dryrun-banner">
-        Connect your Amboss account to buy channel liquidity on the Magma marketplace — and, as an
-        advanced option, to sell it — from the <strong>Market</strong> tab. Browsing the market needs
-        no key; buying and selling do. Get a key at{" "}
-        <a href="https://account.amboss.tech/settings/api-keys" target="_blank" rel="noreferrer">
-          account.amboss.tech
-        </a>
-        . It’s stored only on your node.
-      </div>
       {ambossConnected === null ? (
         <p className="muted">Checking…</p>
       ) : ambossConnected ? (
@@ -343,33 +333,60 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
           ordersInFlight={ordersInFlight}
         />
       ) : (
-        <div className="amboss-row">
-          <input
-            type="password"
-            className="unlock-input amboss-key"
-            value={keyInput}
-            placeholder="Amboss API key"
-            onChange={(e) => setKeyInput(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") void connectAmboss();
-            }}
-          />
-          <button className="primary-btn" disabled={!keyInput.trim() || ambossBusy} onClick={() => void connectAmboss()}>
-            {ambossBusy ? "Connecting…" : "Connect"}
-          </button>
-        </div>
+        <>
+          <p className="muted">
+            Buying and selling on Magma (Market tab) need an Amboss API key — get one at{" "}
+            <a href="https://account.amboss.tech/settings/api-keys" target="_blank" rel="noreferrer">
+              account.amboss.tech
+            </a>
+            . It’s stored only on your node.
+          </p>
+          <div className="amboss-row">
+            <input
+              type="password"
+              className="unlock-input amboss-key"
+              value={keyInput}
+              placeholder="Amboss API key"
+              onChange={(e) => setKeyInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void connectAmboss();
+              }}
+            />
+            <button className="primary-btn" disabled={!keyInput.trim() || ambossBusy} onClick={() => void connectAmboss()}>
+              {ambossBusy ? "Connecting…" : "Connect"}
+            </button>
+          </div>
+        </>
       )}
       {ambossError ? <p className="banner error">{ambossError}</p> : null}
+      <details className="set-more">
+        <summary>Sign a message</summary>
+        <p className="muted">
+          With your node’s key — for Amboss’ <strong>“Login with Node”</strong> challenge (<code>amboss-…</code>):
+          paste it, sign, and copy the signature back to Amboss. Needs write mode (admin macaroon).
+        </p>
+        <textarea
+          className="unlock-input sig-input"
+          rows={2}
+          value={signInput}
+          placeholder="Message to sign (e.g. the amboss-… challenge)"
+          onChange={(e) => setSignInput(e.target.value)}
+        />
+        <div className="amboss-row">
+          <button className="primary-btn" disabled={!signInput.trim() || signing} onClick={() => void doSign()}>
+            {signing ? "Signing…" : "Sign with node"}
+          </button>
+        </div>
+        {signature ? (
+          <div className="challenge-row" style={{ marginTop: 10 }}>
+            <code className="challenge">{signature}</code>
+            <button className="reset" onClick={copySig}>{sigCopied ? "copied" : "copy"}</button>
+          </div>
+        ) : null}
+        {signError ? <p className="banner error">{signError}</p> : null}
+      </details>
 
       <h3 className="sub">LSP mode (experimental)</h3>
-      <div className="dryrun-banner">
-        Sell inbound channels <strong>directly to wallets</strong> speaking the open LSP standard
-        (LSPS1 / bLIP-51) over Lightning peer messages — with no marketplace in between. Orders
-        are priced by the same engine as Magma selling; the buyer pays a hold invoice that only
-        settles once the channel is opening, so failures refund automatically.{" "}
-        <strong>Experimental and off by default</strong>: few wallets can order this way, and on a
-        Tor-only node fewer still (see below). Needs write mode (admin macaroon).
-      </div>
       <div className="amboss-row">
         <Switch
           checked={settings?.lspModeEnabled ?? false}
@@ -381,8 +398,9 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
         {lsp && !lsp.canWrite ? <span className="muted">write mode is off — enable it to use LSP mode</span> : null}
       </div>
       {lspError ? <p className="banner error">{lspError}</p> : null}
-      {/* Who can order here — before the mode is switched on, too. */}
-      {lsp ? <p className="hint">{lspReachText(lsp.uris)}</p> : null}
+      {settings?.lspModeEnabled ? null : (
+        <p className="muted">Sell inbound channels directly to wallets that order over Lightning (LSPS1) — few wallets can, so expect few orders.</p>
+      )}
       {settings?.lspModeEnabled && lsp ? (
         <>
           <LspActivity lsp={lsp} />
@@ -413,14 +431,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
               A {lsp.serviceFeeBps / 100}% service fee on completed sales supports Lightning Mate’s development.
             </p>
           ) : null}
-          <p className="muted">
-            {lsp.featureBit.set
-              ? "Announcing LSP support in the node graph (feature bit 729) — explorers and wallets can discover you."
-              : lsp.featureBit.error
-                ? `Graph announcement unavailable (${lsp.featureBit.error}) — share your URI directly instead.`
-                : "Graph announcement pending…"}
-          </p>
-          <p className="muted">Buyers point their wallet at your node (it connects as a peer):</p>
+          <p className="muted">Buyers connect to:</p>
           {(() => {
             const uri = preferredUri(lsp);
             return (
@@ -435,29 +446,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
               </div>
             );
           })()}
-          <div className="dryrun-banner warn" style={{ marginTop: 10 }}>{CLEARNET_WARNING}</div>
-          <p className="muted">
-            Optional clearnet address (host:port, with port 9735 forwarded on your router). A DDNS
-            name is re-resolved hourly and kept announced across node restarts and IP changes:
-          </p>
-          <div className="amboss-row">
-            <input
-              className="unlock-input amboss-key"
-              value={clearnetInput}
-              placeholder="mynode.example.com:9735 or 203.0.113.7:9735"
-              onChange={(e) => setClearnetInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void saveClearnet();
-              }}
-            />
-            <button
-              className="primary-btn"
-              disabled={lspBusy || clearnetInput.trim() === (settings?.lspClearnetAddress ?? "")}
-              onClick={() => void saveClearnet()}
-            >
-              {clearnetInput.trim() ? "Announce" : "Withdraw"}
-            </button>
-          </div>
+          {/* A home IP in the public graph is never tucked away. */}
           {lsp.announcedSocket.error ? (
             <p className="banner error">{lsp.announcedSocket.error}</p>
           ) : lsp.announcedSocket.address && lsp.announcedSocket.applied ? (
@@ -465,44 +454,59 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
           ) : null}
         </>
       ) : null}
-
-      <h3 className="sub">Sign a message</h3>
-      <div className="dryrun-banner">
-        Sign any message with your node’s key. Use this for Amboss’ <strong>“Login with Node”</strong>{" "}
-        challenge (e.g. <code>amboss-…</code>) to get your API key above — paste the message,
-        sign, and copy the signature back to Amboss. Needs write mode (admin macaroon).
-      </div>
-      <textarea
-        className="unlock-input sig-input"
-        rows={2}
-        value={signInput}
-        placeholder="Message to sign (e.g. the amboss-… challenge)"
-        onChange={(e) => setSignInput(e.target.value)}
-      />
-      <div className="amboss-row">
-        <button className="primary-btn" disabled={!signInput.trim() || signing} onClick={() => void doSign()}>
-          {signing ? "Signing…" : "Sign with node"}
-        </button>
-      </div>
-      {signature ? (
-        <div className="challenge-row" style={{ marginTop: 10 }}>
-          <code className="challenge">{signature}</code>
-          <button className="reset" onClick={copySig}>{sigCopied ? "copied" : "copy"}</button>
-        </div>
+      {lsp ? (
+        <details className="set-more">
+          <summary>{settings?.lspModeEnabled ? "Who can order, graph announcement, clearnet address" : "How it works, and who can order"}</summary>
+          <p className="muted">
+            Inbound channels sold directly to wallets speaking the open LSP standard (LSPS1 / bLIP-51) over Lightning
+            peer messages, with no marketplace in between. Orders are priced by the same engine as Magma selling; the
+            buyer pays a hold invoice that only settles once the channel is opening, so failures refund automatically.
+            Needs write mode (admin macaroon).
+          </p>
+          {/* Who can order here — before the mode is switched on, too. */}
+          <p className="muted">{lspReachText(lsp.uris)}</p>
+          {settings?.lspModeEnabled ? (
+            <>
+              <p className="muted">
+                {lsp.featureBit.set
+                  ? "Announcing LSP support in the node graph (feature bit 729) — explorers and wallets can discover you."
+                  : lsp.featureBit.error
+                    ? `Graph announcement unavailable (${lsp.featureBit.error}) — share your URI directly instead.`
+                    : "Graph announcement pending…"}
+              </p>
+              <div className="dryrun-banner warn" style={{ marginTop: 10 }}>{CLEARNET_WARNING}</div>
+              <p className="muted">
+                Optional clearnet address (host:port, with port 9735 forwarded on your router). A DDNS
+                name is re-resolved hourly and kept announced across node restarts and IP changes:
+              </p>
+              <div className="amboss-row">
+                <input
+                  className="unlock-input amboss-key"
+                  value={clearnetInput}
+                  placeholder="mynode.example.com:9735 or 203.0.113.7:9735"
+                  onChange={(e) => setClearnetInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void saveClearnet();
+                  }}
+                />
+                <button
+                  className="primary-btn"
+                  disabled={lspBusy || clearnetInput.trim() === (settings?.lspClearnetAddress ?? "")}
+                  onClick={() => void saveClearnet()}
+                >
+                  {clearnetInput.trim() ? "Announce" : "Withdraw"}
+                </button>
+              </div>
+            </>
+          ) : null}
+        </details>
       ) : null}
-      {signError ? <p className="banner error">{signError}</p> : null}
-
-      <p className="hint">
-        More settings (autopilot safety caps, refresh intervals, alerts) live in their own
-        tabs — this page will grow.
-      </p>
 
       <h3 className="sub">About</h3>
-      <p className="muted">
-        Lightning Mate <strong>{formatVersion(version) || "version unknown"}</strong> — include this when
-        you report a problem.
-      </p>
       <div className="apply-row">
+        <span className="muted">
+          Lightning Mate <strong>{formatVersion(version) || "version unknown"}</strong>
+        </span>
         <button
           className="reset"
           onClick={() => {
@@ -512,9 +516,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
         >
           Download diagnostics
         </button>
-        <span className="muted small">
-          What the autopilot decided and why, its settings and history, and how the Magma lane stands — no keys or secrets.
-        </span>
+        <span className="muted small">for support — no keys or secrets</span>
       </div>
       {diagError ? <p className="banner error">{diagError}</p> : null}
     </section>

@@ -12,7 +12,7 @@ function formatWhen(iso: string | null): string {
 }
 
 /**
- * Compact "Backup & Recovery" card: shows the channel backup (SCB) watchdog
+ * Compact "Channel backup (SCB)" card: shows the channel backup watchdog
  * status and a one-click export. Read-only except the operator-triggered export.
  */
 export function BackupCard() {
@@ -52,13 +52,11 @@ export function BackupCard() {
 
   return (
     <section className="panel">
-      <div className="panel-head"><h2>Backup &amp; Recovery</h2></div>
-
-      <h3 className="sub">Channel backup (SCB)</h3>
-      <div className="dryrun-banner">
-        The static channel backup (SCB) lets you recover your channel funds if you lose this
-        node. Re-export it whenever your channels change — it never contains your seed phrase.
-      </div>
+      <div className="panel-head"><h2>Channel backup (SCB)</h2></div>
+      <p className="muted">
+        Recovers your channel funds if you lose this node. Export it again whenever your channels change — it never
+        contains your seed phrase.
+      </p>
 
       {status ? (
         <>

@@ -41,8 +41,8 @@ security@opensourceminers.de (please don't open a public issue first).
   - **Without the proxy**, every one of them leaves from this server's
     internet connection, which is your home IP address.
 
-  Settings → Privacy lists each destination with the route it takes right
-  now. Every outbound request has a hard deadline.
+  Settings → Privacy ("Where each lookup goes") lists each destination with
+  the route it takes right now. Every outbound request has a hard deadline.
 - **LSP mode is off by default** (experimental) and adds the only surface that
   processes input from arbitrary network peers: LSPS1 (bLIP-51) JSON-RPC over
   BOLT8 custom messages. It is rate-limited per peer, wrapped in a hard crash
@@ -272,7 +272,7 @@ This still permits rebalancing (which sends payments) and opening/closing
 channels, but excludes admin-only powers like baking further macaroons, message
 signing, and wallet/seed access.
 
-> Note: the optional Amboss sign-in helper (Settings → Sign message) uses LND's
+> Note: the optional Amboss sign-in helper (Settings → Amboss Magma → "Sign a message") uses LND's
 > message signing, which the macaroon above omits. Add the message-signing
 > permission if you want to use that helper; nothing else in the app needs it.
 
