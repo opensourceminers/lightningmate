@@ -100,10 +100,22 @@ export interface RebalanceCosts {
   note: string | null;
 }
 
-/** LND pages payments this many at a time … */
-const PAGE = 250;
+/**
+ * LND pages payments this many at a time, newest first. Few on purpose:
+ * LND walks back through its history — failed payments too (probes,
+ * rebalance attempts), each read whole — until a page is full; a page it
+ * can't fill walks to the first payment ever made. Before, 250 at a time and
+ * with LND's creation-date filter (it skips the payments outside the dates,
+ * but walks on): on a node that had numbered some 73,000 payments, 129 of
+ * them successful and the newest of those in June, every read of an empty 30
+ * days walked them all — 7 s warm, 42 s cold — and the Overview's figures
+ * (the KPI row, the score, P&L) each started one at once: 81 s for the first
+ * load, 13 s for each after it. 25 at a time, the first page reached past
+ * the 30 days in 10 ms …
+ */
+const PAGE = 25;
 /** … for at most this many pages (100,000 payments). */
-const MAX_PAGES = 400;
+const MAX_PAGES = 4_000;
 /** The Overview asks every minute: one read of LND serves a minute. */
 const CACHE_MS = 60_000;
 /** A record without a payment hash (logged before 0.8) matches an LND
@@ -125,10 +137,15 @@ type Listing = { items: SelfPayment[]; complete: boolean };
  *  payments to anyone else, apart. */
 type PaymentsRead = Listing & { sent: SentPayment[] };
 const cache = new WeakMap<AuthenticatedLnd, { at: number; sinceMs: number; listing: PaymentsRead }>();
+/** The read under way, per connection: the Overview's figures ask at once
+ *  (the dashboard, the score, P&L's rebalances and its sends) — one read
+ *  serves every window it covers. */
+const reading = new WeakMap<AuthenticatedLnd, { sinceMs: number; done: Promise<PaymentsRead> }>();
 
 /** Forget what was read (a test changes the node's payments). */
 export function forgetSelfPayments(lnd: AuthenticatedLnd): void {
   cache.delete(lnd);
+  reading.delete(lnd);
 }
 
 /**
@@ -148,28 +165,46 @@ export async function listSentPayments(lnd: AuthenticatedLnd, sinceMs: number, n
   return { items: read.sent, complete: read.complete };
 }
 
+/** The payments of a read from `sinceMs` on. */
+function fromSince(read: PaymentsRead, sinceMs: number): PaymentsRead {
+  const inWindow = <T extends { at: string }>(xs: T[]) => xs.filter((p) => !(Date.parse(p.at) < sinceMs));
+  return { items: inWindow(read.items), sent: inWindow(read.sent), complete: read.complete };
+}
+
 async function readPayments(lnd: AuthenticatedLnd, sinceMs: number, nowMs: number): Promise<PaymentsRead> {
   const cached = cache.get(lnd);
-  if (cached && nowMs - cached.at < CACHE_MS && cached.sinceMs <= sinceMs) {
-    const inWindow = <T extends { at: string }>(xs: T[]) => xs.filter((p) => !(Date.parse(p.at) < sinceMs));
-    return { items: inWindow(cached.listing.items), sent: inWindow(cached.listing.sent), complete: cached.listing.complete };
+  if (cached && nowMs - cached.at < CACHE_MS && cached.sinceMs <= sinceMs) return fromSince(cached.listing, sinceMs);
+  const running = reading.get(lnd);
+  if (running && running.sinceMs <= sinceMs) return fromSince(await running.done, sinceMs);
+  const entry = { sinceMs, done: fetchPayments(lnd, sinceMs) };
+  reading.set(lnd, entry);
+  try {
+    const listing = await entry.done;
+    // (A read forgotten meanwhile is not kept.)
+    if (reading.get(lnd) === entry) cache.set(lnd, { at: nowMs, sinceMs, listing });
+    return listing;
+  } finally {
+    if (reading.get(lnd) === entry) reading.delete(lnd);
   }
+}
+
+async function fetchPayments(lnd: AuthenticatedLnd, sinceMs: number): Promise<PaymentsRead> {
   const own = await getOwnPubkey(lnd);
   const items: SelfPayment[] = [];
   const sent: SentPayment[] = [];
   let complete = true;
   let token: string | undefined;
-  const after = Number.isFinite(sinceMs) && sinceMs > 0 ? new Date(sinceMs).toISOString() : undefined;
   for (let page = 0; ; page++) {
     if (page >= MAX_PAGES) {
       complete = false;
       break;
     }
-    const res = await getPayments(token ? { lnd, token } : { lnd, limit: PAGE, ...(after ? { created_after: after } : {}) });
+    // No creation-date filter: with one, LND walks its whole history (see
+    // PAGE). The window is applied here.
+    const res = await getPayments(token ? { lnd, token } : { lnd, limit: PAGE });
     let older = false;
     for (const p of res.payments) {
       const at = Date.parse(p.created_at);
-      // An LND before 0.16 ignores created_after: the window is applied here.
       if (Number.isFinite(sinceMs) && !(at >= sinceMs)) {
         older = true;
         continue;
@@ -194,9 +229,7 @@ async function readPayments(lnd: AuthenticatedLnd, sinceMs: number, nowMs: numbe
     if (!res.next || older) break;
     token = res.next;
   }
-  const listing = { items, sent, complete };
-  cache.set(lnd, { at: nowMs, sinceMs, listing });
-  return listing;
+  return { items, sent, complete };
 }
 
 /**

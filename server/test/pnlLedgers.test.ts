@@ -27,7 +27,7 @@ import { RebalanceLog, type RebalanceRecord } from "../src/services/rebalanceLog
 import { EarningsLog } from "../src/services/earningsLog.js";
 import { ServiceFeeLedger, type ServiceFeeEntry } from "../src/services/serviceFee.js";
 import { MagmaPurchases, type MagmaPurchase } from "../src/services/magmaPurchases.js";
-import { forgetSelfPayments, rebalanceCosts } from "../src/services/rebalanceCosts.js";
+import { forgetSelfPayments, lightningPaymentFees, rebalanceCosts } from "../src/services/rebalanceCosts.js";
 import { JsonStore, storeIncidents } from "../src/store.js";
 import { stateAlerts } from "../src/services/alerts.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
@@ -412,6 +412,51 @@ test("LND's payments are read again once a minute has passed — a rebalance mad
   installPayments(node, [selfPay(node, 1, 10), selfPay(node, 0, 5)]);
   assert.equal((await rebalanceCosts(node.lnd, log, now - 30 * DAY, now + 30_000)).feeSats, 10, "within the minute: the read serves");
   assert.equal((await rebalanceCosts(node.lnd, log, now - 30 * DAY, now + 61_000)).feeSats, 15);
+});
+
+test("LND is asked for its payments without a date filter, a few at a time, and the read ends with the first page past the window — LND walks its whole history for a page it can't fill (an empty 30 days on a live node: 7 s warm, 42 s cold)", async (t) => {
+  const node = new FakeLnd({ chainBalance: 1_000_000 });
+  const log = new RebalanceLog(makeTempDir(t));
+  // Two years of rebalances, one a week: five of them in the last 30 days.
+  installPayments(node, Array.from({ length: 104 }, (_, i) => selfPay(node, 7 * (103 - i) + 1, 10)));
+  const now = Date.now();
+  const costs = await rebalanceCosts(node.lnd, log, now - 30 * DAY, now);
+  assert.deepEqual([costs.feeSats, costs.count, costs.source], [50, 5, "lnd"]);
+  const asked = node.callsTo("default.listPayments");
+  assert.equal(asked.length, 1, "the first page reaches past the 30 days");
+  assert.ok(!asked[0].creation_date_start && !asked[0].creation_date_end, JSON.stringify(asked[0]));
+  assert.ok(Number(asked[0].max_payments) <= 25, JSON.stringify(asked[0]));
+  // Two years: page after page, every one of them.
+  forgetSelfPayments(node.lnd);
+  assert.deepEqual([(await rebalanceCosts(node.lnd, log, now - 800 * DAY, now)).count, node.callsTo("default.listPayments").length], [104, 6]);
+});
+
+test("figures asked for at once share one read of LND's payments — the Overview's KPI row, score and P&L (its rebalances and its sends) each started their own", async (t) => {
+  const node = new FakeLnd({ chainBalance: 1_000_000 });
+  const log = new RebalanceLog(makeTempDir(t));
+  installPayments(node, [selfPay(node, 40, 99), selfPay(node, 2, 10), paymentRpc({ at: Date.now() - DAY, tokens: 5_000, feeMsat: 4_000, destination: "02" + "e5".repeat(32) })]);
+  const now = Date.now();
+  const month = now - 30 * DAY;
+  const [kpi, score, pnl, sends] = await Promise.all([
+    rebalanceCosts(node.lnd, log, month, now),
+    rebalanceCosts(node.lnd, log, month, now),
+    rebalanceCosts(node.lnd, log, month, now),
+    lightningPaymentFees(node.lnd, month, new Set(), now),
+  ]);
+  assert.equal(node.callsTo("default.listPayments").length, 1);
+  assert.deepEqual([kpi.feeSats, score.feeSats, pnl.feeSats, sends?.feeSats, sends?.count], [10, 10, 10, 4, 1]);
+  // A year's read under way serves 30 days too.
+  forgetSelfPayments(node.lnd);
+  const [year, thirty] = await Promise.all([rebalanceCosts(node.lnd, log, now - 365 * DAY, now), rebalanceCosts(node.lnd, log, month, now)]);
+  assert.deepEqual([year.feeSats, thirty.feeSats, node.callsTo("default.listPayments").length], [109, 10, 2]);
+  // A read that fails fails each figure that shared it (they answer from
+  // the log), and the next figure asks LND again.
+  forgetSelfPayments(node.lnd);
+  node.failNext("default.listPayments", "unable to read payments");
+  const failed = await Promise.all([rebalanceCosts(node.lnd, log, month, now), rebalanceCosts(node.lnd, log, month, now)]);
+  assert.deepEqual(failed.map((c) => c.source), ["log", "log"]);
+  assert.equal(node.callsTo("default.listPayments").length, 3);
+  assert.equal((await rebalanceCosts(node.lnd, log, month, now)).source, "lnd");
 });
 
 test("a rebalance split over two paths: each part's fee goes to the channel it came back through", async (t) => {
