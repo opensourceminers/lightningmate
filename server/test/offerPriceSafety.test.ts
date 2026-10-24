@@ -524,6 +524,72 @@ test("listing a free-disabled offer again takes the engine's price even when it 
   }
 });
 
+test("an offer disabled by hand at 0 ppm + 0 sat gets its price while it stays disabled — so the operator's Enable can list it; never the operator's own terms, never without auto-pricing", async (t) => {
+  quiet(t);
+  for (const [variant, cfg, manual, expectPrice] of [
+    ["auto-pricing on, the last price known", { sellAutoReprice: true }, false, 4435],
+    ["auto-pricing on, terms taken over", { sellAutoReprice: true }, true, 0],
+    ["auto-pricing off", { sellAutoReprice: false }, false, 0],
+  ] as const) {
+    const { autopilot, magma, market } = sellerSetup(t, { chainBalance: 8_000_000, config: { sellAutoSize: true, ...cfg } });
+    market.behaviour = "throw"; // no engine price: the one it last had is what there is
+    const offer = magma.addOffer(LIVE);
+    await autopilot.runOnce(); // seen at 4,435
+    // 2026-10-23: the operator disabled it by hand; Amboss holds it at 0.
+    offer.status = "DISABLED";
+    autopilot.offerStatusSetByHand(offer.id, "DISABLED");
+    if (manual) autopilot.pauseOfferAutomation(offer.id, "you edited this offer");
+    offer.feeRatePpm = 0;
+    const toggles = magma.count("ToggleOffer");
+    await autopilot.runOnce();
+    assert.equal(offer.feeRatePpm, expectPrice, variant);
+    assert.equal(offer.status, "DISABLED", `${variant}: listing it stays the operator's click`);
+    assert.equal(magma.count("ToggleOffer"), toggles, variant);
+    const e = entryOf(autopilot, offer.id);
+    assert.match(
+      e?.differences.join("; ") ?? "",
+      expectPrice ? /disabled by you — the autopilot leaves it disabled/ : /has no price on Amboss \(0 ppm \+ 0 sat\) — edit it on Market → Sell to give it one, then enable it/,
+      variant,
+    );
+    if (expectPrice) {
+      assert.match(e?.lastWrite?.reason ?? "", /^priced at its last 4,435 ppm \+ 0 sat while disabled \(Amboss had it at 0 ppm \+ 0 sat\) — listing it stays your click$/);
+      assert.equal(e?.lastWrite?.verified, true);
+    }
+    neverSentFree(magma);
+  }
+});
+
+test("an offer the autopilot disabled for lack of capital, at 0 ppm + 0 sat, is priced and listed again in the same run once capital is back — and says what holds while no price is known", async (t) => {
+  quiet(t);
+  const { autopilot, magma, node, market } = sellerSetup(t, { chainBalance: 500_000, config: { sellAutoSize: true, sellAutoReprice: true } });
+  market.behaviour = "throw"; // no engine price
+  const offer = magma.addOffer({ minSats: 1_000_000, maxSats: 2_000_000, totalSats: 2_000_000, feeRatePpm: 0, baseFeeSats: 0 });
+  await autopilot.runOnce();
+  assert.equal(offer.status, "DISABLED", "disabled for lack of capital");
+  node.chainBalance = 8_000_000;
+  await autopilot.runOnce();
+  assert.equal(offer.status, "DISABLED", "capital is back, no price known: not listed");
+  assert.match(entryOf(autopilot, offer.id)?.differences.join("; ") ?? "", /left as it is: it has no price on Amboss/);
+  // A price becomes known (the engine's, in life; the one it last had here).
+  (autopilot as unknown as { state: { offerPrices: Record<string, unknown> } }).state.offerPrices = {
+    [offer.id]: { feeRatePpm: 3000, baseFeeSats: 852, at: new Date().toISOString() },
+  };
+  await autopilot.runOnce();
+  assert.deepEqual([offer.status, offer.feeRatePpm, offer.baseFeeSats], ["ENABLED", 3000, 852], "priced, then listed by capital safety in the same run");
+  neverSentFree(magma);
+});
+
+test("with the market report up, a disabled offer at 0 ppm + 0 sat gets the engine's price — as the live node's did need (recommended 4,445 ppm, offer at 0)", async (t) => {
+  quiet(t);
+  const { autopilot, magma } = sellerSetup(t, { chainBalance: 8_000_000, config: { sellAutoSize: true, sellAutoReprice: true } });
+  const offer = magma.addOffer({ ...LIVE, status: "DISABLED", feeRatePpm: 0 });
+  autopilot.offerStatusSetByHand(offer.id, "DISABLED");
+  await autopilot.runOnce();
+  assert.ok(offer.feeRatePpm > 0, `priced: ${offer.feeRatePpm} ppm`);
+  assert.equal(offer.status, "DISABLED");
+  assert.match(entryOf(autopilot, offer.id)?.lastWrite?.reason ?? "", /^priced at the engine's .* while disabled/);
+});
+
 test("the last line: a price of 0 ppm + 0 sat is never sent to Amboss, whoever asks for it", async (t) => {
   quiet(t);
   const { autopilot, magma } = sellerSetup(t, { chainBalance: 8_000_000 });

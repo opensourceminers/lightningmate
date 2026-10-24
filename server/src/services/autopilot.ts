@@ -3692,7 +3692,13 @@ export class Autopilot {
     const unanswered =
       "the autopilot disabled it for lack of capital, and Amboss's answer never came — the next read of the offer tells whether the disable landed";
     const disabledWhy = (status: string): string =>
-      control.freeDisabledAt
+      listedForFree(off) && !control.freeDisabledAt
+        ? `offer is ${status} and has no price on Amboss (0 ppm + 0 sat) — ${
+            !control.manual && this.state.config.sellAutoReprice
+              ? "the autopilot prices it once it knows a price (the market recommendation, or one it had); or edit it on Market → Sell"
+              : "edit it on Market → Sell to give it one"
+          }, then enable it`
+        : control.freeDisabledAt
         ? !control.manual && this.state.config.sellAutoReprice
           ? "disabled by the autopilot: Amboss listed it for free (0 ppm + 0 sat) — it is priced and listed again once there is a price for it (auto-pricing), or set one on Market → Sell"
           : FREE_DISABLED_WHY
@@ -3703,6 +3709,22 @@ export class Autopilot {
           : control.autoDisablingAt
             ? unanswered
             : `offer is ${status} — the autopilot doesn't enable an offer it didn't disable; enable it on Market → Sell to list it`;
+    // A disabled offer the autopilot prices (auto-pricing on, terms not the
+    // operator's) is never left at a price of nothing: its price is written —
+    // whether it is listed stays the operator's click (or capital safety's,
+    // just below: so one disabled for lack of capital is listed again in the
+    // same run once it can be funded). Without this, an offer disabled at
+    // 0 ppm + 0 sat — by hand after 0.8.0's partial writes, or for capital —
+    // couldn't be listed again: enabling a free offer is refused, the price
+    // buttons are the autopilot's, and the autopilot priced listed offers only.
+    let pricedWhileOff: OfferWrite | undefined;
+    if (off.status === "DISABLED" && listedForFree(off) && !control.manual && this.state.config.sellAutoReprice) {
+      const r = await this.priceDisabledFree(key, off, ctx, out);
+      if (r) {
+        pricedWhileOff = r.write;
+        if (r.offer) off = r.offer;
+      }
+    }
     // Capital safety, for every offer (the operator's own too): see
     // capitalStatus and capitalToggle.
     const wantStatus = capitalStatus(off.status, fundable, control);
@@ -3737,7 +3759,7 @@ export class Autopilot {
         control = this.offerControlOf(off.id);
       }
     }
-    if (off.status !== "ENABLED") return this.syncEntry(off, null, undefined, disabledWhy(off.status));
+    if (off.status !== "ENABLED") return this.syncEntry(off, null, pricedWhileOff, disabledWhy(off.status));
 
     const want = this.wantedTerms(off, ctx, !!control.manual);
     if (listedForFree(want.fields)) {
@@ -4678,6 +4700,36 @@ export class Autopilot {
     }
     const last = this.state.offerPrices?.[off.id];
     return last ? { feeRatePpm: last.feeRatePpm, baseFeeSats: last.baseFeeSats, engine: false } : null;
+  }
+
+  /**
+   * A disabled offer at 0 ppm + 0 sat, priced by the autopilot: the price for
+   * it (priceForFree) goes on — onto everything else as Amboss has it — and is
+   * read back and checked. Its listing is left as it is. Null: no price known,
+   * or nothing to do any more (listed, priced or taken over meanwhile).
+   */
+  private async priceDisabledFree(key: string, off: MyOffer, ctx: OfferCtx, out: AutopilotSell[]): Promise<{ offer: MyOffer | null; write: OfferWrite } | null> {
+    return this.withOffer(off.id, async () => {
+      const fresh = await getMyOffer(key, off.id).catch(() => null);
+      if (!fresh || fresh.status !== "DISABLED" || !listedForFree(fresh) || this.offerControlOf(off.id).manual || this.stopWhy("sellEnabled")) return null;
+      const price = this.priceForFree(fresh, ctx, fresh.minBlockLength);
+      if (!price) return null;
+      const terms: OfferTerms = { ...termsOf(fresh), feeRatePpm: price.feeRatePpm, baseFeeSats: price.baseFeeSats };
+      const write: OfferWrite = {
+        at: new Date().toISOString(),
+        by: "autopilot",
+        action: "update",
+        fields: ambossFields(terms),
+        changed: termsChanges(fresh, { ...fieldsOf(fresh), ...terms }),
+        ok: false,
+        reason: `priced at ${price.engine ? "the engine's" : "its last"} ${fmtSat(price.feeRatePpm)} ppm + ${fmtSat(price.baseFeeSats)} sat while disabled (Amboss had it at 0 ppm + 0 sat) — listing it stays your click`,
+      };
+      const read = await this.writeTerms(key, off.id, terms, write, fresh);
+      const ok = write.ok && write.verified === true;
+      out.push({ orderId: off.id, action: "reprice", sizeSats: terms.maxSizeSats, ok, ...(ok ? {} : { error: write.error }) });
+      if (ok) console.log(`[autopilot] offer ${off.id}: ${write.reason}`);
+      return { offer: read, write };
+    });
   }
 
   /**

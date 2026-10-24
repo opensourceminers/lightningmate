@@ -314,6 +314,8 @@ export function MarketSell() {
   const clearing = r0?.clearing ?? null;
   const leaseDays = r0 ? Math.round(r0.recommended.minBlockLength / 144) : null;
   const managedPrice = autoPriced(mine);
+  /** The engine has a price for this offer (what the autopilot would give it). */
+  const enginePriced = (o: MyOffer) => !!rec?.sell.recommendations.some((r) => r.offerId === o.id && (r.recommended.feeRatePpm > 0 || r.recommended.baseFeeSat > 0));
   const sizeWarning = offerSizeWarning(form, cfg, rec?.sell.effectiveMaxOrderSat ?? null);
   // Expected value, not the margin of one sale (m4: the per-sale view made a
   // ≈0-sales feature look profitable): sales a year × what one nets.
@@ -413,7 +415,13 @@ export function MarketSell() {
                       <button
                         className="row-btn ghost"
                         disabled={togglingId !== null || (!active && free)}
-                        title={!active && free ? "Set a price first (edit): listed like this, buyers would get a channel for free" : undefined}
+                        title={
+                          !active && free
+                            ? autoPriced(o) && enginePriced(o)
+                              ? "No price yet: the autopilot gives it one at its next run — then enable it"
+                              : "Set a price first (edit): listed like this, buyers would get a channel for free"
+                            : undefined
+                        }
                         onClick={() => void toggle(o)}
                       >
                         {togglingId === o.id ? "…" : active ? "disable" : "enable"}
@@ -440,6 +448,13 @@ export function MarketSell() {
         </table>
       )}
 
+      {offers.some((o) => o.status !== "ENABLED" && o.feeRatePpm <= 0 && o.baseFeeSats <= 0) ? (
+        <p className="sug-warn">
+          ⚠ {offers.some((o) => o.status !== "ENABLED" && o.feeRatePpm <= 0 && o.baseFeeSats <= 0 && autoPriced(o) && enginePriced(o))
+            ? "This offer has no price on Amboss (0 ppm + 0 sat). The autopilot gives it the recommended one at its next run — then enable it. Listing it again is your click."
+            : "This offer has no price on Amboss (0 ppm + 0 sat). Give it one with edit, then enable it."}
+        </p>
+      ) : null}
       {formOpen ? (
         <div className="offer-form">
           <h4 className="sub">{editingId ? "Edit your offer" : offers.length ? "Another offer (it lists a second one)" : "New offer"}</h4>
