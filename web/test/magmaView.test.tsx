@@ -20,7 +20,11 @@ import {
   buyConfirmMessage,
   disableSellingMessage,
   enableSellingMessage,
+  enableSellingOffersMessage,
+  enableSellingOffersPendingMessage,
   freedCapitalMagmaHint,
+  keepDisabledAction,
+  offersSwitchOnLists,
   leaseBenchmarkLine,
   leaseWarning,
   localLabel,
@@ -86,6 +90,51 @@ test("D9: the confirmation before switching selling on carries the live verdict 
   assert.match(unknown, /Unknown/);
   assert.match(unknown, /could not be made/);
   assert.match(disableSellingMessage(2), /2 offers are still listed/);
+});
+
+test("switching selling on says what happens to the disabled offers: listed again, each once it has a price and can be funded, at whose price — and how to keep one off", () => {
+  assert.equal(enableSellingOffersMessage(0), "", "nothing disabled: nothing to say");
+  assert.equal(
+    enableSellingOffersMessage(1),
+    "Your disabled offer is listed again once its smallest channel can be funded and it has its price — the autopilot's current price where it prices " +
+      "the offer (until it has one, the offer waits), the offer's own price where you set its terms or auto-pricing is off. " +
+      '"Keep disabled" on Market → Sell keeps one off.',
+  );
+  assert.match(enableSellingOffersMessage(3), /^Your 3 disabled offers are listed again, each once its smallest channel can be funded and it has its price/);
+  assert.match(enableSellingOffersMessage(null), /^Your offers that are disabled now are listed again/, "no count: said without one");
+  assert.equal(enableSellingOffersPendingMessage(), "Checking your offers on Amboss…");
+});
+
+test("the count the turn-on dialog gives is the server's: offers its last sync showed disabled and Amboss still does — every disabled one with no sync kept yet; none guessed", () => {
+  const live = [
+    { id: "a", status: "DISABLED" },
+    { id: "b", status: "DISABLED" },
+    { id: "c", status: "ENABLED" },
+  ];
+  const sync = (entries: [string, string][]) => ({
+    at: "2026-10-24T10:00:00Z",
+    offers: entries.map(([offerId, status]) => ({ offerId, amboss: { status } })) as never,
+  });
+  assert.equal(offersSwitchOnLists(live, sync([["a", "DISABLED"], ["b", "ENABLED"], ["c", "DISABLED"]])), 1, "b was listed at the switch; c is listed now");
+  assert.equal(offersSwitchOnLists(live, { at: null, offers: [] }), 2, "no sync kept yet: every disabled offer");
+  assert.equal(offersSwitchOnLists(live, null), null, "the sync couldn't be read");
+});
+
+test("a new offer's draft takes the engine's base fee as it is — 0 included (the market's, where comparable offers charge none)", () => {
+  const caps = { sellMaxChannelSats: 2_000_000, sellMaxDeploySats: 2_000_000 };
+  const create = { mode: "create", recommended: { feeRatePpm: 3000, baseFeeSat: 0, minBlockLength: 4320 } };
+  assert.equal(offerDraftDefaults(report({ standardLeaseBlocks: 4320, recommendations: [create] } as never), caps).baseFeeSats, 0, "before: 1,000 sat");
+  assert.equal(offerDraftDefaults(null, caps).baseFeeSats, 1000, "no recommendation: the default");
+});
+
+test("'keep disabled' is offered for an offer a switch-on is to list — and only for one: a listed offer has 'disable', any other disabled one stays off anyway", () => {
+  const keep = keepDisabledAction({ status: "DISABLED" }, { listOnAt: "2026-10-24T10:00:00Z" });
+  assert.equal(keep?.label, "keep disabled");
+  assert.match(keep?.title ?? "", /lists it once it has a price and its smallest channel can be funded\. Keep it off instead — it stays disabled until you enable it, or switch selling off and on again\./);
+  assert.equal(keepDisabledAction({ status: "DISABLED" }, { disabledByHandAt: "2026-10-24T10:00:00Z" }), null);
+  assert.equal(keepDisabledAction({ status: "DISABLED" }, undefined), null);
+  assert.equal(keepDisabledAction({ status: "ENABLED" }, { listOnAt: "2026-10-24T10:00:00Z" }), null);
+  assert.match(OFFER_AUTOMATION_HINT, /a disable sticks while Liquidity provision stays on \(switching it on lists your disabled offers again; "keep disabled" on Market → Sell keeps one off\)/);
 });
 
 test("the Orders tab never calls an order paid that LightningMate didn't hold the payment for", () => {
@@ -309,6 +358,9 @@ test("offer ownership: a disable by hand is shown as such, whoever sets the term
   assert.equal(mine.label, "yours");
   assert.match(mine.title, /lists it again once it can be funded/);
   assert.doesNotMatch(mine.title, /never enables/);
+  assert.match(disabled.title, /or switch Liquidity provision off and on again/);
+  const switchedOn = offerOwner({ listOnAt: "2026-10-24T10:00:00Z" }, true);
+  assert.match(switchedOn.title, /Liquidity provision was switched on with it disabled: the autopilot lists it once it has a price and its smallest channel can be funded/);
 });
 
 test("rec 5: 'Apply recommended' puts the engine's window into the edit, and every price button the lease its price is for — an odd lease becomes the standard; saving an odd one is warned about", () => {

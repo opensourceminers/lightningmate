@@ -30,6 +30,7 @@ import { failedOfferWrite } from "../statusNotes";
 import { EligibilityCard, HowAmbossPicks, OfferPromiseNote, SellDiagnosticsCard } from "./MagmaSellInfo";
 import {
   STANDARD_LEASE_BLOCKS,
+  keepDisabledAction,
   leaseToKeep,
   leaseWarning,
   offerDraftDefaults,
@@ -217,8 +218,8 @@ export function MarketSell() {
       setError("Sizes must satisfy 0 < min ≤ max ≤ total.");
       return;
     }
-    if (d.baseFeeSats <= 0) {
-      setError("Set a base fee above 0.");
+    if (d.feeRatePpm <= 0 && d.baseFeeSats <= 0) {
+      setError("Set a price: a fee rate, a base fee or both — at 0 ppm + 0 sat buyers would get a channel for free.");
       return;
     }
     const editing = editingId;
@@ -258,7 +259,9 @@ export function MarketSell() {
     if (o.status === "ENABLED" && cfg?.sellEnabled) {
       const ok = await ui.confirm({
         title: "Disable offer",
-        message: "Disable this offer? It stays disabled until you enable it again: the autopilot never enables an offer you disabled. Its terms stay with whoever sets them now.",
+        message:
+          "Disable this offer? While Liquidity provision stays on it stays disabled until you enable it again — switching Liquidity provision " +
+          "off and on lists your disabled offers again. Its terms stay with whoever sets them now.",
         confirmLabel: "Disable",
       });
       if (!ok) return;
@@ -268,6 +271,22 @@ export function MarketSell() {
       // By state, not by flip: if the autopilot changed it since this page
       // loaded, a flip would do the opposite of what the button says.
       await api.ambossToggleOffer(o.id, o.status === "ENABLED" ? "DISABLED" : "ENABLED");
+      await reload();
+    } catch (e) {
+      ui.toast(e instanceof Error ? e.message : String(e), "error");
+    } finally {
+      setTogglingId(null);
+    }
+  };
+
+  // "keep disabled" (keepDisabledAction): an offer a switch-on is to list
+  // stays off. By state — it is disabled, so nothing is flipped; the click is
+  // recorded as a disable by hand, which ends what the switch-on had to list.
+  const keepDisabled = async (o: MyOffer) => {
+    setTogglingId(o.id);
+    try {
+      await api.ambossToggleOffer(o.id, "DISABLED");
+      ui.toast("Kept disabled: the autopilot leaves it off until you enable it.", "success");
       await reload();
     } catch (e) {
       ui.toast(e instanceof Error ? e.message : String(e), "error");
@@ -389,6 +408,7 @@ export function MarketSell() {
               const owner = ownerOf(o);
               const oddLease = leaseToKeep(o.minBlockLength, rec?.sell.standardLeaseBlocks ?? STANDARD_LEASE_BLOCKS) !== o.minBlockLength;
               const free = o.feeRatePpm <= 0 && o.baseFeeSats <= 0;
+              const keep = keepDisabledAction(o, controls[o.id]);
               return (
                 <tr key={o.id} className={active ? "" : "inactive"}>
                   <td>{active ? "🟢 active" : `⚪ ${o.status.toLowerCase()}`}</td>
@@ -426,6 +446,11 @@ export function MarketSell() {
                       >
                         {togglingId === o.id ? "…" : active ? "disable" : "enable"}
                       </button>
+                      {keep ? (
+                        <button className="row-btn ghost" disabled={togglingId !== null} title={keep.title} onClick={() => void keepDisabled(o)}>
+                          {keep.label}
+                        </button>
+                      ) : null}
                       {owner.yours && cfg?.sellEnabled ? (
                         <button className="row-btn ghost" title="Let the autopilot manage this offer's terms again" onClick={() => void handBack(o, true)}>
                           hand to autopilot

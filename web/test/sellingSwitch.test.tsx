@@ -48,6 +48,7 @@ function deps(over: Partial<SellingSwitchDeps> & { answers?: boolean[] } = {}) {
     },
     eligibility: () => new Promise(() => undefined),
     offers: async () => [],
+    offerSync: async () => ({ at: null, managed: false, offers: [], lastError: null }),
     disableOffer: async () => ({ status: "DISABLED" }),
     save: async (patch) => {
       saved.push(patch);
@@ -71,6 +72,43 @@ test("switching selling on opens the confirmation at once — the selling check 
   assert.match(html, /Checking Amboss(&#x27;|')s public offer book/);
   assert.match(html, /Amboss decides which seller gets an order/);
   assert.deepEqual(saved, [{ sellEnabled: true }]);
+});
+
+test("the 'turn on' confirmation learns how many offers are disabled — those it lists again — without waiting for Amboss to open", async () => {
+  const { d, asked } = deps({
+    offers: async () => [offer("a", "DISABLED"), offer("b", "DISABLED"), offer("c"), offer("d", "ADMIN_DISABLED")],
+  });
+  await turnSellingOn(d);
+  const body = asked[0].body as ReactElement<{ disabledOffers: Promise<number | null> }>;
+  assert.match(renderToStaticMarkup(body), /Checking your offers on Amboss…/, "until Amboss answers, it says so");
+  assert.equal(await body.props.disabledOffers, 2, "the disabled ones — not the listed one, nor one Amboss support disabled");
+  const unread = deps({ offers: async () => Promise.reject(new Error("Amboss down")) });
+  await turnSellingOn(unread.d);
+  assert.equal(await (unread.asked[0].body as ReactElement<{ disabledOffers: Promise<number | null> }>).props.disabledOffers, null);
+  // Counted as the server lists them: only those its last offer sync showed
+  // disabled (b was listed then — disabled on amboss.tech since: not listed).
+  const entry = (offerId: string, status: string) => ({
+    offerId,
+    checkedAt: "2026-10-24T10:00:00Z",
+    amboss: { status, minSizeSats: 1, maxSizeSats: 1, totalSizeSats: 1, availableSats: 1, feeRatePpm: 1, baseFeeSats: 0, minBlockLength: 4320, feeRateCapPpm: null, baseFeeCapSats: null },
+    wanted: null,
+    inSync: true,
+    differences: [],
+    lastWrite: null,
+  });
+  const synced = deps({
+    offers: async () => [offer("a", "DISABLED"), offer("b", "DISABLED")],
+    offerSync: async () => ({ at: "2026-10-24T10:00:00Z", managed: true, offers: [entry("a", "DISABLED"), entry("b", "ENABLED")], lastError: null }),
+  });
+  await turnSellingOn(synced.d);
+  assert.equal(await (synced.asked[0].body as ReactElement<{ disabledOffers: Promise<number | null> }>).props.disabledOffers, 1, "never more than the server lists");
+  const noSync = deps({ offers: async () => [offer("a", "DISABLED")], offerSync: async () => Promise.reject(new Error("down")) });
+  await turnSellingOn(noSync.d);
+  assert.equal(await (noSync.asked[0].body as ReactElement<{ disabledOffers: Promise<number | null> }>).props.disabledOffers, null, "the sync unread: no count");
+  // Opens at once: the read may hang.
+  const hanging = deps({ offers: () => new Promise(() => undefined) });
+  const done = await Promise.race([turnSellingOn(hanging.d), new Promise((r) => setTimeout(() => r("blocked"), 500))]);
+  assert.notEqual(done, "blocked");
 });
 
 test("declining the 'turn on' confirmation changes nothing", async () => {

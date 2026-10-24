@@ -9,7 +9,9 @@ import type {
   MagmaOrderLocal,
   MagmaPurchase,
   MagmaV2Report,
+  MyOffer,
   OfferControl,
+  OfferSyncStatus,
   PurchaseState,
 } from "./types";
 
@@ -59,6 +61,44 @@ export function enableSellingMessage(e: Eligibility | null): string {
  *  at once — the check takes as long as Amboss does (up to its deadline). */
 export function enableSellingPendingMessage(): string {
   return `Can this node sell on Magma? Checking Amboss's public offer book… ${ENABLE_SELLING_TERMS}`;
+}
+
+/** What switching Liquidity provision on does with the offers disabled now
+ *  (`disabled`: how many the server will list — those its last offer sync
+ *  showed disabled and Amboss still does; null when that couldn't be told):
+ *  the autopilot lists them again — the switch-off disabled them — each once
+ *  its smallest channel can be funded and it has its price, written first:
+ *  the autopilot's current one where it prices the offer (it waits for one),
+ *  the offer's own where its terms are yours or auto-pricing is off. Empty
+ *  when none is to be listed. */
+export function enableSellingOffersMessage(disabled: number | null): string {
+  const how =
+    "once its smallest channel can be funded and it has its price — the autopilot's current price where it prices the offer " +
+    "(until it has one, the offer waits), the offer's own price where you set its terms or auto-pricing is off.";
+  const after = '"Keep disabled" on Market → Sell keeps one off.';
+  if (disabled === 0) return "";
+  if (disabled === null) return `Your offers that are disabled now are listed again, each ${how} ${after}`;
+  return disabled === 1 ? `Your disabled offer is listed again ${how} ${after}` : `Your ${disabled} disabled offers are listed again, each ${how} ${after}`;
+}
+
+/** How many offers switching selling on will list again, decided as the
+ *  server does (autopilot.ts applySwitchOn): those its last offer sync showed
+ *  disabled and Amboss still does — with no sync kept yet, every one disabled
+ *  now. Null: the sync couldn't be read (the count would be a guess). */
+export function offersSwitchOnLists(
+  live: Pick<MyOffer, "id" | "status">[],
+  sync: Pick<OfferSyncStatus, "at" | "offers"> | null,
+): number | null {
+  if (!sync) return null;
+  const disabledNow = live.filter((o) => o.status === "DISABLED");
+  if (!sync.at) return disabledNow.length;
+  const wasDisabled = new Set(sync.offers.filter((e) => e.amboss.status === "DISABLED").map((e) => e.offerId));
+  return disabledNow.filter((o) => wasDisabled.has(o.id)).length;
+}
+
+/** The same line while the offers are still being read from Amboss. */
+export function enableSellingOffersPendingMessage(): string {
+  return "Checking your offers on Amboss…";
 }
 
 /** The confirmation before Liquidity provision is switched OFF while offers
@@ -154,10 +194,12 @@ export function localLabel(local: Pick<MagmaOrderLocal, "phase" | "booked" | "ex
  *  whether it is listed (your last click; capital safety aside). */
 export function offerOwner(control: OfferControl | undefined, sellEnabled: boolean): { label: string; yours: boolean; title: string } {
   const listing = control?.disabledByHandAt
-    ? " You disabled it: it stays disabled until you enable it."
-    : control?.autoDisabledAt
-      ? " The autopilot disabled it for lack of capital and lists it again once it can be funded."
-      : "";
+    ? " You disabled it: it stays disabled until you enable it (or switch Liquidity provision off and on again)."
+    : control?.listOnAt
+      ? ' Liquidity provision was switched on with it disabled: the autopilot lists it once it has a price and its smallest channel can be funded ("keep disabled" keeps it off).'
+      : control?.autoDisabledAt
+        ? " The autopilot disabled it for lack of capital and lists it again once it can be funded."
+        : "";
   if (control?.manual) {
     return {
       label: "yours",
@@ -169,6 +211,20 @@ export function offerOwner(control: OfferControl | undefined, sellEnabled: boole
   }
   if (!sellEnabled) return { label: "not managed", yours: false, title: `Liquidity provision is off: nothing manages this offer.${listing}` };
   return { label: "autopilot", yours: false, title: `Managed by the autopilot (as your Automation settings say).${listing}` };
+}
+
+/** The Sell tab's "keep disabled" for an offer a switch-on is to list
+ *  (OfferControl.listOnAt): the click records a disable by hand, so the
+ *  autopilot leaves it off. Null for any other offer — one that is listed is
+ *  disabled with "disable". */
+export function keepDisabledAction(o: Pick<MyOffer, "status">, control: OfferControl | undefined): { label: string; title: string } | null {
+  if (o.status !== "DISABLED" || !control?.listOnAt) return null;
+  return {
+    label: "keep disabled",
+    title:
+      "Liquidity provision was switched on with this offer disabled: the autopilot lists it once it has a price and its smallest channel " +
+      "can be funded. Keep it off instead — it stays disabled until you enable it, or switch selling off and on again.",
+  };
 }
 
 export interface OfferDraft {
@@ -204,7 +260,8 @@ export function offerDraftDefaults(
     minSizeSats: Math.min(minSize, maxSize),
     maxSizeSats: maxSize,
     feeRatePpm: create?.recommended.feeRatePpm ?? 3000,
-    baseFeeSats: create?.recommended.baseFeeSat || 1000,
+    // (A base of 0 is a price — the market's, where comparable offers charge none.)
+    baseFeeSats: create?.recommended.baseFeeSat ?? 1000,
     // The lease its price is for: a price and a lease belong together.
     minBlockLength: create?.recommended.minBlockLength ?? rec?.sell.standardLeaseBlocks ?? STANDARD_LEASE_BLOCKS,
   };
@@ -388,7 +445,8 @@ export const PRICING_MODES: { id: AutopilotConfig["sellPricingMode"]; label: str
  */
 export const OFFER_AUTOMATION_HINT =
   "An offer you edit or create by hand on Market → Sell is yours: the autopilot leaves its terms alone (it only keeps it fundable) " +
-  "until you hand it back. Enabling or disabling an offer by hand decides only whether it is listed — a disable sticks. " +
+  "until you hand it back. Enabling or disabling an offer by hand decides only whether it is listed — a disable sticks while " +
+  "Liquidity provision stays on (switching it on lists your disabled offers again; \"keep disabled\" on Market → Sell keeps one off). " +
   "With auto-size on, every offer the autopilot manages promises buyers a routing-fee cap for the lease (offers you create or edit " +
   "on Market → Sell always do); with every switch above off, the autopilot only keeps your offers fundable. The fee autopilot keeps " +
   "each sold channel within the cap its order locked.";

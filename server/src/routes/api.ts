@@ -2449,10 +2449,14 @@ export function createApiRouter(
       res.status(400).json({ error: "bad_sizes", message: "Sizes must satisfy 0 < min ≤ max ≤ total." });
       return null;
     }
-    if (terms.baseFeeSats <= 0) {
+    // A base fee of 0 is a price (the fee rate carries it; comparable offers
+    // may charge none) — 0 ppm + 0 sat is not: buyers would get a channel for
+    // free. (A base above 0 used to be required: the engine's price buttons
+    // carry the market's base, and where that is 0 the form refused them.)
+    if (terms.feeRatePpm <= 0 && terms.baseFeeSats <= 0) {
       res.status(400).json({
         error: "bad_fee",
-        message: "Set a base fee above 0 — offers are priced with a base fee + fee rate.",
+        message: "Set a price: a fee rate, a base fee or both — at 0 ppm + 0 sat buyers would get a channel for free.",
       });
       return null;
     }
@@ -2605,7 +2609,9 @@ export function createApiRouter(
           return;
         }
         if (want && offer.status !== (want === "ENABLED" ? "DISABLED" : "ENABLED")) {
-          if (offer.status === want) autopilot.offerStatusSetByHand(id, want);
+          // ("keep disabled" on Market → Sell: an offer a switch-on would list
+          // stays off — offerStatusSetByHand ends what it had still to list.)
+          if (offer.status === want) autopilot.offerStatusSetByHand(id, want, offer);
           res.json({ status: offer.status, changed: false } satisfies OfferToggleResult);
           return;
         }

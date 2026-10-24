@@ -528,20 +528,50 @@ operator's decision (their reject sent again, their accept completed) is recorde
 run history's `via: "manual"`): the Overview's "Last change by the autopilot" leaves it out. The
 **offer upkeep** (`runSell`, in the main run, only with Liquidity provision on) keeps each offer
 fundable (cut,
-disabled while its smallest channel can't be funded, listed again once it can), gives it the
+disabled while its smallest channel can't be funded, listed again once it can — its terms,
+price and the size that can be funded, written and read back before the listing), gives it the
 standard 4,320-block lease and the
 routing-fee promise (with auto-size), and prices it per `sellPricingMode` (with
 auto-price): `fast` = the 25th percentile of what buyers actually paid, `balanced` = their
 median, `premium` = their 75th percentile, `auto` = between the 25th and 75th percentile,
 starting in the middle and stepping up after each sale (it never steps down on its own, but
-follows the market when what buyers pay moves) — never below the profit floor. Each offer
+follows the market when what buyers pay moves) — never below the profit floor. The base
+fee is the one comparable offers charge (their median; 0 sat is a base too), the offer's own
+while it is within max(50 sat, 20 %) of it — and until the market's has differed beyond that
+for a day from the same base of the offer's, so a median one listing moves back and forth is
+never followed: the clock starts afresh when the offer's base moves (by the autopilot's write
+or by hand), so a move right after a base move isn't followed at once either. A base that
+moves keeps the offer's price at the representative size √(min·max) — the rate makes up
+the rest, so smaller orders pay more or less with it — and a lower base never goes on where
+the offer's smallest order would then pay less than opening and closing its channel costs at
+today's fee rate (the order lane's accept floor). (0.8.0's writes had left the live offer at
+0 sat while nearly every offer charged one.) Each offer
 is priced for the lease it carries after the write: the standard one with auto-size, else
 the one it keeps — a longer lease buyers use (60, 90, 180 days) is priced as such, and a
 price for a shorter lease than the offer promises is never applied to it. With every
 offer-automation switch off, capital safety is all the autopilot does to an offer (its
 lease and routing-fee promise stay as they are). An offer the operator created or edited
 by hand is theirs: the autopilot changes none of its terms; enabling or disabling it by
-hand decides only whether it is listed. A new offer is listed automatically only where the
+hand decides only whether it is listed. Switching Liquidity provision on lists the offers
+that were disabled at that moment — its switch-off disables them — as LightningMate's last
+offer sync showed them, those still disabled at the first offer read after the switch (with
+no sync kept yet, every offer disabled at that read), each once it has a price and its
+smallest channel can be funded, whoever owns its terms. Its terms go on first, read back:
+the size that can be funded, and — where the autopilot sets its terms, with auto-pricing on —
+the engine's current price for it, never an older one: without one that run (no market
+report) it waits and is listed by a later run; with a lease the engine's price doesn't fit
+(auto-size off, a lease buyers don't use) it waits for the operator, and an alert says to
+set its price or lease, or turn on auto-size. An offer whose terms are the operator's, or
+any with auto-pricing off, is listed at its own price, and the record says so. A write
+Amboss doesn't keep leaves it off. Capital safety's relist, and the relist of an offer taken
+off the market for being free, go by the same rule. Not listed: an offer
+that was listed at the switch, or unknown to that sync, and is disabled at the read
+(disabled after the switch); one disabled by hand after the switch; one kept off with "keep
+disabled" on Market → Sell. The listing done — by the switch-on, or seen listed by a run —
+nothing is left to relist: a later disable on amboss.tech sticks (one listed and disabled
+again there between two runs, never seen listed, can't be told apart and is listed). If
+selling goes off, or all automation is paused, while such a listing is on its way, the
+offer is taken off the market again. A new offer is listed automatically only where the
 selling check is better than "not realistic". Optional auto-close/auto-relist. A 1%
 service fee applies to completed sales.
 

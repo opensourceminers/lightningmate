@@ -1,7 +1,14 @@
 import { useEffect, useState } from "react";
 import type { ConfirmOpts } from "./Overlay";
-import type { AutomationSwitch, AutopilotConfig, AutopilotConfigPatch, Eligibility, MyOffer } from "../types";
-import { disableSellingMessage, enableSellingMessage, enableSellingPendingMessage } from "../magmaView";
+import type { AutomationSwitch, AutopilotConfig, AutopilotConfigPatch, Eligibility, MyOffer, OfferSyncStatus } from "../types";
+import {
+  disableSellingMessage,
+  enableSellingMessage,
+  enableSellingOffersMessage,
+  enableSellingOffersPendingMessage,
+  enableSellingPendingMessage,
+  offersSwitchOnLists,
+} from "../magmaView";
 import { LSP_NOT_PAUSED, pauseLines } from "../autopilotView";
 
 /**
@@ -11,7 +18,10 @@ import { LSP_NOT_PAUSED, pauseLines } from "../autopilotView";
  *
  * On: the confirmation opens at once and shows the live selling check when it
  * arrives. Before, the switch waited for the check (Amboss's public book, up to
- * its 15 s deadline — or longer when it hung) before any dialog appeared.
+ * its 15 s deadline — or longer when it hung) before any dialog appeared. It
+ * also says what happens to the offers disabled now: the autopilot lists them
+ * again, each once it has a price and can be funded (the switch-off below
+ * disabled them; before, each had to be enabled again by hand).
  *
  * Off with offers listed: each is disabled by STATE (the server reads it and
  * flips only an enabled one), and selling is switched off only once none is
@@ -27,6 +37,9 @@ export interface SellingSwitchDeps {
   eligibility: () => Promise<Eligibility>;
   /** This node's offers on Amboss. */
   offers: () => Promise<MyOffer[]>;
+  /** The autopilot's last offer sync (GET /amboss/offer-sync): which offers
+   *  a switch-on lists again (offersSwitchOnLists). */
+  offerSync: () => Promise<OfferSyncStatus>;
   /** Disable one offer by state (POST /amboss/offer/toggle, want DISABLED):
    *  resolves with its status, throws when Amboss didn't disable it. */
   disableOffer: (id: string) => Promise<{ status: string }>;
@@ -35,26 +48,45 @@ export interface SellingSwitchDeps {
 }
 
 /** The body of the "turn on" confirmation: the check's verdict once it is
- *  in, "checking…" until then. */
-export function EnableSellingBody({ check }: { check: Promise<Eligibility | null> }) {
+ *  in, "checking…" until then — and, once the offers are read, what the
+ *  switch does with the disabled ones (they are listed again). */
+export function EnableSellingBody({ check, disabledOffers }: { check: Promise<Eligibility | null>; disabledOffers: Promise<number | null> }) {
   const [result, setResult] = useState<{ done: boolean; e: Eligibility | null }>({ done: false, e: null });
+  const [offers, setOffers] = useState<{ done: boolean; n: number | null }>({ done: false, n: null });
   useEffect(() => {
     let alive = true;
     void check.then((e) => {
       if (alive) setResult({ done: true, e });
     });
+    void disabledOffers.then((n) => {
+      if (alive) setOffers({ done: true, n });
+    });
     return () => {
       alive = false;
     };
-  }, [check]);
-  return <p className="modal-msg">{result.done ? enableSellingMessage(result.e) : enableSellingPendingMessage()}</p>;
+  }, [check, disabledOffers]);
+  const listing = offers.done ? enableSellingOffersMessage(offers.n) : enableSellingOffersPendingMessage();
+  return (
+    <>
+      <p className="modal-msg">{result.done ? enableSellingMessage(result.e) : enableSellingPendingMessage()}</p>
+      {listing && <p className="modal-msg">{listing}</p>}
+    </>
+  );
 }
 
 /** Switch selling on — after a confirmation that opens at once. */
 export async function turnSellingOn(d: SellingSwitchDeps): Promise<boolean> {
-  // Started now, never awaited before the dialog: it answers when Amboss does.
+  // Both started now, never awaited before the dialog: they answer when Amboss does.
   const check = d.eligibility().catch(() => null);
-  const ok = await d.confirm({ title: "Turn on Liquidity provision?", body: <EnableSellingBody check={check} />, confirmLabel: "Turn on" });
+  // Counted as the server decides it: never more than it will list.
+  const disabledOffers = Promise.all([d.offers(), d.offerSync().catch(() => null)])
+    .then(([os, sync]) => offersSwitchOnLists(os, sync))
+    .catch(() => null);
+  const ok = await d.confirm({
+    title: "Turn on Liquidity provision?",
+    body: <EnableSellingBody check={check} disabledOffers={disabledOffers} />,
+    confirmLabel: "Turn on",
+  });
   if (!ok) return false;
   return d.save({ sellEnabled: true }, "Liquidity provision is on");
 }

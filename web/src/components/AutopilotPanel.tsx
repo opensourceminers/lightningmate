@@ -352,6 +352,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       confirm: ui.confirm,
       eligibility: () => api.magmaEligibility(),
       offers: () => api.ambossMyOffers().then((r) => r.offers),
+      offerSync: () => api.ambossOfferSync(),
       disableOffer: (id: string) => api.ambossToggleOffer(id, "DISABLED"),
       save,
       toast,

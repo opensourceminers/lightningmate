@@ -1,6 +1,6 @@
 import { getChainBalance, type AuthenticatedLnd } from "lightning";
 import { getChannelsView } from "./channels.js";
-import { nodeCapitalYield, onchainCosts } from "./nodeEconomics.js";
+import { CLOSE_TX_VBYTES, OPEN_TX_VBYTES, nodeCapitalYield, onchainCosts } from "./nodeEconomics.js";
 import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
 import { computeNodeNeed, type NodeNeed } from "./suggestRecommend.js";
@@ -81,6 +81,12 @@ export interface MagmaV2Config {
   /** Offers whose terms the operator took over (OfferControl.manual): the
    *  autopilot leaves their lease alone, whatever auto-size says. */
   operatorOfferIds: string[];
+  /** Per offer: since when the market's base fee has differed from the
+   *  offer's beyond BASE_FEE_TOLERANCE (the autopilot keeps the clock,
+   *  baseFeeDiffers), and the offer's base it was started against — a clock
+   *  of another base of the offer's (one moved since) doesn't count. The base
+   *  follows only after BASE_FEE_HOLD_MS. */
+  baseMoves: Record<string, { since: string; offerBase: number }>;
 }
 
 export const MAGMA_V2_DEFAULTS: MagmaV2Config = {
@@ -112,6 +118,7 @@ export const MAGMA_V2_DEFAULTS: MagmaV2Config = {
   offerFeeCaps: null,
   autoSizeLease: false,
   operatorOfferIds: [],
+  baseMoves: {},
 };
 
 export type MagmaSellOfferState =
@@ -144,6 +151,16 @@ export interface MagmaSellRecommendation {
   state: MagmaSellOfferState;
   shouldReprice: boolean;
   repriceDirection: "up" | "down" | "none";
+  /** The reprice is for the base fee alone: the offer's price at the
+   *  representative size √(min·max) stays (a price the reprice threshold
+   *  leaves alone), split anew with the market's base — `recommended` is that
+   *  split. */
+  baseOnly?: boolean;
+  /** The base the comparable offers charge (their median; null: no pool). */
+  baseFeeMarketSat?: number | null;
+  /** That base differs from the offer's beyond BASE_FEE_TOLERANCE — the clock
+   *  of BASE_FEE_HOLD_MS runs (MagmaV2Config.baseMoveSince). */
+  baseFeeDiffers?: boolean;
   current: { feeRatePpm: number; baseFeeSat: number; effectiveFeePpm: number } | null;
   /** The terms the offer should carry: the price, the lease that price is for
    *  (the one the offer carries after the next write: the standard 4320 —
@@ -308,6 +325,34 @@ function pct(sorted: number[], q: number): number {
   return sorted[Math.min(sorted.length - 1, Math.max(0, Math.round(q * (sorted.length - 1))))];
 }
 const median = (arr: number[]) => pct([...arr].sort((a, b) => a - b), 0.5);
+
+/** How far an offer's own base fee may sit from the market's before the
+ *  engine prices it with the market's: more than 50 sat AND more than 20 % of
+ *  the market's base. Inside that band the offer keeps its base, so a median
+ *  that moves a little (one offer listed or gone) never rewrites it. */
+export const BASE_FEE_TOLERANCE = { minSats: 50, share: 0.2 } as const;
+
+/** How long the market's base must have differed from an offer's (beyond
+ *  BASE_FEE_TOLERANCE) before the offer's base follows it: a small segment's
+ *  median, moved back and forth by one listing, is never followed. */
+export const BASE_FEE_HOLD_MS = 24 * 3_600_000;
+
+/**
+ * The base fee an offer is priced with: the market's — the median base of the
+ * comparable offers (the segment) — not whatever the offer happens to hold.
+ * 0.8.0's size-only writes reset offers' bases to 0 (Amboss resets what an
+ * update leaves out), and the engine kept the base an offer had: the live
+ * offer stayed at 4,445 ppm + 0 sat while 95 of 97 listed offers charged a
+ * base (median 568 sat). An offer's own base stands while it is within
+ * BASE_FEE_TOLERANCE of the market's. With no comparable offer: the offer's
+ * own base, or 1,000 sat for a new one.
+ */
+export function preferredBaseFeeSats(current: number | null, market: number | null): number {
+  if (market === null) return current ?? 1000;
+  if (current === null) return market;
+  const tolerance = Math.max(BASE_FEE_TOLERANCE.minSats, market * BASE_FEE_TOLERANCE.share);
+  return Math.abs(current - market) <= tolerance ? current : market;
+}
 // One decimal unless the number is genuinely round, so a 1,0M–1,25M window can
 // never print as the meaningless "1M–1M".
 const sizeLabel = (n: number): string => {
@@ -346,6 +391,20 @@ export function saleCostFloorSats(c: {
   serviceFeeRate: number;
 }): number {
   return Math.ceil((c.onchainOpenCostSat + c.onchainCloseCostSat + c.minNetLeaseProfitSat) / Math.max(0.01, 1 - c.serviceFeeRate));
+}
+
+/** The order lane's accept floor at an on-chain fee rate: opening and closing
+ *  the channel (OPEN_TX_VBYTES + CLOSE_TX_VBYTES) after the service fee, no
+ *  profit minimum. A rate that isn't known counts as 1 sat/vB. The lane
+ *  (autopilot.ts saleFeeFloorSats) and the base-fee check below use this one. */
+export function saleAcceptFloorSats(feePerVbyte: number | null, serviceFeeRate: number): number {
+  const perVbyte = feePerVbyte !== null && Number.isFinite(feePerVbyte) && feePerVbyte > 0 ? feePerVbyte : 1;
+  return saleCostFloorSats({
+    onchainOpenCostSat: Math.ceil(perVbyte * OPEN_TX_VBYTES),
+    onchainCloseCostSat: Math.ceil(perVbyte * CLOSE_TX_VBYTES),
+    minNetLeaseProfitSat: 0,
+    serviceFeeRate,
+  });
 }
 
 export async function getMagmaRecommendations(
@@ -403,6 +462,10 @@ export async function getMagmaRecommendations(
   const onchainFeePerVbyte = oc.feePerVbyte;
   cfg.defaultOpenCostSat = oc.openCostSat;
   cfg.defaultCloseCostSat = oc.closeCostSat;
+  // The order lane's accept floor at today's fee rate: a base change never lets
+  // an offer's smallest order pay less than that (buildSell).
+  const acceptFloorSat = saleAcceptFloorSats(onchainFeePerVbyte, cfg.serviceFeeRate);
+  const nowMs = Date.now();
 
   // ── Routing opportunity cost — yield ON CAPITAL (shared node-economics model).
   const fees30 = flow?.totalFeesEarnedSats ?? 0;
@@ -578,7 +641,6 @@ export async function getMagmaRecommendations(
     const minBlock = pricingLease(offer);
     const repSize = Math.round(Math.sqrt(Math.max(minSize, 1) * Math.max(maxSize, minSize)));
     const seg = segmentFor(repSize, minSize, maxSize, minBlock);
-    const baseFee = offer?.baseFeeSats ?? seg.baseMed ?? 1000;
     const floorEff = Math.round(profitFloorEffectivePpm(repSize, minBlock));
 
     // ── Target price ──────────────────────────────────────────────────────────
@@ -615,9 +677,47 @@ export async function getMagmaRecommendations(
 
     const targetEff = Math.max(floorEff, clearingFloor, modeTarget);
 
-    const recommended = pricePointFrom(targetEff, repSize, baseFee, minBlock);
-    const recEcon = economics(repSize, minBlock, recommended.effectiveFeePpm);
-    const beatsRouting = recEcon.leasePpmPerYear >= recommendedMinLeasePpmPerYear;
+    const current = offer
+      ? {
+          feeRatePpm: offer.feeRatePpm,
+          baseFeeSat: offer.baseFeeSats,
+          effectiveFeePpm: Math.round(effectiveAt(offer.feeRatePpm, offer.baseFeeSats, repSize)),
+        }
+      : null;
+
+    // ── Base fee ──────────────────────────────────────────────────────────────
+    // The market's: the median base of the comparable offers (none without
+    // any). An offer keeps its own while that is within BASE_FEE_TOLERANCE of
+    // it — and until the market's has differed for a day (BASE_FEE_HOLD_MS):
+    // a median one listing moves back and forth is never followed. Nor where
+    // the market's base would let the offer's smallest order pay less than
+    // opening and closing its channel costs at today's fee rate (the order
+    // lane's accept floor, which would turn such orders down) while its own
+    // base doesn't: the base is spread over the whole size range — the price
+    // stays put only at the representative size √(min·max), and a lower base
+    // charges small orders less.
+    const marketBase = seg.count > 0 ? seg.baseMed : null;
+    const baseDiffers = !!offer && marketBase !== null && preferredBaseFeeSats(offer.baseFeeSats, marketBase) !== offer.baseFeeSats;
+    // The clock of this difference only: one started against another base of
+    // the offer's — before a base move, or an edit — is not.
+    const clock = offer ? cfg.baseMoves[offer.id] : undefined;
+    const baseSince = clock && clock.offerBase === offer?.baseFeeSats ? clock.since : undefined;
+    const baseHeld = baseDiffers && (!baseSince || nowMs - Date.parse(baseSince) < BASE_FEE_HOLD_MS);
+    let baseFee = !offer ? preferredBaseFeeSats(null, marketBase) : baseDiffers && !baseHeld && marketBase !== null ? marketBase : offer.baseFeeSats;
+    const feeAtMinSat = (p: PricePoint) => (p.feeRatePpm * minSize) / 1_000_000 + p.baseFeeSat;
+    let baseRefusedSat: number | null = null;
+    if (offer && baseFee !== offer.baseFeeSats) {
+      for (const eff of current ? [targetEff, current.effectiveFeePpm] : [targetEff]) {
+        const moved = feeAtMinSat(pricePointFrom(eff, repSize, baseFee, minBlock));
+        const kept = feeAtMinSat(pricePointFrom(eff, repSize, offer.baseFeeSats, minBlock));
+        if (moved < acceptFloorSat && moved < kept) baseRefusedSat = Math.floor(moved);
+      }
+      if (baseRefusedSat !== null) baseFee = offer.baseFeeSats;
+    }
+
+    let recommended = pricePointFrom(targetEff, repSize, baseFee, minBlock);
+    let recEcon = economics(repSize, minBlock, recommended.effectiveFeePpm);
+    let beatsRouting = recEcon.leasePpmPerYear >= recommendedMinLeasePpmPerYear;
 
     const atLeastFloor = (n: number) => Math.max(floorEff, clearingFloor, n);
     const pricing = {
@@ -626,14 +726,6 @@ export async function getMagmaRecommendations(
       premium: pricePointFrom(atLeastFloor(ladder.high), repSize, baseFee, minBlock),
       profitFloor: pricePointFrom(Math.max(floorEff, clearingFloor), repSize, baseFee, minBlock),
     };
-
-    const current = offer
-      ? {
-          feeRatePpm: offer.feeRatePpm,
-          baseFeeSat: offer.baseFeeSats,
-          effectiveFeePpm: Math.round(effectiveAt(offer.feeRatePpm, offer.baseFeeSats, repSize)),
-        }
-      : null;
 
     // Where would my current price rank among comparable offers?
     const myRank = current ? seg.effs.filter((e) => e < current.effectiveFeePpm).length + 1 : null;
@@ -682,12 +774,21 @@ export async function getMagmaRecommendations(
     if (mySellerScore == null) warnings.push("your seller score isn't visible yet (it appears once this node lists an offer)");
     // Per sale: what one lease at this price nets a year on its capital
     // (after on-chain costs and the service fee) — whether a sale comes at
-    // all is the eligibility check's question, not this one's.
-    reasons.push(
-      beatsRouting
-        ? `per sale, a lease at this price nets ~${recommended.leaseApy}%/yr (after on-chain costs and the service fee) — above your routing benchmark of ${(adjustedRouting / 10000).toFixed(2)}%/yr`
-        : `per sale, a lease at this price nets ~${recommended.leaseApy}%/yr (after on-chain costs and the service fee) — below your routing benchmark: routing this capital may earn more`,
-    );
+    // all is the eligibility check's question, not this one's. Written below,
+    // once the price is final (a base-only split is a price of its own).
+    const perSaleAt = reasons.push("") - 1;
+    if (offer && baseDiffers && baseHeld && marketBase !== null) {
+      reasons.push(
+        `comparable offers charge ${marketBase} sat base (it has ${offer.baseFeeSats}) — its base follows once that has held for a day${
+          baseSince ? ` (differing since ${baseSince.slice(0, 16).replace("T", " ")} UTC)` : ""
+        }`,
+      );
+    }
+    if (offer && baseRefusedSat !== null && marketBase !== null) {
+      reasons.push(
+        `keeps its base of ${offer.baseFeeSats} sat: with the market's ${marketBase} sat its smallest order (${minSize} sat) would pay ${baseRefusedSat} sat — less than opening and closing its channel costs today (${acceptFloorSat} sat)`,
+      );
+    }
     if (!hasRoutingData && flow !== null) warnings.push("no routing history yet — using a default routing benchmark; treat the %/yr comparison loosely");
     warnings.push("on-chain open/close cost is estimated; high mempool fees can erase lease profit");
 
@@ -743,12 +844,42 @@ export async function getMagmaRecommendations(
       state = "well_priced";
     }
 
+    // A base that goes to the market's is a reprice of its own. At a price the
+    // threshold above leaves alone (well priced, or a depleted offer not to be
+    // raised), the base used to stay whatever it was — the 0 that 0.8.0's
+    // writes left. Now that price is kept and split anew: the market's base,
+    // the rate making up the rest — the price doesn't move (never cheapened,
+    // never raised under a base change). An unlistable offer isn't repriced.
+    let baseOnly = false;
+    if (!shouldReprice && offer?.status === "ENABLED" && current && (state === "well_priced" || state === "exhausted")) {
+      const resplit = pricePointFrom(current.effectiveFeePpm, repSize, baseFee, minBlock);
+      // A move within the tolerance isn't one: a market base too big for the
+      // price is cut to fit (pricePointFrom), and the next run's cut differs
+      // from this one's by a rounding remainder — never rewritten for that.
+      if (preferredBaseFeeSats(current.baseFeeSat, resplit.baseFeeSat) !== current.baseFeeSat) {
+        recommended = resplit;
+        recEcon = economics(repSize, minBlock, recommended.effectiveFeePpm);
+        beatsRouting = recEcon.leasePpmPerYear >= recommendedMinLeasePpmPerYear;
+        shouldReprice = true;
+        baseOnly = true;
+        mode = "update";
+        reasons.push(
+          `base fee to ${recommended.baseFeeSat} sat (it has ${current.baseFeeSat}) — what comparable offers charge, as far as it fits the price; the rate makes up the rest, so the price at the representative size (${repSize} sat, √(min·max)) stays`,
+        );
+      }
+    }
+    reasons[perSaleAt] = beatsRouting
+      ? `per sale, a lease at this price nets ~${recommended.leaseApy}%/yr (after on-chain costs and the service fee) — above your routing benchmark of ${(adjustedRouting / 10000).toFixed(2)}%/yr`
+      : `per sale, a lease at this price nets ~${recommended.leaseApy}%/yr (after on-chain costs and the service fee) — below your routing benchmark: routing this capital may earn more`;
+
     return {
       offerId: offer?.id ?? null,
       mode,
       state,
       shouldReprice,
       repriceDirection,
+      ...(baseOnly ? { baseOnly } : {}),
+      ...(offer ? { baseFeeMarketSat: marketBase, baseFeeDiffers: baseDiffers } : {}),
       current,
       recommended: {
         ...recommended,

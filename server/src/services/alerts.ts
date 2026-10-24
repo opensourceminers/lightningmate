@@ -117,7 +117,8 @@ export function magmaRefusalAlerts(desk: { refusals(): Pick<MagmaRefusal, "order
 
 /** A listed offer of this node that is priced wrong: listed for free, or
  *  holding terms other than the ones LightningMate last wrote — and one the
- *  autopilot took off the market for being free. Derived from the offer sync
+ *  autopilot took off the market for being free, or is to list since selling
+ *  was switched on but can't, having no price. Derived from the offer sync
  *  record (the order lane re-reads listed offers every two minutes), so each
  *  goes once the offer is right again. What it says LightningMate does is
  *  only what it will do: with selling on, a free offer's price goes back on
@@ -127,12 +128,16 @@ export function offerPriceAlerts(
   sync: {
     offers: {
       offerId: string;
-      amboss: { status: string; feeRatePpm: number; baseFeeSats: number };
+      amboss: { status: string; feeRatePpm: number; baseFeeSats: number; minBlockLength?: number };
+      /** To be listed again, waiting for the autopilot's price ("lease": one
+       *  it doesn't price — the operator's to change). */
+      listingWaits?: string;
       inSync: boolean;
-      lastWrite: { ok: boolean; verified?: boolean; error?: string } | null;
-      /** Set when the operator owns the offer's terms, or when the autopilot
-       *  took it off the market for being free. */
-      control?: { manual?: unknown; freeDisabledAt?: string };
+      lastWrite: { ok: boolean; verified?: boolean; error?: string; by?: string; action?: string } | null;
+      /** Set when the operator owns the offer's terms, when the autopilot
+       *  took it off the market for being free, or when it is to be listed
+       *  since Liquidity provision was switched on. */
+      control?: { manual?: unknown; freeDisabledAt?: string; listOnAt?: string };
     }[];
   },
   /** Liquidity provision on and not paused: the autopilot acts on offers. */
@@ -158,6 +163,29 @@ export function offerPriceAlerts(
       alerts.push({
         level: "warn",
         message: `Your Magma offer ${id} was taken off the market: Amboss listed it for free (0 ppm + 0 sat). Set its price on Market → Sell and enable it — with auto-pricing on, LightningMate lists it again itself once it has a price.`,
+      });
+    } else if (e.amboss.status !== "ENABLED" && e.control?.listOnAt && free) {
+      alerts.push({
+        level: "warn",
+        message:
+          `Your Magma offer ${id} isn't listed yet: it has no price (0 ppm + 0 sat). Set its price on Market → Sell — ` +
+          `LightningMate lists it once it has one${e.control.manual ? "." : " (with auto-pricing on, it prices it itself once it knows a price)."}`,
+      });
+    } else if (e.amboss.status === "ENABLED" && !selling && e.lastWrite?.by === "autopilot" && e.lastWrite.action === "disable" && !e.lastWrite.ok) {
+      // Listed with Liquidity provision off, LightningMate's disable not taken
+      // (one being listed when selling went off, or a capital disable).
+      alerts.push({
+        level: "warn",
+        message:
+          `Your Magma offer ${id} is listed although Liquidity provision is off — LightningMate tried to take it off the market and couldn't ` +
+          `(${e.lastWrite.error ?? "no answer"}). Disable it on Market → Sell: meanwhile its orders wait for your decision on Market → Orders.`,
+      });
+    } else if (e.amboss.status !== "ENABLED" && e.listingWaits === "lease") {
+      alerts.push({
+        level: "warn",
+        message:
+          `Your Magma offer ${id} isn't listed again: its ${e.amboss.minBlockLength ? `${e.amboss.minBlockLength.toLocaleString("en-US")}-block ` : ""}lease isn't one the autopilot prices ` +
+          "(with auto-size off it keeps its lease). Set its price or its lease on Market → Sell, or turn on auto-size — it gives the offer the standard lease.",
       });
     } else if (e.lastWrite?.ok && e.lastWrite.verified === false && !e.inSync) {
       alerts.push({

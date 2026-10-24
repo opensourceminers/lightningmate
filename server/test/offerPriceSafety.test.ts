@@ -464,7 +464,7 @@ test("with auto-pricing on and a market report, an offer Amboss lists for free g
   neverSentFree(magma);
 });
 
-test("an offer taken off the market for being free, priced by the autopilot, is listed again — written and checked first — once there is a price for it", async (t) => {
+test("an offer taken off the market for being free, priced by the autopilot, is listed again — written and checked first — once the autopilot has its price for it", async (t) => {
   quiet(t);
   const { autopilot, magma, market } = sellerSetup(t, { chainBalance: 8_000_000, config: { sellAutoSize: true, sellAutoReprice: true } });
   market.behaviour = "throw"; // no market report: no price at first
@@ -473,12 +473,19 @@ test("an offer taken off the market for being free, priced by the autopilot, is 
   assert.equal(offer.status, "DISABLED", "no price known: off the market");
   await autopilot.runOnce();
   assert.equal(offer.status, "DISABLED", "still none: stays off");
-  // A price turns up (the engine's, in life; set here as the one it last had).
+  // A price it last had turns up: it goes on while the offer is off — but the
+  // offer is listed again only at the autopilot's current price for it (an
+  // older one may be the one it was disabled at).
   (autopilot as unknown as { state: { offerPrices: Record<string, unknown> } }).state.offerPrices = {
     [offer.id]: { feeRatePpm: 4435, baseFeeSats: 0, at: new Date().toISOString() },
   };
   await autopilot.runOnce();
-  assert.deepEqual([offer.status, offer.feeRatePpm], ["ENABLED", 4435], "priced, then listed");
+  assert.deepEqual([offer.status, offer.feeRatePpm], ["DISABLED", 4435], "priced while off, not listed at that price");
+  // The market report is back: the engine's price goes on, then it is listed.
+  market.behaviour = "ok";
+  const engine = (await autopilot.magmaReport()).sell.recommendations.find((r) => r.offerId === offer.id)!.recommended;
+  await autopilot.runOnce();
+  assert.deepEqual([offer.status, offer.feeRatePpm, offer.baseFeeSats], ["ENABLED", engine.feeRatePpm, engine.baseFeeSat], "at the autopilot's price, then listed");
   assert.equal(entryOf(autopilot, offer.id)?.control?.freeDisabledAt, undefined);
   neverSentFree(magma);
   // The operator's own offer is never listed again by the autopilot.
@@ -559,7 +566,7 @@ test("an offer disabled by hand at 0 ppm + 0 sat gets its price while it stays d
   }
 });
 
-test("an offer the autopilot disabled for lack of capital, at 0 ppm + 0 sat, is priced and listed again in the same run once capital is back — and says what holds while no price is known", async (t) => {
+test("an offer the autopilot disabled for lack of capital, at 0 ppm + 0 sat, is listed again once capital is back and the autopilot has its price — priced and listed in the same run; it says what holds meanwhile", async (t) => {
   quiet(t);
   const { autopilot, magma, node, market } = sellerSetup(t, { chainBalance: 500_000, config: { sellAutoSize: true, sellAutoReprice: true } });
   market.behaviour = "throw"; // no engine price
@@ -569,13 +576,18 @@ test("an offer the autopilot disabled for lack of capital, at 0 ppm + 0 sat, is 
   node.chainBalance = 8_000_000;
   await autopilot.runOnce();
   assert.equal(offer.status, "DISABLED", "capital is back, no price known: not listed");
-  assert.match(entryOf(autopilot, offer.id)?.differences.join("; ") ?? "", /left as it is: it has no price on Amboss/);
-  // A price becomes known (the engine's, in life; the one it last had here).
+  assert.match(entryOf(autopilot, offer.id)?.differences.join("; ") ?? "", /waits for the autopilot's price before it is listed again: there is no market report for it this run/);
+  // The price it last had: on while it is off — not the one it is listed at.
   (autopilot as unknown as { state: { offerPrices: Record<string, unknown> } }).state.offerPrices = {
     [offer.id]: { feeRatePpm: 3000, baseFeeSats: 852, at: new Date().toISOString() },
   };
   await autopilot.runOnce();
-  assert.deepEqual([offer.status, offer.feeRatePpm, offer.baseFeeSats], ["ENABLED", 3000, 852], "priced, then listed by capital safety in the same run");
+  assert.deepEqual([offer.status, offer.feeRatePpm, offer.baseFeeSats], ["DISABLED", 3000, 852]);
+  // The report is back: the engine's price, then capital safety lists it — in the same run.
+  market.behaviour = "ok";
+  const engine = (await autopilot.magmaReport()).sell.recommendations.find((r) => r.offerId === offer.id)!.recommended;
+  await autopilot.runOnce();
+  assert.deepEqual([offer.status, offer.feeRatePpm, offer.baseFeeSats], ["ENABLED", engine.feeRatePpm, engine.baseFeeSat]);
   neverSentFree(magma);
 });
 

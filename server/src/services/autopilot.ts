@@ -56,8 +56,8 @@ import {
   type YieldEvidence,
 } from "./openPlan.js";
 import type { LnPlusStore } from "./lnplusStore.js";
-import { getMagmaRecommendations, saleCostFloorSats, type MagmaV2Report } from "./magmaRecommend.js";
-import { CLOSE_TX_VBYTES, OPEN_TX_VBYTES, onchainCosts } from "./nodeEconomics.js";
+import { getMagmaRecommendations, saleAcceptFloorSats, saleCostFloorSats, type MagmaV2Report, type MagmaSellRecommendation } from "./magmaRecommend.js";
+import { onchainCosts } from "./nodeEconomics.js";
 import { getFeeElasticity } from "./outcomes.js";
 import { DEFAULT_POLICY, applyFees, type FeeApplyItem, type FeeApplyResult } from "./fees.js";
 import {
@@ -318,9 +318,13 @@ export interface OfferFields {
  *    the autopilot changes is capital safety's: an offer whose smallest
  *    channel can't be funded is disabled — whoever owns its terms — and
  *    listed again once it can be, since listing it was the last thing the
- *    operator chose. A status click never takes the terms over: before, a
- *    manual ENABLE made the offer "yours", so the autopilot stopped fixing its
- *    lease and promise — and never listed it again after a capital dip.
+ *    operator chose. Switching Liquidity provision on is such a choice too:
+ *    every offer disabled then is listed again once it has a price and can be
+ *    funded (listOnAt) — the switch-off disables them, so before, switching
+ *    back on left each to be enabled by hand. A status click never takes
+ *    the terms over: before, a manual ENABLE made the offer "yours", so the
+ *    autopilot stopped fixing its lease and promise — and never listed it
+ *    again after a capital dip.
  * The cut capital safety makes is given back up to the owner's own terms.
  */
 export interface OfferControl {
@@ -339,6 +343,20 @@ export interface OfferControl {
    *  (0 ppm + 0 sat) with no price of its own to put back: it stays disabled
    *  until the operator gives it a price and lists it again. */
   freeDisabledAt?: string;
+  /** Liquidity provision was switched on (when) while the offer was disabled:
+   *  the autopilot lists it once it has a price and its smallest channel can
+   *  be funded — its terms stay with whoever has them. A click on it ends
+   *  this (a disable sticks again), and so does switching selling off. */
+  listOnAt?: string;
+}
+
+/** A base-fee clock (PersistedState.offerBaseMoves). */
+interface BaseMove {
+  /** The base the market charges (the comparable offers' median). */
+  base: number;
+  /** The offer's base when the clock started: one moved since is another difference. */
+  offerBase: number;
+  since: string;
 }
 
 /** The last write to an offer (autopilot or manual) and what came of it. */
@@ -372,6 +390,10 @@ export interface OfferSyncEntry {
   /** Who owns the offer's terms (OfferControl): the operator took it over
    *  (manual), and/or the autopilot disabled it for lack of capital. */
   control?: OfferControl;
+  /** It is to be listed again but waits for the autopilot's price: none this
+   *  run ("report"), or its lease is one the autopilot doesn't price — which
+   *  only the operator can change ("lease", an alert). */
+  listingWaits?: "report" | "lease";
 }
 
 export interface OfferSyncStatus {
@@ -485,6 +507,16 @@ interface PersistedState {
   offerCuts?: Record<string, OfferCut>;
   /** Per offer: who owns its terms (see OfferControl). */
   offerControl?: Record<string, OfferControl>;
+  /** Liquidity provision was switched on, and the offer upkeep hasn't read
+   *  the offers since: when, and which offers LightningMate's last offer sync
+   *  showed disabled at that moment (null: there was no sync to go by) — the
+   *  ones to be listed again (OfferControl.listOnAt, applySwitchOn). */
+  sellSwitchOn?: { at: string; disabled: string[] | null } | null;
+  /** Per offer: the base the market charges while it differs from the
+   *  offer's beyond the tolerance, since when, and the offer's base it was
+   *  started against — the offer's base follows only after a day of the same
+   *  difference (magmaRecommend BASE_FEE_HOLD_MS, trackBaseMoves). */
+  offerBaseMoves?: Record<string, BaseMove>;
   /** Per area: its latest decision and why (decisionNote) — what it did, or
    *  why it did nothing (D16). */
   decisions?: Partial<Record<DecisionArea, AreaDecision>>;
@@ -532,6 +564,36 @@ export function sanitizePaused(raw: unknown): { at: string; was: AutomationSwitc
   const listed = Array.isArray(r.was) ? r.was : [];
   const was = AUTOMATION_SWITCHES.filter((k) => listed.includes(k));
   return { at: r.at, was };
+}
+
+const validTime = (v: unknown): v is string => typeof v === "string" && Number.isFinite(Date.parse(v));
+const validSats = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v >= 0;
+
+/**
+ * A switch-on not yet applied, as it was saved, made safe: a time that
+ * parses and a list of offer ids — or no list (null: no offer sync to go by,
+ * so every offer disabled at the first read is listed). A list that isn't
+ * one counts as none; without a time there is no switch-on to apply.
+ */
+export function sanitizeSellSwitchOn(raw: unknown): { at: string; disabled: string[] | null } | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as { at?: unknown; disabled?: unknown };
+  if (!validTime(r.at)) return null;
+  const disabled = Array.isArray(r.disabled) ? r.disabled.filter((id): id is string => typeof id === "string") : null;
+  return { at: r.at, disabled };
+}
+
+/** The base-fee clocks as they were saved, made safe: only entries with a
+ *  base, an offer base and a time that parses (the engine reads them). */
+export function sanitizeBaseMoves(raw: unknown): Record<string, BaseMove> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, BaseMove> = {};
+  for (const [id, m] of Object.entries(raw as Record<string, unknown>)) {
+    if (!m || typeof m !== "object") continue;
+    const e = m as { base?: unknown; offerBase?: unknown; since?: unknown };
+    if (validSats(e.base) && validSats(e.offerBase) && validTime(e.since)) out[id] = { base: e.base, offerBase: e.offerBase, since: e.since };
+  }
+  return out;
 }
 
 /** The areas of the autopilot that keep a "last decision" (D16). */
@@ -817,8 +879,9 @@ interface OfferCtx {
   listable: (minSizeSats: number) => number;
   /** The engine's price for the offer, and the lease that price is for
    *  (magmaRecommend.ts prices each offer for the lease it carries after the
-   *  autopilot's next write). */
-  target: (off: MyOffer) => { fee: number; base: number; moved: boolean; lease: number } | null;
+   *  autopilot's next write). `why`: what the move is, when it isn't the
+   *  market price moving (a base fee going to the market's). */
+  target: (off: MyOffer) => { fee: number; base: number; moved: boolean; lease: number; why?: string } | null;
   /** A sane size window (auto-size): null when the current one is fine. */
   reshape: (off: MyOffer) => { minSizeSats: number; maxSizeSats: number } | null;
   /** The standard lease the offer should promise (auto-size), or null. */
@@ -875,13 +938,18 @@ const openStopped = (why: string): string => `stopped: ${why} — no open was st
  *    terms (an order it couldn't serve would end in a reject, or worse, a
  *    failed open);
  *  - enabled again once it can be, only when the autopilot itself disabled it
- *    for that reason (it restores the listing the operator chose) — never one
- *    the operator disabled. (Before, every DISABLED offer was re-enabled within
- *    the half hour, a manual "disable" included.)
+ *    for that reason (it restores the listing the operator chose), or when
+ *    the operator switched Liquidity provision on with it disabled (listOnAt)
+ *    — never one the operator disabled since. (Before, every DISABLED offer
+ *    was re-enabled within the half hour, a manual "disable" included.)
+ * Never without a price: capitalToggle refuses to list an offer at 0 ppm +
+ * 0 sat.
  */
 function capitalStatus(status: string, fundable: boolean, control: OfferControl): "ENABLED" | "DISABLED" | null {
   if (status === "ENABLED" && !fundable) return "DISABLED";
-  if (status === "DISABLED" && fundable && !!control.autoDisabledAt && !control.disabledByHandAt && !control.freeDisabledAt) return "ENABLED";
+  if (status === "DISABLED" && fundable && (!!control.autoDisabledAt || !!control.listOnAt) && !control.disabledByHandAt && !control.freeDisabledAt) {
+    return "ENABLED";
+  }
   return null;
 }
 
@@ -1128,6 +1196,9 @@ export class Autopilot {
   /** When the current main run took its lock (null when idle) — exposed so a
    *  run that takes unusually long is visible, not just a stale lastRunAt. */
   private runningSince: string | null = null;
+  /** Liquidity provision was switched on while a run was under way (the run
+   *  kicked for it found that one busy): it runs one more when it ends. */
+  private sellSwitchedMidRun = false;
   /** Set by shutdown(): no new run may start, the process is going away. */
   private shuttingDown = false;
   /** The on-chain budget shared with Magma fulfilment and LSPS1 (capital.ts):
@@ -1252,6 +1323,10 @@ export class Autopilot {
     this.state.history = Array.isArray(this.state.history) ? this.state.history : [];
     // What "Resume" may switch on: the known switches only (sanitizePaused).
     this.state.paused = sanitizePaused(this.state.paused);
+    // The switch-on and the base-fee clocks too: read by the offer upkeep and
+    // the engine, a value left half-written must not throw there.
+    this.state.sellSwitchOn = sanitizeSellSwitchOn(this.state.sellSwitchOn);
+    this.state.offerBaseMoves = sanitizeBaseMoves(this.state.offerBaseMoves);
     // Upgrading to the fee-change log: the fee changes still in the run
     // history move into it (once), so what was measurable stays measurable.
     this.feeLog.seed(
@@ -1400,6 +1475,7 @@ export class Autopilot {
     offerFeeCaps: OfferFeeCaps;
     autoSizeLease: boolean;
     operatorOfferIds: string[];
+    baseMoves: Record<string, { since: string; offerBase: number }>;
   } {
     const c = this.state.config;
     return {
@@ -1418,6 +1494,9 @@ export class Autopilot {
       operatorOfferIds: Object.entries(this.state.offerControl ?? {})
         .filter(([, control]) => !!control.manual)
         .map(([id]) => id),
+      // Since when each offer's base has differed from the market's: it
+      // follows only after a day (trackBaseMoves).
+      baseMoves: Object.fromEntries(Object.entries(this.state.offerBaseMoves ?? {}).map(([id, m]) => [id, { since: m.since, offerBase: m.offerBase }])),
     };
   }
 
@@ -1720,6 +1799,7 @@ export class Autopilot {
   setConfig(raw: unknown): void {
     const result = validateAutopilotPatch(raw, this.state.config);
     if (!result.ok) throw new ConfigValidationError(result.errors);
+    const wasSelling = this.state.config.sellEnabled;
     this.state.config = applyPatch(this.state.config, result.patch);
     if (!this.canWrite) {
       // Refuse to "enable" anything when we have no write macaroon.
@@ -1731,8 +1811,43 @@ export class Autopilot {
     // A switch turned on by hand ends a pause: the operator is choosing
     // switch by switch now, and "Resume" would switch on what they left off.
     if (AUTOMATION_SWITCHES.some((k) => result.patch[k] === true)) this.state.paused = null;
+    this.noteSellSwitch(wasSelling);
     this.persist();
     this.reschedule();
+  }
+
+  /**
+   * Liquidity provision switched on: the offers disabled at this moment are
+   * listed again once each has a price and can be funded. Which ones those are
+   * is taken now — the offers LightningMate's last offer sync showed disabled —
+   * and the first offer read after this marks those still disabled
+   * (applySwitchOn); the run reschedule() kicks makes that read within seconds.
+   * An offer disabled after the switch — on amboss.tech while Amboss couldn't
+   * be read, say — is not among them. Without any offer sync to go by (none
+   * kept yet), every offer disabled at that first read is listed. Switched off
+   * (by hand, or by "Pause all automation"): what an earlier switch-on had
+   * still to list is not listed any more. (Before, the switch-off disabled
+   * every listed offer "by hand" and the switch-on listed none: each had to be
+   * enabled again on Market → Sell.)
+   */
+  private noteSellSwitch(wasSelling: boolean): void {
+    const selling = this.state.config.sellEnabled;
+    if (selling === wasSelling) return;
+    if (selling) {
+      const sync = this.state.offerSync;
+      this.state.sellSwitchOn = {
+        at: new Date().toISOString(),
+        disabled: sync?.at ? sync.offers.filter((e) => e.amboss.status === "DISABLED").map((e) => e.offerId) : null,
+      };
+      // A main run under way skips the run reschedule() kicks: it runs one
+      // more itself when it ends (runOnce).
+      if (this.running) this.sellSwitchedMidRun = true;
+      return;
+    }
+    this.state.sellSwitchOn = null;
+    for (const [id, control] of Object.entries(this.state.offerControl ?? {})) {
+      if (control.listOnAt) this.setOfferControl(id, { ...control, listOnAt: undefined });
+    }
   }
 
   /**
@@ -1755,7 +1870,9 @@ export class Autopilot {
     const was = AUTOMATION_SWITCHES.filter((k) => c[k]);
     if (was.length === 0) return;
     this.state.paused = { at: new Date().toISOString(), was };
+    const wasSelling = c.sellEnabled;
     for (const k of AUTOMATION_SWITCHES) c[k] = false;
+    this.noteSellSwitch(wasSelling);
     this.persist();
     this.reschedule();
   }
@@ -3372,6 +3489,7 @@ export class Autopilot {
     sync.lastError = null;
     // Upkeep works again: its next failure is news (laneNews).
     this.laneLast.delete("offers");
+    this.applySwitchOn(offers);
 
     // Adaptive pricing (mode "auto"): ratchet the level UP when an order fills —
     // you could have charged more — and hold it otherwise.
@@ -3416,7 +3534,17 @@ export class Autopilot {
       if (!cfg.sellAutoReprice) return null;
       const r = recByOffer.get(off.id);
       if (!r) return null;
-      return { fee: r.recommended.feeRatePpm, base: r.recommended.baseFeeSat, moved: r.shouldReprice, lease: r.recommended.minBlockLength };
+      return {
+        fee: r.recommended.feeRatePpm,
+        base: r.recommended.baseFeeSat,
+        moved: r.shouldReprice,
+        lease: r.recommended.minBlockLength,
+        ...(r.baseOnly
+          ? {
+              why: `base fee set to ${fmtSat(r.recommended.baseFeeSat)} sat (was ${fmtSat(off.baseFeeSats)}) — what comparable offers charge; the rate makes up the rest, so the price at the representative size √(min·max) stays`,
+            }
+          : {}),
+      };
     };
 
     // Auto-size is offer-shape hygiene (D19): a standard lease and a sane
@@ -3489,6 +3617,9 @@ export class Autopilot {
     }
     for (const id of Object.keys(this.state.offerPrices ?? {})) {
       if (!offers.some((o) => o.id === id)) delete this.state.offerPrices?.[id];
+    }
+    for (const id of Object.keys(this.state.offerBaseMoves ?? {})) {
+      if (!offers.some((o) => o.id === id)) delete this.state.offerBaseMoves?.[id];
     }
 
     // Auto-list idle capital: no offer at all, leasing beats routing, and
@@ -3691,8 +3822,20 @@ export class Autopilot {
       `${fmtSat(sellableNow)} sat sellable after the reserve, promised orders and the deploy cap; it is listed again once it can be`;
     const unanswered =
       "the autopilot disabled it for lack of capital, and Amboss's answer never came — the next read of the offer tells whether the disable landed";
+    const priceSource = () =>
+      !control.manual && this.state.config.sellAutoReprice
+        ? "the autopilot prices it once it knows a price (the market recommendation, or one it had)"
+        : "edit it on Market → Sell to give it one";
     const disabledWhy = (status: string): string =>
-      listedForFree(off) && !control.freeDisabledAt
+      control.listOnAt
+        ? `Liquidity provision was switched on, so it is listed again ${
+            listedForFree(off)
+              ? `once it has a price — Amboss has it at 0 ppm + 0 sat: ${priceSource()}`
+              : !fundable
+                ? `once its smallest channel (${fmtSat(off.minSizeSats)} sat) can be funded — ${fmtSat(sellableNow)} sat sellable after the reserve, promised orders and the deploy cap`
+                : "with the next run"
+          }; "keep disabled" on Market → Sell keeps it off`
+        : listedForFree(off) && !control.freeDisabledAt
         ? `offer is ${status} and has no price on Amboss (0 ppm + 0 sat) — ${
             !control.manual && this.state.config.sellAutoReprice
               ? "the autopilot prices it once it knows a price (the market recommendation, or one it had); or edit it on Market → Sell"
@@ -3700,7 +3843,7 @@ export class Autopilot {
           }, then enable it`
         : control.freeDisabledAt
         ? !control.manual && this.state.config.sellAutoReprice
-          ? "disabled by the autopilot: Amboss listed it for free (0 ppm + 0 sat) — it is priced and listed again once there is a price for it (auto-pricing), or set one on Market → Sell"
+          ? "disabled by the autopilot: Amboss listed it for free (0 ppm + 0 sat) — it is listed again at the autopilot's price for it once there is one (auto-pricing), or set one on Market → Sell"
           : FREE_DISABLED_WHY
         : control.disabledByHandAt
         ? "disabled by you — the autopilot leaves it disabled; enable it on Market → Sell to list it again"
@@ -3712,8 +3855,9 @@ export class Autopilot {
     // A disabled offer the autopilot prices (auto-pricing on, terms not the
     // operator's) is never left at a price of nothing: its price is written —
     // whether it is listed stays the operator's click (or capital safety's,
-    // just below: so one disabled for lack of capital is listed again in the
-    // same run once it can be funded). Without this, an offer disabled at
+    // just below: so one disabled for lack of capital, or disabled when
+    // Liquidity provision was switched on, is listed in the same run once it
+    // can be funded). Without this, an offer disabled at
     // 0 ppm + 0 sat — by hand after 0.8.0's partial writes, or for capital —
     // couldn't be listed again: enabling a free offer is refused, the price
     // buttons are the autopilot's, and the autopilot priced listed offers only.
@@ -3728,10 +3872,31 @@ export class Autopilot {
     // Capital safety, for every offer (the operator's own too): see
     // capitalStatus and capitalToggle.
     const wantStatus = capitalStatus(off.status, fundable, control);
+    // The status change made this run, for the record when no terms write
+    // follows (the Sell page says why the offer was listed again).
+    let statusWrite: OfferWrite | undefined;
     if (wantStatus) {
+      // Listed again only once the terms it is listed with are on Amboss —
+      // written in full and read back (termsBeforeListing): its price, the size
+      // that can be funded, the standard lease and promise. Before, the flip
+      // came first: an offer disabled at 300 ppm + 100 sat was listed at that
+      // price and repriced afterwards — or, that write not taken, stayed listed
+      // at it, with a max channel it couldn't fund, until the next run.
+      let firstWrite: OfferWrite | undefined;
+      if (wantStatus === "ENABLED") {
+        const prep = await this.termsBeforeListing(key, off, ctx, control, out);
+        if ("stopped" in prep) return this.syncEntry(prep.offer, null, prep.write, `left as it is: ${prep.stopped}`);
+        if ("failed" in prep) {
+          if (prep.waits) return { ...this.syncEntry(prep.offer, prep.wanted, prep.write, prep.failed), listingWaits: prep.waits };
+          return this.syncEntry(prep.offer, prep.wanted, prep.write, `not listed again: ${prep.failed}`);
+        }
+        off = prep.offer;
+        firstWrite = prep.write;
+      }
       const r = await this.capitalToggle(key, off, wantStatus, { fundable, sellableNow }, out);
-      // Switched off before the flip: nothing was sent.
-      if (r.stopped) return this.syncEntry(r.offer, null, undefined, `left as it is: ${r.stopped}`);
+      // Switched off before the flip (nothing sent), or while it was on its
+      // way (taken off the market again: r.write says how that went).
+      if (r.stopped) return this.syncEntry(r.offer, null, r.write ?? firstWrite, `left as it is: ${r.stopped}`);
       control = this.offerControlOf(off.id);
       const wanted = r.write ? { ...fieldsOf(r.offer), status: wantStatus } : null;
       if (r.unresolved) {
@@ -3743,8 +3908,10 @@ export class Autopilot {
             : `${wantStatus === "DISABLED" ? "not disabled" : "not listed again"} yet: ${r.write?.error ?? "Amboss did not answer"} — tried again next run`;
         return this.syncEntry(r.offer, wanted, r.write ?? undefined, why);
       }
-      if (r.offer.status !== "ENABLED") return this.syncEntry(r.offer, wanted, r.write ?? undefined, disabledWhy(r.offer.status));
+      if (r.offer.status !== "ENABLED") return this.syncEntry(r.offer, wanted, r.write ?? firstWrite, disabledWhy(r.offer.status));
       off = r.offer;
+      statusWrite =
+        r.write && firstWrite ? { ...r.write, reason: `${r.write.reason} — after its terms were written: ${firstWrite.reason}` } : (r.write ?? firstWrite);
     }
     // Taken off the market for being free, its price the autopilot's
     // (auto-pricing on, terms not the operator's): its price goes back on and
@@ -3789,7 +3956,7 @@ export class Autopilot {
     if (changed.length === 0) {
       // Amboss already has exactly this: the cut memory matches it as is.
       this.keepCut(off.id, want.cut);
-      return this.syncEntry(off, want.fields, undefined, want.notes);
+      return this.syncEntry(off, want.fields, statusWrite, want.notes);
     }
     // Every term is sent, the unchanged ones too: Amboss resets what an update
     // leaves out (updateOffer) — sending only the new caps once listed this
@@ -3828,7 +3995,7 @@ export class Autopilot {
       if (read) after = read;
       return null;
     });
-    if (outcome && "stopped" in outcome) return this.syncEntry(off, want.fields, undefined, [...want.notes, `not changed: ${outcome.stopped}`]);
+    if (outcome && "stopped" in outcome) return this.syncEntry(off, want.fields, statusWrite, [...want.notes, `not changed: ${outcome.stopped}`]);
     if (outcome) {
       return this.syncEntry(
         outcome.changed,
@@ -3897,6 +4064,10 @@ export class Autopilot {
       write.verified = off.length === 0;
       if (write.verified) {
         this.rememberPrice(read);
+        // The base moved: the clock that led to it is spent — the next report
+        // must not follow the market's next move at once on its account.
+        const clock = this.state.offerBaseMoves?.[offerId];
+        if (clock && clock.offerBase !== read.baseFeeSats) delete this.state.offerBaseMoves?.[offerId];
         if (attempt > 1) write.reason = `${write.reason ? `${write.reason} — ` : ""}stored on the second try (the first read back different)`;
         return read;
       }
@@ -3938,14 +4109,171 @@ export class Autopilot {
       if (older(next.autoDisabledAt)) next.autoDisabledAt = undefined;
       if (older(next.disabledByHandAt)) next.disabledByHandAt = undefined;
       if (older(next.freeDisabledAt)) next.freeDisabledAt = undefined;
+      if (older(next.listOnAt)) next.listOnAt = undefined;
     }
     const changed =
       next.autoDisabledAt !== control.autoDisabledAt ||
       next.disabledByHandAt !== control.disabledByHandAt ||
       next.autoDisablingAt !== control.autoDisablingAt ||
-      next.freeDisabledAt !== control.freeDisabledAt;
+      next.freeDisabledAt !== control.freeDisabledAt ||
+      next.listOnAt !== control.listOnAt;
     if (changed) this.setOfferControl(off.id, next);
     return this.offerControlOf(off.id);
+  }
+
+  /**
+   * The price an offer whose terms the autopilot sets (auto-pricing on) is
+   * listed again at: the engine's current one for it, for the lease the offer
+   * carries after the write — whether or not the engine calls it a move (a
+   * disabled offer's report is "inactive") — and never an older one. Before,
+   * with the report down that run, or a lease the engine's price doesn't fit
+   * (auto-size off, a 5,000-block lease), it was listed at the price it had been
+   * disabled at: 300 ppm + 100 sat, and never repriced. None this run: why,
+   * and whether it waits for the operator ("lease") or for the next run.
+   */
+  private listingPrice(
+    off: MyOffer,
+    ctx: OfferCtx,
+    leaseBlocks: number,
+  ): { feeRatePpm: number; baseFeeSats: number } | { waits: "report" | "lease"; why: string } {
+    const t = ctx.target(off);
+    if (!t || listedForFree({ feeRatePpm: t.fee, baseFeeSats: t.base })) {
+      return { waits: "report", why: "there is no market report for it this run — tried again next run" };
+    }
+    if (!priceFitsLease(t.lease, leaseBlocks)) {
+      return {
+        waits: "lease",
+        why:
+          `its ${fmtSat(leaseBlocks)}-block lease isn't one the autopilot prices (its price is for ${fmtSat(t.lease)} blocks, and with auto-size off ` +
+          "the offer keeps its lease) — set its price or its lease on Market → Sell, or turn on auto-size",
+      };
+    }
+    return { feeRatePpm: t.fee, baseFeeSats: t.base };
+  }
+
+  /**
+   * The terms a disabled offer is listed again with — capital safety's relist
+   * and the switch-on's — put on Amboss before the listing: what it wants as a
+   * listed offer (wantedTerms: the size that can be funded, with auto-size the
+   * standard lease and promise), priced — its terms the autopilot's, with
+   * auto-pricing on — at the autopilot's current price for it (listingPrice;
+   * without one this run it waits, `failed` with `waits`). The operator's own
+   * offer, or any with auto-pricing off, keeps its price; only its size is cut
+   * to what can be funded. Written in full and read back; a write that fails,
+   * or reads back different, keeps the offer off and says why (`failed`).
+   */
+  private async termsBeforeListing(
+    key: string,
+    off: MyOffer,
+    ctx: OfferCtx,
+    control: OfferControl,
+    out: AutopilotSell[],
+  ): Promise<
+    | { offer: MyOffer; write?: OfferWrite }
+    | { offer: MyOffer; write?: OfferWrite; stopped: string }
+    | { offer: MyOffer; write?: OfferWrite; failed: string; wanted: OfferFields; waits?: "report" | "lease" }
+  > {
+    const manual = !!control.manual;
+    const want = this.wantedTerms(off, ctx, manual);
+    if (!manual && this.state.config.sellAutoReprice) {
+      const price = this.listingPrice(off, ctx, want.fields.minBlockLength);
+      if ("waits" in price) {
+        return { offer: off, failed: `waits for the autopilot's price before it is listed again: ${price.why}`, wanted: want.fields, waits: price.waits };
+      }
+      if (price.feeRatePpm !== want.fields.feeRatePpm || price.baseFeeSats !== want.fields.baseFeeSats) {
+        want.reasons.push(`priced at the engine's ${fmtSat(price.feeRatePpm)} ppm + ${fmtSat(price.baseFeeSats)} sat`);
+      }
+      want.fields.feeRatePpm = price.feeRatePpm;
+      want.fields.baseFeeSats = price.baseFeeSats;
+    }
+    // A price of nothing is never written: capital safety refuses to list it.
+    if (listedForFree(want.fields)) return { offer: off };
+    const changed = termsChanges(off, want.fields);
+    if (changed.length === 0) return { offer: off };
+    const write: OfferWrite = {
+      at: new Date().toISOString(),
+      by: "autopilot",
+      action: "update",
+      fields: ambossFields(fullTerms(want.fields, off)),
+      changed,
+      ok: false,
+      reason: `before it is listed again: ${want.reasons.join("; ") || "its terms as they are to be listed"}`,
+    };
+    type Done = { read: MyOffer | null } | { stopped: string; fresh: MyOffer } | { changedMeanwhile: MyOffer | null } | { listedMeanwhile: MyOffer };
+    const done = await this.withOffer(off.id, async (): Promise<Done> => {
+      const fresh = await getMyOffer(key, off.id).catch(() => null);
+      // Listed meanwhile (a click, amboss.tech): no flip follows — its terms
+      // are kept as a listed offer's, by the upkeep below.
+      if (fresh?.status === "ENABLED") return { listedMeanwhile: fresh };
+      if (!fresh || !sameTerms(fresh, off) || !!this.offerControlOf(off.id).manual !== manual) return { changedMeanwhile: fresh };
+      const stop = this.stopWhy("sellEnabled");
+      if (stop) return { stopped: stop, fresh };
+      // What LightningMate doesn't set goes back as Amboss has it now.
+      const terms = fullTerms(want.fields, fresh);
+      write.fields = ambossFields(terms);
+      return { read: await this.writeTerms(key, off.id, terms, write, fresh) };
+    });
+    if ("listedMeanwhile" in done) return { offer: done.listedMeanwhile };
+    if ("stopped" in done) return { offer: done.fresh, stopped: done.stopped };
+    if ("changedMeanwhile" in done) {
+      return {
+        offer: done.changedMeanwhile ?? off,
+        failed: done.changedMeanwhile
+          ? "the offer changed while this run priced it (an edit on Market → Sell or on amboss.tech) — the next run starts from it"
+          : "it couldn't be read from Amboss before its terms were written — tried again next run",
+        wanted: want.fields,
+      };
+    }
+    const ok = write.ok && write.verified === true;
+    out.push({ orderId: off.id, action: want.kind, sizeSats: want.fields.maxSizeSats, ok, ...(ok ? {} : { error: write.error }) });
+    if (!ok || !done.read) {
+      return {
+        offer: done.read ?? off,
+        write,
+        failed: `the terms it is to be listed with weren't taken — ${write.error ?? "Amboss's read-back doesn't show them"}; tried again next run`,
+        wanted: want.fields,
+      };
+    }
+    this.keepCut(off.id, want.cut);
+    console.log(`[autopilot] offer ${off.id}: ${write.reason}`);
+    return { offer: done.read, write };
+  }
+
+  /**
+   * Liquidity provision went off — or all automation was paused — while a
+   * flip that lists the offer was on its way: the switch-off (its dialog
+   * disables what is listed) saw nothing listed, so nobody would decide this
+   * offer's orders. Off again, by state: it was just listed. Recorded as the
+   * switch-off's disable; one that doesn't land is raised as an alert
+   * (offerPriceAlerts: listed with selling off).
+   */
+  private async unlistAfterSwitchOff(key: string, offerId: string, why: string, out: AutopilotSell[]): Promise<{ status: string | null; write: OfferWrite }> {
+    const write: OfferWrite = {
+      at: new Date().toISOString(),
+      by: "autopilot",
+      action: "disable",
+      fields: { offer_id: offerId },
+      ok: false,
+      reason: `${why} while it was being listed — taken off the market again: with selling off nobody decides its orders`,
+    };
+    let status: string | null;
+    try {
+      status = await toggleOffer(key, offerId);
+    } catch (err) {
+      write.error = errText(err);
+      status = (await getMyOffer(key, offerId).catch(() => null))?.status ?? null;
+    }
+    write.ok = status === "DISABLED";
+    write.verified = status === null ? undefined : write.ok;
+    if (write.ok) write.error = undefined;
+    else if (!write.error) write.error = `Amboss reports the offer ${status ?? "unread"}, not DISABLED`;
+    if (write.ok) {
+      this.setOfferControl(offerId, { ...this.offerControlOf(offerId), autoDisabledAt: undefined, listOnAt: undefined, disabledByHandAt: write.at });
+    } else {
+      console.warn(`[autopilot] offer ${offerId} listed with selling off — could not take it off the market: ${write.error}`);
+    }
+    out.push({ orderId: offerId, action: "disable", sizeSats: 0, ok: write.ok, ...(write.ok ? {} : { error: write.error }) });
+    return { status, write };
   }
 
   /**
@@ -3980,9 +4308,12 @@ export class Autopilot {
   ): Promise<{ offer: MyOffer; write: OfferWrite | null; unresolved?: boolean; stopped?: string }> {
     return this.withOffer(off.id, async () => {
       const action = want === "ENABLED" ? "enable" : "disable";
+      const byCapital = !!this.offerControlOf(off.id).autoDisabledAt;
       const reason =
         want === "ENABLED"
-          ? "its smallest channel can be funded again (the autopilot had disabled it for lack of capital)"
+          ? byCapital
+            ? "its smallest channel can be funded again (the autopilot had disabled it for lack of capital)"
+            : "Liquidity provision was switched on with it disabled — it has a price, and its smallest channel can be funded"
           : `its smallest channel (${off.minSizeSats} sat) can't be funded: ${cap.sellableNow} sat sellable after the reserve, promised orders and the deploy cap`;
       const write: OfferWrite = { at: new Date().toISOString(), by: "autopilot", action, fields: { offer_id: off.id }, ok: false, reason };
       const report = (ok: boolean) =>
@@ -4001,6 +4332,17 @@ export class Autopilot {
       // until it has one — the operator's to set on Market → Sell.
       if (want === "ENABLED" && listedForFree(fresh)) {
         return { offer: fresh, write: null, stopped: "it has no price on Amboss (0 ppm + 0 sat) — listed again once it has one" };
+      }
+      // Whose price it is listed at, said: the autopilot's (written just before,
+      // termsBeforeListing), or the offer's own — the operator's terms, or
+      // auto-pricing off.
+      if (want === "ENABLED") {
+        const whose = this.offerControlOf(off.id).manual
+          ? "your price"
+          : this.state.config.sellAutoReprice
+            ? "the autopilot's price"
+            : "its own price (auto-pricing is off)";
+        write.reason = `${reason} — listed at ${whose}, ${fmtSat(fresh.feeRatePpm)} ppm + ${fmtSat(fresh.baseFeeSats)} sat`;
       }
       // Liquidity provision switched off (or all automation paused) since the
       // run began: no flip — the operator was asked what to do with listed
@@ -4035,6 +4377,8 @@ export class Autopilot {
       if (status === want) {
         next.autoDisabledAt = want === "DISABLED" && !current.disabledByHandAt ? write.at : undefined;
         next.autoDisablingAt = undefined;
+        // Listed: what the switch-on asked for is done.
+        if (want === "ENABLED") next.listOnAt = undefined;
       } else if (status !== null) {
         next.autoDisablingAt = undefined; // it didn't land
       }
@@ -4046,6 +4390,13 @@ export class Autopilot {
       if (write.ok) write.error = undefined;
       else if (!write.error) write.error = `Amboss reports the offer ${status}, not ${want}`;
       report(write.ok);
+      // Listed — while Liquidity provision went off (or all automation was
+      // paused) after the check above: off again (unlistAfterSwitchOff).
+      const late = write.ok && want === "ENABLED" && !this.state.config.sellEnabled ? this.stopWhy("sellEnabled") : null;
+      if (late) {
+        const undo = await this.unlistAfterSwitchOff(key, off.id, late, out);
+        return { offer: { ...fresh, status: undo.status ?? "ENABLED" }, write: undo.write, stopped: late };
+      }
       return status === null ? { offer: fresh, write, unresolved: true } : { offer: { ...fresh, status }, write };
     });
   }
@@ -4084,10 +4435,11 @@ export class Autopilot {
           w.feeRatePpm = t.fee;
           w.baseFeeSats = t.base;
           repriced = true;
+          const move = t.why ?? "market price moved";
           reasons.push(
             t.lease === leaseAfter
-              ? "market price moved"
-              : `market price moved (priced for the standard ${fmtSat(t.lease)}-block lease; with auto-size off the offer keeps its ${fmtSat(leaseAfter)} blocks)`,
+              ? move
+              : `${move} (priced for the standard ${fmtSat(t.lease)}-block lease; with auto-size off the offer keeps its ${fmtSat(leaseAfter)} blocks)`,
           );
         } else {
           notes.push(
@@ -4192,9 +4544,65 @@ export class Autopilot {
       ...(control.autoDisablingAt ? { autoDisablingAt: control.autoDisablingAt } : {}),
       ...(control.disabledByHandAt ? { disabledByHandAt: control.disabledByHandAt } : {}),
       ...(control.freeDisabledAt ? { freeDisabledAt: control.freeDisabledAt } : {}),
+      ...(control.listOnAt ? { listOnAt: control.listOnAt } : {}),
     };
     if (Object.keys(clean).length) (this.state.offerControl ??= {})[offerId] = clean;
     else if (this.state.offerControl) delete this.state.offerControl[offerId];
+  }
+
+  /**
+   * The offers read first after Liquidity provision was switched on
+   * (sellSwitchOn): each one that was disabled at the switch — as the last
+   * offer sync showed it — and still is gets listed again once it has a price
+   * and its smallest channel can be funded (listOnAt, capitalStatus), whoever
+   * owns its terms. Not one disabled since: listed at the switch (or unknown
+   * to that sync), or disabled by hand after it. With no sync to go by, every
+   * offer disabled now. Once per switch-on: an offer disabled by hand
+   * afterwards stays off.
+   */
+  private applySwitchOn(offers: MyOffer[]): void {
+    const sw = this.state.sellSwitchOn;
+    if (!sw) return;
+    for (const o of offers) {
+      if (o.status !== "DISABLED") continue;
+      if (sw.disabled && !sw.disabled.includes(o.id)) continue;
+      const control = this.offerControlOf(o.id);
+      if (control.disabledByHandAt && Date.parse(control.disabledByHandAt) > Date.parse(sw.at)) continue;
+      // The switch-on supersedes the disable it found — the operator's, or
+      // the autopilot's for a price of nothing (still never listed free).
+      this.setOfferControl(o.id, { ...control, disabledByHandAt: undefined, freeDisabledAt: undefined, listOnAt: sw.at });
+    }
+    this.state.sellSwitchOn = null;
+    this.persist();
+  }
+
+  /**
+   * The base-fee clocks (magmaRecommend BASE_FEE_HOLD_MS): an offer whose base
+   * differs from the market's beyond the tolerance gets one when a report
+   * first says so, kept while reports go on saying it about the same base of
+   * the offer's. Back within the tolerance, it goes; the offer's base moved —
+   * by the autopilot's write (writeTerms drops it at once) or any other — it
+   * starts afresh. The engine reads them (magmaOverrides baseMoves): the base
+   * follows once the market's has differed for a day, so a median one listing
+   * flips is never followed — nor the next move right after a base move.
+   */
+  private trackBaseMoves(recs: MagmaSellRecommendation[]): void {
+    const now = new Date().toISOString();
+    const before = this.state.offerBaseMoves ?? {};
+    const moves = { ...before };
+    for (const r of recs) {
+      if (!r.offerId || r.baseFeeDiffers === undefined || !r.current) continue;
+      const prev = moves[r.offerId];
+      if (r.baseFeeDiffers && r.baseFeeMarketSat != null) {
+        moves[r.offerId] =
+          prev && prev.offerBase === r.current.baseFeeSat
+            ? { ...prev, base: r.baseFeeMarketSat }
+            : { base: r.baseFeeMarketSat, offerBase: r.current.baseFeeSat, since: now };
+      } else delete moves[r.offerId];
+    }
+    if (JSON.stringify(moves) === JSON.stringify(before)) return;
+    this.state.offerBaseMoves = moves;
+    this.persist();
   }
 
   /** The operator created or edited the offer by hand (or took it over): its
@@ -4217,17 +4625,23 @@ export class Autopilot {
 
   /** The operator enabled or disabled the offer by hand (Market → Sell, or
    *  turning Liquidity provision off): the listing is theirs — a disable
-   *  sticks, an enable lists it — and the terms stay with whoever had them. */
-  offerStatusSetByHand(offerId: string, status: string): void {
+   *  sticks (until they enable it, or switch Liquidity provision on again:
+   *  noteSellSwitch), an enable lists it — and the terms stay with whoever
+   *  had them. */
+  offerStatusSetByHand(offerId: string, status: string, read?: MyOffer): void {
     this.forgetPageReport();
+    // What the click found (a click that changed nothing: the offer was so
+    // already): the offer sync shows it — a switch-on goes by what that shows.
+    if (read) this.noteOfferRead(read);
     const control = this.offerControlOf(offerId);
     this.setOfferControl(offerId, {
       ...control,
-      // Whatever the autopilot had disabled (or was disabling) is superseded
-      // by the click.
+      // Whatever the autopilot had disabled (or was disabling, or was to list
+      // after selling was switched on) is superseded by the click.
       autoDisabledAt: undefined,
       autoDisablingAt: undefined,
       freeDisabledAt: undefined,
+      listOnAt: undefined,
       disabledByHandAt: status === "DISABLED" ? new Date().toISOString() : undefined,
     });
     this.persist();
@@ -4260,7 +4674,12 @@ export class Autopilot {
   /** The Magma engine's report with THIS autopilot's inputs — the one call the
    *  Market page and the offer upkeep share (a8: they used to differ). */
   magmaReport(key: string = this.amboss.getKey()): Promise<MagmaV2Report> {
-    return getMagmaRecommendations(this.readLnd, key, this.magmaOverrides());
+    return getMagmaRecommendations(this.readLnd, key, this.magmaOverrides()).then((report) => {
+      // Every report keeps the base-fee clocks — the upkeep's and the pages':
+      // an offer the autopilot doesn't price has its recommendation too.
+      this.trackBaseMoves(report.sell.recommendations);
+      return report;
+    });
   }
 
   /** The report the pages read — shared (see magmaReportShared). */
@@ -4666,13 +5085,7 @@ export class Autopilot {
   async saleFeeFloorSats(): Promise<number> {
     if (this.saleFloor && Date.now() - this.saleFloor.at < SALE_FLOOR_TTL_MS) return this.saleFloor.sats;
     const oc = await onchainCosts(this.readLnd);
-    const perVbyte = oc.feePerVbyte !== null && Number.isFinite(oc.feePerVbyte) && oc.feePerVbyte > 0 ? oc.feePerVbyte : 1;
-    const sats = saleCostFloorSats({
-      onchainOpenCostSat: Math.ceil(perVbyte * OPEN_TX_VBYTES),
-      onchainCloseCostSat: Math.ceil(perVbyte * CLOSE_TX_VBYTES),
-      minNetLeaseProfitSat: 0,
-      serviceFeeRate: saleFeeConfig().bps / 10_000,
-    });
+    const sats = saleAcceptFloorSats(oc.feePerVbyte, saleFeeConfig().bps / 10_000);
     if (oc.feePerVbyte !== null) this.saleFloor = { at: Date.now(), sats };
     return sats;
   }
@@ -4734,19 +5147,18 @@ export class Autopilot {
 
   /**
    * An offer the autopilot took off the market for being free, priced by the
-   * autopilot: once there is a price for it (the engine's, else the one it
-   * last had), every term is written — read back, checked — and only then is
-   * it listed again, its record cleared. Null: it stays off (no price yet, a
-   * write Amboss didn't keep, the flip not landing, or the switch going off).
+   * autopilot: once the autopilot has its current price for it (listingPrice
+   * — not the one it last had: that may be the price it was disabled at),
+   * every term is written — read back, checked — and only then is it listed
+   * again, its record cleared. Null: it stays off (no price this run, a write
+   * Amboss didn't keep, the flip not landing, or the switch going off).
    */
   private async relistFree(key: string, off: MyOffer, ctx: OfferCtx, out: AutopilotSell[]): Promise<MyOffer | null> {
     const want = this.wantedTerms(off, ctx, false);
-    if (listedForFree(want.fields)) {
-      const price = this.priceForFree(off, ctx, want.fields.minBlockLength);
-      if (!price) return null;
-      want.fields.feeRatePpm = price.feeRatePpm;
-      want.fields.baseFeeSats = price.baseFeeSats;
-    }
+    const price = this.listingPrice(off, ctx, want.fields.minBlockLength);
+    if ("waits" in price) return null;
+    want.fields.feeRatePpm = price.feeRatePpm;
+    want.fields.baseFeeSats = price.baseFeeSats;
     return this.withOffer(off.id, async () => {
       const fresh = await getMyOffer(key, off.id).catch(() => null);
       const control = this.offerControlOf(off.id);
@@ -4780,7 +5192,15 @@ export class Autopilot {
       if (status !== "ENABLED") return null;
       this.setOfferControl(off.id, { ...this.offerControlOf(off.id), freeDisabledAt: undefined });
       out.push({ orderId: off.id, action: "enable", sizeSats: terms.totalSizeSats, ok: true });
-      console.log(`[autopilot] offer ${off.id} listed again: ${write.reason}`);
+      // Selling went off while the flip was on its way: off again.
+      const late = !this.state.config.sellEnabled ? this.stopWhy("sellEnabled") : null;
+      if (late) {
+        const undo = await this.unlistAfterSwitchOff(key, off.id, late, out);
+        if (undo.write.ok) return null;
+        this.recordOfferWrite(null, off.id, undo.write);
+      } else {
+        console.log(`[autopilot] offer ${off.id} listed again: ${write.reason}`);
+      }
       return { ...(read ?? fresh), status: "ENABLED" };
     });
   }
@@ -5110,6 +5530,8 @@ export class Autopilot {
     if (this.running || !this.writeLnd) return emptyRun;
     this.running = true;
     this.runningSince = new Date().toISOString();
+    // This run's own offer upkeep applies a switch-on made before it.
+    this.sellSwitchedMidRun = false;
     const writeLnd = this.writeLnd;
     // Every stage that threw in this pass — and which of those failures are
     // news for the run history (the same failure again is not).
@@ -5257,6 +5679,17 @@ export class Autopilot {
       this.persist();
       this.running = false;
       this.runningSince = null;
+      // Liquidity provision was switched on while this run was under way, and
+      // the switch-on is still to be applied: the run reschedule() kicked found
+      // this one busy, and this one's offer upkeep came before the switch. One
+      // more now, so the offers are listed within seconds — not at the next
+      // run, half an hour later. Once: the next run starts without the flag (a
+      // read that keeps failing is retried on the schedule, not back to back).
+      const midRun = this.sellSwitchedMidRun;
+      this.sellSwitchedMidRun = false;
+      if (midRun && this.state.sellSwitchOn && this.state.config.sellEnabled && !this.shuttingDown) {
+        this.kick(() => this.runOnce(), 2_000);
+      }
     }
   }
 
