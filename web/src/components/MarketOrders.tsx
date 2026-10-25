@@ -2,12 +2,22 @@ import { useEffect, useState } from "react";
 import { api } from "../api";
 import { sharedMagmaReport } from "../magmaReport";
 import { useVisibleInterval } from "../usePolledData";
-import type { LspOrder, MagmaPurchase, MagmaV2Report, MyOrder, MyOrdersView } from "../types";
+import type { DeskResult, LspOrder, MagmaPurchase, MagmaV2Report, MyOrder, MyOrdersView } from "../types";
 import { sats, satsCompact } from "../format";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
 import { awaitsYourDecision, laneBanner } from "../statusNotes";
-import { acceptedToast, localLabel, orderStatusLabel, purchaseLabel } from "../magmaView";
+import {
+  acceptConfirmMessage,
+  acceptedToast,
+  belowCostQuestion,
+  belowCostRefusal,
+  deskDoneToast,
+  localLabel,
+  openConfirmMessage,
+  orderStatusLabel,
+  purchaseLabel,
+} from "../magmaView";
 import { lspOrderLabel } from "../lspView";
 
 /** Why the order is where it is: the reason, the lane's last decision, or the
@@ -28,6 +38,7 @@ export function MarketOrders() {
   const [lspOrders, setLspOrders] = useState<LspOrder[]>([]);
   const [purchases, setPurchases] = useState<MagmaPurchase[]>([]);
   const [ordersInFlight, setOrdersInFlight] = useState(0);
+  const [feeBps, setFeeBps] = useState(0);
 
   const load = async () => {
     // Direct LSPS1 sales and Magma purchases are on this node — shown
@@ -40,6 +51,7 @@ export function MarketOrders() {
       conn = s.connected;
       setConnected(s.connected);
       setOrdersInFlight(s.ordersInFlight ?? 0);
+      setFeeBps(s.saleFeeBps ?? 0);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setConnected(false);
@@ -58,21 +70,33 @@ export function MarketOrders() {
   // Every 30 s while the page is visible — paused in a background tab.
   useVisibleInterval(() => void load(), 30_000);
 
+  /** Opening and closing a channel on chain at today's fee rate (the report's). */
+  const channelCostSat = rec ? rec.sell.onchainOpenCostSat + rec.sell.onchainCloseCostSat : null;
+
   const accept = async (o: MyOrder) => {
-    const fee = o.feeSats > 0 ? `${o.feeSats.toLocaleString()} sat ` : "";
     const ok = await ui.confirm({
       title: "Accept order",
-      message:
-        `Accept this order? You'll create a ${fee}hold invoice for the fee — the buyer's payment is held, ` +
-        `and only settles once Amboss confirms the ${satsCompact(o.sizeSats)} channel you then open ` +
-        `(any failure refunds the buyer). No funds move yet.`,
+      message: acceptConfirmMessage(o, feeBps, channelCostSat),
       confirmLabel: "Accept",
     });
     if (!ok) return;
     setBusyId(o.id);
     try {
-      const r = await api.ambossAcceptOrder(o.id);
-      ui.toast(acceptedToast(r.opensItself === true), "success");
+      let r: DeskResult;
+      try {
+        r = await api.ambossAcceptOrder(o.id);
+      } catch (e) {
+        // Below what its channel costs on chain: only with an explicit yes.
+        const below = belowCostRefusal(e);
+        if (!below) throw e;
+        const yes = await ui.confirm({ title: "Accept below cost?", message: belowCostQuestion(below), confirmLabel: "Accept at a loss", danger: true });
+        if (!yes) {
+          ui.toast(below.message, "error");
+          return;
+        }
+        r = await api.ambossAcceptOrder(o.id, true);
+      }
+      ui.toast(deskDoneToast(r, acceptedToast(r.opensItself === true)), "success");
       await load();
     } catch (e) {
       ui.toast(e instanceof Error ? e.message : String(e), "error");
@@ -82,12 +106,9 @@ export function MarketOrders() {
   };
 
   const openCh = async (o: MyOrder) => {
-    const pubkey = o.destination.split("@")[0] || o.destination;
     const ok = await ui.confirm({
       title: "Open channel to buyer",
-      message:
-        `Open a ${satsCompact(o.sizeSats)} channel to ${pubkey.slice(0, 20)}…? This commits real ` +
-        `on-chain funds into the channel (you earn ${o.feeSats.toLocaleString()} sat). Real transaction.`,
+      message: openConfirmMessage(o, feeBps, channelCostSat),
       confirmLabel: `Open ${satsCompact(o.sizeSats)} channel`,
       danger: true,
     });
@@ -120,8 +141,8 @@ export function MarketOrders() {
     if (!ok) return;
     setBusyId(o.id);
     try {
-      await api.ambossRejectOrder(o.id);
-      ui.toast("Order rejected.", "success");
+      const r = await api.ambossRejectOrder(o.id);
+      ui.toast(deskDoneToast(r, "Order rejected."), "success");
       await load();
     } catch (e) {
       ui.toast(e instanceof Error ? e.message : String(e), "error");

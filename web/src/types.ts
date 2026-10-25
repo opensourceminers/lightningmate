@@ -164,6 +164,7 @@ export type {
   OnchainUtxo,
   OpenChannelResult,
   OpenEstimate,
+  OrderAcceptRequest,
   OrderActionRequest,
   OrderQuery,
   OrderState,

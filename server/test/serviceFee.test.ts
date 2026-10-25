@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
-  MAX_FEE_ATTEMPTS,
+  FEE_RETRY_DAYS,
   ServiceFeeLedger,
   checkFeeInvoice,
   feeForSale,
@@ -21,6 +21,18 @@ import { withEnv } from "./helpers/env.js";
 
 const ADDRESS = "fees@fees.example";
 const HOUR = 3_600_000;
+const GAVE_UP = new RegExp(`gave up after \\d+ attempts in ${FEE_RETRY_DAYS} days`);
+
+/** Pass after pass, a day and an hour apart, until the fee is no longer
+ *  owed (or `limit` passes): the time that took. */
+async function untilSettled(ledger: ServiceFeeLedger, clock: { now(): number; advance(ms: number): number }, limit = FEE_RETRY_DAYS + 5): Promise<number> {
+  const start = clock.now();
+  for (let i = 0; i < limit && ledger.entries()[0].state === "pending"; i++) {
+    clock.advance(25 * HOUR);
+    await ledger.processDue();
+  }
+  return clock.now() - start;
+}
 
 function feeEnv(t: AfterHook, extra: Record<string, string | undefined> = {}): void {
   withEnv(t, { LM_SELL_FEE_BPS: "100", LM_SELL_FEE_ADDRESS: ADDRESS, LM_SELL_FEE_PUBKEY: undefined, ...extra });
@@ -109,13 +121,11 @@ test("refuses an invoice for the wrong amount (LUD-06), alerts, and eventually g
   assert.equal(e.lastErrorCode, "amount_mismatch");
   assert.equal(ledger.problems().length, 1, "surfaced as an alert while it keeps retrying");
 
-  for (let i = 1; i < MAX_FEE_ATTEMPTS; i++) {
-    clock.advance(25 * HOUR);
-    await ledger.processDue();
-  }
+  const took = await untilSettled(ledger, clock);
   [e] = ledger.entries();
   assert.equal(e.state, "failed");
-  assert.equal(e.attempts, MAX_FEE_ATTEMPTS);
+  assert.ok(took >= FEE_RETRY_DAYS * 24 * HOUR, `tried for ${FEE_RETRY_DAYS} days first (${Math.round(took / HOUR)} h)`);
+  assert.match(e.lastError ?? "", GAVE_UP);
   assert.equal(sends(node).length, 0);
 });
 
@@ -135,16 +145,13 @@ test("dismissing a refused invoice's alert doesn't hide that the fee was given u
   clock.advance(25 * HOUR);
   await ledger.processDue();
   assert.equal(serviceFeeAlerts(ledger).length, 0, "the same refusal on the next try stays dismissed");
-  for (let i = 2; i < MAX_FEE_ATTEMPTS; i++) {
-    clock.advance(25 * HOUR);
-    await ledger.processDue();
-  }
+  await untilSettled(ledger, clock);
   assert.equal(ledger.entries()[0].state, "failed");
   // Before: the dismissal stuck to the entry, so the give-up — which needs a
   // human, and which SECURITY.md promises to alert — never showed.
   const alerts = serviceFeeAlerts(ledger);
   assert.equal(alerts.length, 1);
-  assert.match(alerts[0].message, new RegExp(`gave up after ${MAX_FEE_ATTEMPTS} attempts`));
+  assert.match(alerts[0].message, GAVE_UP);
   assert.equal(ledger.acknowledge("magma:ord-ack"), true);
   assert.equal(serviceFeeAlerts(ledger).length, 0, "dismissing the give-up silences it for good");
   assert.equal(sends(node).length, 0);
@@ -398,24 +405,21 @@ test("a payment that keeps failing is given up after the last attempt, with exac
   assert.ok(e.paymentHash, "its hash is kept until LND confirms how it ended");
   assert.equal(ledger.problems().length, 0, "no alert while it is still being retried");
 
-  for (let i = 0; i < 50 && ledger.entries()[0].attempts < MAX_FEE_ATTEMPTS; i++) {
-    clock.advance(25 * HOUR);
-    await ledger.processDue();
-  }
-  assert.equal(ledger.entries()[0].state, "pending", "the last failure is confirmed with LND first …");
-  clock.advance(6 * 60_000);
-  await ledger.processDue();
+  const took = await untilSettled(ledger, clock);
   [e] = ledger.entries();
-  assert.equal(e.state, "failed", "… within minutes, not a day later");
-  assert.equal(e.attempts, MAX_FEE_ATTEMPTS);
-  assert.equal(e.paymentHash, undefined);
-  assert.match(e.lastError ?? "", new RegExp(`gave up after ${MAX_FEE_ATTEMPTS} attempts`));
+  assert.equal(e.state, "failed", "given up once its days are over");
+  assert.ok(took >= FEE_RETRY_DAYS * 24 * HOUR, "not before");
+  assert.ok(took < (FEE_RETRY_DAYS + 2) * 24 * HOUR, "and within about a day of it");
+  assert.equal(e.paymentHash, undefined, "its last payment confirmed failed first");
+  assert.match(e.lastError ?? "", GAVE_UP);
+  const attempts = e.attempts;
+  assert.ok(attempts > 10, `tried ${attempts} times — not the old ten`);
 
   for (let i = 0; i < 10; i++) {
     clock.advance(25 * HOUR);
     await ledger.processDue();
   }
-  assert.equal(sends(node).length, MAX_FEE_ATTEMPTS, "one payment per attempt, then none");
+  assert.equal(sends(node).length, attempts, "one payment per attempt, then none");
   assert.deepEqual(
     ledger.problems().map((p) => p.key),
     ["magma:no-route"],
@@ -423,6 +427,28 @@ test("a payment that keeps failing is given up after the last attempt, with exac
   const alerts = serviceFeeAlerts(ledger);
   assert.equal(alerts.length, 1);
   assert.match(alerts[0].message, /no-route.*not paid: .*gave up/);
+});
+
+test("a fee that can't be paid for a long weekend is still paid after it — retried for 30 days, not given up after ten attempts (about three days)", async (t) => {
+  feeEnv(t);
+  const http = installFetchMock(t);
+  const { node, ledger, clock } = setup(t);
+  mockLnurlPayServer(http, { address: ADDRESS, now: clock.now });
+  node.payOutcome = "fail"; // no route to the fee node over the weekend
+  ledger.enqueue({ source: "magma", orderId: "weekend", earnedSats: 20_000 });
+  await ledger.processDue();
+  for (let i = 0; i < 12; i++) {
+    clock.advance(9 * HOUR);
+    await ledger.processDue();
+  }
+  let [e] = ledger.entries();
+  assert.equal(e.state, "pending", `still owed after ${e.attempts} attempts in 4½ days`);
+  assert.equal(ledger.problems().length, 0, "and no alert: it is still being tried");
+  node.payOutcome = "succeed"; // the route is back
+  await untilSettled(ledger, clock, 3);
+  [e] = ledger.entries();
+  assert.equal(e.state, "paid");
+  assert.equal(e.paidSats, 200);
 });
 
 test("a last attempt we stopped waiting for, then confirmed failed, gives up with the real reason", async (t) => {
@@ -450,9 +476,9 @@ test("a last attempt we stopped waiting for, then confirmed failed, gives up wit
         earnedSats: 20_000,
         bps: 100,
         feeSats: 200,
-        createdAt: new Date(Date.now() - 5 * 86_400_000).toISOString(),
+        createdAt: new Date(Date.now() - (FEE_RETRY_DAYS + 1) * 86_400_000).toISOString(),
         state: "inflight",
-        attempts: MAX_FEE_ATTEMPTS,
+        attempts: 34,
         nextAttemptAt: new Date(Date.now() - 60_000).toISOString(),
         paymentHash: hash,
         lastError: "payment still in flight after 60s — will check its outcome",
@@ -464,7 +490,7 @@ test("a last attempt we stopped waiting for, then confirmed failed, gives up wit
   await ledger.processDue();
   const [e] = ledger.entries();
   assert.equal(e.state, "failed");
-  assert.equal(e.lastError, `the payment failed (gave up after ${MAX_FEE_ATTEMPTS} attempts)`);
+  assert.equal(e.lastError, `the payment failed (gave up after 34 attempts in ${FEE_RETRY_DAYS} days)`);
   assert.equal(sends(node).length, 0);
   assert.equal(http.requests.length, 0);
 });

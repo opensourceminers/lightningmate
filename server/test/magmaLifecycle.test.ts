@@ -507,6 +507,10 @@ test("fees.seller reads 0 until settlement: the HODL invoice is fees.fixed + fee
   feeEnv(t);
   quiet(t);
   const { autopilot, node, magma, dir, earnings, fees } = sellerSetup(t);
+  // The parts are billed only as the offer's price for the size (review
+  // 2026-10-25): 2M at 3,000 ppm + 852 sat = 6,852 sat, to within a sat.
+  magma.addOffer({ feeRatePpm: 3000, baseFeeSats: 852 });
+  await autopilot.runOnce();
   const sale = magma.addSale({ buyerPubkey: BUYER, feeSeller: "0", feeFixed: "852", feeVariable: "6000.5" });
   await autopilot.pollSellOrders();
   const inv = acceptedInvoice(magma.sales.get(sale.id)!);

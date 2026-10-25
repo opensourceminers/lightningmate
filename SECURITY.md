@@ -194,8 +194,9 @@ Fees are paid from a persistent ledger in the background — never inside an
 order's accept/open/settle path — with a hard per-attempt timeout, retries with
 backoff, and a recorded payment hash so a crash or timeout can never pay twice.
 A fee refused for a security reason (wrong amount, wrong payee, foreign
-callback) raises an alert at once; a fee that still has not gone through after
-10 attempts (about three days) is given up and raises an alert too. Dismissing
+callback) raises an alert at once; a fee that still has not gone through 30
+days after its sale (tried about daily after the first day) is given up and
+raises an alert too. Dismissing
 an alert silences only the problem it showed: a later, different one — another
 kind of refusal, or the give-up after a dismissed refusal — is alerted again.
 

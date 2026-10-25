@@ -6,7 +6,8 @@ import { getOwnPubkey } from "./node.js";
 import { computeNodeNeed, type NodeNeed } from "./suggestRecommend.js";
 import { saleFeeConfig } from "./serviceFee.js";
 import { getMarket, type MagmaOffer } from "./amboss.js";
-import { getMyOffers, getMyOrders, type MyOffer, type MyOrder } from "./magmaApi.js";
+import { getMyOffers, getMyOrders, waitingOnYou, type MyOffer, type MyOrder } from "./magmaApi.js";
+import { standardChannelId } from "./leases.js";
 import { errorText as errorMessage } from "./errorText.js";
 import {
   clearingFor,
@@ -87,6 +88,14 @@ export interface MagmaV2Config {
    *  clock of another base of the offer's (one moved since) doesn't count —
    *  and when the autopilot last moved the offer's base (baseFeeFollow). */
   baseMoves: Record<string, { since?: string; offerBase?: number; movedAt?: string }>;
+  /** What the order lane can sell in one channel right now
+   *  (Autopilot.sellCapital: the wallet after the reserve and the coins
+   *  promised to orders, within what the deploy cap has left). Null: not
+   *  known — the wallet after the reserve stands in. */
+  sellableNowSat: number | null;
+  /** Does the order lane open this paid order's channel itself
+   *  (MagmaDesk.opensItself)? Such an order isn't waiting on you. */
+  laneOpens: (orderId: string) => boolean;
 }
 
 export const MAGMA_V2_DEFAULTS: MagmaV2Config = {
@@ -119,6 +128,8 @@ export const MAGMA_V2_DEFAULTS: MagmaV2Config = {
   autoSizeLease: false,
   operatorOfferIds: [],
   baseMoves: {},
+  sellableNowSat: null,
+  laneOpens: () => false,
 };
 
 export type MagmaSellOfferState =
@@ -295,6 +306,9 @@ export interface MagmaV2Report {
     onchainOpenCostSat: number;
     onchainCloseCostSat: number;
     onchainFeePerVbyte: number | null;
+    /** The order lane's accept floor at that rate (saleAcceptFloorSats): an
+     *  order paying less is turned down as below cost. */
+    acceptFloorSat: number;
     pendingSellerOrders: number;
     /** Real completed Magma orders from Amboss, for our own size band. */
     clearing: ClearingStats | null;
@@ -436,6 +450,23 @@ export function saleAcceptFloorSats(feePerVbyte: number | null, serviceFeeRate: 
     minNetLeaseProfitSat: 0,
     serviceFeeRate,
   });
+}
+
+/** What an order of `sizeSat` pays at a price: rate × size + base (sat). The
+ *  order lane compares this with its accept floor; the upkeep and the base
+ *  fee's check below use the same sum. */
+export function orderFeeSat(feeRatePpm: number, baseFeeSats: number, sizeSat: number): number {
+  return (feeRatePpm * sizeSat) / 1_000_000 + baseFeeSats;
+}
+
+/** The smallest order (rounded up to 10k sat) whose fee at a price covers
+ *  `floorSat` — the order lane's accept floor (saleAcceptFloorSats): every
+ *  smaller one it turns down as below cost. 0 when the base alone covers it;
+ *  Infinity when nothing does (no rate, a base under the floor). */
+export function minSizeCoveringSat(feeRatePpm: number, baseFeeSats: number, floorSat: number): number {
+  if (!(floorSat > 0) || baseFeeSats >= floorSat) return 0;
+  if (!(feeRatePpm > 0)) return Number.POSITIVE_INFINITY;
+  return Math.ceil(((floorSat - baseFeeSats) * 1_000_000) / feeRatePpm / 10_000) * 10_000;
 }
 
 export async function getMagmaRecommendations(
@@ -672,7 +703,9 @@ export async function getMagmaRecommendations(
     const minBlock = pricingLease(offer);
     const repSize = Math.round(Math.sqrt(Math.max(minSize, 1) * Math.max(maxSize, minSize)));
     const seg = segmentFor(repSize, minSize, maxSize, minBlock);
-    const floorEff = Math.round(profitFloorEffectivePpm(repSize, minBlock));
+    // Rounded up: a price exactly at the floor is at it, never "below" or
+    // "doesn't beat routing" by a rounding (review 2026-10-25).
+    const floorEff = Math.ceil(profitFloorEffectivePpm(repSize, minBlock));
 
     // ── Target price ──────────────────────────────────────────────────────────
     // Priced against what the market actually PAYS, not what sellers ask.
@@ -741,7 +774,7 @@ export async function getMagmaRecommendations(
         : null;
     const baseHeld = baseDiffers && follow !== null && follow.at !== null;
     let baseFee = !offer ? preferredBaseFeeSats(null, marketBase) : baseDiffers && !baseHeld && marketBase !== null ? marketBase : offer.baseFeeSats;
-    const feeAtMinSat = (p: PricePoint) => (p.feeRatePpm * minSize) / 1_000_000 + p.baseFeeSat;
+    const feeAtMinSat = (p: PricePoint) => orderFeeSat(p.feeRatePpm, p.baseFeeSat, minSize);
     let baseRefusedSat: number | null = null;
     if (offer && baseFee !== offer.baseFeeSats) {
       for (const eff of current ? [targetEff, current.effectiveFeePpm] : [targetEff]) {
@@ -839,10 +872,20 @@ export async function getMagmaRecommendations(
     if (offer && offer.status !== "ENABLED") {
       state = "inactive";
       mode = "hold";
+    } else if (current && current.effectiveFeePpm < floorEff) {
+      // A listed offer under its profit floor is raised first — whatever the
+      // market or the routing comparison says (review 2026-10-25: checked
+      // after "uncompetitive" and "unprofitable", neither of which reprices,
+      // an offer at 4,445 ppm against a 10,277 ppm floor stayed there).
+      state = "below_profit_floor";
+      shouldReprice = true;
+      repriceDirection = "up";
+      reasons.push(`current price is below your profit floor (${floorEff} ppm effective) — raise it`);
     } else if (floorEff > seg.p75) {
-      // Our profitable price is above the top of the market — listing won't fill.
+      // The price that pays for the lease is above what comparable offers ask.
+      // (Not "won't fill": Amboss picks sellers by score and depth, not price.)
       state = "do_not_list_uncompetitive";
-      reasons.push("profitable price is above current market — an offer here may not fill quickly");
+      reasons.push(`the price that pays for this lease (${floorEff} ppm effective) is above what comparable offers ask — not listed automatically`);
     } else if (!beatsRouting && cfg.sellPricingMode !== "premium") {
       state = "do_not_list_unprofitable";
       reasons.push("even the recommended price barely beats routing — better to keep this capital routing");
@@ -851,11 +894,6 @@ export async function getMagmaRecommendations(
       reasons.push("offer is depleted — relist at today's recommended price, not the old one");
       shouldReprice = current ? recommended.effectiveFeePpm > current.effectiveFeePpm : false;
       repriceDirection = "up";
-    } else if (current && current.effectiveFeePpm < floorEff) {
-      state = "below_profit_floor";
-      shouldReprice = true;
-      repriceDirection = "up";
-      reasons.push(`current price is below your profit floor (${floorEff} ppm effective) — raise it`);
     } else if (current) {
       const delta = recommended.effectiveFeePpm - current.effectiveFeePpm;
       const threshold = Math.max(cfg.minRepriceDeltaPpm, recommended.effectiveFeePpm * cfg.relativeRepriceThreshold);
@@ -1097,7 +1135,14 @@ export async function getMagmaRecommendations(
     avgLeaseFeePpm: leasePpms.length ? Math.round(median(leasePpms)) : null,
     fillRate: myOrders.length ? Math.round((filled.length / myOrders.length) * 100) / 100 : null,
     // The Magma API's list says only when a lease is over (0 blocks left).
-    closableSoon: myOrders.filter((o) => o.blocksUntilClosable !== null && o.blocksUntilClosable <= 288).length,
+    // Leases ending within two days whose channel is still open (review
+    // 2026-10-25: every lease that ever ended counted, its channel closed
+    // long ago or not).
+    closableSoon: myOrders.filter((o) => {
+      if (o.blocksUntilClosable === null || o.blocksUntilClosable > 288) return false;
+      const id = standardChannelId(o.channelId);
+      return id !== null && channels.some((c) => c.id === id);
+    }).length,
   };
 
   // ── On-chain cost surfaced + spike warning (#4) ──
@@ -1109,9 +1154,20 @@ export async function getMagmaRecommendations(
     );
 
   // ── Seller-score / pending-order risk (#5) ──
-  if (myOrdersView.pendingSeller > 0)
+  // What each kind waits on you for (review 2026-10-25: an order awaiting
+  // approval was told to "open the channel", and a paid order the lane opens
+  // itself counted as waiting on you).
+  const awaitingDecision = myOrders.filter((o) => o.status === "WAITING_FOR_SELLER_APPROVAL").length;
+  const awaitingOpen = waitingOnYou(myOrders, cfg.laneOpens) - awaitingDecision;
+  const pendingSeller = awaitingDecision + awaitingOpen;
+  const one = (n: number, it: string, them: string) => (n === 1 ? it : them);
+  if (awaitingDecision > 0)
     sellWarnings.push(
-      `${myOrdersView.pendingSeller} order${myOrdersView.pendingSeller === 1 ? "" : "s"} waiting on you — open the channel${myOrdersView.pendingSeller === 1 ? "" : "s"} in time or your seller score drops`,
+      `${awaitingDecision} order${one(awaitingDecision, "", "s")} waiting for your decision — accept or reject ${one(awaitingDecision, "it", "them")} on Market → Orders in time, or your seller score drops`,
+    );
+  if (awaitingOpen > 0)
+    sellWarnings.push(
+      `${awaitingOpen} paid order${one(awaitingOpen, "", "s")} waiting for you to open ${one(awaitingOpen, "its channel", "their channels")} — open ${one(awaitingOpen, "it", "them")} in time, or your seller score drops`,
     );
 
   // Report and price card must describe the SAME band, or the page contradicts
@@ -1134,11 +1190,15 @@ export async function getMagmaRecommendations(
   // user's cap or simply the coins on chain. Those need different answers: one is
   // a setting, the other is a funding problem, and conflating them is how an
   // offer stays idle while the operator tunes the wrong knob.
-  const effectiveMaxOrderSat = Math.min(cfg.maxSellSizeSat, Math.max(0, deployableCapitalSat));
+  // The order lane's own figure where it is known (review 2026-10-25: the
+  // wallet after the reserve alone — the deploy cap already used and the
+  // coins promised to accepted orders still counted as fundable, and the lane
+  // turned down orders of the size the page said could be funded).
+  const effectiveMaxOrderSat = Math.min(cfg.maxSellSizeSat, Math.max(0, deployableCapitalSat), Math.max(0, cfg.sellableNowSat ?? Number.POSITIVE_INFINITY));
   const capitalLimited = effectiveMaxOrderSat < cfg.maxSellSizeSat;
   if (capitalLimited)
     sellWarnings.push(
-      `your cap allows ${sizeLabel(cfg.maxSellSizeSat)} orders but only ${sizeLabel(effectiveMaxOrderSat)} is funded on-chain — orders above that are turned down`,
+      `your cap allows ${sizeLabel(cfg.maxSellSizeSat)} orders but only ${sizeLabel(effectiveMaxOrderSat)} can be sold now (the wallet after the reserve and the coins promised to orders, within what the deploy cap has left) — orders above that are turned down`,
     );
 
   const recommendedMaxSizeSat = sellWindow.max;
@@ -1189,7 +1249,8 @@ export async function getMagmaRecommendations(
       onchainOpenCostSat,
       onchainCloseCostSat,
       onchainFeePerVbyte,
-      pendingSellerOrders: myOrdersView.pendingSeller,
+      acceptFloorSat,
+      pendingSellerOrders: pendingSeller,
       clearing: reportClearing,
       marketActivity: marketActivity(),
       historyAgeHours: magmaHistoryAgeHours(),

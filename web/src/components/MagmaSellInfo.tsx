@@ -229,9 +229,12 @@ export function HowAmbossPicks({
   usdOrderSat,
   usdAtOwnPriceSat,
   feeTiers,
+  feeBps = 100,
 }: {
   usdOrderSat?: number | null;
   usdAtOwnPriceSat?: number | null;
+  /** The service fee as configured (LM_SELL_FEE_BPS); 0: none. */
+  feeBps?: number;
   /** The live book's Amboss fee tiers (eligibility check); none: the dated ones. */
   feeTiers?: { ambossFeePpm: number; upToSats: number | null }[] | null;
 }) {
@@ -289,8 +292,8 @@ export function HowAmbossPicks({
           <b>So for a small node, price and size are not the lever.</b> With Liquidity provision on, LightningMate fulfils orders
           fast and safely and keeps every offer within what it can fund; with auto-size on, it also gives the offers it manages
           the standard 30-day lease, a routing-fee promise (which the fee autopilot keeps for every channel sold) and a size
-          window it can fund. Whether Amboss sends an order is Amboss's choice. The 1% service fee applies only to completed
-          sales.
+          window it can fund. Whether Amboss sends an order is Amboss's choice.
+          {feeBps > 0 ? ` The ${feeBps / 100}% service fee applies only to completed sales.` : ""}
         </li>
         <li>
           <b>Other uses of the same capital:</b> a routing channel to a well-connected peer usually earns more on a small node; LN+

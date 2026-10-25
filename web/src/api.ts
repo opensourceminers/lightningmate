@@ -83,6 +83,7 @@ import type {
   OnchainTx,
   OpenChannelResult,
   OpenEstimate,
+  OrderAcceptRequest,
   OrderActionRequest,
   OrderQuery,
   OrderState,
@@ -368,7 +369,11 @@ export const api = {
     post<OfferToggleResult, OfferToggleRequest>("/amboss/offer/toggle", want ? { id, want } : { id }),
   // Manual order actions go through the same order journal as the autopilot;
   // a failure answers with an error status (thrown here), never 200 + ok:false.
-  ambossAcceptOrder: (id: string) => post<DeskResult, OrderActionRequest>("/amboss/order/accept", { id }),
+  /** A 409 "below_cost" refusal (the order pays less than its channel costs
+   *  on chain now) is thrown as an ApiError; send again with `belowCost`
+   *  only after the operator confirmed it (magmaView belowCostRefusal). */
+  ambossAcceptOrder: (id: string, belowCost = false) =>
+    post<DeskResult, OrderAcceptRequest>("/amboss/order/accept", { id, ...(belowCost ? { belowCost } : {}) }),
   ambossOpenOrder: (id: string) => post<DeskResult, OrderActionRequest>("/amboss/order/open", { id }),
   ambossRejectOrder: (id: string) => post<DeskResult, OrderActionRequest>("/amboss/order/reject", { id }),
   backupStatus: () => get<BackupStatus>("/backup/status"),

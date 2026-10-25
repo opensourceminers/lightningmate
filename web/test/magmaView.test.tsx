@@ -165,7 +165,7 @@ test("D7/a6: the Sell form starts on the standard 30-day lease and a window the 
   // A max above what the autopilot will serve is called out before listing.
   const config = { sellEnabled: true, ...caps };
   assert.match(offerSizeWarning({ maxSizeSats: 5_000_000 }, config, 3_000_000) ?? "", /Channels above 2,000,000 sat \(your max channel size\) would be turned down/);
-  assert.match(offerSizeWarning({ maxSizeSats: 1_900_000 }, config, 1_500_000) ?? "", /what your wallet can fund now/);
+  assert.match(offerSizeWarning({ maxSizeSats: 1_900_000 }, config, 1_500_000) ?? "", /what can be sold now — the wallet after the reserve and promised coins, within the deploy cap/);
   assert.equal(offerSizeWarning({ maxSizeSats: 1_000_000 }, config, 1_500_000), null);
   assert.equal(offerSizeWarning({ maxSizeSats: 5_000_000 }, { ...config, sellEnabled: false }, 0), null, "selling off: you decide each order");
 });

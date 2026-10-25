@@ -1,4 +1,4 @@
-import { getChannels, getWalletInfo, type AuthenticatedLnd } from "lightning";
+import { getChannels, getWalletInfo, type AuthenticatedLnd, type GetChannelsResult } from "lightning";
 import { JsonStore, recordStoreIncident } from "../store.js";
 import {
   AmbossError,
@@ -36,7 +36,7 @@ import {
   type FoundInvoice,
   type HodlStatus,
 } from "./hodl.js";
-import { channelsWith, findOpenedChannel, spendableOnchain, type CapitalLedger } from "./capital.js";
+import { channelsWith, findOpenedChannel, saleTag, spendableOnchain, type CapitalLedger } from "./capital.js";
 import {
   MissingPermission,
   closeChannelByOutpoint,
@@ -54,6 +54,7 @@ import { errorText } from "./errorText.js";
 import { getOwnPubkey } from "./node.js";
 import type { SoldLease } from "./leaseCaps.js";
 import { standardChannelId } from "./leases.js";
+import { orderFeeSat } from "./magmaRecommend.js";
 
 /**
  * Magma selling, end to end, on the Magma API — the "order desk".
@@ -154,6 +155,15 @@ const REJECT_MARGIN_MS = 2 * 60_000;
  *  match is not missed). It does not stay 0 "until settled": the order of
  *  2026-10-23 read 0 in every fee part from its first read to its end. */
 const ZERO_FEE_GRACE_MS = 60_000;
+/** An invoice billed from an order's fee parts (fees.seller read 0) must be
+ *  an offer's price for the order's size to within this many sats. */
+const PARTS_MATCH_SATS = 1;
+/** Slack when the block an order was placed in is estimated from its time at
+ *  10 minutes a block: a few blocks, plus a tenth of the blocks since — blocks
+ *  come faster than that while the hashrate grows, and a day can run 10+
+ *  blocks ahead of 144 (as leases.ts allows for purchases). */
+const ORDER_HEIGHT_SLACK_BLOCKS = 6;
+const ORDER_HEIGHT_SLACK_SHARE = 0.1;
 /** An order the lane was deciding when selling was switched off (or all
  *  automation paused): nothing was promised — it is the operator's now. */
 export const SELLING_OFF_SKIP =
@@ -206,6 +216,10 @@ const SEEN_MAX_AGE_MS = 24 * 3_600_000;
 const REPORT_RESEND_MS = 10 * 60_000;
 /** The deployed-capital listing is re-read at most this often. */
 const DEPLOYED_TTL_MS = 30_000;
+/** A listing of sold capital that fails: the last good one stands for this
+ *  long (with this journal's own sales since), so an order the wallet can fund
+ *  is still decided (review 2026-10-25: it was rejected at its deadline). */
+const DEPLOYED_FALLBACK_MS = 60 * 60_000;
 /** The last listing of this node's sales with a running lease (the lease
  *  registry's fallback for sales the journal never recorded) is trusted this
  *  long; the close list and a close ask Amboss again after it. */
@@ -288,6 +302,15 @@ export interface MagmaDeskDeps {
    *  routes well enough to keep (Autopilot.soldChannelClose). Without it,
    *  no such channel is closed: never at any rate. */
   soldChannelClose?: () => Promise<{ feeRate: number | null; maxFeeRate: number; routesWell: (channelId: string) => boolean }>;
+  /** The prices this node's offers ask, or asked lately
+   *  (Autopilot.knownOfferPrices): an invoice billed from an order's fee
+   *  parts — fees.seller read 0 — must be one of them for the order's size.
+   *  Without it, the lane bills no such order. */
+  offerPrices?: () => Array<{ feeRatePpm: number; baseFeeSats: number }>;
+  /** The routing fee a new channel starts with (Autopilot.initialRoutingFee):
+   *  a sold channel's too, within what its lease promised. Without it, LND's
+   *  own default. */
+  initialRoutingFee?: () => { feeRatePpm: number; baseFeeMsat: number };
 }
 
 /** A finished lease's channel with less than this share of its capacity on
@@ -327,8 +350,16 @@ export interface DeskResult {
     | "unreachable"
     | "not_held"
     | "journal"
-    | "open_failed";
+    | "open_failed"
+    /** An accept by hand that pays less than its channel costs on chain now:
+     *  sent again with `belowCost: true` only after the operator said yes. */
+    | "below_cost";
   message: string;
+  /** With "below_cost": what the order pays, and the accept floor — what
+   *  opening and closing its channel costs on chain now, after the service
+   *  fee (sat). */
+  feeSats?: number;
+  floorSats?: number;
   phase?: MagmaPhase;
   outpoint?: string;
   transactionId?: string;
@@ -354,6 +385,8 @@ export interface MagmaOrderLocal {
   booked: boolean | null;
   /** Ended here without LightningMate taking it on (see the journal). */
   external: MagmaJournalEntry["external"] | null;
+  /** What our hold invoice bills — what the order earns (null: none yet). */
+  invoiceSats?: number | null;
 }
 
 export type { RefusalKind } from "./magmaJournal.js";
@@ -533,7 +566,12 @@ export class MagmaDesk {
   private lane: Omit<LaneStatus, "running" | "openOrders"> = { lastTickAt: null, ok: null, error: null, retrying: false, idle: null };
   /** Magma capital in sold channels with a running lease (and orders accepted
    *  outside this journal), from the last listing — the deploy-cap share. */
-  private deployed = { sats: 0, at: 0 };
+  /** Amboss's last good listing of this node's sold capital: the sats (the
+   *  orders this journal reserved then left out), when, and the orders it
+   *  showed waiting for this node's approval. */
+  private deployed: { sats: number; at: number; awaiting: string[] } = { sats: 0, at: 0, awaiting: [] };
+  /** When that listing last failed (it isn't asked again at once). */
+  private deployedFailedAt = 0;
   /** This node's sales Amboss reports with a running lease and a channel,
    *  from the same listing (refreshDeployed) — the lease registry's fallback
    *  for sales this journal never recorded (leases.ts) — and when that
@@ -583,7 +621,7 @@ export class MagmaDesk {
     deps.capital.register("magma", {
       // Each accepted order's open will be checked against the sell reserve.
       reservations: () => this.journal.reservations(deps.config().sellReserveSats),
-      deployedSat: () => this.deployed.sats,
+      deployedSat: () => this.deployedNow(),
       claimedOutpoints: () => this.journal.claimedOutpoints(),
       // A lease Amboss still lists as running holds — the routing-fee
       // promise and the rebalancer's hands-off alike — whatever the
@@ -751,6 +789,7 @@ export class MagmaDesk {
       lastError: e.lastError ?? null,
       booked: e.phase === "settled" ? !e.unbooked : null,
       external: e.external ?? null,
+      invoiceSats: BigInt(e.feeMsat || "0") > 0n ? Number(BigInt(e.feeMsat) / 1000n) : null,
     };
   }
 
@@ -1034,6 +1073,17 @@ export class MagmaDesk {
           // with selling on the next pass ACCEPTED the order they had
           // rejected — and once it was paid, opened its channel.
           else if (entry && rejectByHand(entry)) out.push(...(await this.rejectOrder(entry, REJECTED_BY_YOU)));
+          // The lane's own reject that Amboss didn't confirm ("will try
+          // again"), with Liquidity provision switched off — or all
+          // automation paused — since: nothing sends it again (the lane
+          // decides nothing now). The order is the operator's, and its record
+          // says so; the retry it promised goes. (Before, it kept "will try
+          // again" while the order timed out on the operator.)
+          else if (entry?.phase === "seen" && entry.via === "autopilot" && entry.decision?.action === "reject" && !cfg.sellEnabled) {
+            entry.lastError = undefined;
+            entry.lastErrorAt = undefined;
+            out.push(this.skip(entry, SELLING_OFF_SKIP));
+          }
           // A new order is the lane's to decide while Liquidity provision is
           // on. One the operator is deciding is taken up whatever the switch
           // says — only to say so on its record: decide() leaves it to them.
@@ -1599,11 +1649,17 @@ export class MagmaDesk {
       }
       return this.rejectOrder(entry, "Amboss priced it at 0 sats for this node — there is nothing to earn");
     }
+    // fees.seller reads 0 while its parts don't: the lane bills the parts only
+    // when they are an offer's price for the order's size. Anything else —
+    // more than Amboss pays out, or less than the order earns — is not billed
+    // here: the order is the operator's to judge, neither accepted nor turned
+    // down by the lane (review 2026-10-25: the parts were billed unchecked).
+    const unmatched = this.partsUnmatched(order);
+    if (unmatched) return [this.skip(entry, unmatched)];
     // Never at a loss, however the order came to be priced so (an offer listed
     // too low for a while, a price set elsewhere): what it pays must at least
     // cover opening and closing its channel on chain.
-    const floor = this.deps.saleFloorSats ? await this.deps.saleFloorSats() : 0;
-    const floorSats = Number.isFinite(floor) && floor > 0 ? Math.ceil(floor) : 0;
+    const floorSats = await this.acceptFloorSats();
     if (fee < BigInt(floorSats) * 1000n) {
       return this.rejectOrder(
         entry,
@@ -1649,6 +1705,35 @@ export class MagmaDesk {
     if (!reached.ok) return this.rejectOrder(entry, "the buyer's node is unreachable");
     if (this.stopping) return [this.skip(entry, "shutting down")];
     return this.acceptOrder(entry, order, fee, "autopilot", pass);
+  }
+
+  /** The accept floor (deps.saleFloorSats) in whole sats; 0 without one. */
+  private async acceptFloorSats(): Promise<number> {
+    const floor = this.deps.saleFloorSats ? await this.deps.saleFloorSats() : 0;
+    return Number.isFinite(floor) && floor > 0 ? Math.ceil(floor) : 0;
+  }
+
+  /**
+   * Why the lane can't bill an order's fee parts — or null: fees.seller reads
+   * more than 0 (it is billed), or the parts (fixed + variable) are an offer's
+   * price for the order's size, fee rate × size + base, to within a sat — of
+   * an offer of this node, at a price it asks or asked lately. fees.seller
+   * is what Amboss pays out: an invoice above it is never paid, one below it
+   * earns less. (Not seen live: the 0 order of 2026-10-23 had every part 0.)
+   */
+  private partsUnmatched(order: SaleOrder): string | null {
+    if ((msatOf(order.fees.seller) ?? 0n) > 0n) return null;
+    const parts = Number(this.invoiceMsat(order)) / 1000;
+    const prices = this.deps.offerPrices?.() ?? [];
+    const at = prices.map((p) => orderFeeSat(p.feeRatePpm, p.baseFeeSats, order.sizeSats));
+    if (at.some((sats) => Math.abs(sats - parts) <= PARTS_MATCH_SATS)) return null;
+    const fmt = (n: number) => Math.round(n).toLocaleString("en-US");
+    const distinct = [...new Set(at.map(fmt))];
+    const yours = distinct.length ? ` (your price${distinct.length === 1 ? "" : "s"}: ${distinct.join(" or ")} sat)` : "";
+    return (
+      `Amboss shows no amount for this order, and its fee parts — ${fmt(parts)} sat — aren't your price for a ${fmt(order.sizeSats)} sat channel${yours}: ` +
+      "the lane doesn't accept it; accept or reject it on Market → Orders"
+    );
   }
 
   private skip(entry: MagmaJournalEntry, reason: string): MagmaSellAction {
@@ -1974,17 +2059,28 @@ export class MagmaDesk {
    * its own invoice wait. (Review of P8, round 2: a pause during that lookup
    * still sent the lane's never-sent accept.)
    */
-  private async resumeAccept(entry: MagmaJournalEntry, order: SaleOrderDetail, pass: LanePass | null): Promise<MagmaSellAction[]> {
+  /** An accept whose invoice is gone, or too old to be sent again. */
+  private acceptStale(entry: MagmaJournalEntry): boolean {
     const inv = entry.invoice;
-    if (!inv || Date.parse(inv.expiresAt) - Date.now() < MIN_INVOICE_LIFE_MS) {
-      if (inv) await this.lndCancel(inv.id).catch(() => undefined);
-      // Nothing checks this accept again: its "checking with Amboss on the
-      // next pass" goes with it (backToSeen). Review of P9, final round: it
-      // stayed, shown before MANUAL_ACCEPT_SKIP on Market → Orders and in
-      // the recent orders, while the order waited for the operator.
-      this.backToSeen(entry);
-      this.journal.event(entry, "earlier accept never confirmed; its invoice was released");
-      this.journal.note(entry);
+    return !inv || Date.parse(inv.expiresAt) - Date.now() < MIN_INVOICE_LIFE_MS;
+  }
+
+  /** A stale accept (acceptStale) released: its invoice cancelled, the order
+   *  back to "seen". Nothing checks this accept again: its "checking with
+   *  Amboss on the next pass" goes with it (backToSeen). Review of P9, final
+   *  round: it stayed, shown before MANUAL_ACCEPT_SKIP on Market → Orders and
+   *  in the recent orders, while the order waited for the operator. */
+  private async releaseStaleAccept(entry: MagmaJournalEntry): Promise<void> {
+    const inv = entry.invoice;
+    if (inv) await this.lndCancel(inv.id).catch(() => undefined);
+    this.backToSeen(entry);
+    this.journal.event(entry, "earlier accept never confirmed; its invoice was released");
+    this.journal.note(entry);
+  }
+
+  private async resumeAccept(entry: MagmaJournalEntry, order: SaleOrderDetail, pass: LanePass | null): Promise<MagmaSellAction[]> {
+    if (this.acceptStale(entry)) {
+      await this.releaseStaleAccept(entry);
       // The lane's pass takes the order up afresh, as advance() does
       // (decide): a running lane decides on it again; one of the operator's
       // goes back to them, and so does one of the lane's own with selling
@@ -2141,6 +2237,12 @@ export class MagmaDesk {
         sockets: order.sockets,
         localTokens: entry.sizeSats,
         isPrivate: entry.isPrivate,
+        // Its order's tag — what finds it again (findOurOpen) — and a routing
+        // fee from the start: a new channel's, within the lease's promise
+        // (review 2026-10-25: LND's default 1 sat + 1 ppm until something
+        // set a fee — forever, with fee automation off).
+        description: saleTag("magma", entry.orderId),
+        ...this.startingRoutingFee(entry),
       });
       if (res.ok && res.transactionId) {
         this.recordFunding(entry, `${res.transactionId}:${res.transactionVout ?? 0}`);
@@ -2249,8 +2351,22 @@ export class MagmaDesk {
       pubkey: entry.buyerPubkey,
       capacity: entry.sizeSats,
       exclude: [...(entry.opening?.preExisting ?? []), ...this.deps.capital.claimedOutpoints()],
+      tag: saleTag("magma", entry.orderId),
     });
     return found?.outpoint ?? null;
+  }
+
+  /** The routing fee a sold channel opens with: a new channel's
+   *  (deps.initialRoutingFee), never above what its lease promised. */
+  private startingRoutingFee(entry: MagmaJournalEntry): { routingFeePpm?: number; routingBaseFeeMsat?: number } {
+    const start = this.deps.initialRoutingFee?.();
+    if (!start) return {};
+    const capPpm = entry.feeRateCapPpm;
+    const capBaseMsat = entry.baseFeeCapSats !== null ? entry.baseFeeCapSats * 1000 : null;
+    return {
+      routingFeePpm: capPpm !== null && capPpm >= 0 ? Math.min(start.feeRatePpm, capPpm) : start.feeRatePpm,
+      routingBaseFeeMsat: capBaseMsat !== null && capBaseMsat >= 0 ? Math.min(start.baseFeeMsat, capBaseMsat) : start.baseFeeMsat,
+    };
   }
 
   /**
@@ -2331,6 +2447,11 @@ export class MagmaDesk {
   private async settle(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<MagmaSellAction[]> {
     const base = { orderId: entry.orderId, action: "settle" as const, sizeSats: entry.sizeSats };
     if (entry.phase === "opening") await this.reconcileOpening(entry);
+    // Opened outside LightningMate (by hand with another tool, say): the
+    // channel Amboss names, as LND shows it — so the lease's routing-fee
+    // promise binds it and the rebalancer leaves it alone (review
+    // 2026-10-25: such a sale was settled, booked and charged with neither).
+    if (!entry.fundingOutpoint) await this.adoptReportedChannel(entry, order);
     if (!entry.fundingOutpoint) this.journal.event(entry, `Amboss reports ${order.status} but no funding outpoint is on record here`);
     // Amboss's word alone is never income: only a payment our invoice holds
     // is claimed, booked and charged the service fee.
@@ -2375,6 +2496,36 @@ export class MagmaDesk {
     );
     console.log(`[magma] order ${entry.orderId} complete: ${entry.sizeSats} sat channel, ${feeSatsOf(entry)} sat earned`);
     return [{ ...base, ok: true, transactionId: entry.fundingOutpoint?.split(":")[0] }];
+  }
+
+  /**
+   * The channel Amboss reports for an order with no outpoint on record, when
+   * LND shows it: ours, to the buyer, at the outpoint (or funding
+   * transaction) Amboss names — or with its channel id — and tied to no other
+   * sale. Only the outpoint is recorded: no "funded" time (its open was not
+   * this node's, and the deploy share counts it from Amboss's listing).
+   */
+  private async adoptReportedChannel(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<void> {
+    const [txid, vout] = String(order.transactionId ?? "").split(":");
+    const channelId = standardChannelId(order.channelId);
+    if (!txid && !channelId) return;
+    let channels: GetChannelsResult["channels"];
+    try {
+      channels = (await getChannels({ lnd: this.deps.readLnd, partner_public_key: entry.buyerPubkey })).channels;
+    } catch {
+      return; // LND didn't answer: the event below says no outpoint is on record
+    }
+    const claimed = new Set(this.deps.capital.claimedOutpoints());
+    const found = channels.find(
+      (c) =>
+        c.partner_public_key === entry.buyerPubkey &&
+        !c.is_partner_initiated &&
+        !claimed.has(`${c.transaction_id}:${c.transaction_vout}`) &&
+        ((!!txid && c.transaction_id === txid && (vout === undefined || Number(vout) === c.transaction_vout)) || (!!channelId && c.id === channelId)),
+    );
+    if (!found) return;
+    entry.fundingOutpoint = `${found.transaction_id}:${found.transaction_vout}`;
+    this.journal.event(entry, `its channel ${entry.fundingOutpoint} was opened outside LightningMate — taken from Amboss and LND`);
   }
 
   /** Book the completed sale and enqueue the disclosed service fee. Both are
@@ -2513,10 +2664,15 @@ export class MagmaDesk {
         pubkey: order.buyerPubkey,
         capacity: order.sizeSats,
         exclude: this.deps.capital.claimedOutpoints(),
-        // Funded before the order was placed (with a few blocks of slack for
-        // clocks): an older channel of ours to this buyer — a routing one, or
-        // a sale whose record was trimmed — never the one this buyer paid for.
-        notBeforeHeight: height - blocksSince - 6,
+        // Funded before the order was placed (with slack for clocks and for
+        // blocks faster than 10 minutes: ORDER_HEIGHT_SLACK_*): an older
+        // channel of ours to this buyer — a routing one, or a sale whose
+        // record was trimmed — never the one this buyer paid for. Review
+        // 2026-10-25: 6 blocks of slack missed, a day after the order, the
+        // channel opened right after it (158 blocks that day), and a second
+        // channel was opened for one payment.
+        notBeforeHeight: height - blocksSince - ORDER_HEIGHT_SLACK_BLOCKS - Math.ceil(blocksSince * ORDER_HEIGHT_SLACK_SHARE),
+        tag: saleTag("magma", order.id),
       });
       const fields = {
         ...terms,
@@ -2698,8 +2854,10 @@ export class MagmaDesk {
   /** Accept an order by hand: same journal, same HODL invoice, same capital
    *  check as the lane (the autopilot's caps don't bind a manual pick). An
    *  order accepted already, with an accept of ours under way here, is
-   *  answered as done. */
-  accept(id: string): Promise<DeskResult> {
+   *  answered as done. One that pays less than its channel costs on chain
+   *  now is refused ("below_cost") unless `belowCost` says the operator
+   *  confirmed it. */
+  accept(id: string, opts: { belowCost?: boolean } = {}): Promise<DeskResult> {
     return this.manual(id, async () => {
       const order = await this.readForManual(id);
       if ("ok" in order) return this.unreadClick(id, "accept", order);
@@ -2744,6 +2902,26 @@ export class MagmaDesk {
               ? "Amboss reports no fee for this order yet — try again in a minute."
               : "Amboss priced this order at 0 sats for this node — there is nothing to earn. Reject it rather than let it time out.",
           };
+        }
+        // Below what opening and closing its channel costs on chain now: only
+        // with the operator's explicit yes — the click is told both figures
+        // and asked (review 2026-10-25: an Accept sold below cost unasked,
+        // where the lane turns such an order down). Asked before the buyer is
+        // dialed; the order is theirs meanwhile — the lane leaves it alone.
+        if (!opts.belowCost) {
+          const floorSats = await this.acceptFloorSats();
+          if (fee < BigInt(floorSats) * 1000n) {
+            const feeSats = Number(fee) / 1000;
+            return {
+              ok: false,
+              code: "below_cost",
+              feeSats,
+              floorSats,
+              message:
+                `Not accepted: this order pays ${feeSats.toLocaleString("en-US")} sat — less than opening and closing its channel costs on chain now ` +
+                `(${floorSats.toLocaleString("en-US")} sat, after the service fee).`,
+            };
+          }
         }
         const reached = await this.connectBuyer(order);
         if (!reached.ok && reached.blocked) {
@@ -2875,6 +3053,12 @@ export class MagmaDesk {
       }
       const entry = this.journal.get(id);
       this.revive(entry, order.status); // as in accept
+      // An accept whose invoice has grown too old to send again (one that
+      // hung for most of an hour): nothing can complete it any more. Released
+      // first, as the lane's next pass would — then this reject goes out.
+      // (Before, the Reject was refused, and with selling on the lane then
+      // released the accept and accepted the order afresh.)
+      if (entry?.phase === "accepting" && this.acceptStale(entry)) await this.releaseStaleAccept(entry);
       // An accept of ours under way, though Amboss still shows the order
       // awaiting approval: completed first — one that may have reached Amboss
       // is never withdrawn (resumeAccept). Refused, as before — now saying
@@ -3018,26 +3202,73 @@ export class MagmaDesk {
   /** Magma capital whose lease is still running, plus orders accepted outside
    *  this journal (they will need coins too) — the deploy-cap share. */
   async refreshDeployed(force = false): Promise<number> {
-    if (!this.deps.amboss.hasKey()) return this.deployed.sats;
-    if (!force && Date.now() - this.deployed.at < DEPLOYED_TTL_MS) return this.deployed.sats;
+    if (!this.deps.amboss.hasKey()) return this.deployedNow();
+    if (!force && Date.now() - this.deployed.at < DEPLOYED_TTL_MS) return this.deployedNow();
+    // Failed a moment ago: the last good listing stands rather than another
+    // wait on Amboss (each failure can be a 15 s timeout).
+    if (!force && this.deployedFailedAt > 0 && Date.now() - this.deployedFailedAt < DEPLOYED_TTL_MS && this.lastListingUsable()) {
+      return this.deployedNow();
+    }
     const reserving = new Set(this.journal.reservations(0).map((r) => r.key));
     const own = await this.ownPubkey();
-    const { orders } = await this.ambossSales(this.deps.amboss.getKey(), {
-      status: [...LEASE_RUNNING_STATUSES, "WAITING_FOR_BUYER_PAYMENT", "WAITING_FOR_CHANNEL_OPEN"],
-    });
+    let orders: Awaited<ReturnType<MagmaDesk["ambossSales"]>>["orders"];
+    try {
+      ({ orders } = await this.ambossSales(this.deps.amboss.getKey(), {
+        status: [...LEASE_RUNNING_STATUSES, "WAITING_FOR_BUYER_PAYMENT", "WAITING_FOR_CHANNEL_OPEN", "WAITING_FOR_SELLER_APPROVAL"],
+      }));
+    } catch (err) {
+      // Only this listing failed: the last good one (under an hour old) with
+      // this journal's own sales since decides; the wallet check still runs
+      // (capitalFor). Older than that, the decision waits (undecided).
+      if (this.lastListingUsable()) {
+        this.deployedFailedAt = Date.now();
+        console.warn(`[magma] the listing of your sold capital failed (${errorText(err)}) — deciding on the one from ${new Date(this.deployed.at).toISOString()}`);
+        return this.deployedNow();
+      }
+      throw err;
+    }
+    this.deployedFailedAt = 0;
     // This node's sold capital only (another node of the account has its own
-    // wallet); orders this journal reserves are counted as reservations already.
-    const sats = orders
-      .filter((o) => o.sellerPubkey === own && !reserving.has(`magma:${o.id}`))
+    // wallet); orders this journal reserves are counted as reservations
+    // already; an order waiting for approval holds nothing of the wallet yet.
+    const mine = orders.filter((o) => o.sellerPubkey === own);
+    const sats = mine
+      .filter((o) => o.status !== "WAITING_FOR_SELLER_APPROVAL" && !reserving.has(`magma:${o.id}`))
       .reduce((s, o) => s + o.sizeSats, 0);
-    this.deployed = { sats, at: Date.now() };
+    this.deployed = { sats, at: Date.now(), awaiting: mine.filter((o) => o.status === "WAITING_FOR_SELLER_APPROVAL").map((o) => o.id) };
     const running = new Set<string>(LEASE_RUNNING_STATUSES);
     this.keepAmbossLeases(
       orders
         .filter((o) => o.sellerPubkey === own && running.has(o.status) && !!o.channelId)
         .map((o) => ({ orderId: o.id, channelId: o.channelId as string })),
     );
-    return sats;
+    return this.deployedNow();
+  }
+
+  /** The last good listing of sold capital is recent enough to decide on. */
+  private lastListingUsable(): boolean {
+    return this.deployed.at > 0 && Date.now() - this.deployed.at < DEPLOYED_FALLBACK_MS;
+  }
+
+  /**
+   * The deploy cap's share now: Amboss's last listing plus this journal's own
+   * sales funded since it, which that listing can't show yet. Before, an order
+   * funded within the listing's 30 s cache counted neither as reserved (it
+   * wasn't any more) nor as deployed (the cached listing predated it), and a
+   * second order got past the deploy cap (review 2026-10-25).
+   */
+  private deployedNow(): number {
+    if (this.deployed.at <= 0) return this.deployed.sats;
+    return this.deployed.sats + this.journal.fundedSince(this.deployed.at);
+  }
+
+  /** Orders that hold part of this node's offers unsold: waiting for its
+   *  approval (Amboss's last listing), or taken on here and not yet booked —
+   *  the offer upkeep tops up and gives back nothing meanwhile. */
+  ordersPending(): number {
+    const ids = new Set(this.lastListingUsable() ? this.deployed.awaiting : []);
+    for (const e of this.journal.pendingSale()) ids.add(e.orderId);
+    return ids.size;
   }
 
   /** A new listing of the running leases: in memory, and on disk when it

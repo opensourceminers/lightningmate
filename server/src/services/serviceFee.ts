@@ -271,8 +271,12 @@ const problemOf = (e: ServiceFeeEntry): string => `${e.state}:${e.lastErrorCode 
 /** Retry backoff after a failed attempt (index = attempts so far − 1). */
 const RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000, 3_600_000, 3 * 3_600_000, 6 * 3_600_000, 12 * 3_600_000];
 const LAST_RETRY_DELAY_MS = 24 * 3_600_000;
-/** With the delays above, ≈ 3 days of trying before a human is asked to look. */
-export const MAX_FEE_ATTEMPTS = 10;
+/** A fee is tried for this long after its sale (with the delays above: about
+ *  daily after the first day) before a human is asked to look. Review
+ *  2026-10-25: it was given up after 10 attempts — about three days, so a
+ *  fee server down over a long weekend cost the fee for good. */
+export const FEE_RETRY_DAYS = 30;
+const FEE_RETRY_WINDOW_MS = FEE_RETRY_DAYS * 86_400_000;
 /** How often an in-flight payment's final state is re-checked. */
 const INFLIGHT_RECHECK_MS = 5 * 60_000;
 const ENTRIES_KEPT = 500;
@@ -486,8 +490,8 @@ export class ServiceFeeLedger {
       }
       // The give-up check lives here because a failed payment keeps its hash
       // until LND confirms the failure — retryLater can't give up on it.
-      if (e.attempts >= MAX_FEE_ATTEMPTS) {
-        this.finish(e, "failed", `${e.lastError ?? "the payment did not go through"} (gave up after ${e.attempts} attempts)`);
+      if (this.outOfTime(e)) {
+        this.finish(e, "failed", `${e.lastError ?? "the payment did not go through"} (${this.gaveUp(e)})`);
         return;
       }
     }
@@ -604,8 +608,8 @@ export class ServiceFeeLedger {
     // A payment LND may still know about is never given up on here: its
     // outcome must be learned first (step 1 of the next pass asks LND, and
     // gives up there once the last attempt is confirmed failed).
-    if (!e.paymentHash && e.attempts >= MAX_FEE_ATTEMPTS) {
-      this.finish(e, "failed", `${e.lastError} (gave up after ${e.attempts} attempts)`);
+    if (!e.paymentHash && this.outOfTime(e)) {
+      this.finish(e, "failed", `${e.lastError} (${this.gaveUp(e)})`);
       return;
     }
     // Nothing is known to be in flight — a kept hash is only there for that
@@ -613,11 +617,22 @@ export class ServiceFeeLedger {
     e.state = "pending";
     // After the last attempt only the confirmation is left: ask soon, so the
     // give-up (and its alert) comes within minutes instead of a day later.
-    const lastAttempt = e.paymentHash !== undefined && e.attempts >= MAX_FEE_ATTEMPTS;
+    const lastAttempt = e.paymentHash !== undefined && this.outOfTime(e);
     e.nextAttemptAt = new Date(this.now() + (lastAttempt ? INFLIGHT_RECHECK_MS : retryDelay(e.attempts))).toISOString();
     const log = SECURITY_REFUSALS.has(e.lastErrorCode) ? console.error : console.warn;
     log(`[fee] ${e.key}: attempt ${e.attempts} failed — ${e.lastError}; next try ${e.nextAttemptAt}`);
     this.save();
+  }
+
+  /** Tried for FEE_RETRY_DAYS since its sale (an unreadable date: no more
+   *  waiting) — the next failure is given up, with an alert. */
+  private outOfTime(e: ServiceFeeEntry): boolean {
+    const since = Date.parse(e.createdAt);
+    return !Number.isFinite(since) || this.now() - since >= FEE_RETRY_WINDOW_MS;
+  }
+
+  private gaveUp(e: ServiceFeeEntry): string {
+    return `gave up after ${e.attempts} attempt${e.attempts === 1 ? "" : "s"} in ${FEE_RETRY_DAYS} days`;
   }
 
   private finish(e: ServiceFeeEntry, state: "skipped" | "failed", reason: string): void {

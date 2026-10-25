@@ -61,11 +61,17 @@ status and each area's last decision without exposing the Amboss key.
    `value_msat`, `state OPEN`, expiry about 49 h, `cltv_expiry 288`).
    - With `fees.seller` above 0, the invoice is for exactly that.
    - If `fees.seller` read **0** when the order was accepted, LightningMate
-     billed **`fees.fixed + fees.variable`** (`magmaDesk.invoiceMsat`).
-     Confirm on this sale that Amboss charges the buyer for that invoice and
-     moves the order on when it is paid — no mismatch error, no refund.
-   Note `fees.seller`, `fees.fixed`, `fees.variable` at accept time, the
-   invoice amount and what B paid.
+     billed **`fees.fixed + fees.variable`** (`magmaDesk.invoiceMsat`) — the
+     order lane only when that sum is the offer's price for the order's size
+     (fee rate × size / 1,000,000 + base, within 1 sat); any other amount it
+     leaves to you on Market → Orders ("Amboss shows no amount for this
+     order …"), and the Accept dialog says so. Confirm on this sale that
+     Amboss charges the buyer for that invoice and moves the order on when it
+     is paid — no mismatch error, no refund.
+   Note `fees.seller`, `fees.fixed`, `fees.variable`, `fees.buyer` and
+   Amboss's own fee at accept time, the invoice amount and what B paid — on
+   the first real sale, so the fallback is checked against what Amboss
+   really sends.
 
 **4. Payment held (B pays)**
 

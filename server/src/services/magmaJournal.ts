@@ -227,6 +227,26 @@ export class MagmaJournal {
       .map((e) => ({ key: `magma:${e.orderId}`, sats: e.sizeSats, reserveSat }));
   }
 
+  /** Orders that hold part of an offer and aren't sold yet: seen waiting for
+   *  this node's approval (and not past their deadline), taken on and not
+   *  yet settled, or settled and not yet booked — the offer upkeep tops up
+   *  and gives back nothing meanwhile. */
+  pendingSale(nowMs = Date.now()): MagmaJournalEntry[] {
+    return this.entries.filter((e) => {
+      if (e.phase === "seen") return !e.timeout || Date.parse(e.timeout) > nowMs;
+      if (e.phase === "settled") return !e.bookedAt;
+      return !TERMINAL_PHASES.has(e.phase);
+    });
+  }
+
+  /** The channels this node sold and funded after `sinceMs` (sat): a listing
+   *  of sold capital from before can't show them yet. */
+  fundedSince(sinceMs: number): number {
+    return this.entries
+      .filter((e) => (e.phase === "funded" || e.phase === "reported" || e.phase === "settled") && !e.closedAt && !!e.fundedAt && Date.parse(e.fundedAt) > sinceMs)
+      .reduce((sum, e) => sum + e.sizeSats, 0);
+  }
+
   /** Orders with something of ours under way: accepted (or being accepted)
    *  and not yet ended — what removing the Amboss key would leave hanging. */
   inFlight(): MagmaJournalEntry[] {

@@ -740,6 +740,13 @@ export interface OrderActionRequest {
   id: string;
 }
 
+/** An accept by hand. `belowCost`: the operator confirmed accepting an order
+ *  that pays less than its channel costs on chain now (refused without it:
+ *  409 "below_cost", with the order's fee and the floor). */
+export interface OrderAcceptRequest extends OrderActionRequest {
+  belowCost?: boolean;
+}
+
 // ── the query strings the web sends ─────────────────────────────────────────
 // What a GET carries after the `?`, the same way: the web client builds the
 // query from the type (web/src/api.ts get<Answer, Query>) and the route reads

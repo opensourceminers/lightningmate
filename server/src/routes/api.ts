@@ -59,6 +59,7 @@ import type {
   OnchainState as ApiOnchainState,
   OpenChannelResult as ApiOpenChannelResult,
   OpenEstimate,
+  OrderAcceptRequest,
   OrderActionRequest,
   OrderQuery,
   OrderState as ApiOrderState,
@@ -152,6 +153,7 @@ import {
   getMyOrders,
   toggleOffer,
   updateOffer,
+  waitingOnYou,
   type MyOffer,
   type OfferTerms,
 } from "../services/magmaApi.js";
@@ -627,7 +629,7 @@ export function createApiRouter(
           ...stateAlerts(config.dataDir),
           ...serviceFeeAlerts(serviceFees),
           ...magmaRefusalAlerts(autopilot.magma),
-          ...offerPriceAlerts(autopilot.offerSyncStatus(), autopilot.actsOnOffers()),
+          ...offerPriceAlerts(autopilot.offerSyncStatus(), autopilot.actsOnOffers(), autopilot.getState().config.sellAutoReprice),
           ...autopilot.onchainLockAlerts(),
         ]),
       );
@@ -1482,6 +1484,8 @@ export function createApiRouter(
         const refusal = spendPromised ? null : await promisedSpendRefusal(lnd, autopilot.capital, amount, { newChannel: true });
         return refusal ? { refusal } : { opened: await fundChannel(writeLnd, params) };
       });
+      // Coins spent outside the main run: the offers' capital, within seconds.
+      if ("opened" in done && done.opened.ok) autopilot.recheckOfferCapital();
       if ("refusal" in done) refusePromisedSpend(res, done.refusal);
       // An open also says the routing fee the channel starts with.
       else res.json((done.opened.ok ? { ...done.opened, startingFee: routing } : done.opened) satisfies ApiOpenChannelResult);
@@ -1841,6 +1845,8 @@ export function createApiRouter(
         res.json({ ok: false, transactionId: "", error: describeError(err) } satisfies OnchainSendResult);
         return;
       }
+      // Coins spent outside the main run: the offers' capital, within seconds.
+      if ("sent" in done && done.sent.ok) autopilot.recheckOfferCapital();
       if ("refusal" in done) refusePromisedSpend(res, done.refusal);
       else if ("invalid" in done) res.status(400).json({ error: "bad_send", message: done.invalid });
       else if ("confirm" in done) {
@@ -2368,7 +2374,8 @@ export function createApiRouter(
       // This node's sales only (one Amboss account can sell for several nodes).
       const view = await withAmboss(async () => getMyOrders(amboss.getKey(), await getOwnPubkey(lnd)));
       res.json({
-        pendingSeller: view.pendingSeller,
+        // Not the paid orders whose channel the lane opens itself.
+        pendingSeller: waitingOnYou(view.orders, (id) => autopilot.magma.opensItself(id)),
         lane: autopilot.magma.laneStatus(),
         orders: view.orders.map((o): ApiMyOrder => {
           const local = autopilot.magma.localView(o.id);
@@ -2650,7 +2657,7 @@ export function createApiRouter(
       r.code === "read_only" || r.code === "permission" ? 403
       : r.code === "no_key" ? 400
       : r.code === "shutting_down" || r.code === "journal" ? 503
-      : r.code === "bad_status" || r.code === "capital" || r.code === "unreachable" || r.code === "not_held" ? 409
+      : r.code === "bad_status" || r.code === "capital" || r.code === "unreachable" || r.code === "not_held" || r.code === "below_cost" ? 409
       : 502;
     res.status(status).json({ ...r, error: r.code ?? "failed" });
   };
@@ -2670,9 +2677,11 @@ export function createApiRouter(
   router.post(
     "/amboss/order/accept",
     wrap(async (req, res) => {
-      const id = orderId(bodyOf<OrderActionRequest>(req), res);
+      const body = bodyOf<OrderAcceptRequest>(req);
+      const id = orderId(body, res);
       if (!id) return;
-      const result = await autopilot.magma.accept(id);
+      // Below cost only with the operator's explicit yes (409 "below_cost" first).
+      const result = await autopilot.magma.accept(id, { belowCost: body.belowCost === true });
       // What happens once the buyer pays: the lane opens it, or you do.
       sendDesk(res, result.ok ? { ...result, opensItself: autopilot.magma.opensItself(id) } : result);
     }),

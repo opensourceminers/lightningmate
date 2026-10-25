@@ -134,6 +134,10 @@ export function offerPriceAlerts(
       listingWaits?: string;
       inSync: boolean;
       lastWrite: { ok: boolean; verified?: boolean; error?: string; by?: string; action?: string } | null;
+      /** Orders under this size pay less than their channel's on-chain cost
+       *  at today's fee rate — the lane turns them down (an offer whose window
+       *  the autopilot doesn't size). */
+      turnedDownUnderSat?: number;
       /** Set when the operator owns the offer's terms, when the autopilot
        *  took it off the market for being free, or when it is to be listed
        *  since Liquidity provision was switched on. */
@@ -142,6 +146,9 @@ export function offerPriceAlerts(
   },
   /** Liquidity provision on and not paused: the autopilot acts on offers. */
   selling: boolean,
+  /** Auto-pricing on: the autopilot prices (and lists again) the offers whose
+   *  terms are its own. */
+  autoPricing = false,
 ): Alert[] {
   const alerts: Alert[] = [];
   for (const e of sync.offers) {
@@ -160,16 +167,23 @@ export function offerPriceAlerts(
             : "Liquidity provision is off (or paused), so nothing changes it: set its price on Market → Sell or disable it, and reject any order it gets."),
       });
     } else if (e.amboss.status !== "ENABLED" && e.control?.freeDisabledAt && free) {
+      // Who lists it again, said exactly (review 2026-10-25: "LightningMate
+      // lists it again itself" was said of offers it never relists — the
+      // operator's own, or with auto-pricing off).
       alerts.push({
         level: "warn",
-        message: `Your Magma offer ${id} was taken off the market: Amboss listed it for free (0 ppm + 0 sat). Set its price on Market → Sell and enable it — with auto-pricing on, LightningMate lists it again itself once it has a price.`,
+        message:
+          `Your Magma offer ${id} was taken off the market: Amboss listed it for free (0 ppm + 0 sat). ` +
+          (autoPricing && !e.control.manual
+            ? "LightningMate lists it again itself — its terms written and checked first — once it has its price; or set one on Market → Sell."
+            : "Set its price on Market → Sell and enable it."),
       });
     } else if (e.amboss.status !== "ENABLED" && e.control?.listOnAt && free) {
       alerts.push({
         level: "warn",
         message:
           `Your Magma offer ${id} isn't listed yet: it has no price (0 ppm + 0 sat). Set its price on Market → Sell — ` +
-          `LightningMate lists it once it has one${e.control.manual ? "." : " (with auto-pricing on, it prices it itself once it knows a price)."}`,
+          `LightningMate lists it once it has one${e.control.manual || !autoPricing ? "." : " (it prices it itself once it knows a price)."}`,
       });
     } else if (e.amboss.status === "ENABLED" && !selling && e.lastWrite?.by === "autopilot" && e.lastWrite.action === "disable" && !e.lastWrite.ok) {
       // Listed with Liquidity provision off, LightningMate's disable not taken
@@ -191,6 +205,18 @@ export function offerPriceAlerts(
       alerts.push({
         level: "warn",
         message: `Amboss doesn't hold the terms LightningMate set for offer ${id} (${e.lastWrite.error ?? "it reads back different"}). Check it on Market → Sell.`,
+      });
+    }
+    // Listed, with a window that invites orders the lane turns down below
+    // cost (its window not the autopilot's to size): from which size.
+    if (e.amboss.status === "ENABLED" && e.turnedDownUnderSat !== undefined) {
+      alerts.push({
+        level: "warn",
+        message:
+          `Your Magma offer ${id}: orders under ${Math.round(e.turnedDownUnderSat).toLocaleString("en-US")} sat pay less than opening and closing their channel costs at today's fee rate — ` +
+          `LightningMate turns them down, and each refusal can cost seller score. ${
+            e.control?.manual ? "Raise its min channel (or its price) on Market → Sell." : "Turn on auto-size, or raise its min channel on Market → Sell."
+          }`,
       });
     }
   }

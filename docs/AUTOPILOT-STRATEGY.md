@@ -628,8 +628,9 @@ the one it keeps — a longer lease buyers use (60, 90, 180 days) is priced as s
 price for a shorter lease than the offer promises is never applied to it. With every
 offer-automation switch off, capital safety is all the autopilot does to an offer (its
 lease and routing-fee promise stay as they are). An offer the operator created or edited
-by hand is theirs: the autopilot changes none of its terms; enabling or disabling it by
-hand decides only whether it is listed. Switching Liquidity provision on lists the offers
+by hand is theirs: the autopilot changes none of its price or lease — capital safety still
+cuts its max channel and total to what can be funded (and gives them back once there is
+room); enabling or disabling it by hand decides only whether it is listed. Switching Liquidity provision on lists the offers
 that were disabled at that moment — its switch-off disables them — as LightningMate's last
 offer sync showed them, those still disabled at the first offer read after the switch (with
 no sync kept yet, every offer disabled at that read), each once it has a price and its
@@ -655,6 +656,31 @@ running lease is listed on, kept open when under a quarter of it is on our side 
 inbound worth keeping) or it earns at least what a sat of this node's month-old channels earns,
 and closed at LND's economy rate — never above the maximum on-chain fee rate
 (`channelMaxFeeRate`), never without an estimate. A 1% service fee applies to completed sales.
+
+**Never an order below cost (review 2026-10-25).** The order lane turns down an order that
+pays less than opening and closing its channel costs on chain at today's fee rate (its
+accept floor, `saleAcceptFloorSats`); the offer upkeep checks every listed offer against
+the same number, at the price it is written with. With auto-size, and terms that are the
+autopilot's, the min channel goes up to the smallest order that pays for its channel (and at
+least the engine's own minimum); when not even the largest order the offer can fund does,
+the offer is taken off the market ("below cost at today's on-chain fee rate") and listed
+again — its terms written and checked first — once fees drop. An offer whose window is the
+operator's (or with auto-size off) keeps it: an alert and Market → Sell say from which size
+its orders are turned down. A listed offer under its profit floor is raised before anything
+else (its floor rounded up), whatever the market or the routing comparison says. While an
+order waits for approval — or is accepted and not yet on Amboss's listing — nothing is
+topped up or given back, and the offers share what can be sold. The deploy cap's share is
+Amboss's listing of sold capital plus the journal's own sales funded since; when the listing
+fails, the last good one (under an hour old) stands. A spend outside the main run — a channel
+opened by hand, an on-chain send, an LSPS1 sale's channel — has the offers' capital checked
+within seconds (capital only: no price, size or lease move). The lane bills an order's fee
+parts (`fees.fixed + fees.variable`, when `fees.seller` reads 0) only when they are an
+offer's price for the order's size to within a sat; any other amount is left to the operator.
+An Accept by hand below the floor needs a second yes. A sold channel opens with a routing fee
+of its own (a new channel's, never above the lease's promise) and its order's tag
+(`magma:<id>`); a sale whose channel was opened elsewhere takes its outpoint from Amboss and
+LND, so its promise binds it. A service fee that can't be paid is tried for 30 days, about
+daily after the first, before it is given up with an alert.
 
 ---
 

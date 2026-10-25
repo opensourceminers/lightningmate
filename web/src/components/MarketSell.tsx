@@ -39,7 +39,9 @@ import {
   offerSizeWarning,
   priceDraft,
   pricedLeaseWarning,
+  freeOfferNote,
   sellSummary,
+  turnedDownLine,
   type OfferDraft,
 } from "../magmaView";
 
@@ -58,7 +60,7 @@ const SELL_STATE_LABEL: Record<MagmaSellOfferState, string> = {
   overpriced: "overpriced",
   below_profit_floor: "below profit floor",
   do_not_list_unprofitable: "unprofitable to list",
-  do_not_list_uncompetitive: "too dear to fill",
+  do_not_list_uncompetitive: "floor above market",
   exhausted: "exhausted — relist",
   inactive: "inactive",
 };
@@ -321,7 +323,7 @@ export function MarketSell() {
         </div>
         <div className="dryrun-banner">Connect your Amboss API key in <strong>Settings</strong> to create offers.</div>
         <EligibilityCard e={elig} busy={eligBusy} onRefresh={() => loadEligibility(true)} />
-        <HowAmbossPicks usdOrderSat={elig?.usdOrders?.minOrderSat ?? null} usdAtOwnPriceSat={elig?.usdOrders?.atOwnPriceSat ?? null} feeTiers={elig?.feeTiers ?? null} />
+        <HowAmbossPicks usdOrderSat={elig?.usdOrders?.minOrderSat ?? null} usdAtOwnPriceSat={elig?.usdOrders?.atOwnPriceSat ?? null} feeTiers={elig?.feeTiers ?? null} feeBps={feeBps} />
       </section>
     );
   }
@@ -443,7 +445,7 @@ export function MarketSell() {
                         title={
                           !active && free
                             ? autoPriced(o) && enginePriced(o)
-                              ? "No price yet: the autopilot gives it one at its next run — then enable it"
+                              ? freeOfferNote(controls[o.id], true, true)
                               : "Set a price first (edit): listed like this, buyers would get a channel for free"
                             : undefined
                         }
@@ -478,13 +480,21 @@ export function MarketSell() {
         </table>
       )}
 
-      {offers.some((o) => o.status !== "ENABLED" && o.feeRatePpm <= 0 && o.baseFeeSats <= 0) ? (
-        <p className="sug-warn">
-          ⚠ {offers.some((o) => o.status !== "ENABLED" && o.feeRatePpm <= 0 && o.baseFeeSats <= 0 && autoPriced(o) && enginePriced(o))
-            ? "This offer has no price on Amboss (0 ppm + 0 sat). The autopilot gives it the recommended one at its next run — then enable it. Listing it again is your click."
-            : "This offer has no price on Amboss (0 ppm + 0 sat). Give it one with edit, then enable it."}
-        </p>
-      ) : null}
+      {offers
+        .filter((o) => o.status !== "ENABLED" && o.feeRatePpm <= 0 && o.baseFeeSats <= 0)
+        .slice(0, 1)
+        .map((o) => (
+          <p key={`free-${o.id}`} className="sug-warn">
+            ⚠ {freeOfferNote(controls[o.id], autoPriced(o), enginePriced(o))}
+          </p>
+        ))}
+      {(sync?.offers ?? [])
+        .filter((e) => e.amboss.status === "ENABLED" && e.turnedDownUnderSat !== undefined)
+        .map((e) => (
+          <p key={`under-${e.offerId}`} className="sug-warn">
+            ⚠ {turnedDownLine(e, !!controls[e.offerId]?.manual)}
+          </p>
+        ))}
       {formOpen ? (
         <div className="offer-form">
           <h4 className="sub">{editingId ? "Edit your offer" : offers.length ? "Another offer (it lists a second one)" : "New offer"}</h4>
@@ -543,15 +553,15 @@ export function MarketSell() {
                 </span>
               )}
               {evPerYear !== null ? (
-                <span className={`magma-verdict ${evPerYear > 0 ? "win" : "lose"}`} title="Expected sales a year (offers like yours) × what one sale nets">
+                <span className={`magma-verdict ${evPerYear > 0 ? "win" : "lose"}`} title="Expected sales a year (offers like yours) × what one sale nets at the recommended price">
                   expected ≈ {sats(evPerYear)} sat/yr
                 </span>
               ) : null}
             </div>
             <div className="magma-price-meta muted">
               {clearing
-                ? `buyers paid ${clearing.p25Ppm}–${clearing.p75Ppm} ppm (median ${clearing.medianPpm}) in ${clearing.count} sales of the last ${clearing.windowDays} days · one sale nets ~${sats(r0.economics.netLeaseProfitSat)} sat`
-                : `no sale history: priced against listed asks (median ${r0.market.median} ppm) · one sale nets ~${sats(r0.economics.netLeaseProfitSat)} sat`}
+                ? `buyers paid ${clearing.p25Ppm}–${clearing.p75Ppm} ppm (median ${clearing.medianPpm}) in ${clearing.count} sales of the last ${clearing.windowDays} days · one sale at the recommended price nets ~${sats(r0.economics.netLeaseProfitSat)} sat`
+                : `no sale history: priced against listed asks (median ${r0.market.median} ppm) · one sale at the recommended price nets ~${sats(r0.economics.netLeaseProfitSat)} sat`}
             </div>
             {(() => {
               const m = r0.market;
@@ -658,7 +668,7 @@ export function MarketSell() {
                 </div>
                 <span className="magma-vs">vs</span>
                 <div className={`magma-stat ${r0.economics.beatsRouting ? "good" : ""}`}>
-                  <span className="magma-stat-label">One sale at this price</span>
+                  <span className="magma-stat-label">One sale at the recommended price</span>
                   <span className="magma-stat-val">
                     {r0.economics.leaseApy}% <span className="muted">/yr net · {sats(r0.economics.netLeaseProfitSat)} sat net per sale</span>
                   </span>
@@ -697,7 +707,7 @@ export function MarketSell() {
 
       <EligibilityCard e={elig} busy={eligBusy} onRefresh={() => loadEligibility(true)} />
       <SellDiagnosticsCard d={diag} onFix={(tab, sub) => goTo(tab, sub)} />
-      <HowAmbossPicks usdOrderSat={elig?.usdOrders?.minOrderSat ?? null} usdAtOwnPriceSat={elig?.usdOrders?.atOwnPriceSat ?? null} feeTiers={elig?.feeTiers ?? null} />
+      <HowAmbossPicks usdOrderSat={elig?.usdOrders?.minOrderSat ?? null} usdAtOwnPriceSat={elig?.usdOrders?.atOwnPriceSat ?? null} feeTiers={elig?.feeTiers ?? null} feeBps={feeBps} />
     </section>
   );
 }

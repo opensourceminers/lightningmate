@@ -497,6 +497,10 @@ export interface MyOrder {
   sizeSats: number;
   /** fees.seller — what you earn (Amboss reports 0 until it has settled it). */
   feeSats: number;
+  /** Its parts, fixed + variable: what the hold invoice bills while feeSats
+   *  reads 0 — only when they are your offer's price for the size, for the
+   *  order lane (the Accept dialog says which applies). */
+  feePartsSats?: number;
   /** The buyer's node id. */
   destination: string;
   buyerAlias: string | null;
@@ -530,6 +534,7 @@ export function toMyOrder(o: SaleOrder, transactionId: string | null = null): My
     side: "SELL",
     sizeSats: o.sizeSats,
     feeSats: satsOf(o.fees.seller),
+    feePartsSats: satsOf(o.fees.fixed) + satsOf(o.fees.variable),
     destination: o.buyerPubkey,
     buyerAlias: o.buyerAlias,
     isPrivate: o.isPrivate,
@@ -550,10 +555,14 @@ export function toMyOrder(o: SaleOrder, transactionId: string | null = null): My
 export async function getMyOrders(apiKey: string, ownPubkey?: string): Promise<MyOrdersView> {
   const { orders } = await listSales(apiKey);
   const views = orders.filter((o) => ownPubkey === undefined || o.sellerPubkey === ownPubkey).map((o) => toMyOrder(o));
-  return {
-    orders: views,
-    pendingSeller: views.filter((o) => o.status === "WAITING_FOR_SELLER_APPROVAL" || o.status === "WAITING_FOR_CHANNEL_OPEN").length,
-  };
+  return { orders: views, pendingSeller: waitingOnYou(views) };
+}
+
+/** Orders waiting on you: awaiting your approval, or paid and waiting for a
+ *  channel the order lane doesn't open itself (`laneOpens`: MagmaDesk's
+ *  opensItself; without it, every paid one). */
+export function waitingOnYou(orders: Pick<MyOrder, "id" | "status">[], laneOpens: (orderId: string) => boolean = () => false): number {
+  return orders.filter((o) => o.status === "WAITING_FOR_SELLER_APPROVAL" || (o.status === "WAITING_FOR_CHANNEL_OPEN" && !laneOpens(o.id))).length;
 }
 
 export const ACCEPT_MUTATION = `mutation AcceptOrder($input: SellerAcceptOrdersInput!) {

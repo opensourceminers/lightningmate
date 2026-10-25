@@ -10,10 +10,13 @@ import type {
   MagmaPurchase,
   MagmaV2Report,
   MyOffer,
+  MyOrder,
   OfferControl,
+  OfferSyncEntry,
   OfferSyncStatus,
   PurchaseState,
 } from "./types";
+import { ApiError } from "./apiError";
 
 /**
  * The words and small decisions behind the Magma views (Market → Buy / Sell /
@@ -105,7 +108,12 @@ export function enableSellingOffersPendingMessage(): string {
 /** The confirmation before Liquidity provision is switched OFF while offers
  *  are still listed: orders would then wait for a decision nobody makes. */
 export function disableSellingMessage(enabledOffers: number): string {
-  if (enabledOffers <= 0) return "Turn off Liquidity provision? Orders already in flight are still finished (settled or refunded).";
+  if (enabledOffers <= 0) {
+    return (
+      "Turn off Liquidity provision? Orders the autopilot accepted are still carried to their end (opened, settled or refunded); " +
+      "one you accepted by hand waits for you to open its channel on Market → Orders once it is paid."
+    );
+  }
   const which = enabledOffers === 1 ? "Your offer is" : `${enabledOffers} offers are`;
   return (
     `${which} still listed on Amboss. With Liquidity provision off, new orders wait for your decision on Market → Orders — ` +
@@ -167,8 +175,109 @@ export function orderStatusLabel(status: string, side: "SELL" | "BUY" | string, 
  *  you ("Open channel"). */
 export function acceptedToast(opensItself: boolean): string {
   return opensItself
-    ? "Order accepted — the autopilot opens the channel once the buyer has paid."
+    ? "Order accepted — while Liquidity provision is on, the autopilot opens the channel once the buyer has paid."
     : "Order accepted — open the channel once the buyer has paid.";
+}
+
+/** A click's answer when the order already is what it asked for (the API's
+ *  "Order is already accepted." / "Order is already rejected."): shown as it
+ *  is, not as if this click had done it. */
+export function deskDoneToast(r: { message?: string }, otherwise: string): string {
+  return r.message === "Order is already accepted." || r.message === "Order is already rejected." ? r.message : otherwise;
+}
+
+/** What an order pays you, after the service fee, and what its channel costs
+ *  on chain at today's rate (`costSat`, null: unknown) — the Accept and Open
+ *  dialogs (review 2026-10-25: they named the gross fee, or nothing). */
+export function orderEarnings(paysSat: number, feeBps: number, costSat: number | null): string {
+  const fee = feeBps > 0 ? Math.floor((paysSat * feeBps) / 10_000) : 0;
+  const net = fee > 0 ? ` — ${fmt(paysSat - fee)} sat after the ${feeBps / 100}% service fee` : "";
+  const cost = costSat !== null ? `; opening and later closing its channel costs about ${fmt(costSat)} sat on chain at today's fee rate` : "";
+  return `It pays ${fmt(paysSat)} sat${net}${cost}.`;
+}
+
+/** The Accept dialog: what the order pays — or that Amboss shows no amount
+ *  for it, and what the hold invoice then bills — and what accepting does. */
+export function acceptConfirmMessage(
+  o: Pick<MyOrder, "sizeSats" | "feeSats" | "feePartsSats">,
+  feeBps: number,
+  costSat: number | null,
+): string {
+  const parts = o.feePartsSats ?? 0;
+  const cost = costSat !== null ? ` Opening and later closing its channel costs about ${fmt(costSat)} sat on chain at today's fee rate.` : "";
+  const amount =
+    o.feeSats > 0
+      ? orderEarnings(o.feeSats, feeBps, costSat)
+      : parts > 0
+        ? `Amboss shows no amount for this order (its seller fee reads 0): the hold invoice bills its fee parts, ${fmt(parts)} sat — check that this is your price for a ${fmt(o.sizeSats)} sat channel.${cost}`
+        : "Amboss shows no amount for this order yet — it can't be accepted until it does.";
+  return (
+    `${amount} Accept it? You create a hold invoice for the fee — the buyer's payment is held, and only settles once Amboss ` +
+    `confirms the ${fmt(o.sizeSats)} sat channel you then open (any failure refunds the buyer). No funds move yet.`
+  );
+}
+
+/** The Open dialog: the channel, what it earns (the held payment, else
+ *  Amboss's figure) and what it costs on chain. */
+export function openConfirmMessage(o: Pick<MyOrder, "sizeSats" | "feeSats" | "destination" | "local">, feeBps: number, costSat: number | null): string {
+  const pubkey = o.destination.split("@")[0] || o.destination;
+  const pays = o.local?.invoiceSats ?? o.feeSats;
+  const earns = pays > 0 ? orderEarnings(pays, feeBps, costSat) : "Amboss shows no amount for this order.";
+  return `Open a ${fmt(o.sizeSats)} sat channel to ${pubkey.slice(0, 20)}…? This commits real on-chain funds into the channel. ${earns} Real transaction.`;
+}
+
+/** An Accept the server refused as below cost (409 "below_cost"): what the
+ *  order pays and the accept floor — or null for any other error. */
+export function belowCostRefusal(err: unknown): { message: string; feeSats: number; floorSats: number } | null {
+  if (!(err instanceof ApiError) || err.status !== 409) return null;
+  const body = err.body as { error?: unknown; message?: unknown; feeSats?: unknown; floorSats?: unknown } | null;
+  if (body?.error !== "below_cost") return null;
+  return {
+    message: typeof body.message === "string" && body.message ? body.message : err.message,
+    feeSats: Number(body.feeSats) || 0,
+    floorSats: Number(body.floorSats) || 0,
+  };
+}
+
+/** The second question before an Accept below cost. */
+export function belowCostQuestion(r: { feeSats: number; floorSats: number }): string {
+  return (
+    `This order pays ${fmt(r.feeSats)} sat; opening and later closing its channel costs ${fmt(r.floorSats)} sat on chain now ` +
+    `(after the service fee) — accepting it sells at a loss of about ${fmt(Math.max(0, r.floorSats - r.feeSats))} sat. ` +
+    "The autopilot turns such orders down. Accept it anyway?"
+  );
+}
+
+/** Does the autopilot list this disabled offer again by itself (autopilot.ts
+ *  upkeepOffer)? Yes when it took it off the market — for lack of capital,
+ *  below cost, or when Liquidity provision was switched on with it disabled —
+ *  and, for being free, when it prices the offer. Never one you disabled. */
+export function relistsItself(control: OfferControl | undefined, autoPriced: boolean): boolean {
+  if (!control || control.disabledByHandAt) return false;
+  if (control.freeDisabledAt) return autoPriced && !control.manual;
+  return !!(control.autoDisabledAt || control.listOnAt || control.costDisabledAt);
+}
+
+/** A disabled offer with no price on Amboss: who gives it one, and who lists
+ *  it again — said exactly (review 2026-10-25: "listing it again is your
+ *  click" of an offer the next run listed by itself). */
+export function freeOfferNote(control: OfferControl | undefined, autoPriced: boolean, enginePriced: boolean): string {
+  const none = "This offer has no price on Amboss (0 ppm + 0 sat).";
+  if (!(autoPriced && enginePriced)) return `${none} Give it one with edit, then enable it.`;
+  return relistsItself(control, autoPriced)
+    ? `${none} The autopilot gives it the recommended price at its next run and lists it again itself once it can be funded — its terms written and checked first.`
+    : `${none} The autopilot gives it the recommended price at its next run; listing it again is then your click (enable).`;
+}
+
+/** A listed offer whose window invites orders the lane turns down below cost
+ *  (its window not the autopilot's to size): from which size, and what to do. */
+export function turnedDownLine(e: Pick<OfferSyncEntry, "offerId" | "turnedDownUnderSat">, manual: boolean): string | null {
+  if (e.turnedDownUnderSat === undefined) return null;
+  return (
+    `Offer ${e.offerId.slice(0, 8)}…: orders under ${fmt(e.turnedDownUnderSat)} sat pay less than opening and closing their channel costs ` +
+    `at today's fee rate — the autopilot turns them down, and each refusal can cost seller score. ` +
+    (manual ? "Raise its min channel (or its price)." : "Turn on auto-size, or raise its min channel.")
+  );
 }
 
 /** This node's own record of an order, in a few words. */
@@ -194,20 +303,25 @@ export function localLabel(local: Pick<MagmaOrderLocal, "phase" | "booked" | "ex
 /** Who sets an offer's terms, as the Sell tab says it — and who decides
  *  whether it is listed (your last click; capital safety aside). */
 export function offerOwner(control: OfferControl | undefined, sellEnabled: boolean): { label: string; yours: boolean; title: string } {
+  // With Liquidity provision off, nothing lists anything again until it is on.
+  const whileOn = sellEnabled ? "" : "with Liquidity provision on, ";
   const listing = control?.disabledByHandAt
     ? " You disabled it: it stays disabled until you enable it (or switch Liquidity provision off and on again)."
     : control?.listOnAt
       ? ' Liquidity provision was switched on with it disabled: the autopilot lists it once it has a price and its smallest channel can be funded ("keep disabled" keeps it off).'
-      : control?.autoDisabledAt
-        ? " The autopilot disabled it for lack of capital and lists it again once it can be funded."
-        : "";
+      : control?.costDisabledAt
+        ? ` The autopilot took it off the market: its orders would pay less than opening and closing their channels costs at today's fee rate — ${whileOn}it lists it again once they pay for them.`
+        : control?.autoDisabledAt
+          ? ` The autopilot disabled it for lack of capital; ${whileOn}it lists it again once it can be funded.`
+          : "";
   if (control?.manual) {
     return {
       label: "yours",
       yours: true,
       title:
-        `You took this offer over (${control.manual.why}) — the autopilot changes none of its terms; it only keeps it fundable ` +
-        `(disabled while its smallest channel can't be funded, listed again once it can).${listing}`,
+        `You took this offer over (${control.manual.why}) — the autopilot changes none of its price or lease; it only keeps it fundable: ` +
+        `its max channel and total are cut to what can be funded (and given back once there is room), and it is disabled while its ` +
+        `smallest channel can't be funded, listed again once it can.${listing}`,
     };
   }
   if (!sellEnabled) return { label: "not managed", yours: false, title: `Liquidity provision is off: nothing manages this offer.${listing}` };
@@ -396,7 +510,7 @@ export function offerSizeWarning(
   const limits = [
     { sat: config.sellMaxChannelSats, what: "your max channel size" },
     { sat: config.sellMaxDeploySats, what: "your capital cap" },
-    ...(fundableSat !== null ? [{ sat: fundableSat, what: "what your wallet can fund now" }] : []),
+    ...(fundableSat !== null ? [{ sat: fundableSat, what: "what can be sold now — the wallet after the reserve and promised coins, within the deploy cap" }] : []),
   ];
   const binding = limits.reduce((a, b) => (b.sat < a.sat ? b : a));
   if (draft.maxSizeSats <= binding.sat) return null;
