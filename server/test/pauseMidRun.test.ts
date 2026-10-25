@@ -361,6 +361,7 @@ function finishedLease(t: TestContext) {
   const txid = "cd".repeat(32);
   s.node.channels.push({ partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 1_990_000, transactionId: txid, transactionVout: 0 });
   s.magma.addSale({ buyerPubkey: BUYER, status: "CHANNEL_MONITORING_FINISHED", transactionId: `${txid}:0` });
+  s.node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: "500" })); // the close's economy rate
   s.node.override("default.closeChannel", () => {
     const st = Object.assign(new EventEmitter(), { cancel: () => undefined });
     setImmediate(() => st.emit("data", { update: "close_pending", close_pending: { txid: randomBytes(32), output_index: 0 } }));

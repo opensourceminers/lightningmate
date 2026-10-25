@@ -167,6 +167,10 @@ export interface SuggestionV2 {
   /** This node closed a channel with the peer this many days ago (within
    *  RECENT_CLOSE_DAYS), or null. */
   closedDaysAgo: number | null;
+  /** False when LND didn't say its block height or its closed channels: a
+   *  recent close can't be ruled out (closedDaysAgo null says nothing then),
+   *  and the channel autopilot doesn't open to it. Absent: known. */
+  closeHistoryKnown?: false;
 }
 
 /** A peer this node closed a channel with this recently is not proposed for
@@ -267,7 +271,7 @@ export async function getChannelSuggestionsV2(
     getWalletInfo({ lnd }).catch(() => null),
     getClosedChannels({ lnd })
       .then((r) => r.channels)
-      .catch(() => []),
+      .catch(() => null),
   ]);
   // A node that announces no clearnet address of its own dials over Tor:
   // a peer's .onion first (no exit node in between).
@@ -276,8 +280,11 @@ export async function getChannelSuggestionsV2(
   // no confirmation height (a funding that never confirmed) can't be dated:
   // it doesn't count — or a years-old one would bar the peer for good.
   const height = info?.current_block_height ?? 0;
+  // Without the height or the closes, none of them can be dated: every
+  // suggestion says the close history is unknown (and isn't auto-opened to).
+  const closeHistoryKnown = height > 0 && closed !== null;
   const closedDays = new Map<string, number>();
-  for (const c of closed) {
+  for (const c of closed ?? []) {
     if (!c.close_confirm_height || !height) continue;
     const days = Math.max(0, Math.floor((height - c.close_confirm_height) / 144));
     if (days <= RECENT_CLOSE_DAYS && days < (closedDays.get(c.partner_public_key) ?? Infinity)) closedDays.set(c.partner_public_key, days);
@@ -644,6 +651,8 @@ export async function getChannelSuggestionsV2(
     const closedDaysAgo = closedDays.get(pk) ?? null;
     if (closedDaysAgo !== null) {
       warnings.push(`You closed a channel with this node ${closedDaysAgo === 0 ? "recently" : `${closedDaysAgo} days ago`} — the autopilot doesn't reopen to it within ${RECENT_CLOSE_DAYS} days.`);
+    } else if (!closeHistoryKnown) {
+      warnings.push("LND didn't say its block height or its closed channels — whether you closed a channel with it lately is unknown, so the autopilot doesn't open to it until it does.");
     }
     if (meta.sockets.length === 0) warnings.push("It advertises no address — it can only be opened to while it is connected to you.");
     if (hasDemandData && s.demandScore < 0.15) {
@@ -725,6 +734,7 @@ export async function getChannelSuggestionsV2(
         : null,
       peerMinChannelSats: lp && lp.minChannelSizeSats > 0 ? lp.minChannelSizeSats : null,
       closedDaysAgo,
+      ...(closeHistoryKnown ? {} : { closeHistoryKnown: false as const }),
     };
   });
 
@@ -868,6 +878,10 @@ export interface CloseContext {
   leaseSources?: LeaseSources;
   /** The offline-duration record — observed with this read, then asked. */
   uptime?: Pick<ChannelUptime, "observe" | "offlineInfo">;
+  /** Where the capital a close frees could go: the opens the channel
+   *  autopilot would make (its peer rules, LN+ included — swapTargets).
+   *  Without it: the top suggestions as ranked (no LN+, no skip rules). */
+  opportunity?: () => Promise<{ alias: string; score: number; sizeSats: number }[]>;
 }
 
 /** Everything the close ranking works from — no I/O (rankCloseCandidates). */
@@ -886,6 +900,17 @@ export interface CloseInput {
   leases: ReadonlyMap<string, ChannelLease>;
   offline: (c: ChannelView) => OfflineInfo | null;
   nowMs: number;
+  /** The chain's height now (0 or absent: unknown) — a channel's age from
+   *  its short channel id where the fee engine has none. */
+  heightNow?: number;
+}
+
+/** Days since the block a channel was funded in (its short channel id), or
+ *  null when that or the height now is unknown. */
+function scidAgeDays(channelId: string, heightNow: number): number | null {
+  const block = Number(channelId.split("x")[0]);
+  if (!Number.isFinite(block) || block <= 0 || !(heightNow > 0) || block > heightNow) return null;
+  return (heightNow - block) / 144;
 }
 
 /** Thousands-separated "k" amounts ("2,000k", not "2000k"). */
@@ -899,12 +924,40 @@ function boughtText(l: ChannelLease): string {
 }
 
 /**
+ * What protects a channel on the close list for what it earns (2026-10-25):
+ * its 60-day earnings — its own outbound fees plus those of the forwards it
+ * brought in — per sat of its local balance (what a close frees) must reach
+ * CLOSE_EARN_SHARE of what this node's channels earn per sat of capacity over
+ * the same 60 days, and at least CLOSE_EARN_MIN_PPM_YEAR. Before, any routing
+ * in 30 days protected it: dead channels holding 11.8M on the live node (2,
+ * 13 and 69 sat in 60 days) were never listed. Without the 60-day flows,
+ * routing in 30 days still protects ("routed recently").
+ */
+export const CLOSE_EARN_SHARE = 0.25;
+/** …on a node that earns almost nothing, a quarter of almost nothing would
+ *  protect every channel that routed a sat (ppm/yr). */
+export const CLOSE_EARN_MIN_PPM_YEAR = 25;
+/** "Significant unique reach" protects only with at least this many 2-hop
+ *  nodes no other peer reaches, besides half the best channel's (review
+ *  2026-10-25: on a node whose best channel reached ONE such node, that dead
+ *  channel was protected for it). */
+export const UNIQUE_REACH_MIN = 5;
+
+/**
  * The close list from its inputs — pure, so every protection and signal can
  * be tested without a node.
  */
 export function rankCloseCandidates(input: CloseInput): CloseV2Report {
   const { channels, feeById, flow60ById, closeCostSat, rebalanceRecords, channelOverrides, nowMs } = input;
   const maxUniqueReach = Math.max(1, ...[...input.uniqueReachByChan.values()]);
+  // What a sat of this node's open channels earned over the 60 days (ppm/yr,
+  // capacity-weighted) — the bar a channel's earnings on its local balance
+  // are held against. Null without the 60-day flows.
+  const openChans = channels.filter((c) => c.status === "open");
+  const capacity60 = openChans.reduce((s, c) => s + c.capacity, 0);
+  const earned60 = openChans.reduce((s, c) => s + (flow60ById.get(c.id)?.feesEarned ?? 0), 0);
+  const nodeYield60 = flow60ById.size > 0 && capacity60 > 0 ? (earned60 / capacity60) * (365 / 60) * 1_000_000 : null;
+  const earnFloorPpm = nodeYield60 === null ? null : Math.max(CLOSE_EARN_MIN_PPM_YEAR, CLOSE_EARN_SHARE * nodeYield60);
 
   // 60d revenue percentile is not needed once fee-v2 gives us isTopEarner; we keep
   // the rebalance-cost lookups window-aware for the P&L.
@@ -950,23 +1003,41 @@ export function rankCloseCandidates(input: CloseInput): CloseV2Report {
     const assisted60 = f60?.inboundFeesEarned ?? 0;
     const pnl30 = rev30 - rebalCost(c.id, 30);
     const pnl60 = rev60 + assisted60 - rebalCost(c.id, 60);
-    const ageDays = m?.channelAgeDays ?? null;
+    // Its age as the fee engine read it, else from its short channel id (the
+    // block it was funded in) and the chain's height now.
+    const ageDays = m?.channelAgeDays ?? scidAgeDays(c.id, input.heightNow ?? 0);
     const uniqueReach = input.uniqueReachByChan.get(c.id) ?? 0;
     const reachContribution = uniqueReach / maxUniqueReach;
     const feeState = fee?.state ?? "normal";
     const weOpened = c.initiator === "local";
+    // What it earned in 60 days per sat of its local balance (ppm/yr) — and
+    // whether that earns its keep (CLOSE_EARN_SHARE). A drained channel that
+    // earns does: nothing to free there.
+    const earnings60 = rev60 + assisted60;
+    const earnPpm = c.localBalance > 0 ? (earnings60 / c.localBalance) * (365 / 60) * 1_000_000 : earnings60 > 0 ? Infinity : 0;
+    const earnsItsKeep = earnFloorPpm === null ? routed30 > 0 : earnings60 > 0 && earnPpm >= earnFloorPpm;
+    // Routed in the 60 days, but too little for the capital it holds.
+    const lowYield = earnFloorPpm !== null && !earnsItsKeep && routed60 > 0;
 
     // ── Protections: never suggest closing these ──
-    // "Routed recently" and "unique reach" hold whether or not the peer is
+    // What it earns and "unique reach" hold whether or not the peer is
     // connected this minute (before, both required c.active: a peer offline
     // for a moment lost them and the channel went to the top of the list).
     let protectedReason: string | null = null;
     if (lease?.running) protectedReason = leaseProtection(lease);
     else if (channelOverrides[c.id]?.mode === "exclude") protectedReason = "manually protected";
-    else if (ageDays != null && ageDays < 30) protectedReason = "new channel — still in its test period";
-    else if (routed30 > 0) protectedReason = "routed recently";
+    // A channel under 30 days old is never listed — nor one whose age can't
+    // be told (review 2026-10-25: without an age from the fee engine, a
+    // channel opened hours ago was listed on the fee engine's weak signal).
+    else if (ageDays === null) protectedReason = "its age can't be told (LND didn't say the block height) — a channel under 30 days old is never listed";
+    else if (ageDays < 30) protectedReason = "new channel — still in its test period";
+    else if (earnsItsKeep)
+      protectedReason =
+        earnFloorPpm === null
+          ? "routed recently"
+          : `earns its keep — ${Math.round(earnings60).toLocaleString("en-US")} sat in 60 d${Number.isFinite(earnPpm) ? `, ~${Math.round(earnPpm).toLocaleString("en-US")} ppm/yr on its local balance` : ""}`;
     else if (m?.isTopEarner) protectedReason = "top earner";
-    else if (reachContribution >= 0.5) protectedReason = "provides significant unique reach";
+    else if (reachContribution >= 0.5 && uniqueReach >= UNIQUE_REACH_MIN) protectedReason = "provides significant unique reach";
     if (protectedReason) {
       protectedList.push({ channelId: c.id, alias: c.peerAlias, reason: protectedReason, lease: lease?.running ? lease : null });
       continue;
@@ -981,10 +1052,10 @@ export function rankCloseCandidates(input: CloseInput): CloseV2Report {
     const idle60 = routed60 === 0;
     const losing = pnl60 < 0;
     const weak = feeState === "close_candidate" || m?.peerGate === "weak";
-    if (!longOffline && !idle60 && !losing && !weak) continue;
+    if (!longOffline && !idle60 && !losing && !weak && !lowYield) continue;
 
     // ── Score ──
-    const idleScore = longOffline ? 1 : idle60 ? 0.8 : routed30 === 0 ? 0.4 : 0;
+    const idleScore = longOffline ? 1 : idle60 ? 0.8 : routed30 === 0 || lowYield ? 0.4 : 0;
     const negPnlScore = pnl60 < 0 ? clamp01(-pnl60 / 5000) : 0;
     const weakPeerScore = feeState === "close_candidate" ? 1 : longOffline ? 0.6 : m?.peerGate === "weak" ? 0.5 : 0;
     const lowReachScore = 1 - reachContribution;
@@ -1022,6 +1093,15 @@ export function rankCloseCandidates(input: CloseInput): CloseV2Report {
     }
     if (idle60 && lifetime === 0) reasons.push("Never routed.");
     else if (idle60) reasons.push("No forwards in 60d.");
+    else if (lowYield && nodeYield60 !== null)
+      reasons.push(
+        `Earned ${Math.round(earnings60).toLocaleString("en-US")} sat in 60d` +
+          (assisted60 > 0 ? ` (incl. ${Math.round(assisted60).toLocaleString("en-US")} on forwards it brought in)` : "") +
+          ` on its ${kSep(c.localBalance)} — ~${Math.round(earnPpm).toLocaleString("en-US")} ppm/yr, ` +
+          (CLOSE_EARN_SHARE * nodeYield60 >= CLOSE_EARN_MIN_PPM_YEAR
+            ? `under a quarter of what this node's channels earn (~${Math.round(nodeYield60).toLocaleString("en-US")} ppm/yr).`
+            : `under the ${CLOSE_EARN_MIN_PPM_YEAR} ppm/yr a channel must earn to be kept (this node's channels earn ~${Math.round(nodeYield60).toLocaleString("en-US")} ppm/yr).`),
+      );
     if (losing)
       reasons.push(
         `Negative P&L: -${Math.round(-pnl60)} sat over 60d (earned ${Math.round(rev60)}` +
@@ -1123,13 +1203,19 @@ export async function getCloseSuggestionsV2(
   channelOverrides: OverrideMap = {},
   ctx: CloseContext = {},
 ): Promise<CloseV2Report> {
-  const [channels, ownKey, graph, flow60, feeRep, sugRep, oc, height] = await Promise.all([
+  const [channels, ownKey, graph, flow60, feeRep, opportunity, oc, height] = await Promise.all([
     getChannelsView(lnd),
     getOwnPubkey(lnd),
     buildGraphCache(lnd),
     getFlowSummary(lnd, 60).catch(() => null),
     getFeeRecommendations(lnd, rebalanceRecords, null, feeConfig, channelOverrides),
-    getChannelSuggestionsV2(lnd).catch(() => null),
+    // The opens the autopilot would make (review 2026-10-25: the "redeploy
+    // into" line named the top suggestion without LN+ or its skip rules — a
+    // 6–10M open the autopilot would never make).
+    (ctx.opportunity
+      ? ctx.opportunity()
+      : getChannelSuggestionsV2(lnd).then((r) => r.suggestions.slice(0, 3).map((s) => ({ alias: s.alias, score: s.score, sizeSats: s.recommendedSizeSats })))
+    ).catch(() => [] as { alias: string; score: number; sizeSats: number }[]),
     onchainCosts(lnd),
     getWalletInfo({ lnd })
       .then((w) => w.current_block_height)
@@ -1160,11 +1246,7 @@ export async function getCloseSuggestionsV2(
     feeById: new Map(feeRep.recommendations.map((r) => [r.channelId, r])),
     flow60ById: new Map((flow60?.perChannel ?? []).map((f) => [f.channelId, f])),
     uniqueReachByChan: new Map(channels.map((c) => [c.id, uniqueReachOf(c.peerPubkey)])),
-    opportunity: (sugRep?.suggestions ?? []).slice(0, 3).map((s) => ({
-      alias: s.alias,
-      score: s.score,
-      sizeSats: s.recommendedSizeSats,
-    })),
+    opportunity: opportunity.slice(0, 3),
     closeCostSat: oc.closeCostSat,
     rebalanceRecords,
     channelOverrides,
@@ -1172,5 +1254,6 @@ export async function getCloseSuggestionsV2(
     // Without the record (a caller of its own), no peer counts as away long.
     offline: (c) => (ctx.uptime ? ctx.uptime.offlineInfo(c, nowMs) : null),
     nowMs,
+    heightNow: height,
   });
 }

@@ -59,7 +59,7 @@ export function buildPresets(config: Pick<AutopilotConfig, "policy" | "rebalance
     {
       id: "balanced",
       label: "Balanced",
-      desc: "Compete for flow at sensible fees, refill a drained channel when the profit check passes, open channels as funds allow. Recommended.",
+      desc: "Compete for flow at sensible fees, refill a drained channel when the profit check passes, open channels as funds allow (with Liquidity provision on, not the coins held for Magma). Recommended.",
       cfg: {
         enabled: true,
         rebalanceEnabled: true,

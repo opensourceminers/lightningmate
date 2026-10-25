@@ -41,7 +41,8 @@ export const SELLER_SCORE_COPY =
 const ENABLE_SELLING_TERMS =
   "Amboss decides which seller gets an order — mostly sellers with a track record; LightningMate can make fulfilment correct and reliable, " +
   "not make Amboss pick you. With Liquidity provision on, the order lane accepts (with a hold invoice), opens and rejects orders on its own, " +
-  "within your caps, and keeps your offer fundable.";
+  "within your caps, and keeps your offer fundable. Routing opens of the channel autopilot then wait for the coins your offer can list " +
+  "(within your deploy cap) while selling them is expected to earn more than a routing channel; the rest stays free for them.";
 
 /**
  * The confirmation before Liquidity provision is switched ON (D9): the
@@ -498,15 +499,25 @@ export function refusalDigest(count: number | undefined, reason: string | null |
  * offers don't sell, one sale's lease rate advertised a feature that brings it
  * no orders (m4: per-sale margin is not expected value).
  */
-export function freedCapitalMagmaHint(rec: MagmaV2Report | null, e: Eligibility | null, freedSat: number): string | null {
+export function freedCapitalMagmaHint(
+  rec: MagmaV2Report | null,
+  e: Eligibility | null,
+  freedSat: number,
+  /** What your deploy cap still lets Magma sell (null: unknown). */
+  roomSat: number | null = null,
+): string | null {
   const r0 = rec?.sell.recommendations[0];
   if (!rec || !r0 || freedSat <= 0 || !e) return null;
   if (e.verdict !== "possible_but_slow" && e.verdict !== "realistic") return null;
   if (!r0.economics.beatsRouting) return null;
+  // Never an invitation to close more than Magma may take (review
+  // 2026-10-25): the deploy cap reached, no hint; part of it, that part.
+  if (roomSat !== null && roomSat <= 0) return null;
+  const cap = roomSat !== null && roomSat < freedSat ? ` — your deploy cap lets Magma take ~${fmt(roomSat)} sat of it` : "";
   const sales = e.expectedSalesPerYear !== null ? `; offers like yours sell about ${e.expectedSalesPerYear.toFixed(1)} times a year` : "";
   // leaseApy is NET (after on-chain costs and the service fee), per sale.
   return (
-    `Closing these frees ~${fmt(freedSat)} sat. One Magma sale at today's price nets ~${r0.economics.leaseApy}%/yr ` +
+    `Closing these frees ~${fmt(freedSat)} sat${cap}. One Magma sale at today's price nets ~${r0.economics.leaseApy}%/yr ` +
     `(after on-chain costs and the service fee), against ~${(rec.sell.adjustedRoutingPpmPerYear / 10_000).toFixed(2)}% routing${sales} — see Market → Sell.`
   );
 }

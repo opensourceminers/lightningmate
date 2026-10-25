@@ -80,10 +80,15 @@ export const CHANNEL_OPEN_HINT =
   "down the suggestions: a peer that refused an open waits 1 day, then 7, then 30; one that takes bigger channels than your " +
   "fixed size is skipped (auto size meets its minimum, up to a third of the node's capital); a peer closed within 90 days, " +
   "rated poorly on LN+, of low usefulness or marked “never auto” is never opened to automatically, nor one that advertises " +
-  "no address to dial unless it is connected already. " +
+  "no address to dial unless it is connected already. Auto size shrinks to what can be spent (rounded down to 100,000 sat, " +
+  "never below 1,000,000 sat nor the peer's minimum); a fixed size is never shrunk. " +
+  "With Liquidity provision on, the coins your Magma offer can list (within your deploy cap) wait for Magma while selling " +
+  "them is expected to earn more than a routing channel; the rest stays free for routing opens, and the note says how much " +
+  "is held. The reserve is what an open leaves on chain — LND's own anchor reserve (10,000 sat per anchor channel, up to " +
+  "100,000) wins when it is larger, and the open's fee comes on top. " +
   "When the open fails on this node's side — LND's wallet not synced or short of confirmed coins, or no connection to any " +
-  "peer — no peer is held back for it, and the next run tries again. An open that ends unclearly starts the cooldown, as " +
-  "an open does.";
+  "peer — no peer is held back for it, and the next run tries again. A peer's refusal before anything is broadcast moves " +
+  "on to the next suggestion; an open that ends unclearly (also one cut off by a restart) starts the cooldown, as an open does.";
 
 const SELL_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "sellMaxDeploySats", label: "Max capital deployed (sat)" },

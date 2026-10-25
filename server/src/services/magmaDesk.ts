@@ -53,6 +53,7 @@ import type { ServiceFeeLedger } from "./serviceFee.js";
 import { errorText } from "./errorText.js";
 import { getOwnPubkey } from "./node.js";
 import type { SoldLease } from "./leaseCaps.js";
+import { standardChannelId } from "./leases.js";
 
 /**
  * Magma selling, end to end, on the Magma API — the "order desk".
@@ -281,6 +282,30 @@ export interface MagmaDeskDeps {
    *  its channel costs on chain now, after the service fee
    *  (Autopilot.saleFeeFloorSats). Without it, no floor beyond "not 0". */
   saleFloorSats?: () => Promise<number>;
+  /** For the close of a finished lease's channel (closeFinishedLeases): the
+   *  economy fee rate a close pays now (null: no estimate) and the
+   *  operator's maximum on-chain fee rate (sat/vB), and whether a channel
+   *  routes well enough to keep (Autopilot.soldChannelClose). Without it,
+   *  no such channel is closed: never at any rate. */
+  soldChannelClose?: () => Promise<{ feeRate: number | null; maxFeeRate: number; routesWell: (channelId: string) => boolean }>;
+}
+
+/** A finished lease's channel with less than this share of its capacity on
+ *  our side is kept: what is left is inbound worth keeping, and closing it
+ *  frees little (review 2026-10-25: 20k of 2M closed, 1.98M of inbound given
+ *  up). */
+export const SOLD_CLOSE_MIN_LOCAL_SHARE = 0.25;
+
+/** The open channel at a funding outpoint ("txid:vout"); with no vout, the
+ *  one channel of that funding transaction — none when it funds several
+ *  (two channels can share one transaction: which one isn't known). */
+export function channelAtOutpoint<T extends { transaction_id: string; transaction_vout: number }>(open: readonly T[], outpoint: string): T | undefined {
+  const [txid, vout] = outpoint.split(":");
+  if (vout !== undefined && vout !== "" && Number.isInteger(Number(vout))) {
+    return open.find((c) => c.transaction_id === txid && c.transaction_vout === Number(vout));
+  }
+  const same = open.filter((c) => c.transaction_id === txid);
+  return same.length === 1 ? same[0] : undefined;
 }
 
 /** Outcome of a manual action, for the API route. */
@@ -521,8 +546,11 @@ export class MagmaDesk {
   private ambossLeasesTriedAt = 0;
   private ambossLeasesRefresh: Promise<void> | null = null;
   private readonly ambossLeasesStore: JsonStore<AmbossLeasesFile>;
-  /** Funding txids of finished leases, learned once per process. */
+  /** Funding outpoints ("txid:vout") of finished leases, learned once per
+   *  process. */
   private readonly finishedTxids = new Map<string, string | null>();
+  /** A finished lease's channel kept open, and why (said once per process). */
+  private readonly closeKept = new Map<string, string>();
   /** Orders whose last read Amboss refused or failed, whatever the failure
    *  (this process), each with WHEN its read was last attempted — a sequence
    *  number (readSeq), set right before the read: monotonic, so two reads
@@ -3074,7 +3102,17 @@ export class MagmaDesk {
     return this.runningLeasesOnAmboss();
   }
 
-  /** Close sold channels whose lease is over (CHANNEL_MONITORING_FINISHED). */
+  /**
+   * Close sold channels whose lease is over (CHANNEL_MONITORING_FINISHED):
+   * the sale's own channel, by its funding outpoint — txid AND vout: two
+   * channels can share one funding transaction, and matching the txid alone
+   * closed the first one LND listed, another buyer's whose lease still ran
+   * (review 2026-10-25). Never one whose lease Amboss still lists as running.
+   * Kept open when our side holds under SOLD_CLOSE_MIN_LOCAL_SHARE of it (what
+   * is left is inbound worth keeping) or it routes well; closed at the
+   * economy fee rate, never above the operator's maximum on-chain fee rate
+   * (it paid LND's 6-block rate, whatever that was).
+   */
   async closeFinishedLeases(): Promise<MagmaSellAction[]> {
     const { writeLnd, amboss } = this.deps;
     if (!writeLnd || !amboss.hasKey()) return [];
@@ -3085,27 +3123,58 @@ export class MagmaDesk {
     );
     if (orders.length === 0) return [];
     const open = (await getChannels({ lnd: this.deps.readLnd })).channels;
+    // Other sales' leases, as Amboss last listed them running.
+    const running = new Set(this.runningLeasesOnAmboss().map((l) => standardChannelId(l.channelId)));
+    let terms: Awaited<ReturnType<NonNullable<MagmaDeskDeps["soldChannelClose"]>>> | null | undefined;
     const out: MagmaSellAction[] = [];
     for (const o of orders) {
       // (Auto-close is selling's automation: none starts once Liquidity
       // provision is switched off — or all automation paused — meanwhile.)
       if (this.stopping || !this.deps.config().sellEnabled) break;
-      let txid = this.journal.get(o.id)?.fundingOutpoint?.split(":")[0] ?? this.finishedTxids.get(o.id);
-      if (txid === undefined) {
+      let point = this.journal.get(o.id)?.fundingOutpoint ?? this.finishedTxids.get(o.id);
+      if (point === undefined) {
         // Asked once per process — but only Amboss's answer is remembered. A
         // read that failed is asked again on the next run (before, one
         // hiccup was remembered as "no funding transaction", and that lease's
         // channel stayed open until a restart).
         const sale = await this.ambossSale(key, o.id).catch(() => null);
         if (!sale) continue;
-        txid = sale.transactionId?.split(":")[0] ?? null;
-        this.finishedTxids.set(o.id, txid);
+        point = sale.transactionId ?? null;
+        this.finishedTxids.set(o.id, point);
       }
-      const ch = txid ? open.find((c) => c.transaction_id === txid) : undefined;
-      if (!ch) continue; // closed already, or not ours
+      const ch = point ? channelAtOutpoint(open, point) : undefined;
+      if (!ch) continue; // closed already, not ours, or not which one of a shared funding
+      if (running.has(standardChannelId(ch.id))) continue; // a lease still runs on it
+      // Is it worth closing? (Asked once per pass, when a close is due.)
+      terms ??= this.deps.soldChannelClose ? await this.deps.soldChannelClose().catch(() => null) : null;
+      const keep =
+        ch.local_balance < SOLD_CLOSE_MIN_LOCAL_SHARE * ch.capacity
+          ? `kept open: ${Math.round(ch.local_balance).toLocaleString("en-US")} of its ${Math.round(ch.capacity).toLocaleString("en-US")} sat are on our side — the rest is inbound worth keeping`
+          : terms?.routesWell(ch.id)
+            ? "kept open: it routes well (it earns at least what a sat of this node's channels earns)"
+            : !terms
+              ? "not closed yet: no on-chain fee estimate to close it at an economy rate"
+              : terms.feeRate === null
+                ? "not closed yet: LND gave no on-chain fee estimate"
+                : terms.feeRate > terms.maxFeeRate
+                  ? `not closed yet: on-chain fees are ${terms.feeRate} sat/vB at the economy rate — above your ${terms.maxFeeRate} sat/vB maximum`
+                  : null;
+      if (keep) {
+        // Said once per process (in the order's history, or the log for a
+        // sale the journal doesn't know), not each run.
+        if (this.closeKept.get(o.id) !== keep) {
+          this.closeKept.set(o.id, keep);
+          const entry = this.journal.get(o.id);
+          if (entry) {
+            this.journal.event(entry, `lease over — ${keep}`);
+            this.journal.note(entry);
+          } else console.log(`[magma] order ${o.id}: lease over — ${keep}`);
+        }
+        continue;
+      }
       // Again right before the close: the read above may have taken a while.
       if (this.stopping || !this.deps.config().sellEnabled) break;
-      const res = await closeChannelByOutpoint(writeLnd, ch.transaction_id, ch.transaction_vout, false);
+      const res = await closeChannelByOutpoint(writeLnd, ch.transaction_id, ch.transaction_vout, false, terms?.feeRate ?? undefined);
       const entry = this.journal.get(o.id);
       if (entry && res.ok) {
         entry.closedAt = now();

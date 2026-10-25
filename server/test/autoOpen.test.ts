@@ -15,8 +15,10 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { ONCHAIN_LOCK_ALERT_MS } from "../src/services/autopilot.js";
 import { getChannelSuggestionsV2, type SuggestionV2 } from "../src/services/suggestRecommend.js";
 import {
   MIN_YIELD_EARNED_SAT,
@@ -31,7 +33,7 @@ import {
 } from "../src/services/openPlan.js";
 import { isPreBroadcastRefusal, nodeSideRefusal, peerMaxChannelFromError, peerMinChannelFromError } from "../src/services/channelOps.js";
 import { LnPlusStore } from "../src/services/lnplusStore.js";
-import { GOSSIP_PEER, autopilotWith, suggestion, type AutopilotSeams } from "./helpers/autopilot.js";
+import { GOSSIP_PEER, autopilotAt, autopilotWith, suggestion, type AutopilotSeams } from "./helpers/autopilot.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
 import { chanNumber, feeNode, forwardsOut } from "./helpers/feeNode.js";
 import { makeTempDir } from "./helpers/tmp.js";
@@ -114,8 +116,28 @@ test("planOpen: the peer's minimum is met — auto size rises to it (up to a thi
     sizeSats: 1_600_000,
     why: "sized down to its 1,677,721 sat maximum",
   });
-  // Bigger than the wallet: says so (before: silence).
-  assert.match((planOpen(cand(), ctx({ spendableSat: 1_400_000 })) as { skip: string }).skip, /^needs 2,000,000 sat — 1,400,000 spendable after the reserve and the coins promised to buyers$/);
+  // Bigger than the wallet: auto size shrinks to what can be spent, rounded
+  // down to 100k (review 2026-10-25: 3.94M spendable skipped every 4–10M
+  // suggestion though 3.9M passed every other check) …
+  assert.deepEqual(planOpen(cand(), ctx({ spendableSat: 1_456_789 })), { sizeSats: 1_400_000, why: "sized down to the 1,400,000 sat that can be spent" });
+  assert.deepEqual(planOpen(cand({ recommendedSizeSats: 10_000_000 }), ctx({ spendableSat: 3_941_232 })), {
+    sizeSats: 3_900_000,
+    why: "sized down to the 3,900,000 sat that can be spent",
+  });
+  // … never below 1M nor the peer's minimum, and a fixed size never — says so (before: silence).
+  assert.match((planOpen(cand(), ctx({ spendableSat: 999_999 })) as { skip: string }).skip, /^needs 2,000,000 sat — 999,999 spendable after the reserve, the coins promised to buyers$/);
+  assert.match(
+    (planOpen(cand({ peerMinChannelSats: 1_500_000 }), ctx({ spendableSat: 1_456_789 })) as { skip: string }).skip,
+    /^needs 2,000,000 sat — 1,456,789 spendable/,
+    "the peer takes 1.5M at least",
+  );
+  assert.match((planOpen(cand(), ctx({ fixedSize: 2_000_000, spendableSat: 1_456_789 })) as { skip: string }).skip, /^needs 2,000,000 sat — 1,456,789 spendable/);
+  assert.match((planOpen(cand(), ctx({ spendableSat: 999_999, heldSat: 2_000_000 })) as { skip: string }).skip, /and those held for Magma$/);
+  // The payback is judged at the shrunk size: 1.4M at 1,000 ppm/yr earns ~1,400 sat a year.
+  assert.match(
+    (planOpen(cand(), ctx({ spendableSat: 1_456_789, feeRate: 30, yieldPpmYear: 1_000 })) as { skip: string }).skip,
+    /of what a 1,400,000 sat channel earns here/,
+  );
 });
 
 test("planOpen: the open and its later close must pay back within 12 months of what a channel earns here — the finding's 2M channel at 100 sat/vB doesn't; at 2 sat/vB it does; with no routing income measured only the fee cap applies", () => {
@@ -466,12 +488,13 @@ test("POST /channels/never-open keeps the operator's list (a preference — no n
 
 test("nothing silent: a top pick bigger than the wallet, the cooldown and an empty wallet each leave a decision note — and no failed run", async (t) => {
   const s = stage(t);
-  s.node.chainBalance = 1_500_000;
+  // Under the 1M auto size shrinks to at most (AUTO_SIZE_MIN_SATS).
+  s.node.chainBalance = 1_000_000;
   s.seams.channelSuggestions = async () => ({ suggestions: [suggestion] });
   const run = await s.autopilot.runOnce();
   assert.deepEqual(run.channels, []);
   const decision = () => s.autopilot.getState().decisions.channels;
-  assert.match(decision()?.text ?? "", /^no channel opened — next-peer: needs 2,000,000 sat — 1,4\d\d,\d{3} spendable after the reserve/);
+  assert.match(decision()?.text ?? "", /^no channel opened — next-peer: needs 2,000,000 sat — 9\d\d,\d{3} spendable after the reserve/);
   // Each is a wait (D16), never "nothing to do": the Overview tile shows a
   // waiting area's reason — "Channel autopilot — waiting: …" — and hides an
   // idle one's.
@@ -830,4 +853,189 @@ test("auto-size rising to a peer's minimum rounds UP to the next 100k: a 1,234,5
   assert.deepEqual(plan, { sizeSats: 1_300_000, why: "sized up to its 1,234,567 sat minimum" });
   // A round minimum is met exactly.
   assert.deepEqual(planOpen(cand({ peerMinChannelSats: 3_000_000, recommendedSizeSats: 1_000_000 }), ctx()), { sizeSats: 3_000_000, why: "sized up to its 3,000,000 sat minimum" });
+});
+
+// ── review 2026-10-25: the channel autopilot ─────────────────────────────────
+
+test("a peer's own refusal during the negotiation — 'received funding error from …', whatever it says, or LND giving up on its answer — comes before any broadcast: the next peer opens in the same run, the refuser backs off, and no 'may have opened' cooldown starts", async (t) => {
+  const pk = PK(9);
+  for (const e of [
+    `FailedToOpenChannel: received funding error from ${pk}: chan_id=ab, err=channel rejected`,
+    `FailedToOpenChannel: received funding error from ${pk}: chan_id=ab, err=open channel request rejected: we only accept channels > 5M`,
+    `FailedToOpenChannel: received funding error from ${pk}: Funding amount too small`,
+    `FailedToOpenChannel: received funding error from ${pk}: invalid funding_amount=2000000 (min=5000000 max=16777215)`,
+    `FailedToOpenChannel: received funding error from ${pk}: channel too large`,
+    `FailedToOpenChannel: received funding error from ${pk}: remote canceled funding, possibly timed out`,
+    `FailedToOpenChannel: reservation timed out waiting for peer (peer_id:${pk}, chan_id:ab)`,
+  ]) {
+    assert.equal(isPreBroadcastRefusal(e), true, e);
+  }
+  // What may come after the broadcast stays unclear.
+  for (const e of ["FailedToOpenChannel: Connection dropped", "UnexpectedErrorOpeningChannel: rpc error: code = DeadlineExceeded", "FailedToOpenChannel: something new"]) {
+    assert.equal(isPreBroadcastRefusal(e), false, e);
+  }
+
+  const s = stage(t, { channelCooldownMinutes: 1_440 });
+  const A = { ...suggestion, pubkey: PK(81), alias: "A", sockets: ["apeer.onion:9735"] };
+  const B = { ...suggestion, pubkey: PK(82), alias: "B", sockets: ["bpeer.onion:9735"] };
+  s.seams.channelSuggestions = async () => ({ suggestions: [A, B] });
+  s.node.beforeCall = (method, args) => {
+    if (method !== "default.openChannel") return;
+    s.node.openFailure = pubkeyOf(args) === A.pubkey ? `received funding error from ${A.pubkey}: chan_id=ab, err=channel rejected` : null;
+  };
+  const run = await s.autopilot.runOnce();
+  // Before: the run stopped at A ("it may have opened a channel"), B wasn't
+  // tried, and the day's cooldown started.
+  assert.deepEqual(run.channels.map((c) => [c.alias, c.ok]), [["A", false], ["B", true]]);
+  assert.deepEqual(s.opened(), [[A.pubkey, 2_000_000], [B.pubkey, 2_000_000]]);
+  assert.equal(s.books.peerOpenFailures?.[A.pubkey]?.fails, 1, "A backs off");
+  assert.equal(s.books.lastChannelOpenUnclear, null);
+  assert.match(s.autopilot.getState().decisions.channels?.text ?? "", /^opened 2,000,000 sat to B /);
+});
+
+test("a restart while LND funds an open — its answer never came — finds the open on record: it counts as unclear, and the new process waits out the cooldown instead of opening a second channel beside it; the on-chain lock held that long is an alert naming the holder", async (t) => {
+  t.mock.method(console, "warn", () => undefined);
+  const s = stage(t, { channelCooldownMinutes: 1_440 });
+  const A = { ...suggestion, pubkey: PK(91), alias: "A", sockets: ["apeer.onion:9735"] };
+  const B = { ...suggestion, pubkey: PK(92), alias: "B", sockets: ["bpeer.onion:9735"] };
+  s.seams.channelSuggestions = async () => ({ suggestions: [A, B] });
+  // LND takes the open and never answers: the process goes down meanwhile.
+  s.node.override("default.openChannel", () => Object.assign(new EventEmitter(), { cancel: () => undefined }));
+  void s.autopilot.runOnce();
+  for (let i = 0; i < 400 && s.node.callsTo("default.openChannel").length === 0; i++) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(s.node.callsTo("default.openChannel").length, 1);
+  // On disk before LND had it: the peer, the amount, the time.
+  const onDisk = JSON.parse(readFileSync(join(s.dir, "autopilot.json"), "utf8"));
+  assert.deepEqual([onDisk.channelOpening?.pubkey, onDisk.channelOpening?.alias, onDisk.channelOpening?.sizeSats], [A.pubkey, "A", 2_000_000]);
+  assert.ok(Date.parse(onDisk.channelOpening.at) <= Date.now());
+  // The lock it holds: nothing to say for ten minutes, then who holds it.
+  assert.deepEqual(s.autopilot.onchainLockAlerts(), []);
+  assert.deepEqual(s.autopilot.onchainLockAlerts(Date.now() + ONCHAIN_LOCK_ALERT_MS - 60_000), []);
+  const [alert, ...more] = s.autopilot.onchainLockAlerts(Date.now() + ONCHAIN_LOCK_ALERT_MS + 60_000);
+  assert.equal(more.length, 0);
+  assert.equal(alert?.level, "warn");
+  assert.match(alert?.message ?? "", /^The on-chain lock has been held by "autopilot open" for 1[01] minutes — channel opens, Magma accepts and LSP opens wait behind it\./);
+
+  // The restarted process: the same data dir, the same LND.
+  const again = autopilotAt(t, s.dir, s.node);
+  again.seams.openFeeRate = async () => 2;
+  again.seams.channelSuggestions = async () => ({ suggestions: [B] });
+  // (An open it would make now is answered at once — refused.)
+  s.node.override("default.openChannel", () => {
+    const st = Object.assign(new EventEmitter(), { cancel: () => undefined });
+    setImmediate(() => st.emit("status", { details: `received funding error from ${B.pubkey}: channel rejected` }));
+    return st;
+  });
+  const run = await again.autopilot.runOnce();
+  // Before: no cooldown known — B opened at once, beside A's funding.
+  assert.deepEqual(run.channels, []);
+  assert.equal(s.node.callsTo("default.openChannel").length, 1, "no second open");
+  assert.match(
+    again.autopilot.getState().decisions.channels?.text ?? "",
+    /^the open to A \d+ min ago ended unclearly — it may have opened a channel; the next open waits for the 1440-minute cooldown$/,
+  );
+  const after = JSON.parse(readFileSync(join(s.dir, "autopilot.json"), "utf8"));
+  assert.equal(after.channelOpening, null);
+  assert.equal(after.lastChannelOpenUnclear, "A");
+  assert.equal(after.lastChannelOpenAt, onDisk.channelOpening.at, "the cooldown runs from the open");
+});
+
+test("an open the peer refused before anything was broadcast leaves no record of an open behind: a restart right after opens at once — no cooldown for an open that never was", async (t) => {
+  const s = stage(t, { channelCooldownMinutes: 1_440 });
+  const A = { ...suggestion, pubkey: PK(93), alias: "A", sockets: ["apeer.onion:9735"] };
+  s.seams.channelSuggestions = async () => ({ suggestions: [A] });
+  s.node.openFailure = `received funding error from ${A.pubkey}: Funding amount too small`;
+  await s.autopilot.runOnce();
+  assert.equal(s.node.callsTo("default.openChannel").length, 1);
+  const onDisk = JSON.parse(readFileSync(join(s.dir, "autopilot.json"), "utf8"));
+  assert.equal(onDisk.channelOpening, null);
+  assert.ok(!onDisk.lastChannelOpenAt, "no cooldown");
+  s.node.openFailure = null;
+  const again = autopilotAt(t, s.dir, s.node);
+  again.seams.openFeeRate = async () => 2;
+  const B = { ...suggestion, pubkey: PK(94), alias: "B", sockets: ["bpeer.onion:9735"] };
+  again.seams.channelSuggestions = async () => ({ suggestions: [B] });
+  const run = await again.autopilot.runOnce();
+  assert.equal(run.channels[0]?.ok, true, JSON.stringify(run.channels));
+});
+
+test("GET /alerts says when the on-chain lock has been held for over ten minutes, and by whom", async (t) => {
+  const api = await startApi(t);
+  const mutex = (api.autopilot as unknown as { capital: { mutex: { run: <T>(label: string, fn: () => Promise<T>) => Promise<T> } } }).capital.mutex;
+  let release!: () => void;
+  const held = mutex.run("Magma accept", () => new Promise<void>((r) => (release = r)));
+  t.after(() => release());
+  await new Promise((r) => setTimeout(r, 5));
+  const messages = async () => ((await api.request("GET", "/alerts")).body as { message: string }[]).map((a) => a.message);
+  assert.ok(!(await messages()).some((m) => /on-chain lock/.test(m)), "held for moments: nothing to say");
+  // Eleven minutes later.
+  (mutex as unknown as { since: number }).since = Date.now() - 11 * 60_000;
+  assert.ok((await messages()).some((m) => /^The on-chain lock has been held by "Magma accept" for 11 minutes/.test(m)));
+  release();
+  await held;
+  assert.ok(!(await messages()).some((m) => /on-chain lock/.test(m)), "gone once it is free");
+});
+
+test("an automatic open pays LND's economy estimate rounded, not rounded up: at LND's floor (253 sat/kw = 1.012 sat/vB) 1 sat/vB, not 2 — and never less than 1", async (t) => {
+  const env = autopilotWith(t, { channelEnabled: true });
+  for (const [kw, rate] of [["253", 1], ["300", 1], ["375", 2], ["500", 2], ["1000", 4], ["100", 1]] as const) {
+    env.node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: kw }));
+    assert.equal(await env.seams.openFeeRate(), rate, `${kw} sat/kw`);
+  }
+});
+
+test("LND not saying its block height or its closed channels: no suggestion is opened to automatically — a close within 90 days can't be ruled out — and the suggestion says why", async () => {
+  const { node, C } = graphNode();
+  const closedWithC = {
+    alias_scids: [], capacity: "1000000", chan_id: chanNumber("850000x9x0"), channel_point: `${(9).toString(16).padStart(64, "0")}:0`,
+    close_height: 860_000 - 1_440, closing_tx_hash: "98".repeat(32), remote_pubkey: C, settled_balance: "990000",
+    time_locked_balance: "0", close_type: "COOPERATIVE_CLOSE", open_initiator: "INITIATOR_LOCAL", close_initiator: "INITIATOR_LOCAL", resolutions: [], zero_conf_confirmed_scid: "0",
+  };
+  node.override("default.closedChannels", (_a, cb) => cb(null, { channels: [closedWithC] }));
+  const known = (await getChannelSuggestionsV2(node.lnd, { minChannels: 8 })).suggestions.find((s) => s.pubkey === C);
+  assert.equal(known?.closedDaysAgo, 10);
+  assert.equal(known?.closeHistoryKnown, undefined, "known");
+  // One failed GetInfo: before, the close ten days ago went unseen and C was opened to.
+  node.override("default.getInfo", (_a, cb) => cb({ details: "rpc error: deadline exceeded" }));
+  const blind = (await getChannelSuggestionsV2(node.lnd, { minChannels: 8 })).suggestions.find((s) => s.pubkey === C);
+  assert.ok(blind, "still suggested — by hand it can be opened");
+  assert.equal(blind.closedDaysAgo, null);
+  assert.equal(blind.closeHistoryKnown, false);
+  assert.ok(
+    blind.warnings.some((w) => /^LND didn't say its block height or its closed channels — whether you closed a channel with it lately is unknown, so the autopilot doesn't open to it until it does\.$/.test(w)),
+    blind.warnings.join(" | "),
+  );
+  assert.deepEqual(planOpen(blind, ctx()), {
+    skip: "LND didn't say its block height or its closed channels — whether you closed a channel with it within 90 days can't be checked, so it isn't opened to automatically until LND does",
+  });
+  assert.ok("sizeSats" in planOpen({ ...blind, closeHistoryKnown: undefined }, ctx()), "that alone held it back");
+});
+
+test("LND not listing its closed channels: the same — no automatic open until it does", async () => {
+  const { node, C } = graphNode();
+  node.override("default.closedChannels", (_a, cb) => cb({ details: "rpc error: unavailable" }));
+  const c = (await getChannelSuggestionsV2(node.lnd, { minChannels: 8 })).suggestions.find((s) => s.pubkey === C);
+  assert.equal(c?.closeHistoryKnown, false);
+  assert.ok("skip" in planOpen(c!, ctx()));
+});
+
+test("the close list's 'redeploy into' names only opens the channel autopilot would make — its peer rules, LN+ and a third of the node's capital — not the top suggestions as ranked", async (t) => {
+  const s = stage(t);
+  const mk = (n: number, alias: string, o: Partial<SuggestionV2> = {}) => ({ ...suggestion, pubkey: PK(n), alias, score: 200 - n, ...o }) as SuggestionV2;
+  const poorlyRated = mk(101, "poorly-rated", { lnplus: { positiveRatings: 1, negativeRatings: 3 } as SuggestionV2["lnplus"] });
+  const vetoed = mk(102, "vetoed");
+  const backedOff = mk(103, "backed-off");
+  const closedLately = mk(104, "closed-lately", { closedDaysAgo: 12 });
+  const lowUse = mk(105, "low-use", { usefulness: "low" });
+  const greedy = mk(106, "greedy", { peerMinChannelSats: 8_000_000 }); // 20M on chain: a third is 6.67M
+  const fine = [mk(107, "ok-1"), mk(108, "ok-2", { peerMinChannelSats: 3_000_000 }), mk(109, "ok-3"), mk(110, "ok-4")];
+  s.seams.channelSuggestions = async () => ({ suggestions: [poorlyRated, vetoed, backedOff, closedLately, lowUse, greedy, ...fine] });
+  s.autopilot.setNeverOpen(vetoed.pubkey, true, "vetoed");
+  s.books.peerOpenFailures = { [backedOff.pubkey]: refusal({ alias: "backed-off", retryAt: new Date(Date.now() + DAY).toISOString() }) };
+  // Before: the first three as ranked — none of which the autopilot would open to.
+  assert.deepEqual(await s.autopilot.swapTargets(), [
+    { alias: "ok-1", score: 93, sizeSats: 2_000_000 },
+    { alias: "ok-2", score: 92, sizeSats: 3_000_000 },
+    { alias: "ok-3", score: 91, sizeSats: 2_000_000 },
+  ]);
 });

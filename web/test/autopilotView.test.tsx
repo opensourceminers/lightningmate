@@ -103,7 +103,7 @@ test("a preset says exactly what it changes before it applies — what moves cap
   const balanced = buildPresets(c).find((p) => p.id === "balanced")!;
   const changes = presetChanges(c, balanced.cfg);
   const by = Object.fromEntries(changes.map((x) => [x.label, x]));
-  assert.equal(by["Channel autopilot"]?.capital, "opens channels with your on-chain funds, when an open pays back");
+  assert.equal(by["Channel autopilot"]?.capital, "opens channels with your on-chain funds, when an open pays back — not with the coins held for Magma while Liquidity provision is on");
   assert.equal(by["Auto-rebalance"]?.capital, "pays routing fees for refills — up to 10,000 sat a day");
   assert.deepEqual([by["Fee automation"]?.from, by["Fee automation"]?.to], ["off", "on"]);
   assert.ok(!changes.some((x) => /Liquidity|selling|Magma/i.test(x.label)), "presets never switch selling (D9)");

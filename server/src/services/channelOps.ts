@@ -108,9 +108,19 @@ function describe(err: unknown): string {
  * not "failed": its caller keeps the "opening" record and looks for the
  * channel in LND before opening again or releasing the buyer's payment
  * (otherwise: a second channel, or a refunded buyer with a free channel).
+ *
+ * A peer's own error ("received funding error from <peer>: …", whatever it
+ * says) and LND giving up on the peer's answer ("reservation timed out") are
+ * negotiation too: LND passes a peer's error on only while the channel is
+ * still being negotiated, and publishes the funding only after the peer has
+ * signed it — after that the open answers with the pending channel. (Review
+ * 2026-10-25: seven of nine common refusals — "channel rejected", "Funding
+ * amount too small", "invalid funding_amount", "channel too large" … — read
+ * as "may have opened a channel": the run stopped, the next peer wasn't
+ * tried, and the day's cooldown started for nothing.)
  */
 const PRE_BROADCAST_REFUSAL =
-  /couldn't connect|channel size must be|PeerIsNotOnline|is not online|RemotePeerDisconnected|disconnected$|RemotePeerExited|peer exiting|RemoteNodeDoesNotSupportMultipleChannels|multiple channels unsupported|PeerPendingChannelsExceedMaximumAllowable|pending channels exceed|InsufficientFundsToCreateChannel|not enough witness outputs|insufficient funds|reserved wallet balance invalidated|ChainUnsupported|CannotOpenChannelToOwnNode|WalletNotFullySynced|RemoteNodeSyncing|MaxChannelDescriptionLengthExceeded|ExpectedLargerChannelSizeForChannelOpen|rejected the channel|chan size of .* is (below|above)|chan size of .* exceeds max|permission denied/i;
+  /couldn't connect|channel size must be|PeerIsNotOnline|is not online|RemotePeerDisconnected|disconnected$|RemotePeerExited|peer exiting|RemoteNodeDoesNotSupportMultipleChannels|multiple channels unsupported|PeerPendingChannelsExceedMaximumAllowable|pending channels exceed|InsufficientFundsToCreateChannel|not enough witness outputs|insufficient funds|reserved wallet balance invalidated|ChainUnsupported|CannotOpenChannelToOwnNode|WalletNotFullySynced|RemoteNodeSyncing|MaxChannelDescriptionLengthExceeded|ExpectedLargerChannelSizeForChannelOpen|rejected the channel|chan size of .* is (below|above)|chan size of .* exceeds max|permission denied|received funding error from|reservation timed out/i;
 
 export function isPreBroadcastRefusal(error: string): boolean {
   return PRE_BROADCAST_REFUSAL.test(error);

@@ -33,7 +33,8 @@ standalone via Docker.
   listing still reports running stays protected — its routing-fee promise
   kept, its channel never drained by a rebalance — even after the journal's
   own count has ended. A peer counts as offline only after days away.
-  Closing opens a dialog to pick the on-chain fee (fast / economy / custom); a
+  Closing opens a dialog to pick the on-chain fee (fast / normal / economy /
+  custom; economy is preselected); a
   peer that is away is offered a reconnect first, a force-close is
   its own step that says what it does, and breaking a lease needs an explicit
   "close it anyway". The channel stays visible as "pending close" until it

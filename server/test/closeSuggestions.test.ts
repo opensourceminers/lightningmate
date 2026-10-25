@@ -533,3 +533,107 @@ test("a flaky peer that is offline right now counts as long offline at once — 
   const steady = up.offlineInfo({ ...c, timeOfflineMs: 2 * DAY, timeOnlineMs: 18 * DAY }, nowMs) as OfflineInfo;
   assert.equal(steady.long, false);
 });
+
+// ── review 2026-10-25: what protects a channel ───────────────────────────────
+
+/** 60 days of flow through a channel (only what the close list reads). */
+const flow = (routedOut: number, routedIn: number, feesEarned: number, inboundFeesEarned = 0) => ({ routedOut, routedIn, forwardCount: 3, feesEarned, inboundFeesEarned });
+
+test("a channel is protected for what it earns only when its 60-day earnings — its own fees and those of the forwards it brought in — reach a quarter of what a sat of this node's channels earns: the live node's dead channels with a trickle of routing are listed, an earning one stays protected", () => {
+  // The live node's numbers (2026-10-25): before, all three were "routed recently".
+  const coin = chan(1, { peerAlias: "coinbroderie", capacity: 1_000_000, localBalance: 982_822 });
+  const all2 = chan(2, { peerAlias: "All2Easy", capacity: 6_000_000, localBalance: 5_880_000 });
+  const lnsc = chan(3, { peerAlias: "LNShortcut", capacity: 5_000_000, localBalance: 4_950_000 });
+  const sunny = chan(4, { peerAlias: "Sunny Sarah", capacity: 9_000_000, localBalance: 8_910_000 });
+  const earner = chan(5, { peerAlias: "earner", capacity: 10_000_000, localBalance: 5_000_000 });
+  const drained = chan(6, { peerAlias: "drained", capacity: 2_000_000, localBalance: 0 });
+  const channels = [coin, all2, lnsc, sunny, earner, drained];
+  const report = rankCloseCandidates(
+    input(channels, {
+      feeById: new Map([
+        [coin.id, feeOf(coin, { routed30: 2 })],
+        [all2.id, feeOf(all2, { routed30: 201_483 })],
+        [lnsc.id, feeOf(lnsc, { routed30: 275_226 })],
+        [sunny.id, feeOf(sunny, { state: "close_candidate" })],
+        [earner.id, feeOf(earner, { routed30: 9_000_000 })],
+        [drained.id, feeOf(drained, { routed30: 500_000 })],
+      ]),
+      // This node's channels: 1,800 sat in 60 days on 33M — ~332 ppm/yr.
+      flow60ById: new Map([
+        [coin.id, flow(2, 0, 0)],
+        [all2.id, flow(81_268, 728_700, 2, 67)],
+        [lnsc.id, flow(137_550, 137_861, 7, 6)],
+        [earner.id, flow(9_000_000, 0, 1_771)],
+        [drained.id, flow(2_000_000, 0, 20)],
+      ]),
+    }),
+  );
+  assert.deepEqual(report.candidates.map((c) => c.alias).sort(), ["All2Easy", "LNShortcut", "Sunny Sarah", "coinbroderie"]);
+  const why = Object.fromEntries(report.protected.map((p) => [p.alias, p.reason]));
+  assert.equal(why.earner, "earns its keep — 1,771 sat in 60 d, ~2,155 ppm/yr on its local balance");
+  // Drained, and earning: nothing to free there.
+  assert.equal(why.drained, "earns its keep — 20 sat in 60 d");
+  const all2Reasons = report.candidates.find((c) => c.alias === "All2Easy")?.reasons ?? [];
+  assert.ok(
+    all2Reasons.includes("Earned 69 sat in 60d (incl. 67 on forwards it brought in) on its 5,880k — ~71 ppm/yr, under a quarter of what this node's channels earn (~332 ppm/yr)."),
+    all2Reasons.join(" | "),
+  );
+});
+
+test("on a node whose channels earn almost nothing, a channel must still earn 25 ppm/yr on its local balance to be protected for it — a quarter of almost nothing would keep every channel that routed a sat", () => {
+  const slow = chan(1, { capacity: 10_000_000, localBalance: 5_000_000 });
+  const trickle = chan(2, { capacity: 10_000_000, localBalance: 5_000_000 });
+  const report = rankCloseCandidates(
+    input([slow, trickle], {
+      feeById: new Map([
+        [slow.id, feeOf(slow, { routed30: 1_000_000 })],
+        [trickle.id, feeOf(trickle, { routed30: 100_000 })],
+      ]),
+      // ~40 ppm/yr across the node; a quarter of it is 10.
+      flow60ById: new Map([
+        [slow.id, flow(1_000_000, 0, 120)],
+        [trickle.id, flow(100_000, 0, 12)],
+      ]),
+    }),
+  );
+  assert.deepEqual(report.candidates.map((c) => c.channelId), [trickle.id]);
+  assert.equal(report.protected.find((p) => p.channelId === slow.id)?.reason, "earns its keep — 120 sat in 60 d, ~146 ppm/yr on its local balance");
+  assert.ok(
+    report.candidates[0].reasons.includes("Earned 12 sat in 60d on its 5,000k — ~15 ppm/yr, under the 25 ppm/yr a channel must earn to be kept (this node's channels earn ~40 ppm/yr)."),
+    report.candidates[0].reasons.join(" | "),
+  );
+});
+
+test("a channel under 30 days old is never a close candidate — also when the fee engine has no age for it (its short channel id and the height tell), and when nothing can tell its age", () => {
+  const young = chan(1, { ageBlocks: 288 }); // two days
+  const old = chan(2);
+  // The fee engine's weak signal on a channel opened two days ago.
+  const report = rankCloseCandidates(input([young, old], { feeById: new Map([[young.id, feeOf(young, { ageDays: 2, state: "close_candidate" })], [old.id, feeOf(old)]]) }));
+  assert.deepEqual(report.candidates.map((c) => c.channelId), [old.id]);
+  assert.equal(report.protected.find((p) => p.channelId === young.id)?.reason, "new channel — still in its test period");
+  // No age from the fee engine (it had no block height): the channel's own
+  // short channel id and the height now tell. Before: listed.
+  const noAge = (c: ChannelView) => ({ ...feeOf(c, { state: "close_candidate" }), metrics: { ...feeOf(c).metrics, channelAgeDays: null } }) as unknown as FeeRecommendation;
+  const fromScid = rankCloseCandidates(input([young, old], { feeById: new Map([[young.id, noAge(young)], [old.id, noAge(old)]]), heightNow: HEIGHT }));
+  assert.deepEqual(fromScid.candidates.map((c) => c.channelId), [old.id]);
+  assert.equal(fromScid.protected.find((p) => p.channelId === young.id)?.reason, "new channel — still in its test period");
+  // Nothing tells its age (no height either): not listed — nor is any other.
+  const blind = rankCloseCandidates(input([young, old], { feeById: new Map([[young.id, noAge(young)], [old.id, noAge(old)]]) }));
+  assert.deepEqual(blind.candidates, []);
+  assert.deepEqual(
+    blind.protected.map((p) => p.reason),
+    Array(2).fill("its age can't be told (LND didn't say the block height) — a channel under 30 days old is never listed"),
+  );
+});
+
+test("'significant unique reach' protects only with at least five 2-hop nodes no other peer reaches — on a node whose best channel reaches ONE such node, that dead channel was protected for it", () => {
+  const ranked = (reach: number[]) => {
+    const channels = reach.map((_, i) => chan(i + 1, { capacity: 5_000_000, localBalance: 4_950_000 }));
+    const r = rankCloseCandidates(input(channels, { uniqueReachByChan: new Map(channels.map((c, i) => [c.id, reach[i]])) }));
+    return { listed: r.candidates.map((c) => c.alias).sort(), kept: r.protected.map((p) => `${p.alias}: ${p.reason}`) };
+  };
+  assert.deepEqual(ranked([1, 0, 0]), { listed: ["peer-1", "peer-2", "peer-3"], kept: [] });
+  assert.deepEqual(ranked([4, 3, 0]), { listed: ["peer-1", "peer-2", "peer-3"], kept: [] });
+  assert.deepEqual(ranked([6, 2, 0]), { listed: ["peer-2", "peer-3"], kept: ["peer-1: provides significant unique reach"] });
+  assert.deepEqual(ranked([40, 25, 0]).kept, ["peer-1: provides significant unique reach", "peer-2: provides significant unique reach"]);
+});

@@ -104,7 +104,8 @@ export function CloseChannelDialog({
       .feeEstimates()
       .then((f) => {
         setFees(f);
-        setRate(f.normal ?? f.fast ?? f.economy ?? 1);
+        // A close is rarely urgent: the economy rate first (review 2026-10-25).
+        setRate(f.economy ?? f.normal ?? f.fast ?? 1);
       })
       .catch(() => {});
   }, []);

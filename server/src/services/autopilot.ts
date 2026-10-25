@@ -41,12 +41,14 @@ import { getOwnPubkey } from "./node.js";
 import { torVia } from "./http.js";
 import { getChannelSuggestionsV2, type SuggestionV2 } from "./suggestRecommend.js";
 import {
+  AUTO_SIZE_MIN_SATS,
   MAX_CAPITAL_SHARE_PER_OPEN,
   MAX_OPEN_TRIES_PER_RUN,
   OPEN_CONF_TARGET,
   OPEN_DIAL_BUDGET_MS,
   PEER_BACKOFF_DAYS,
   PEER_RECORDS_KEPT,
+  magmaFillsPerYear,
   measuredYield,
   monthOldChannels,
   planOpen,
@@ -85,7 +87,6 @@ import type { EarningsLog } from "./earningsLog.js";
 import { getChannelsView } from "./channels.js";
 import { getForwardsReport } from "./forwards.js";
 import { activeCap, capText, offerFeeCaps, type OfferFeeCaps } from "./leaseCaps.js";
-import { routingYieldStats } from "./capitalAllocator.js";
 import {
   AUTOPILOT_CONFIG_BOUNDS,
   ConfigValidationError,
@@ -471,6 +472,15 @@ interface PersistedState {
    *  alias): its funding may have been broadcast, so the cooldown runs as
    *  after an open — the note says which open it was. */
   lastChannelOpenUnclear?: string | null;
+  /** An automatic open handed to LND and not answered yet (write-ahead, set
+   *  right before the call): found at the next channel stage — the process
+   *  went down mid-open — it counts as an open that ended unclearly
+   *  (validOpening). */
+  channelOpening?: OpeningRecord | null;
+  /** The channel stage's last Magma comparison (leaveForMagma): reused for
+   *  up to MAGMA_HOLD_KEEP_MS when Amboss's public book can't be read
+   *  (validHold). */
+  magmaHold?: MagmaHold | null;
   lastSellRepriceAt: string | null;
   /** Adaptive Magma pricing state (mode "auto"): the current 0..1 price level and
    *  the fill bookkeeping that ratchets it up (sells fast) or down (sits unsold). */
@@ -599,6 +609,48 @@ export function sanitizeBaseMoves(raw: unknown): Record<string, BaseMove> {
     if (validSats(e.base) && validSats(e.offerBase) && validTime(e.since)) out[id] = { base: e.base, offerBase: e.offerBase, since: e.since };
   }
   return out;
+}
+
+/** An automatic open handed to LND (PersistedState.channelOpening). */
+export interface OpeningRecord {
+  pubkey: string;
+  alias: string;
+  sizeSats: number;
+  at: string;
+}
+
+/** The channel stage's Magma comparison (PersistedState.magmaHold): when it
+ *  was made, what it held for Magma (sat) and its note (null: nothing held). */
+export interface MagmaHold {
+  at: string;
+  heldSat: number;
+  text: string | null;
+}
+
+/** A saved Magma comparison stands this long when Amboss's public book can't
+ *  be read; past it nothing is held for Magma (and the note says so). */
+export const MAGMA_HOLD_KEEP_MS = 24 * 3_600_000;
+
+/** The shared on-chain lock held this long raises an alert (onchainLockAlerts). */
+export const ONCHAIN_LOCK_ALERT_MS = 10 * 60_000;
+
+/** A saved write-ahead record, made safe (read where it is used: a damaged
+ *  value is no open in flight). */
+export function validOpening(raw: unknown): OpeningRecord | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Partial<Record<keyof OpeningRecord, unknown>>;
+  if (typeof o.pubkey !== "string" || typeof o.alias !== "string" || !validTime(o.at)) return null;
+  const sizeSats = typeof o.sizeSats === "number" && Number.isFinite(o.sizeSats) && o.sizeSats > 0 ? o.sizeSats : 0;
+  return { pubkey: o.pubkey, alias: o.alias, sizeSats, at: o.at };
+}
+
+/** A saved Magma comparison, made safe (null: none usable). */
+export function validHold(raw: unknown): MagmaHold | null {
+  if (!raw || typeof raw !== "object") return null;
+  const h = raw as Partial<Record<keyof MagmaHold, unknown>>;
+  if (!validTime(h.at) || typeof h.heldSat !== "number" || !Number.isFinite(h.heldSat) || h.heldSat < 0) return null;
+  if (h.text !== null && typeof h.text !== "string") return null;
+  return { at: h.at, heldSat: Math.floor(h.heldSat), text: h.text ?? null };
 }
 
 /** Per-id times as they were saved, made safe: only those that parse. */
@@ -1302,6 +1354,7 @@ export class Autopilot {
         };
       },
       saleFloorSats: () => this.saleFeeFloorSats(),
+      soldChannelClose: () => this.soldChannelClose(),
     });
     initMagmaHistory(dataDir);
     this.purchases = new MagmaPurchases(dataDir);
@@ -3076,6 +3129,23 @@ export class Autopilot {
       }
     }
 
+    // An open handed to LND that never got its answer: the process went down
+    // mid-open (write-ahead, openTo). Its funding may be out — it counts as
+    // an open that ended unclearly, so the cooldown runs from it (review
+    // 2026-10-25: a restart while LND funded an open knew no cooldown, and
+    // the next run opened a second channel at once).
+    if (this.state.channelOpening !== undefined && this.state.channelOpening !== null) {
+      const left = validOpening(this.state.channelOpening);
+      this.state.channelOpening = null;
+      if (left) {
+        const prev = this.state.lastChannelOpenAt ? Date.parse(this.state.lastChannelOpenAt) : NaN;
+        if (!(prev >= Date.parse(left.at))) this.state.lastChannelOpenAt = left.at;
+        this.state.lastChannelOpenUnclear = left.alias;
+        logLine("warn", `[autopilot] channels: the open to ${left.alias} (${fmtSat(left.sizeSats)} sat, ${left.at}) never got LND's answer — it counts as unclear, and the cooldown runs from it`);
+      }
+      this.persist();
+    }
+
     // Respect the cooldown between auto-opens — after an open, and after one
     // that ended unclearly (it may have opened a channel).
     if (this.state.lastChannelOpenAt) {
@@ -3120,27 +3190,37 @@ export class Autopilot {
       return [];
     }
 
-    // Capital engine (D10): with Liquidity provision on, a routing open waits
-    // — the coins left for Magma — only when Magma can actually take them and
-    // is expected to earn more on them (leaveForMagma). Before, the deferral
-    // read no lease data at all: it compared the median routing yield with
-    // 1.2 × the lower-quartile one — a dispersion test that deferred whenever
-    // channels earned alike (a node with ONE channel could never open a
-    // second) — and parked capital for an offer that wasn't selling.
+    // Capital engine (D10): with Liquidity provision on, the coins Magma can
+    // list are held for it — only when Magma can actually take them and is
+    // expected to earn more on them (leaveForMagma) — and the rest stays free
+    // for routing opens. Before, the deferral read no lease data at all (a
+    // dispersion test of routing yields), and later held back every coin,
+    // also what the deploy cap keeps Magma from ever listing.
+    let hold: { heldSat: number; text: string | null } = { heldSat: 0, text: null };
     if (cfg.sellEnabled) {
-      let deferral: string | null = null;
       try {
-        deferral = await this.leaveForMagma();
+        hold = await this.leaveForMagma();
       } catch (err) {
-        // No answer: no deferral — the open goes ahead. Said in the log (it
+        // No answer: nothing held — the open goes ahead. Said in the log (it
         // was silent): the comparison it skipped is the one that holds
         // capital back for Magma.
-        logLine("warn", `[autopilot] channels: the Magma comparison couldn't be made (${errText(err)}) — an open is not held back for it`);
+        logLine("warn", `[autopilot] channels: the Magma comparison couldn't be made (${errText(err)}) — nothing is held back for it`);
       }
-      if (deferral) {
-        note(deferral, "deferred");
-        return [];
-      }
+    }
+    const free = Math.max(0, pre.spendableSat - hold.heldSat);
+    /** Every note of the stage carries what is held for Magma, and what is free. */
+    const withHold = (text: string): string =>
+      hold.text ? `${text} · ${hold.text}${hold.heldSat > 0 ? `; ${fmtSat(free)} sat left for routing opens` : ""}` : text;
+    // What is left can't fund the smallest open this stage makes (your
+    // channel size, else the auto-size floor): the open waits for Magma.
+    const smallest = cfg.channelSizeSats > 0 ? cfg.channelSizeSats : AUTO_SIZE_MIN_SATS;
+    if (hold.heldSat > 0 && free < smallest) {
+      note(
+        `deferred: ${hold.text} — ${free > 0 ? `the ${fmtSat(free)} sat left` : "nothing left"} for a routing open ` +
+          `(${fmtSat(pre.spendableSat)} sat spendable; the smallest open is ${fmtSat(smallest)} sat)`,
+        "deferred",
+      );
+      return [];
     }
 
     // The autopilot opens channels with real capital, so it gets the LN+ trust
@@ -3176,7 +3256,8 @@ export class Autopilot {
     }
     const ctx: OpenContext = {
       fixedSize: cfg.channelSizeSats > 0 ? cfg.channelSizeSats : null,
-      spendableSat: pre.spendableSat,
+      spendableSat: free,
+      heldSat: hold.heldSat,
       feeRate: rate,
       yieldPpmYear: earning?.ppmYear ?? null,
       maxRaiseSat: Math.floor((earning?.capitalSat ?? pre.chainSat) * MAX_CAPITAL_SHARE_PER_OPEN),
@@ -3207,7 +3288,7 @@ export class Autopilot {
         continue;
       }
       tries += 1;
-      const res = await this.openTo(writeLnd, s, plan.sizeSats, rate);
+      const res = await this.openTo(writeLnd, s, plan.sizeSats, rate, hold.heldSat);
       if (res.kind === "opened") {
         delete this.state.peerOpenFailures?.[s.pubkey];
         this.channelLast.delete(s.pubkey);
@@ -3220,8 +3301,10 @@ export class Autopilot {
               ? unmeasuredYieldText(earning.evidence)
               : null;
         note(
-          `opened ${fmtSat(plan.sizeSats)} sat to ${s.alias} at ${rate} sat/vB${plan.why ? ` (${plan.why})` : ""}` +
-            (unchecked ? ` — no payback check: ${unchecked}` : ""),
+          withHold(
+            `opened ${fmtSat(plan.sizeSats)} sat to ${s.alias} at ${rate} sat/vB${plan.why ? ` (${plan.why})` : ""}` +
+              (unchecked ? ` — no payback check: ${unchecked}` : ""),
+          ),
           "acted",
         );
         this.persist();
@@ -3231,7 +3314,7 @@ export class Autopilot {
         // The final capital check (inside the mutex), the shutdown or the
         // switch going off: not the peer's doing — nothing to remember about
         // it. (Earlier peers' refusals this run are said too.)
-        note([refusalNote(refused), res.reason].filter(Boolean).join(" · "), "waiting");
+        note(withHold([refusalNote(refused), res.reason].filter(Boolean).join(" · ")), "waiting");
         return out;
       }
       if (res.kind === "blocked") {
@@ -3293,7 +3376,10 @@ export class Autopilot {
     const why = skipped.slice(0, 3).join("; ") + (skipped.length > 3 ? `; and ${skipped.length - 3} more` : "");
     // A refusal or a peer waiting out its back-off or the funds: waiting;
     // only nothing to open at all is idle.
-    note(`no channel opened — ${[refusalNote(refused), why].filter(Boolean).join(" · ") || "no suggestion qualified"}`, refused.length || skipped.length ? "waiting" : "idle");
+    note(
+      withHold(`no channel opened — ${[refusalNote(refused), why].filter(Boolean).join(" · ") || "no suggestion qualified"}`),
+      refused.length || skipped.length ? "waiting" : "idle",
+    );
     return out;
   }
 
@@ -3317,12 +3403,15 @@ export class Autopilot {
     return peers.size === 0 ? "this node lost its connection to every peer (Tor or the internet down?)" : null;
   }
 
-  /** The economy fee rate an automatic open pays (sat/vB, rounded up), or
-   *  null when LND can't estimate one. */
+  /** The economy fee rate an automatic open pays (sat/vB, rounded, at least
+   *  1), or null when LND can't estimate one. Rounded, not up: LND's floor of
+   *  253 sat/kw is 1.012 sat/vB, which rounded up paid 2 — twice the fee, and
+   *  a payback judged at twice the cost (review 2026-10-25; the manual Open
+   *  form rounds the same estimate). LND lifts a rate below its floor itself. */
   private async openFeeRate(): Promise<number | null> {
     try {
       const { tokens_per_vbyte } = await getChainFeeRate({ lnd: this.readLnd, confirmation_target: OPEN_CONF_TARGET });
-      return Number.isFinite(tokens_per_vbyte) && tokens_per_vbyte > 0 ? Math.max(1, Math.ceil(tokens_per_vbyte)) : null;
+      return Number.isFinite(tokens_per_vbyte) && tokens_per_vbyte > 0 ? Math.max(1, Math.round(tokens_per_vbyte)) : null;
     } catch {
       return null;
     }
@@ -3337,9 +3426,9 @@ export class Autopilot {
    * is nothing to measure a payback against, and only the maximum fee rate
    * applies (a node can always open its first channels).
    *
-   * (The Magma comparison, D10, asks what the MEDIAN month-old channel
-   * earns — robust to one big earner, for "beats a new routing channel";
-   * each decision note names the measure it quotes.)
+   * (The Magma comparison, D10, quotes the same capacity-weighted figure
+   * since 2026-10-25 — it asked what the MEDIAN month-old channel earned, 0
+   * on a node where most channels route nothing, and deferred every open.)
    */
   async openEconomics(): Promise<{ ppmYear: number | null; capitalSat: number; evidence: YieldEvidence } | null> {
     try {
@@ -3365,6 +3454,85 @@ export class Autopilot {
     }
   }
 
+  /** An alert while the shared on-chain lock has been held for more than
+   *  ONCHAIN_LOCK_ALERT_MS: an LND call that never answers (an open's
+   *  funding has no deadline) holds every spend behind it — Magma accepts,
+   *  LSP opens, manual opens. Derived: gone once the lock is free. */
+  onchainLockAlerts(nowMs = Date.now()): { level: "warn"; message: string }[] {
+    const stuck = this.capital.mutex.heldTooLong(ONCHAIN_LOCK_ALERT_MS, nowMs);
+    if (!stuck) return [];
+    return [
+      {
+        level: "warn",
+        message:
+          `The on-chain lock has been held by "${stuck.holder}" for ${stuck.minutes} minutes — channel opens, Magma accepts and LSP opens wait behind it. ` +
+          "If LND doesn't answer, restarting Lightning Mate frees it (an open it was waiting for then counts as unclear: no second one is made during the cooldown).",
+      },
+    ];
+  }
+
+  /**
+   * Where the capital a close frees could go, for the close list's line: the
+   * opens the channel autopilot would make — its ranked suggestions, LN+
+   * sentiment included, that pass its peer rules (usefulness, an LN+ rating,
+   * a recent close, a refusal's back-off, an address to dial, "never open
+   * automatically", a peer's size limits against your channel size and a
+   * third of the node's capital) — funds and payback aside: the close frees
+   * the funds (review 2026-10-25: it named the top suggestion without LN+ or
+   * the skip rules, a 6–10M open the autopilot would never make).
+   */
+  async swapTargets(): Promise<{ alias: string; score: number; sizeSats: number }[]> {
+    const cfg = this.state.config;
+    const [{ suggestions }, connected, earning] = await Promise.all([this.channelSuggestions(), this.connectedPeers(), this.openEconomics()]);
+    const ctx: OpenContext = {
+      fixedSize: cfg.channelSizeSats > 0 ? cfg.channelSizeSats : null,
+      spendableSat: Number.POSITIVE_INFINITY,
+      feeRate: 1,
+      yieldPpmYear: null,
+      // (A close moves capital on chain; the node's capital stays what it is.)
+      maxRaiseSat: earning ? Math.floor(earning.capitalSat * MAX_CAPITAL_SHARE_PER_OPEN) : Number.POSITIVE_INFINITY,
+      peers: this.state.peerOpenFailures ?? {},
+      connected: connected ?? new Set(),
+      neverOpen: new Set(Object.keys(this.state.neverOpen ?? {})),
+      nowMs: Date.now(),
+    };
+    return suggestions
+      .flatMap((s) => {
+        const plan = planOpen(s, ctx);
+        return "skip" in plan ? [] : [{ alias: s.alias, score: s.score, sizeSats: plan.sizeSats }];
+      })
+      .slice(0, 3);
+  }
+
+  /** For the close of a finished lease's channel (MagmaDesk
+   *  closeFinishedLeases): the economy fee rate a close pays now, the
+   *  operator's maximum for on-chain fees, and whether a channel routes well
+   *  enough to keep — it earned (30 days) at least what a sat of this node's
+   *  month-old channels earned, capacity-weighted. */
+  async soldChannelClose(): Promise<{ feeRate: number | null; maxFeeRate: number; routesWell: (channelId: string) => boolean }> {
+    const [feeRate, earning, report, chans] = await Promise.all([
+      this.openFeeRate(),
+      this.openEconomics(),
+      getForwardsReport(this.readLnd, 30).catch(() => null),
+      getChannelsView(this.readLnd).catch(() => null),
+    ]);
+    const ev = earning?.evidence;
+    const nodePpm = earning?.ppmYear ?? (ev && ev.capacitySat > 0 ? (ev.earnedSat / ev.capacitySat) * (365 / 30) * 1_000_000 : null);
+    const earned = new Map((report?.perChannel ?? []).map((c) => [c.channelId, c.feesEarnedSats]));
+    const capacity = new Map((chans ?? []).map((c) => [c.id, c.capacity]));
+    return {
+      feeRate,
+      maxFeeRate: this.state.config.channelMaxFeeRate,
+      routesWell: (channelId) => {
+        const sat = earned.get(channelId) ?? 0;
+        const cap = capacity.get(channelId) ?? 0;
+        if (sat <= 0 || cap <= 0) return false;
+        const ppm = (sat / cap) * (365 / 30) * 1_000_000;
+        return nodePpm === null || ppm >= nodePpm;
+      },
+    };
+  }
+
   /**
    * Dial the peer (outside the mutex: over Tor that can take a minute and a
    * half, and a slow routing peer must not hold up a Magma accept's capital
@@ -3376,6 +3544,9 @@ export class Autopilot {
     s: Pick<SuggestionV2, "pubkey" | "alias" | "socket" | "sockets">,
     sizeSats: number,
     feeRate: number,
+    /** Of the spendable coins, those held for Magma (leaveForMagma): not
+     *  this open's either, checked again with the fresh balance. */
+    heldSat = 0,
   ): Promise<
     | { kind: "opened"; transactionId?: string }
     | { kind: "deferred"; reason: string }
@@ -3400,15 +3571,25 @@ export class Autopilot {
       // of LND's anchor reserve, and the SELL reserve its check applies (a
       // sell reserve above the channel reserve used to be spent here).
       const sp = await spendableOnchain(this.readLnd, this.capital, this.state.config.channelReserveSats);
-      if (sp.spendableSat < sizeSats) {
+      if (sp.spendableSat - heldSat < sizeSats) {
         return {
           kind: "deferred" as const,
-          reason: `deferred: only ${sp.spendableSat} sat spendable after the reserve and ${sp.reservedSat} sat promised to sold channels — ${s.alias} needs ${sizeSats}`,
+          reason:
+            `deferred: only ${fmtSat(Math.max(0, sp.spendableSat - heldSat))} sat spendable after the reserve` +
+            (heldSat > 0
+              ? `, the ${fmtSat(sp.reservedSat)} sat promised to sold channels and the ${fmtSat(heldSat)} sat held for Magma`
+              : ` and the ${fmtSat(sp.reservedSat)} sat promised to sold channels`) +
+            ` — ${s.alias} needs ${fmtSat(sizeSats)} sat`,
         };
       }
       const late = this.stopWhy("channelEnabled");
       if (late) return { kind: "deferred" as const, reason: openStopped(late) };
       const routing = this.initialRoutingFee();
+      // Write-ahead: on record before LND has it — a process that goes down
+      // while LND funds the open finds it at the next channel stage, as an
+      // open that ended unclearly (its cooldown runs).
+      this.state.channelOpening = { pubkey: s.pubkey, alias: s.alias, sizeSats, at: new Date().toISOString() };
+      this.persist();
       const res = await fundChannel(writeLnd, {
         pubkey: s.pubkey,
         localTokens: sizeSats,
@@ -3416,6 +3597,9 @@ export class Autopilot {
         routingFeePpm: routing.feeRatePpm,
         routingBaseFeeMsat: routing.baseFeeMsat,
       });
+      // Answered: the caller records how it ended (the cooldown for an open,
+      // or an unclear one; nothing for a refusal before the broadcast).
+      this.state.channelOpening = null;
       if (res.ok) {
         this.state.lastChannelOpenAt = new Date().toISOString();
         this.state.lastChannelOpenUnclear = null;
@@ -3424,6 +3608,7 @@ export class Autopilot {
         this.persist();
         return { kind: "opened" as const, transactionId: res.transactionId };
       }
+      this.persist();
       const error = res.error ?? "the open failed";
       return { kind: "refused" as const, error, preBroadcast: isPreBroadcastRefusal(error) };
     });
@@ -4842,55 +5027,101 @@ export class Autopilot {
   }
 
   /**
-   * Leave this capital for Magma instead of a routing open? A reason when
-   * yes, null when no (D10, a3-channels). Only when ALL hold:
+   * How much of the spendable capital the channel stage leaves for Magma
+   * (D10, a3-channels; 2026-10-25), with the note that says why — nothing
+   * when any of these fails:
    *  - Magma can take it: a key Amboss accepts, and an offer of this node
    *    listed (enabled) as of the last upkeep;
    *  - selling is better than "not realistic" (the eligibility check, D8);
-   *  - the lease income this capital can expect — offers like this node's
-   *    fill ~N times a year, each netting the clearing price of comparable
-   *    leases minus the on-chain costs and the service fee — beats what a new
-   *    routing channel is expected to earn (the median yield of this node's
-   *    channels older than 30 days).
-   * No data, no deferral: without a routing history (no channel older than
-   * 30 days) or a clearing price, the open goes ahead — a node can always
-   * open its first channels.
+   *  - the lease income it can expect — offers like this node's fill ~N
+   *    times a year (capped by its own offer's record once listed
+   *    MAGMA_OWN_RECORD_DAYS: magmaFillsPerYear), each netting the clearing
+   *    price of comparable leases minus the on-chain costs and the service
+   *    fee — beats what a sat of this node's month-old channels earned
+   *    (capacity-weighted: the figure the payback check quotes; before, the
+   *    MEDIAN channel — 0 on a node where most channels route nothing, so any
+   *    lease income deferred every open, for good).
+   * What is held is only what Magma can list — the deploy cap's headroom
+   * (sellCapital): before, a deferral held the whole wallet (20M on chain
+   * against a 2M cap left ~18M neither routed nor leased); the rest is free
+   * for routing opens. Each comparison is kept (magmaHold): when Amboss's
+   * public book can't be read — it is cached in memory, so right after a
+   * restart — the last one stands for MAGMA_HOLD_KEEP_MS and the note says
+   * so; past that nothing is held. No routing history (no month-old
+   * channel) or no clearing price: nothing held — a node can always open its
+   * first channels.
    */
-  private async leaveForMagma(): Promise<string | null> {
-    if (!this.amboss.hasKey() || this.amboss.getValidity() === false) return null;
+  private async leaveForMagma(): Promise<{ heldSat: number; text: string | null }> {
+    const none = { heldSat: 0, text: null };
+    if (!this.amboss.hasKey() || this.amboss.getValidity() === false) return none;
     const listed = (this.state.offerSync?.offers ?? []).some((e) => e.amboss.status === "ENABLED");
-    if (!listed) return null;
+    if (!listed) return none;
     const realistic = await this.sellingRealistic();
     const e = realistic.eligibility;
-    if (!realistic.ok || !e?.comparable || e.own.listableSat <= 0) return null;
-    const fillsPerYear = e.comparable.fillsPerMonth * 12;
+    // No answer from Amboss's public book (unreadable, or nothing to judge
+    // by): the last comparison stands, for a day.
+    if (!e || e.verdict === "unknown") return this.lastMagmaHold(realistic.why);
+    const keep = (hold: { heldSat: number; text: string | null }) => {
+      this.state.magmaHold = { at: new Date().toISOString(), ...hold };
+      this.persist(); // the comparison a restart's first runs fall back on
+      return hold;
+    };
+    if (!realistic.ok || !e.comparable || e.own.listableSat <= 0) return keep(none);
+    const own = await getOwnPubkey(this.readLnd).catch(() => null);
+    const book = own ? cachedPublicBook(own)?.book : undefined;
+    const mine = book && own ? book.offers.filter((o) => o.sellerPubkey === own) : [];
+    const since = Math.min(...mine.map((o) => Date.parse(o.createdAt)).filter(Number.isFinite));
+    const record = mine.length && Number.isFinite(since) ? { fills: mine.reduce((s, o) => s + o.filledOrders, 0), listedDays: (Date.now() - since) / 86_400_000 } : null;
+    const comparablePerYear = e.comparable.fillsPerMonth * 12;
+    const fills = magmaFillsPerYear(comparablePerYear, record);
     const clearing = clearingFor({ minSizeSat: 0, maxSizeSat: Math.max(1, e.own.maxChannelSat || e.own.listableSat) });
-    if (!clearing || fillsPerYear <= 0) return null;
+    if (!clearing || fills.perYear <= 0) return keep(none);
     const fillSize = Math.min(e.own.maxChannelSat || e.own.listableSat, clearing.medianSizeSat);
     const costs = await onchainCosts(this.readLnd);
     const netPerFill =
       clearing.medianApr * fillSize * (DEFAULT_LEASE_BLOCKS / BLOCKS_PER_YEAR) * (1 - saleFeeConfig().bps / 10_000) -
       costs.openCostSat -
       costs.closeCostSat;
-    if (netPerFill <= 0) return null;
-    const leasePpmYear = Math.round(((fillsPerYear * netPerFill) / e.own.listableSat) * 1_000_000);
-    const [chans, report, info] = await Promise.all([
-      getChannelsView(this.readLnd),
-      getForwardsReport(this.readLnd, 30),
-      getWalletInfo({ lnd: this.readLnd }),
-    ]);
-    // Channels with a month of history (≈ 4320 blocks) say what a channel earns.
-    const aged = monthOldChannels(chans, info.current_block_height);
-    if (aged.length === 0) return null;
-    const revByChan = new Map(report.perChannel.map((c) => [c.channelId, c.feesEarnedSats]));
-    const routing = routingYieldStats(aged, revByChan).medianPpmYear;
-    if (leasePpmYear <= routing) return null;
-    // (The measure is named: the payback check of the same stage quotes the
-    // capacity-weighted yield of the same channels — openEconomics.)
-    return (
-      `deferred: selling on Magma is expected to earn more on this capital (~${leasePpmYear} ppm/yr: offers like yours ` +
-      `fill ~${fillsPerYear.toFixed(1)} times a year) than a new routing channel (~${routing} ppm/yr: what the median month-old channel here earned) — left for Magma`
-    );
+    if (netPerFill <= 0) return keep(none);
+    const leasePpmYear = Math.round(((fills.perYear * netPerFill) / e.own.listableSat) * 1_000_000);
+    // What a sat of month-old channels earned, capacity-weighted (the payback
+    // check's measure; with too little routing to trust it there, the figure
+    // as it stands — little routing is what it says).
+    const earning = await this.openEconomics();
+    if (!earning || !earning.evidence.forwardsRead || earning.evidence.channels === 0) return keep(none);
+    const ev = earning.evidence;
+    const routing = earning.ppmYear ?? (ev.capacitySat > 0 ? Math.round((ev.earnedSat / ev.capacitySat) * (365 / 30) * 1_000_000) : 0);
+    if (leasePpmYear <= routing) return keep(none);
+    const heldSat = e.own.listableSat;
+    const ownLine =
+      record && fills.ownPerYear !== null && fills.perYear < comparablePerYear
+        ? `; yours sold ${record.fills} in ${Math.max(1, Math.round(record.listedDays / 30))} months listed`
+        : "";
+    return keep({
+      heldSat,
+      text:
+        `${fmtSat(heldSat)} sat held for Magma — what your offer can list (spendable, within your deploy cap): selling there is expected to earn more on it ` +
+        `(~${leasePpmYear} ppm/yr: offers like yours fill ~${fills.perYear.toFixed(1)} times a year${ownLine}) than a routing channel ` +
+        `(~${routing} ppm/yr: what a sat of month-old channels here earned, capacity-weighted)`,
+    });
+  }
+
+  /** The last Magma comparison, when Amboss's public book can't be read now:
+   *  it stands for MAGMA_HOLD_KEEP_MS (said so); past that, nothing held. */
+  private lastMagmaHold(why: string): { heldSat: number; text: string | null } {
+    const last = validHold(this.state.magmaHold);
+    const asOf = last ? `${last.at.slice(0, 16).replace("T", " ")} UTC` : "";
+    if (last && Date.now() - Date.parse(last.at) <= MAGMA_HOLD_KEEP_MS) {
+      return last.heldSat > 0
+        ? { heldSat: last.heldSat, text: `${last.text ?? `${fmtSat(last.heldSat)} sat held for Magma`} (the comparison of ${asOf}: ${why})` }
+        : { heldSat: 0, text: null };
+    }
+    return {
+      heldSat: 0,
+      text: last
+        ? `nothing held for Magma: ${why}, and its last comparison (${asOf}) is over a day old`
+        : `nothing held for Magma: ${why}, and there is no earlier comparison`,
+    };
   }
 
   /**

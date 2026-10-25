@@ -13,7 +13,10 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { assessEligibility, feeTiers, type BookOffer, type PublicBook } from "../src/services/magmaEligibility.js";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { __resetEligibilityCache, assessEligibility, feeTiers, type BookOffer, type PublicBook } from "../src/services/magmaEligibility.js";
+import { MAGMA_OWN_RECORD_DAYS, magmaFillsPerYear } from "../src/services/openPlan.js";
 import { ambossFeePpmFor } from "../src/services/magmaBuy.js";
 import { __setHistoryForTests } from "../src/services/magmaHistory.js";
 import { sellerSetup, suggestion, type AutopilotSeams } from "./helpers/autopilot.js";
@@ -239,8 +242,12 @@ test("D10: the open waits for Magma only where selling is realistic AND the expe
   const s = await deferralSetup(t, (score) => (score <= 15 ? 12 : 30));
   const run = await s.autopilot.runOnce();
   // A deferral is the channel stage's decision, not a failed run (D15).
+  // (The deploy cap here, 50M, leaves Magma room for every spendable coin.)
   assert.deepEqual(run.channels, []);
-  assert.match(s.autopilot.getState().decisions.channels?.text ?? "", /^deferred: selling on Magma is expected to earn more on this capital \(~\d+ ppm\/yr: offers like yours fill ~[\d.]+ times a year\) than a new routing channel \(~0 ppm\/yr: what the median month-old channel here earned\)/);
+  assert.match(
+    s.autopilot.getState().decisions.channels?.text ?? "",
+    /^deferred: 19,9\d0,000 sat held for Magma — what your offer can list \(spendable, within your deploy cap\): selling there is expected to earn more on it \(~\d+ ppm\/yr: offers like yours fill ~[\d.]+ times a year\) than a routing channel \(~0 ppm\/yr: what a sat of month-old channels here earned, capacity-weighted\) — (nothing left|the [\d,]+ sat left) for a routing open \(19,9\d\d,\d{3} sat spendable; the smallest open is 1,000,000 sat\)$/,
+  );
   // D15/D16: amber "deferred" on the Autopilot tab — never a red failure.
   assert.equal(s.autopilot.getState().status.channels.state, "deferred");
   assert.equal(s.node.callsTo("default.openChannel").length, 0);
@@ -250,6 +257,25 @@ test("D10: the open waits for Magma only where selling is realistic AND the expe
 // expected lease income above routing (the test above defers), take one
 // condition away and the open goes ahead.
 const sellsWell = (score: number) => (score <= 15 ? 12 : 30);
+
+// Review 2026-10-25: a deferral held back the whole wallet — 20M on chain
+// against a 2M deploy cap left ~18M neither routed nor leased. Only what
+// Magma can list is held; the rest opens routing channels.
+test("D10: only what the offer can list is held for Magma — the deploy cap's headroom; the rest of the wallet opens routing channels, and the note says both", async (t) => {
+  quiet(t);
+  const s = await deferralSetup(t, sellsWell);
+  // (5M: the comparable sales cleared at 3M.)
+  s.autopilot.setConfig({ sellMaxDeploySats: 5_000_000 });
+  const run = await s.autopilot.runOnce();
+  assert.equal(run.channels[0]?.ok, true, JSON.stringify(run.channels));
+  assert.equal(run.channels[0]?.sizeSats, 1_000_000);
+  assert.equal(s.node.callsTo("default.openChannel").length, 1);
+  assert.match(
+    s.autopilot.getState().decisions.channels?.text ?? "",
+    /^opened 1,000,000 sat to .* · 5,000,000 sat held for Magma — what your offer can list \(spendable, within your deploy cap\): .* than a routing channel \(~0 ppm\/yr: .*\); 14,9\d\d,\d{3} sat left for routing opens$/,
+  );
+  assert.equal(s.autopilot.getState().status.channels.state, "acted");
+});
 
 test("D10: no deferral without an offer of this node listed — selling realistic, a month-old channel, every offer disabled: the open goes ahead", async (t) => {
   quiet(t);
@@ -325,7 +351,7 @@ test("D10: routing that out-earns the lease keeps the open going — selling rea
   forwardsEarning(s.node, "850000x1x0", 2_000);
   const slow = await s.autopilot.runOnce();
   assert.deepEqual(slow.channels, []);
-  assert.match(s.autopilot.getState().decisions.channels?.text ?? "", /^deferred: .* than a new routing channel \(~12167 ppm\/yr: what the median month-old channel here earned\)/);
+  assert.match(s.autopilot.getState().decisions.channels?.text ?? "", /^deferred: .* than a routing channel \(~12167 ppm\/yr: what a sat of month-old channels here earned, capacity-weighted\)/);
   assert.equal(s.node.callsTo("default.openChannel").length, 0);
   // One that earned 20,000 sat (~121,700 ppm/yr) beats the lease: routing
   // gets the capital. (Without the comparison — the core of D10 — it would
@@ -334,6 +360,119 @@ test("D10: routing that out-earns the lease keeps the open going — selling rea
   const run = await s.autopilot.runOnce();
   assert.equal(run.channels[0]?.ok, true, JSON.stringify(run.channels));
   assert.equal(s.node.callsTo("default.openChannel").length, 1);
+});
+
+// Review 2026-10-25: the comparison asked what the MEDIAN month-old channel
+// earned — 0 on a node where most channels route nothing, so any lease
+// income deferred every open, however much the others earned.
+test("D10: routing is what a sat of month-old channels earned, capacity-weighted — two idle channels beside one that earns don't make it 0", async (t) => {
+  quiet(t);
+  const s = await deferralSetup(t, sellsWell);
+  for (const n of [2, 3]) {
+    s.node.channels.push({ id: `850000x${n}x0`, partnerPublicKey: "02" + (0x70 + n).toString(16).repeat(32), capacity: 2_000_000, localBalance: 1_000_000, transactionId: (0x70 + n).toString(16).repeat(32), transactionVout: 0 });
+  }
+  // 20,000 sat in 30 days on 6M of month-old channels: ~40,556 ppm/yr; the
+  // median channel earned nothing.
+  forwardsEarning(s.node, "850000x3x0", 20_000);
+  const run = await s.autopilot.runOnce();
+  assert.equal(run.channels[0]?.ok, true, JSON.stringify(run.channels));
+  assert.equal(s.node.callsTo("default.openChannel").length, 1);
+  assert.doesNotMatch(s.autopilot.getState().decisions.channels?.text ?? "", /held for Magma/);
+});
+
+/** This node's own offer in Amboss's public book: listed `months`, `fills` sold. */
+function ownOffer(s: Awaited<ReturnType<typeof deferralSetup>>, months: number, fills: number): void {
+  s.market.addOffer({ sellerPubkey: s.node.publicKey, totalSats: 5_000_000, sellerScore: 0, filledOrders: fills, monthsListed: months });
+  __resetEligibilityCache(); // the book as Amboss shows it now
+}
+
+test("D10: once this node's own offer has 60 days of record, the lease income expected is capped by what it sold itself — an offer unsold for a year no longer holds capital back from a routing channel that earns", async (t) => {
+  quiet(t);
+  t.after(() => __resetEligibilityCache());
+  // Sold 10 in a year (~7.4 a year, other sellers' like it ~42): still more
+  // than a routing channel that earned nothing — held, and the note says why.
+  const sold = await deferralSetup(t, sellsWell);
+  ownOffer(sold, 12, 10);
+  await sold.autopilot.runOnce();
+  assert.match(sold.autopilot.getState().decisions.channels?.text ?? "", /^deferred: [\d,]+ sat held for Magma — .*\(~\d+ ppm\/yr: offers like yours fill ~7\.4 times a year; yours sold 10 in 12 months listed\) than a routing channel/);
+  // Unsold for a year, against a channel that earned 2,000 sat (~12,167
+  // ppm/yr): before, the market's ~42 fills a year held the capital back.
+  const unsold = await deferralSetup(t, sellsWell);
+  ownOffer(unsold, 12, 0);
+  forwardsEarning(unsold.node, "850000x1x0", 2_000);
+  const run = await unsold.autopilot.runOnce();
+  assert.equal(run.channels[0]?.ok, true, JSON.stringify(run.channels));
+  assert.doesNotMatch(unsold.autopilot.getState().decisions.channels?.text ?? "", /held for Magma/);
+  // Under 60 days listed: no record of its own yet — the market's fills.
+  const fresh = await deferralSetup(t, sellsWell);
+  ownOffer(fresh, 1, 0);
+  forwardsEarning(fresh.node, "850000x1x0", 2_000);
+  assert.deepEqual((await fresh.autopilot.runOnce()).channels, []);
+  assert.match(fresh.autopilot.getState().decisions.channels?.text ?? "", /^deferred: .*offers like yours fill ~[\d.]+ times a year\) than a routing channel \(~12167 ppm\/yr/);
+});
+
+test("magmaFillsPerYear: other sellers' fills until this node's own offer has 60 days of record — then its own, never above the market's: up with every sale, down the longer it sits unsold", () => {
+  assert.deepEqual(magmaFillsPerYear(24, null), { perYear: 24, ownPerYear: null });
+  assert.deepEqual(magmaFillsPerYear(24, { fills: 0, listedDays: MAGMA_OWN_RECORD_DAYS - 1 }), { perYear: 24, ownPerYear: null });
+  assert.deepEqual(magmaFillsPerYear(24, { fills: 0, listedDays: 365 }), { perYear: 1 / 1.5, ownPerYear: 1 / 1.5 });
+  // Selling more than the market: the market's.
+  assert.equal(magmaFillsPerYear(2, { fills: 30, listedDays: 365 }).perYear, 2);
+  let prev = 0;
+  for (let fills = 0; fills <= 60; fills++) {
+    const f = magmaFillsPerYear(24, { fills, listedDays: 365 }).perYear;
+    assert.ok(f >= prev && f <= 24, `${fills} fills: ${f}`);
+    prev = f;
+  }
+  prev = Infinity;
+  for (let days = MAGMA_OWN_RECORD_DAYS; days <= 1_500; days += 15) {
+    const f = magmaFillsPerYear(24, { fills: 3, listedDays: days }).perYear;
+    assert.ok(f <= prev, `${days} days: ${f}`);
+    prev = f;
+  }
+});
+
+test("D10: when Amboss's public book can't be read — right after a restart, its copy is in memory only — the last comparison stands for a day, and the note says so; past a day nothing is held", async (t) => {
+  quiet(t);
+  t.after(() => __resetEligibilityCache());
+  const s = await deferralSetup(t, sellsWell);
+  await s.autopilot.runOnce();
+  assert.equal(s.autopilot.getState().status.channels.state, "deferred");
+  const kept = JSON.parse(readFileSync(join(s.dir, "autopilot.json"), "utf8")).magmaHold;
+  assert.ok(kept.heldSat > 19_000_000, JSON.stringify(kept));
+  assert.match(kept.text, /^[\d,]+ sat held for Magma — /);
+  // A restart, with Amboss unreachable. Before: the deferral vanished on
+  // every such run and the whole wallet went into a routing channel.
+  __resetEligibilityCache();
+  s.market.behaviour = "throw";
+  const again = s.restart();
+  (again as unknown as AutopilotSeams).channelSuggestions = async () => ({ suggestions: [suggestion] });
+  (again as unknown as AutopilotSeams).openFeeRate = async () => 2;
+  assert.deepEqual((await again.runOnce()).channels, []);
+  assert.equal(s.node.callsTo("default.openChannel").length, 0);
+  assert.match(
+    again.getState().decisions.channels?.text ?? "",
+    /^deferred: [\d,]+ sat held for Magma — .* \(the comparison of \d{4}-\d\d-\d\d \d\d:\d\d UTC: the selling check has no answer \(Amboss's public offer book could not be read.*\)\) — /,
+  );
+  // A day later, still no answer: nothing held, and the note says why.
+  (again as unknown as { state: { magmaHold: { at: string } } }).state.magmaHold.at = new Date(Date.now() - 25 * 3_600_000).toISOString();
+  const run = await again.runOnce();
+  assert.equal(run.channels[0]?.ok, true, JSON.stringify(run.channels));
+  assert.match(
+    again.getState().decisions.channels?.text ?? "",
+    /^opened 1,000,000 sat to .* · nothing held for Magma: the selling check has no answer \(.*\), and its last comparison \(\d{4}-\d\d-\d\d \d\d:\d\d UTC\) is over a day old$/,
+  );
+});
+
+test("D10: no comparison on record (or a damaged one) and Amboss's public book unreadable: nothing held — the note says there is no earlier comparison", async (t) => {
+  quiet(t);
+  t.after(() => __resetEligibilityCache());
+  const s = await deferralSetup(t, sellsWell);
+  __resetEligibilityCache();
+  s.market.behaviour = "throw";
+  (s.autopilot as unknown as { state: { magmaHold: unknown } }).state.magmaHold = { at: "yesterday", heldSat: -5 };
+  const run = await s.autopilot.runOnce();
+  assert.equal(run.channels[0]?.ok, true, JSON.stringify(run.channels));
+  assert.match(s.autopilot.getState().decisions.channels?.text ?? "", / · nothing held for Magma: the selling check has no answer \(.*\), and there is no earlier comparison$/);
 });
 
 test("D10: a sale that nets nothing at today's on-chain fees leaves nothing for Magma — and is not weighed against 30 days of forwards", async (t) => {

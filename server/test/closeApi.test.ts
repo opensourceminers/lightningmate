@@ -92,6 +92,24 @@ test("GET /suggestions/close: a channel sold on Magma or over LSPS1 is protected
   assert.deepEqual(body.pending.map((p) => [p.channelId, p.status]), [[`${TX(4)}:0`, "pending_open"]]);
 });
 
+test("GET /suggestions/close: where a close's capital could go names the opens the channel autopilot would make — not the top suggestions as ranked", async (t) => {
+  t.mock.method(console, "log", () => undefined);
+  const { api, channels } = await setup(t);
+  // (The autopilot's peer rules and LN+: swapTargets.)
+  let asked = 0;
+  api.autopilot.swapTargets = async () => {
+    asked += 1;
+    return [{ alias: "the-autopilots-pick", score: 70, sizeSats: 1_000_000 }];
+  };
+  const res = await api.request("GET", "/suggestions/close");
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  const [c] = res.body.candidates as { channelId: string; reasons: string[]; opportunityCandidates: { alias: string }[] }[];
+  assert.equal(c?.channelId, channels[1].id);
+  assert.ok(c.reasons.includes("Frees 2,000k you could redeploy into the-autopilots-pick."), c.reasons.join(" | "));
+  assert.deepEqual(c.opportunityCandidates.map((o) => o.alias), ["the-autopilots-pick"]);
+  assert.equal(asked, 1);
+});
+
 test("POST /channels/close refuses a channel inside its lease unless the request says breakLease — and a channel still opening at all", async (t) => {
   t.mock.method(console, "log", () => undefined);
   const { api, node } = await setup(t);

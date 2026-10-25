@@ -827,7 +827,7 @@ test("a Magma accept that lands while a routing open dials its peer: the routing
   const done = await run;
   // A deferral is the channel stage's decision, not a failed run (D15).
   assert.deepEqual(done.channels, []);
-  assert.match(autopilot.getState().decisions.channels?.text ?? "", /^deferred: only 548000 sat spendable after the reserve and 2000000 sat promised/);
+  assert.match(autopilot.getState().decisions.channels?.text ?? "", /^deferred: only 548,000 sat spendable after the reserve and the 2,000,000 sat promised to sold channels — \S+ needs 1,000,000 sat$/);
   assert.equal(node.callsTo("default.openChannel").length, 0, "the buyer's coins stayed the buyer's");
   magma.buyerPays(sale.id, node);
   await autopilot.pollSellOrders();

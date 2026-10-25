@@ -15,7 +15,7 @@ import { readFileSync } from "node:fs";
 import { openLines, startingFeeText } from "../src/openView";
 import { NEED_LABEL } from "../src/components/SuggestionsPanel";
 import { CHANNEL_OPEN_HINT } from "../src/components/AutopilotPanel";
-import { freedCapitalMagmaHint, SUMMARY_LABEL } from "../src/magmaView";
+import { enableSellingPendingMessage, freedCapitalMagmaHint, SUMMARY_LABEL } from "../src/magmaView";
 import type { OpenEstimate } from "../src/types";
 
 const estimate = (o: Partial<OpenEstimate> = {}): OpenEstimate => ({
@@ -86,6 +86,23 @@ test("the need labels say what the node lacks: ≥ 70 % local is short of INBOUN
   } as unknown as Parameters<typeof freedCapitalMagmaHint>[0];
   const elig = { verdict: "realistic", expectedSalesPerYear: 6 } as unknown as Parameters<typeof freedCapitalMagmaHint>[1];
   assert.match(freedCapitalMagmaHint(rec, elig, 2_000_000) ?? "", /^Closing these frees ~2,000,000 sat\. One Magma sale at today's price nets ~4\.2%\/yr/);
+  // Review 2026-10-25: never an invitation to close beyond the deploy cap.
+  assert.equal(freedCapitalMagmaHint(rec, elig, 2_000_000, 0), null, "the cap reached: no hint");
+  assert.match(freedCapitalMagmaHint(rec, elig, 2_000_000, 500_000) ?? "", /^Closing these frees ~2,000,000 sat — your deploy cap lets Magma take ~500,000 sat of it\. One Magma sale/);
+  assert.match(freedCapitalMagmaHint(rec, elig, 2_000_000, 5_000_000) ?? "", /^Closing these frees ~2,000,000 sat\. One Magma sale/);
+  const panel = readFileSync(new URL("../src/components/CloseCandidatesPanel.tsx", import.meta.url), "utf8");
+  assert.match(panel, /freedCapitalMagmaHint\(magma, elig, data\?\.totalCapitalFreedSats \?\? 0, room\)/);
+});
+
+test("review 2026-10-25: the close dialog preselects the economy rate; the channel hint, the presets and the switch-on dialog say opens wait for the coins held for Magma", () => {
+  const dialog = readFileSync(new URL("../src/components/CloseChannelDialog.tsx", import.meta.url), "utf8");
+  assert.match(dialog, /setRate\(f\.economy \?\? f\.normal \?\? f\.fast \?\? 1\)/);
+  assert.match(CHANNEL_OPEN_HINT, /the coins your Magma offer can list \(within your deploy cap\) wait for Magma/);
+  assert.match(CHANNEL_OPEN_HINT, /LND's own anchor reserve \(10,000 sat per anchor channel, up to 100,000\) wins when it is larger/);
+  assert.match(CHANNEL_OPEN_HINT, /Auto size shrinks to what can be spent/);
+  assert.match(enableSellingPendingMessage(), /Routing opens of the channel autopilot then wait for the coins your offer can list/);
+  const presets = readFileSync(new URL("../src/presets.ts", import.meta.url), "utf8");
+  assert.match(presets, /open channels as funds allow \(with Liquidity provision on, not the coins held for Magma\)/);
 });
 
 test("a suggestion can be put on the channel autopilot's 'never open automatically' list from its row", () => {

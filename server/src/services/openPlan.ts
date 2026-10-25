@@ -38,6 +38,10 @@ export const PEER_RECORDS_KEPT = 200;
 export const MAX_CAPITAL_SHARE_PER_OPEN = 1 / 3;
 /** A channel this many blocks old (~30 days) has a month of routing to judge by. */
 export const MONTH_BLOCKS = 4_320;
+/** Auto size shrinks a suggestion to what can be spent, but not below this
+ *  (nor the peer's minimum): a smaller channel routes too little to be worth
+ *  its open and close. */
+export const AUTO_SIZE_MIN_SATS = 1_000_000;
 /**
  * The month-old channels' yield is trusted for the payback only with this
  * much routing behind it in the 30 days: MIN_YIELD_FORWARDS forwards out
@@ -52,6 +56,26 @@ export const MONTH_BLOCKS = 4_320;
  */
 export const MIN_YIELD_FORWARDS = 10;
 export const MIN_YIELD_EARNED_SAT = 1_000;
+/** A Magma offer of this node listed this long has a sales record of its own
+ *  for the channel stage's comparison (magmaFillsPerYear). */
+export const MAGMA_OWN_RECORD_DAYS = 60;
+
+/**
+ * The sales a year this node's Magma offer can expect, for the channel
+ * stage's comparison (leaveForMagma): what offers like it fill (the public
+ * book's comparable cell) — capped, once its own offer has been listed
+ * MAGMA_OWN_RECORD_DAYS, by its own record: (own fills + 1) / (listed years
+ * + ½). One fill and half a year are added so a short record claims neither
+ * nothing nor far more than the market; the estimate rises with every sale
+ * and falls the longer the offer sits unsold. (Review 2026-10-25: the
+ * comparison took other sellers' ~2 fills a year for a node whose own offer
+ * hadn't sold in a year, and never revisited it.)
+ */
+export function magmaFillsPerYear(comparablePerYear: number, own: { fills: number; listedDays: number } | null): { perYear: number; ownPerYear: number | null } {
+  if (!own || !(own.listedDays >= MAGMA_OWN_RECORD_DAYS)) return { perYear: comparablePerYear, ownPerYear: null };
+  const ownPerYear = (Math.max(0, own.fills) + 1) / (own.listedDays / 365 + 0.5);
+  return { perYear: Math.min(comparablePerYear, ownPerYear), ownPerYear };
+}
 
 /** What the autopilot remembers about a peer that refused an open. */
 export interface PeerOpenRecord {
@@ -72,8 +96,12 @@ export interface PeerOpenRecord {
 export interface OpenContext {
   /** The operator's channel size; null: auto (the suggestion's). */
   fixedSize: number | null;
-  /** What an open may spend: after the reserve and the coins promised to buyers. */
+  /** What an open may spend: after the reserve, the coins promised to buyers
+   *  and those held for Magma (heldSat). */
   spendableSat: number;
+  /** Of the spendable coins, those held for Magma (leaveForMagma) — already
+   *  taken off spendableSat; said in a skip. */
+  heldSat?: number;
   /** The economy fee rate the open pays (sat/vB). */
   feeRate: number;
   /** What a sat in this node's month-old channels earned (ppm/yr,
@@ -166,7 +194,10 @@ export const briefError = (error: string): string => {
  * size never does), fit the funds, and pay back its open and close.
  */
 export function planOpen(
-  s: Pick<SuggestionV2, "pubkey" | "alias" | "socket" | "sockets" | "recommendedSizeSats" | "usefulness" | "lnplus" | "peerMinChannelSats" | "closedDaysAgo">,
+  s: Pick<
+    SuggestionV2,
+    "pubkey" | "alias" | "socket" | "sockets" | "recommendedSizeSats" | "usefulness" | "lnplus" | "peerMinChannelSats" | "closedDaysAgo" | "closeHistoryKnown"
+  >,
   ctx: OpenContext,
 ): OpenPlan {
   if (ctx.neverOpen.has(s.pubkey)) return { skip: "you marked it “never open automatically”" };
@@ -177,6 +208,14 @@ export function planOpen(
   }
   if (s.closedDaysAgo !== null && s.closedDaysAgo <= RECENT_CLOSE_DAYS) {
     return { skip: `you closed a channel with it ${s.closedDaysAgo === 0 ? "recently" : `${s.closedDaysAgo} days ago`} (not reopened within ${RECENT_CLOSE_DAYS} days)` };
+  }
+  // LND didn't say its block height (or its closed channels) when the
+  // suggestions were made: a close within RECENT_CLOSE_DAYS can't be ruled
+  // out — nor, without the height, what a channel earns here (review
+  // 2026-10-25: one failed GetInfo dropped the guard, and only the fee cap
+  // applied).
+  if (s.closeHistoryKnown === false) {
+    return { skip: `LND didn't say its block height or its closed channels — whether you closed a channel with it within ${RECENT_CLOSE_DAYS} days can't be checked, so it isn't opened to automatically until LND does` };
   }
   const rec = ctx.peers[s.pubkey];
   if (rec && Date.parse(rec.retryAt) > ctx.nowMs) {
@@ -206,7 +245,17 @@ export function planOpen(
     why = `sized down to its ${fmt(max)} sat maximum`;
   }
   if (size > ctx.spendableSat) {
-    return { skip: `needs ${fmt(size)} sat — ${fmt(ctx.spendableSat)} spendable after the reserve and the coins promised to buyers` };
+    // Auto size shrinks to what can be spent — rounded down to 100k, never
+    // below AUTO_SIZE_MIN_SATS nor the peer's minimum (review 2026-10-25:
+    // with 3.94M spendable every suggestion of 4–10M was skipped, though a
+    // 3.9M channel passed every other check). A fixed size is the
+    // operator's: never shrunk. The payback below is judged at the new size.
+    const fits = Math.floor(ctx.spendableSat / 100_000) * 100_000;
+    if (ctx.fixedSize !== null || fits < Math.max(AUTO_SIZE_MIN_SATS, min)) {
+      return { skip: `needs ${fmt(size)} sat — ${fmt(ctx.spendableSat)} spendable after the reserve, the coins promised to buyers${ctx.heldSat ? " and those held for Magma" : ""}` };
+    }
+    size = fits;
+    why = `sized down to the ${fmt(fits)} sat that can be spent`;
   }
   if (ctx.yieldPpmYear !== null) {
     const cost = openAndCloseCost(ctx.feeRate);

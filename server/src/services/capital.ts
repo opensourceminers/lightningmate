@@ -39,6 +39,7 @@ export class OnchainMutex {
   private tail: Promise<void> = Promise.resolve();
   private depth = 0;
   private holder: string | null = null;
+  private since: number | null = null;
 
   /** Run `fn` once every earlier holder is done. FIFO — waits, never skips. */
   async run<T>(label: string, fn: () => Promise<T>): Promise<T> {
@@ -49,12 +50,22 @@ export class OnchainMutex {
     try {
       await prev;
       this.holder = label;
+      this.since = Date.now();
       return await fn();
     } finally {
       this.holder = null;
+      this.since = null;
       this.depth -= 1;
       release();
     }
+  }
+
+  /** Who has held it for at least `limitMs` (and how long), or null — an
+   *  LND call that never answers (an open's funding, a close) holds every
+   *  other spend behind it: Magma accepts, LSP opens, manual opens. */
+  heldTooLong(limitMs: number, nowMs = Date.now()): { holder: string; minutes: number } | null {
+    if (this.holder === null || this.since === null || nowMs - this.since < limitMs) return null;
+    return { holder: this.holder, minutes: Math.floor((nowMs - this.since) / 60_000) };
   }
 
   /** True while anyone holds or waits for the mutex. */

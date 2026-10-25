@@ -628,6 +628,7 @@ export function createApiRouter(
           ...serviceFeeAlerts(serviceFees),
           ...magmaRefusalAlerts(autopilot.magma),
           ...offerPriceAlerts(autopilot.offerSyncStatus(), autopilot.actsOnOffers()),
+          ...autopilot.onchainLockAlerts(),
         ]),
       );
     }),
@@ -1275,6 +1276,8 @@ export function createApiRouter(
         await getCloseSuggestionsV2(lnd, rebalanceLog.successes(), autopilot.feeV2Overrides(), overrides.all(), {
           leaseSources,
           uptime: autopilot.uptime,
+          // Only opens the channel autopilot would make (its rules, LN+).
+          opportunity: () => autopilot.swapTargets(),
         }),
       );
     }),

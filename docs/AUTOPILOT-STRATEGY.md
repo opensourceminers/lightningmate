@@ -513,9 +513,14 @@ peer suggestion it can really open, when on-chain funds exceed the reserve. It w
 ranked suggestions and skips, with the reason, a peer of low usefulness, one LN+ operators
 rate poorly, one this node closed a channel with in the last 90 days, one on the operator's
 "never auto" list, one without an address to dial (unless connected), and one still backing
-off after a refusal (1 day, then 7, then 30). The size meets what the peer takes: its LN+
+off after a refusal (1 day, then 7, then 30). While LND doesn't say its block height or its
+closed channels, no peer is opened to automatically (a close within 90 days can't be ruled
+out). The size meets what the peer takes: its LN+
 minimum, or the minimum (or maximum) its refusal named — auto size rises to a minimum up to
-a third of the node's capital, a fixed size never does. It dials every address the peer
+a third of the node's capital, a fixed size never does — and auto size shrinks to what can be
+spent, rounded down to 100k, never below 1M nor the peer's minimum (the payback is judged at
+that size). The reserve is what an open leaves on chain; LND's own anchor reserve (10k per
+anchor channel, up to 100k) wins when it is larger, and the open's fee comes on top. It dials every address the peer
 advertises (.onion first on a Tor-only node), at most three peers a run and no new one after
 two minutes. The funding pays LND's economy rate (a 72-block target), never above the
 operator's maximum (`channelMaxFeeRate`, 20 sat/vB by default), and only when the open and a
@@ -526,19 +531,39 @@ rate applies, and the note says the payback was not checked). The channel starts
 engine's protected new-channel fee (manual opens too; the Open form says which).
 A failure on this node's own side — LND's wallet not synced, too few confirmed coins, the
 anchor reserve, or no connection to any peer at all (Tor or the internet down; then nobody is
-dialed) — holds no peer back: the stage stops, says why, and the next run tries again. An open
-that ends unclearly (its funding may be out) stops the run and starts the cooldown as an open does.
-Waits and deferrals are the stage's decision note, never failed runs; a refusal is one line
+dialed) — holds no peer back: the stage stops, says why, and the next run tries again. A
+peer's own refusal during the negotiation ("received funding error from …", whatever it says,
+or LND's "reservation timed out") comes before any broadcast: the peer backs off and the next
+suggestion is tried in the same run. An open that ends unclearly (its funding may be out)
+stops the run and starts the cooldown as an open does. Each open is on record (peer, amount,
+time) before LND gets it: a restart that finds one LND never answered counts it as unclear,
+so the cooldown runs from it. The on-chain mutex held for over 10 minutes is an alert naming
+its holder. Waits and deferrals are the stage's decision note, never failed runs; a refusal is one line
 of history, not one per run. Every open takes the shared on-chain mutex and capital ledger.
-**Capital gate (`leaveForMagma`, D10):** a routing open
-waits for Magma only when ALL of these hold — Amboss accepts the key and an offer of this node
-is listed (enabled); the selling check says better than "not realistic" (offers like this
-node's sell at least about once a year); and the lease income this capital can expect
-(how often offers like it fill × what one fill nets at the clearing price of comparable
-leases, after on-chain costs and the service fee, over the capital it could list) beats the
-median routing yield of this node's channels at least ~30 days (4,320 blocks) old. Without
-routing history or clearing data, the open goes ahead — a node can always open its first
-channels. This is the one place capital allocation is unified across routing vs leasing.
+**Capital gate (`leaveForMagma`, D10):** with Liquidity provision on, the coins Magma can
+list — spendable, within the deploy cap's headroom — are held for it when ALL of these hold:
+Amboss accepts the key and an offer of this node is listed (enabled); the selling check says
+better than "not realistic" (offers like this node's sell at least about once a year); and
+the lease income this capital can expect (how often offers like it fill — capped, once its own
+offer has been listed 60 days, by its own record: (fills + 1) / (years listed + ½) — × what one
+fill nets at the clearing price of comparable leases, after on-chain costs and the service
+fee, over the capital it could list) beats what a sat of this node's channels at least ~30
+days (4,320 blocks) old earned, capacity-weighted (until 2026-10-25 the median channel: 0 on
+a node where most route nothing). The rest stays free for routing opens; the open waits
+("deferred") only when what is left can't fund the smallest open, and every note says how
+much is held. Each comparison is kept: when Amboss's public book can't be read (right after
+a restart: it is cached in memory) the last one stands for a day, said so; past that nothing
+is held. Without routing history or clearing data, nothing is held — a node can always open
+its first channels. This is the one place capital allocation is unified across routing vs leasing.
+**Close list** (`rankCloseCandidates`): a channel under 30 days old — or whose age can't be
+told — is never a candidate. One that routed is protected for what it earns only when its 60-day
+earnings (its own fees plus those of the forwards it brought in) on its local balance reach a
+quarter of what a sat of this node's channels earns over the same 60 days, and at least 25
+ppm/yr; below that it is listed ("Earned … in 60d … under a quarter of what this node's
+channels earn"). "Significant unique reach" protects only with at least five 2-hop nodes no
+other peer reaches. Where freed capital could go names only opens the channel autopilot would
+make (its peer rules and LN+). Parallel channels to an existing peer (adding capacity where a
+channel earns) are not planned yet.
 
 **Magma** — two parts. The **order lane** (every 45 s, its own busy flag, never the main
 run's lock) accepts orders with a hold invoice, opens the channel, reports it, settles once
@@ -624,8 +649,12 @@ nothing is left to relist: a later disable on amboss.tech sticks (one listed and
 again there between two runs, never seen listed, can't be told apart and is listed). If
 selling goes off, or all automation is paused, while such a listing is on its way, the
 offer is taken off the market again. A new offer is listed automatically only where the
-selling check is better than "not realistic". Optional auto-close/auto-relist. A 1%
-service fee applies to completed sales.
+selling check is better than "not realistic". Optional auto-relist, and optional auto-close
+at a lease's end: the sale's own channel by its funding outpoint (txid and vout), never one a
+running lease is listed on, kept open when under a quarter of it is on our side (the rest is
+inbound worth keeping) or it earns at least what a sat of this node's month-old channels earns,
+and closed at LND's economy rate — never above the maximum on-chain fee rate
+(`channelMaxFeeRate`), never without an estimate. A 1% service fee applies to completed sales.
 
 ---
 
