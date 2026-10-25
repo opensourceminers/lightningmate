@@ -56,7 +56,7 @@ import {
   type YieldEvidence,
 } from "./openPlan.js";
 import type { LnPlusStore } from "./lnplusStore.js";
-import { getMagmaRecommendations, saleAcceptFloorSats, saleCostFloorSats, type MagmaV2Report, type MagmaSellRecommendation } from "./magmaRecommend.js";
+import { getMagmaRecommendations, preferredBaseFeeSats, saleAcceptFloorSats, saleCostFloorSats, type MagmaV2Report, type MagmaSellRecommendation } from "./magmaRecommend.js";
 import { onchainCosts } from "./nodeEconomics.js";
 import { getFeeElasticity } from "./outcomes.js";
 import { DEFAULT_POLICY, applyFees, type FeeApplyItem, type FeeApplyResult } from "./fees.js";
@@ -513,10 +513,13 @@ interface PersistedState {
    *  ones to be listed again (OfferControl.listOnAt, applySwitchOn). */
   sellSwitchOn?: { at: string; disabled: string[] | null } | null;
   /** Per offer: the base the market charges while it differs from the
-   *  offer's beyond the tolerance, since when, and the offer's base it was
-   *  started against — the offer's base follows only after a day of the same
-   *  difference (magmaRecommend BASE_FEE_HOLD_MS, trackBaseMoves). */
+   *  offer's beyond the tolerance, since when it has stood at that level,
+   *  and the offer's base it was started against (magmaRecommend
+   *  baseFeeFollow, trackBaseMoves). */
   offerBaseMoves?: Record<string, BaseMove>;
+  /** Per offer: when the autopilot last moved its base fee (a verified
+   *  write) — at most one move per BASE_FEE_MOVE_GAP_MS. */
+  offerBaseMovedAt?: Record<string, string>;
   /** Per area: its latest decision and why (decisionNote) — what it did, or
    *  why it did nothing (D16). */
   decisions?: Partial<Record<DecisionArea, AreaDecision>>;
@@ -594,6 +597,12 @@ export function sanitizeBaseMoves(raw: unknown): Record<string, BaseMove> {
     if (validSats(e.base) && validSats(e.offerBase) && validTime(e.since)) out[id] = { base: e.base, offerBase: e.offerBase, since: e.since };
   }
   return out;
+}
+
+/** Per-id times as they were saved, made safe: only those that parse. */
+export function sanitizeTimes(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  return Object.fromEntries(Object.entries(raw as Record<string, unknown>).filter((e): e is [string, string] => validTime(e[1])));
 }
 
 /** The areas of the autopilot that keep a "last decision" (D16). */
@@ -1327,6 +1336,7 @@ export class Autopilot {
     // the engine, a value left half-written must not throw there.
     this.state.sellSwitchOn = sanitizeSellSwitchOn(this.state.sellSwitchOn);
     this.state.offerBaseMoves = sanitizeBaseMoves(this.state.offerBaseMoves);
+    this.state.offerBaseMovedAt = sanitizeTimes(this.state.offerBaseMovedAt);
     // Upgrading to the fee-change log: the fee changes still in the run
     // history move into it (once), so what was measurable stays measurable.
     this.feeLog.seed(
@@ -1475,7 +1485,7 @@ export class Autopilot {
     offerFeeCaps: OfferFeeCaps;
     autoSizeLease: boolean;
     operatorOfferIds: string[];
-    baseMoves: Record<string, { since: string; offerBase: number }>;
+    baseMoves: Record<string, { since?: string; offerBase?: number; movedAt?: string }>;
   } {
     const c = this.state.config;
     return {
@@ -1494,9 +1504,15 @@ export class Autopilot {
       operatorOfferIds: Object.entries(this.state.offerControl ?? {})
         .filter(([, control]) => !!control.manual)
         .map(([id]) => id),
-      // Since when each offer's base has differed from the market's: it
-      // follows only after a day (trackBaseMoves).
-      baseMoves: Object.fromEntries(Object.entries(this.state.offerBaseMoves ?? {}).map(([id, m]) => [id, { since: m.since, offerBase: m.offerBase }])),
+      // Since when each offer's base has differed from the market's, at the
+      // market's present level, and when its base last moved (baseFeeFollow).
+      baseMoves: Object.fromEntries(
+        [...new Set([...Object.keys(this.state.offerBaseMoves ?? {}), ...Object.keys(this.state.offerBaseMovedAt ?? {})])].map((id) => {
+          const m = this.state.offerBaseMoves?.[id];
+          const movedAt = this.state.offerBaseMovedAt?.[id];
+          return [id, { ...(m ? { since: m.since, offerBase: m.offerBase } : {}), ...(movedAt ? { movedAt } : {}) }];
+        }),
+      ),
     };
   }
 
@@ -3621,6 +3637,9 @@ export class Autopilot {
     for (const id of Object.keys(this.state.offerBaseMoves ?? {})) {
       if (!offers.some((o) => o.id === id)) delete this.state.offerBaseMoves?.[id];
     }
+    for (const id of Object.keys(this.state.offerBaseMovedAt ?? {})) {
+      if (!offers.some((o) => o.id === id)) delete this.state.offerBaseMovedAt?.[id];
+    }
 
     // Auto-list idle capital: no offer at all, leasing beats routing, and
     // auto-pricing on (listing means choosing a price, which only that switch
@@ -4065,9 +4084,13 @@ export class Autopilot {
       if (write.verified) {
         this.rememberPrice(read);
         // The base moved: the clock that led to it is spent — the next report
-        // must not follow the market's next move at once on its account.
+        // must not follow the market's next move at once on its account — and
+        // the next move waits BASE_FEE_MOVE_GAP_MS.
         const clock = this.state.offerBaseMoves?.[offerId];
-        if (clock && clock.offerBase !== read.baseFeeSats) delete this.state.offerBaseMoves?.[offerId];
+        if (clock && clock.offerBase !== read.baseFeeSats) {
+          delete this.state.offerBaseMoves?.[offerId];
+          this.state.offerBaseMovedAt = { ...(this.state.offerBaseMovedAt ?? {}), [offerId]: new Date().toISOString() };
+        }
         if (attempt > 1) write.reason = `${write.reason ? `${write.reason} — ` : ""}stored on the second try (the first read back different)`;
         return read;
       }
@@ -4577,14 +4600,17 @@ export class Autopilot {
   }
 
   /**
-   * The base-fee clocks (magmaRecommend BASE_FEE_HOLD_MS): an offer whose base
+   * The base-fee clocks (magmaRecommend baseFeeFollow): an offer whose base
    * differs from the market's beyond the tolerance gets one when a report
    * first says so, kept while reports go on saying it about the same base of
-   * the offer's. Back within the tolerance, it goes; the offer's base moved —
-   * by the autopilot's write (writeTerms drops it at once) or any other — it
+   * the offer's and the market's stays at the level it started at (within
+   * the tolerance — a move beyond starts it afresh). Back within the
+   * tolerance, it goes; the offer's base moved — by the autopilot's write
+   * (writeTerms drops it at once and stamps the move) or any other — it
    * starts afresh. The engine reads them (magmaOverrides baseMoves): the base
-   * follows once the market's has differed for a day, so a median one listing
-   * flips is never followed — nor the next move right after a base move.
+   * follows at once when far off, else once the market's has held for 1.5 h
+   * — a median one listing flips is never followed — and never sooner than
+   * 6 h after the last base move.
    */
   private trackBaseMoves(recs: MagmaSellRecommendation[]): void {
     const now = new Date().toISOString();
@@ -4594,10 +4620,10 @@ export class Autopilot {
       if (!r.offerId || r.baseFeeDiffers === undefined || !r.current) continue;
       const prev = moves[r.offerId];
       if (r.baseFeeDiffers && r.baseFeeMarketSat != null) {
-        moves[r.offerId] =
-          prev && prev.offerBase === r.current.baseFeeSat
-            ? { ...prev, base: r.baseFeeMarketSat }
-            : { base: r.baseFeeMarketSat, offerBase: r.current.baseFeeSat, since: now };
+        // The same difference while the market's base stays at the level the
+        // clock started at; one that moved beyond the tolerance settles anew.
+        const same = prev && prev.offerBase === r.current.baseFeeSat && preferredBaseFeeSats(prev.base, r.baseFeeMarketSat) === prev.base;
+        moves[r.offerId] = same ? prev : { base: r.baseFeeMarketSat, offerBase: r.current.baseFeeSat, since: now };
       } else delete moves[r.offerId];
     }
     if (JSON.stringify(moves) === JSON.stringify(before)) return;

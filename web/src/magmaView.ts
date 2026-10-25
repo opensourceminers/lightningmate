@@ -213,6 +213,41 @@ export function offerOwner(control: OfferControl | undefined, sellEnabled: boole
   return { label: "autopilot", yours: false, title: `Managed by the autopilot (as your Automation settings say).${listing}` };
 }
 
+/**
+ * The base fee move the autopilot has pending for an offer, said where the
+ * base fee is shown (2026-10-25: the move waited a day and nothing on the page
+ * said so — the 0 that 0.8.0 left looked like the autopilot's choice). Only
+ * for an offer the autopilot prices: "→ 284 at 16:14", "→ 284 next run", or
+ * null when its base is where comparable offers' is. `time` formats the
+ * moment (local time; the date too when it isn't today).
+ */
+export function baseFeeFollow(
+  o: Pick<MyOffer, "id" | "baseFeeSats">,
+  report: Pick<MagmaV2Report, "sell"> | null | undefined,
+  autoPriced: boolean,
+  time: (iso: string) => string = localMoment,
+): { cell: string; title: string } | null {
+  if (!autoPriced) return null;
+  const r = report?.sell.recommendations.find((x) => x.offerId === o.id);
+  if (!r?.baseFeeDiffers || r.baseFeeMarketSat == null || r.baseFeeMarketSat === o.baseFeeSats) return null;
+  const market = r.baseFeeMarketSat;
+  const when = r.baseFeeFollowsAt ? `at ${time(r.baseFeeFollowsAt)}` : "next run";
+  return {
+    cell: `→ ${market} ${when}`,
+    title:
+      `Comparable offers charge ${market} sat base; the autopilot moves this offer's base there ${r.baseFeeFollowsAt ? `at ${time(r.baseFeeFollowsAt)}` : "at its next run"} ` +
+      "— right away when the base is far off, else once the market's has held for 1.5 h, and at most once every 6 h. " +
+      "The rate makes up the rest, so a channel of the offer's typical size costs the same.",
+  };
+}
+
+/** "16:14" today, "Mon 16:14" on another day (local time). */
+function localMoment(iso: string): string {
+  const d = new Date(iso);
+  const hm = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === new Date().toDateString() ? hm : `${d.toLocaleDateString([], { weekday: "short" })} ${hm}`;
+}
+
 /** The Sell tab's "keep disabled" for an offer a switch-on is to list
  *  (OfferControl.listOnAt): the click records a disable by hand, so the
  *  autopilot leaves it off. Null for any other offer — one that is listed is

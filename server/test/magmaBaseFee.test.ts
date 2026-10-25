@@ -18,7 +18,15 @@ import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { sanitizeBaseMoves } from "../src/services/autopilot.js";
-import { BASE_FEE_HOLD_MS, BASE_FEE_TOLERANCE, preferredBaseFeeSats, saleAcceptFloorSats } from "../src/services/magmaRecommend.js";
+import {
+  BASE_FEE_FAR_FACTOR,
+  BASE_FEE_MOVE_GAP_MS,
+  BASE_FEE_STABLE_MS,
+  BASE_FEE_TOLERANCE,
+  baseFeeFollow,
+  preferredBaseFeeSats,
+  saleAcceptFloorSats,
+} from "../src/services/magmaRecommend.js";
 import { __setHistoryForTests } from "../src/services/magmaHistory.js";
 import { sellerSetup } from "./helpers/autopilot.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
@@ -51,28 +59,29 @@ const WINDOW = { ...BAND, totalSats: 2_000_000, minBlockLength: 4320 };
 const effective = (o: { feeRatePpm: number; baseFeeSats: number }, w: Window = BAND) => o.feeRatePpm + (o.baseFeeSats / Math.sqrt(w.minSats * w.maxSats)) * 1e6;
 type S = ReturnType<typeof pricedMarket>;
 const recOf = async (s: S, id: string) => (await s.autopilot.magmaReport()).sell.recommendations.find((r) => r.offerId === id)!;
-/** The market's base has differed from the offer's for `hours` (the hold's clock). */
+/** The market's base has differed from the offer's, at its level, for `hours` (the clock). */
 function differedFor(s: S, id: string, hours: number): void {
   const moves = (s.autopilot as unknown as { state: { offerBaseMoves?: Record<string, { base: number; since: string }> } }).state.offerBaseMoves ?? {};
   assert.ok(moves[id], "the clock runs");
   moves[id].since = new Date(Date.now() - hours * 3_600_000).toISOString();
 }
+/** The autopilot last moved the offer's base `hours` ago. */
+function movedAgo(s: S, id: string, hours: number): void {
+  const state = (s.autopilot as unknown as { state: { offerBaseMovedAt?: Record<string, string> } }).state;
+  assert.ok(state.offerBaseMovedAt?.[id], "a move was stamped");
+  state.offerBaseMovedAt[id] = new Date(Date.now() - hours * 3_600_000).toISOString();
+}
 
-test("an offer the autopilot prices gets the base comparable offers charge — after it has differed for a day; the rate makes up the rest, so the price at √(min·max) stays", async (t) => {
+test("an offer the autopilot prices gets the base comparable offers charge — at once when its own is far off (the 0 that 0.8.0 left waited a day); the rate makes up the rest, so the price at √(min·max) stays", async (t) => {
   quiet(t);
   const s = pricedMarket(t);
   const { autopilot, magma } = s;
   const offer = magma.addOffer({ ...WINDOW, feeRatePpm: 4000, baseFeeSats: 0, feeRateCap: "2200", baseFeeCap: "1" });
   // Its rate alone set to the engine's price: well priced, as the live offer was.
   offer.feeRatePpm = (await recOf(s, offer.id)).recommended.effectiveFeePpm;
-  const held = await recOf(s, offer.id);
-  assert.deepEqual([held.state, held.baseFeeMarketSat, held.baseFeeDiffers, held.shouldReprice], ["well_priced", 568, true, false]);
-  assert.ok(held.reasons.some((r) => r.startsWith("comparable offers charge 568 sat base (it has 0) — its base follows once that has held for a day")), held.reasons.join(" | "));
-  await autopilot.runOnce();
-  assert.equal(magma.count("UpdateOffer"), 0, "not before a day");
-
-  differedFor(s, offer.id, 25);
+  // 0 against 568: far off — no wait (before: a day's hold).
   const rec = await recOf(s, offer.id);
+  assert.deepEqual([rec.state, rec.baseFeeMarketSat, rec.baseFeeDiffers, rec.baseFeeFollowsAt], ["well_priced", 568, true, undefined]);
   assert.deepEqual([rec.shouldReprice, rec.baseOnly, rec.recommended.baseFeeSat], [true, true, 568], "before: no reprice, the base the offer had (0)");
   const before = effective(offer);
   await autopilot.runOnce();
@@ -128,7 +137,7 @@ test("a base-only recommendation is one price: `recommended`, beats-routing and 
   assert.equal(rec.economics.beatsRouting, rec.reasons.some((r) => r.includes("above your routing benchmark")));
 });
 
-test("no flip-flop: a small segment whose median base one listing moves back and forth never rewrites the base — it follows only once the market's has differed for a day", async (t) => {
+test("no flip-flop: a small segment whose median base one listing moves back and forth never rewrites the base — it follows only once the market's has held for 1.5 h", async (t) => {
   quiet(t);
   // 5 in band: median (index 2) 568; a sixth at 900 moves it to 900.
   const s = pricedMarket(t, { bases: [300, 300, 568, 900, 900] });
@@ -148,7 +157,7 @@ test("no flip-flop: a small segment whose median base one listing moves back and
   assert.equal(magma.count("UpdateOffer") - w0, 0);
   const clocks = () => (autopilot as unknown as { state: { offerBaseMoves?: Record<string, unknown> } }).state.offerBaseMoves ?? {};
   assert.equal(clocks()[offer.id], undefined, "back within the tolerance: the clock stops — it starts afresh");
-  // The median stays at 900 for a day: one base write, then quiet.
+  // The median stays at 900 (longer than 1.5 h): one base write, then quiet.
   market.addOffer({ id: "flipper", totalSats: 2_000_000, minSats: 1_000_000, maxSats: 2_000_000, feeRatePpm: 4000, baseFeeSats: 900, sellerScore: 50 });
   await autopilot.runOnce();
   differedFor(s, offer.id, 25);
@@ -165,7 +174,7 @@ test("no flip-flop: a small segment whose median base one listing moves back and
   assert.equal(clocks()[offer.id], undefined);
 });
 
-test("the clock is spent by the move it led to: after a day-long difference the base moves once — a median that then flips every run, or moves right after, is not followed at once", async (t) => {
+test("the clock is spent by the move it led to: after a held difference the base moves once — a median that then flips every run, or moves right after, is not followed at once", async (t) => {
   quiet(t);
   // 6 in band: median (index round(2.5) = 3) 900; one 900 fewer: 568.
   const s = pricedMarket(t, { bases: [300, 300, 568, 900, 900, 900] });
@@ -186,7 +195,91 @@ test("the clock is spent by the move it led to: after a day-long difference the 
     else market.addOffer({ totalSats: 2_000_000, minSats: 1_000_000, maxSats: 2_000_000, feeRatePpm: 4200, baseFeeSats: 900, sellerScore: 50 });
   }
   assert.deepEqual(bases, [568, 900, 900, 900, 900, 900, 900], "before: 568 → 900 → 568 → 900 …, a write every run");
-  assert.equal(magma.count("UpdateOffer") - w0, 1, "one write for the one day-long difference");
+  assert.equal(magma.count("UpdateOffer") - w0, 1, "one write for the one held difference");
+});
+
+test("a difference that isn't far off waits for the market's base to hold 1.5 h — and says until when, also on the recommendation the Sell page reads", async (t) => {
+  quiet(t);
+  const s = pricedMarket(t);
+  const { autopilot, magma } = s;
+  // 450 against 568: beyond the tolerance (113.6), not far off (under 2 ×, over ½ ×).
+  const offer = magma.addOffer({ ...WINDOW, feeRatePpm: 4000, baseFeeSats: 450, feeRateCap: "2200", baseFeeCap: "1" });
+  offer.feeRatePpm = (await recOf(s, offer.id)).recommended.feeRatePpm;
+  await autopilot.runOnce();
+  assert.equal(offer.baseFeeSats, 450, "settling: not yet");
+  const held = await recOf(s, offer.id);
+  const clock = (autopilot as unknown as { state: { offerBaseMoves?: Record<string, { since: string }> } }).state.offerBaseMoves?.[offer.id];
+  assert.ok(clock);
+  assert.equal(held.baseFeeFollowsAt, new Date(Date.parse(clock.since) + BASE_FEE_STABLE_MS).toISOString());
+  const at = held.baseFeeFollowsAt!.slice(11, 16);
+  assert.ok(
+    held.reasons.includes(`comparable offers charge 568 sat base (it has 450) — its base follows at ${at} UTC, once that has held for 1.5 h`),
+    held.reasons.join(" | "),
+  );
+  differedFor(s, offer.id, 1.4);
+  await autopilot.runOnce();
+  assert.equal(offer.baseFeeSats, 450, "1.4 h: still settling");
+  differedFor(s, offer.id, 1.6);
+  await autopilot.runOnce();
+  assert.equal(offer.baseFeeSats, 568, "held for 1.5 h: followed");
+  assert.equal((await recOf(s, offer.id)).baseFeeFollowsAt, undefined);
+});
+
+test("a market base that moves to another level while it differs starts the 1.5 h afresh — the offer follows a level that held, not one just reached", async (t) => {
+  quiet(t);
+  const s = pricedMarket(t, { bases: Array(8).fill(284) });
+  const { autopilot, magma, market } = s;
+  // 200 against 284: beyond the tolerance (56.8), not far off.
+  const offer = magma.addOffer({ ...WINDOW, feeRatePpm: 4000, baseFeeSats: 200, feeRateCap: "2200", baseFeeCap: "1" });
+  offer.feeRatePpm = (await recOf(s, offer.id)).recommended.feeRatePpm;
+  await autopilot.runOnce();
+  differedFor(s, offer.id, 1); // at 284 for an hour…
+  // …then the market's base moves to 380 (still not far from 200: under 2 ×).
+  for (let i = 0; i < 12; i++) market.addOffer({ totalSats: 2_000_000, minSats: 1_000_000, maxSats: 2_000_000, feeRatePpm: 3000, baseFeeSats: 380, sellerScore: 50 });
+  await autopilot.runOnce();
+  const clock = (autopilot as unknown as { state: { offerBaseMoves?: Record<string, { base: number; since: string }> } }).state.offerBaseMoves?.[offer.id];
+  assert.equal(clock?.base, 380);
+  assert.ok(Date.now() - Date.parse(clock?.since ?? "") < 60_000, "the clock started afresh at the new level");
+  assert.equal(offer.baseFeeSats, 200, "1 h at 284 doesn't make 380 a level that held");
+  differedFor(s, offer.id, 1.6);
+  await autopilot.runOnce();
+  assert.equal(offer.baseFeeSats, 380);
+});
+
+test("at most one base move per 6 h: after one, the next difference — even a far one — waits until 6 h after it, and the reason says so", async (t) => {
+  quiet(t);
+  const s = pricedMarket(t);
+  const { autopilot, magma, market } = s;
+  const offer = magma.addOffer({ ...WINDOW, feeRatePpm: 4000, baseFeeSats: 0, feeRateCap: "2200", baseFeeCap: "1" });
+  offer.feeRatePpm = (await recOf(s, offer.id)).recommended.feeRatePpm;
+  await autopilot.runOnce();
+  assert.equal(offer.baseFeeSats, 568, "far off: at once");
+  const movedAt = (autopilot as unknown as { state: { offerBaseMovedAt?: Record<string, string> } }).state.offerBaseMovedAt?.[offer.id];
+  assert.ok(movedAt && Date.now() - Date.parse(movedAt) < 60_000, "the move is stamped");
+  // The market moves far (to 1,500 sat: over 2 × 568).
+  for (let i = 0; i < 20; i++) market.addOffer({ totalSats: 2_000_000, minSats: 1_000_000, maxSats: 2_000_000, feeRatePpm: 3000, baseFeeSats: 1500, sellerScore: 50 });
+  await autopilot.runOnce();
+  assert.equal(offer.baseFeeSats, 568, "within 6 h of the last move: waits");
+  const rec = await recOf(s, offer.id);
+  assert.equal(rec.baseFeeFollowsAt, new Date(Date.parse(movedAt) + BASE_FEE_MOVE_GAP_MS).toISOString());
+  assert.ok(rec.reasons.some((r) => r.endsWith("UTC, 6 h after its last base change") && r.startsWith("comparable offers charge 1500 sat base (it has 568)")), rec.reasons.join(" | "));
+  movedAgo(s, offer.id, 6.1);
+  await autopilot.runOnce();
+  assert.equal(offer.baseFeeSats, 1500, "6 h later: followed");
+});
+
+test("baseFeeFollow, the rule itself: far off (under ½ × or over 2 ×, 0 among them) at once; else after 1.5 h at the market's level; never sooner than 6 h after the last move", () => {
+  const now = Date.parse("2026-10-25T12:00:00.000Z");
+  const ago = (h: number) => new Date(now - h * 3_600_000).toISOString();
+  assert.equal(BASE_FEE_FAR_FACTOR, 2);
+  assert.deepEqual(baseFeeFollow(0, 284, undefined, now), { at: null, why: "far" });
+  assert.deepEqual(baseFeeFollow(700, 284, undefined, now), { at: null, why: "far" });
+  assert.deepEqual(baseFeeFollow(200, 284, undefined, now), { at: now + BASE_FEE_STABLE_MS, why: "settling" }, "first seen now");
+  assert.deepEqual(baseFeeFollow(200, 284, { since: ago(1) }, now), { at: now + 0.5 * 3_600_000, why: "settling" });
+  assert.deepEqual(baseFeeFollow(200, 284, { since: ago(2) }, now), { at: null, why: "stable" });
+  assert.deepEqual(baseFeeFollow(200, 284, { since: ago(2), movedAt: ago(5) }, now), { at: now + 3_600_000, why: "gap" });
+  assert.deepEqual(baseFeeFollow(0, 284, { movedAt: ago(1) }, now), { at: now + 5 * 3_600_000, why: "gap" }, "far, but within 6 h of a move");
+  assert.deepEqual(baseFeeFollow(200, 284, { since: ago(0.5), movedAt: ago(5.9) }, now), { at: now + 3_600_000, why: "settling" }, "the later of the two");
 });
 
 test("a clock started against another base of the offer's doesn't count: an edit on amboss.tech after a day-long difference is not followed at once — the clock starts afresh", async (t) => {
@@ -214,9 +307,11 @@ test("base-fee clocks read back from a damaged state file are made safe — the 
   const file = join(s.dir, "autopilot.json");
   const state = JSON.parse(readFileSync(file, "utf8"));
   state.offerBaseMoves = { a: null, b: { base: "568" }, c: 5, [offer.id]: { base: 568, offerBase: 0, since: "not a time" }, kept: { base: 568, offerBase: 0, since: new Date().toISOString() } };
+  state.offerBaseMovedAt = { x: null, y: "never", [offer.id]: 7, kept: new Date().toISOString() };
   writeFileSync(file, JSON.stringify(state));
   const ap = s.restart();
   assert.deepEqual(Object.keys((ap as unknown as { state: { offerBaseMoves: Record<string, unknown> } }).state.offerBaseMoves), ["kept"]);
+  assert.deepEqual(Object.keys((ap as unknown as { state: { offerBaseMovedAt: Record<string, unknown> } }).state.offerBaseMovedAt), ["kept"]);
   await ap.magmaReport(); // before: threw on the null entry
   const run = await ap.runOnce();
   assert.deepEqual(run.sells.filter((x) => x.action === "error"), []);
@@ -236,13 +331,16 @@ test("a market base too big for the price is cut to fit — written once: the ne
   __setHistoryForTests(Array.from({ length: 30 }, (_, i) => ({ at: Date.now() - i * 86_400_000, sizeSat: 400_000, blocks: 4320, apr: 0.01, leasePpm: 500, status: "FINISHED" })));
   const offer = magma.addOffer({ ...w, totalSats: 800_000, minBlockLength: 4320, feeRatePpm: 2070, baseFeeSats: 0, feeRateCap: "2200", baseFeeCap: "1" });
   const target = await recOf(s, offer.id);
-  assert.deepEqual([target.recommended.effectiveFeePpm, target.state], [2063, "well_priced"], "the case: 2,070 ppm + 0 is well priced against 2,063");
+  // The case: 2,070 ppm + 0 is well priced (the engine's price is ~2,063–2,071 ppm effective there).
+  assert.equal(target.state, "well_priced", `${target.recommended.effectiveFeePpm}`);
+  assert.ok(Math.abs(target.recommended.effectiveFeePpm - 2070) <= 10, `${target.recommended.effectiveFeePpm}`);
   differedFor(s, offer.id, 25);
   await autopilot.runOnce();
   assert.equal(magma.count("UpdateOffer"), 1);
   assert.deepEqual([offer.feeRatePpm, offer.baseFeeSats], [3, 827], "cut to fit");
   await autopilot.runOnce(); // 827 is still far from 5,000: the clock starts again, against 827
-  differedFor(s, offer.id, 25); // …and a day passes
+  differedFor(s, offer.id, 25); // …and a day passes, past the 6 h after the move
+  movedAgo(s, offer.id, 25);
   await autopilot.runOnce();
   await autopilot.runOnce();
   assert.equal(magma.count("UpdateOffer"), 1, "before: a second write a day later, 3 + 827 → 1 + 828, for one sat");
@@ -282,7 +380,7 @@ test("a base going down to the market's is refused where the smallest order woul
 
 test("anti-churn: a base within max(50 sat, 20 % of the market's) stays the offer's — a median that wobbles never rewrites it; one further off goes to the market's", async (t) => {
   assert.deepEqual(BASE_FEE_TOLERANCE, { minSats: 50, share: 0.2 });
-  assert.equal(BASE_FEE_HOLD_MS, 24 * 3_600_000);
+  assert.deepEqual([BASE_FEE_STABLE_MS, BASE_FEE_MOVE_GAP_MS], [90 * 60_000, 6 * 3_600_000]);
   assert.equal(preferredBaseFeeSats(540, 568), 540);
   assert.equal(preferredBaseFeeSats(681, 568), 681, "113 sat off: within 20 % of 568 (113.6)");
   assert.equal(preferredBaseFeeSats(682, 568), 568);
@@ -308,7 +406,7 @@ test("anti-churn: a base within max(50 sat, 20 % of the market's) stays the offe
   assert.equal(offer.baseFeeSats, 540);
 });
 
-test("an offer whose terms are the operator's, or any offer with auto-pricing off, keeps its base — the recommendation, and so 'Apply recommended', carries the market's once it has differed for a day", async (t) => {
+test("an offer whose terms are the operator's, or any offer with auto-pricing off, keeps its base — the recommendation, and so 'Apply recommended', carries the market's (at once, its own being far off)", async (t) => {
   quiet(t);
   for (const variant of ["terms taken over", "auto-pricing off"] as const) {
     const s = pricedMarket(t, { config: variant === "auto-pricing off" ? { sellAutoReprice: false } : {} });
@@ -317,7 +415,6 @@ test("an offer whose terms are the operator's, or any offer with auto-pricing of
     if (variant === "terms taken over") autopilot.pauseOfferAutomation(offer.id, "you edited this offer");
     await autopilot.runOnce();
     await recOf(s, offer.id); // a page view: the clock runs whoever prices the offer
-    differedFor(s, offer.id, 25);
     await autopilot.runOnce();
     assert.equal(magma.count("UpdateOffer"), 0, variant);
     assert.deepEqual([offer.feeRatePpm, offer.baseFeeSats], [4100, 0], variant);

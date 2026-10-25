@@ -17,6 +17,7 @@ import {
   PRICING_MODES,
   SELLER_SCORE_COPY,
   STANDARD_LEASE_BLOCKS,
+  baseFeeFollow,
   buyConfirmMessage,
   disableSellingMessage,
   enableSellingMessage,
@@ -460,3 +461,23 @@ test("Market → Sell's verdict line is per sale — and where offers like this 
   assert.deepEqual([slow.label, slow.good], ["Priced to beat routing", true]);
   assert.doesNotMatch(slow.line, /list around/);
 });
+
+test("Market → Sell says when the autopilot moves the offer's base fee to the market's — only for an offer it prices (2026-10-25: a pending move waited a day and nothing said so)", () => {
+  type Report = Parameters<typeof baseFeeFollow>[1];
+  const rec = (r: Record<string, unknown>) => ({ sell: { recommendations: [{ offerId: "o1", ...r }] } }) as unknown as Report;
+  const o = { id: "o1", baseFeeSats: 0 };
+  const held = baseFeeFollow(o, rec({ baseFeeDiffers: true, baseFeeMarketSat: 284, baseFeeFollowsAt: "2026-10-25T16:14:00.000Z" }), true, () => "17:14");
+  assert.equal(held?.cell, "→ 284 at 17:14");
+  assert.match(held!.title, /^Comparable offers charge 284 sat base; the autopilot moves this offer's base there at 17:14 — right away when the base is far off/);
+  assert.match(held!.title, /so a channel of the offer's typical size costs the same\.$/);
+  // Due now: at the next run.
+  assert.equal(baseFeeFollow(o, rec({ baseFeeDiffers: true, baseFeeMarketSat: 284 }), true)?.cell, "→ 284 next run");
+  // Not for an offer whose terms are the operator's (or with auto-pricing off).
+  assert.equal(baseFeeFollow(o, rec({ baseFeeDiffers: true, baseFeeMarketSat: 284 }), false), null);
+  // At the market's base, within the tolerance, or no report: nothing.
+  assert.equal(baseFeeFollow(o, rec({ baseFeeDiffers: false, baseFeeMarketSat: 284 }), true), null);
+  assert.equal(baseFeeFollow({ id: "o1", baseFeeSats: 284 }, rec({ baseFeeDiffers: true, baseFeeMarketSat: 284 }), true), null);
+  assert.equal(baseFeeFollow(o, null, true), null);
+  assert.equal(baseFeeFollow({ id: "other", baseFeeSats: 0 }, rec({ baseFeeDiffers: true, baseFeeMarketSat: 284 }), true), null);
+});
+

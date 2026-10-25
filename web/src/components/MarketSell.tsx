@@ -30,6 +30,7 @@ import { failedOfferWrite } from "../statusNotes";
 import { EligibilityCard, HowAmbossPicks, OfferPromiseNote, SellDiagnosticsCard } from "./MagmaSellInfo";
 import {
   STANDARD_LEASE_BLOCKS,
+  baseFeeFollow,
   keepDisabledAction,
   leaseToKeep,
   leaseWarning,
@@ -409,6 +410,7 @@ export function MarketSell() {
               const oddLease = leaseToKeep(o.minBlockLength, rec?.sell.standardLeaseBlocks ?? STANDARD_LEASE_BLOCKS) !== o.minBlockLength;
               const free = o.feeRatePpm <= 0 && o.baseFeeSats <= 0;
               const keep = keepDisabledAction(o, controls[o.id]);
+              const follow = baseFeeFollow(o, rec, autoPriced(o));
               return (
                 <tr key={o.id} className={active ? "" : "inactive"}>
                   <td>{active ? "🟢 active" : `⚪ ${o.status.toLowerCase()}`}</td>
@@ -419,7 +421,10 @@ export function MarketSell() {
                   <td className={`num ${free ? "delta-up" : ""}`} title={free ? "No price: buyers would get a channel for free" : undefined}>
                     {o.feeRatePpm} ppm{free ? " ⚠" : ""}
                   </td>
-                  <td className="num">{o.baseFeeSats}</td>
+                  <td className="num" title={follow?.title}>
+                    {o.baseFeeSats}
+                    {follow ? <span className="base-follow"> {follow.cell}</span> : null}
+                  </td>
                   <td className={`num ${oddLease ? "delta-up" : ""}`} title={`${o.minBlockLength} blocks${oddLease ? " — not the standard lease buyers use" : ""}`}>
                     {Math.round(o.minBlockLength / 144)}d{oddLease ? " ⚠" : ""}
                   </td>

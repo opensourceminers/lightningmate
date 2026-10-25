@@ -81,12 +81,12 @@ export interface MagmaV2Config {
   /** Offers whose terms the operator took over (OfferControl.manual): the
    *  autopilot leaves their lease alone, whatever auto-size says. */
   operatorOfferIds: string[];
-  /** Per offer: since when the market's base fee has differed from the
-   *  offer's beyond BASE_FEE_TOLERANCE (the autopilot keeps the clock,
-   *  baseFeeDiffers), and the offer's base it was started against — a clock
-   *  of another base of the offer's (one moved since) doesn't count. The base
-   *  follows only after BASE_FEE_HOLD_MS. */
-  baseMoves: Record<string, { since: string; offerBase: number }>;
+  /** Per offer: since when the market's base fee has stood at its level and
+   *  differed from the offer's beyond BASE_FEE_TOLERANCE (the autopilot keeps
+   *  the clock, baseFeeDiffers), the offer's base it was started against — a
+   *  clock of another base of the offer's (one moved since) doesn't count —
+   *  and when the autopilot last moved the offer's base (baseFeeFollow). */
+  baseMoves: Record<string, { since?: string; offerBase?: number; movedAt?: string }>;
 }
 
 export const MAGMA_V2_DEFAULTS: MagmaV2Config = {
@@ -158,9 +158,12 @@ export interface MagmaSellRecommendation {
   baseOnly?: boolean;
   /** The base the comparable offers charge (their median; null: no pool). */
   baseFeeMarketSat?: number | null;
-  /** That base differs from the offer's beyond BASE_FEE_TOLERANCE — the clock
-   *  of BASE_FEE_HOLD_MS runs (MagmaV2Config.baseMoveSince). */
+  /** That base differs from the offer's beyond BASE_FEE_TOLERANCE — the
+   *  autopilot keeps its clock (MagmaV2Config.baseMoves, baseFeeFollow). */
   baseFeeDiffers?: boolean;
+  /** It differs and the offer's base follows at this time (ISO) — not yet:
+   *  the market's base is settling, or a base move was made < 6 h ago. */
+  baseFeeFollowsAt?: string;
   current: { feeRatePpm: number; baseFeeSat: number; effectiveFeePpm: number } | null;
   /** The terms the offer should carry: the price, the lease that price is for
    *  (the one the offer carries after the next write: the standard 4320 —
@@ -332,10 +335,38 @@ const median = (arr: number[]) => pct([...arr].sort((a, b) => a - b), 0.5);
  *  that moves a little (one offer listed or gone) never rewrites it. */
 export const BASE_FEE_TOLERANCE = { minSats: 50, share: 0.2 } as const;
 
-/** How long the market's base must have differed from an offer's (beyond
- *  BASE_FEE_TOLERANCE) before the offer's base follows it: a small segment's
- *  median, moved back and forth by one listing, is never followed. */
-export const BASE_FEE_HOLD_MS = 24 * 3_600_000;
+/** How the offer's base follows the market's (2026-10-25: a day's hold kept
+ *  the 0 that 0.8.0 left on the live offer for 24 h, and every ordinary move
+ *  waited as long):
+ *  - far off — the offer's base under half the market's, or over twice it
+ *    (0 among them) — it follows at once;
+ *  - else once the market's base has stayed where it is (within
+ *    BASE_FEE_TOLERANCE of the level it moved to) for BASE_FEE_STABLE_MS:
+ *    a small segment's median, flipped back and forth by one listing, is
+ *    never followed;
+ *  - either way at most one base move per BASE_FEE_MOVE_GAP_MS. */
+export const BASE_FEE_STABLE_MS = 90 * 60_000;
+export const BASE_FEE_MOVE_GAP_MS = 6 * 3_600_000;
+export const BASE_FEE_FAR_FACTOR = 2;
+
+/** When an offer's base follows the market's (null: now), or why not yet. */
+export function baseFeeFollow(
+  own: number,
+  market: number,
+  clock: { since?: string; movedAt?: string } | undefined,
+  nowMs: number,
+): { at: number | null; why: "far" | "stable" | "gap" | "settling" } {
+  const far = own * BASE_FEE_FAR_FACTOR < market || own > market * BASE_FEE_FAR_FACTOR;
+  const movedMs = clock?.movedAt ? Date.parse(clock.movedAt) : NaN;
+  const gapEnd = Number.isFinite(movedMs) ? movedMs + BASE_FEE_MOVE_GAP_MS : -Infinity;
+  const sinceMs = clock?.since ? Date.parse(clock.since) : NaN;
+  // Without a clock the market's base is seen for the first time now.
+  const stableEnd = (Number.isFinite(sinceMs) ? sinceMs : nowMs) + BASE_FEE_STABLE_MS;
+  const due = far ? gapEnd : Math.max(gapEnd, stableEnd);
+  if (due <= nowMs) return { at: null, why: far ? "far" : "stable" };
+  // Held by the gap after its last base move, or while the market's settles.
+  return { at: due, why: far || gapEnd >= stableEnd ? "gap" : "settling" };
+}
 
 /**
  * The base fee an offer is priced with: the market's — the median base of the
@@ -688,8 +719,10 @@ export async function getMagmaRecommendations(
     // ── Base fee ──────────────────────────────────────────────────────────────
     // The market's: the median base of the comparable offers (none without
     // any). An offer keeps its own while that is within BASE_FEE_TOLERANCE of
-    // it — and until the market's has differed for a day (BASE_FEE_HOLD_MS):
-    // a median one listing moves back and forth is never followed. Nor where
+    // it — and until baseFeeFollow says it follows: at once when far off,
+    // else once the market's base has held for BASE_FEE_STABLE_MS (a median
+    // one listing moves back and forth is never followed), at most one move
+    // per BASE_FEE_MOVE_GAP_MS. Nor where
     // the market's base would let the offer's smallest order pay less than
     // opening and closing its channel costs at today's fee rate (the order
     // lane's accept floor, which would turn such orders down) while its own
@@ -702,7 +735,11 @@ export async function getMagmaRecommendations(
     // the offer's — before a base move, or an edit — is not.
     const clock = offer ? cfg.baseMoves[offer.id] : undefined;
     const baseSince = clock && clock.offerBase === offer?.baseFeeSats ? clock.since : undefined;
-    const baseHeld = baseDiffers && (!baseSince || nowMs - Date.parse(baseSince) < BASE_FEE_HOLD_MS);
+    const follow =
+      baseDiffers && offer && marketBase !== null
+        ? baseFeeFollow(offer.baseFeeSats, marketBase, { since: baseSince, movedAt: clock?.movedAt }, nowMs)
+        : null;
+    const baseHeld = baseDiffers && follow !== null && follow.at !== null;
     let baseFee = !offer ? preferredBaseFeeSats(null, marketBase) : baseDiffers && !baseHeld && marketBase !== null ? marketBase : offer.baseFeeSats;
     const feeAtMinSat = (p: PricePoint) => (p.feeRatePpm * minSize) / 1_000_000 + p.baseFeeSat;
     let baseRefusedSat: number | null = null;
@@ -777,11 +814,12 @@ export async function getMagmaRecommendations(
     // all is the eligibility check's question, not this one's. Written below,
     // once the price is final (a base-only split is a price of its own).
     const perSaleAt = reasons.push("") - 1;
-    if (offer && baseDiffers && baseHeld && marketBase !== null) {
+    if (offer && baseDiffers && baseHeld && marketBase !== null && follow?.at != null) {
+      const at = new Date(follow.at).toISOString().slice(11, 16);
       reasons.push(
-        `comparable offers charge ${marketBase} sat base (it has ${offer.baseFeeSats}) — its base follows once that has held for a day${
-          baseSince ? ` (differing since ${baseSince.slice(0, 16).replace("T", " ")} UTC)` : ""
-        }`,
+        follow.why === "gap"
+          ? `comparable offers charge ${marketBase} sat base (it has ${offer.baseFeeSats}) — its base follows at ${at} UTC, 6 h after its last base change`
+          : `comparable offers charge ${marketBase} sat base (it has ${offer.baseFeeSats}) — its base follows at ${at} UTC, once that has held for 1.5 h`,
       );
     }
     if (offer && baseRefusedSat !== null && marketBase !== null) {
@@ -880,6 +918,7 @@ export async function getMagmaRecommendations(
       repriceDirection,
       ...(baseOnly ? { baseOnly } : {}),
       ...(offer ? { baseFeeMarketSat: marketBase, baseFeeDiffers: baseDiffers } : {}),
+      ...(offer && baseHeld && follow?.at != null ? { baseFeeFollowsAt: new Date(follow.at).toISOString() } : {}),
       current,
       recommended: {
         ...recommended,

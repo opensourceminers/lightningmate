@@ -537,10 +537,14 @@ median, `premium` = their 75th percentile, `auto` = between the 25th and 75th pe
 starting in the middle and stepping up after each sale (it never steps down on its own, but
 follows the market when what buyers pay moves) — never below the profit floor. The base
 fee is the one comparable offers charge (their median; 0 sat is a base too), the offer's own
-while it is within max(50 sat, 20 %) of it — and until the market's has differed beyond that
-for a day from the same base of the offer's, so a median one listing moves back and forth is
-never followed: the clock starts afresh when the offer's base moves (by the autopilot's write
-or by hand), so a move right after a base move isn't followed at once either. A base that
+while it is within max(50 sat, 20 %) of it. Beyond that it follows **at once when far off**
+(the offer's base under half the market's or over twice it — the 0 that 0.8.0 left among
+them), **else once the market's base has held at its level for 1.5 h** (a level that moves
+beyond the tolerance starts the clock afresh, so a median one listing moves back and forth is
+never followed), and **never sooner than 6 h after its last base move** (the autopilot stamps
+each verified one). The clock also starts afresh when the offer's base moves by hand. Market →
+Sell shows a pending move beside the base fee ("→ 284 at 17:14") and says why in its reasons.
+(Until 2026-10-25 every move waited a day: the live offer kept its 0 for 24 h.) A base that
 moves keeps the offer's price at the representative size √(min·max) — the rate makes up
 the rest, so smaller orders pay more or less with it — and a lower base never goes on where
 the offer's smallest order would then pay less than opening and closing its channel costs at
