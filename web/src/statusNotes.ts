@@ -100,6 +100,12 @@ export function runProgress(
   };
 }
 
+/** A history line of work a stage finished after it was given up for its
+ *  deadline (AutopilotRun.lateStage): what it had under way went through. */
+export function lateStageNote(lateStage: string | undefined): string | null {
+  return lateStage ? `finished after ${lateStage} was given up` : null;
+}
+
 /** A run-history line that happened several times in a row (merged): "35
  *  times in a row, since 19 h ago" — `since` is the first time, as shown. */
 export function repeatsNote(repeats: number | undefined, since: string | null): string | null {

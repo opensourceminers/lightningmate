@@ -199,7 +199,9 @@ export function switchOnConfirm(
       message:
         "It opens channels with your on-chain funds, on its own: to the best suggestion it can actually open, " +
         `${config.channelSizeSats ? `${sats(config.channelSizeSats)} each` : "sized automatically"}, keeping ${sats(config.channelReserveSats)} on chain, ` +
-        `at most ${config.channelMaxFeeRate} sat/vB, and only when an open pays back. A channel ties its funds up until it is closed — and closing costs an on-chain fee again.`,
+        `at most ${config.channelMaxFeeRate} sat/vB. With enough routing history an open must also pay back what opening and closing cost; without it, only that fee rate cap applies. ` +
+        "While Liquidity provision is on, routing opens leave the coins your offers can list to Magma when leasing them is expected to earn more — how much is decided each run. " +
+        "A channel ties its funds up until it is closed — and closing costs an on-chain fee again.",
       confirmLabel: "Turn on",
     };
   }
@@ -224,7 +226,8 @@ export function switchOnConfirm(
  *  (review 2026-10-25: 0 read "waits for the next run", which never came;
  *  equal hours meaning "any time" was said nowhere). */
 export const PER_RUN_HINTS = {
-  maxChangesPerRun: "0 = the autopilot writes no fee change at all (it still shows what it would change). A change over the limit waits for the next run.",
+  maxChangesPerRun:
+    "0 = the autopilot writes no fee change (it still shows what it would change) — except the 10-minute check that lowers a sold channel's fee to what its buyer was promised. A change over the limit waits for the next run.",
   maxRebalancesPerRun: "0 = no refill runs automatically (the Rebalancing tab still shows what would pass). A refill over the limit waits for the next run.",
 } as const;
 export const REBALANCE_WINDOW_HINT =

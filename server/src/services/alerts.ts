@@ -236,7 +236,7 @@ export function leasePromiseAlerts(failing: { channelId: string; alias: string; 
       message:
         `The fee of ${f.alias} (${f.channelId}), a channel you sold, is above what its buyer was promised (${promise}), ` +
         `and LND has refused to lower it since ${f.since.slice(0, 16).replace("T", " ")} UTC: ${f.error}. ` +
-        "LightningMate tries again every 10 minutes — lower it by hand on the Channels tab if this stays.",
+        "LightningMate tries again every 10 minutes. If it keeps failing, check LND's log for why it refuses the update, and the channel's state (for example whether it is closing).",
     };
   });
 }

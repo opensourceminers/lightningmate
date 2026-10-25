@@ -351,7 +351,7 @@ test("an order-lane pass whose call never answers is given up at its deadline: t
   const lane = autopilot.magma.laneStatus();
   assert.equal(lane.running, false, "the lane is free again");
   assert.equal(lane.ok, false);
-  assert.match(lane.error ?? "", /^the order lane's pass did not finish in 150 ms — LND or Amboss didn't answer; it was given up/);
+  assert.match(lane.error ?? "", /^the order lane's pass did not finish in 150 ms — LND or Amboss didn't answer, or a buyer couldn't be reached in time; it was given up/);
   // A newer pass under way (its read hangs too) when the first answers late.
   const newer = autopilot.magma.tick();
   await sleep(10);

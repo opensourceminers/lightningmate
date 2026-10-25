@@ -1,9 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   RUN_STUCK_MINUTES,
   awaitsYourDecision,
   failedOfferWrite,
+  lateStageNote,
   laneBanner,
   promisedSpend,
   removeKeyMessage,
@@ -83,6 +85,17 @@ test("a history line that happened several times in a row says how often, and si
   assert.equal(repeatsNote(1, "2h ago"), null, "once is no repeat");
   assert.equal(repeatsNote(35, "19h ago"), "35 times in a row, since 19h ago");
   assert.equal(repeatsNote(2, null), "2 times in a row");
+});
+
+// Final review 2026-10-25: what a stage finished after it was given up for
+// its deadline (an open, a refill, a fee write LND answered late) is a line of
+// its own, and the line says so.
+test("a history line of work a stage finished after it was given up says so — and the run history shows it", () => {
+  assert.equal(lateStageNote(undefined), null);
+  assert.equal(lateStageNote("the channels stage"), "finished after the channels stage was given up");
+  const panel = readFileSync(new URL("../src/components/AutopilotPanel.tsx", import.meta.url), "utf8");
+  assert.match(panel, /const late = lateStageNote\(run\.lateStage\);/);
+  assert.match(panel, /\{late \? <span className="muted"> · \{late\}<\/span> : null\}/);
 });
 
 test("removing the Amboss key says what happens to Magma orders in flight", () => {

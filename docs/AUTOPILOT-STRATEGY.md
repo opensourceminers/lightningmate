@@ -56,10 +56,18 @@ its area's error ("… did not finish in 15 min — LND or Amboss didn't answer;
 up"), and the run goes on to its other stages and ends: the next runs, "Run once now" and
 manual fee writes are not held up until a restart any more. The given-up work can't be
 cancelled, but whatever it still does when the call answers late writes nothing (no fee
-write, payment, open, offer write or order step). An order-lane pass that is given up frees
-the lane; the next pass leaves alone an order whose step the given-up one still waits on and
-goes on with the others; at most two given-up passes wait at once, then none starts until one
-ends.
+write, payment, open, offer write or order step) — except the one it was waiting on: an
+open, a refill or a fee write that goes through when LND answers late gets a run-history
+line of its own ("finished after the channels stage was given up"), and the area's decision
+says what happened instead of "did not finish" (unless a later run has decided something
+else since). A rebalancing stage given up while its payment is out keeps the refill lock
+until LND answers: the rebalancing decision and a refused manual refill say so ("a refill of
+the given-up rebalancing stage is still running — LND hasn't answered"), and after 10
+minutes it is an alert, as is a manual refill holding it that long. An order-lane pass that
+is given up ("… did not finish in 5 min — LND or Amboss didn't answer, or a buyer couldn't
+be reached in time") frees the lane; the next pass leaves alone an order whose step the
+given-up one still waits on and goes on with the others; at most two given-up passes wait
+at once, then none starts until one ends.
 
 Fee writes have a lock of their own, apart from the run's: the run's fee and max_htlc
 stages (each writes the whole policy back, so one must never land between the other's read
@@ -71,10 +79,11 @@ the lock taken answers "Fees are being written right now … — try again in a 
 
 The run history keeps one line for the same successful changes run after run (the same fee
 or max_htlc change on the same channels: "35 times in a row, since 19h ago"); a failed write,
-a fee set by hand, a refill, an open, a Magma action and a stage error always get a line of
-their own. A sold channel's fee promise that LND keeps refusing to restore is an alert until
-a write takes or the fee is back within the promise, and the fee area's status says the cap
-could not be restored.
+a fee set by hand, a refill, an open, a Magma action, a stage error and what a stage finished
+after it was given up always get a line of their own. A sold channel's fee promise that LND
+keeps refusing to restore is an alert until a write takes, the fee is back within the
+promise or the lease ends (its promise is no longer registered), and the fee area's status
+says the cap could not be restored.
 
 ---
 

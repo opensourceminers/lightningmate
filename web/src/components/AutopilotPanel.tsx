@@ -3,7 +3,7 @@ import { api } from "../api";
 import type { AreaStatus, AutopilotConfigPatch, AutopilotRun, AutopilotState, DecisionArea, MagmaV2Report, SellDiagnostics } from "../types";
 import { satsCompact, timeAgo } from "../format";
 import { rangeText } from "../numField";
-import { repeatsNote, runProgress } from "../statusNotes";
+import { lateStageNote, repeatsNote, runProgress } from "../statusNotes";
 import { buildPresets, matchesPreset as presetMatches, type Preset } from "../presets";
 import { NEUTRAL_PPM_HINT, historyFeeLine } from "../feeView";
 import { OFFER_AUTOMATION_HINT, PRICING_MODES } from "../magmaView";
@@ -804,12 +804,14 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                 ];
                 // The same changes run after run: one line, counted.
                 const repeated = repeatsNote(run.repeats, run.firstAt ? timeAgo(run.firstAt) : null);
+                const late = lateStageNote(run.lateStage);
                 return (
                   <li key={`${run.at}-${i}`}>
                     <div className="ap-run-head">
                       <span>
                         {timeAgo(run.at)}
                         {repeated ? <span className="muted"> · {repeated}</span> : null}
+                        {late ? <span className="muted"> · {late}</span> : null}
                       </span>
                       <span className="muted">
                         {run.applied} applied

@@ -304,7 +304,15 @@ export interface AutopilotRun {
    *  (`at` the latest time, `firstAt` the first), not one line each. */
   repeats?: number;
   firstAt?: string;
+  /** What a stage did after it was given up for its deadline (e.g. "the
+   *  channels stage"): the call it waited on answered late, and what it had
+   *  under way then — an open, a refill, a fee write — went through. Never
+   *  merged with another line. */
+  lateStage?: string;
 }
+
+/** Where a stage's items go in a history line (lateStageDone). */
+type LateKey = "changes" | "rebalances" | "channels" | "sells" | "maxHtlc";
 
 /**
  * A history line with nothing but fee and max_htlc changes, exactly like the
@@ -319,6 +327,7 @@ export interface AutopilotRun {
  */
 export function withHistoryLine(history: AutopilotRun[], line: AutopilotRun, limit: number): AutopilotRun[] {
   const sig = (r: AutopilotRun): string | null =>
+    r.lateStage ||
     (r.rebalances?.length ?? 0) ||
     (r.channels?.length ?? 0) ||
     (r.sells?.length ?? 0) ||
@@ -691,6 +700,19 @@ export const MAGMA_HOLD_KEEP_MS = 24 * 3_600_000;
 
 /** The shared on-chain lock held this long raises an alert (onchainLockAlerts). */
 export const ONCHAIN_LOCK_ALERT_MS = 10 * 60_000;
+/** The refill lock held this long by work that can't still be paying raises
+ *  an alert (refillLockAlerts). */
+export const REFILL_LOCK_ALERT_MS = 10 * 60_000;
+/** The refill lock's holder in words while a rebalancing stage given up
+ *  for its deadline still waits on its payment (refillBusyWhy). */
+const GIVEN_UP_REFILL_WORDS = "a refill of the given-up rebalancing stage is still running — LND hasn't answered";
+/** Who holds the refill lock: the rebalancing stage (and whether it was
+ *  given up for its deadline since), or a manual refill — since when. */
+interface RefillHolder {
+  by: "stage" | "manual";
+  since: number;
+  givenUp: () => boolean;
+}
 
 /** A saved write-ahead record, made safe (read where it is used: a damaged
  *  value is no open in flight). */
@@ -986,11 +1008,13 @@ export class WorkDeadlineError extends Error {}
 /** `work` in a scope of its own, within `ms`: past it the scope is given up
  *  and the promise rejects (WorkDeadlineError) — the caller frees whatever it
  *  holds; the work goes on without being able to write. */
-export function withDeadline<T>(what: string, ms: number, work: () => Promise<T>): Promise<T> {
+export function withDeadline<T>(what: string, ms: number, work: () => Promise<T>, onLate?: (value: T, lateMs: number) => void): Promise<T> {
   const scope: WorkScope = { what, abandoned: false, parent: workScope.getStore() ?? null };
+  let gaveUpAt = 0;
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
       scope.abandoned = true;
+      gaveUpAt = Date.now();
       reject(new WorkDeadlineError(`${what} did not finish in ${deadlineWords(ms)} — LND or Amboss didn't answer; it was given up`));
     }, ms);
     timer.unref?.();
@@ -998,6 +1022,19 @@ export function withDeadline<T>(what: string, ms: number, work: () => Promise<T>
       (v) => {
         clearTimeout(timer);
         resolve(v);
+        // Finished after it was given up: what it did then is the caller's
+        // to put on record (onLate) — after the give-up was recorded (a
+        // macrotask later than the rejection's handlers).
+        if (scope.abandoned && onLate) {
+          const lateMs = Date.now() - gaveUpAt;
+          setImmediate(() => {
+            try {
+              onLate(v, lateMs);
+            } catch (err) {
+              console.warn(`[autopilot] recording ${what}'s late result: ${errText(err)}`);
+            }
+          });
+        }
       },
       (e: unknown) => {
         clearTimeout(timer);
@@ -1005,6 +1042,16 @@ export function withDeadline<T>(what: string, ms: number, work: () => Promise<T>
       },
     );
   });
+}
+
+/** Whether the work this code runs in NOW has been given up since — asked
+ *  later, from anywhere (the refill lock's holder, refillBusyWhy). */
+export function givenUpCheck(): () => boolean {
+  const scope = workScope.getStore();
+  return () => {
+    for (let s: WorkScope | null | undefined = scope; s; s = s.parent) if (s.abandoned) return true;
+    return false;
+  };
 }
 
 /** Why the work this code runs in may not write any more (null: it may). */
@@ -1422,7 +1469,7 @@ export class Autopilot {
    *  one. Its own lock, not the main run's: a manual refill (up to the
    *  150 s hard limit) no longer holds back fees, lease promises, channel
    *  opens or Magma upkeep, and the two can't both pass the budget check. */
-  private refilling = false;
+  private refilling: RefillHolder | null = null;
   /** Refill payments this process is waiting on right now (their
    *  pendingRebalances entries are write-ahead records, not yet the
    *  reconciliation's to book). */
@@ -1454,7 +1501,7 @@ export class Autopilot {
   /** Per sold channel: its broken lease promise LND refused to restore —
    *  since when, LND's reason (writeFees; cleared once a write takes or the
    *  breach is gone). In memory: the next check finds it again after a restart. */
-  private readonly leaseFixFailing = new Map<string, { since: string; error: string; alias: string; why: string }>();
+  private readonly leaseFixFailing = new Map<string, { since: string; error: string; alias: string; why: string; outpoint: string }>();
   /** When the current main run took its lock (null when idle) — exposed so a
    *  run that takes unusually long is visible, not just a stale lastRunAt. */
   private runningSince: string | null = null;
@@ -2456,7 +2503,13 @@ export class Autopilot {
         if (res.ok) this.leaseFixFailing.delete(res.id);
         else {
           const was = this.leaseFixFailing.get(res.id);
-          this.leaseFixFailing.set(res.id, { since: was?.since ?? nowIso, error: res.error ?? "failed", alias: w.alias ?? res.id, why: w.why ?? "" });
+          this.leaseFixFailing.set(res.id, {
+            since: was?.since ?? nowIso,
+            error: res.error ?? "failed",
+            alias: w.alias ?? res.id,
+            why: w.why ?? "",
+            outpoint: `${w.transactionId}:${w.transactionVout}`,
+          });
         }
       }
       if (res.ok) {
@@ -2572,7 +2625,14 @@ export class Autopilot {
    *  LND keeps refusing to lower: since when, and LND's reason (an alert;
    *  the fee area's status says so too). */
   leasePromiseFailures(): { channelId: string; alias: string; since: string; error: string; why: string }[] {
-    return [...this.leaseFixFailing.entries()].map(([channelId, f]) => ({ channelId, ...f }));
+    // Only channels a promise is still registered for: a lease that ended
+    // takes its failure with it — before, the last one ending left the alert
+    // and the fee status for good (the check returns without caps, review
+    // 2026-10-25, PROBE-LEASE-ALERT-STALE).
+    const caps = this.capital.leaseCaps();
+    return [...this.leaseFixFailing.entries()]
+      .filter(([, f]) => caps.some((c) => c.fundingOutpoint === f.outpoint))
+      .map(([channelId, f]) => ({ channelId, alias: f.alias, since: f.since, error: f.error, why: f.why }));
   }
 
   /**
@@ -2588,7 +2648,11 @@ export class Autopilot {
    */
   async keepLeasePromisesNow(): Promise<AutopilotChange[]> {
     if (this.shuttingDown || this.feeLock.busy || !this.writeLnd) return [];
-    if (this.capital.leaseCaps().length === 0) return [];
+    if (this.capital.leaseCaps().length === 0) {
+      // No promise left on this node: nothing can be breaking one.
+      this.leaseFixFailing.clear();
+      return [];
+    }
     const writeLnd = this.writeLnd;
     try {
       return await this.feeLock.run("lease-promise check", () =>
@@ -2729,6 +2793,63 @@ export class Autopilot {
     this.persist();
   }
 
+  /**
+   * What a main-run stage did after it was given up (withDeadline's onLate):
+   * the call it waited on answered late, and the open, refill or fee write it
+   * had under way went through — nothing after it (a given-up stage writes
+   * nothing more). A history line of its own says so, and the area's
+   * decision says what happened — over the deadline's own (when something
+   * went through: with nothing done, "did not finish" stays true) or a later
+   * run's waiting for this very work (a refill of the given-up stage "still
+   * running", no longer true either way); never over anything a later run
+   * decided otherwise (review 2026-10-25: an open made late was in no
+   * history line, a late refill and fee write neither, and the area kept
+   * saying "did not finish").
+   */
+  private lateStageDone(name: string, area: DecisionArea, key: LateKey | undefined, items: unknown[], mark: { decisionAt?: string }, lateMs: number): void {
+    type Done = { ok: boolean; inFlight?: boolean; repeat?: boolean; action?: string };
+    const done = (key ? (items as Done[]) : []).filter((x) => !x.repeat && x.action !== "skip");
+    const applied = done.filter((x) => x.ok).length;
+    const failed = done.filter((x) => !x.ok && !x.inFlight).length;
+    const inFlight = done.filter((x) => !x.ok && x.inFlight).length;
+    if (key && done.length > 0) {
+      const line: AutopilotRun = {
+        at: new Date().toISOString(),
+        attempted: done.length,
+        applied,
+        failed,
+        changes: key === "changes" ? (done as unknown as AutopilotChange[]) : [],
+        rebalances: key === "rebalances" ? (done as unknown as AutopilotRebalance[]) : [],
+        channels: key === "channels" ? (done as unknown as AutopilotChannelOpen[]) : [],
+        sells: key === "sells" ? (done as unknown as AutopilotSell[]) : [],
+        ...(key === "maxHtlc" ? { maxHtlc: done as unknown as MaxHtlcChange[] } : {}),
+        lateStage: `the ${name} stage`,
+      };
+      this.state.history = withHistoryLine(this.state.history, line, HISTORY_LIMIT);
+    }
+    const cur = this.state.decisions?.[area];
+    const waitingOnIt = key === "rebalances" && !!cur?.text.startsWith(GIVEN_UP_REFILL_WORDS);
+    const givenUpNote = !!cur && mark.decisionAt !== undefined && cur.at === mark.decisionAt;
+    if (waitingOnIt || (givenUpNote && done.length > 0)) {
+      const what: Record<LateKey, [string, string]> = {
+        changes: ["fee change", "fee changes"],
+        rebalances: ["refill", "refills"],
+        channels: ["channel open", "channel opens"],
+        sells: ["Magma action", "Magma actions"],
+        maxHtlc: ["max_htlc update", "max_htlc updates"],
+      };
+      const n = (count: number) => (key ? `${count} ${what[key][count === 1 ? 0 : 1]}` : `${count}`);
+      const parts = [applied ? `${n(applied)} went through` : "", failed ? `${n(failed)} failed` : "", inFlight ? `${n(inFlight)} still in flight` : ""];
+      const after = `the ${name} stage finished ${deadlineWords(lateMs)} after it was given up`;
+      this.decisionNote(
+        area,
+        done.length > 0 ? `${after}: ${parts.filter(Boolean).join(", ")} — see the run history` : `${after} — nothing more was changed`,
+        applied ? "acted" : failed ? "error" : inFlight ? "waiting" : "idle",
+      );
+    }
+    this.persist();
+  }
+
   /** Within the configured rebalance hour window (UTC — the budget's day is
    *  UTC too; the container's clock is UTC unless TZ is set)? */
   private inRebalanceWindow(): boolean {
@@ -2768,14 +2889,16 @@ export class Autopilot {
       return [];
     }
     if (this.refilling) {
-      this.decisionNote("rebalance", "a manual refill is under way — the autopilot's refills wait for the next run", "waiting");
+      const why = this.refillBusyWhy() ?? "";
+      // (The given-up stage's words carry a dash of their own.)
+      this.decisionNote("rebalance", `${why}${why.includes(" — ") ? ";" : " —"} the autopilot's refills wait for the next run`, "waiting");
       return [];
     }
-    this.refilling = true;
+    this.refilling = { by: "stage", since: Date.now(), givenUp: givenUpCheck() };
     try {
       return await this.payRefills(writeLnd);
     } finally {
-      this.refilling = false;
+      this.refilling = null;
     }
   }
 
@@ -3301,7 +3424,7 @@ export class Autopilot {
     }
     const budget = this.rebalanceBudget();
     if (budget.leftSats !== null && budget.leftSats <= 0) throw new RebalanceBudgetError(budget);
-    this.refilling = true;
+    this.refilling = { by: "manual", since: Date.now(), givenUp: () => false };
     try {
       const maxFeeSats = Math.min(params.maxFeeSats ?? Infinity, budget.leftSats ?? Infinity);
       return await this.refillBooks({ targetId: params.targetId, via: "manual", holdPpm: params.gate?.revenuePpm ?? null }).settle((hooks) =>
@@ -3312,9 +3435,48 @@ export class Autopilot {
         ),
       );
     } finally {
-      this.refilling = false;
+      this.refilling = null;
       this.persist();
     }
+  }
+
+  /** Who holds the refill lock, in words (null: free) — the rebalancing
+   *  decision and a refused manual refill say it (review 2026-10-25: a given-
+   *  up rebalancing stage still holding it read "a manual refill is under
+   *  way"). */
+  refillBusyWhy(): string | null {
+    const h = this.refilling;
+    if (!h) return null;
+    if (h.by === "manual") return "a manual refill is under way";
+    return h.givenUp() ? GIVEN_UP_REFILL_WORDS : "the autopilot's rebalancing stage is paying a refill";
+  }
+
+  /** The 409 a refused manual refill answers with: who holds the lock. */
+  refillBusyMessage(): string {
+    const h = this.refilling;
+    if (h?.by === "stage" && h.givenUp()) {
+      return "A refill of the given-up rebalancing stage is still running — LND hasn't answered its payment yet. Try again once it does (restarting Lightning Mate frees the lock; a payment still in flight is then followed up from LND).";
+    }
+    return `A refill is already under way (${h?.by === "manual" ? "another manual one" : "the autopilot's"}) — try again in a few minutes.`;
+  }
+
+  /** An alert while the refill lock is held REFILL_LOCK_ALERT_MS or longer by
+   *  work that can't still be legitimately paying: a manual refill (150 s at
+   *  most) or a rebalancing stage given up for its deadline. A stage within
+   *  its deadline may pay several refills in a row — no alarm for that. */
+  refillLockAlerts(nowMs = Date.now()): { level: "warn"; message: string }[] {
+    const h = this.refilling;
+    if (!h || nowMs - h.since < REFILL_LOCK_ALERT_MS) return [];
+    if (h.by === "stage" && !h.givenUp()) return [];
+    const minutes = Math.floor((nowMs - h.since) / 60_000);
+    return [
+      {
+        level: "warn",
+        message:
+          `The refill lock has been held for ${minutes} minutes by ${h.by === "manual" ? "a manual refill" : "the given-up rebalancing stage"} — LND hasn't answered its payment, and the autopilot's and manual refills wait behind it. ` +
+          "If LND doesn't answer, restarting Lightning Mate frees it (a payment still in flight is then followed up from LND and booked once).",
+      },
+    ];
   }
 
   /** Rebalance payments that may still land (pendingRebalances), as the
@@ -6422,11 +6584,16 @@ export class Autopilot {
       area: DecisionArea,
       on: boolean,
       run: () => Promise<T[]>,
-      opts: { deadlineMs?: number; feeLock?: boolean } = {},
+      opts: { deadlineMs?: number; feeLock?: boolean; history?: LateKey } = {},
     ): Promise<T[]> => {
       if (!on || this.shuttingDown) return [];
+      // The give-up's decision, for a late finish to replace (lateStageDone).
+      const mark: { decisionAt?: string } = {};
       try {
-        const timed = () => withDeadline(`the ${name} stage`, opts.deadlineMs ?? WORK_DEADLINES_MS.stage, run);
+        const timed = () =>
+          withDeadline(`the ${name} stage`, opts.deadlineMs ?? WORK_DEADLINES_MS.stage, run, (late, lateMs) =>
+            this.lateStageDone(name, area, opts.history, late, mark, lateMs),
+          );
         const res = await (opts.feeLock ? this.feeLock.run(`the ${name} stage`, timed) : timed());
         this.stageLast.delete(name);
         return res;
@@ -6435,6 +6602,7 @@ export class Autopilot {
         logLine("error", `[autopilot] ${name} stage failed: ${error}`);
         // (A deadline's own words say which stage, and that it was given up.)
         this.decisionNote(area, err instanceof WorkDeadlineError ? error : `the ${name} stage failed: ${error}`, "error");
+        if (err instanceof WorkDeadlineError) mark.decisionAt = this.state.decisions?.[area]?.at;
         const sig = error.replace(/\d[\d,.]*/g, "#");
         if (this.stageLast.get(name) !== sig) news.add(name);
         this.stageLast.set(name, sig);
@@ -6463,7 +6631,7 @@ export class Autopilot {
       // lease-promise check under way is waited for — FIFO). So does the
       // max_htlc stage, below.
       const changes = [
-        ...(await stage("fees", "fees", this.state.config.enabled, () => this.runFees(writeLnd), { feeLock: true })),
+        ...(await stage("fees", "fees", this.state.config.enabled, () => this.runFees(writeLnd), { feeLock: true, history: "changes" })),
         // D7 with fee automation off: the routing-fee promises of sold
         // channels are still kept — LND's default fee or a change made with
         // another tool can sit above a cap. Only a breach is touched, and only
@@ -6473,16 +6641,17 @@ export class Autopilot {
           "fees",
           !this.state.config.enabled && this.capital.leaseCaps().length > 0,
           () => this.keepLeasePromises(writeLnd),
-          { feeLock: true },
+          { feeLock: true, history: "changes" },
         )),
       ];
       // Its payments take a while each (REBALANCE_HARD_TIMEOUT_MS at most):
       // their time on top of the stage's.
       const rebalances = await stage("rebalancing", "rebalance", this.state.config.rebalanceEnabled, () => this.runRebalances(writeLnd), {
         deadlineMs: WORK_DEADLINES_MS.stage + Math.max(1, this.state.config.maxRebalancesPerRun) * WORK_DEADLINES_MS.perRefill,
+        history: "rebalances",
       });
-      const channels = await stage("channels", "channels", this.state.config.channelEnabled, () => this.runChannels(writeLnd));
-      const sells = await stage("magma", "magma", true, () => this.runSell());
+      const channels = await stage("channels", "channels", this.state.config.channelEnabled, () => this.runChannels(writeLnd), { history: "channels" });
+      const sells = await stage("magma", "magma", true, () => this.runSell(), { history: "sells" });
       // Advertised-size upkeep: only gossips when a channel's bucket moved.
       // (Its failure used to be swallowed — `.catch(() => [])` — so LND not
       // answering it left no trace; now it is the area's error.) Under the
@@ -6504,7 +6673,7 @@ export class Autopilot {
           this.explain("maxHtlc", () => maxHtlcDecision(moved, halted.why));
           return moved;
         },
-        { feeLock: true },
+        { feeLock: true, history: "maxHtlc" },
       );
       // "skip" entries are non-actions (cap/reserve) — don't count them as
       // attempts.

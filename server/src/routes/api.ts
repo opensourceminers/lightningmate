@@ -638,6 +638,7 @@ export function createApiRouter(
           ...offerPriceAlerts(autopilot.offerSyncStatus(), autopilot.actsOnOffers(), autopilot.getState().config.sellAutoReprice),
           ...autopilot.onchainLockAlerts(),
           ...leasePromiseAlerts(autopilot.leasePromiseFailures()),
+          ...autopilot.refillLockAlerts(),
         ]),
       );
     }),
@@ -1037,10 +1038,7 @@ export function createApiRouter(
       if (!done) {
         // (The refill lock: the autopilot's refills or another manual one
         // are paying — never two side by side, or both could pass the budget.)
-        res.status(409).json({
-          error: "busy",
-          message: "A refill is already under way (the autopilot's or another manual one) — try again in a few minutes.",
-        });
+        res.status(409).json({ error: "busy", message: autopilot.refillBusyMessage() });
         return;
       }
       res.json(done);

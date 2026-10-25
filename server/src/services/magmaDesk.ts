@@ -871,7 +871,7 @@ export class MagmaDesk {
         this.lane = {
           lastTickAt: now(),
           ok: false,
-          error: `the order lane's pass did not finish in ${deadlineWords(LANE_PASS_DEADLINE.ms)} — LND or Amboss didn't answer; it was given up, and the next pass starts afresh`,
+          error: `the order lane's pass did not finish in ${deadlineWords(LANE_PASS_DEADLINE.ms)} — LND or Amboss didn't answer, or a buyer couldn't be reached in time; it was given up, and the next pass starts afresh`,
           retrying: true,
           idle: null,
         };

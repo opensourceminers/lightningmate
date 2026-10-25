@@ -834,6 +834,11 @@ test("switching the channel autopilot or auto-rebalance on asks first, saying wh
   const open = switchOnConfirm("channelEnabled", c);
   assert.equal(open?.title, "Turn on the channel autopilot?");
   assert.match(open?.message ?? "", /opens channels with your on-chain funds, on its own: .*sized automatically, keeping 500,000 sat on chain, at most 8 sat\/vB/);
+  // Final review 2026-10-25: the payback check needs routing history, and
+  // routing opens leave Magma what it can list — the confirmation says both.
+  assert.match(open?.message ?? "", /With enough routing history an open must also pay back what opening and closing cost; without it, only that fee rate cap applies\./);
+  assert.match(open?.message ?? "", /While Liquidity provision is on, routing opens leave the coins your offers can list to Magma when leasing them is expected to earn more — how much is decided each run\./);
+  assert.doesNotMatch(open?.message ?? "", /only when an open pays back/);
   const refill = switchOnConfirm("rebalanceEnabled", c);
   assert.equal(refill?.title, "Turn on auto-rebalance?");
   assert.match(refill?.message ?? "", /at most 2,000 sat a day in fees \(manual runs included\) and at most 3 per run\.$/);
@@ -853,6 +858,6 @@ test("a rebalance window with no hour in it (24 → 0) is refused at the field b
   assert.equal(never.errors.length, 1);
   assert.deepEqual(checkDraft(draft({ nums: { rebalanceHourStart: "5", rebalanceHourEnd: "5" } }), config(), b, labels).errors, []);
   assert.match(REBALANCE_WINDOW_HINT, /Equal hours \(0 and 24, or 5 and 5\) mean any time/);
-  assert.match(PER_RUN_HINTS.maxChangesPerRun, /^0 = the autopilot writes no fee change at all/);
+  assert.match(PER_RUN_HINTS.maxChangesPerRun, /^0 = the autopilot writes no fee change \(it still shows what it would change\) — except the 10-minute check that lowers a sold channel's fee to what its buyer was promised\./);
   assert.match(PER_RUN_HINTS.maxRebalancesPerRun, /^0 = no refill runs automatically/);
 });

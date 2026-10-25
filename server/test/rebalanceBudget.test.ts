@@ -216,7 +216,7 @@ test("a manual refill never pays beside the autopilot's rebalance stage — nor 
   const refused = await api.request("POST", "/rebalance/execute", manual);
   assert.equal(refused.status, 409);
   assert.equal(refused.body.error, "busy");
-  assert.match(refused.body.message, /^A refill is already under way \(the autopilot's or another manual one\) — try again in a few minutes\./);
+  assert.match(refused.body.message, /^A refill is already under way \(the autopilot's\) — try again in a few minutes\./);
   assert.deepEqual(paying, ["800005x1x0"]);
   hold.release();
   await run;
