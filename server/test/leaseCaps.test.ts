@@ -25,7 +25,7 @@ import { feeNode, forwardsOut } from "./helpers/feeNode.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
 import { AMBOSS_API } from "./helpers/amboss.js";
-import { suppressSchedulerKicks, BUYER, sellerSetup } from "./helpers/autopilot.js";
+import { suppressSchedulerKicks, BUYER, sellerSetup, type AutopilotSeams } from "./helpers/autopilot.js";
 import { makeTempDir } from "./helpers/tmp.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
 import { quiet } from "./helpers/lifecycle.js";
@@ -559,17 +559,24 @@ test("…and an LSPS1 sale's channel the same way (the shared capital ledger)", 
   assert.deepEqual(node.policyWrites, [{ outpoint: `${TX(3)}:0`, feeRatePpm: 1500, baseFeeMsat: 0 }]);
 });
 
-test("the lease keeper never runs into the main run: while it holds its lock the check is skipped", async (t) => {
+test("the lease keeper never writes beside another fee write: while the fee lock is held the check is skipped — a run's other stages don't hold it up", async (t) => {
   const { node } = engineSetup();
   const dir = makeTempDir(t);
   writeFileSync(join(dir, "magma-orders.json"), JSON.stringify([journalSale("magma-3", TX(3))]));
   const autopilot = new Autopilot(dir, node.lnd, node.lnd, new RebalanceLog(dir), new OverridesStore(dir), new AmbossStore(dir), new EarningsLog(dir), new ServiceFeeLedger(dir, null));
   suppressSchedulerKicks(autopilot);
   t.after(() => autopilot.shutdown());
-  (autopilot as unknown as { running: boolean }).running = true;
+  // The main run's fee stage (or an apply) holds the fee lock.
+  const { feeLock } = autopilot as unknown as { feeLock: { run<T>(label: string, fn: () => Promise<T>): Promise<T> } };
+  let release!: () => void;
+  const held = feeLock.run("fee stage", () => new Promise<void>((r) => (release = r)));
   assert.deepEqual(await autopilot.keepLeasePromisesNow(), []);
   assert.equal(node.policyWrites.length, 0);
-  (autopilot as unknown as { running: boolean }).running = false;
+  release();
+  await held;
+  // A main run in a stage that writes no fees (a refill, an open): before,
+  // it skipped the check too — every 10 minutes while a refill paid.
+  (autopilot as unknown as { running: boolean }).running = true;
   assert.equal((await autopilot.keepLeasePromisesNow()).length, 1);
 });
 
@@ -623,17 +630,20 @@ function keeperSetup(
   return autopilot;
 }
 
-test("a main run started while the lease keeper writes is skipped — the keeper holds the lock until its write is booked", async (t) => {
+test("a main run started while the lease keeper writes goes ahead — its fee stage waits until the keeper's write is booked, never writing beside it", async (t) => {
   const { node } = engineSetup();
   const autopilot = keeperSetup(t, node, { enabled: true });
-  // The keeper takes the lock at once, then reads LND and writes.
+  // The keeper takes the fee lock at once, then reads LND and writes.
   const keeping = autopilot.keepLeasePromisesNow();
   const run = await autopilot.runOnce();
-  assert.equal(run.attempted, 0, "skipped: before, both wrote fees at the same time");
+  // Before, the run was skipped without a trace (both shared its lock).
+  assert.ok(run.attempted > 0, JSON.stringify(run));
+  assert.ok(autopilot.getState().lastRunAt);
   assert.equal((await keeping).length, 1);
-  assert.deepEqual(node.policyWrites, [{ outpoint: `${TX(3)}:0`, feeRatePpm: 2200, baseFeeMsat: 1000 }]);
-  // Done: the next run goes ahead.
-  assert.ok((await autopilot.runOnce()).attempted > 0);
+  // The keeper's write first; the fee stage read and wrote only after it.
+  assert.deepEqual(node.policyWrites[0], { outpoint: `${TX(3)}:0`, feeRatePpm: 2200, baseFeeMsat: 1000 });
+  assert.equal(node.policyWrites.length, 1 + run.changes.length);
+  for (const c of run.changes.filter((x) => x.id === "859000x3x0")) assert.equal(c.fromPpm, 2200, "read after the keeper's write");
 });
 
 test("a broken promise LND refuses to fix is tried again at every check — no back-off holds it — but is on record once", async (t) => {
@@ -832,4 +842,64 @@ test("past the journal's end of a Magma lease that Amboss still lists as running
     ["old-sale", "", "850000x9x0", true],
   );
   assert.equal(listed.capital.leaseCaps().length, 1, "no promise is made up for it: its terms are unknown");
+});
+
+// Review 2026-10-25 (PROBE-LEASE-FAIL): a promise LND kept refusing to restore
+// was one line of the run history — and the fee status read "the promised fee
+// cap is still kept".
+test("a sold channel's fee promise LND keeps refusing to restore is an alert, and the fee status says the cap is not kept — both clear once it is kept again, or the breach is gone", async (t) => {
+  quiet(t);
+  const api = await startApi(t, { node: new FakeLnd({ chainBalance: 1_000_000 }) });
+  const { autopilot } = api;
+  autopilot.capital.register("test", {
+    reservations: () => [],
+    deployedSat: () => 0,
+    claimedOutpoints: () => [],
+    leaseCaps: () => [{ fundingOutpoint: `${"ee".repeat(32)}:0`, source: "magma", orderId: "o1", feeRateCapPpm: 2200, baseFeeCapMsat: 1000, leaseBlocks: 4320 }],
+  });
+  const breach = {
+    id: "800000x1x0",
+    transactionId: "ee".repeat(32),
+    transactionVout: 0,
+    feeRatePpm: 2200,
+    baseFeeMsat: 1000,
+    alias: "buyer",
+    fromPpm: 5000,
+    fromBaseMsat: 1000,
+    why: "lease promise: at most 2,200 ppm + 1 sat base — its fee (5000 ppm, 1000 msat base) was above that",
+    leaseBreach: true,
+  };
+  let breaches: unknown[] = [breach];
+  (autopilot as unknown as { leaseBreaches: () => Promise<unknown[]> }).leaseBreaches = async () => breaches;
+  let refuse = true;
+  (autopilot as unknown as AutopilotSeams).feeApply = async (_w, items) =>
+    items.map((i) =>
+      refuse
+        ? { id: i.id, ok: false, feeRatePpm: i.feeRatePpm, error: "UpdateRoutingFeesFailed: refused" }
+        : { id: i.id, ok: true, feeRatePpm: i.feeRatePpm, baseFeeMsat: i.baseFeeMsat },
+    );
+  const alerts = async () => ((await api.request("GET", "/alerts")).body as { message: string }[]).filter((a) => /a channel you sold/.test(a.message));
+  const fees = () => autopilot.getState().status.fees;
+  for (let i = 0; i < 3; i++) await autopilot.keepLeasePromisesNow(); // half an hour of checks
+  const shown = await alerts();
+  assert.equal(shown.length, 1, JSON.stringify(shown));
+  assert.match(
+    shown[0].message,
+    /^The fee of buyer \(800000x1x0\), a channel you sold, is above what its buyer was promised \(at most 2,200 ppm \+ 1 sat base\), and LND has refused to lower it since \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC: UpdateRoutingFeesFailed: refused\. LightningMate tries again every 10 minutes/,
+  );
+  assert.equal(fees().state, "off");
+  assert.match(fees().text, /promised fee cap could not be restored — LND refuses \(UpdateRoutingFeesFailed: refused\)/);
+  assert.doesNotMatch(fees().text, /is still kept/);
+  // Kept again: the alert goes, the status says so.
+  refuse = false;
+  await autopilot.keepLeasePromisesNow();
+  assert.deepEqual(await alerts(), []);
+  assert.match(fees().text, /is still kept/);
+  // Refused again, then lowered by hand (no breach any more): gone as well.
+  refuse = true;
+  await autopilot.keepLeasePromisesNow();
+  assert.equal((await alerts()).length, 1);
+  breaches = [];
+  await autopilot.keepLeasePromisesNow();
+  assert.deepEqual(await alerts(), []);
 });

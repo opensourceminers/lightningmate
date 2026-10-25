@@ -7,6 +7,7 @@ import {
   laneBanner,
   promisedSpend,
   removeKeyMessage,
+  repeatsNote,
   runProgress,
   spendPromisedQuestion,
 } from "../src/statusNotes";
@@ -70,6 +71,18 @@ test("a run in progress is shown, and called stuck once it runs far longer than 
   assert.equal(stuck?.stuck, true);
   assert.match(stuck?.text ?? "", /35 min — far longer than usual/);
   assert.match(stuck?.text ?? "", /Magma orders are handled separately/);
+  // Everything that waits is named (it named fees, rebalancing and opens only).
+  assert.match(
+    stuck?.text ?? "",
+    /the next runs, the Magma offer upkeep and its 2-minute price check, and the bookkeeping of refills in flight wait; manual fee writes and the lease-promise check wait while its fee or max_htlc stage runs\. A stage that doesn't answer is given up after 15 min/,
+  );
+});
+
+test("a history line that happened several times in a row says how often, and since when", () => {
+  assert.equal(repeatsNote(undefined, null), null);
+  assert.equal(repeatsNote(1, "2h ago"), null, "once is no repeat");
+  assert.equal(repeatsNote(35, "19h ago"), "35 times in a row, since 19h ago");
+  assert.equal(repeatsNote(2, null), "2 times in a row");
 });
 
 test("removing the Amboss key says what happens to Magma orders in flight", () => {

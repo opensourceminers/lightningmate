@@ -645,3 +645,26 @@ test("upgrade migrations still behave: 0.7.5, 0.7.6 and a deliberate choice", (t
   );
 });
 
+// Review 2026-10-25 (PROBE-WINDOW): the API took 24→0 — a window with no
+// hour in it — and a restart kept it: rebalancing on, never running.
+test("a rebalance window 24→0 never opens: the API refuses it, and a stored one becomes any time, rebalancing switched off saying why — equal hours mean any time", () => {
+  const both = validateAutopilotPatch({ rebalanceEnabled: true, rebalanceHourStart: 24, rebalanceHourEnd: 0 }, DEFAULT_CONFIG);
+  assert.equal(both.ok, false);
+  assert.match(both.ok ? "" : both.errors.join("; "), /the window 24→0 never opens \(hour 24 is the next day's 0\) — use equal hours for any time/);
+  const oneEnd = validateAutopilotPatch({ rebalanceHourEnd: 0 }, { ...DEFAULT_CONFIG, rebalanceHourStart: 24 });
+  assert.equal(oneEnd.ok, false, "one end patched into it");
+  assert.ok(validateAutopilotPatch({ rebalanceHourStart: 5, rebalanceHourEnd: 5 }, DEFAULT_CONFIG).ok);
+  assert.ok(Array.from({ length: 24 }, (_, h) => h).every((h) => rebalanceWindowOpen(5, 5, h)), "equal hours: any time");
+  assert.ok(validateAutopilotPatch({ rebalanceHourStart: 24, rebalanceHourEnd: 3 }, DEFAULT_CONFIG).ok, "24→3 is 0–3");
+
+  const on = sanitizePersistedConfig({ ...DEFAULT_CONFIG, rebalanceEnabled: true, rebalanceHourStart: 24, rebalanceHourEnd: 0 });
+  assert.deepEqual([on.config.rebalanceHourStart, on.config.rebalanceHourEnd, on.config.rebalanceEnabled], [0, 24, false]);
+  assert.ok(on.repairs.some((r) => /hour window 24→0 never opened — it is now 0→24 \(any time\)/.test(r)), JSON.stringify(on.repairs));
+  assert.ok(on.repairs.some((r) => /^rebalanceEnabled: switched off — the stored hour window 24→0 never opened/.test(r)));
+  const off = sanitizePersistedConfig({ ...DEFAULT_CONFIG, rebalanceHourStart: 24, rebalanceHourEnd: 0 });
+  assert.deepEqual([off.config.rebalanceHourStart, off.config.rebalanceHourEnd, off.config.rebalanceEnabled], [0, 24, false]);
+  assert.equal(off.repairs.filter((r) => /rebalanceEnabled/.test(r)).length, 0, "nothing to switch off");
+  // A window that opens is left as it is.
+  assert.deepEqual(sanitizePersistedConfig({ ...DEFAULT_CONFIG, rebalanceHourStart: 22, rebalanceHourEnd: 6 }).repairs, []);
+});
+

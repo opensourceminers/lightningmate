@@ -3,7 +3,7 @@ import { api } from "../api";
 import type { AreaStatus, AutopilotConfigPatch, AutopilotRun, AutopilotState, DecisionArea, MagmaV2Report, SellDiagnostics } from "../types";
 import { satsCompact, timeAgo } from "../format";
 import { rangeText } from "../numField";
-import { runProgress } from "../statusNotes";
+import { repeatsNote, runProgress } from "../statusNotes";
 import { buildPresets, matchesPreset as presetMatches, type Preset } from "../presets";
 import { NEUTRAL_PPM_HINT, historyFeeLine } from "../feeView";
 import { OFFER_AUTOMATION_HINT, PRICING_MODES } from "../magmaView";
@@ -19,7 +19,21 @@ import {
   resumeLines,
   runResultLine,
 } from "../autopilotView";
-import { EMPTY_DRAFT, boundsFor, checkDraft, draftIsEmpty, draftStore, savedNum, type Draft, type FlagKey, type NumKey, type NumPath } from "../autopilotForm";
+import {
+  EMPTY_DRAFT,
+  PER_RUN_HINTS,
+  REBALANCE_WINDOW_HINT,
+  boundsFor,
+  checkDraft,
+  draftIsEmpty,
+  draftStore,
+  savedNum,
+  switchOnConfirm,
+  type Draft,
+  type FlagKey,
+  type NumKey,
+  type NumPath,
+} from "../autopilotForm";
 import { forgetMagmaReport, sharedMagmaReport } from "../magmaReport";
 import { useVisibleInterval } from "../usePolledData";
 import { ApiError } from "../apiError";
@@ -46,7 +60,7 @@ export const MIN_CHANGE_HINT =
 const FEE_NUM_FIELDS: { key: NumKey; label: string; hint?: string }[] = [
   { key: "intervalMinutes", label: "Run every (min)" },
   { key: "cooldownMinutes", label: "Fee cooldown (min)", hint: FEE_COOLDOWN_HINT },
-  { key: "maxChangesPerRun", label: "Max fee changes / run" },
+  { key: "maxChangesPerRun", label: "Max fee changes / run", hint: PER_RUN_HINTS.maxChangesPerRun },
 ];
 const POLICY_FIELDS: { key: keyof AutopilotState["config"]["policy"]; label: string; hint?: string }[] = [
   { key: "minPpm", label: "Min ppm (full)" },
@@ -57,12 +71,12 @@ const POLICY_FIELDS: { key: keyof AutopilotState["config"]["policy"]; label: str
   { key: "step", label: "Round to" },
   { key: "minChangePpm", label: "Min change", hint: MIN_CHANGE_HINT },
 ];
-const REB_NUM_FIELDS: { key: NumKey; label: string }[] = [
-  { key: "maxRebalancesPerRun", label: "Max rebalances / run" },
+const REB_NUM_FIELDS: { key: NumKey; label: string; hint?: string }[] = [
+  { key: "maxRebalancesPerRun", label: "Max rebalances / run", hint: PER_RUN_HINTS.maxRebalancesPerRun },
   { key: "rebalanceDailyBudgetSats", label: "Daily fee budget (sat, manual runs included)" },
   { key: "rebalanceCooldownMinutes", label: "Rebalance cooldown (min)" },
-  { key: "rebalanceHourStart", label: "Run from hour (UTC, 0–24)" },
-  { key: "rebalanceHourEnd", label: "Run to hour (UTC, 0–24)" },
+  { key: "rebalanceHourStart", label: "Run from hour (UTC, 0–24)", hint: REBALANCE_WINDOW_HINT },
+  { key: "rebalanceHourEnd", label: "Run to hour (UTC, 0–24)", hint: REBALANCE_WINDOW_HINT },
 ];
 // Every rebalance setting shown binds the profit gate (rebalanceView.ts).
 const REB_POLICY_FIELDS = REBALANCE_POLICY_FIELDS;
@@ -337,12 +351,19 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   };
 
   type BoolKey = "enabled" | "rebalanceEnabled" | "channelEnabled" | "sellEnabled" | "maxHtlcEnabled";
+  /** A switch flipped: one that moves capital asks first when switched on
+   *  (switchOnConfirm); off never asks. */
+  const flip = async (field: BoolKey, v: boolean) => {
+    const ask = v ? switchOnConfirm(field, config) : null;
+    if (ask && !(await ui.confirm(ask))) return;
+    void save({ [field]: v });
+  };
   const toggleRow = (field: BoolKey, title: string, subtitle: string, onChange?: (v: boolean) => void) => (
     <div className="ap-master">
       <Switch
         checked={config[field]}
         disabled={busy || writeOff}
-        onChange={(v) => (onChange ? onChange(v) : void save({ [field]: v }))}
+        onChange={(v) => (onChange ? onChange(v) : void flip(field, v))}
         label={title}
       />
       <div className="ap-master-text">
@@ -781,10 +802,15 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                   // A stage that threw (the others still ran).
                   ...(run.errors ?? []).map((e) => ({ ok: false, label: `${e.stage} stage failed`, error: e.error })),
                 ];
+                // The same changes run after run: one line, counted.
+                const repeated = repeatsNote(run.repeats, run.firstAt ? timeAgo(run.firstAt) : null);
                 return (
                   <li key={`${run.at}-${i}`}>
                     <div className="ap-run-head">
-                      <span>{timeAgo(run.at)}</span>
+                      <span>
+                        {timeAgo(run.at)}
+                        {repeated ? <span className="muted"> · {repeated}</span> : null}
+                      </span>
                       <span className="muted">
                         {run.applied} applied
                         {run.failed ? <span className="ap-fail-count"> · {run.failed} failed</span> : null}

@@ -170,6 +170,8 @@ export const CONFIG_BOUNDS: Record<NumericTopKey, NumberBounds> = {
   // 0 = apply no fee changes. That is how the engine has always read 0, and a
   // blank field in the 0.7.7 UI saved exactly 0 — those installs must not
   // start changing fees on upgrade. (0 is the safe end here, never "unlimited".)
+  // The decisions say so: "Max … / run is 0", never "wait for the next run"
+  // (review 2026-10-25: that run never came) — and the UI hint does too.
   maxChangesPerRun: int(0, 50),
   maxRebalancesPerRun: int(0, 10),
   // > 0: the failure backoff multiplies this, so 0 would also disable backoff.
@@ -325,6 +327,13 @@ function crossFieldErrors(c: AutopilotConfig, patch: AutopilotConfigPatch): stri
   }
   if (patch.channelSizeSats !== undefined && c.channelSizeSats !== 0 && c.channelSizeSats < MIN_CHANNEL_SATS) {
     errors.push(`channelSizeSats must be 0 (auto) or at least ${MIN_CHANNEL_SATS} sat (got ${c.channelSizeSats})`);
+  }
+  // A window not one hour is in (24→0: hour 24 is the next day's 0) would
+  // keep rebalancing on but never running (review 2026-10-25, PROBE-WINDOW).
+  if ((patch.rebalanceHourStart !== undefined || patch.rebalanceHourEnd !== undefined) && openHours(c.rebalanceHourStart, c.rebalanceHourEnd) === 0) {
+    errors.push(
+      `rebalanceHourStart/rebalanceHourEnd: the window ${c.rebalanceHourStart}→${c.rebalanceHourEnd} never opens (hour 24 is the next day's 0) — use equal hours for any time`,
+    );
   }
   return errors;
 }
@@ -610,9 +619,31 @@ export function sanitizePersistedConfig(raw: unknown): { config: AutopilotConfig
   section<RebalancePolicy>("rebalancePolicy", src.rebalancePolicy, REBALANCE_POLICY_BOUNDS, config.rebalancePolicy);
 
   repairs.push(...keepIdleAutomationIdle(src, config));
+  repairs.push(...repairNeverOpenWindow(config));
   // Spanning rules that can't be satisfied field by field.
   repairs.push(...repairCrossFields(config));
   return { config, repairs };
+}
+
+/**
+ * A rebalance window that never opens as it is stored — 24→0: hour 24 is the
+ * next day's hour 0 and a start after the end wraps, so not one hour is in
+ * it — becomes "any time" (0→24). Rebalancing, if on, is switched off: it
+ * never ran in that window, and "any time" would start it (review
+ * 2026-10-25, PROBE-WINDOW: the API took 24→0 and a restart kept it). The API
+ * refuses such a window now (crossFieldErrors).
+ */
+function repairNeverOpenWindow(config: AutopilotConfig): string[] {
+  if (openHours(config.rebalanceHourStart, config.rebalanceHourEnd) > 0) return [];
+  const was = `${config.rebalanceHourStart}→${config.rebalanceHourEnd}`;
+  config.rebalanceHourStart = 0;
+  config.rebalanceHourEnd = 24;
+  const repairs = [`rebalanceHourStart/rebalanceHourEnd: the hour window ${was} never opened — it is now 0→24 (any time)`];
+  if (config.rebalanceEnabled) {
+    config.rebalanceEnabled = false;
+    repairs.push(`rebalanceEnabled: switched off — the stored hour window ${was} never opened; review the rebalance hours and switch it back on`);
+  }
+  return repairs;
 }
 
 /**

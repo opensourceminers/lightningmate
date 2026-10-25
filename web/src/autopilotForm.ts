@@ -4,8 +4,10 @@ import type { AutopilotBounds, AutopilotConfig, AutopilotConfigPatch, FeePolicy,
 /**
  * The Autopilot settings form (review a6-ux:autopilot-form-traps): ONE save
  * model. The five automation switches (and the presets, and pause) act at
- * once — they are actions, each with its own confirmation where capital
- * moves. Every setting below them — numbers, check boxes, the pricing level
+ * once — they are actions, and each that moves capital asks first when
+ * switched on: the channel autopilot and auto-rebalance (switchOnConfirm),
+ * Liquidity provision (its own dialog), the presets and Resume. Every
+ * setting below them — numbers, check boxes, the pricing level
  * — is a draft until "Save changes": a sticky bar on every sub-tab says what
  * is unsaved, Save and Discard act on all of it, and a draft survives leaving
  * the tab (the panel unmounts: it was lost without a word) and warns before
@@ -157,8 +159,76 @@ export function checkDraft(draft: Draft, config: AutopilotConfig, bounds: Autopi
     fieldErrors.channelSizeSats ??= e;
     errors.push(e);
   }
+  // A window not one hour is in (24→0), as the server refuses it.
+  if (patch.rebalanceHourStart !== undefined || patch.rebalanceHourEnd !== undefined) {
+    const start = patch.rebalanceHourStart ?? config.rebalanceHourStart;
+    const end = patch.rebalanceHourEnd ?? config.rebalanceHourEnd;
+    if (!windowEverOpen(start, end)) {
+      const e = `${label("rebalanceHourStart")} ${start} → ${label("rebalanceHourEnd")} ${end} never opens (hour 24 is the next day's 0) — use equal hours for any time`;
+      fieldErrors[patch.rebalanceHourStart !== undefined ? "rebalanceHourStart" : "rebalanceHourEnd"] ??= e;
+      errors.push(e);
+    }
+  }
   return { patch, fieldErrors, errors, changes };
 }
+
+/** Whether a rebalance window has any hour in it — the server's rule
+ *  (rebalanceWindowOpen): equal ends mean any time, a start after the end
+ *  wraps past midnight (22 → 6); 24 → 0 has no hour. */
+export function windowEverOpen(start: number, end: number): boolean {
+  if (start === end) return true;
+  return Array.from({ length: 24 }, (_, h) => h).some((h) => (start < end ? h >= start && h < end : h >= start || h < end));
+}
+
+/**
+ * The confirmation before an automation that moves capital is switched ON by
+ * its own switch — as the presets and Resume ask before the same effect
+ * (review 2026-10-25: the channel autopilot and auto-rebalance saved at once,
+ * while this file said each asks first). Null: no confirmation (fee
+ * automation and max_htlc move no funds; Liquidity provision has its own
+ * dialog, SellingSwitch.tsx; switching anything off never asks).
+ */
+export function switchOnConfirm(
+  field: "enabled" | "rebalanceEnabled" | "channelEnabled" | "sellEnabled" | "maxHtlcEnabled",
+  config: Pick<AutopilotConfig, "rebalanceDailyBudgetSats" | "maxRebalancesPerRun" | "channelReserveSats" | "channelMaxFeeRate" | "channelSizeSats">,
+): { title: string; message: string; confirmLabel: string } | null {
+  const sats = (n: number) => `${n.toLocaleString("en-US")} sat`;
+  if (field === "channelEnabled") {
+    return {
+      title: "Turn on the channel autopilot?",
+      message:
+        "It opens channels with your on-chain funds, on its own: to the best suggestion it can actually open, " +
+        `${config.channelSizeSats ? `${sats(config.channelSizeSats)} each` : "sized automatically"}, keeping ${sats(config.channelReserveSats)} on chain, ` +
+        `at most ${config.channelMaxFeeRate} sat/vB, and only when an open pays back. A channel ties its funds up until it is closed — and closing costs an on-chain fee again.`,
+      confirmLabel: "Turn on",
+    };
+  }
+  if (field === "rebalanceEnabled") {
+    const budget = config.rebalanceDailyBudgetSats === null ? "with no daily limit" : `at most ${sats(config.rebalanceDailyBudgetSats)} a day in fees`;
+    const perRun =
+      config.maxRebalancesPerRun === 0
+        ? " — but Max rebalances / run is 0: none runs until you raise it."
+        : ` and at most ${config.maxRebalancesPerRun} per run.`;
+    return {
+      title: "Turn on auto-rebalance?",
+      message:
+        "It pays routing fees to move liquidity between your channels, on its own: only refills that pass the profit check, " +
+        `${budget} (manual runs included)${perRun}`,
+      confirmLabel: "Turn on",
+    };
+  }
+  return null;
+}
+
+/** What the per-run limits and the hour window mean, beside their fields
+ *  (review 2026-10-25: 0 read "waits for the next run", which never came;
+ *  equal hours meaning "any time" was said nowhere). */
+export const PER_RUN_HINTS = {
+  maxChangesPerRun: "0 = the autopilot writes no fee change at all (it still shows what it would change). A change over the limit waits for the next run.",
+  maxRebalancesPerRun: "0 = no refill runs automatically (the Rebalancing tab still shows what would pass). A refill over the limit waits for the next run.",
+} as const;
+export const REBALANCE_WINDOW_HINT =
+  "UTC hours. Equal hours (0 and 24, or 5 and 5) mean any time; a start after the end wraps past midnight (22 → 6). 24 → 0 has no hour and is refused.";
 
 // ── the draft outlives the panel ─────────────────────────────────────────────
 

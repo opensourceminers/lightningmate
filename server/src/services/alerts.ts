@@ -223,6 +223,24 @@ export function offerPriceAlerts(
   return alerts;
 }
 
+/** Sold channels whose fee breaks the routing-fee promise made to their buyer
+ *  (D7) and that LND keeps refusing to lower: the lease-promise keeper tries
+ *  every 10 minutes, but a promise broken for hours must not be one line in
+ *  the run history (review 2026-10-25, PROBE-LEASE-FAIL). Derived: each goes
+ *  once a write takes or the fee is back within the promise. */
+export function leasePromiseAlerts(failing: { channelId: string; alias: string; since: string; error: string; why: string }[]): Alert[] {
+  return failing.map((f) => {
+    const promise = f.why.replace(/^lease promise: /, "").replace(/ — its fee .*$/, "");
+    return {
+      level: "warn" as const,
+      message:
+        `The fee of ${f.alias} (${f.channelId}), a channel you sold, is above what its buyer was promised (${promise}), ` +
+        `and LND has refused to lower it since ${f.since.slice(0, 16).replace("T", " ")} UTC: ${f.error}. ` +
+        "LightningMate tries again every 10 minutes — lower it by hand on the Channels tab if this stays.",
+    };
+  });
+}
+
 /** Service fees that need a human: given up, or refused for safety. */
 export function serviceFeeAlerts(ledger: Pick<ServiceFeeLedger, "problems">): Alert[] {
   return ledger.problems().map((e) => ({

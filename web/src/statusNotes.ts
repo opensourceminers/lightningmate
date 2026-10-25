@@ -85,13 +85,26 @@ export function runProgress(
   if (minutes < RUN_STUCK_MINUTES) {
     return { text: minutes < 1 ? "Run in progress…" : `Run in progress for ${minutes} min…`, stuck: false };
   }
+  // Everything that waits behind a run, named (review 2026-10-25: it named
+  // fees, rebalancing and opens only). A stage that doesn't answer is given
+  // up at its deadline (15 min; rebalancing longer, by its payments): the
+  // run then goes on and ends.
   return {
     text:
       `A run has been in progress for ${minutes} min — far longer than usual. A payment or a call to the ` +
-      "node may be stuck; fees, rebalancing and channel opens wait until it ends. (Magma orders are handled " +
-      "separately and are not held up.)",
+      "node may be stuck. Until it ends, the next runs, the Magma offer upkeep and its 2-minute price check, " +
+      "and the bookkeeping of refills in flight wait; manual fee writes and the lease-promise check wait while " +
+      "its fee or max_htlc stage runs. A stage that doesn't answer is given up after 15 min (rebalancing: longer, by its " +
+      "payments) and the run goes on. (Magma orders are handled separately and are not held up.)",
     stuck: true,
   };
+}
+
+/** A run-history line that happened several times in a row (merged): "35
+ *  times in a row, since 19 h ago" — `since` is the first time, as shown. */
+export function repeatsNote(repeats: number | undefined, since: string | null): string | null {
+  if (!repeats || repeats < 2) return null;
+  return `${repeats} times in a row${since ? `, since ${since}` : ""}`;
 }
 
 /**

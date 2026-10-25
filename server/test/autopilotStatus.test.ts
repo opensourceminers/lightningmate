@@ -654,7 +654,7 @@ test("Magma with no offer and too little capital to list one is waiting — ambe
   assert.match(m.text, /^no offer listed: only \d+k deployable on-chain after reserve/);
 });
 
-test("a rebalance run whose refills all wait — for the daily budget, or for the next run — is waiting, never an error (D15)", async (t) => {
+test("a rebalance run whose refills all wait for the daily budget is waiting, never an error (D15) — and with Max rebalances / run at 0 it says no refill runs at all, not 'the next run'", async (t) => {
   quiet(t);
   const budget = autopilotWith(t, { rebalanceEnabled: true, rebalanceDailyBudgetSats: 5 });
   budget.seams.rebalanceReport = async () => ({ recommendations: [plannedRebalance("800001x1x0", 500)] }); // ~10 sat
@@ -663,13 +663,15 @@ test("a rebalance run whose refills all wait — for the daily budget, or for th
   const b = budget.autopilot.getState().status.rebalance;
   assert.equal(b.state, "waiting");
   assert.match(b.text, /^1 profitable refill waits for the daily budget/);
-  const later = autopilotWith(t, { rebalanceEnabled: true, maxRebalancesPerRun: 0 });
-  later.seams.rebalanceReport = async () => ({ recommendations: [plannedRebalance("800001x1x0", 500)] });
-  later.seams.rebalanceExec = async () => assert.fail("none this run");
-  await later.autopilot.runOnce();
-  const l = later.autopilot.getState().status.rebalance;
-  assert.equal(l.state, "waiting");
-  assert.match(l.text, /^1 more waits for the next run/);
+  // (The per-run limit's "N more wait for the next run": rebalanceBudget.test.ts.)
+  const off = autopilotWith(t, { rebalanceEnabled: true, maxRebalancesPerRun: 0 });
+  off.seams.rebalanceReport = async () => ({ recommendations: [plannedRebalance("800001x1x0", 500)] });
+  off.seams.rebalanceExec = async () => assert.fail("none, ever");
+  await off.autopilot.runOnce();
+  const o = off.autopilot.getState().status.rebalance;
+  // Before: "1 more waits for the next run" — run after run, and none ran it.
+  assert.equal(o.state, "blocked");
+  assert.match(o.text, /^Max rebalances \/ run is 0 — no refill runs \(1 profitable refill passes the check\); raise it to let the autopilot refill$/);
 });
 
 test("'Last change by the autopilot' is the autopilot's: a fee set by hand since is not — before, the Overview said the autopilot changed it 2m ago", async (t) => {
@@ -863,4 +865,16 @@ test("the Magma report says when its reads came in — a copy the pages share la
   await new Promise((r) => setTimeout(r, 20));
   const shared = await s.autopilot.magmaReportShared();
   assert.equal(shared.generatedAt, report.generatedAt, "the shared copy: as of its read");
+});
+
+test("Max fee changes / run at 0 writes no fee change — the decision says so, not 'over the per-run limit (next run)': that run never comes", () => {
+  const held = { alias: "a", currentPpm: 100, targetPpm: 80, wouldApply: false, blockedByGuards: ["max changes per run reached"] };
+  assert.deepEqual(feeDecision([held, { ...held, alias: "b" }], [], 0), {
+    state: "blocked",
+    text: "Max fee changes / run is 0 — no fee change is written (2 channels would change); raise it to let the autopilot change fees",
+  });
+  // Above 0, what is over the limit does wait for the next run.
+  assert.equal(feeDecision([held], [], 1).text, "no fee needed changing — 1 channel checked: 1 over the per-run limit (next run)");
+  // 0 with nothing to change: nothing to say about the limit.
+  assert.equal(feeDecision([{ ...held, targetPpm: 100, blockedByGuards: [] }], [], 0).state, "idle");
 });

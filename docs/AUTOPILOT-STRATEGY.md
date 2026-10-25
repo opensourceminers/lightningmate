@@ -44,6 +44,38 @@ On top of the four sub-autopilots sits **Strategy** — three one-click presets 
 configure fees, rebalancing and channel opening coherently (Section 3). No preset touches
 Magma selling.
 
+### Deadlines, locks and the run history
+
+LND's gRPC calls carry no deadline (the `lightning` library builds its clients without
+one and offers no hook to add one), so the autopilot sets its own. Each stage of a run has
+a deadline — 15 min; the rebalancing stage 15 min plus each refill's payment time
+(`REBALANCE_HARD_TIMEOUT_MS`) — and so do the lease-promise check, a manual fee write, the
+check of refills still in flight, the offer price check and the purchase follow-up (5 min
+each) and every order-lane pass (5 min). A stage that doesn't finish in time is recorded as
+its area's error ("… did not finish in 15 min — LND or Amboss didn't answer; it was given
+up"), and the run goes on to its other stages and ends: the next runs, "Run once now" and
+manual fee writes are not held up until a restart any more. The given-up work can't be
+cancelled, but whatever it still does when the call answers late writes nothing (no fee
+write, payment, open, offer write or order step). An order-lane pass that is given up frees
+the lane; the next pass leaves alone an order whose step the given-up one still waits on and
+goes on with the others; at most two given-up passes wait at once, then none starts until one
+ends.
+
+Fee writes have a lock of their own, apart from the run's: the run's fee and max_htlc
+stages (each writes the whole policy back, so one must never land between the other's read
+and write), the 10-minute lease-promise check and a manual Apply or fee set by hand. A
+scheduled run that comes due while the lease-promise check or an Apply is under way runs —
+its fee stage waits for the lock — instead of being skipped without a trace, and the run
+the Liquidity provision switch-on kicks is not lost either. A manual fee write that finds
+the lock taken answers "Fees are being written right now … — try again in a moment".
+
+The run history keeps one line for the same successful changes run after run (the same fee
+or max_htlc change on the same channels: "35 times in a row, since 19h ago"); a failed write,
+a fee set by hand, a refill, an open, a Magma action and a stage error always get a line of
+their own. A sold channel's fee promise that LND keeps refusing to restore is an alert until
+a write takes or the fee is back within the promise, and the fee area's status says the cap
+could not be restored.
+
 ---
 
 ## 2. The fee engine (the heart) — `feeRecommend.ts`
@@ -701,6 +733,14 @@ maxHtlcEnabled
 
 Every numeric setting has bounds (`GET /api/autopilot` publishes them); a blank or
 out-of-range value is refused with the field named, never turned into 0 (D17).
+
+`maxChangesPerRun` and `maxRebalancesPerRun` at 0 mean none: no fee change is written, no
+refill runs — and the area's decision says so ("Max … / run is 0 — …; raise it"), never
+"waits for the next run". The rebalance hours are UTC; equal hours mean any time, and a start
+after the end wraps past midnight (22 → 6). A window with no hour in it — 24 → 0, hour 24
+being the next day's 0 — is refused, and one stored that way becomes any time on load, with
+auto-rebalance switched off and an alert saying why. Switching the channel autopilot or
+auto-rebalance on asks first, saying what it spends.
 
 The Strategy presets write: `enabled`, `rebalanceEnabled` and (except Max profit)
 `channelEnabled`, the `policy` curve and behaviour, and the rebalance economics

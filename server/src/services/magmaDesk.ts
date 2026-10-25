@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { getChannels, getWalletInfo, type AuthenticatedLnd, type GetChannelsResult } from "lightning";
 import { JsonStore, recordStoreIncident } from "../store.js";
 import {
@@ -548,6 +549,10 @@ const unreadText = (unread: string[]): string =>
 const undecidedText = (undecided: string[]): string =>
   `could not decide ${undecided.length === 1 ? "1 order" : `${undecided.length} orders`} (${undecided[0]})`;
 
+/** Orders a pass left alone: a given-up pass still waits on a step of theirs. */
+const stuckText = (ids: string[]): string =>
+  `${ids.length === 1 ? "1 order waits" : `${ids.length} orders wait`} on a step LND or Amboss hasn't answered (${ids[0]}) — left for a later pass`;
+
 /** What a capital check before an accept ran into: Amboss's listing of your
  *  sold capital (the deploy cap's share — the check's only Amboss call), or
  *  LND (the wallet, the channels). Amboss's bare "Internal server error" on
@@ -557,9 +562,29 @@ const capitalCheckFailed = (err: unknown): string =>
     ? `could not read your sold capital from Amboss: ${msg(err)}`
     : `LND did not answer the capital check: ${msg(err)}`;
 
+/**
+ * How long one pass of the order lane may take before it is given up (LND's
+ * gRPC calls carry no deadline: one that never answered kept the lane busy —
+ * no order decided, waitIdle never idle — until a restart; review
+ * 2026-10-25). Generous: a pass with several orders dials buyers and makes
+ * Amboss mutations with deadlines of their own. Mutable for tests.
+ */
+export const LANE_PASS_DEADLINE = { ms: 5 * 60_000 };
+
+/** A deadline as a status says it: "5 min", "30 s" (a test's "200 ms"). */
+export const deadlineWords = (ms: number): string =>
+  ms >= 60_000 ? `${Math.round(ms / 60_000)} min` : ms >= 1_000 ? `${Math.round(ms / 1_000)} s` : `${ms} ms`;
+/** Passes given up and still waiting on their call: past this many, the lane
+ *  starts none — each would wait on the same unanswered node. */
+const MAX_GIVEN_UP_PASSES = 2;
+
 export class MagmaDesk {
   readonly journal: MagmaJournal;
   private laneBusy = false;
+  /** The lane pass under way (its scope), and the given-up ones still waiting. */
+  private readonly laneScope = new AsyncLocalStorage<{ abandoned: boolean }>();
+  private passUnderWay: { abandoned: boolean } | null = null;
+  private givenUpPasses = 0;
   private stopping = false;
   private active = 0;
   private readonly orderChains = new Map<string, Promise<void>>();
@@ -656,6 +681,12 @@ export class MagmaDesk {
   /** Shutdown: no new step starts; the one under way finishes (waitIdle). */
   stop(): void {
     this.stopping = true;
+  }
+
+  /** No new order step may start: shutting down, or the lane pass this runs
+   *  in was given up (LANE_PASS_DEADLINE) and resumed late. */
+  private halted(): boolean {
+    return this.stopping || this.laneScope.getStore()?.abandoned === true;
   }
 
   isBusy(): boolean {
@@ -806,8 +837,60 @@ export class MagmaDesk {
    * at once, so a held payment ran into its HTLC expiry and the order's coins
    * stayed reserved — blocking routing opens, LSPS1 and the offer — until a
    * key came back.
+   *
+   * Within LANE_PASS_DEADLINE: a pass whose LND or Amboss call never answers
+   * is given up — the lane is free again (the status says so), and whatever
+   * the given-up pass still does when the call answers late starts no order
+   * step (halted). Each order's steps stay one at a time (withOrder): a step
+   * that hangs holds its own order only — a later pass leaves that order
+   * alone (the status says so) and goes on with the others. At most
+   * MAX_GIVEN_UP_PASSES wait on their call at once: then no pass starts until
+   * one of them ends.
    */
   async tick(): Promise<MagmaSellAction[]> {
+    if (this.laneBusy || this.stopping || !this.deps.writeLnd) return [];
+    if (this.givenUpPasses >= MAX_GIVEN_UP_PASSES) {
+      this.lane = {
+        ...this.lane,
+        ok: false,
+        error: `${this.givenUpPasses} passes of the order lane did not finish — LND or Amboss isn't answering; no new pass starts until one of them ends`,
+        retrying: true,
+      };
+      return [];
+    }
+    const scope = { abandoned: false };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const given = new Promise<MagmaSellAction[]>((resolve) => {
+      timer = setTimeout(() => {
+        scope.abandoned = true;
+        this.givenUpPasses += 1;
+        if (this.passUnderWay === scope) {
+          this.passUnderWay = null;
+          this.laneBusy = false;
+        }
+        this.lane = {
+          lastTickAt: now(),
+          ok: false,
+          error: `the order lane's pass did not finish in ${deadlineWords(LANE_PASS_DEADLINE.ms)} — LND or Amboss didn't answer; it was given up, and the next pass starts afresh`,
+          retrying: true,
+          idle: null,
+        };
+        console.warn(`[magma] order lane: ${this.lane.error}`);
+        resolve([]);
+      }, LANE_PASS_DEADLINE.ms);
+      timer.unref?.();
+    });
+    const work = this.laneScope.run(scope, () => this.lanePass(scope));
+    void work
+      .finally(() => {
+        clearTimeout(timer);
+        if (scope.abandoned) this.givenUpPasses -= 1;
+      })
+      .catch(() => undefined);
+    return Promise.race([work, given]);
+  }
+
+  private async lanePass(scope: { abandoned: boolean }): Promise<MagmaSellAction[]> {
     const { writeLnd, amboss } = this.deps;
     if (this.laneBusy || this.stopping || !writeLnd) return [];
     const cfg = this.deps.config();
@@ -823,6 +906,7 @@ export class MagmaDesk {
       return this.idle("Liquidity provision is off, and no order of yours is in flight");
     }
     this.laneBusy = true;
+    this.passUnderWay = scope;
     const pass: LanePass = {
       lndOnly: !keyed,
       reason: keyed ? null : NO_KEY,
@@ -879,8 +963,15 @@ export class MagmaDesk {
         return !e || !TERMINAL_PHASES.has(e.phase) || this.revive(e, o.status);
       });
       const ids = this.walkOrder(mine, fresh);
+      const stuck: string[] = [];
       for (const id of ids) {
-        if (this.stopping) break;
+        if (this.halted()) break;
+        // An order whose step a given-up pass still waits on: left to a
+        // later pass, the others go on (before, this pass waited on it too).
+        if (this.givenUpPasses > 0 && this.orderChains.has(id)) {
+          stuck.push(id);
+          continue;
+        }
         out.push(...(await this.withOrder(id, () => this.advance(id, pass))));
       }
       // Orders the lane no longer walks (ended, or no longer listed) are
@@ -895,18 +986,26 @@ export class MagmaDesk {
       const leftOver = [
         pass.unread.length > 0 ? unreadText(pass.unread) : null,
         pass.undecided.length > 0 ? undecidedText(pass.undecided) : null,
+        stuck.length > 0 ? stuckText(stuck) : null,
       ].filter((t): t is string => t !== null);
       const problem: { text: string; retrying: boolean } | null = pass.lndOnly
         ? { text: pass.reason ?? "Amboss can't be asked", retrying: pass.reason !== NO_KEY }
         : (listError ??
           (pass.problem !== null ? { text: pass.problem, retrying: false } : null) ??
           (leftOver.length > 0 ? { text: leftOver.join("; "), retrying: true } : null));
-      this.lane = { lastTickAt: now(), ok: problem === null, error: problem?.text ?? null, retrying: problem?.retrying ?? false, idle: null };
+      // (A given-up pass leaves the status to the deadline, or to a later pass.)
+      if (!scope.abandoned) {
+        this.lane = { lastTickAt: now(), ok: problem === null, error: problem?.text ?? null, retrying: problem?.retrying ?? false, idle: null };
+      }
     } catch (err) {
-      this.lane = { lastTickAt: now(), ok: false, error: msg(err), retrying: true, idle: null };
+      if (!scope.abandoned) this.lane = { lastTickAt: now(), ok: false, error: msg(err), retrying: true, idle: null };
       console.warn(`[magma] order lane: ${msg(err)}`);
     } finally {
-      this.laneBusy = false;
+      // Not another pass's flag: a given-up one freed the lane already.
+      if (this.passUnderWay === scope) {
+        this.passUnderWay = null;
+        this.laneBusy = false;
+      }
     }
     return out;
   }
@@ -1703,7 +1802,7 @@ export class MagmaDesk {
       return this.rejectOrder(entry, `this node can't check its connection to the buyer: ${reached.blocked}`);
     }
     if (!reached.ok) return this.rejectOrder(entry, "the buyer's node is unreachable");
-    if (this.stopping) return [this.skip(entry, "shutting down")];
+    if (this.halted()) return [this.skip(entry, this.stopping ? "shutting down" : "the lane's pass was given up")];
     return this.acceptOrder(entry, order, fee, "autopilot", pass);
   }
 
@@ -2207,7 +2306,7 @@ export class MagmaDesk {
     if (!reached.ok) {
       return reached.blocked ? this.openFailed(entry, order, reached.blocked, true) : this.openFailed(entry, order, couldNotConnect(entry.buyerPubkey));
     }
-    if (this.stopping) return [{ ...base, ok: false, error: "shutting down" }];
+    if (this.halted()) return [{ ...base, ok: false, error: this.stopping ? "shutting down" : "the lane's pass was given up" }];
     return this.deps.capital.mutex.run("magma open", async (): Promise<MagmaSellAction[]> => {
       if (entry.phase !== "held") return []; // someone else got here first
       // Again: dialing took a while, and LND may have released the payment.
@@ -2216,7 +2315,7 @@ export class MagmaDesk {
       const lacking = await this.capitalFor(entry.sizeSats, { caps: false, exceptKey: `magma:${entry.orderId}` });
       if (lacking) return this.openFailed(entry, order, lacking.reason);
       const preExisting = (await channelsWith(this.deps.readLnd, entry.buyerPubkey)).map((c) => c.outpoint);
-      if (this.stopping) return [{ ...base, ok: false, error: "shutting down" }];
+      if (this.halted()) return [{ ...base, ok: false, error: this.stopping ? "shutting down" : "the lane's pass was given up" }];
       entry.phase = "opening";
       entry.opening = { startedAt: now(), preExisting };
       entry.openAttempts += 1;
@@ -2416,7 +2515,7 @@ export class MagmaDesk {
    *  sent; a lost answer is resolved by Amboss's status on the next pass. */
   private async report(entry: MagmaJournalEntry): Promise<MagmaSellAction[]> {
     const base = { orderId: entry.orderId, action: "report" as const, sizeSats: entry.sizeSats };
-    if (this.stopping || !entry.fundingOutpoint) return [];
+    if (this.halted() || !entry.fundingOutpoint) return [];
     entry.reportAttempts += 1;
     entry.reportSentAt = now();
     this.journal.event(entry, "funding transaction sent to Amboss");

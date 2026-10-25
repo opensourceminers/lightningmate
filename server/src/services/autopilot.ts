@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { getChainBalance, getChainFeeRate, getChannels, getFeeRates, getPayment, getPeers, getWalletInfo, type AuthenticatedLnd } from "lightning";
 import { JsonStore, recordStoreIncident } from "../store.js";
 import {
@@ -14,8 +15,8 @@ import {
 } from "./channelOps.js";
 import { isAuthError } from "./amboss.js";
 import { NO_EXTRA_TERMS, createOffer, getMyOffer, getMyOffers, termsOf, toggleOffer, updateOffer, type MyOffer, type OfferTerms } from "./magmaApi.js";
-import { MagmaDesk, type MagmaSellAction, type SellActionKind } from "./magmaDesk.js";
-import { CapitalLedger, listableSat, spendableOnchain, type Spendable } from "./capital.js";
+import { MagmaDesk, deadlineWords, type MagmaSellAction, type SellActionKind } from "./magmaDesk.js";
+import { CapitalLedger, OnchainMutex, listableSat, spendableOnchain, type Spendable } from "./capital.js";
 import {
   BLOCKS_PER_YEAR,
   DEFAULT_LEASE_BLOCKS,
@@ -81,7 +82,7 @@ import {
 } from "./feeRecommend.js";
 import { FeeChangeLog, type FeeChangeRecord } from "./feeChangeLog.js";
 import { getAlias } from "./aliases.js";
-import { executeRebalance, type RebalanceExecOptions, type RebalanceExecParams, type RebalanceExecResult, type RefillHooks } from "./rebalance.js";
+import { REBALANCE_HARD_TIMEOUT_MS, executeRebalance, type RebalanceExecOptions, type RebalanceExecParams, type RebalanceExecResult, type RefillHooks } from "./rebalance.js";
 import {
   getRebalanceRecommendations,
   selectRebalanceRuns,
@@ -298,6 +299,44 @@ export interface AutopilotRun {
    *  run runOnce returns lists every one; its line in the run history only
    *  those that are news (the same failure again is not). */
   errors?: { stage: string; error: string }[];
+  /** This exact line happened this many times in a row (≥ 2): the same fee or
+   *  max_htlc changes on the same channels, run after run — kept as one line
+   *  (`at` the latest time, `firstAt` the first), not one line each. */
+  repeats?: number;
+  firstAt?: string;
+}
+
+/**
+ * A history line with nothing but fee and max_htlc changes, exactly like the
+ * newest line before it, is that line again: it counts up there instead of
+ * taking a line of its own. On 22–23 Oct 2026 one max_htlc update LND took
+ * but never kept (300,000 → 1,048,576 sat, every 30 min for 19 h) filled 35
+ * of the 50 lines and pushed every fee change out (review 2026-10-25).
+ * Only successes merge: opens, refills, Magma actions, stage errors, a
+ * failed write and anything set by hand always get a line of their own (a
+ * click is on the record every time, and a failure again is no news anyway:
+ * writeFees and the stages say so).
+ */
+export function withHistoryLine(history: AutopilotRun[], line: AutopilotRun, limit: number): AutopilotRun[] {
+  const sig = (r: AutopilotRun): string | null =>
+    (r.rebalances?.length ?? 0) ||
+    (r.channels?.length ?? 0) ||
+    (r.sells?.length ?? 0) ||
+    (r.errors?.length ?? 0) ||
+    (r.changes ?? []).some((c) => !c.ok || c.via === "manual") ||
+    (r.maxHtlc ?? []).some((m) => !m.ok)
+      ? null
+      : JSON.stringify([
+          (r.changes ?? []).map((c) => [c.id, c.fromPpm, c.toPpm, c.fromBaseMsat ?? null, c.toBaseMsat ?? null, c.via ?? null, c.ok, c.error ?? null]),
+          (r.maxHtlc ?? []).map((m) => [m.id, m.fromSat, m.toSat, m.ok, m.error ?? null]),
+        ]);
+  const prev = history[0];
+  const s = sig(line);
+  if (prev && s !== null && s === sig(prev)) {
+    const merged: AutopilotRun = { ...prev, at: line.at, repeats: (prev.repeats ?? 1) + 1, firstAt: prev.firstAt ?? prev.at };
+    return [merged, ...history.slice(1)].slice(0, limit);
+  }
+  return [line, ...history].slice(0, limit);
 }
 
 /** An offer's terms as Amboss has them, or as the engine wants them. */
@@ -763,7 +802,19 @@ export interface RunSummary {
 export function feeDecision(
   recs: readonly Pick<FeeRecommendation, "alias" | "currentPpm" | "targetPpm" | "wouldApply" | "blockedByGuards">[],
   changes: readonly Pick<AutopilotChange, "alias" | "fromPpm" | "toPpm" | "ok" | "error" | "repeat">[],
+  /** The operator's "Max fee changes / run": 0 writes none, ever — the
+   *  decision says so instead of "over the per-run limit (next run)". */
+  maxPerRun?: number,
 ): { text: string; state: DecisionState } {
+  if (maxPerRun === 0 && changes.length === 0) {
+    const held = recs.filter((r) => r.blockedByGuards?.some((g) => /max changes per run/.test(g))).length;
+    if (held > 0) {
+      return {
+        text: `Max fee changes / run is 0 — no fee change is written (${held} channel${held === 1 ? " would" : "s would"} change); raise it to let the autopilot change fees`,
+        state: "blocked",
+      };
+    }
+  }
   const ok = changes.filter((c) => c.ok);
   const failed = changes.filter((c) => !c.ok);
   // Every write that failed in the pass — one LND refused the same way as
@@ -890,6 +941,80 @@ export interface RebalanceBudget {
 }
 
 const HISTORY_LIMIT = 50;
+
+/**
+ * How long each unit of work may take before it is given up. LND's gRPC
+ * calls carry no deadline (the lightning library builds its clients with
+ * fixed options: no per-call deadline, no keepalive), so one call that never
+ * answers held the main run's lock — and everything waiting behind it: the
+ * next runs, "Run once now", the manual fee writes, the lease-promise check —
+ * until a restart (review 2026-10-25, PROBE-HANG). Generous on purpose: they
+ * bound "forever", never slow work. Mutable for tests.
+ */
+export const WORK_DEADLINES_MS = {
+  /** A main-run stage (fees, lease promises, channels, Magma offers, max_htlc). */
+  stage: 15 * 60_000,
+  /** The rebalancing stage: on top of `stage`, each refill it may pay (up to
+   *  REBALANCE_HARD_TIMEOUT_MS a payment). */
+  perRefill: REBALANCE_HARD_TIMEOUT_MS,
+  /** The lease-promise check between runs, a manual Apply or fee set by hand. */
+  feeWork: 5 * 60_000,
+  /** The in-flight refill check (also the main run's bookkeeping stage). */
+  inflightCheck: 5 * 60_000,
+  /** The order lane's offer price check and purchase follow-up (its pass
+   *  has its own deadline in MagmaDesk). */
+  laneWork: 5 * 60_000,
+};
+
+/** A unit of work that may be given up (a main-run stage, the lease-promise
+ *  check, a manual fee apply, the in-flight refill check, the offer price
+ *  check): once given up, nothing it still does may write — stopWhy and every
+ *  fee write ask (givenUp). The work itself can't be cancelled: a call that
+ *  answers late resumes it, and it finds its scope given up. A scope opened
+ *  inside another (the in-flight refill check inside the run's bookkeeping
+ *  stage) is given up with it. */
+interface WorkScope {
+  what: string;
+  abandoned: boolean;
+  parent: WorkScope | null;
+}
+const workScope = new AsyncLocalStorage<WorkScope>();
+
+/** The work was given up: it did not finish within its deadline. */
+export class WorkDeadlineError extends Error {}
+
+/** `work` in a scope of its own, within `ms`: past it the scope is given up
+ *  and the promise rejects (WorkDeadlineError) — the caller frees whatever it
+ *  holds; the work goes on without being able to write. */
+export function withDeadline<T>(what: string, ms: number, work: () => Promise<T>): Promise<T> {
+  const scope: WorkScope = { what, abandoned: false, parent: workScope.getStore() ?? null };
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      scope.abandoned = true;
+      reject(new WorkDeadlineError(`${what} did not finish in ${deadlineWords(ms)} — LND or Amboss didn't answer; it was given up`));
+    }, ms);
+    timer.unref?.();
+    workScope.run(scope, work).then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e: unknown) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** Why the work this code runs in may not write any more (null: it may). */
+export function givenUp(): string | null {
+  for (let s: WorkScope | null | undefined = workScope.getStore(); s; s = s.parent) {
+    if (s.abandoned) return `${s.what} was given up (it did not finish in time)`;
+  }
+  return null;
+}
+
 /** The Magma order lane's cadence (D4): independent of the main run. */
 export const ORDER_LANE_INTERVAL_MS = 45_000;
 /** How often the order lane reads the listed offers to catch one priced below
@@ -1314,6 +1439,22 @@ export class Autopilot {
    *  the same failure again is not news (channelNews). */
   private readonly channelLast = new Map<string, string>();
   private running = false;
+  /**
+   * Every fee write — the main run's fee stage (and its lease-promise stage),
+   * its max_htlc stage (it writes the whole policy back), the lease-promise
+   * check between runs, a manual Apply or fee set — takes this lock, not the
+   * main run's. Before, the lease check and the manual
+   * applies took the main run's own lock: a scheduled run that fired during
+   * one was skipped without a trace, "Run once now" answered "busy" with no
+   * run under way, and a switch-on's listing run was skipped too (review
+   * 2026-10-25, PROBE-LOCK-*). FIFO: the fee stage waits for a manual apply
+   * under way; a manual apply or the lease check meeting it busy says so.
+   */
+  private readonly feeLock = new OnchainMutex();
+  /** Per sold channel: its broken lease promise LND refused to restore —
+   *  since when, LND's reason (writeFees; cleared once a write takes or the
+   *  breach is gone). In memory: the next check finds it again after a restart. */
+  private readonly leaseFixFailing = new Map<string, { since: string; error: string; alias: string; why: string }>();
   /** When the current main run took its lock (null when idle) — exposed so a
    *  run that takes unusually long is visible, not just a stale lastRunAt. */
   private runningSince: string | null = null;
@@ -1705,17 +1846,20 @@ export class Autopilot {
   recordExternalSell(orderId: string, sizeSats: number, transactionId: string): void {
     // Its channel has just been opened from the wallet the offers list.
     this.recheckOfferCapital();
-    this.state.history.unshift({
-      at: new Date().toISOString(),
-      attempted: 1,
-      applied: 1,
-      failed: 0,
-      changes: [],
-      rebalances: [],
-      channels: [],
-      sells: [{ orderId: `lsps1:${orderId}`, action: "open", sizeSats, ok: true, transactionId }],
-    });
-    this.state.history = this.state.history.slice(0, HISTORY_LIMIT);
+    this.state.history = withHistoryLine(
+      this.state.history,
+      {
+        at: new Date().toISOString(),
+        attempted: 1,
+        applied: 1,
+        failed: 0,
+        changes: [],
+        rebalances: [],
+        channels: [],
+        sells: [{ orderId: `lsps1:${orderId}`, action: "open", sizeSats, ok: true, transactionId }],
+      },
+      HISTORY_LIMIT,
+    );
     this.persist();
   }
 
@@ -1860,6 +2004,11 @@ export class Autopilot {
    */
   private startOrderLane(): void {
     if (this.laneTimer || this.shuttingDown || !this.canWrite) return;
+    // The timers outside any work scope, like kick's.
+    workScope.exit(() => this.startLaneTimers());
+  }
+
+  private startLaneTimers(): void {
     this.laneTimer = setInterval(() => void this.pollSellOrders(), ORDER_LANE_INTERVAL_MS);
     // A restart picks up orders in flight right away.
     this.kick(() => this.pollSellOrders(), 5_000);
@@ -1924,7 +2073,7 @@ export class Autopilot {
    *  has a recorded state by then (a refill payment from before it was sent). */
   async waitIdle(timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
-    while (this.running || this.refilling || this.magma.isBusy() || this.capital.mutex.busy || this.reconciling || this.guarding) {
+    while (this.running || this.feeLock.busy || this.refilling || this.magma.isBusy() || this.capital.mutex.busy || this.reconciling || this.guarding) {
       if (Date.now() >= deadline) return false;
       await new Promise((r) => setTimeout(r, 100));
     }
@@ -2051,6 +2200,10 @@ export class Autopilot {
    */
   private stopWhy(sw: AutomationSwitch): string | null {
     if (this.shuttingDown) return "shutting down";
+    // Asked by work that was given up (its deadline passed while LND or
+    // Amboss didn't answer) and resumed late: it may not write.
+    const gone = givenUp();
+    if (gone) return gone;
     if (this.state.config[sw]) return null;
     return this.state.paused ? "all automation was paused during the run" : `${SWITCH_WORDS[sw]} was switched off during the run`;
   }
@@ -2062,10 +2215,14 @@ export class Autopilot {
   }
 
   private kick(fn: () => Promise<unknown>, delayMs: number): void {
-    const t = setTimeout(() => {
-      this.kickTimers.delete(t);
-      void fn();
-    }, delayMs);
+    // Outside the scope of whatever kicked it: a run kicked from a stage that
+    // is later given up must not inherit that.
+    const t: ReturnType<typeof setTimeout> = workScope.exit(() =>
+      setTimeout(() => {
+        this.kickTimers.delete(t);
+        void fn();
+      }, delayMs),
+    );
     this.kickTimers.add(t);
   }
 
@@ -2075,8 +2232,10 @@ export class Autopilot {
     const { enabled, rebalanceEnabled, channelEnabled, sellEnabled, maxHtlcEnabled } = this.state.config;
     if ((!enabled && !rebalanceEnabled && !channelEnabled && !sellEnabled && !maxHtlcEnabled) || !this.canWrite) return;
     // Clamped again here, whatever reached the config: Node turns any delay
-    // above 2^31-1 ms into 1 ms, i.e. a back-to-back loop.
-    this.timer = setInterval(() => void this.runOnce(), schedulerIntervalMs(this.state.config.intervalMinutes));
+    // above 2^31-1 ms into 1 ms, i.e. a back-to-back loop. Outside any work
+    // scope (as kick's): a run must never inherit a given-up one's.
+    const everyMs = schedulerIntervalMs(this.state.config.intervalMinutes);
+    this.timer = workScope.exit(() => setInterval(() => void this.runOnce(), everyMs));
     // Kick off one run shortly after enabling, without blocking.
     this.kick(() => this.runOnce(), 2_000);
     // Selling just switched on: the order lane looks for orders right away
@@ -2174,7 +2333,7 @@ export class Autopilot {
       shouldStop: () => this.stopWhy("enabled") !== null,
     });
     this.explain("fees", () => {
-      const d = feeDecision(report.recommendations, changes);
+      const d = feeDecision(report.recommendations, changes, this.state.config.maxChangesPerRun);
       if (notSent === 0) return d;
       const stopped = unsent(notSent, this.stopWhy("enabled") ?? "stopped during the run");
       // What was sent still counts (applied, or refused); none sent: a wait.
@@ -2291,6 +2450,15 @@ export class Autopilot {
       const why = w?.why;
       let error = res.error;
       let repeat = false;
+      // A broken lease promise LND refuses to restore is the operator's to
+      // know (leasePromiseFailures → an alert), not one history line.
+      if (w?.leaseBreach) {
+        if (res.ok) this.leaseFixFailing.delete(res.id);
+        else {
+          const was = this.leaseFixFailing.get(res.id);
+          this.leaseFixFailing.set(res.id, { since: was?.since ?? nowIso, error: res.error ?? "failed", alias: w.alias ?? res.id, why: w.why ?? "" });
+        }
+      }
       if (res.ok) {
         delete retry[res.id];
         this.state.perChannelLastApplied[res.id] = nowIso;
@@ -2334,7 +2502,9 @@ export class Autopilot {
     const results = await this.feeApply(
       writeLnd,
       writes.map(({ id, transactionId, transactionVout, feeRatePpm, baseFeeMsat }) => ({ id, transactionId, transactionVout, feeRatePpm, baseFeeMsat })),
-      { ...(opts.shouldStop ? { shouldStop: opts.shouldStop } : {}), onResult: book },
+      // Every write asks — the lease keeper's and a manual apply's too — whether
+      // the work it belongs to was given up meanwhile (withDeadline).
+      { shouldStop: () => givenUp() !== null || (opts.shouldStop?.() ?? false), onResult: book },
     );
     // (Whatever was not booked as it came — none, with applyFees — now.)
     for (const res of results as FeeApplyResult[]) book(res);
@@ -2390,29 +2560,47 @@ export class Autopilot {
   private async keepLeasePromises(writeLnd: AuthenticatedLnd): Promise<AutopilotChange[]> {
     // Never stopped by a switch: a promise to a buyer holds whatever the
     // automation switches say (also while everything is paused).
-    return (await this.writeFees(writeLnd, await this.leaseBreaches(), "lease", { quietRepeats: true })).changes;
+    const breaches = await this.leaseBreaches();
+    // A channel whose fee is back within its promise (fixed by hand, by
+    // another tool, or the lease ended) is no failure any more.
+    const breaching = new Set(breaches.map((b) => b.id));
+    for (const id of [...this.leaseFixFailing.keys()]) if (!breaching.has(id)) this.leaseFixFailing.delete(id);
+    return (await this.writeFees(writeLnd, breaches, "lease", { quietRepeats: true })).changes;
+  }
+
+  /** Sold channels whose fee breaks their routing-fee promise (D7) and that
+   *  LND keeps refusing to lower: since when, and LND's reason (an alert;
+   *  the fee area's status says so too). */
+  leasePromiseFailures(): { channelId: string; alias: string; since: string; error: string; why: string }[] {
+    return [...this.leaseFixFailing.entries()].map(([channelId, f]) => ({ channelId, ...f }));
   }
 
   /**
    * The lease-promise check of the timer (every LEASE_PROMISE_CHECK_MS, from
-   * start-up, whatever the switches say): skipped while the main run holds
-   * its lock (its own stages keep the promises), and holding it while it
-   * writes. Only ever lowers a breaching fee to its cap; a write is recorded
-   * in the run history like any other.
+   * start-up, whatever the switches say): skipped while fees are being
+   * written (the main run's fee stage keeps the promises itself; a manual
+   * write is clamped to them), and holding the fee lock while it writes —
+   * not the main run's lock: a run that comes due meanwhile runs (its fee
+   * stage waits for the lock). Within WORK_DEADLINES_MS.feeWork: a check whose
+   * LND reads never answer is given up, the lock freed. Only ever lowers a
+   * breaching fee to its cap; a write is recorded in the run history like any
+   * other.
    */
   async keepLeasePromisesNow(): Promise<AutopilotChange[]> {
-    if (this.shuttingDown || this.running || !this.writeLnd) return [];
+    if (this.shuttingDown || this.feeLock.busy || !this.writeLnd) return [];
     if (this.capital.leaseCaps().length === 0) return [];
-    this.running = true;
+    const writeLnd = this.writeLnd;
     try {
-      const changes = await this.keepLeasePromises(this.writeLnd);
-      if (changes.length) this.recordRun({ changes });
-      return changes;
+      return await this.feeLock.run("lease-promise check", () =>
+        withDeadline("the lease-promise check", WORK_DEADLINES_MS.feeWork, async () => {
+          const changes = await this.keepLeasePromises(writeLnd);
+          if (changes.length) this.recordRun({ changes });
+          return changes;
+        }),
+      );
     } catch (err) {
       console.warn(`[autopilot] keeping lease promises: ${errText(err)}`);
       return [];
-    } finally {
-      this.running = false;
     }
   }
 
@@ -2423,25 +2611,31 @@ export class Autopilot {
    * changed), the cooldown stamped, the run history and the fee-change log
    * written. Recomputed here, so a stale page applies nothing the engine no
    * longer wants. `channelIds`: the rows the operator saw (all when absent).
-   * Null when the main run holds the lock (the caller says "try again").
+   * Null while fees are being written — the main run's fee stage, the
+   * lease-promise check, another apply (the caller says "try again"): the
+   * fee lock, not the main run's (a run's other stages don't hold it up).
+   * Within WORK_DEADLINES_MS.feeWork (WorkDeadlineError past it).
    */
   async applyRecommended(channelIds?: string[]): Promise<AutopilotChange[] | null> {
     if (!this.writeLnd) throw new Error("writing is disabled");
-    if (this.running || this.shuttingDown) return null;
-    this.running = true;
+    if (this.feeLock.busy || this.shuttingDown) return null;
+    const writeLnd = this.writeLnd;
     try {
-      this.migrateOutOfRangePins();
-      const report = await this.feeReport(await this.feeElasticityModifiers());
-      this.noteFlowReturns(report.recommendations);
-      const wanted = channelIds ? new Set(channelIds) : null;
-      const eligible = report.recommendations.filter(
-        (r) => r.wouldApply && r.transactionId !== null && r.transactionVout !== null && (!wanted || wanted.has(r.channelId)),
+      return await this.feeLock.run("fee apply", () =>
+        withDeadline("the fee apply", WORK_DEADLINES_MS.feeWork, async () => {
+          this.migrateOutOfRangePins();
+          const report = await this.feeReport(await this.feeElasticityModifiers());
+          this.noteFlowReturns(report.recommendations);
+          const wanted = channelIds ? new Set(channelIds) : null;
+          const eligible = report.recommendations.filter(
+            (r) => r.wouldApply && r.transactionId !== null && r.transactionVout !== null && (!wanted || wanted.has(r.channelId)),
+          );
+          const { changes } = await this.writeFees(writeLnd, eligible.map((r) => recommendationWrite(r)), "manual");
+          if (changes.length) this.recordRun({ changes });
+          return changes;
+        }),
       );
-      const { changes } = await this.writeFees(this.writeLnd, eligible.map((r) => recommendationWrite(r)), "manual");
-      if (changes.length) this.recordRun({ changes });
-      return changes;
     } finally {
-      this.running = false;
       this.persist();
     }
   }
@@ -2449,7 +2643,6 @@ export class Autopilot {
   /**
    * A fee set by hand (POST /fees/apply): written as asked — clamped to a
    * sold channel's promise — and kept on the books like every other write.
-   * Null when the main run holds the lock.
    *
    * Every item's channel is resolved from LND by its funding outpoint first,
    * and an item whose id is not the channel at that outpoint is refused
@@ -2458,55 +2651,58 @@ export class Autopilot {
    * the cooldown, the fee-change log, the retry back-off — so a sold
    * channel's outpoint sent with an older channel's id was written past its
    * lease promise and booked on the wrong channel (P2 final review).
+   *
+   * Null while fees are being written (the fee lock, as applyRecommended);
+   * within WORK_DEADLINES_MS.feeWork.
    */
   async applyByHand(items: FeeApplyItem[]): Promise<{ changes: AutopilotChange[]; results: FeeApplyResult[] } | null> {
     if (!this.writeLnd) throw new Error("writing is disabled");
-    if (this.running || this.shuttingDown) return null;
-    this.running = true;
-    try {
-      // What each channel charges now (the "from" of the record) and whose
-      // it is — read once. The channel list must be read: it is how each
-      // item is checked (no list, no write).
-      const [rates, chans] = await Promise.all([
-        getFeeRates({ lnd: this.readLnd }).catch(() => ({ channels: [] as { id: string; fee_rate: number; base_fee_mtokens: string }[] })),
-        getChannels({ lnd: this.readLnd }),
-      ]);
-      const atOutpoint = new Map(chans.channels.map((c) => [`${c.transaction_id}:${c.transaction_vout}`, c.id]));
-      const mismatched = items.flatMap((it) => {
-        const outpoint = `${it.transactionId}:${it.transactionVout}`;
-        const id = atOutpoint.get(outpoint);
-        if (id === undefined) return [`${outpoint}: no open channel has this funding outpoint`];
-        return id === it.id ? [] : [`${it.id}: the channel at ${outpoint} is ${id}`];
+    if (this.feeLock.busy || this.shuttingDown) return null;
+    const writeLnd = this.writeLnd;
+    return this.feeLock.run("fee set by hand", () => withDeadline("the fee set by hand", WORK_DEADLINES_MS.feeWork, () => this.setFeesByHand(writeLnd, items)));
+  }
+
+  private async setFeesByHand(writeLnd: AuthenticatedLnd, items: FeeApplyItem[]): Promise<{ changes: AutopilotChange[]; results: FeeApplyResult[] }> {
+    // What each channel charges now (the "from" of the record) and whose
+    // it is — read once. The channel list must be read: it is how each
+    // item is checked (no list, no write).
+    const [rates, chans] = await Promise.all([
+      getFeeRates({ lnd: this.readLnd }).catch(() => ({ channels: [] as { id: string; fee_rate: number; base_fee_mtokens: string }[] })),
+      getChannels({ lnd: this.readLnd }),
+    ]);
+    const atOutpoint = new Map(chans.channels.map((c) => [`${c.transaction_id}:${c.transaction_vout}`, c.id]));
+    const mismatched = items.flatMap((it) => {
+      const outpoint = `${it.transactionId}:${it.transactionVout}`;
+      const id = atOutpoint.get(outpoint);
+      if (id === undefined) return [`${outpoint}: no open channel has this funding outpoint`];
+      return id === it.id ? [] : [`${it.id}: the channel at ${outpoint} is ${id}`];
+    });
+    if (mismatched.length) throw new FeeItemError(mismatched);
+    const now = new Map(rates.channels.map((c) => [c.id, c]));
+    const peerOf = new Map(chans.channels.map((c) => [c.id, c.partner_public_key]));
+    const writes: FeeWrite[] = [];
+    for (const it of items) {
+      const peer = peerOf.get(it.id);
+      const rate = now.get(it.id);
+      writes.push({
+        ...it,
+        alias: peer ? await getAlias(this.readLnd, peer) : it.id,
+        fromPpm: rate?.fee_rate ?? 0,
+        fromBaseMsat: rate ? Number(rate.base_fee_mtokens) : null,
+        why: "set by hand",
       });
-      if (mismatched.length) throw new FeeItemError(mismatched);
-      const now = new Map(rates.channels.map((c) => [c.id, c]));
-      const peerOf = new Map(chans.channels.map((c) => [c.id, c.partner_public_key]));
-      const writes: FeeWrite[] = [];
-      for (const it of items) {
-        const peer = peerOf.get(it.id);
-        const rate = now.get(it.id);
-        writes.push({
-          ...it,
-          alias: peer ? await getAlias(this.readLnd, peer) : it.id,
-          fromPpm: rate?.fee_rate ?? 0,
-          fromBaseMsat: rate ? Number(rate.base_fee_mtokens) : null,
-          why: "set by hand",
-        });
-      }
-      const { changes } = await this.writeFees(this.writeLnd, writes, "manual");
-      if (changes.length) this.recordRun({ changes });
-      const results: FeeApplyResult[] = changes.map((c) => ({
-        id: c.id,
-        ok: c.ok,
-        feeRatePpm: c.toPpm,
-        ...(c.toBaseMsat != null ? { baseFeeMsat: c.toBaseMsat } : {}),
-        ...(c.clampedBy ? { clampedBy: c.clampedBy } : {}),
-        ...(c.error ? { error: c.error } : {}),
-      }));
-      return { changes, results };
-    } finally {
-      this.running = false;
     }
+    const { changes } = await this.writeFees(writeLnd, writes, "manual");
+    if (changes.length) this.recordRun({ changes });
+    const results: FeeApplyResult[] = changes.map((c) => ({
+      id: c.id,
+      ok: c.ok,
+      feeRatePpm: c.toPpm,
+      ...(c.toBaseMsat != null ? { baseFeeMsat: c.toBaseMsat } : {}),
+      ...(c.clampedBy ? { clampedBy: c.clampedBy } : {}),
+      ...(c.error ? { error: c.error } : {}),
+    }));
+    return { changes, results };
   }
 
   /** A run-history line for work done outside the main run (lease keeper,
@@ -2516,17 +2712,20 @@ export class Autopilot {
   private recordRun(part: Partial<Pick<AutopilotRun, "changes">>): void {
     const changes = (part.changes ?? []).filter((c) => !c.repeat);
     if (changes.length === 0) return;
-    this.state.history.unshift({
-      at: new Date().toISOString(),
-      attempted: changes.length,
-      applied: changes.filter((c) => c.ok).length,
-      failed: changes.filter((c) => !c.ok).length,
-      changes,
-      rebalances: [],
-      channels: [],
-      sells: [],
-    });
-    this.state.history = this.state.history.slice(0, HISTORY_LIMIT);
+    this.state.history = withHistoryLine(
+      this.state.history,
+      {
+        at: new Date().toISOString(),
+        attempted: changes.length,
+        applied: changes.filter((c) => c.ok).length,
+        failed: changes.filter((c) => !c.ok).length,
+        changes,
+        rebalances: [],
+        channels: [],
+        sells: [],
+      },
+      HISTORY_LIMIT,
+    );
     this.persist();
   }
 
@@ -2746,6 +2945,14 @@ export class Autopilot {
           `${b.spentSats.toLocaleString("en-US")} of ${(b.budgetSats ?? 0).toLocaleString("en-US")} sat spent today, resets 00:00 UTC: ${budgetSkips.join(", ")}`,
       );
     }
+    // 0 per run runs none, ever: say so — "the next run" never came (review
+    // 2026-10-25). The decision is the operator's to change: blocked.
+    if (later.length && this.state.config.maxRebalancesPerRun === 0 && ran.length === 0) {
+      return {
+        text: `Max rebalances / run is 0 — no refill runs (${later.length} profitable refill${later.length === 1 ? " passes" : "s pass"} the check); raise it to let the autopilot refill`,
+        state: "blocked",
+      };
+    }
     if (later.length) parts.push(`${later.length} more wait${later.length === 1 ? "s" : ""} for the next run (at most ${this.state.config.maxRebalancesPerRun} per run)`);
     if (waiting.length) parts.push(waiting.join("; "));
     if (parts.length) {
@@ -2958,7 +3165,10 @@ export class Autopilot {
    *  One at a time: a main run and the timer share the reconciliation under
    *  way. */
   private reconcilePendingRebalances(): Promise<void> {
-    this.reconciling ??= this.reconcileNow().finally(() => {
+    // Within WORK_DEADLINES_MS.inflightCheck: a payment-status call LND never
+    // answers frees the reconciliation for the next one (it books nothing
+    // twice — reconcileNow asks again after every answer).
+    this.reconciling ??= withDeadline("the in-flight refill check", WORK_DEADLINES_MS.inflightCheck, () => this.reconcileNow()).finally(() => {
       this.reconciling = null;
     });
     return this.reconciling;
@@ -3000,6 +3210,10 @@ export class Autopilot {
         continue; // LND can't say right now — ask again later
       }
       if (st.state === "pending") continue;
+      // The answer took a while: this check may have been given up (another
+      // has booked it since, or will) — and its payment may be on the books
+      // already. Never twice.
+      if (givenUp() || this.rebalanceLog.hasPayment(p.id) || !(this.state.pendingRebalances ?? []).includes(p)) continue;
       const manual = p.via === "manual";
       const ok = st.state === "confirmed";
       if (p.sourceId) this.notePairs(p.targetId, { ok, sourceId: p.sourceId, failedSourceIds: ok ? [] : [p.sourceId] });
@@ -5498,6 +5712,9 @@ export class Autopilot {
    * An error is also kept as the area's last error.
    */
   private decisionNote(area: DecisionArea, text: string, state: DecisionState): void {
+    // A stage given up for its deadline, resumed late: the area's decision is
+    // the deadline's (or a later run's) — not what the stale stage says now.
+    if (givenUp()) return;
     const nowIso = new Date().toISOString();
     const prev = this.state.decisions?.[area];
     // An action is never "the same again": "opened 2,000,000 sat to X" today
@@ -5595,8 +5812,14 @@ export class Autopilot {
       if (!d) return { state: "not_run", text: "not run yet since it was switched on — the next run decides", at: null };
       return { ...d };
     };
+    // A sold channel's promise the keeper can't restore (LND refuses): the
+    // status mustn't claim the cap is kept (review 2026-10-25, PROBE-LEASE-FAIL).
+    const failing = this.leasePromiseFailures();
+    const leaseWords = failing.length
+      ? `a sold channel's promised fee cap could not be restored — LND refuses (${failing[0].error}); see the alert`
+      : "a sold channel's promised fee cap is still kept";
     return {
-      fees: status("fees", c.enabled, "fee automation is off — fees change only when you set them (a sold channel's promised fee cap is still kept)"),
+      fees: status("fees", c.enabled, `fee automation is off — fees change only when you set them (${leaseWords})`),
       rebalance: status("rebalance", c.rebalanceEnabled, "auto-rebalance is off — refills run only when you start one"),
       channels: status("channels", c.channelEnabled, "the channel autopilot is off — channels open only when you open them"),
       magma: status("magma", c.sellEnabled, "Liquidity provision is off — no offer is kept and no new order is taken (orders already taken on are carried to their end)"),
@@ -5911,15 +6134,21 @@ export class Autopilot {
     this.offerGuardAt = Date.now();
     this.guarding = true;
     try {
-      const key = this.amboss.getKey();
-      for (const e of listed) {
-        if (this.shuttingDown || this.running) return;
-        try {
-          await this.guardOfferPrice(key, e.offerId);
-        } catch (err) {
-          console.warn(`[autopilot] offer ${e.offerId}: price check failed: ${errText(err)}`);
+      // Within WORK_DEADLINES_MS.laneWork: a read that never answers frees the
+      // check (and waitIdle) — the given-up one writes nothing (stopWhy).
+      await withDeadline("the offer price check", WORK_DEADLINES_MS.laneWork, async () => {
+        const key = this.amboss.getKey();
+        for (const e of listed) {
+          if (this.shuttingDown || this.running || givenUp()) return;
+          try {
+            await this.guardOfferPrice(key, e.offerId);
+          } catch (err) {
+            console.warn(`[autopilot] offer ${e.offerId}: price check failed: ${errText(err)}`);
+          }
         }
-      }
+      });
+    } catch (err) {
+      console.warn(`[autopilot] offer price check: ${errText(err)}`);
     } finally {
       this.guarding = false;
     }
@@ -6028,8 +6257,7 @@ export class Autopilot {
     };
     // Not lastRunAt: that is the main run's, and a lane that acts every 45 s
     // would hide a main run that stopped (the lane has magmaLane.lastTickAt).
-    this.state.history.unshift(run);
-    this.state.history = this.state.history.slice(0, HISTORY_LIMIT);
+    this.state.history = withHistoryLine(this.state.history, run, HISTORY_LIMIT);
     this.persist();
   }
 
@@ -6050,19 +6278,26 @@ export class Autopilot {
   async followPurchases(): Promise<void> {
     if (this.followingPurchases || this.shuttingDown) return;
     this.followingPurchases = true;
+    // Within WORK_DEADLINES_MS.laneWork: a read that never answers frees the
+    // follow-up for the next pass; a given-up one records nothing it reads late.
+    const stop = () => this.shuttingDown || givenUp() !== null;
     try {
-      const { payments } = this.purchases.followUps();
-      await eachBounded(payments, PURCHASE_FOLLOW_PARALLEL, () => this.shuttingDown, async (p) => {
-        const report = await this.purchasePaymentReport(p.paymentHash);
-        if (!this.shuttingDown) this.purchases.paymentOutcome(p.orderId, report);
+      await withDeadline("the purchase follow-up", WORK_DEADLINES_MS.laneWork, async () => {
+        const { payments } = this.purchases.followUps();
+        await eachBounded(payments, PURCHASE_FOLLOW_PARALLEL, stop, async (p) => {
+          const report = await this.purchasePaymentReport(p.paymentHash);
+          if (!stop()) this.purchases.paymentOutcome(p.orderId, report);
+        });
+        if (!this.amboss.hasKey()) return;
+        const key = this.amboss.getKey();
+        const { orders } = this.purchases.followUps();
+        await eachBounded(orders, PURCHASE_FOLLOW_PARALLEL, stop, async (p) => {
+          const order = await getOrder(key, p.orderId);
+          if (!stop()) this.purchases.fromOrder(p.orderId, order);
+        });
       });
-      if (!this.amboss.hasKey()) return;
-      const key = this.amboss.getKey();
-      const { orders } = this.purchases.followUps();
-      await eachBounded(orders, PURCHASE_FOLLOW_PARALLEL, () => this.shuttingDown, async (p) => {
-        const order = await getOrder(key, p.orderId);
-        if (!this.shuttingDown) this.purchases.fromOrder(p.orderId, order);
-      });
+    } catch (err) {
+      console.warn(`[autopilot] purchase follow-up: ${errText(err)}`);
     } finally {
       this.followingPurchases = false;
     }
@@ -6172,16 +6407,34 @@ export class Autopilot {
     // A stage's failure is its area's decision (D16) — and a line of the run
     // history only when it is news: the same failure again (LND down for an
     // hour) counts up on the area's status instead of filling the history.
-    const stage = async <T>(name: string, area: DecisionArea, on: boolean, run: () => Promise<T[]>): Promise<T[]> => {
+    // Each stage within its deadline (WORK_DEADLINES_MS), in a scope of its
+    // own: one whose LND or Amboss call never answers is recorded as the
+    // area's error and given up — the run goes on to the next stage and ends,
+    // its lock freed — and whatever the given-up stage still does when the
+    // call answers late writes nothing (stopWhy, writeFees). Before, one such
+    // call held the lock until a restart: no further run, no "Run once now",
+    // no manual fee write (review 2026-10-25, PROBE-HANG). A stage that
+    // writes routing policies (`feeLock`) takes the fee lock first and its
+    // deadline runs from then: given up, it frees the fee lock too. (The wait
+    // for the lock is bounded by its holder's own deadline.)
+    const stage = async <T>(
+      name: string,
+      area: DecisionArea,
+      on: boolean,
+      run: () => Promise<T[]>,
+      opts: { deadlineMs?: number; feeLock?: boolean } = {},
+    ): Promise<T[]> => {
       if (!on || this.shuttingDown) return [];
       try {
-        const res = await run();
+        const timed = () => withDeadline(`the ${name} stage`, opts.deadlineMs ?? WORK_DEADLINES_MS.stage, run);
+        const res = await (opts.feeLock ? this.feeLock.run(`the ${name} stage`, timed) : timed());
         this.stageLast.delete(name);
         return res;
       } catch (err) {
         const error = errText(err);
         logLine("error", `[autopilot] ${name} stage failed: ${error}`);
-        this.decisionNote(area, `the ${name} stage failed: ${error}`, "error");
+        // (A deadline's own words say which stage, and that it was given up.)
+        this.decisionNote(area, err instanceof WorkDeadlineError ? error : `the ${name} stage failed: ${error}`, "error");
         const sig = error.replace(/\d[\d,.]*/g, "#");
         if (this.stageLast.get(name) !== sig) news.add(name);
         this.stageLast.set(name, sig);
@@ -6196,37 +6449,63 @@ export class Autopilot {
       // rebalance stage this ran only within the window, with rebalancing on:
       // a payment left in flight could stay unreconciled, its maximum fee
       // charged to the budget, for as long as rebalancing stayed off.)
-      await stage("rebalance bookkeeping", "rebalance", (this.state.pendingRebalances ?? []).length > 0, async () => {
-        await this.reconcilePendingRebalances();
-        return [];
-      });
+      await stage(
+        "rebalance bookkeeping",
+        "rebalance",
+        (this.state.pendingRebalances ?? []).length > 0,
+        async () => {
+          await this.reconcilePendingRebalances();
+          return [];
+        },
+        { deadlineMs: WORK_DEADLINES_MS.inflightCheck },
+      );
+      // The fee stages write fees: under the fee lock (a manual apply or the
+      // lease-promise check under way is waited for — FIFO). So does the
+      // max_htlc stage, below.
       const changes = [
-        ...(await stage("fees", "fees", this.state.config.enabled, () => this.runFees(writeLnd))),
+        ...(await stage("fees", "fees", this.state.config.enabled, () => this.runFees(writeLnd), { feeLock: true })),
         // D7 with fee automation off: the routing-fee promises of sold
         // channels are still kept — LND's default fee or a change made with
         // another tool can sit above a cap. Only a breach is touched, and only
         // lowered to the cap; every other fee stays the operator's.
-        ...(await stage("lease promises", "fees", !this.state.config.enabled && this.capital.leaseCaps().length > 0, () =>
-          this.keepLeasePromises(writeLnd),
+        ...(await stage(
+          "lease promises",
+          "fees",
+          !this.state.config.enabled && this.capital.leaseCaps().length > 0,
+          () => this.keepLeasePromises(writeLnd),
+          { feeLock: true },
         )),
       ];
-      const rebalances = await stage("rebalancing", "rebalance", this.state.config.rebalanceEnabled, () => this.runRebalances(writeLnd));
+      // Its payments take a while each (REBALANCE_HARD_TIMEOUT_MS at most):
+      // their time on top of the stage's.
+      const rebalances = await stage("rebalancing", "rebalance", this.state.config.rebalanceEnabled, () => this.runRebalances(writeLnd), {
+        deadlineMs: WORK_DEADLINES_MS.stage + Math.max(1, this.state.config.maxRebalancesPerRun) * WORK_DEADLINES_MS.perRefill,
+      });
       const channels = await stage("channels", "channels", this.state.config.channelEnabled, () => this.runChannels(writeLnd));
       const sells = await stage("magma", "magma", true, () => this.runSell());
       // Advertised-size upkeep: only gossips when a channel's bucket moved.
       // (Its failure used to be swallowed — `.catch(() => [])` — so LND not
-      // answering it left no trace; now it is the area's error.)
-      const maxHtlc = await stage("max_htlc", "maxHtlc", this.state.config.maxHtlcEnabled, async () => {
-        // Each update asks the live switch first (stopWhy): the pass reads
-        // every channel's policy from the graph, which takes a while.
-        const halted: { why: string | null } = { why: null };
-        const moved = await runMaxHtlcPass(this.readLnd, writeLnd, this.maxHtlcBackoff, {
-          shouldStop: () => (halted.why = this.stopWhy("maxHtlcEnabled")) !== null,
-          lastWrites: this.maxHtlcLastWrites,
-        });
-        this.explain("maxHtlc", () => maxHtlcDecision(moved, halted.why));
-        return moved;
-      });
+      // answering it left no trace; now it is the area's error.) Under the
+      // fee lock too: it writes the whole policy back with the fee it read,
+      // and a fee write in between (by hand, or the lease-promise check)
+      // would be undone by it — as a fee write echoes the max_htlc it read.
+      const maxHtlc = await stage(
+        "max_htlc",
+        "maxHtlc",
+        this.state.config.maxHtlcEnabled,
+        async () => {
+          // Each update asks the live switch first (stopWhy): the pass reads
+          // every channel's policy from the graph, which takes a while.
+          const halted: { why: string | null } = { why: null };
+          const moved = await runMaxHtlcPass(this.readLnd, writeLnd, this.maxHtlcBackoff, {
+            shouldStop: () => (halted.why = this.stopWhy("maxHtlcEnabled")) !== null,
+            lastWrites: this.maxHtlcLastWrites,
+          });
+          this.explain("maxHtlc", () => maxHtlcDecision(moved, halted.why));
+          return moved;
+        },
+        { feeLock: true },
+      );
       // "skip" entries are non-actions (cap/reserve) — don't count them as
       // attempts.
       const acted = sells.filter((s) => s.action !== "skip");
@@ -6294,10 +6573,7 @@ export class Autopilot {
       };
       // Only record runs that actually did something (applied or failed) — skip the
       // hourly no-op runs so the history shows changes, not "0 applied" every hour.
-      if (line.attempted > 0) {
-        this.state.history.unshift(line);
-        this.state.history = this.state.history.slice(0, HISTORY_LIMIT);
-      }
+      if (line.attempted > 0) this.state.history = withHistoryLine(this.state.history, line, HISTORY_LIMIT);
       return run;
     } finally {
       // Also on a failed stage: whatever earlier stages recorded (fee cooldowns,

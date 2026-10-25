@@ -136,7 +136,7 @@ import { getBtcPrice } from "../services/price.js";
 import { outboundRouting, viaTor } from "../services/http.js";
 import type { FiatCurrency, SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, FeeMode, OverridesStore } from "../services/overrides.js";
-import { getAlerts, magmaRefusalAlerts, offerPriceAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
+import { getAlerts, leasePromiseAlerts, magmaRefusalAlerts, offerPriceAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
 import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
 import { SlidingWindowLimiter } from "../services/rateLimit.js";
 import { acknowledgeStoreIncident } from "../store.js";
@@ -181,6 +181,12 @@ function numericOverrides<T>(query: Fields<T>, keys: (keyof T)[]): Partial<T> {
 const WRITE_DISABLED_MSG =
   "Writing is disabled. Set LM_ENABLE_WRITE=true and provide a write macaroon " +
   "(LND_WRITE_MACAROON / LND_WRITE_MACAROON_PATH, or admin.macaroon on Umbrel).";
+
+/** A fee write met another under way (the fee lock): the autopilot's fee or
+ *  max_htlc stage, the lease-promise check, or another apply — not "the
+ *  autopilot is running", which a run's other stages no longer block. */
+const FEES_BUSY_MSG =
+  "Fees are being written right now (the autopilot's fee or max_htlc stage, the lease-promise check or another apply) — try again in a moment.";
 
 // ── What a request carries, as the contract names it ─────────────────────────
 
@@ -631,6 +637,7 @@ export function createApiRouter(
           ...magmaRefusalAlerts(autopilot.magma),
           ...offerPriceAlerts(autopilot.offerSyncStatus(), autopilot.actsOnOffers(), autopilot.getState().config.sellAutoReprice),
           ...autopilot.onchainLockAlerts(),
+          ...leasePromiseAlerts(autopilot.leasePromiseFailures()),
         ]),
       );
     }),
@@ -781,7 +788,7 @@ export function createApiRouter(
         throw err;
       }
       if (!done) {
-        res.status(409).json({ error: "busy", message: "The autopilot is running right now — try again in a moment." });
+        res.status(409).json({ error: "busy", message: FEES_BUSY_MSG });
         return;
       }
       res.json({ results: done.results } satisfies FeeApplyResponse);
@@ -805,7 +812,7 @@ export function createApiRouter(
       }
       const changes = await autopilot.applyRecommended(raw as string[] | undefined);
       if (!changes) {
-        res.status(409).json({ error: "busy", message: "The autopilot is running right now — try again in a moment." });
+        res.status(409).json({ error: "busy", message: FEES_BUSY_MSG });
         return;
       }
       res.json({ changes } satisfies ApplyRecommendedResponse);

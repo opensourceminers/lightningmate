@@ -29,7 +29,17 @@ import {
   resumeLines,
   runResultLine,
 } from "../src/autopilotView";
-import { EMPTY_DRAFT, checkDraft, draftIsEmpty, draftStore, type Draft } from "../src/autopilotForm";
+import {
+  EMPTY_DRAFT,
+  PER_RUN_HINTS,
+  REBALANCE_WINDOW_HINT,
+  checkDraft,
+  draftIsEmpty,
+  draftStore,
+  switchOnConfirm,
+  windowEverOpen,
+  type Draft,
+} from "../src/autopilotForm";
 import { buildPresets } from "../src/presets";
 import { EMPTY_REPORT_VIEW, MAGMA_REPORT_MAX_AGE_MS, forgetMagmaReport, reportErrorText, reportLoaded, reportRefreshFailed, sharedMagmaReport } from "../src/magmaReport";
 import { caretButtonProps, trapTab } from "../src/a11y";
@@ -815,4 +825,34 @@ test("Settings offers 'Download diagnostics' — what the autopilot decided and 
   assert.match(settings, />\s*Download diagnostics\s*</);
   const api = readFileSync(new URL("../src/api.ts", import.meta.url), "utf8");
   assert.match(api, /fetch\("\/api\/diagnostics", \{ headers: authHeaders\(\) \}\)/);
+});
+
+// Review 2026-10-25: the channel autopilot and auto-rebalance switched on at
+// once — while this form's own comment said each asks first.
+test("switching the channel autopilot or auto-rebalance on asks first, saying what it spends; switching off — or fee automation and max_htlc on — never asks", () => {
+  const c = config({ rebalanceDailyBudgetSats: 2_000, maxRebalancesPerRun: 3, channelReserveSats: 500_000, channelMaxFeeRate: 8, channelSizeSats: 0 });
+  const open = switchOnConfirm("channelEnabled", c);
+  assert.equal(open?.title, "Turn on the channel autopilot?");
+  assert.match(open?.message ?? "", /opens channels with your on-chain funds, on its own: .*sized automatically, keeping 500,000 sat on chain, at most 8 sat\/vB/);
+  const refill = switchOnConfirm("rebalanceEnabled", c);
+  assert.equal(refill?.title, "Turn on auto-rebalance?");
+  assert.match(refill?.message ?? "", /at most 2,000 sat a day in fees \(manual runs included\) and at most 3 per run\.$/);
+  assert.match(switchOnConfirm("rebalanceEnabled", { ...c, rebalanceDailyBudgetSats: null })?.message ?? "", /with no daily limit/);
+  assert.match(switchOnConfirm("rebalanceEnabled", { ...c, maxRebalancesPerRun: 0 })?.message ?? "", /Max rebalances \/ run is 0: none runs until you raise it\.$/);
+  for (const f of ["enabled", "maxHtlcEnabled", "sellEnabled"] as const) assert.equal(switchOnConfirm(f, c), null, f);
+  const panel = readFileSync(new URL("../src/components/AutopilotPanel.tsx", import.meta.url), "utf8");
+  assert.match(panel, /const ask = v \? switchOnConfirm\(field, config\) : null;/, "off never asks");
+});
+
+test("a rebalance window with no hour in it (24 → 0) is refused at the field before it is sent; equal hours mean any time — and the hints say what 0 per run means", () => {
+  assert.equal(windowEverOpen(24, 0), false);
+  for (const [s, e] of [[5, 5], [0, 24], [22, 6], [24, 3], [0, 1]]) assert.equal(windowEverOpen(s, e), true, `${s}→${e}`);
+  const b = { ...bounds, config: { ...bounds.config, rebalanceHourStart: int(0, 24), rebalanceHourEnd: int(0, 24) } } as AutopilotBounds;
+  const never = checkDraft(draft({ nums: { rebalanceHourStart: "24", rebalanceHourEnd: "0" } }), config(), b, labels);
+  assert.match(never.fieldErrors.rebalanceHourStart ?? "", /never opens \(hour 24 is the next day's 0\) — use equal hours for any time/);
+  assert.equal(never.errors.length, 1);
+  assert.deepEqual(checkDraft(draft({ nums: { rebalanceHourStart: "5", rebalanceHourEnd: "5" } }), config(), b, labels).errors, []);
+  assert.match(REBALANCE_WINDOW_HINT, /Equal hours \(0 and 24, or 5 and 5\) mean any time/);
+  assert.match(PER_RUN_HINTS.maxChangesPerRun, /^0 = the autopilot writes no fee change at all/);
+  assert.match(PER_RUN_HINTS.maxRebalancesPerRun, /^0 = no refill runs automatically/);
 });

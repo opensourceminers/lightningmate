@@ -282,19 +282,26 @@ test("each fee write is booked and saved as LND takes it — a restart in the mi
   assert.deepEqual(Object.keys(saved().perChannelLastApplied).sort(), [first.id, second.id].sort());
 });
 
-test("a manual Apply never runs into the autopilot: while a run holds the lock, POST /fees/apply-recommended and POST /fees/apply answer 409, write nothing and leave the lock to its holder", async (t) => {
+test("a manual Apply never writes beside another fee write: while the fee lock is held, POST /fees/apply-recommended and POST /fees/apply answer 409, write nothing and leave the lock to its holder — a run's other stages don't hold them up", async (t) => {
   const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 800_000 })] });
   const api = await startApi(t, { node });
-  const lock = api.autopilot as unknown as { running: boolean };
-  lock.running = true;
+  // The main run's fee stage (or the lease-promise check) holds the fee lock.
+  const { feeLock } = api.autopilot as unknown as { feeLock: { run<T>(label: string, fn: () => Promise<T>): Promise<T>; busy: boolean } };
+  let release!: () => void;
+  const held = feeLock.run("fee stage", () => new Promise<void>((r) => (release = r)));
   const recommended = await api.request("POST", "/fees/apply-recommended", {});
   const byHand = await api.request("POST", "/fees/apply", {
     items: [{ id: "850000x1x0", transactionId: TX(1), transactionVout: 0, feeRatePpm: 420, baseFeeMsat: 0 }],
   });
   assert.deepEqual([recommended.status, byHand.status], [409, 409]);
-  assert.equal(node.policyRequests.length, 0, "nothing written beside the run");
-  assert.equal(lock.running, true, "a refused request does not release the run's lock");
-  lock.running = false;
+  assert.match(recommended.body.message, /^Fees are being written right now/);
+  assert.equal(node.policyRequests.length, 0, "nothing written beside the fee stage");
+  assert.equal(feeLock.busy, true, "a refused request does not release the holder's lock");
+  release();
+  await held;
+  // A run refilling or opening — no fee write under way: the Apply goes
+  // through (before, any run under way refused it).
+  (api.autopilot as unknown as { running: boolean }).running = true;
   assert.equal((await api.request("POST", "/fees/apply-recommended", {})).status, 200);
   assert.equal(node.policyWrites.length, 1);
 });
