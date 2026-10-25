@@ -60,6 +60,7 @@ import {
 } from "./openPlan.js";
 import type { LnPlusStore } from "./lnplusStore.js";
 import {
+  autoSizedWindow,
   getMagmaRecommendations,
   minSizeCoveringSat,
   preferredBaseFeeSats,
@@ -599,6 +600,10 @@ interface PersistedState {
   /** Per offer: when the autopilot last moved its base fee (a verified
    *  write) — at most one move per BASE_FEE_MOVE_GAP_MS. */
   offerBaseMovedAt?: Record<string, string>;
+  /** The order lane's accept floor as LND's fee estimate last gave it, and
+   *  when: while the estimate fails, the floor is this one (saleFeeFloor) —
+   *  not the minimum relay fee's. */
+  lastSaleFloor?: { at: string; sats: number };
   /** Per area: its latest decision and why (decisionNote) — what it did, or
    *  why it did nothing (D16). */
   decisions?: Partial<Record<DecisionArea, AreaDecision>>;
@@ -1069,6 +1074,10 @@ export const ORDER_LANE_INTERVAL_MS = 45_000;
 export const OFFER_GUARD_INTERVAL_MS = 2 * 60_000;
 /** How long the order lane's accept floor (saleFeeFloorSats) is reused. */
 const SALE_FLOOR_TTL_MS = 10 * 60_000;
+/** How long the last floor LND's fee estimate gave stands in, unremarked,
+ *  for an estimate that fails (saleFeeFloor): past it the lane still goes by
+ *  it, and says so with each order it turns down below it (saleFloorNote). */
+const SALE_FLOOR_KEEP_MS = 6 * 3_600_000;
 /** How often the routing-fee promises of sold channels are checked (D7) —
  *  whatever the autopilot switches say (keepLeasePromisesNow). */
 export const LEASE_PROMISE_CHECK_MS = 10 * 60_000;
@@ -1165,6 +1174,10 @@ interface OfferCtx {
   /** The order lane's accept floor now (saleFeeFloorSats): an order paying
    *  less is turned down as below cost. Null: not known this run. */
   acceptFloorSat: number | null;
+  /** That floor is LND's fee estimate now — not the last one known while the
+   *  estimate fails (saleFeeFloor): an offer taken off the market below cost
+   *  is listed again only on a real estimate (coverableNow). */
+  acceptFloorLive: boolean;
   /** Liquidity this node's offers upkept before this one list: the sellable
    *  amount is shared — two offers never each list all of it. */
   listedElsewhere: number;
@@ -1508,9 +1521,12 @@ export class Autopilot {
   /** Liquidity provision was switched on while a run was under way (the run
    *  kicked for it found that one busy): it runs one more when it ends. */
   private sellSwitchedMidRun = false;
-  /** A spend outside the main run came while a run held the lock: the
-   *  offers' capital is checked once it is done (recheckOfferCapital). */
-  private offerRecheckPending = false;
+  /** The offers' own lock: the offer capital check after a spend
+   *  (offerCapitalNow) and the main run's magma stage take it, so neither
+   *  works on the offers while the other does — FIFO, each within its own
+   *  deadline. Not the main run's lock: no scheduled run is skipped for a
+   *  check (final review 2026-10-25, PROBE-RECHECK-HANG/-LOCK). */
+  private readonly offerLock = new OnchainMutex();
   private offerRecheckTimer: NodeJS.Timeout | undefined;
   /** Set by shutdown(): no new run may start, the process is going away. */
   private shuttingDown = false;
@@ -1587,6 +1603,7 @@ export class Autopilot {
         };
       },
       saleFloorSats: () => this.saleFeeFloorSats(),
+      saleFloorNote: () => this.saleFloorNote(),
       soldChannelClose: () => this.soldChannelClose(),
       offerPrices: () => this.knownOfferPrices(),
       initialRoutingFee: () => this.initialRoutingFee(),
@@ -1644,6 +1661,14 @@ export class Autopilot {
     this.state.sellSwitchOn = sanitizeSellSwitchOn(this.state.sellSwitchOn);
     this.state.offerBaseMoves = sanitizeBaseMoves(this.state.offerBaseMoves);
     this.state.offerBaseMovedAt = sanitizeTimes(this.state.offerBaseMovedAt);
+    // The last real accept floor: kept only whole (a time and a floor above 0).
+    const lastFloor = this.state.lastSaleFloor as { at?: unknown; sats?: unknown } | null | undefined;
+    if (
+      lastFloor !== undefined &&
+      !(typeof lastFloor?.at === "string" && Number.isFinite(Date.parse(lastFloor.at)) && typeof lastFloor.sats === "number" && Number.isFinite(lastFloor.sats) && lastFloor.sats > 0)
+    ) {
+      delete this.state.lastSaleFloor;
+    }
     // Upgrading to the fee-change log: the fee changes still in the run
     // history move into it (once), so what was measurable stays measurable.
     this.feeLog.seed(
@@ -2120,7 +2145,7 @@ export class Autopilot {
    *  has a recorded state by then (a refill payment from before it was sent). */
   async waitIdle(timeoutMs: number): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
-    while (this.running || this.feeLock.busy || this.refilling || this.magma.isBusy() || this.capital.mutex.busy || this.reconciling || this.guarding) {
+    while (this.running || this.feeLock.busy || this.offerLock.busy || this.refilling || this.magma.isBusy() || this.capital.mutex.busy || this.reconciling || this.guarding) {
       if (Date.now() >= deadline) return false;
       await new Promise((r) => setTimeout(r, 100));
     }
@@ -4118,7 +4143,8 @@ export class Autopilot {
    * within seconds (offerCapitalNow): before, a listed offer kept inviting
    * orders the wallet could no longer fund until the next main run, up to
    * half an hour later (review 2026-10-25, O5). One check for a burst of
-   * spends; one while the main run holds the lock comes after it.
+   * spends; one that comes while the offers are worked on — the main run's
+   * magma stage, or a check under way — waits for that (offerLock).
    */
   recheckOfferCapital(): void {
     if (this.shuttingDown || this.offerRecheckTimer) return;
@@ -4133,26 +4159,29 @@ export class Autopilot {
    * The capital part of the offer upkeep, on its own: each offer listed only
    * while fundable, its window and total cut to what can be funded now — no
    * market read, no price, size or lease move, no new offer, no lease closed
-   * (those are the main run's). Holds the main run's lock while it writes;
-   * with a run under way, it runs once that run is done. Recorded like the
-   * order lane's pass.
+   * (those are the main run's). Under the offers' lock (offerLock): after
+   * the magma stage or a check under way, never beside one — and within
+   * WORK_DEADLINES_MS.laneWork: a call that never answers frees the lock,
+   * and what the given-up check still does writes nothing (stopWhy). Never
+   * the main run's lock: holding it, a check skipped the run that came due
+   * meanwhile without a trace — and every run, "Run once now" too, while
+   * an LND call of it never answered (final review 2026-10-25,
+   * PROBE-RECHECK-HANG/-LOCK). Recorded like the order lane's pass.
    */
   async offerCapitalNow(): Promise<AutopilotSell[]> {
     if (this.shuttingDown || !this.writeLnd || !this.amboss.hasKey() || this.stopWhy("sellEnabled")) return [];
-    if (this.running) {
-      this.offerRecheckPending = true;
-      return [];
-    }
-    this.running = true;
     try {
-      const sells = await this.runSell({ capitalOnly: true });
-      this.recordLanePass(sells);
-      return sells;
+      return await this.offerLock.run("the offer capital check", () =>
+        withDeadline("the offer capital check", WORK_DEADLINES_MS.laneWork, async () => {
+          const sells = await this.runSell({ capitalOnly: true });
+          if (!givenUp()) this.recordLanePass(sells);
+          return sells;
+        }),
+      );
     } catch (err) {
       console.warn(`[autopilot] offer capital check: ${errText(err)}`);
       return [];
     } finally {
-      this.running = false;
       this.persist();
     }
   }
@@ -4171,6 +4200,8 @@ export class Autopilot {
     const sync = this.syncState();
     sync.managed = true;
     const failed = (message: string): AutopilotSell[] => {
+      // Given up (its deadline said so): a newer run's record stands.
+      if (givenUp()) return out;
       sync.lastError = { at: new Date().toISOString(), message };
       this.decisionNote("magma", `offer upkeep failed: ${message}`, "error");
       return [...out, { orderId: "offers", action: "error", sizeSats: 0, ok: false, error: message }];
@@ -4190,8 +4221,11 @@ export class Autopilot {
         reshape: () => null,
         lease: () => null,
         caps: this.offerFeeCaps(),
-        // The lane's own floor, at the lane's fee rate (one number for both).
-        acceptFloorSat: await this.saleFeeFloorSats().catch(() => null),
+        // The lane's own floor, at the lane's fee rate (one number for both)
+        // — and whether LND's estimate gave it now (saleFeeFloor).
+        ...(await this.saleFeeFloor()
+          .then((f) => ({ acceptFloorSat: f.sats, acceptFloorLive: f.live }))
+          .catch(() => ({ acceptFloorSat: null, acceptFloorLive: false }))),
         listedElsewhere: 0,
         ordersPending: this.magma.ordersPending(),
       };
@@ -4216,6 +4250,11 @@ export class Autopilot {
       if (isAuthError(err)) await this.amboss.recheckAfterRefusal();
       return failed(`could not read your offers from Amboss: ${errText(err)}`);
     }
+    // Given up while the listing was on its way: nothing of this stage is
+    // written any more — not the offers' sync record, not what it prunes;
+    // a newer run's stands (final review 2026-10-25, PROBE-MAGMA-STAGE-LATE:
+    // "left as it is: … given up" written over the next run's record).
+    if (givenUp()) return out;
     sync.lastError = null;
     // Upkeep works again: its next failure is news (laneNews).
     this.laneLast.delete("offers");
@@ -4251,7 +4290,7 @@ export class Autopilot {
       } catch (err) {
         // No recommendation: prices and shapes stay; the capital limits below
         // still apply. Not silent: the sync status says why.
-        sync.lastError = { at: new Date().toISOString(), message: `no market recommendation this run: ${errText(err)}` };
+        if (!givenUp()) sync.lastError = { at: new Date().toISOString(), message: `no market recommendation this run: ${errText(err)}` };
       }
     }
     const recByOffer = new Map(
@@ -4321,19 +4360,13 @@ export class Autopilot {
       const room = ctx.maxOrder(Math.min(wantMin, off.minSizeSats));
       const wantMax = Math.max(wantMin, Math.min(sell.recommendedMaxSizeSat, room));
       if (wantMax < wantMin || room < wantMin) return null;
-      // Only act on a MEANINGFUL difference: a window much narrower than
-      // what can be funded, a floor above what is economic — or one well
-      // under it: the smallest channel that pays for itself moves with the
-      // mempool, both ways (review 2026-10-25: at 10 sat/vB the engine wanted
-      // 850k and the offer kept 250k — auto-size only ever lowered the min).
-      const widens = wantMax > off.maxSizeSats * 1.2;
-      const lowersFloor = wantMin < off.minSizeSats * 0.8;
-      const raisesFloor = wantMin > off.minSizeSats * 1.2;
-      if (!widens && !lowersFloor && !raisesFloor) return null;
-      return {
-        minSizeSats: raisesFloor ? wantMin : Math.min(wantMin, off.minSizeSats),
-        maxSizeSats: Math.max(wantMax, off.maxSizeSats),
-      };
+      // Only on a MEANINGFUL difference (autoSizedWindow, ±20 %): a window
+      // much narrower than what can be funded, a floor above what is
+      // economic — or one well under it: the smallest channel that pays for
+      // itself moves with the mempool, both ways (review 2026-10-25: at
+      // 10 sat/vB the engine wanted 850k and the offer kept 250k). The engine
+      // priced the offer for this same window (magmaRecommend buildSell).
+      return autoSizedWindow(off, wantMin, wantMax);
     };
 
     const entries: OfferSyncEntry[] = [];
@@ -4353,6 +4386,8 @@ export class Autopilot {
       // What this offer lists now is not the next one's to list again.
       if (entry.amboss.status === "ENABLED") ctx.listedElsewhere += Math.max(0, entry.amboss.availableSats);
     }
+    // Given up during the upkeep: the records stay as a newer run left them.
+    if (givenUp()) return out;
     // Cut memories of offers that are gone have nothing left to give back,
     // and their ownership records nothing left to own.
     for (const id of Object.keys(this.state.offerCuts ?? {})) {
@@ -4597,7 +4632,9 @@ export class Autopilot {
         : control.disabledByHandAt
         ? "disabled by you — the autopilot leaves it disabled; enable it on Market → Sell to list it again"
         : control.costDisabledAt
-        ? `taken off the market by the autopilot below cost: at today's on-chain fee rate not even its largest order pays for opening and closing its channel (${fmtSat(ctx.acceptFloorSat ?? 0)} sat) — the order lane would turn every order down; listed again (its terms first) once fees drop`
+        ? `taken off the market by the autopilot below cost: at today's on-chain fee rate not even its largest order pays for opening and closing its channel (${fmtSat(ctx.acceptFloorSat ?? 0)} sat) — the order lane would turn every order down; listed again (its terms first) once fees drop, or once there is capital for an order that pays for it${
+            ctx.acceptFloorLive ? "" : " — on a fee rate LND's estimate gives: it isn't answering now"
+          }`
         : control.autoDisabledAt
           ? lackOfCapital()
           : control.autoDisablingAt
@@ -4674,6 +4711,14 @@ export class Autopilot {
     // have stayed off for good.)
     if (off.status === "DISABLED" && control.freeDisabledAt && !control.manual && this.state.config.sellAutoReprice && fundable) {
       const listed = await this.relistFree(key, off, ctx, out);
+      if (listed === "below_cost") {
+        return this.syncEntry(
+          off,
+          null,
+          pricedWhileOff,
+          `disabled by the autopilot: Amboss listed it for free (0 ppm + 0 sat) — not listed again yet: at the autopilot's price for it no order it can fund pays for opening and closing its channel at today's fee rate (${fmtSat(ctx.acceptFloorSat ?? 0)} sat); tried again next run`,
+        );
+      }
       if (listed) {
         off = listed;
         control = this.offerControlOf(off.id);
@@ -4681,14 +4726,7 @@ export class Autopilot {
     }
     if (off.status !== "ENABLED") return this.syncEntry(off, null, pricedWhileOff, disabledWhy(off.status));
 
-    const want = this.wantedTerms(off, ctx, !!control.manual);
-    if (want.belowCost) {
-      // Every order it could get would be turned down by the lane: off the
-      // market until fees drop (disableBelowCost), not left inviting them.
-      const r = await this.disableBelowCost(key, off, want.belowCost, out);
-      control = this.offerControlOf(off.id); // its record now says why (disabledWhy)
-      return this.syncEntry(r.offer, null, r.write ?? undefined, r.offer.status === "ENABLED" ? `below cost and not yet taken off the market: ${r.write?.error ?? "left for the next run"}` : disabledWhy(r.offer.status));
-    }
+    let want = this.wantedTerms(off, ctx, !!control.manual);
     if (listedForFree(want.fields)) {
       // Never a price of nothing — not kept as the wanted price, never sent.
       // (A run that keeps "what Amboss has" kept 0 ppm + 0 sat: 0.8.0's
@@ -4705,11 +4743,21 @@ export class Autopilot {
           r.offer.status === "ENABLED" ? `listed for free (0 ppm + 0 sat) and not yet taken off the market: ${r.write?.error ?? "left for the next check"}` : FREE_DISABLED_WHY,
         );
       }
-      want.fields.feeRatePpm = last.feeRatePpm;
-      want.fields.baseFeeSats = last.baseFeeSats;
-      want.reasons.push(
-        `${last.engine ? "priced at the engine's" : "price put back to the last one it had,"} ${fmtSat(last.feeRatePpm)} ppm + ${fmtSat(last.baseFeeSats)} sat (Amboss listed it at 0 ppm + 0 sat)`,
-      );
+      // Its sizes judged at the price it gets — the min that covers the
+      // lane's accept floor among them, or off the market below cost — not
+      // at 0 ppm + 0 sat, where no such check holds (final review 2026-10-25).
+      want = this.wantedTerms(off, ctx, !!control.manual, {
+        feeRatePpm: last.feeRatePpm,
+        baseFeeSats: last.baseFeeSats,
+        why: `${last.engine ? "priced at the engine's" : "price put back to the last one it had,"} ${fmtSat(last.feeRatePpm)} ppm + ${fmtSat(last.baseFeeSats)} sat (Amboss listed it at 0 ppm + 0 sat)`,
+      });
+    }
+    if (want.belowCost) {
+      // Every order it could get would be turned down by the lane: off the
+      // market until fees drop (disableBelowCost), not left inviting them.
+      const r = await this.disableBelowCost(key, off, want.belowCost, out);
+      control = this.offerControlOf(off.id); // its record now says why (disabledWhy)
+      return this.syncEntry(r.offer, null, r.write ?? undefined, r.offer.status === "ENABLED" ? `below cost and not yet taken off the market: ${r.write?.error ?? "left for the next run"}` : disabledWhy(r.offer.status));
     }
     if (want.notes.length) notes.push(`offer ${off.id.slice(0, 8)}…: ${want.notes.join("; ")}`);
     const changed = termsChanges(off, want.fields);
@@ -4795,7 +4843,9 @@ export class Autopilot {
    */
   private coverableNow(off: MyOffer, ctx: OfferCtx, control: OfferControl): boolean {
     const floorSat = ctx.acceptFloorSat;
-    if (!floorSat) return false; // not known this run: it waits for one that knows
+    // Not known this run, or not LND's estimate now (the last one known while
+    // it fails): it waits for a run that knows today's fee rate.
+    if (!floorSat || !ctx.acceptFloorLive) return false;
     let price = { feeRatePpm: off.feeRatePpm, baseFeeSats: off.baseFeeSats };
     if (!control.manual && this.state.config.sellAutoReprice) {
       const lp = this.listingPrice(off, ctx, ctx.lease(off) ?? off.minBlockLength);
@@ -5268,9 +5318,11 @@ export class Autopilot {
     off: MyOffer,
     ctx: OfferCtx,
     manual: boolean,
-    /** The price it is to be listed again at (termsBeforeListing): applied
-     *  before the size checks below, which judge the price it gets. */
-    listAt?: { feeRatePpm: number; baseFeeSats: number },
+    /** The price it is to be listed again at (termsBeforeListing, relistFree),
+     *  or the one a free offer gets back (upkeepOffer): applied before the
+     *  size checks below, which judge the price it gets. `why`: the reason
+     *  said for it (else "priced at the engine's …"). */
+    listAt?: { feeRatePpm: number; baseFeeSats: number; why?: string },
   ): {
     fields: OfferFields;
     kind: SellActionKind;
@@ -5324,7 +5376,7 @@ export class Autopilot {
         w.feeRatePpm = listAt.feeRatePpm;
         w.baseFeeSats = listAt.baseFeeSats;
         repriced = true;
-        reasons.push(`priced at the engine's ${fmtSat(listAt.feeRatePpm)} ppm + ${fmtSat(listAt.baseFeeSats)} sat`);
+        reasons.push(listAt.why ?? `priced at the engine's ${fmtSat(listAt.feeRatePpm)} ppm + ${fmtSat(listAt.baseFeeSats)} sat`);
       }
       if (shape) {
         w.minSizeSats = shape.minSizeSats;
@@ -6068,6 +6120,8 @@ export class Autopilot {
 
   /** The order lane's accept floor, cached (saleFeeFloorSats). */
   private saleFloor: { at: number; sats: number } | null = null;
+  /** Where the floor last handed out came from (saleFloorNote). */
+  private saleFloorSeen: { live: boolean; at: number | null } | null = null;
 
   /**
    * The smallest fee the order lane accepts an order for: what opening and
@@ -6075,15 +6129,52 @@ export class Autopilot {
    * order that pays less loses money, however it came to be priced so. Not the
    * minimum profit on top: that is the engine's pricing floor, and refusing a
    * profitable order inside the offer's own window costs seller score. Live
-   * from LND's fee estimate (cached ten minutes, whatever the switches say);
-   * without one, at the minimum relay fee — a floor no real order is below.
+   * from LND's fee estimate (cached ten minutes, whatever the switches say).
+   * While the estimate fails, the last floor it gave (lastSaleFloor, kept
+   * across restarts) — not the minimum relay fee's: at 1 sat/vB the lane
+   * took orders below cost, and an offer taken off the market below cost
+   * was listed again (final review 2026-10-25). Only with none ever known,
+   * the minimum relay fee's — a floor no real order is below.
    */
   async saleFeeFloorSats(): Promise<number> {
-    if (this.saleFloor && Date.now() - this.saleFloor.at < SALE_FLOOR_TTL_MS) return this.saleFloor.sats;
+    return (await this.saleFeeFloor()).sats;
+  }
+
+  /** saleFeeFloorSats, and whether LND's estimate gave it now (`live`) —
+   *  else when it gave the floor it stands in for (`at`; null: none known). */
+  private async saleFeeFloor(): Promise<{ sats: number; live: boolean; at: number | null }> {
+    if (this.saleFloor && Date.now() - this.saleFloor.at < SALE_FLOOR_TTL_MS) {
+      this.saleFloorSeen = { live: true, at: this.saleFloor.at };
+      return { sats: this.saleFloor.sats, live: true, at: this.saleFloor.at };
+    }
     const oc = await onchainCosts(this.readLnd);
-    const sats = saleAcceptFloorSats(oc.feePerVbyte, saleFeeConfig().bps / 10_000);
-    if (oc.feePerVbyte !== null) this.saleFloor = { at: Date.now(), sats };
-    return sats;
+    const share = saleFeeConfig().bps / 10_000;
+    if (oc.feePerVbyte !== null) {
+      const at = Date.now();
+      const sats = saleAcceptFloorSats(oc.feePerVbyte, share);
+      this.saleFloor = { at, sats };
+      this.state.lastSaleFloor = { at: new Date(at).toISOString(), sats };
+      this.saleFloorSeen = { live: true, at };
+      return { sats, live: true, at };
+    }
+    const last = this.state.lastSaleFloor;
+    const floor = last ? { sats: last.sats, live: false, at: Date.parse(last.at) } : { sats: saleAcceptFloorSats(null, share), live: false, at: null };
+    this.saleFloorSeen = { live: false, at: floor.at };
+    return floor;
+  }
+
+  /**
+   * What the order lane says with an order it turns down below its floor
+   * while LND's fee estimate fails: the floor it went by — once that is
+   * older than SALE_FLOOR_KEEP_MS, or with none known (the minimum relay
+   * fee's). Null while the floor is the estimate's, or a recent one.
+   */
+  saleFloorNote(nowMs = Date.now()): string | null {
+    const s = this.saleFloorSeen;
+    if (!s || s.live) return null;
+    if (s.at === null) return "LND's fee estimate isn't answering and none is known from before — the floor is the minimum relay fee's";
+    if (nowMs - s.at <= SALE_FLOOR_KEEP_MS) return null;
+    return `LND's fee estimate isn't answering — the floor is the one it last gave (${new Date(s.at).toISOString().slice(0, 16).replace("T", " ")} UTC)`;
   }
 
   /** The prices this node's offers ask or asked lately: as last read from
@@ -6161,14 +6252,18 @@ export class Autopilot {
    * — not the one it last had: that may be the price it was disabled at),
    * every term is written — read back, checked — and only then is it listed
    * again, its record cleared. Null: it stays off (no price this run, a write
-   * Amboss didn't keep, the flip not landing, or the switch going off).
+   * Amboss didn't keep, the flip not landing, or the switch going off);
+   * "below_cost": at that price no order it can fund pays for its channel.
    */
-  private async relistFree(key: string, off: MyOffer, ctx: OfferCtx, out: AutopilotSell[]): Promise<MyOffer | null> {
-    const want = this.wantedTerms(off, ctx, false);
-    const price = this.listingPrice(off, ctx, want.fields.minBlockLength);
+  private async relistFree(key: string, off: MyOffer, ctx: OfferCtx, out: AutopilotSell[]): Promise<MyOffer | null | "below_cost"> {
+    const price = this.listingPrice(off, ctx, ctx.lease(off) ?? off.minBlockLength);
     if ("waits" in price) return null;
-    want.fields.feeRatePpm = price.feeRatePpm;
-    want.fields.baseFeeSats = price.baseFeeSats;
+    // Its sizes judged at the price it is listed at (the min that covers the
+    // lane's accept floor among them) — and not listed where no order it can
+    // fund pays for its channel (final review 2026-10-25: judged at
+    // 0 ppm + 0 sat, the cost check never ran).
+    const want = this.wantedTerms(off, ctx, false, price);
+    if (want.belowCost) return "below_cost";
     return this.withOffer(off.id, async () => {
       const fresh = await getMyOffer(key, off.id).catch(() => null);
       const control = this.offerControlOf(off.id);
@@ -6288,7 +6383,7 @@ export class Autopilot {
    * or without a key.
    */
   private async guardOfferPrices(): Promise<void> {
-    if (this.guarding || this.shuttingDown || this.running || !this.writeLnd || !this.amboss.hasKey()) return;
+    if (this.guarding || this.shuttingDown || this.running || this.offerLock.busy || !this.writeLnd || !this.amboss.hasKey()) return;
     if (Date.now() - this.offerGuardAt < OFFER_GUARD_INTERVAL_MS) return;
     if (this.stopWhy("sellEnabled")) return;
     const listed = (this.state.offerSync?.offers ?? []).filter((e) => e.amboss.status === "ENABLED");
@@ -6301,7 +6396,7 @@ export class Autopilot {
       await withDeadline("the offer price check", WORK_DEADLINES_MS.laneWork, async () => {
         const key = this.amboss.getKey();
         for (const e of listed) {
-          if (this.shuttingDown || this.running || givenUp()) return;
+          if (this.shuttingDown || this.running || this.offerLock.busy || givenUp()) return;
           try {
             await this.guardOfferPrice(key, e.offerId);
           } catch (err) {
@@ -6350,7 +6445,7 @@ export class Autopilot {
         this.noteOfferRead(fresh);
         return;
       }
-      if (this.running || this.stopWhy("sellEnabled")) return;
+      if (this.running || this.offerLock.busy || this.stopWhy("sellEnabled")) return;
       // The autopilot's promise too, when it gives one (Amboss drops it with the price).
       const wanted = this.state.offerSync?.offers.find((x) => x.offerId === offerId)?.wanted ?? null;
       const terms: OfferTerms = {
@@ -6378,7 +6473,7 @@ export class Autopilot {
     if (!putBack) {
       // Couldn't be put back: off the market rather than listed for free.
       const now = await getMyOffer(key, offerId).catch(() => null);
-      if (now && now.status === "ENABLED" && listedForFree(now) && !this.running && !this.stopWhy("sellEnabled")) {
+      if (now && now.status === "ENABLED" && listedForFree(now) && !this.running && !this.offerLock.busy && !this.stopWhy("sellEnabled")) {
         const r = await this.disableFree(key, now, out);
         this.noteOfferRead(r.offer, r.write ?? undefined);
       }
@@ -6577,14 +6672,16 @@ export class Autopilot {
     // call held the lock until a restart: no further run, no "Run once now",
     // no manual fee write (review 2026-10-25, PROBE-HANG). A stage that
     // writes routing policies (`feeLock`) takes the fee lock first and its
-    // deadline runs from then: given up, it frees the fee lock too. (The wait
-    // for the lock is bounded by its holder's own deadline.)
+    // deadline runs from then: given up, it frees the fee lock too. One that
+    // works on the offers (`offerLock`: the magma stage) takes the offers'
+    // lock the same way — the offer capital check takes it too. (The wait
+    // for a lock is bounded by its holder's own deadline.)
     const stage = async <T>(
       name: string,
       area: DecisionArea,
       on: boolean,
       run: () => Promise<T[]>,
-      opts: { deadlineMs?: number; feeLock?: boolean; history?: LateKey } = {},
+      opts: { deadlineMs?: number; feeLock?: boolean; offerLock?: boolean; history?: LateKey } = {},
     ): Promise<T[]> => {
       if (!on || this.shuttingDown) return [];
       // The give-up's decision, for a late finish to replace (lateStageDone).
@@ -6594,7 +6691,8 @@ export class Autopilot {
           withDeadline(`the ${name} stage`, opts.deadlineMs ?? WORK_DEADLINES_MS.stage, run, (late, lateMs) =>
             this.lateStageDone(name, area, opts.history, late, mark, lateMs),
           );
-        const res = await (opts.feeLock ? this.feeLock.run(`the ${name} stage`, timed) : timed());
+        const lock = opts.feeLock ? this.feeLock : opts.offerLock ? this.offerLock : null;
+        const res = await (lock ? lock.run(`the ${name} stage`, timed) : timed());
         this.stageLast.delete(name);
         return res;
       } catch (err) {
@@ -6651,7 +6749,7 @@ export class Autopilot {
         history: "rebalances",
       });
       const channels = await stage("channels", "channels", this.state.config.channelEnabled, () => this.runChannels(writeLnd), { history: "channels" });
-      const sells = await stage("magma", "magma", true, () => this.runSell(), { history: "sells" });
+      const sells = await stage("magma", "magma", true, () => this.runSell(), { history: "sells", offerLock: true });
       // Advertised-size upkeep: only gossips when a channel's bucket moved.
       // (Its failure used to be swallowed — `.catch(() => [])` — so LND not
       // answering it left no trace; now it is the area's error.) Under the
@@ -6750,12 +6848,6 @@ export class Autopilot {
       this.persist();
       this.running = false;
       this.runningSince = null;
-      // A spend outside this run came while it held the lock: the offers'
-      // capital now (this run's own upkeep may have come before the spend).
-      if (this.offerRecheckPending) {
-        this.offerRecheckPending = false;
-        this.recheckOfferCapital();
-      }
       // Liquidity provision was switched on while this run was under way, and
       // the switch-on is still to be applied: the run reschedule() kicked found
       // this one busy, and this one's offer upkeep came before the switch. One

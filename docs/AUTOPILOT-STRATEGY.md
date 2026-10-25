@@ -705,18 +705,30 @@ the same number, at the price it is written with. With auto-size, and terms that
 autopilot's, the min channel goes up to the smallest order that pays for its channel (and at
 least the engine's own minimum); when not even the largest order the offer can fund does,
 the offer is taken off the market ("below cost at today's on-chain fee rate") and listed
-again — its terms written and checked first — once fees drop. An offer whose window is the
+again — its terms written and checked first — once fees drop, or once there is capital for an
+order that pays for its channel. While LND's fee estimate fails, the floor is the last one it
+gave (kept across restarts) — never the minimum relay fee's; past 6 h the lane says so with each
+order it turns down, and an offer taken off the market below cost is listed again only on a
+real estimate. An offer listed for free gets its price back judged the same way, at that
+price. An offer whose window is the
 operator's (or with auto-size off) keeps it: an alert and Market → Sell say from which size
 its orders are turned down. A listed offer under its profit floor is raised before anything
 else (its floor rounded up), whatever the market or the routing comparison says. While an
-order waits for approval — or is accepted and not yet on Amboss's listing — nothing is
+order waits for approval — or is taken on and not yet booked as a sale — nothing is
 topped up or given back, and the offers share what can be sold. The deploy cap's share is
 Amboss's listing of sold capital plus the journal's own sales funded since; when the listing
 fails, the last good one (under an hour old) stands. A spend outside the main run — a channel
 opened by hand, an on-chain send, an LSPS1 sale's channel — has the offers' capital checked
-within seconds (capital only: no price, size or lease move). The lane bills an order's fee
+within seconds — no price or lease move, but the same capital and cost checks: it cuts what
+can't be funded, can raise the min channel to the smallest order that pays for its channel and
+take an offer off the market below cost. It takes the offers' own lock (the main run's magma
+stage takes it too, so the two never overlap) within a 5-minute deadline, and never holds up a
+scheduled run. A magma stage given up at its deadline writes nothing when its call answers
+late. The lane bills an order's fee
 parts (`fees.fixed + fees.variable`, when `fees.seller` reads 0) only when they are an
-offer's price for the order's size to within a sat; any other amount is left to the operator.
+offer's price for the order's size to within a sat; any other amount is left to the operator,
+and an alert names the order and its deadline. An auto-sized offer whose min goes up is priced
+for the window it gets, in the same run (not for the old one, corrected a run later).
 An Accept by hand below the floor needs a second yes. A sold channel opens with a routing fee
 of its own (a new channel's, never above the lease's promise) and its order's tag
 (`magma:<id>`); a sale whose channel was opened elsewhere takes its outpoint from Amboss and

@@ -91,8 +91,15 @@ test("with auto-size on, an offer the autopilot manages gets the standard lease 
   assert.equal(byId(theirs.id).recommended.minBlockLength, 12_960, "the operator's terms: its lease stays, priced as such");
   await autopilot.runOnce();
   assert.equal(managed.minBlockLength, 4320);
-  // 5% a year for 4,320 blocks is ~4,110 ppm per lease.
-  assert.ok(Math.abs(effective(managed) - 4110) <= 2, `the 30-day price with the 30-day lease: ${Math.round(effective(managed))}`);
+  // 5% a year for 4,320 blocks is ~4,110 ppm per lease — at the size window
+  // auto-size gives it in the same write (the engine prices it for that one;
+  // its max is the deployable capital, the write's what one channel can fund
+  // after the open's own fee: a few ppm apart).
+  const eff = managed.feeRatePpm + (managed.baseFeeSats / Math.sqrt(managed.minSats * managed.maxSats)) * 1e6;
+  assert.ok(
+    Math.abs(eff - 4110) <= 5,
+    `the 30-day price with the 30-day lease: ${Math.round(eff)} (${managed.feeRatePpm} + ${managed.baseFeeSats}, ${managed.minSats}–${managed.maxSats}; ${Math.round(effective(managed))} at 1M–2M)`,
+  );
   assert.deepEqual([theirs.feeRatePpm, theirs.minBlockLength], [11_500, 12_960], "not the autopilot's to change");
 });
 

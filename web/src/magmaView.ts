@@ -117,7 +117,8 @@ export function disableSellingMessage(enabledOffers: number): string {
   const which = enabledOffers === 1 ? "Your offer is" : `${enabledOffers} offers are`;
   return (
     `${which} still listed on Amboss. With Liquidity provision off, new orders wait for your decision on Market → Orders — ` +
-    "and Amboss counts an order nobody decides against your seller score. Disable the offer too?"
+    "and Amboss counts an order nobody decides against your seller score. Orders the autopilot accepted are still carried to their end; " +
+    "one you accepted by hand waits for you to open its channel on Market → Orders once it is paid. Disable the offer too?"
   );
 }
 
@@ -310,7 +311,7 @@ export function offerOwner(control: OfferControl | undefined, sellEnabled: boole
     : control?.listOnAt
       ? ' Liquidity provision was switched on with it disabled: the autopilot lists it once it has a price and its smallest channel can be funded ("keep disabled" keeps it off).'
       : control?.costDisabledAt
-        ? ` The autopilot took it off the market: its orders would pay less than opening and closing their channels costs at today's fee rate — ${whileOn}it lists it again once they pay for them.`
+        ? ` The autopilot took it off the market: its orders would pay less than opening and closing their channels cost at today's fee rate — ${whileOn}it lists it again once they pay for them.`
         : control?.autoDisabledAt
           ? ` The autopilot disabled it for lack of capital; ${whileOn}it lists it again once it can be funded.`
           : "";
@@ -332,9 +333,11 @@ export function offerOwner(control: OfferControl | undefined, sellEnabled: boole
  * The base fee move the autopilot has pending for an offer, said where the
  * base fee is shown (2026-10-25: the move waited a day and nothing on the page
  * said so — the 0 that 0.8.0 left looked like the autopilot's choice). Only
- * for an offer the autopilot prices: "→ 284 at 16:14", "→ 284 next run", or
- * null when its base is where comparable offers' is. `time` formats the
- * moment (local time; the date too when it isn't today).
+ * for an offer the autopilot prices: "→ 284 at 16:14", "→ 284 next run",
+ * "kept" when the engine keeps the offer's own (with the market's, its
+ * smallest order would fall below cost — never "→ 284 next run" for a move
+ * that won't come), or null when its base is where comparable offers' is.
+ * `time` formats the moment (local time; the date too when it isn't today).
  */
 export function baseFeeFollow(
   o: Pick<MyOffer, "id" | "baseFeeSats">,
@@ -346,6 +349,14 @@ export function baseFeeFollow(
   const r = report?.sell.recommendations.find((x) => x.offerId === o.id);
   if (!r?.baseFeeDiffers || r.baseFeeMarketSat == null || r.baseFeeMarketSat === o.baseFeeSats) return null;
   const market = r.baseFeeMarketSat;
+  if (r.baseFeeKept) {
+    return {
+      cell: "kept",
+      title:
+        `Comparable offers charge ${market} sat base; this offer keeps its own: with the market's, its smallest order would pay less than ` +
+        "opening and closing its channel costs at today's fee rate — an order the order lane turns down.",
+    };
+  }
   const when = r.baseFeeFollowsAt ? `at ${time(r.baseFeeFollowsAt)}` : "next run";
   return {
     cell: `→ ${market} ${when}`,
@@ -354,6 +365,24 @@ export function baseFeeFollow(
       "— right away when the base is far off, else once the market's has held for 1.5 h, and at most once every 6 h. " +
       "The rate makes up the rest, so a channel of the offer's typical size costs the same.",
   };
+}
+
+/** The Sell tab's banner for orders waiting on you: a decision to make in
+ *  time, or — paid, their channel not one the lane opens — your Open click
+ *  (final review 2026-10-25: both read "accept or reject in time"). Null:
+ *  none waits. */
+export function pendingOrdersBanner(s: { pendingSellerOrders: number; pendingSellerOpens?: number }): string | null {
+  const opens = Math.max(0, Math.min(s.pendingSellerOrders, s.pendingSellerOpens ?? 0));
+  const decide = Math.max(0, s.pendingSellerOrders - opens);
+  const parts: string[] = [];
+  if (decide > 0) parts.push(`${decide} order${decide === 1 ? "" : "s"} waiting for your decision — accept or reject ${decide === 1 ? "it" : "them"} in time on Market → Orders`);
+  if (opens > 0) {
+    parts.push(
+      `${opens} paid order${opens === 1 ? "" : "s"} waiting for you to open ${opens === 1 ? "its channel" : "their channels"} — click Open on Market → Orders before the deadline`,
+    );
+  }
+  if (parts.length === 0) return null;
+  return `${parts.join("; ")}, or Amboss counts ${decide + opens === 1 ? "it" : "them"} against your seller score.`;
 }
 
 /** "16:14" today, "Mon 16:14" on another day (local time). */

@@ -115,8 +115,10 @@ export interface MagmaJournalEntry {
   /** A rejected order: what it was refused for (RefusalKind). Absent on
    *  records from before it was kept. */
   refusalKind?: RefusalKind;
-  /** The lane's latest decision about this order, with its reason. */
-  decision?: { at: string; action: string; reason: string };
+  /** The lane's latest decision about this order, with its reason. `kind`
+   *  "parts": a skip because its fee parts aren't an offer price — the
+   *  order is the operator's to decide (MagmaDesk.partsLeftToYou). */
+  decision?: { at: string; action: string; reason: string; kind?: "parts" };
   lastStatus?: string;
   lastStatusAt?: string;
   /** Amboss's deadline for the current phase, as last seen. */

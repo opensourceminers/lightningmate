@@ -37,6 +37,7 @@ import {
   offerDraftDefaults,
   offerOwner,
   offerSizeWarning,
+  pendingOrdersBanner,
   priceDraft,
   pricedLeaseWarning,
   freeOfferNote,
@@ -373,12 +374,7 @@ export function MarketSell() {
       {cfg?.sellEnabled && failedOfferWrite(sync) ? (
         <p className="banner error">The autopilot could not update your offer on Amboss: {failedOfferWrite(sync)}</p>
       ) : null}
-      {rec && rec.sell.pendingSellerOrders > 0 ? (
-        <div className="magma-warn-banner">
-          ⚠ {rec.sell.pendingSellerOrders} order{rec.sell.pendingSellerOrders === 1 ? "" : "s"} waiting on you — accept or reject in
-          time (Market → Orders), or Amboss counts it against your seller score.
-        </div>
-      ) : null}
+      {rec && pendingOrdersBanner(rec.sell) ? <div className="magma-warn-banner">⚠ {pendingOrdersBanner(rec.sell)}</div> : null}
       <p className="sell-lede muted">
         Amboss decides who gets an order — mostly sellers with a track record. LightningMate makes selling correct and reliable; it
         can't make Amboss pick you.
@@ -489,7 +485,8 @@ export function MarketSell() {
           </p>
         ))}
       {(sync?.offers ?? [])
-        .filter((e) => e.amboss.status === "ENABLED" && e.turnedDownUnderSat !== undefined)
+        // While selling is on: with it off, nothing turns them down.
+        .filter((e) => !!cfg?.sellEnabled && e.amboss.status === "ENABLED" && e.turnedDownUnderSat !== undefined)
         .map((e) => (
           <p key={`under-${e.offerId}`} className="sug-warn">
             ⚠ {turnedDownLine(e, !!controls[e.offerId]?.manual)}

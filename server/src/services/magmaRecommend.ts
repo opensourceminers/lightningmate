@@ -175,6 +175,10 @@ export interface MagmaSellRecommendation {
   /** It differs and the offer's base follows at this time (ISO) — not yet:
    *  the market's base is settling, or a base move was made < 6 h ago. */
   baseFeeFollowsAt?: string;
+  /** It differs, and the offer keeps its own: with the market's base its
+   *  smallest order would pay less than its channel costs today — the base
+   *  doesn't follow (Market → Sell says "kept", never "→ X next run"). */
+  baseFeeKept?: boolean;
   current: { feeRatePpm: number; baseFeeSat: number; effectiveFeePpm: number } | null;
   /** The terms the offer should carry: the price, the lease that price is for
    *  (the one the offer carries after the next write: the standard 4320 —
@@ -310,6 +314,9 @@ export interface MagmaV2Report {
      *  order paying less is turned down as below cost. */
     acceptFloorSat: number;
     pendingSellerOrders: number;
+    /** Of those, the paid ones waiting for the operator to open their
+     *  channel (the lane doesn't open them): their Open click, not a decision. */
+    pendingSellerOpens: number;
     /** Real completed Magma orders from Amboss, for our own size band. */
     clearing: ClearingStats | null;
     /** Market-wide activity, so "nothing sells" can be told from "we don't sell". */
@@ -467,6 +474,32 @@ export function minSizeCoveringSat(feeRatePpm: number, baseFeeSats: number, floo
   if (!(floorSat > 0) || baseFeeSats >= floorSat) return 0;
   if (!(feeRatePpm > 0)) return Number.POSITIVE_INFINITY;
   return Math.ceil(((floorSat - baseFeeSats) * 1_000_000) / feeRatePpm / 10_000) * 10_000;
+}
+
+/**
+ * The window auto-size gives an offer (the autopilot's reshape): its floor
+ * moves to the smallest channel that pays for itself (`wantMin`) when that
+ * is well above or below the offer's (±20 %), its max widens to what can be
+ * funded (`wantMax`) when that is well above it (20 %). Null: the offer's
+ * own window stands. The engine prices an auto-sized offer for this window
+ * — the one it is written with — and the upkeep writes it (final review
+ * 2026-10-25: priced for the old 250k–2M while the min went to 1.6M, the
+ * offer went out at ~2.2× the market and came back down a run later).
+ */
+export function autoSizedWindow(
+  off: { minSizeSats: number; maxSizeSats: number },
+  wantMin: number,
+  wantMax: number,
+): { minSizeSats: number; maxSizeSats: number } | null {
+  if (!(wantMin > 0) || wantMax < wantMin) return null;
+  const widens = wantMax > off.maxSizeSats * 1.2;
+  const lowersFloor = wantMin < off.minSizeSats * 0.8;
+  const raisesFloor = wantMin > off.minSizeSats * 1.2;
+  if (!widens && !lowersFloor && !raisesFloor) return null;
+  return {
+    minSizeSats: raisesFloor ? wantMin : Math.min(wantMin, off.minSizeSats),
+    maxSizeSats: Math.max(wantMax, off.maxSizeSats),
+  };
 }
 
 export async function getMagmaRecommendations(
@@ -691,8 +724,13 @@ export async function getMagmaRecommendations(
 
   // ── Build a sell recommendation for an existing offer (or a hypothetical create) ──
   const buildSell = (offer: MyOffer | null): MagmaSellRecommendation => {
-    const minSize = offer?.minSizeSats ?? sellWindow.min;
-    const maxSize = offer?.maxSizeSats ?? sellWindow.max;
+    // An offer auto-size manages is priced for the window it is about to get
+    // (autoSizedWindow — the upkeep's reshape writes the same), not for the
+    // one it has: the representative size, and with it the profit floor,
+    // moves with it.
+    const sized = offer && autoLease(offer) ? autoSizedWindow(offer, sellWindow.min, sellWindow.max) : null;
+    const minSize = sized?.minSizeSats ?? offer?.minSizeSats ?? sellWindow.min;
+    const maxSize = sized?.maxSizeSats ?? offer?.maxSizeSats ?? sellWindow.max;
     // Priced for the lease the offer carries after the next write: a 90-day
     // lease ties the capital up three times as long as a 30-day one, so its
     // profit floor and the clearing price at the same rate a year are about
@@ -957,6 +995,7 @@ export async function getMagmaRecommendations(
       ...(baseOnly ? { baseOnly } : {}),
       ...(offer ? { baseFeeMarketSat: marketBase, baseFeeDiffers: baseDiffers } : {}),
       ...(offer && baseHeld && follow?.at != null ? { baseFeeFollowsAt: new Date(follow.at).toISOString() } : {}),
+      ...(offer && baseRefusedSat !== null ? { baseFeeKept: true } : {}),
       current,
       recommended: {
         ...recommended,
@@ -1251,6 +1290,7 @@ export async function getMagmaRecommendations(
       onchainFeePerVbyte,
       acceptFloorSat,
       pendingSellerOrders: pendingSeller,
+      pendingSellerOpens: awaitingOpen,
       clearing: reportClearing,
       marketActivity: marketActivity(),
       historyAgeHours: magmaHistoryAgeHours(),

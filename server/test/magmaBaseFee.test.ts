@@ -367,6 +367,8 @@ test("a base going down to the market's is refused where the smallest order woul
       assert.ok(rec.reasons.some((r) => r.startsWith("keeps its base of 1500 sat: with the market's 568 sat its smallest order (250000 sat) would pay")), rec.reasons.join(" | "));
       assert.equal(offer.baseFeeSats, 1500);
       assert.ok(smallest(offer) >= floor, `${smallest(offer)} vs the floor ${floor}`);
+      // Market → Sell says "kept" — never "→ 568 next run" for a move that won't come.
+      assert.equal(rec.baseFeeKept, true);
     } else if (own === 0) {
       // Going UP: the smallest order pays more with the market's base — even
       // where that is still short of the floor, it is never kept from going up.
@@ -375,6 +377,7 @@ test("a base going down to the market's is refused where the smallest order woul
       assert.equal(offer.baseFeeSats, 568, `${satPerVbyte} sat/vB: the smallest order still pays its way — the base follows`);
       assert.ok(smallest(offer) >= floor);
     }
+    if (!kept) assert.equal(rec.baseFeeKept, undefined);
   }
 });
 

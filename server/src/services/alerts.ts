@@ -115,6 +115,18 @@ export function magmaRefusalAlerts(desk: { refusals(): Pick<MagmaRefusal, "order
   }));
 }
 
+/** Orders the order lane leaves to the operator — their fee parts aren't an
+ *  offer price for their size (MagmaDesk.partsLeftToYou) — with the deadline
+ *  the decision has to come by. Derived: each goes once it is decided. */
+export function magmaPartsAlerts(desk: { partsLeftToYou(): { orderId: string; sizeSats: number; reason: string; deadline: string | null }[] }): Alert[] {
+  return desk.partsLeftToYou().map((o) => ({
+    level: "warn" as const,
+    message:
+      `A ${Math.round(o.sizeSats).toLocaleString("en-US")} sat Magma order waits for your decision: ${o.reason}` +
+      `${o.deadline ? ` before ${o.deadline.slice(0, 16).replace("T", " ")} UTC` : ""} — Amboss counts an order nobody decides against your seller score.`,
+  }));
+}
+
 /** A listed offer of this node that is priced wrong: listed for free, or
  *  holding terms other than the ones LightningMate last wrote — and one the
  *  autopilot took off the market for being free, or is to list since selling
@@ -208,8 +220,10 @@ export function offerPriceAlerts(
       });
     }
     // Listed, with a window that invites orders the lane turns down below
-    // cost (its window not the autopilot's to size): from which size.
-    if (e.amboss.status === "ENABLED" && e.turnedDownUnderSat !== undefined) {
+    // cost (its window not the autopilot's to size): from which size — while
+    // selling is on (with it off, nothing turns them down: they wait for the
+    // operator).
+    if (selling && e.amboss.status === "ENABLED" && e.turnedDownUnderSat !== undefined) {
       alerts.push({
         level: "warn",
         message:

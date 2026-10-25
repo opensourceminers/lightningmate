@@ -297,6 +297,9 @@ export interface MagmaDeskDeps {
    *  its channel costs on chain now, after the service fee
    *  (Autopilot.saleFeeFloorSats). Without it, no floor beyond "not 0". */
   saleFloorSats?: () => Promise<number>;
+  /** What a refusal below that floor adds while LND's fee estimate fails:
+   *  which floor it went by (Autopilot.saleFloorNote) — null: nothing to add. */
+  saleFloorNote?: () => string | null;
   /** For the close of a finished lease's channel (closeFinishedLeases): the
    *  economy fee rate a close pays now (null: no estimate) and the
    *  operator's maximum on-chain fee rate (sat/vB), and whether a channel
@@ -734,6 +737,28 @@ export class MagmaDesk {
         const reason = e.reason ?? e.decision?.reason ?? "rejected";
         return { orderId: e.orderId, sizeSats: e.sizeSats, reason, kind: e.refusalKind ?? refusalKindOf(reason), at: e.decision!.at };
       });
+  }
+
+  /**
+   * Orders waiting for approval that the lane leaves to the operator: Amboss
+   * shows no amount for them, and their fee parts aren't an offer price for
+   * their size (partsUnmatched) — neither accepted nor turned down here, so
+   * without a click Amboss counts the missed deadline against the seller
+   * score (final review 2026-10-25: nothing but the order's own row said
+   * so). Each goes once it is decided, or its deadline has passed.
+   */
+  partsLeftToYou(nowMs = Date.now()): { orderId: string; sizeSats: number; reason: string; deadline: string | null }[] {
+    return this.journal
+      .all()
+      .filter(
+        (e) =>
+          e.phase === "seen" &&
+          e.decision?.action === "skip" &&
+          e.decision.kind === "parts" &&
+          (e.lastStatus === undefined || e.lastStatus === "WAITING_FOR_SELLER_APPROVAL") &&
+          !(e.timeout && Date.parse(e.timeout) <= nowMs),
+      )
+      .map((e) => ({ orderId: e.orderId, sizeSats: e.sizeSats, reason: e.decision!.reason, deadline: e.timeout ?? null }));
   }
 
   /** The operator read the alert about a turned-down order. */
@@ -1754,15 +1779,16 @@ export class MagmaDesk {
     // here: the order is the operator's to judge, neither accepted nor turned
     // down by the lane (review 2026-10-25: the parts were billed unchecked).
     const unmatched = this.partsUnmatched(order);
-    if (unmatched) return [this.skip(entry, unmatched)];
+    if (unmatched) return [this.skip(entry, unmatched, "parts")];
     // Never at a loss, however the order came to be priced so (an offer listed
     // too low for a while, a price set elsewhere): what it pays must at least
     // cover opening and closing its channel on chain.
     const floorSats = await this.acceptFloorSats();
     if (fee < BigInt(floorSats) * 1000n) {
+      const note = this.deps.saleFloorNote?.();
       return this.rejectOrder(
         entry,
-        `it pays ${(Number(fee) / 1000).toLocaleString("en-US")} sat — less than opening and closing its channel costs on chain now (${floorSats.toLocaleString("en-US")} sat)`,
+        `it pays ${(Number(fee) / 1000).toLocaleString("en-US")} sat — less than opening and closing its channel costs on chain now (${floorSats.toLocaleString("en-US")} sat)${note ? `; ${note}` : ""}`,
       );
     }
     // That read is awaited: the switch, again.
@@ -1835,8 +1861,8 @@ export class MagmaDesk {
     );
   }
 
-  private skip(entry: MagmaJournalEntry, reason: string): MagmaSellAction {
-    entry.decision = { at: now(), action: "skip", reason };
+  private skip(entry: MagmaJournalEntry, reason: string, kind?: "parts"): MagmaSellAction {
+    entry.decision = { at: now(), action: "skip", reason, ...(kind ? { kind } : {}) };
     this.journal.note(entry);
     return { orderId: entry.orderId, action: "skip", sizeSats: entry.sizeSats, ok: false, error: reason };
   }
@@ -3011,6 +3037,7 @@ export class MagmaDesk {
           const floorSats = await this.acceptFloorSats();
           if (fee < BigInt(floorSats) * 1000n) {
             const feeSats = Number(fee) / 1000;
+            const note = this.deps.saleFloorNote?.();
             return {
               ok: false,
               code: "below_cost",
@@ -3018,7 +3045,7 @@ export class MagmaDesk {
               floorSats,
               message:
                 `Not accepted: this order pays ${feeSats.toLocaleString("en-US")} sat — less than opening and closing its channel costs on chain now ` +
-                `(${floorSats.toLocaleString("en-US")} sat, after the service fee).`,
+                `(${floorSats.toLocaleString("en-US")} sat, after the service fee).${note ? ` ${note.charAt(0).toUpperCase()}${note.slice(1)}.` : ""}`,
             };
           }
         }
@@ -3308,6 +3335,12 @@ export class MagmaDesk {
     if (!force && this.deployedFailedAt > 0 && Date.now() - this.deployedFailedAt < DEPLOYED_TTL_MS && this.lastListingUsable()) {
       return this.deployedNow();
     }
+    // The listing's time is when it was asked for, taken before the
+    // reservations it is read against: an order funded while the listing is
+    // on its way is in neither (final review: a second 2M order was accepted
+    // against a 3M cap with 2M already funded) — the deployed figure counts
+    // as of the ask, so deployedNow adds that order from the journal.
+    const askedAt = Date.now();
     const reserving = new Set(this.journal.reservations(0).map((r) => r.key));
     const own = await this.ownPubkey();
     let orders: Awaited<ReturnType<MagmaDesk["ambossSales"]>>["orders"];
@@ -3334,7 +3367,7 @@ export class MagmaDesk {
     const sats = mine
       .filter((o) => o.status !== "WAITING_FOR_SELLER_APPROVAL" && !reserving.has(`magma:${o.id}`))
       .reduce((s, o) => s + o.sizeSats, 0);
-    this.deployed = { sats, at: Date.now(), awaiting: mine.filter((o) => o.status === "WAITING_FOR_SELLER_APPROVAL").map((o) => o.id) };
+    this.deployed = { sats, at: askedAt, awaiting: mine.filter((o) => o.status === "WAITING_FOR_SELLER_APPROVAL").map((o) => o.id) };
     const running = new Set<string>(LEASE_RUNNING_STATUSES);
     this.keepAmbossLeases(
       orders
