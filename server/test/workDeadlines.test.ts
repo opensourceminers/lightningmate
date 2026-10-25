@@ -22,7 +22,10 @@ import { LANE_PASS_DEADLINE } from "../src/services/magmaDesk.js";
 import type { FeeApplyItem } from "../src/services/fees.js";
 import type { FeeRecReport } from "../src/services/feeRecommend.js";
 import { autopilotWith, plannedFeeChange, sellerSetup, type AutopilotSeams } from "./helpers/autopilot.js";
-import { quiet } from "./helpers/lifecycle.js";
+import { quiet, keepFileAlive } from "./helpers/lifecycle.js";
+
+// Deadlines in these tests fire on timers nothing else keeps alive (see keepFileAlive).
+keepFileAlive();
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

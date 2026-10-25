@@ -27,7 +27,10 @@ import { openFeeRateOf } from "../src/services/openPlan.js";
 import type { FeeRecommendation } from "../src/services/feeRecommend.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
 import { GOSSIP_PEER, autopilotAt, autopilotWith, plannedFeeChange, suggestion } from "./helpers/autopilot.js";
-import { quiet } from "./helpers/lifecycle.js";
+import { quiet, keepFileAlive } from "./helpers/lifecycle.js";
+
+// Deadlines in these tests fire on timers nothing else keeps alive (see keepFileAlive).
+keepFileAlive();
 
 const HOUR = 3_600_000;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

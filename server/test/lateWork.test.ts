@@ -23,8 +23,11 @@ import type { RebalanceRecReport } from "../src/services/rebalanceRecommend.js";
 import { autopilotWith, paidRebalance, plannedFeeChange, plannedRebalance, suggestion, type AutopilotSeams } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
-import { quiet, sleep } from "./helpers/lifecycle.js";
+import { quiet, sleep, keepFileAlive } from "./helpers/lifecycle.js";
 import { until } from "./helpers/wait.js";
+
+// Deadlines in these tests fire on timers nothing else keeps alive (see keepFileAlive).
+keepFileAlive();
 
 /** Every deadline this short (ms); restored after the test. */
 function shortDeadlines(t: TestContext, stage = 150, perRefill = 150): void {

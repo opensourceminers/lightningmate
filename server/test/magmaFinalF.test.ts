@@ -19,9 +19,12 @@ import { __setHistoryForTests } from "../src/services/magmaHistory.js";
 import { minSizeCoveringSat, saleAcceptFloorSats } from "../src/services/magmaRecommend.js";
 import { magmaPartsAlerts, offerPriceAlerts } from "../src/services/alerts.js";
 import { BUYER, plannedFeeChange, sellerSetup, type AutopilotSeams } from "./helpers/autopilot.js";
-import { IN_AN_HOUR, entryOnDisk, feeEnv, quiet, walletBalance } from "./helpers/lifecycle.js";
+import { IN_AN_HOUR, entryOnDisk, feeEnv, quiet, walletBalance, keepFileAlive } from "./helpers/lifecycle.js";
 import type { FakeLnd } from "./helpers/fakeLnd.js";
 import type { AfterHook } from "./helpers/tmp.js";
+
+// Deadlines in these tests fire on timers nothing else keeps alive (see keepFileAlive).
+keepFileAlive();
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const fmt = (n: number) => n.toLocaleString("en-US");

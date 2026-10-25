@@ -19,7 +19,10 @@ import { WORK_DEADLINES_MS } from "../src/services/autopilot.js";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
 import type { FakeLnd } from "./helpers/fakeLnd.js";
 import { chanNumber } from "./helpers/feeNode.js";
-import { quiet } from "./helpers/lifecycle.js";
+import { quiet, keepFileAlive } from "./helpers/lifecycle.js";
+
+// Deadlines in these tests fire on timers nothing else keeps alive (see keepFileAlive).
+keepFileAlive();
 
 const OTHER = "03" + "ef".repeat(32);
 

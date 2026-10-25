@@ -1,4 +1,4 @@
-import type { TestContext } from "node:test";
+import { after, type TestContext } from "node:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import type { MagmaJournalEntry } from "../../src/services/magmaJournal.js";
@@ -93,3 +93,19 @@ export function crashAt(desk: object, seam: Seam, when: "before" | "after"): () 
   };
   return () => reached;
 }
+
+/**
+ * Keeps this test file's process alive until all its tests are done. A test
+ * that waits for work to be given up at a (shortened) deadline — LND faked
+ * never to answer — has nothing pending but that deadline's timer, and the
+ * app's timers are unref'd (they must never hold up a shutdown). Node 22 then
+ * ends the event loop before the deadline fires and cancels every test left
+ * in the file ("Promise resolution is still pending but the event loop has
+ * already resolved"); Node 24 happened to keep going. Call it once, at the
+ * top of such a file.
+ */
+export function keepFileAlive(): void {
+  const handle = setInterval(() => {}, 1_000);
+  after(() => clearInterval(handle));
+}
+
