@@ -637,3 +637,14 @@ test("'significant unique reach' protects only with at least five 2-hop nodes no
   assert.deepEqual(ranked([6, 2, 0]), { listed: ["peer-2", "peer-3"], kept: ["peer-1: provides significant unique reach"] });
   assert.deepEqual(ranked([40, 25, 0]).kept, ["peer-1: provides significant unique reach", "peer-2: provides significant unique reach"]);
 });
+
+test("a forwarding history read cut short lists no channel as dead — only a peer away for days still lists one (final review 2026-10-25)", () => {
+  const idle = chan(1);
+  const away = chan(2);
+  const offline = (c: ChannelView) => (c.id === away.id ? ({ long: true } as unknown as OfflineInfo) : null);
+  const full = rankCloseCandidates(input([idle, away], { offline }));
+  assert.deepEqual(full.candidates.map((c) => c.channelId).sort(), [idle.id, away.id].sort());
+  const cut = rankCloseCandidates(input([idle, away], { offline, flowKnown: false }));
+  assert.deepEqual(cut.candidates.map((c) => c.channelId), [away.id]);
+  assert.match(cut.protected.find((p) => p.channelId === idle.id)?.reason ?? "", /^its 60-day forwarding history couldn't be read in full/);
+});

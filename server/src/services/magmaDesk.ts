@@ -303,9 +303,10 @@ export interface MagmaDeskDeps {
   /** For the close of a finished lease's channel (closeFinishedLeases): the
    *  economy fee rate a close pays now (null: no estimate) and the
    *  operator's maximum on-chain fee rate (sat/vB), and whether a channel
-   *  routes well enough to keep (Autopilot.soldChannelClose). Without it,
-   *  no such channel is closed: never at any rate. */
-  soldChannelClose?: () => Promise<{ feeRate: number | null; maxFeeRate: number; routesWell: (channelId: string) => boolean }>;
+   *  routes well enough to keep (Autopilot.soldChannelClose; null: that
+   *  can't be told — kept). Without it, no such channel is closed: never at
+   *  any rate. */
+  soldChannelClose?: () => Promise<{ feeRate: number | null; maxFeeRate: number; routesWell: (channelId: string) => boolean | null }>;
   /** The prices this node's offers ask, or asked lately
    *  (Autopilot.knownOfferPrices): an invoice billed from an order's fee
    *  parts — fees.seller read 0 — must be one of them for the order's size.
@@ -3474,9 +3475,12 @@ export class MagmaDesk {
    * Kept open when our side holds under SOLD_CLOSE_MIN_LOCAL_SHARE of it (what
    * is left is inbound worth keeping) or it routes well; closed at the
    * economy fee rate, never above the operator's maximum on-chain fee rate
-   * (it paid LND's 6-block rate, whatever that was).
+   * (it paid LND's 6-block rate, whatever that was). Whether it routes well
+   * unknown (a read failed): kept — never closed on a guess. `shouldStop`
+   * (the autopilot's: selling or auto-close switched off, its stage given
+   * up) is asked before each sale and right before each close.
    */
-  async closeFinishedLeases(): Promise<MagmaSellAction[]> {
+  async closeFinishedLeases(opts: { shouldStop?: () => boolean } = {}): Promise<MagmaSellAction[]> {
     const { writeLnd, amboss } = this.deps;
     if (!writeLnd || !amboss.hasKey()) return [];
     const key = amboss.getKey();
@@ -3490,10 +3494,12 @@ export class MagmaDesk {
     const running = new Set(this.runningLeasesOnAmboss().map((l) => standardChannelId(l.channelId)));
     let terms: Awaited<ReturnType<NonNullable<MagmaDeskDeps["soldChannelClose"]>>> | null | undefined;
     const out: MagmaSellAction[] = [];
+    // (Auto-close is selling's automation: none starts once Liquidity
+    // provision is switched off — or all automation paused, auto-close
+    // switched off, the work given up — meanwhile.)
+    const stop = () => this.stopping || !this.deps.config().sellEnabled || opts.shouldStop?.() === true;
     for (const o of orders) {
-      // (Auto-close is selling's automation: none starts once Liquidity
-      // provision is switched off — or all automation paused — meanwhile.)
-      if (this.stopping || !this.deps.config().sellEnabled) break;
+      if (stop()) break;
       let point = this.journal.get(o.id)?.fundingOutpoint ?? this.finishedTxids.get(o.id);
       if (point === undefined) {
         // Asked once per process — but only Amboss's answer is remembered. A
@@ -3510,33 +3516,41 @@ export class MagmaDesk {
       if (running.has(standardChannelId(ch.id))) continue; // a lease still runs on it
       // Is it worth closing? (Asked once per pass, when a close is due.)
       terms ??= this.deps.soldChannelClose ? await this.deps.soldChannelClose().catch(() => null) : null;
-      const keep =
+      const well = terms ? terms.routesWell(ch.id) : null;
+      const keep: { why: string; text: string } | null =
         ch.local_balance < SOLD_CLOSE_MIN_LOCAL_SHARE * ch.capacity
-          ? `kept open: ${Math.round(ch.local_balance).toLocaleString("en-US")} of its ${Math.round(ch.capacity).toLocaleString("en-US")} sat are on our side — the rest is inbound worth keeping`
-          : terms?.routesWell(ch.id)
-            ? "kept open: it routes well (it earns at least what a sat of this node's channels earns)"
+          ? {
+              why: "local",
+              text: `kept open: ${Math.round(ch.local_balance).toLocaleString("en-US")} of its ${Math.round(ch.capacity).toLocaleString("en-US")} sat are on our side — the rest is inbound worth keeping`,
+            }
+          : well === true
+            ? { why: "routes", text: "kept open: it routes well (it earns at least what a sat of this node's channels earns)" }
             : !terms
-              ? "not closed yet: no on-chain fee estimate to close it at an economy rate"
-              : terms.feeRate === null
-                ? "not closed yet: LND gave no on-chain fee estimate"
-                : terms.feeRate > terms.maxFeeRate
-                  ? `not closed yet: on-chain fees are ${terms.feeRate} sat/vB at the economy rate — above your ${terms.maxFeeRate} sat/vB maximum`
-                  : null;
+              ? { why: "terms", text: "not closed yet: no on-chain fee estimate to close it at an economy rate" }
+              : well === null
+                ? { why: "unknown", text: "not closed yet: whether it routes well couldn't be read (this node's forwarding history or channel list) — it is not closed on a guess" }
+                : terms.feeRate === null
+                  ? { why: "estimate", text: "not closed yet: LND gave no on-chain fee estimate" }
+                  : terms.feeRate > terms.maxFeeRate
+                    ? { why: "fees", text: `not closed yet: on-chain fees are ${terms.feeRate} sat/vB at the economy rate — above your ${terms.maxFeeRate} sat/vB maximum` }
+                    : null;
       if (keep) {
-        // Said once per process (in the order's history, or the log for a
-        // sale the journal doesn't know), not each run.
-        if (this.closeKept.get(o.id) !== keep) {
-          this.closeKept.set(o.id, keep);
+        // Said once per process for each reason (in the order's history, or
+        // the log for a sale the journal doesn't know) — not each run, nor
+        // each time its figures move (final review 2026-10-25: the fee rate
+        // and the balance in the text made a line most runs).
+        if (this.closeKept.get(o.id) !== keep.why) {
+          this.closeKept.set(o.id, keep.why);
           const entry = this.journal.get(o.id);
           if (entry) {
-            this.journal.event(entry, `lease over — ${keep}`);
+            this.journal.event(entry, `lease over — ${keep.text}`);
             this.journal.note(entry);
-          } else console.log(`[magma] order ${o.id}: lease over — ${keep}`);
+          } else console.log(`[magma] order ${o.id}: lease over — ${keep.text}`);
         }
         continue;
       }
-      // Again right before the close: the read above may have taken a while.
-      if (this.stopping || !this.deps.config().sellEnabled) break;
+      // Again right before the close: the reads above may have taken a while.
+      if (stop()) break;
       const res = await closeChannelByOutpoint(writeLnd, ch.transaction_id, ch.transaction_vout, false, terms?.feeRate ?? undefined);
       const entry = this.journal.get(o.id);
       if (entry && res.ok) {

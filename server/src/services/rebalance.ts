@@ -615,15 +615,34 @@ export function pathfindingMs(leftMs: number): number {
   return Math.max(1_000, Math.min(PATHFINDING_TIMEOUT_MS, Math.floor((leftMs - margin) / 1_000) * 1_000));
 }
 
+/** How the executor asks LND about a payment its call lost track of
+ *  (paymentAbsent): twice, `recheckMs` apart, all within `deadlineMs`
+ *  (exported for tests). */
+export const PAYMENT_CHECK = { recheckMs: 2_000, deadlineMs: 20_000 };
+
 /** LND has no payment by this id (it never left this node): the library's
- *  SentPaymentNotFound. Any other answer — pending, settled, failed, or no
- *  answer at all — is not "absent". */
+ *  SentPaymentNotFound — twice, PAYMENT_CHECK.recheckMs apart: a call that
+ *  broke off in transport may have reached LND, still creating the payment,
+ *  and one "not found" right after could race that (final review
+ *  2026-10-25). Any other answer — pending, settled, failed, an error, or
+ *  none within PAYMENT_CHECK.deadlineMs (the check had no deadline: an LND
+ *  that didn't answer held the refill until the stage's) — is not "absent". */
 async function paymentAbsent(lnd: AuthenticatedLnd, id: string): Promise<boolean> {
-  try {
-    await getPayment({ lnd, id });
-    return false;
-  } catch (err) {
-    return Array.isArray(err) && err[1] === "SentPaymentNotFound";
-  }
+  const deadline = Date.now() + PAYMENT_CHECK.deadlineMs;
+  const notFound = async (): Promise<boolean> => {
+    const left = deadline - Date.now();
+    if (left <= 0) return false;
+    const answer = await waitAtMost(
+      getPayment({ lnd, id }).then(
+        () => false,
+        (err: unknown) => Array.isArray(err) && err[1] === "SentPaymentNotFound",
+      ),
+      left,
+    );
+    return answer === true;
+  };
+  if (!(await notFound())) return false;
+  await new Promise((resolve) => setTimeout(resolve, Math.max(0, Math.min(PAYMENT_CHECK.recheckMs, deadline - Date.now()))));
+  return notFound();
 }
 

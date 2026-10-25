@@ -197,7 +197,8 @@ export function measureFeeChanges(
     const series = byChannel.get(id) ?? empty;
     for (let i = 0; i < list.length; i++) {
       const c = list[i];
-      if (c.fromPpm === c.toPpm) continue;
+      // (A change whose "from" wasn't known can't say which way it went.)
+      if (c.fromPpm === null || c.fromPpm === c.toPpm) continue;
       const t = Date.parse(c.at);
       if (nowMs - t > LOOKBACK_DAYS * DAY) continue;
       const prev = i > 0 ? Date.parse(list[i - 1].at) : -Infinity;

@@ -160,6 +160,8 @@ test("a finished lease (CHANNEL_MONITORING_FINISHED) is closed when auto-close i
   node.channels.push({ partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 1_990_000, transactionId: txid, transactionVout: 0 });
   magma.addSale({ buyerPubkey: BUYER, status: "CHANNEL_MONITORING_FINISHED", transactionId: `${txid}:0` });
   node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: "500" })); // 2 sat/vB: the close's economy rate
+  // (Its routing read, and nothing earned: unread, it would be kept — final review 2026-10-25.)
+  node.override("default.forwardingHistory", (_a, cb) => cb(null, { forwarding_events: [], last_offset_index: "0" }));
   node.override("default.closeChannel", () => {
     const s = Object.assign(new EventEmitter(), { cancel: () => undefined });
     setImmediate(() => s.emit("data", { update: "close_pending", close_pending: { txid: randomBytes(32), output_index: 0 } }));
@@ -179,6 +181,7 @@ test("a finished lease whose order Amboss fails to show once is closed on the ne
   magma.addSale({ buyerPubkey: BUYER, status: "CHANNEL_MONITORING_FINISHED", transactionId: `${txid}:0` });
   magma.saleRead = (_id, n) => (n === 0 ? resolverFailed() : null);
   node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: "500" }));
+  node.override("default.forwardingHistory", (_a, cb) => cb(null, { forwarding_events: [], last_offset_index: "0" }));
   node.override("default.closeChannel", () => {
     const s = Object.assign(new EventEmitter(), { cancel: () => undefined });
     setImmediate(() => s.emit("data", { update: "close_pending", close_pending: { txid: randomBytes(32), output_index: 0 } }));

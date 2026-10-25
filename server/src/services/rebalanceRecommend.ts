@@ -16,6 +16,8 @@ import {
   DEMAND_RAMP_SALES,
   LOW_FLOW_FORWARDS,
   LOW_FLOW_GRACE_DAYS,
+  LOW_FLOW_LOCAL_RATIO,
+  PROVEN_RECENT_DAYS,
   PROVEN_WINDOW_DAYS,
   REFILL_INFLOW_TOLERANCE_SATS,
   REFILL_INFLOW_TOLERANCE_SHARE,
@@ -541,7 +543,12 @@ export function classify(ch: ChannelView, fee: FeeRecommendation | undefined, cf
   // (review 2026-10-25: three reviewers, no refill in 2,880 runs).
   const sold = m?.soldSinceChange;
   const level = m?.provenLevel ?? null;
-  const provenPpm = level && level.out > 0 ? level.paidPpm : null;
+  // Only a recent proof — its last sale at most PROVEN_RECENT_DAYS old —
+  // values a refill above the 30-day earnings (final review 2026-10-25: a
+  // level that sold three times 13 days ago, nothing since, still valued
+  // refills at its price).
+  const recentProof = !!level && level.lastSaleDaysAgo <= PROVEN_RECENT_DAYS;
+  const provenPpm = level && level.out > 0 && recentProof ? level.paidPpm : null;
   const earned = Math.max(rec.revenuePpm30d, provenPpm ?? 0);
   const expectedRevenuePpm = Math.round(Math.min(earned, rec.currentPpm || earned, fee?.targetPpm ?? Infinity, fee?.aimPpm ?? Infinity));
   // Valued at a proven price (it lifted the value): the refill is sized to
@@ -556,7 +563,9 @@ export function classify(ch: ChannelView, fee: FeeRecommendation | undefined, cf
     ? provenPpm! >= rec.revenuePpm30d * 1.05
       ? `valued at ${expectedRevenuePpm} ppm: it sold ${level!.sales} times at ${level!.ppm} ppm ${level!.to ? `until ${level!.to.slice(0, 10)}` : "since it was set"} (${provenPpm} ppm paid; ${rec.revenuePpm30d} ppm over 30 d) — a refill of at most ${k(provenCap)}, ${PROVEN_REFILL_MULTIPLE}× what sold at it`
       : null
-    : rec.currentPpm > rec.revenuePpm30d * 1.05
+    : level && !recentProof && level.out > 0 && level.paidPpm > rec.revenuePpm30d * 1.05
+      ? `it sold ${level.sales} times at ${level.ppm} ppm, the last ${Math.round(level.lastSaleDaysAgo)} d ago — older than ${PROVEN_RECENT_DAYS} d, so the ${rec.revenuePpm30d} ppm it earned in 30 d decides`
+      : rec.currentPpm > rec.revenuePpm30d * 1.05
       ? `its fee now (${rec.currentPpm} ppm) counts once it sold ${PROVEN_SALES} times at it within ${PROVEN_WINDOW_DAYS} d (now ${sold?.forwards ?? 0} since it was set) — until then the ${rec.revenuePpm30d} ppm it earned in 30 d decides`
       : null;
   rec.preRefillPpm = expectedRevenuePpm;
@@ -841,7 +850,8 @@ export function refillHoldText(valuePpm: number, cfg: Pick<FeeRecConfig, "maxPpm
   const cap = cfg && !cfg.floorAboveMax ? cfg.maxPpm : null;
   return (
     `after the refill the fee engine keeps it at ≥ ${cap !== null ? Math.min(valuePpm, cap) : valuePpm} ppm until the refilled sats have routed out ` +
-    `(at most 30 d${cap !== null ? `, never above your max of ${cap} ppm` : ""}; released after ${LOW_FLOW_GRACE_DAYS} d with under ${LOW_FLOW_FORWARDS} forwards out in 14 d)`
+    `(at most 30 d${cap !== null ? `, never above your max of ${cap} ppm` : ""}; released after ${LOW_FLOW_GRACE_DAYS} d with under ${LOW_FLOW_FORWARDS} forwards out in 14 d ` +
+    `while ≥ ${Math.round(LOW_FLOW_LOCAL_RATIO * 100)} % of it is local)`
   );
 }
 

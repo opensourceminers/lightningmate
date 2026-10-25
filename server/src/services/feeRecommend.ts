@@ -162,14 +162,28 @@ export const DEMAND_RAMP_HOURS = 6;
  *  — a 2-sat inflow switched a drained channel's demand off (review). */
 export const REFILL_INFLOW_TOLERANCE_SHARE = 0.01;
 export const REFILL_INFLOW_TOLERANCE_SATS = 50_000;
-/** The step-back: a fee raised to a price nothing sold at for this long,
- *  with at least STEP_BACK_MIN_SELLABLE (or 1 % of capacity, if more) it
- *  could have sold, goes back to the last price that sold. */
+/** The step-back: a fee raised to a price nothing sold at for this long —
+ *  counted from the raise, or from when the channel last got sats to sell
+ *  if that is later — with at least STEP_BACK_MIN_SELLABLE (or 1 % of
+ *  capacity, if more) it could have sold, goes back to the higher of the
+ *  last price that sold and the fee before the raise. */
 export const STEP_BACK_AFTER_HOURS = 48;
 export const STEP_BACK_MIN_SELLABLE = 50_000;
 /** LND's default channel reserve: what of a channel's local balance can't
  *  be sold. */
 export const CHANNEL_RESERVE_SHARE = 0.01;
+/** What of a channel's local balance it can sell: what is above LND's
+ *  reserve. */
+export const sellableSats = (capacity: number, localRatio: number): number => {
+  const cap = Math.max(1, capacity);
+  return Math.max(0, Math.round(localRatio * cap - CHANNEL_RESERVE_SHARE * cap));
+};
+/** The least a channel must have to sell for the step-back's hours to run:
+ *  STEP_BACK_MIN_SELLABLE, or 1 % of its capacity if more. */
+export const stepBackSellableMin = (capacity: number): number => Math.max(STEP_BACK_MIN_SELLABLE, CHANNEL_RESERVE_SHARE * Math.max(1, capacity));
+/** After a step-back, the fee it stepped back from is not raised to again
+ *  for this long. */
+export const STEP_BACK_MEMORY_DAYS = 7;
 /** Elasticity may widen a raise step by at most this factor. */
 const MAX_ELASTIC_STEP = 1.5;
 /** The profit floor comes from the autopilot's own refills of this window. */
@@ -373,6 +387,9 @@ export interface FeeRecommendation {
   noFlowLowering: boolean;
   /** Pinned by hand (override "fixed"): applied as set, once. */
   pinned: boolean;
+  /** This move is a step-back (the autopilot remembers the fee it stepped
+   *  back from: not raised to again for STEP_BACK_MEMORY_DAYS). */
+  stepBack?: boolean;
   /** A channel this node sold (Magma, LSPS1) whose order locked a routing-fee
    *  promise for the lease: the target never exceeds it (leaseCaps.ts). */
   leaseCap: { source: LeaseCap["source"]; orderId: string; feeRateCapPpm: number; baseFeeCapMsat: number; untilHeight: number | null } | null;
@@ -454,9 +471,11 @@ export interface Flow {
 
 /** A forward that counts as a SALE — the evidence a raise, the demand ramp
  *  and the refill gate's proof act on (2026-10-25 review): at least
- *  SALE_MIN_SATS out, and forwards through the same pair (in → out) within
- *  SALE_BURST_MS of the one before count once — one sender's burst of
- *  eleven 6–3,200-sat forwards in a minute is one buyer, not eleven. */
+ *  SALE_MIN_SATS out, and forwards out of the channel within SALE_BURST_MS
+ *  of the one before count once — one sender's burst of eleven 6–3,200-sat
+ *  forwards in a minute is one buyer, not eleven, and one payment's shards
+ *  entering through three channels one sale, not three (final review: the
+ *  burst was counted per incoming → outgoing pair). */
 export const SALE_MIN_SATS = 1_000;
 export const SALE_BURST_MS = 60_000;
 
@@ -466,7 +485,7 @@ export const SALE_BURST_MS = 60_000;
 export function salesOf(events: readonly ForwardEvent[], channelId: string, fromMs: number, toMs = Infinity): Flow {
   const flow: Flow = { out: 0, inn: 0, revenue: 0, forwards: 0 };
   let revenueMsat = 0;
-  const lastByPair = new Map<string, number>();
+  let last: number | undefined;
   const inWindow = events
     .map((e) => ({ e, t: Date.parse(e.createdAt) }))
     .filter(({ t }) => t > fromMs && t < toMs)
@@ -476,12 +495,22 @@ export function salesOf(events: readonly ForwardEvent[], channelId: string, from
     if (e.outgoingChannel !== channelId || e.tokens < SALE_MIN_SATS) continue;
     flow.out += e.tokens;
     revenueMsat += e.feeMsat;
-    const last = lastByPair.get(e.incomingChannel);
     if (last === undefined || t - last > SALE_BURST_MS) flow.forwards += 1;
-    lastByPair.set(e.incomingChannel, t);
+    last = t;
   }
   flow.revenue = revenueMsat / 1000;
   return flow;
+}
+
+/** When `channelId` last sold in (fromMs, toMs) — -Infinity: never. */
+function lastSaleMs(events: readonly ForwardEvent[], channelId: string, fromMs: number, toMs: number): number {
+  let last = -Infinity;
+  for (const e of events) {
+    if (e.outgoingChannel !== channelId || e.tokens < SALE_MIN_SATS) continue;
+    const t = Date.parse(e.createdAt);
+    if (t > fromMs && t < toMs && t > last) last = t;
+  }
+  return last;
 }
 
 /** What `channelId` sold after `sinceMs` (its fee's last change) — at the
@@ -495,6 +524,10 @@ export function soldSince(events: readonly ForwardEvent[], channelId: string, si
 export const PROVEN_LEVEL_SALES = DEMAND_RAMP_SALES;
 /** How far back a proven level counts. */
 export const PROVEN_WINDOW_DAYS = 14;
+/** A proven level values a refill above what the channel earned in 30 days
+ *  only while its last sale is at most this old: a week-old proof says
+ *  little about what sells now (final review 2026-10-25). */
+export const PROVEN_RECENT_DAYS = 7;
 
 /** The highest fee level a channel sold PROVEN_LEVEL_SALES times at within
  *  PROVEN_WINDOW_DAYS (what the refill gate values a refill at). */
@@ -509,6 +542,9 @@ export interface ProvenLevel {
   /** When the level began and ended (null: it is the current fee). */
   from: string;
   to: string | null;
+  /** Its last sale, and how many days before the level was read. */
+  lastSaleAt: string;
+  lastSaleDaysAgo: number;
 }
 
 /**
@@ -534,19 +570,22 @@ export function provenLevel(
   const before = [...changes].reverse().find((h) => h.t <= start);
   const inside = changes.filter((h) => h.t > start);
   const levels: { ppm: number; from: number; to: number | null }[] = [];
-  let fee = before ? before.toPpm : inside.length ? inside[0].fromPpm : currentPpm;
+  // (A change whose "from" wasn't known — null — is not guessed at: what
+  // sold before it counts at no level.)
+  let fee: number | null = before ? before.toPpm : inside.length ? inside[0].fromPpm : currentPpm;
   let from = start;
   for (const h of inside) {
-    levels.push({ ppm: fee, from, to: h.t });
+    if (fee !== null) levels.push({ ppm: fee, from, to: h.t });
     fee = h.toPpm;
     from = h.t;
   }
-  levels.push({ ppm: fee, from, to: null });
+  if (fee !== null) levels.push({ ppm: fee, from, to: null });
   let best: ProvenLevel | null = null;
   for (const l of levels) {
     const sold = salesOf(events, channelId, l.from, l.to ?? Infinity);
     if (sold.forwards < PROVEN_LEVEL_SALES || sold.out <= 0) continue;
     if (best && best.ppm >= l.ppm) continue;
+    const lastMs = lastSaleMs(events, channelId, l.from, l.to ?? Infinity);
     best = {
       ppm: l.ppm,
       paidPpm: Math.round((sold.revenue / sold.out) * 1_000_000),
@@ -555,6 +594,8 @@ export function provenLevel(
       revenue: sold.revenue,
       from: new Date(l.from).toISOString(),
       to: l.to === null ? null : new Date(l.to).toISOString(),
+      lastSaleAt: new Date(lastMs).toISOString(),
+      lastSaleDaysAgo: Math.round(((nowMs - lastMs) / DAY_MS) * 10) / 10,
     };
   }
   return best;
@@ -785,6 +826,13 @@ export interface CooldownInput {
    *  promise excepted. Without it, an update LND keeps refusing was resent
    *  every run, each a failed line in the run history. */
   retryAfter?: Record<string, string>;
+  /** Since when each channel has had sats to sell without a break
+   *  (stepBackSellableMin; no entry: it hasn't now) — the step-back's hours
+   *  count from it too. Absent: not kept, the hours count from the raise. */
+  sellableSince?: Record<string, string>;
+  /** Each channel's last step-back: the fee it stepped back from, and when
+   *  — not raised to again for STEP_BACK_MEMORY_DAYS. */
+  stepBacks?: Record<string, { fromPpm: number; at: string }>;
 }
 
 // ── main builder ──────────────────────────────────────────────────────────────
@@ -925,7 +973,9 @@ export async function runFeeEngine(lnd: AuthenticatedLnd, inputs: FeeEngineInput
   for (const r of inputs.feeHistory ?? []) changesOf.set(r.channelId, [...(changesOf.get(r.channelId) ?? []), r]);
   const lastChangeOf = (id: string): BuildCtx["lastChange"] => {
     const last = [...(changesOf.get(id) ?? [])].sort((a, b) => b.at.localeCompare(a.at))[0];
-    return last ? { at: last.at, fromPpm: last.fromPpm, toPpm: last.toPpm } : undefined;
+    return last
+      ? { at: last.at, fromPpm: last.fromPpm, toPpm: last.toPpm, via: last.via, ...(last.why ? { why: last.why } : {}), ...(last.pinned ? { pinned: true } : {}) }
+      : undefined;
   };
   const contexts = new Map<string, BuildCtx>(
     channels.map((ch) => [
@@ -1057,8 +1107,10 @@ export interface BuildCtx {
   soldSinceChange?: Flow;
   /** Its highest proven fee level (provenLevel) — absent: none known. */
   provenLevel?: ProvenLevel | null;
-  /** Its last fee change LightningMate made (the fee-change log). */
-  lastChange?: { at: string; fromPpm: number; toPpm: number };
+  /** Its last fee change LightningMate made (the fee-change log): who made
+   *  it (absent: the autopilot), its reason, whether it applied a pin — and
+   *  its "from", null when that wasn't known. */
+  lastChange?: { at: string; fromPpm: number | null; toPpm: number; via?: FeeChangeRecord["via"]; why?: string; pinned?: boolean };
   currentBlock: number;
   records: RebalanceRecord[];
   bench: NodeBenchmarks;
@@ -1192,11 +1244,12 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   if (grossFlow14d >= 0.2 && netDrain14d >= 0.1) {
     velocityMod = 1.1;
     winsFlow = true;
-    velocityLine = `velocity: draining fast (${Math.round(netDrain14d * 100)}% net in ${cfg.flowWindowDays}d) — small nudge up`;
+    const fact = `velocity: draining fast (${Math.round(netDrain14d * 100)}% net in ${cfg.flowWindowDays}d)`;
+    velocityLine = claim(`${fact} — small nudge up`, fact, 1);
   } else if (grossFlow14d >= 0.05 && netDrain14d >= 0.03) {
     velocityMod = 1.05;
     winsFlow = true;
-    velocityLine = "velocity: steady outbound demand — small nudge up";
+    velocityLine = claim("velocity: steady outbound demand — small nudge up", "velocity: steady outbound demand", 1);
   } else if (grossFlow14d >= 0.2 && Math.abs(netDrain14d) < 0.05) {
     winsFlow = true;
     velocityLine = "velocity: active and balanced — holding";
@@ -1216,7 +1269,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     else if (grossFlow14d <= bench.medianGrossFlow14d * 0.5) benchmarkComparison = "below";
     if (benchmarkComparison === "above" && netDrain14d > 0.05) {
       benchMod = 1.05;
-      benchLine = "benchmark: outperforms node average and draining — raising fee";
+      benchLine = claim("benchmark: outperforms node average and draining — raising fee", "benchmark: outperforms node average and draining", 1);
     } else if (isTopEarner) {
       // never let a top earner be pushed cheaper (by this rule, the explore
       // test or the market below) — nor say it is being tested lower (review:
@@ -1308,7 +1361,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     ch.localRatio >= targetLocalRatio - cfg.deadband && velocityMod <= 1 && (!draining || ctx.elasticityMod < 1);
   // (A fee below the policy's min is lifted to the min by the range rule.)
   let heldLine: string | null = null;
-  const curveAt = (): string => `the balance curve's ~${Math.round(aim / step) * step} ppm`;
+  const curveAt = (): string => `the balance curve's ~${Math.min(cfg.maxPpm, Math.round(aim / step) * step)} ppm`;
   if (noDrainSignal && aim > currentPpm) {
     heldLine = draining
       ? `hold: draining, but higher fees cost flow here before — not raised toward ${curveAt()}`
@@ -1454,45 +1507,104 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const salesKnown = sold !== undefined;
   const changedMs = Date.parse(ctx.cooldown?.lastApplied?.[ch.id] ?? ctx.lastChange?.at ?? "");
   const setAgo = Number.isFinite(changedMs) ? ` (set ${since(changedMs, ctx.nowMs)})` : "";
+  // A drained channel nobody routes through is never raised (below) — its
+  // own hold says so, with its fee as the aim, not "before a sale" (final
+  // review: it read "not raised toward 350 ppm before a sale").
+  const drainedIdle = idle && ch.localRatio < 0.1;
   let unsoldLine: string | null = null;
-  if (salesKnown && sold.forwards === 0 && target > currentPpm) {
-    unsoldLine = `hold: nothing sold at ${currentPpm} ppm since it was set${setAgo} — not raised toward ${Math.round(aim / step) * step} ppm before a sale`;
+  if (salesKnown && sold.forwards === 0 && target > currentPpm && !drainedIdle) {
+    // (The aim as the policy's max bounds it: the line named aims above it.)
+    unsoldLine = `hold: nothing sold at ${currentPpm} ppm since it was set${setAgo} — not raised toward ${Math.min(cfg.maxPpm, Math.round(aim / step) * step)} ppm before a sale`;
     target = currentPpm;
     hiLimit = currentPpm;
     kind = "hold";
     dominant(unsoldLine);
   }
 
+  // After a step-back, the fee it stepped back from is not raised to again
+  // for STEP_BACK_MEMORY_DAYS (final review 2026-10-25): one sale at the
+  // price it went back to, and the ramp climbed straight back into the price
+  // nobody had bought at. A raise goes at most to the highest grid price
+  // below it; a floor, the policy's min, a pin and a lease promise still
+  // move the fee (and a fee a floor took past it is not held back by it).
+  const lastBack = ctx.cooldown?.stepBacks?.[ch.id];
+  const backAtMs = lastBack ? Date.parse(lastBack.at) : NaN;
+  let backCapLine: string | null = null;
+  let backCapAt = Infinity;
+  if (
+    lastBack &&
+    Number.isFinite(backAtMs) &&
+    ctx.nowMs - backAtMs < STEP_BACK_MEMORY_DAYS * DAY_MS &&
+    currentPpm < lastBack.fromPpm &&
+    target >= lastBack.fromPpm
+  ) {
+    backCapAt = Math.max(currentPpm, Math.ceil(lastBack.fromPpm / step) * step - step);
+    const until = new Date(backAtMs + STEP_BACK_MEMORY_DAYS * DAY_MS).toISOString().slice(0, 10);
+    const fact = `stepped back from ${lastBack.fromPpm} ppm ${since(backAtMs, ctx.nowMs)}`;
+    target = backCapAt;
+    hiLimit = Math.min(hiLimit, backCapAt);
+    aim = Math.min(aim, backCapAt);
+    if (backCapAt <= currentPpm) {
+      backCapLine = `hold: ${fact} — not raised back to it before ${until}`;
+      kind = "hold";
+      dominant(backCapLine);
+    } else {
+      backCapLine = claim(`guard: ${fact} — raised no higher than ${backCapAt} ppm before ${until}`, null, 1);
+      reasons.push(backCapLine);
+    }
+  }
+
   // The step-back (2026-10-25 review): a fee LightningMate raised that sold
   // nothing for STEP_BACK_AFTER_HOURS while the channel had sats to sell goes
-  // back to the last price that sold three times (its proven level) — or the
-  // fee before that raise — in one move, paced like a lowering. The ramp
-  // stopped one step above what buyers paid, and a drained channel had no
-  // way back down: the no-flow rule needs 10 % local and 30 idle days.
-  const raised = ctx.lastChange && ctx.lastChange.toPpm > ctx.lastChange.fromPpm && ctx.lastChange.toPpm === currentPpm ? ctx.lastChange : null;
-  const raisedMs = raised ? Date.parse(raised.at) : NaN;
-  const sellable = Math.max(0, Math.round(ch.localRatio * cap - CHANNEL_RESERVE_SHARE * cap));
+  // back in one move, paced like a lowering, to the higher of the last price
+  // that sold three times (its proven level) and the fee before that raise —
+  // never below a fee that sold (final review: a proven level under the
+  // raise's "from" took it below a fee that had sold); none when a level at
+  // or above this fee sold three times. The ramp stopped one step above what
+  // buyers paid, and a drained channel had no way back down: the no-flow
+  // rule needs 10 % local and 30 idle days. The hours count from the raise —
+  // or, if later, from when the channel last got sats to sell (the
+  // autopilot keeps that time): a channel drained through them could sell
+  // nothing, and was stepped back on the first run its liquidity came back.
+  // Not a raise set by hand (a manual apply, a pin) or one whose "from"
+  // wasn't known (recorded as 0, it read as a raise from 0), nor while a pin
+  // or an exclusion holds the fee.
+  const lc = ctx.lastChange;
+  const byHand = !!lc && (lc.via === "manual" || lc.pinned === true || /^pinned to /.test(lc.why ?? ""));
+  const manualNow = ctx.override?.mode === "exclude" || (ctx.override?.mode === "fixed" && Number.isFinite(ctx.override.fixedPpm));
+  const raisedFrom = lc && !byHand && lc.fromPpm !== null && lc.fromPpm > 0 && lc.toPpm > lc.fromPpm && lc.toPpm === currentPpm ? lc.fromPpm : null;
+  const raisedMs = lc && raisedFrom !== null ? Date.parse(lc.at) : NaN;
+  const sellable = sellableSats(cap, ch.localRatio);
   const proven = ctx.provenLevel ?? null;
-  const backTo = raised ? (proven && proven.ppm < currentPpm ? proven.ppm : raised.fromPpm) : null;
+  // (At or above this fee, the proven level leaves nothing below it: none.)
+  const backTo = raisedFrom !== null ? Math.max(raisedFrom, proven?.ppm ?? 0) : null;
+  const sinceMap = ctx.cooldown?.sellableSince;
+  const clockMs = Math.max(raisedMs, sinceMap === undefined ? -Infinity : Date.parse(sinceMap[ch.id] ?? ""));
   let stepBackLine: string | null = null;
   if (
-    raised &&
+    raisedFrom !== null &&
     backTo !== null &&
     backTo < currentPpm &&
+    !manualNow &&
     salesKnown &&
     sold.forwards === 0 &&
-    ctx.nowMs - raisedMs >= STEP_BACK_AFTER_HOURS * 3_600_000 &&
-    sellable >= Math.max(STEP_BACK_MIN_SELLABLE, CHANNEL_RESERVE_SHARE * cap)
+    Number.isFinite(clockMs) &&
+    ctx.nowMs - clockMs >= STEP_BACK_AFTER_HOURS * 3_600_000 &&
+    sellable >= stepBackSellableMin(cap)
   ) {
+    const fact = `step back: raised ${raisedFrom}→${currentPpm} ppm ${since(raisedMs, ctx.nowMs)} and nothing sold at it since`;
+    const selling = clockMs > raisedMs ? ` (with sats to sell for ${since(clockMs, ctx.nowMs).replace(/ ago$/, "")})` : "";
     stepBackLine = claim(
-      `step back: raised ${raised.fromPpm}→${currentPpm} ppm ${since(raisedMs, ctx.nowMs)} and nothing sold at it since, with ${satsShort(sellable)} to sell — back to ${backTo} ppm, ${
+      `${fact}${selling}, with ${satsShort(sellable)} to sell — back to ${backTo} ppm, ${
         proven && backTo === proven.ppm ? `the last price that sold ${proven.sales} times` : "its fee before that raise"
       }`,
-      `step back: raised ${raised.fromPpm}→${currentPpm} ppm ${since(raisedMs, ctx.nowMs)} and nothing sold at it since`,
+      fact,
       -1,
     );
     if (unsoldLine) dropLine(unsoldLine);
     unsoldLine = null;
+    if (backCapLine) dropLine(backCapLine);
+    backCapLine = null;
     target = backTo;
     aim = Math.min(aim, backTo);
     loLimit = backTo;
@@ -1504,7 +1616,6 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // A drained channel nobody routes through is never raised: there is no
   // flow to slow, and it would sit at a high fee once it refills (review a1:
   // 80 → 900 ppm in one update, then stuck at 590 after a refill).
-  const drainedIdle = idle && ch.localRatio < 0.1;
   let drainedIdleLine: string | null = null;
   if (drainedIdle && target > currentPpm) {
     target = currentPpm;
@@ -1932,6 +2043,9 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     dropLine(drainedIdleLine);
     dropLine(unsoldLine);
   }
+  // (The step-back's memory: its hold, when the fee moved after all; its
+  // cap, when a floor or the min took the fee past it.)
+  if (backCapLine && (backCapAt <= currentPpm ? targetPpm !== currentPpm : targetPpm > backCapAt)) dropLine(backCapLine);
   if (targetPpm > currentPpm) dropLine(noFlowLine);
   // What the engine's rules claimed for their move no longer holds when a
   // pin, an exclusion or a lease promise set another one — nor a claimed
@@ -1940,8 +2054,9 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const replaced = targetPpm !== engineTargetPpm;
   for (let i = reasons.length - 1; i >= 0; i--) {
     const c = claims.get(reasons[i]);
-    // (Held for want of a sale, a raise the rules claimed didn't happen.)
-    const withheld = unsoldLine !== null && moved === 0 && c?.dir === 1;
+    // (Held — for want of a sale, or by a hold of its own — a raise the rules
+    // claimed didn't happen: no "small nudge up" beside a hold.)
+    const withheld = (unsoldLine !== null || kind === "hold") && moved === 0 && c?.dir === 1;
     if (!c || !(replaced || withheld || (c.dir !== 0 && moved === -c.dir))) continue;
     if (c.fact === null) reasons.splice(i, 1);
     else reasons[i] = c.fact;
@@ -2052,6 +2167,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     // Only a lowering opens the flow-won episode — not a fee a pin took up.
     noFlowLowering: noFlowLowering && targetPpm < currentPpm,
     pinned,
+    ...(kind === "step_back" && targetPpm < currentPpm && targetPpm === engineTargetPpm ? { stepBack: true } : {}),
     leaseCap: lease
       ? { source: lease.source, orderId: lease.orderId, feeRateCapPpm: lease.feeRateCapPpm, baseFeeCapMsat: lease.baseFeeCapMsat, untilHeight: lease.untilHeight }
       : null,

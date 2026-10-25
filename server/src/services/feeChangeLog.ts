@@ -20,7 +20,9 @@ export interface FeeChangeRecord {
   at: string;
   channelId: string;
   alias: string;
-  fromPpm: number;
+  /** The fee before it — null: not known (LND's fee couldn't be read before
+   *  a manual apply); never recorded as 0, which read as a raise from 0. */
+  fromPpm: number | null;
   toPpm: number;
   /** Base fee before and after, msat (null: not known — records imported
    *  from the run history). */
@@ -31,6 +33,9 @@ export interface FeeChangeRecord {
   via: "autopilot" | "lease" | "manual";
   /** The engine's main reason, as the run history shows it. */
   why?: string;
+  /** It applied a pin (an override "fixed"): the operator's fee, as one set
+   *  by hand is — the step-back never takes it back. */
+  pinned?: boolean;
 }
 
 const FILE = "fee-changes.json";
@@ -93,7 +98,7 @@ function isRecord(r: unknown): r is FeeChangeRecord {
     !!o &&
     typeof o.at === "string" &&
     typeof o.channelId === "string" &&
-    typeof o.fromPpm === "number" &&
+    (typeof o.fromPpm === "number" || o.fromPpm === null) &&
     typeof o.toPpm === "number"
   );
 }

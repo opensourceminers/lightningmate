@@ -88,10 +88,17 @@ test("the need labels say what the node lacks: ≥ 70 % local is short of INBOUN
   assert.match(freedCapitalMagmaHint(rec, elig, 2_000_000) ?? "", /^Closing these frees ~2,000,000 sat\. One Magma sale at today's price nets ~4\.2%\/yr/);
   // Review 2026-10-25: never an invitation to close beyond the deploy cap.
   assert.equal(freedCapitalMagmaHint(rec, elig, 2_000_000, 0), null, "the cap reached: no hint");
-  assert.match(freedCapitalMagmaHint(rec, elig, 2_000_000, 500_000) ?? "", /^Closing these frees ~2,000,000 sat — your deploy cap lets Magma take ~500,000 sat of it\. One Magma sale/);
+  assert.match(
+    freedCapitalMagmaHint(rec, elig, 2_000_000, 500_000) ?? "",
+    /^Closing these frees ~2,000,000 sat — after its running leases and accepted orders, your deploy cap lets Magma take ~500,000 sat of it\. One Magma sale/,
+  );
   assert.match(freedCapitalMagmaHint(rec, elig, 2_000_000, 5_000_000) ?? "", /^Closing these frees ~2,000,000 sat\. One Magma sale/);
   const panel = readFileSync(new URL("../src/components/CloseCandidatesPanel.tsx", import.meta.url), "utf8");
-  assert.match(panel, /freedCapitalMagmaHint\(magma, elig, data\?\.totalCapitalFreedSats \?\? 0, room\)/);
+  // The room as the offer upkeep counts it — accepted orders too (final
+  // review 2026-10-25: the panel took the cap less the deployed leases).
+  assert.match(panel, /freedCapitalMagmaHint\(magma, elig, data\?\.totalCapitalFreedSats \?\? 0, deployRoom\)/);
+  assert.match(panel, /setDeployRoom\(s\.sellDeployRoomSat\)/);
+  assert.doesNotMatch(panel, /analytics\.deployedSat/);
 });
 
 test("review 2026-10-25: the close dialog preselects the economy rate; the channel hint, the presets and the switch-on dialog say opens wait for the coins held for Magma", () => {

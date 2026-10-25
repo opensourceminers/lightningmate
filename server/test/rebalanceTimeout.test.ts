@@ -11,7 +11,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { REBALANCE_MAX_TIMEOUT_BLOCKS, executeRebalance, pathfindingMs } from "../src/services/rebalance.js";
+import { EventEmitter } from "node:events";
+import { PAYMENT_CHECK, REBALANCE_MAX_TIMEOUT_BLOCKS, executeRebalance, pathfindingMs } from "../src/services/rebalance.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
 import { BUYER, autopilotWith, failedRebalance, paidRebalance, plannedRebalance, sellerSetup, type AutopilotSeams } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
@@ -321,3 +322,31 @@ test("a payment LND refuses outright (a macaroon without offchain:write) is book
   assert.equal(node.payments.size, 0);
 });
 
+
+test("A10: a payment whose call broke off is booked failed only on LND's explicit 'none by that id' twice — one, then no answer within the check's own deadline: in flight (final review 2026-10-25)", async (t) => {
+  const saved = { ...PAYMENT_CHECK };
+  Object.assign(PAYMENT_CHECK, { recheckMs: 20, deadlineMs: 300 });
+  t.after(() => Object.assign(PAYMENT_CHECK, saved));
+  const node = rebalanceNode();
+  let asks = 0;
+  // LND's first answer: not found (the call may still be creating it); the second never comes.
+  node.override("router.trackPaymentV2", () => {
+    asks += 1;
+    const s = Object.assign(new EventEmitter(), { cancel: () => undefined });
+    if (asks === 1) setImmediate(() => s.emit("error", { details: "payment isn't initiated" }));
+    return s;
+  });
+  const ends: string[] = [];
+  const started = Date.now();
+  const res = await executeRebalance(
+    node.lnd,
+    node.withoutPermission("router.sendPaymentV2"),
+    { targetId: "800001x1x0", sourceId: "800002x1x0", amountSats: 400_000, econRatio: 0.8 },
+    { onEnd: (_id, outcome) => ends.push(outcome) },
+  );
+  assert.ok(res.inFlight, res.error);
+  assert.deepEqual(ends, ["in_flight"]);
+  assert.equal(asks, 2, "asked again before booking it failed");
+  assert.ok(Date.now() - started < 5_000, "within the check's own deadline");
+  assert.match(res.error ?? "", /^LND hasn't said how the payment ended/);
+});

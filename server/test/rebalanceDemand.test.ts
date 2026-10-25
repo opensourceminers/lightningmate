@@ -53,7 +53,17 @@ const view = (o: Partial<ChannelView> & { id: string; localBalance: number }): C
 /** The level `sold` makes at `ppm` — proven with PROVEN_SALES sales. */
 const levelOf = (ppm: number, sold: Flow): ProvenLevel | null =>
   sold.forwards >= PROVEN_SALES && sold.out > 0
-    ? { ppm, paidPpm: Math.round((sold.revenue / sold.out) * 1_000_000), sales: sold.forwards, out: sold.out, revenue: sold.revenue, from: new Date(NOW - 86_400_000).toISOString(), to: null }
+    ? {
+        ppm,
+        paidPpm: Math.round((sold.revenue / sold.out) * 1_000_000),
+        sales: sold.forwards,
+        out: sold.out,
+        revenue: sold.revenue,
+        from: new Date(NOW - 86_400_000).toISOString(),
+        to: null,
+        lastSaleAt: new Date(NOW - 3_600_000).toISOString(),
+        lastSaleDaysAgo: 0,
+      }
     : null;
 const ctxOf = (ch: ChannelView, ppm: number, f14: Flow, f30: Flow, sold: Flow = NONE, o: Partial<BuildCtx> = {}): BuildCtx => ({
   cfg: { ...FEE_REC_DEFAULTS, stepPpm: 10, minChangePpm: 25 },
@@ -207,7 +217,17 @@ test("'what it would take' asks for the demand the gate counted — not the raw 
 
 test("the proof survives the raise it led to: proven at 820, the same run's fee stage moved it on (nothing sold since) — the refill is still valued at the 820 that sold (three reviewers: never a refill while a ramp climbs)", async () => {
   // The fee is 980 now, nothing sold at it; the level before (820) sold 3 times.
-  const proven: ProvenLevel = { ppm: 820, paidPpm: 820, sales: 3, out: 48_000, revenue: 39.36, from: new Date(NOW - 3 * 86_400_000).toISOString(), to: new Date(NOW - 3_600_000).toISOString() };
+  const proven: ProvenLevel = {
+    ppm: 820,
+    paidPpm: 820,
+    sales: 3,
+    out: 48_000,
+    revenue: 39.36,
+    from: new Date(NOW - 3 * 86_400_000).toISOString(),
+    to: new Date(NOW - 3_600_000).toISOString(),
+    lastSaleAt: new Date(NOW - 2 * 3_600_000).toISOString(),
+    lastSaleDaysAgo: 0.1,
+  };
   const { rec } = await planAt(980, NONE, { ctx: { provenLevel: proven } });
   assert.equal(rec.expectedRevenuePpm, 820, rec.reasons.join(" | "));
   assert.equal(rec.wouldRebalance, true, rec.reasons.join(" | "));
@@ -261,3 +281,26 @@ test("a drained channel's demand basis tolerates inflows up to max(1 % of capaci
   assert.equal(bw(60_000).earningDemandSats, 0, "60k in, nothing out: refilling itself");
 });
 
+
+test("A9: a proof older than 7 days values no refill above what the channel earned in 30 days — the row says why; a recent one does (final review 2026-10-25)", async () => {
+  const day = 86_400_000;
+  const proven: ProvenLevel = {
+    ppm: 820,
+    paidPpm: 820,
+    sales: 3,
+    out: 48_000,
+    revenue: 39.36,
+    from: new Date(NOW - 13 * day).toISOString(),
+    to: new Date(NOW - 9 * day).toISOString(),
+    lastSaleAt: new Date(NOW - 10 * day).toISOString(),
+    lastSaleDaysAgo: 10,
+  };
+  const stale = (await planAt(980, NONE, { ctx: { provenLevel: proven } })).rec;
+  assert.ok((stale.expectedRevenuePpm ?? 0) < 820, stale.reasons.join(" | "));
+  assert.ok(
+    stale.reasons.some((x) => /^it sold 3 times at 820 ppm, the last 10 d ago — older than 7 d, so the \d+ ppm it earned in 30 d decides$/.test(x)),
+    stale.reasons.join(" | "),
+  );
+  const recent = (await planAt(980, NONE, { ctx: { provenLevel: { ...proven, lastSaleDaysAgo: 2 } } })).rec;
+  assert.equal(recent.expectedRevenuePpm, 820, recent.reasons.join(" | "));
+});

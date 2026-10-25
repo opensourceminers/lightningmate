@@ -14,7 +14,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { randomBytes } from "node:crypto";
-import { SOLD_CLOSE_MIN_LOCAL_SHARE, channelAtOutpoint } from "../src/services/magmaDesk.js";
+import { LANE_PASS_DEADLINE, SOLD_CLOSE_MIN_LOCAL_SHARE, channelAtOutpoint } from "../src/services/magmaDesk.js";
+import { WORK_DEADLINES_MS } from "../src/services/autopilot.js";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
 import type { FakeLnd } from "./helpers/fakeLnd.js";
 import { chanNumber } from "./helpers/feeNode.js";
@@ -23,9 +24,12 @@ import { quiet } from "./helpers/lifecycle.js";
 const OTHER = "03" + "ef".repeat(32);
 
 /** A selling node with auto-close on; LND closes what it is asked to, and
- *  estimates `satPerKw` for the economy rate (null: no estimate). */
+ *  estimates `satPerKw` for the economy rate (null: no estimate). Its
+ *  forwarding history reads, and is empty: whether a channel routes well is
+ *  known — unread, a channel is never closed (final review 2026-10-25). */
 function closer(t: Parameters<typeof sellerSetup>[0], satPerKw: string | null = "500") {
   const s = sellerSetup(t, { config: { sellAutoClose: true } });
+  s.node.override("default.forwardingHistory", (_a, cb) => cb(null, { forwarding_events: [], last_offset_index: "0" }));
   if (satPerKw !== null) s.node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: satPerKw }));
   s.node.override("default.closeChannel", () => {
     const st = Object.assign(new EventEmitter(), { cancel: () => undefined });
@@ -161,4 +165,86 @@ test("a finished lease's channel closes at LND's economy rate, never above the o
   s.node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: "500" }));
   await s.autopilot.runOnce();
   assert.deepEqual(s.closes(), [{ vout: 0, satPerVbyte: 2 }]);
+});
+
+test("N2: whether a finished lease's channel routes well can't be read — LND's forwarding history fails — it is kept, never closed on a guess (final review 2026-10-25)", async (t) => {
+  t.mock.method(console, "warn", () => undefined);
+  t.mock.method(console, "error", () => undefined);
+  const logs: string[] = [];
+  t.mock.method(console, "log", (line: unknown) => void logs.push(String(line)));
+  const s = closer(t);
+  const txid = "cd".repeat(32);
+  s.node.channels.push({ id: "850000x5x0", partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 1_500_000, transactionId: txid, transactionVout: 0 });
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, status: "CHANNEL_MONITORING_FINISHED", transactionId: `${txid}:0` });
+  s.node.override("default.forwardingHistory", (_a, cb) => cb({ details: "rpc error: deadline exceeded" }));
+  await s.autopilot.runOnce();
+  assert.deepEqual(s.closes(), [], "before: closed — a failed read made it 'not routing well'");
+  assert.ok(
+    logs.some((l) => l.includes(sale.id) && l.includes("not closed yet: whether it routes well couldn't be read")),
+    logs.filter((l) => l.includes(sale.id)).join("\n"),
+  );
+  // Readable again — it earned nothing: closed.
+  s.node.override("default.forwardingHistory", (_a, cb) => cb(null, { forwarding_events: [], last_offset_index: "0" }));
+  await s.autopilot.runOnce();
+  assert.equal(s.closes().length, 1);
+});
+
+test("N2: auto-close asks again right before each close — switched off while the close terms were read: no close (final review 2026-10-25)", async (t) => {
+  quiet(t);
+  const s = closer(t);
+  const txid = "ce".repeat(32);
+  s.node.channels.push({ partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 1_990_000, transactionId: txid, transactionVout: 0 });
+  s.magma.addSale({ buyerPubkey: BUYER, status: "CHANNEL_MONITORING_FINISHED", transactionId: `${txid}:0` });
+  const real = s.autopilot.soldChannelClose.bind(s.autopilot);
+  (s.autopilot as unknown as { soldChannelClose: () => ReturnType<typeof real> }).soldChannelClose = async () => {
+    s.autopilot.setConfig({ sellAutoClose: false });
+    return real();
+  };
+  await s.autopilot.runOnce();
+  assert.deepEqual(s.closes(), []);
+});
+
+test("N2: the magma stage given up while the close terms were read — LND answering late — closes nothing when they come (final review 2026-10-25)", async (t) => {
+  quiet(t);
+  const saved = { ...WORK_DEADLINES_MS };
+  const lane = LANE_PASS_DEADLINE.ms;
+  Object.assign(WORK_DEADLINES_MS, { stage: 150, perRefill: 150, feeWork: 150, inflightCheck: 150, laneWork: 150 });
+  LANE_PASS_DEADLINE.ms = 150;
+  t.after(() => {
+    Object.assign(WORK_DEADLINES_MS, saved);
+    LANE_PASS_DEADLINE.ms = lane;
+  });
+  t.mock.method(console, "error", () => undefined);
+  const s = closer(t);
+  const txid = "ce".repeat(32);
+  s.node.channels.push({ partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 1_990_000, transactionId: txid, transactionVout: 0 });
+  s.magma.addSale({ buyerPubkey: BUYER, status: "CHANNEL_MONITORING_FINISHED", transactionId: `${txid}:0` });
+  let answer!: () => void;
+  const late = new Promise<void>((r) => (answer = r));
+  const real = s.autopilot.soldChannelClose.bind(s.autopilot);
+  (s.autopilot as unknown as { soldChannelClose: () => ReturnType<typeof real> }).soldChannelClose = async () => {
+    await late;
+    return real();
+  };
+  const run = await s.autopilot.runOnce();
+  assert.ok(run.errors?.some((e) => e.stage === "magma"), "the magma stage was given up");
+  answer();
+  await new Promise((r) => setTimeout(r, 100));
+  assert.deepEqual(s.closes(), [], "before: the given-up stage closed it once LND answered");
+});
+
+test("N5: a finished lease's channel kept for the same reason is one line in its order's history, however the figures in it move run to run (final review 2026-10-25)", async (t) => {
+  t.mock.method(console, "warn", () => undefined);
+  const logs: string[] = [];
+  t.mock.method(console, "log", (line: unknown) => void logs.push(String(line)));
+  const s = closer(t, "25000"); // 100 sat/vB at the economy rate, above the 20 sat/vB maximum
+  s.node.channels.push({ partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 1_990_000, transactionId: "ce".repeat(32), transactionVout: 0 });
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, status: "CHANNEL_MONITORING_FINISHED", transactionId: `${"ce".repeat(32)}:0` });
+  await s.autopilot.runOnce();
+  s.node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: "30000" })); // 120 sat/vB
+  await s.autopilot.runOnce();
+  const said = logs.filter((l) => l.includes(sale.id));
+  assert.equal(said.length, 1, said.join("\n"));
+  assert.match(said[0], /not closed yet: on-chain fees are 100 sat\/vB at the economy rate/);
+  assert.deepEqual(s.closes(), []);
 });

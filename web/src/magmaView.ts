@@ -646,7 +646,8 @@ export function freedCapitalMagmaHint(
   rec: MagmaV2Report | null,
   e: Eligibility | null,
   freedSat: number,
-  /** What your deploy cap still lets Magma sell (null: unknown). */
+  /** What your deploy cap still lets Magma sell — after its running leases
+   *  and accepted orders (null: unknown). */
   roomSat: number | null = null,
 ): string | null {
   const r0 = rec?.sell.recommendations[0];
@@ -656,7 +657,7 @@ export function freedCapitalMagmaHint(
   // Never an invitation to close more than Magma may take (review
   // 2026-10-25): the deploy cap reached, no hint; part of it, that part.
   if (roomSat !== null && roomSat <= 0) return null;
-  const cap = roomSat !== null && roomSat < freedSat ? ` — your deploy cap lets Magma take ~${fmt(roomSat)} sat of it` : "";
+  const cap = roomSat !== null && roomSat < freedSat ? ` — after its running leases and accepted orders, your deploy cap lets Magma take ~${fmt(roomSat)} sat of it` : "";
   const sales = e.expectedSalesPerYear !== null ? `; offers like yours sell about ${e.expectedSalesPerYear.toFixed(1)} times a year` : "";
   // leaseApy is NET (after on-chain costs and the service fee), per sale.
   return (

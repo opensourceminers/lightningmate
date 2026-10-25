@@ -362,6 +362,8 @@ function finishedLease(t: TestContext) {
   s.node.channels.push({ partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 1_990_000, transactionId: txid, transactionVout: 0 });
   s.magma.addSale({ buyerPubkey: BUYER, status: "CHANNEL_MONITORING_FINISHED", transactionId: `${txid}:0` });
   s.node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: "500" })); // the close's economy rate
+  // (Its routing read, and nothing earned: unread, it would be kept.)
+  s.node.override("default.forwardingHistory", (_a, cb) => cb(null, { forwarding_events: [], last_offset_index: "0" }));
   s.node.override("default.closeChannel", () => {
     const st = Object.assign(new EventEmitter(), { cancel: () => undefined });
     setImmediate(() => st.emit("data", { update: "close_pending", close_pending: { txid: randomBytes(32), output_index: 0 } }));

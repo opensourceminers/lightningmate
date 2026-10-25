@@ -382,7 +382,7 @@ async function plan(target: ChannelView, targetCtx: BuildCtx, routePpm: number, 
 test("a row promises the hold only with fee automation on — and says its limits: 30 days at most, your max ppm, released when the sats barely move (review 2026-10-25)", async () => {
   const on = (await plan(drained5M(), ctxOf(), 250)).recommendations.find((r) => r.channelId === "850000x1x0")!;
   assert.ok(
-    on.reasons.some((x) => /keeps it at ≥ 400 ppm until the refilled sats have routed out \(at most 30 d, never above your max of \d+ ppm; released after 7 d with under 3 forwards out in 14 d\)/.test(x)),
+    on.reasons.some((x) => /keeps it at ≥ 400 ppm until the refilled sats have routed out \(at most 30 d, never above your max of \d+ ppm; released after 7 d with under 3 forwards out in 14 d while ≥ 40 % of it is local\)/.test(x)),
     on.reasons.join(" | "),
   );
   const off = (await plan(drained5M(), ctxOf(), 250, false)).recommendations.find((r) => r.channelId === "850000x1x0")!;

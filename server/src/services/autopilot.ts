@@ -47,6 +47,7 @@ import {
   MAX_OPEN_TRIES_PER_RUN,
   OPEN_CONF_TARGET,
   OPEN_DIAL_BUDGET_MS,
+  openFeeRateOf,
   PEER_BACKOFF_DAYS,
   PEER_RECORDS_KEPT,
   magmaFillsPerYear,
@@ -75,8 +76,11 @@ import { DEFAULT_POLICY, applyFees, type FeeApplyItem, type FeeApplyResult } fro
 import {
   FEE_REC_DEFAULTS,
   MARKET_RUN_WAIT_MS,
+  STEP_BACK_MEMORY_DAYS,
   floorWindowStart,
   getFeeRecommendations,
+  sellableSats,
+  stepBackSellableMin,
   type CooldownInput,
   type FeeRecConfig,
   type FeeRecommendation,
@@ -228,9 +232,15 @@ export interface AutopilotChange {
 /** A fee write with what the books need about it (writeFees). */
 type FeeWrite = FeeApplyItem & {
   alias: string;
-  fromPpm: number;
+  /** The fee before it (null: LND's fee couldn't be read — on record as
+   *  unknown, never as 0). */
+  fromPpm: number | null;
   fromBaseMsat: number | null;
   why?: string;
+  /** It applies a pin: the operator's fee, like one set by hand. */
+  pinned?: boolean;
+  /** A step-back from this fee: remembered once LND took it (feeStepBacks). */
+  stepBackFromPpm?: number;
   /** A no-flow lowering: opens the flow-won episode (flowAnchors). */
   noFlowLowering?: boolean;
   /** It fixes a broken lease promise: retried at every chance, whatever
@@ -254,6 +264,8 @@ function recommendationWrite(r: FeeRecommendation): FeeWrite {
     ...(r.reasons?.[0] ? { why: r.reasons[0] } : {}),
     noFlowLowering: r.noFlowLowering,
     leaseBreach: r.leaseCapBreach === true,
+    ...(r.pinned ? { pinned: true } : {}),
+    ...(r.stepBack ? { stepBackFromPpm: r.currentPpm } : {}),
   };
 }
 
@@ -549,6 +561,14 @@ interface PersistedState {
    *  up to MAGMA_HOLD_KEEP_MS when Amboss's public book can't be read
    *  (validHold). */
   magmaHold?: MagmaHold | null;
+  /** Since when each channel has had sats to sell without a break, as the
+   *  fee stage last looked (noteFeeChannels) — the step-back's hours count
+   *  from it — and when that was. */
+  feeSellableSince?: Record<string, string>;
+  feeSellableCheckedAt?: string | null;
+  /** Each channel's last step-back — the fee it stepped back from, and when:
+   *  not raised to again for STEP_BACK_MEMORY_DAYS (sanitizeStepBacks). */
+  feeStepBacks?: Record<string, { fromPpm: number; at: string }>;
   lastSellRepriceAt: string | null;
   /** Adaptive Magma pricing state (mode "auto"): the current 0..1 price level and
    *  the fill bookkeeping that ratchets it up (sells fast) or down (sits unsold). */
@@ -1086,17 +1106,44 @@ export const LEASE_PROMISE_CHECK_MS = 10 * 60_000;
  *  lease promise excepted (writeFees). */
 export const FEE_RETRY_BACKOFF_MS = 6 * 3_600_000;
 
+/** How long past its time a fee retry entry is kept: only its reason is
+ *  left to read then ("the same failure again" is no news). */
+export const FEE_RETRY_KEEP_MS = 7 * 86_400_000;
+
 /** The saved fee retry back-off, made safe: entries with a time that parses
- *  and a reason only (feeCooldown and writeFees read them). */
-export function sanitizeFeeRetry(raw: unknown): Record<string, { until: string; error: string }> {
+ *  and a reason only (feeCooldown and writeFees read them) — none whose
+ *  time is FEE_RETRY_KEEP_MS past (they piled up, one per channel that ever
+ *  failed, closed ones too: final review 2026-10-25). */
+export function sanitizeFeeRetry(raw: unknown, nowMs = Date.now()): Record<string, { until: string; error: string }> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   const out: Record<string, { until: string; error: string }> = {};
   for (const [id, r] of Object.entries(raw as Record<string, unknown>)) {
     const e = (r ?? {}) as { until?: unknown; error?: unknown };
-    if (typeof e.until === "string" && Number.isFinite(Date.parse(e.until)) && typeof e.error === "string") out[id] = { until: e.until, error: e.error };
+    if (typeof e.until !== "string" || typeof e.error !== "string") continue;
+    const until = Date.parse(e.until);
+    if (Number.isFinite(until) && until > nowMs - FEE_RETRY_KEEP_MS) out[id] = { until: e.until, error: e.error };
   }
   return out;
 }
+
+/** The saved step-back memories, made safe: a fee above 0 and a time that
+ *  parses, under STEP_BACK_MEMORY_DAYS old (the fee engine reads them). */
+export function sanitizeStepBacks(raw: unknown, nowMs = Date.now()): Record<string, { fromPpm: number; at: string }> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, { fromPpm: number; at: string }> = {};
+  for (const [id, r] of Object.entries(raw as Record<string, unknown>)) {
+    const e = (r ?? {}) as { fromPpm?: unknown; at?: unknown };
+    const at = typeof e.at === "string" ? Date.parse(e.at) : NaN;
+    if (typeof e.fromPpm !== "number" || !Number.isFinite(e.fromPpm) || e.fromPpm <= 0 || !Number.isFinite(at)) continue;
+    if (nowMs - at < STEP_BACK_MEMORY_DAYS * 86_400_000) out[id] = { fromPpm: e.fromPpm, at: e.at as string };
+  }
+  return out;
+}
+
+/** Two looks of the fee stage further apart than this (fee automation was
+ *  off, say) start every step-back clock again: nobody saw whether the
+ *  channel had sats to sell in between. At least three run intervals. */
+export const feeSellableGapMs = (intervalMinutes: unknown): number => Math.max(6 * 3_600_000, 3 * schedulerIntervalMs(intervalMinutes));
 /** How often rebalance payments still in flight are asked about between
  *  runs — also with every automation off (a manual one must end on record). */
 export const INFLIGHT_REBALANCE_CHECK_MS = 2 * 60_000;
@@ -1224,6 +1271,8 @@ export function refusalNote(refused: readonly { alias: string; days: number; siz
  *  wallet, its chain, its connection) — one line while the cause stays the
  *  same, whichever peer the open was meant for (channelNews). */
 const SELF_NEWS_KEY = "self";
+/** How long the close list's swap line reuses its ranking (swapTargets). */
+export const SWAP_SUGGESTIONS_KEEP_MS = 30 * 60_000;
 
 /** The channel decision when the stage was told to stop (stopWhy). */
 const openStopped = (why: string): string => `stopped: ${why} — no open was started`;
@@ -1515,6 +1564,12 @@ export class Autopilot {
    *  since when, LND's reason (writeFees; cleared once a write takes or the
    *  breach is gone). In memory: the next check finds it again after a restart. */
   private readonly leaseFixFailing = new Map<string, { since: string; error: string; alias: string; why: string; outpoint: string }>();
+  /** The suggestions the close list's swap line was last ranked from
+   *  (swapTargets), and when. */
+  private swapSuggestions: { at: number; list: Promise<SuggestionV2[]> } | null = null;
+  /** This process's own open while LND hasn't answered it (openTo): its
+   *  write-ahead record is not one a restart left. */
+  private openInFlight: OpeningRecord | null = null;
   /** When the current main run took its lock (null when idle) — exposed so a
    *  run that takes unusually long is visible, not just a stale lastRunAt. */
   private runningSince: string | null = null;
@@ -1692,6 +1747,10 @@ export class Autopilot {
     );
     this.state.perChannelLastApplied ??= {};
     this.state.perChannelFeeRetry = sanitizeFeeRetry(this.state.perChannelFeeRetry);
+    // The step-back's clocks and memories too: the fee engine reads them.
+    this.state.feeSellableSince = sanitizeTimes(this.state.feeSellableSince);
+    this.state.feeSellableCheckedAt = validTime(this.state.feeSellableCheckedAt) ? this.state.feeSellableCheckedAt : null;
+    this.state.feeStepBacks = sanitizeStepBacks(this.state.feeStepBacks);
     this.state.perTargetLastRebalanced ??= {};
     // Today's rebalance spend is read from the rebalance log now
     // (rebalanceBudget) — the separate counter is gone.
@@ -1744,10 +1803,16 @@ export class Autopilot {
     const now = Date.now();
     const retryAfter: Record<string, string> = {};
     for (const [id, r] of Object.entries(this.state.perChannelFeeRetry ?? {})) if (Date.parse(r.until) > now) retryAfter[id] = r.until;
+    // The step-back's clocks as the fee stage last saw them — none when that
+    // is too long ago to say (the next look starts them again).
+    const looked = Date.parse(this.state.feeSellableCheckedAt ?? "");
+    const recent = Number.isFinite(looked) && now - looked <= feeSellableGapMs(this.state.config.intervalMinutes);
     return {
       lastApplied: this.state.perChannelLastApplied,
       cooldownHours: this.state.config.cooldownMinutes / 60,
       retryAfter,
+      sellableSince: recent ? { ...(this.state.feeSellableSince ?? {}) } : {},
+      stepBacks: sanitizeStepBacks(this.state.feeStepBacks, now),
     };
   }
 
@@ -1977,6 +2042,10 @@ export class Autopilot {
       config: this.state.config,
       /** Allowed range of every numeric setting — the UI mirrors these. */
       bounds: AUTOPILOT_CONFIG_BOUNDS,
+      /** What the deploy cap still lets Magma sell: the cap less what is
+       *  deployed and what accepted orders hold — the offer upkeep's
+       *  headroom (the close list's Magma hint is never more). */
+      sellDeployRoomSat: Math.max(0, this.state.config.sellMaxDeploySats - this.capital.deployedSat() - this.capital.reservedSat()),
       lastRunAt: this.state.lastRunAt,
       /** The main run in progress, if any: since when. */
       runningSince: this.runningSince,
@@ -2388,6 +2457,7 @@ export class Autopilot {
     // a manual Apply waits no longer than a page does.)
     const report = await this.feeReport(elasticity, MARKET_RUN_WAIT_MS);
     this.noteFlowReturns(report.recommendations);
+    this.noteFeeChannels(report.recommendations);
     const eligible = report.recommendations.filter(
       (r) => r.wouldApply && r.transactionId !== null && r.transactionVout !== null,
     );
@@ -2468,6 +2538,33 @@ export class Autopilot {
   }
 
   /**
+   * The step-back's clocks (A1, final review 2026-10-25): since when each
+   * channel has had sats to sell (stepBackSellableMin) without a break, as
+   * the fee stage sees it each run — one drained meanwhile starts again when
+   * its liquidity is back, and its raise is not stepped back on the first
+   * run it could sell; two looks too far apart (feeSellableGapMs) start
+   * every clock again. What closed channels left goes: their clocks, their
+   * fee retry back-off (and entries a week past their time), their
+   * step-back memories.
+   */
+  private noteFeeChannels(recs: readonly Pick<FeeRecommendation, "channelId" | "capacity" | "metrics">[]): void {
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const looked = Date.parse(this.state.feeSellableCheckedAt ?? "");
+    const was = Number.isFinite(looked) && nowMs - looked <= feeSellableGapMs(this.state.config.intervalMinutes) ? (this.state.feeSellableSince ?? {}) : {};
+    const since: Record<string, string> = {};
+    for (const r of recs) {
+      if (sellableSats(r.capacity, r.metrics.localRatio) >= stepBackSellableMin(r.capacity)) since[r.channelId] = was[r.channelId] ?? nowIso;
+    }
+    this.state.feeSellableSince = since;
+    this.state.feeSellableCheckedAt = nowIso;
+    const open = new Set(recs.map((r) => r.channelId));
+    const keep = <T>(m: Record<string, T>): Record<string, T> => Object.fromEntries(Object.entries(m).filter(([id]) => open.has(id)));
+    this.state.perChannelFeeRetry = keep(sanitizeFeeRetry(this.state.perChannelFeeRetry, nowMs));
+    this.state.feeStepBacks = keep(sanitizeStepBacks(this.state.feeStepBacks, nowMs));
+  }
+
+  /**
    * Every fee write goes through here — the autopilot's, the lease-promise
    * keeper's and a manual apply alike — so the books always match what LND
    * has (review a1: a manual Apply stamped no cooldown and wrote no history,
@@ -2542,16 +2639,24 @@ export class Autopilot {
         this.state.perChannelLastApplied[res.id] = nowIso;
         // Applied a no-flow lowering → open (or refresh) the flow-won episode.
         if (w?.noFlowLowering) fa[res.id] = { ...fa[res.id], episodeAt: nowIso };
+        // A step-back LND took: the fee it left is not raised to again for
+        // STEP_BACK_MEMORY_DAYS (the fee engine reads it).
+        if (w?.stepBackFromPpm !== undefined && res.feeRatePpm < w.stepBackFromPpm) {
+          (this.state.feeStepBacks ??= {})[res.id] = { fromPpm: w.stepBackFromPpm, at: nowIso };
+        }
         this.feeLog.append([
           {
             at: nowIso,
             channelId: res.id,
             alias: w?.alias ?? res.id,
-            fromPpm: w?.fromPpm ?? 0,
+            // (Not known stays unknown: a 0 read as a raise from 0 — and the
+            // step-back took such a raise back to 0.)
+            fromPpm: w?.fromPpm ?? null,
             toPpm: res.feeRatePpm,
             fromBaseMsat: w?.fromBaseMsat ?? null,
             toBaseMsat: toBaseMsat ?? null,
             via,
+            ...(w?.pinned ? { pinned: true } : {}),
             ...(why || res.clampedBy ? { why: [why, res.clampedBy].filter(Boolean).join("; ") } : {}),
           },
         ]);
@@ -2776,7 +2881,7 @@ export class Autopilot {
       writes.push({
         ...it,
         alias: peer ? await getAlias(this.readLnd, peer) : it.id,
-        fromPpm: rate?.fee_rate ?? 0,
+        fromPpm: rate?.fee_rate ?? null,
         fromBaseMsat: rate ? Number(rate.base_fee_mtokens) : null,
         why: "set by hand",
       });
@@ -3587,6 +3692,18 @@ export class Autopilot {
     // 2026-10-25: a restart while LND funded an open knew no cooldown, and
     // the next run opened a second channel at once).
     if (this.state.channelOpening !== undefined && this.state.channelOpening !== null) {
+      // This process's own open, LND still answering it (the stage that sent
+      // it was given up meanwhile): no restart cut it off — left alone, its
+      // answer books it, and no other open goes out before that (final review
+      // 2026-10-25: a run in between counted it as unclear).
+      const mine = this.openInFlight;
+      if (mine && mine.at === this.state.channelOpening.at && mine.pubkey === this.state.channelOpening.pubkey) {
+        note(
+          `the open to ${mine.alias} (${fmtSat(mine.sizeSats)} sat, sent ${mine.at.slice(11, 16)} UTC) is still waiting for LND's answer — no other open until it has one`,
+          "waiting",
+        );
+        return [];
+      }
       const left = validOpening(this.state.channelOpening);
       this.state.channelOpening = null;
       if (left) {
@@ -3653,16 +3770,24 @@ export class Autopilot {
       try {
         hold = await this.leaveForMagma();
       } catch (err) {
-        // No answer: nothing held — the open goes ahead. Said in the log (it
-        // was silent): the comparison it skipped is the one that holds
-        // capital back for Magma.
-        logLine("warn", `[autopilot] channels: the Magma comparison couldn't be made (${errText(err)}) — nothing is held back for it`);
+        // No comparison could be made: as when Amboss's book can't be read,
+        // the last one stands for a day — else, with an offer listed, what
+        // it can list is held (the safe side). Said in the log, with what is
+        // held: it said "nothing is held back" (final review 2026-10-25).
+        const why = `the comparison couldn't be made (${errText(err)})`;
+        hold = await this.magmaHoldWithout(why).catch(() => ({ heldSat: 0, text: null }));
+        logLine(
+          "warn",
+          `[autopilot] channels: the Magma comparison couldn't be made (${errText(err)}) — ${hold.heldSat > 0 ? `${fmtSat(hold.heldSat)} sat held for Magma meanwhile` : "nothing is held back for it"}`,
+        );
       }
     }
     const free = Math.max(0, pre.spendableSat - hold.heldSat);
-    /** Every note of the stage carries what is held for Magma, and what is free. */
-    const withHold = (text: string): string =>
-      hold.text ? `${text} · ${hold.text}${hold.heldSat > 0 ? `; ${fmtSat(free)} sat left for routing opens` : ""}` : text;
+    /** Every note of the stage carries what is held for Magma, and what is
+     *  free — less what an open of this run spent (`spentSat`: the note of an
+     *  open read the figure from before it). */
+    const withHold = (text: string, spentSat = 0): string =>
+      hold.text ? `${text} · ${hold.text}${hold.heldSat > 0 ? `; ${fmtSat(Math.max(0, free - spentSat))} sat left for routing opens` : ""}` : text;
     // What is left can't fund the smallest open this stage makes (your
     // channel size, else the auto-size floor): the open waits for Magma.
     const smallest = cfg.channelSizeSats > 0 ? cfg.channelSizeSats : AUTO_SIZE_MIN_SATS;
@@ -3756,6 +3881,7 @@ export class Autopilot {
           withHold(
             `opened ${fmtSat(plan.sizeSats)} sat to ${s.alias} at ${rate} sat/vB${plan.why ? ` (${plan.why})` : ""}` +
               (unchecked ? ` — no payback check: ${unchecked}` : ""),
+            plan.sizeSats,
           ),
           "acted",
         );
@@ -3855,15 +3981,13 @@ export class Autopilot {
     return peers.size === 0 ? "this node lost its connection to every peer (Tor or the internet down?)" : null;
   }
 
-  /** The economy fee rate an automatic open pays (sat/vB, rounded, at least
-   *  1), or null when LND can't estimate one. Rounded, not up: LND's floor of
-   *  253 sat/kw is 1.012 sat/vB, which rounded up paid 2 — twice the fee, and
-   *  a payback judged at twice the cost (review 2026-10-25; the manual Open
-   *  form rounds the same estimate). LND lifts a rate below its floor itself. */
+  /** The economy fee rate an automatic open pays (sat/vB, at least 1:
+   *  openFeeRateOf — up only past a tenth over a whole rate), or null when
+   *  LND can't estimate one. LND lifts a rate below its floor itself. */
   private async openFeeRate(): Promise<number | null> {
     try {
       const { tokens_per_vbyte } = await getChainFeeRate({ lnd: this.readLnd, confirmation_target: OPEN_CONF_TARGET });
-      return Number.isFinite(tokens_per_vbyte) && tokens_per_vbyte > 0 ? Math.max(1, Math.round(tokens_per_vbyte)) : null;
+      return Number.isFinite(tokens_per_vbyte) && tokens_per_vbyte > 0 ? openFeeRateOf(tokens_per_vbyte) : null;
     } catch {
       return null;
     }
@@ -3935,7 +4059,18 @@ export class Autopilot {
    */
   async swapTargets(): Promise<{ alias: string; score: number; sizeSats: number }[]> {
     const cfg = this.state.config;
-    const [{ suggestions }, connected, earning] = await Promise.all([this.channelSuggestions(), this.connectedPeers(), this.openEconomics()]);
+    // Ranked at most every SWAP_SUGGESTIONS_KEEP_MS: the ranking asks LN+
+    // about peers it has no profile of, and every close-list load asked
+    // again (final review 2026-10-25). A ranking that failed is not kept.
+    let ranked = this.swapSuggestions;
+    if (!ranked || Date.now() - ranked.at > SWAP_SUGGESTIONS_KEEP_MS) {
+      const list = this.channelSuggestions().then((r) => r.suggestions);
+      ranked = this.swapSuggestions = { at: Date.now(), list };
+      list.catch(() => {
+        if (this.swapSuggestions?.list === list) this.swapSuggestions = null;
+      });
+    }
+    const [suggestions, connected, earning] = await Promise.all([ranked.list, this.connectedPeers(), this.openEconomics()]);
     const ctx: OpenContext = {
       fixedSize: cfg.channelSizeSats > 0 ? cfg.channelSizeSats : null,
       spendableSat: Number.POSITIVE_INFINITY,
@@ -3960,8 +4095,11 @@ export class Autopilot {
    *  closeFinishedLeases): the economy fee rate a close pays now, the
    *  operator's maximum for on-chain fees, and whether a channel routes well
    *  enough to keep — it earned (30 days) at least what a sat of this node's
-   *  month-old channels earned, capacity-weighted. */
-  async soldChannelClose(): Promise<{ feeRate: number | null; maxFeeRate: number; routesWell: (channelId: string) => boolean }> {
+   *  month-old channels earned, capacity-weighted — null when that can't be
+   *  told: the forwarding history not read in full, or the channel list
+   *  not read (final review 2026-10-25: a failed read made every sold
+   *  channel "not routing well", and auto-close closed them). */
+  async soldChannelClose(): Promise<{ feeRate: number | null; maxFeeRate: number; routesWell: (channelId: string) => boolean | null }> {
     const [feeRate, earning, report, chans] = await Promise.all([
       this.openFeeRate(),
       this.openEconomics(),
@@ -3972,13 +4110,15 @@ export class Autopilot {
     const nodePpm = earning?.ppmYear ?? (ev && ev.capacitySat > 0 ? (ev.earnedSat / ev.capacitySat) * (365 / 30) * 1_000_000 : null);
     const earned = new Map((report?.perChannel ?? []).map((c) => [c.channelId, c.feesEarnedSats]));
     const capacity = new Map((chans ?? []).map((c) => [c.id, c.capacity]));
+    const known = report !== null && report.complete && chans !== null;
     return {
       feeRate,
       maxFeeRate: this.state.config.channelMaxFeeRate,
       routesWell: (channelId) => {
         const sat = earned.get(channelId) ?? 0;
         const cap = capacity.get(channelId) ?? 0;
-        if (sat <= 0 || cap <= 0) return false;
+        if (!known || cap <= 0) return null;
+        if (sat <= 0) return false;
         const ppm = (sat / cap) * (365 / 30) * 1_000_000;
         return nodePpm === null || ppm >= nodePpm;
       },
@@ -4039,16 +4179,33 @@ export class Autopilot {
       const routing = this.initialRoutingFee();
       // Write-ahead: on record before LND has it — a process that goes down
       // while LND funds the open finds it at the next channel stage, as an
-      // open that ended unclearly (its cooldown runs).
+      // open that ended unclearly (its cooldown runs). Saved, or the open is
+      // not sent: a record only in memory protects nothing (final review
+      // 2026-10-25: the plain write logged a failed save and went on).
       this.state.channelOpening = { pubkey: s.pubkey, alias: s.alias, sizeSats, at: new Date().toISOString() };
-      this.persist();
-      const res = await fundChannel(writeLnd, {
-        pubkey: s.pubkey,
-        localTokens: sizeSats,
-        feeRate,
-        routingFeePpm: routing.feeRatePpm,
-        routingBaseFeeMsat: routing.baseFeeMsat,
-      });
+      try {
+        this.store.writeOrThrow(this.state);
+      } catch (err) {
+        this.state.channelOpening = null;
+        return {
+          kind: "blocked" as const,
+          reason: `the open to ${s.alias} couldn't be put on record before it is sent (${errText(err)}) — no open goes out until LightningMate can save its state`,
+        };
+      }
+      const opening = this.state.channelOpening;
+      this.openInFlight = opening;
+      let res: Awaited<ReturnType<typeof fundChannel>>;
+      try {
+        res = await fundChannel(writeLnd, {
+          pubkey: s.pubkey,
+          localTokens: sizeSats,
+          feeRate,
+          routingFeePpm: routing.feeRatePpm,
+          routingBaseFeeMsat: routing.baseFeeMsat,
+        });
+      } finally {
+        if (this.openInFlight === opening) this.openInFlight = null;
+      }
       // Answered: the caller records how it ended (the cooldown for an open,
       // or an unclear one; nothing for a refusal before the broadcast).
       this.state.channelOpening = null;
@@ -4498,7 +4655,12 @@ export class Autopilot {
     // capital — not once the switch is off (stopWhy).
     if (cfg.sellAutoClose && !opts.capitalOnly && !this.stopWhy("sellEnabled")) {
       try {
-        out.push(...(await this.magma.closeFinishedLeases()));
+        // Asked again right before each close: the switch, auto-close itself,
+        // and whether this stage was given up (stopWhy) — the reads before a
+        // close may answer late.
+        out.push(
+          ...(await this.magma.closeFinishedLeases({ shouldStop: () => this.stopWhy("sellEnabled") !== null || !this.state.config.sellAutoClose })),
+        );
       } catch (err) {
         out.push({ orderId: "leases", action: "error", sizeSats: 0, ok: false, error: `closing finished leases: ${errText(err)}` });
       }
@@ -5788,8 +5950,8 @@ export class Autopilot {
     const realistic = await this.sellingRealistic();
     const e = realistic.eligibility;
     // No answer from Amboss's public book (unreadable, or nothing to judge
-    // by): the last comparison stands, for a day.
-    if (!e || e.verdict === "unknown") return this.lastMagmaHold(realistic.why);
+    // by): the last comparison stands, for a day — else the safe side.
+    if (!e || e.verdict === "unknown") return this.magmaHoldWithout(realistic.why, e?.own.listableSat);
     const keep = (hold: { heldSat: number; text: string | null }) => {
       this.state.magmaHold = { at: new Date().toISOString(), ...hold };
       this.persist(); // the comparison a restart's first runs fall back on
@@ -5835,22 +5997,42 @@ export class Autopilot {
     });
   }
 
-  /** The last Magma comparison, when Amboss's public book can't be read now:
-   *  it stands for MAGMA_HOLD_KEEP_MS (said so); past that, nothing held. */
-  private lastMagmaHold(why: string): { heldSat: number; text: string | null } {
+  /** No comparison can be made now (Amboss's public book unreadable, or the
+   *  comparison failed): lastMagmaHold, with what the offer can list now
+   *  (`listableSat`, else read here) — while an offer is listed. */
+  private async magmaHoldWithout(why: string, listableSat?: number): Promise<{ heldSat: number; text: string | null }> {
+    const listed = (this.state.offerSync?.offers ?? []).some((e) => e.amboss.status === "ENABLED");
+    if (!listed || !this.amboss.hasKey() || this.amboss.getValidity() === false) return { heldSat: 0, text: null };
+    const listable = listableSat ?? (await this.sellCapital({ refreshDeployed: false }).then((c) => c.listableSat, () => null));
+    return this.lastMagmaHold(why, listable);
+  }
+
+  /**
+   * The last Magma comparison, when none can be made now: it stands for
+   * MAGMA_HOLD_KEEP_MS (said so) — holding no more than the offer can list
+   * now (`listableNow`; null: unknown): a comparison of yesterday held what
+   * the deploy cap allowed then. Without one that recent, with an offer
+   * listed, what it can list is held, on the safe side: an order the lane
+   * accepts must find its coins (final review 2026-10-25: on the first run
+   * after the upgrade, Amboss's book unreadable, nothing was held and a 6M
+   * routing open could take the coins of a listed offer).
+   */
+  private lastMagmaHold(why: string, listableNow: number | null): { heldSat: number; text: string | null } {
     const last = validHold(this.state.magmaHold);
     const asOf = last ? `${last.at.slice(0, 16).replace("T", " ")} UTC` : "";
     if (last && Date.now() - Date.parse(last.at) <= MAGMA_HOLD_KEEP_MS) {
-      return last.heldSat > 0
-        ? { heldSat: last.heldSat, text: `${last.text ?? `${fmtSat(last.heldSat)} sat held for Magma`} (the comparison of ${asOf}: ${why})` }
-        : { heldSat: 0, text: null };
+      if (last.heldSat <= 0) return { heldSat: 0, text: null };
+      const held = listableNow === null ? last.heldSat : Math.min(last.heldSat, listableNow);
+      if (held <= 0) return { heldSat: 0, text: `nothing held for Magma: your offer can list nothing now (the comparison of ${asOf} held ${fmtSat(last.heldSat)} sat: ${why})` };
+      return held < last.heldSat
+        ? { heldSat: held, text: `${fmtSat(held)} sat held for Magma — what your offer can list now, of the ${fmtSat(last.heldSat)} sat the comparison of ${asOf} held (${why})` }
+        : { heldSat: held, text: `${last.text ?? `${fmtSat(held)} sat held for Magma`} (the comparison of ${asOf}: ${why})` };
     }
-    return {
-      heldSat: 0,
-      text: last
-        ? `nothing held for Magma: ${why}, and its last comparison (${asOf}) is over a day old`
-        : `nothing held for Magma: ${why}, and there is no earlier comparison`,
-    };
+    const gone = last ? `its last comparison (${asOf}) is over a day old` : "there is no earlier comparison";
+    if (listableNow !== null && listableNow > 0) {
+      return { heldSat: listableNow, text: `${fmtSat(listableNow)} sat held for Magma — what your listed offer can list, on the safe side: ${why}, and ${gone}` };
+    }
+    return { heldSat: 0, text: `nothing held for Magma: ${why}, and ${gone}` };
   }
 
   /**

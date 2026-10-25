@@ -149,16 +149,30 @@ the benchmark, the replacement cost, the demand ramp — waits until the channel
 once at the fee it charges now, since that fee was set (by the fee-change log); the Why says
 so ("hold: nothing sold at X ppm since it was set — not raised toward Y ppm before a sale").
 Floors, the min/max range, pins and lease promises are not held by it. A **sale** is a forward
-out of at least 1,000 sat; the same incoming → outgoing pair within 60 s counts once (one
-payment's retries and shards) — for the demand ramp's three sales and the refill gate's proof
-alike. When the forwards couldn't be read completely, sales are unknown and the
-ordinary raises go on as before.
+out of at least 1,000 sat; forwards out of the channel within 60 s of the one before count
+once — one payment's retries, and its shards even when they enter through different channels
+(until the final review the 60 s were counted per incoming → outgoing pair, so three shards
+through three channels were three sales) — for the demand ramp's three sales and the refill
+gate's proof alike. When the forwards couldn't be read completely, sales are unknown and the
+ordinary raises go on as before. The hold names the aim as your max bounds it.
 
-**Step back.** A fee raised and then not sold at for 48 h, while the channel has something to
-sell (local balance minus its 1 % reserve at least max(50k, 1 % of capacity)), goes back in
-one move — paced like a lowering — to its **proven level** (the highest fee of the last 14 days
-it sold at least 3 times at; see Rebalancing) or else to its fee before that raise. The
-drained-idle hold doesn't strand it there.
+**Step back.** A fee the autopilot raised and then not sold at for 48 h, while the channel had
+something to sell (local balance minus its 1 % reserve at least max(50k, 1 % of capacity)),
+goes back in one move — paced like a lowering — to the **higher** of its **proven level** (the
+highest fee of the last 14 days it sold at least 3 times at; see Rebalancing) and its fee
+before that raise: never below a fee that sold, and not at all when a level at or above the
+current fee sold three times. The 48 h count from the raise, or from when the channel last got
+sats to sell if that is later: the fee stage notes each run since when every channel has had
+something to sell without a break (a channel drained in between starts again — before, its
+raise was stepped back on the first run its liquidity came back; two looks further apart than
+three run intervals, at least 6 h, start every clock again). A raise set by hand (a manual
+apply or a pin) is never stepped back, nor one whose earlier fee wasn't known (a manual apply
+that couldn't read LND's fee is on record with an unknown "from" — it read as a raise from 0).
+For 7 days after a step-back, the fee it stepped back from is not raised to again — a raise
+stops on the grid step below it ("guard: stepped back from …"), floors, the min, pins and lease
+promises excepted. The drained-idle hold doesn't strand it there; a drained channel nobody
+routes through shows that hold ("an idle channel is never raised") with its fee as the aim, and
+no raise note ("small nudge up", "raising fee") stands beside a hold or a step-back.
 
 **On the grid.** A step lands on the “Round to” grid (a raise rounds down onto it, a lowering
 up — a 333 ppm step lands on 330 at a 10 ppm grid). A move that lands exactly stays exact — a floor, the min, a jump to the
@@ -289,8 +303,8 @@ idle).
    - **Demand ramp** (2026-10-24): a **drained channel with buyers** — under 10 % local (the
      protect rule's "drained"), ≥ 3 forwards in 30 days, not refilled faster than it sells (14-day
      inflow at most max(1 % of capacity, 50k) above its outflow — a 2-sat inflow switched it off), no measured elasticity below 1 — that **sold at the fee it charges now**
-     (three forwards out since that fee was set, by LightningMate's own stamp — the refill gate's
-     proof, too) is raised by
+     (three sales since that fee was set — a sale as above: at least 1,000 sat, one per 60 s burst
+     out of the channel — by LightningMate's own stamp; the refill gate's proof, too) is raised by
      **a quarter of its fee per move** (rounded down onto the grid, at least the ordinary two
      steps), **at most every 6 h** (the operator's cooldown if longer — and the operator's own,
      shorter cadence while the move stays within a protect or profit-floor ramp's reach — a move
@@ -489,7 +503,9 @@ fee for up to 30 days where nobody bought (in a 60-day simulation it cut the cha
 1,365 to 203 sat where demand stopped at 500 ppm). A refill valued at a proven price is **at most
 10× the sats that sold at it** (at least the 50k minimum): three 1k forwards don't carry a 443k
 refill whose hold then keeps the fee there. A pin or a floor's lift counts like any fee — only
-once three forwards were paid at it; until then the row says what would count. The **demand** the gate counts — the earnings cap and the refill's
+once it sold three times at it (three sales, as above); until then the row says what would
+count. And only a **recent** proof: a level whose last sale is more than 7 days old values a
+refill at no more than what the channel earned in 30 days (the row says so). The **demand** the gate counts — the earnings cap and the refill's
 size — is, for a **drained** channel (under 10 % local) not refilling itself (14-day inflow at
 most max(1 % of capacity, 50k) above its outflow), the larger of its 14-day outflow and half its 30-day one (net drain likewise); every
 other channel counts its 14 days. A drained channel can't route out, and its last 14 days
@@ -532,7 +548,9 @@ ended counts as still in flight (no smaller size or other source is tried meanwh
 attempt's pathfinding gets the time left less 10 s, in whole seconds (at most 45 s), and none
 starts with under 20 s left: LND's own failure then arrives inside the wait — before, it came
 just after the attempt was booked "in flight", and the next size never got a real try. A payment
-LND refuses outright (it has none by that id) is failed at once, with LND's reason. LND failing
+LND refuses outright is failed at once, with LND's reason — once LND says twice, 2 s apart,
+that it has none by that id (a call cut off in transport may still be creating it at LND); the
+question has its own 20 s deadline, and anything but those two answers counts as in flight. LND failing
 a refill before anything was sent (its first reads) fails that refill only: its cooldown is
 given back, and the run goes on with the next. After the
 shutdown signal no new attempt starts — no smaller size, no other source: only the payment
@@ -563,7 +581,8 @@ spent, rounded down to 100k, never below 1M nor the peer's minimum (the payback 
 that size). The reserve is what an open leaves on chain; LND's own anchor reserve (10k per
 anchor channel, up to 100k) wins when it is larger, and the open's fee comes on top. It dials every address the peer
 advertises (.onion first on a Tor-only node), at most three peers a run and no new one after
-two minutes. The funding pays LND's economy rate (a 72-block target), never above the
+two minutes. The funding pays LND's economy rate (a 72-block target) — up to the next whole
+sat/vB only once the estimate is more than a tenth above one: 1.012 → 1, 1.4 → 2 — never above the
 operator's maximum (`channelMaxFeeRate`, 20 sat/vB by default), and only when the open and a
 later close pay back within 12 months of what a channel of that size earns on this node
 (capacity-weighted yield of channels older than ~30 days, trusted only with at least 10 forwards
@@ -577,8 +596,10 @@ peer's own refusal during the negotiation ("received funding error from …", wh
 or LND's "reservation timed out") comes before any broadcast: the peer backs off and the next
 suggestion is tried in the same run. An open that ends unclearly (its funding may be out)
 stops the run and starts the cooldown as an open does. Each open is on record (peer, amount,
-time) before LND gets it: a restart that finds one LND never answered counts it as unclear,
-so the cooldown runs from it. The on-chain mutex held for over 10 minutes is an alert naming
+time) before LND gets it — saved, or the open is not sent: a restart that finds one LND never
+answered counts it as unclear, so the cooldown runs from it. One this process still waits on
+(its stage given up while LND funds it) is left alone: its answer books it, and no other open
+goes out before. The on-chain mutex held for over 10 minutes is an alert naming
 its holder. Waits and deferrals are the stage's decision note, never failed runs; a refusal is one line
 of history, not one per run. Every open takes the shared on-chain mutex and capital ledger.
 **Capital gate (`leaveForMagma`, D10):** with Liquidity provision on, the coins Magma can
@@ -593,8 +614,9 @@ days (4,320 blocks) old earned, capacity-weighted (until 2026-10-25 the median c
 a node where most route nothing). The rest stays free for routing opens; the open waits
 ("deferred") only when what is left can't fund the smallest open, and every note says how
 much is held. Each comparison is kept: when Amboss's public book can't be read (right after
-a restart: it is cached in memory) the last one stands for a day, said so; past that nothing
-is held. Without routing history or clearing data, nothing is held — a node can always open
+a restart: it is cached in memory) — or the comparison fails — the last one stands for a day,
+said so, holding no more than the offer can list now; past that, or with none on record, what
+the listed offer can list is held, on the safe side (an order it accepts must find its coins). Without routing history or clearing data, nothing is held — a node can always open
 its first channels. This is the one place capital allocation is unified across routing vs leasing.
 **Close list** (`rankCloseCandidates`): a channel under 30 days old — or whose age can't be
 told — is never a candidate. One that routed is protected for what it earns only when its 60-day
@@ -602,8 +624,12 @@ earnings (its own fees plus those of the forwards it brought in) on its local ba
 quarter of what a sat of this node's channels earns over the same 60 days, and at least 25
 ppm/yr; below that it is listed ("Earned … in 60d … under a quarter of what this node's
 channels earn"). "Significant unique reach" protects only with at least five 2-hop nodes no
-other peer reaches. Where freed capital could go names only opens the channel autopilot would
-make (its peer rules and LN+). Parallel channels to an existing peer (adding capacity where a
+other peer reaches. A forwarding history read cut short (LND had more than was read — the
+newest are missing) or not read lists no channel as idle, losing or earning too little: only a
+peer away for days does then. Where freed capital could go names only opens the channel
+autopilot would make (its peer rules and LN+), ranked at most every 30 minutes — LN+ is not
+asked on every load. The Magma hint never offers more than the deploy cap leaves after
+running leases and accepted orders (the offer upkeep's headroom). Parallel channels to an existing peer (adding capacity where a
 channel earns) are not planned yet.
 
 **Magma** — two parts. The **order lane** (every 45 s, its own busy flag, never the main
@@ -694,9 +720,12 @@ offer is taken off the market again. A new offer is listed automatically only wh
 selling check is better than "not realistic". Optional auto-relist, and optional auto-close
 at a lease's end: the sale's own channel by its funding outpoint (txid and vout), never one a
 running lease is listed on, kept open when under a quarter of it is on our side (the rest is
-inbound worth keeping) or it earns at least what a sat of this node's month-old channels earns,
-and closed at LND's economy rate — never above the maximum on-chain fee rate
-(`channelMaxFeeRate`), never without an estimate. A 1% service fee applies to completed sales.
+inbound worth keeping) or it earns at least what a sat of this node's month-old channels earns
+— and kept when that can't be told (the forwarding history not read in full, no channel list):
+never closed on a guess — and closed at LND's economy rate, never above the maximum on-chain
+fee rate (`channelMaxFeeRate`), never without an estimate. Right before each close it asks
+again whether selling or auto-close was switched off, or the stage given up. Each reason a
+channel is kept is one line in the order's history (not one per run as its figures move). A 1% service fee applies to completed sales.
 
 **Never an order below cost (review 2026-10-25).** The order lane turns down an order that
 pays less than opening and closing its channel costs on chain at today's fee rate (its

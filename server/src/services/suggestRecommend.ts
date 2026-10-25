@@ -903,6 +903,10 @@ export interface CloseInput {
   /** The chain's height now (0 or absent: unknown) — a channel's age from
    *  its short channel id where the fee engine has none. */
   heightNow?: number;
+  /** The 60-day forwarding history was read in full (absent: yes). Cut
+   *  short — LND hands the oldest first, so the newest are missing — or not
+   *  read, whether a channel routed or earns can't be told from it. */
+  flowKnown?: boolean;
 }
 
 /** Days since the block a channel was funded in (its short channel id), or
@@ -1049,6 +1053,19 @@ export function rankCloseCandidates(input: CloseInput): CloseV2Report {
     // offline for hours is not one — it is shown, and the dialog offers a
     // reconnect first (a force-close locks funds for the CSV delay).
     const longOffline = away?.long === true;
+    // A forwarding history read cut short (or not read) says nothing about
+    // "routed nothing", "losing" or "earns too little" (final review
+    // 2026-10-25: incomplete, a busy channel read as dead): only a peer
+    // away for days lists a channel then.
+    if (input.flowKnown === false && !longOffline) {
+      protectedList.push({
+        channelId: c.id,
+        alias: c.peerAlias,
+        reason: "its 60-day forwarding history couldn't be read in full — not listed on a partial record",
+        lease: null,
+      });
+      continue;
+    }
     const idle60 = routed60 === 0;
     const losing = pnl60 < 0;
     const weak = feeState === "close_candidate" || m?.peerGate === "weak";
@@ -1255,5 +1272,6 @@ export async function getCloseSuggestionsV2(
     offline: (c) => (ctx.uptime ? ctx.uptime.offlineInfo(c, nowMs) : null),
     nowMs,
     heightNow: height,
+    flowKnown: flow60 !== null && flow60.complete,
   });
 }

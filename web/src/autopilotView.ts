@@ -129,7 +129,7 @@ export function presetChanges(config: AutopilotConfig, preset: AutopilotConfigPa
     if (to === undefined || to === config[k]) continue;
     const capital =
       to && k === "channelEnabled"
-        ? "opens channels with your on-chain funds, when an open pays back — not with the coins held for Magma while Liquidity provision is on"
+        ? "opens channels with your on-chain funds, at most at your max on-chain fee rate — and, once this node's routing history is enough to judge it, only when an open pays back — not with the coins held for Magma while Liquidity provision is on"
         : to && k === "rebalanceEnabled"
           ? `pays routing fees for refills — up to ${budget === null ? "no daily limit" : `${sats(budget)} sat a day`}`
           : to && k === "sellEnabled"

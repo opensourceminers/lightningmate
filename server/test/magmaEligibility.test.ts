@@ -272,7 +272,9 @@ test("D10: only what the offer can list is held for Magma — the deploy cap's h
   assert.equal(s.node.callsTo("default.openChannel").length, 1);
   assert.match(
     s.autopilot.getState().decisions.channels?.text ?? "",
-    /^opened 1,000,000 sat to .* · 5,000,000 sat held for Magma — what your offer can list \(spendable, within your deploy cap\): .* than a routing channel \(~0 ppm\/yr: .*\); 14,9\d\d,\d{3} sat left for routing opens$/,
+    // (What is left after this open: 14.9M before it — the note said that
+    // figure, from before the open, final review 2026-10-25.)
+    /^opened 1,000,000 sat to .* · 5,000,000 sat held for Magma — what your offer can list \(spendable, within your deploy cap\): .* than a routing channel \(~0 ppm\/yr: .*\); 13,9\d\d,\d{3} sat left for routing opens$/,
   );
   assert.equal(s.autopilot.getState().status.channels.state, "acted");
 });
@@ -431,7 +433,7 @@ test("magmaFillsPerYear: other sellers' fills until this node's own offer has 60
   }
 });
 
-test("D10: when Amboss's public book can't be read — right after a restart, its copy is in memory only — the last comparison stands for a day, and the note says so; past a day nothing is held", async (t) => {
+test("D10: when Amboss's public book can't be read — right after a restart, its copy is in memory only — the last comparison stands for a day, and the note says so; past a day what the listed offer can list is held, on the safe side", async (t) => {
   quiet(t);
   t.after(() => __resetEligibilityCache());
   const s = await deferralSetup(t, sellsWell);
@@ -453,17 +455,19 @@ test("D10: when Amboss's public book can't be read — right after a restart, it
     again.getState().decisions.channels?.text ?? "",
     /^deferred: [\d,]+ sat held for Magma — .* \(the comparison of \d{4}-\d\d-\d\d \d\d:\d\d UTC: the selling check has no answer \(Amboss's public offer book could not be read.*\)\) — /,
   );
-  // A day later, still no answer: nothing held, and the note says why.
+  // A day later, still no answer: no comparison to go by, but an offer is
+  // listed — what it can list is held, on the safe side (N1, final review
+  // 2026-10-25: nothing was held, and a routing open took its coins).
   (again as unknown as { state: { magmaHold: { at: string } } }).state.magmaHold.at = new Date(Date.now() - 25 * 3_600_000).toISOString();
   const run = await again.runOnce();
-  assert.equal(run.channels[0]?.ok, true, JSON.stringify(run.channels));
+  assert.deepEqual(run.channels, []);
   assert.match(
     again.getState().decisions.channels?.text ?? "",
-    /^opened 1,000,000 sat to .* · nothing held for Magma: the selling check has no answer \(.*\), and its last comparison \(\d{4}-\d\d-\d\d \d\d:\d\d UTC\) is over a day old$/,
+    /^deferred: [\d,]+ sat held for Magma — what your listed offer can list, on the safe side: the selling check has no answer \(.*\), and its last comparison \(\d{4}-\d\d-\d\d \d\d:\d\d UTC\) is over a day old — /,
   );
 });
 
-test("D10: no comparison on record (or a damaged one) and Amboss's public book unreadable: nothing held — the note says there is no earlier comparison", async (t) => {
+test("D10/N1: no comparison on record (or a damaged one) and Amboss's public book unreadable — the first run after the upgrade: what the listed offer can list is held, on the safe side — the note says there is no earlier comparison", async (t) => {
   quiet(t);
   t.after(() => __resetEligibilityCache());
   const s = await deferralSetup(t, sellsWell);
@@ -471,8 +475,11 @@ test("D10: no comparison on record (or a damaged one) and Amboss's public book u
   s.market.behaviour = "throw";
   (s.autopilot as unknown as { state: { magmaHold: unknown } }).state.magmaHold = { at: "yesterday", heldSat: -5 };
   const run = await s.autopilot.runOnce();
-  assert.equal(run.channels[0]?.ok, true, JSON.stringify(run.channels));
-  assert.match(s.autopilot.getState().decisions.channels?.text ?? "", / · nothing held for Magma: the selling check has no answer \(.*\), and there is no earlier comparison$/);
+  assert.deepEqual(run.channels, []);
+  assert.match(
+    s.autopilot.getState().decisions.channels?.text ?? "",
+    /^deferred: [\d,]+ sat held for Magma — what your listed offer can list, on the safe side: the selling check has no answer \(.*\), and there is no earlier comparison — /,
+  );
 });
 
 test("D10: a sale that nets nothing at today's on-chain fees leaves nothing for Magma — and is not weighed against 30 days of forwards", async (t) => {
@@ -527,4 +534,25 @@ test("a8: the Market page and the autopilot run the engine with the same capital
   // Before: the autopilot's own call passed only the pricing level — it saw
   // 950k deployable, "insufficient capital", and listed nothing.
   assert.equal(s.magma.calls.filter((c) => c.op === "CreateOffer").length, 1);
+});
+
+test("N3: the last comparison, reused while Amboss's book can't be read, holds no more than the offer can list now — the deploy cap lowered since: what it allows; the note says so (final review 2026-10-25)", async (t) => {
+  quiet(t);
+  t.after(() => __resetEligibilityCache());
+  const s = await deferralSetup(t, sellsWell);
+  await s.autopilot.runOnce();
+  const kept = JSON.parse(readFileSync(join(s.dir, "autopilot.json"), "utf8")).magmaHold;
+  assert.ok(kept.heldSat > 19_000_000, JSON.stringify(kept));
+  __resetEligibilityCache();
+  s.market.behaviour = "throw";
+  const again = s.restart();
+  (again as unknown as AutopilotSeams).channelSuggestions = async () => ({ suggestions: [suggestion] });
+  (again as unknown as AutopilotSeams).openFeeRate = async () => 2;
+  again.setConfig({ sellMaxDeploySats: 1_000_000 });
+  const run = await again.runOnce();
+  assert.equal(run.channels[0]?.ok, true, JSON.stringify(run.channels));
+  assert.match(
+    again.getState().decisions.channels?.text ?? "",
+    /^opened 1,000,000 sat to .* · 1,000,000 sat held for Magma — what your offer can list now, of the [\d,]+ sat the comparison of \d{4}-\d\d-\d\d \d\d:\d\d UTC held \(the selling check has no answer \(.*\)\); [\d,]+ sat left for routing opens$/,
+  );
 });

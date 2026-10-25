@@ -24,6 +24,13 @@ export const OPEN_DIAL_BUDGET_MS = 120_000;
 /** The funding fee's confirmation target: an automatic open is not urgent
  *  (~12 hours — LND's economy estimate, not its 6-block default). */
 export const OPEN_CONF_TARGET = 72;
+/** The rate an automatic open pays for LND's estimate (sat/vB): up to the
+ *  next whole rate once it is more than a tenth above one — 1.012 → 1, 1.4
+ *  → 2, 2.05 → 2 — at least 1. Rounded up, LND's floor of 253 sat/kw (1.012)
+ *  paid 2: twice the fee, a payback judged at twice the cost (review
+ *  2026-10-25); to the nearest, 1.4 paid 1, under what LND estimated (final
+ *  review). */
+export const openFeeRateOf = (satPerVbyte: number): number => Math.max(1, Math.ceil(satPerVbyte - 0.1));
 /** Opening and later closing must pay back within this many months of what
  *  a channel of that size earns on this node. (A 3-month horizon would block
  *  nearly every routing open of a small node: a 2M channel at 1,000 ppm/yr

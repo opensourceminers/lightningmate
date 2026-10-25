@@ -976,9 +976,9 @@ test("GET /alerts says when the on-chain lock has been held for over ten minutes
   assert.ok(!(await messages()).some((m) => /on-chain lock/.test(m)), "gone once it is free");
 });
 
-test("an automatic open pays LND's economy estimate rounded, not rounded up: at LND's floor (253 sat/kw = 1.012 sat/vB) 1 sat/vB, not 2 — and never less than 1", async (t) => {
+test("an automatic open pays LND's economy estimate rounded up only past a tenth over a whole rate: at LND's floor (253 sat/kw = 1.012 sat/vB) 1 sat/vB, not 2; 1.2 sat/vB 2, not 1 (final review) — and never less than 1", async (t) => {
   const env = autopilotWith(t, { channelEnabled: true });
-  for (const [kw, rate] of [["253", 1], ["300", 1], ["375", 2], ["500", 2], ["1000", 4], ["100", 1]] as const) {
+  for (const [kw, rate] of [["253", 1], ["275", 1], ["300", 2], ["375", 2], ["500", 2], ["1000", 4], ["100", 1]] as const) {
     env.node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: kw }));
     assert.equal(await env.seams.openFeeRate(), rate, `${kw} sat/kw`);
   }

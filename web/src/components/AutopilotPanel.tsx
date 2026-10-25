@@ -612,9 +612,10 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
               at most every 6 h, for a drained channel that sold three times at its fee — the demand ramp) and at most the
               idle-ratchet’s steps down. A fee is raised only when the channel drains below its target, its flow says
               it drains, or a floor or Min ppm needs it — a channel that routes at its price keeps it — and an ordinary
-              raise waits for a sale at the fee it charges now; a raise nothing sold at for 48 h goes back to the last
-              price that sold. In one update
-              only: an idle channel dropping to the price that last won it flow or to the market’s price into its
+              raise waits for a sale at the fee it charges now; a raise nothing sold at for 48 h while the channel had
+              sats to sell goes back to the higher of the last price that sold and the fee before it — and isn’t raised
+              back to that level for a week. In one update only: a step back, an idle channel dropping to the price
+              that last won it flow or to the market’s price into its
               peer, a pinned fee, a new channel’s protected fee, a broken lease promise, and a fee outside Min/Max ppm
               (a fee below Min goes to Min first, then steps). “Min change” only skips fees already that close to
               where the engine is heading — never an idle channel’s step or jump down, nor a fee brought into Min/Max.

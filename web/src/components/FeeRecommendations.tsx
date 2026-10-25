@@ -147,7 +147,8 @@ export function FeeRecommendations() {
         ramps faster; a drained channel that keeps selling at its fee rises by a quarter of it per move — the demand ramp). A fee
         goes up only when something says the channel drains, or a floor or your min needs it — never just back toward your
         balanced level — and an ordinary raise only after a sale at the fee it charges now; a raise nothing sold at for 48 h
-        steps back to the last price that sold. Only these move in one update: an idle channel dropping to the
+        while it had sats to sell steps back to the higher of the last price that sold and the fee before it, and isn&apos;t
+        raised back to that level for a week. Only these move in one update: a step back, an idle channel dropping to the
         price that last won it flow or to what the market charges into its peer, a fee you pinned, a new
         channel&apos;s protected fee, a broken lease promise, and a fee outside your min/max (one below your min goes
         to the min, and steps on from there). Apply them now, or let the autopilot manage them.

@@ -15,7 +15,7 @@ export function CloseCandidatesPanel() {
   const [data, setData] = useState<CloseCandidatesResponse | null>(null);
   const [closeTarget, setCloseTarget] = useState<CloseTarget | null>(null);
   const [canWrite, setCanWrite] = useState(false);
-  const [deployCap, setDeployCap] = useState<number | null>(null);
+  const [deployRoom, setDeployRoom] = useState<number | null>(null);
   const [magma, setMagma] = useState<MagmaV2Report | null>(null);
   const [elig, setElig] = useState<Eligibility | null>(null);
   const [open, setOpen] = useState<Set<string>>(new Set());
@@ -35,7 +35,7 @@ export function CloseCandidatesPanel() {
       .autopilotGet()
       .then((s) => {
         setCanWrite(s.canWrite);
-        setDeployCap(s.config.sellMaxDeploySats);
+        setDeployRoom(s.sellDeployRoomSat);
       })
       .catch(() => setCanWrite(false));
     sharedMagmaReport().then(setMagma).catch(() => {});
@@ -62,9 +62,10 @@ export function CloseCandidatesPanel() {
 
   const rows = data?.candidates ?? [];
   // Only where this node can realistically sell on Magma (D8) — and never
-  // for more than the deploy cap still lets it sell.
-  const room = deployCap !== null && magma ? Math.max(0, deployCap - magma.analytics.deployedSat) : null;
-  const magmaHint = freedCapitalMagmaHint(magma, elig, data?.totalCapitalFreedSats ?? 0, room);
+  // for more than the deploy cap still lets it sell: less what is deployed
+  // and what accepted orders hold, as the offer upkeep counts it (final
+  // review 2026-10-25: the accepted orders were left out).
+  const magmaHint = freedCapitalMagmaHint(magma, elig, data?.totalCapitalFreedSats ?? 0, deployRoom);
 
   return (
     <section className="panel feerec">
