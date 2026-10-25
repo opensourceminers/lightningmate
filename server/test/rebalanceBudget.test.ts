@@ -420,11 +420,17 @@ test("a drained channel the gate turns down says what a refill would need — 'a
   } as RebalanceRecommendation;
   // 80 ppm earned, a 50 ppm route: above the 0.8 × 80 = 64 ppm cost cap? No
   // — but 30 ppm of margin needs 3.3M to net 100 sat, and 500k is the most
-  // this 2M channel takes: it needs earnings of ≥ 250 ppm on that route.
+  // this 2M channel takes: it needs earnings of ≥ 250 ppm on that route —
+  // and the demand a 500k refill needs (2026-10-25: the line left it out).
   assert.equal(
     wouldTake(rec, REBAL_REC_DEFAULTS, null),
-    "to clear the 100 sat minimum at a ~50 ppm route it needs earnings of ≥ 250 ppm (now 80 ppm) on a refill of up to 500k",
+    "to clear the 100 sat minimum at a ~50 ppm route it needs earnings of ≥ 250 ppm (now 80 ppm) on a refill of up to 500k; it also needs ≥ 500k of 14-day outflow (now 300k) and ≥ 333k of 14-day net drain (now 200k)",
   );
+  // Above the operator's max fee: said so.
+  assert.match(wouldTake(rec, REBAL_REC_DEFAULTS, null, 200) ?? "", /— more than your max of 200 ppm: no fee it may charge pays for a refill this way/);
+  // On the refill its demand sizes, where that is smaller than the most it takes.
+  const sizedRec = { ...rec, demandSizedAmount: 300_000 } as RebalanceRecommendation;
+  assert.match(wouldTake(sizedRec, REBAL_REC_DEFAULTS, null) ?? "", /needs earnings of ≥ 384 ppm \(now 80 ppm\) on the 300k refill its demand sizes/);
   // Earning enough per sat, but not enough outflow yet.
   const rich = { ...rec, expectedRevenuePpm: 400, revenuePpm30d: 400, estimatedRouteCostPpm: 150 } as RebalanceRecommendation;
   assert.equal(

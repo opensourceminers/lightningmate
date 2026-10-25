@@ -123,7 +123,7 @@ export function RebalanceRecommendations() {
     if (!request) return;
     const ok = await ui.confirm({
       title: "Run rebalance",
-      message: confirmRefillText(r, data?.budget),
+      message: confirmRefillText(r, data?.budget, data?.feeAutomation !== false),
       confirmLabel: "Run it",
     });
     if (!ok) return;
@@ -165,8 +165,11 @@ export function RebalanceRecommendations() {
 
       <div className="dryrun-banner">
         Rebalance only when it pays back — and never refill liquidity Fee Autopilot says is being sold too cheaply
-        (raise the fee first). A refill is valued at the fee the fee engine charges after it, which it then keeps until
-        the refilled sats have routed out; its payment can't pay more than that check allows. The autopilot runs the
+        (raise the fee first). A refill is valued at the fee the fee engine charges after it
+        {data?.feeAutomation === false
+          ? " (Fee automation is off: nothing holds that fee afterwards)"
+          : ", which it then keeps until the refilled sats have routed out — 30 days at most, never above your Max ppm, released a week on if they barely move"}
+        ; its payment can't pay more than that check allows. The autopilot runs the
         profitable ones when <strong>Auto-rebalance</strong> is on; you can also run one now — checked and held the
         same way.
         {canWrite ? null : <> Running is disabled (read-only macaroon).</>}
@@ -346,7 +349,7 @@ export function RebalanceRecommendations() {
                                 </span>
                               ) : null}
                               <span>max cost <b>{r.maxCostPpm != null ? `${r.maxCostPpm} ppm` : "—"}</b>{r.maxFeeSats != null ? ` · pays at most ${sats(r.maxFeeSats)} sat` : ""} · payback limit {r.maxPaybackDays}d</span>
-                              {afterRefillText(r) ? <span>{afterRefillText(r)}</span> : null}
+                              {afterRefillText(r, data?.feeAutomation !== false) ? <span>{afterRefillText(r, data?.feeAutomation !== false)}</span> : null}
                             </div>
                             <div className="ov-control">
                               <span className="ov-label">Autopilot:</span>

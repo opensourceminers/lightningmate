@@ -34,9 +34,18 @@ import { InfoTip } from "./InfoTip";
 
 type Sub = "fees" | "rebalancing" | "channels" | "magma" | "history";
 
-const FEE_NUM_FIELDS: { key: NumKey; label: string }[] = [
+/** What the fee cooldown paces (review 2026-10-25: it read as the wait
+ *  between any two updates). */
+export const FEE_COOLDOWN_HINT =
+  "How often a ramp steps a fee — protecting a drained channel, or recovering a refill's cost. Every other move waits at least this " +
+  "long too, and longer by its own rule: a raise 72 h after the last update, the demand ramp 6 h, a lowering 24 h.";
+/** What "Min change" skips — and what it never does. */
+export const MIN_CHANGE_HINT =
+  "A fee this close to where the engine is heading — or within 20 % of the fee, whichever is more — is left as it is. Never an idle " +
+  "channel's step or jump down, nor a fee brought into Min/Max.";
+const FEE_NUM_FIELDS: { key: NumKey; label: string; hint?: string }[] = [
   { key: "intervalMinutes", label: "Run every (min)" },
-  { key: "cooldownMinutes", label: "Fee cooldown (min)" },
+  { key: "cooldownMinutes", label: "Fee cooldown (min)", hint: FEE_COOLDOWN_HINT },
   { key: "maxChangesPerRun", label: "Max fee changes / run" },
 ];
 const POLICY_FIELDS: { key: keyof AutopilotState["config"]["policy"]; label: string; hint?: string }[] = [
@@ -46,7 +55,7 @@ const POLICY_FIELDS: { key: keyof AutopilotState["config"]["policy"]; label: str
   { key: "protectPpm", label: "Protect ppm (drained+wanted)" },
   { key: "baseFeeMsat", label: "Base fee (msat)" },
   { key: "step", label: "Round to" },
-  { key: "minChangePpm", label: "Min change" },
+  { key: "minChangePpm", label: "Min change", hint: MIN_CHANGE_HINT },
 ];
 const REB_NUM_FIELDS: { key: NumKey; label: string }[] = [
   { key: "maxRebalancesPerRun", label: "Max rebalances / run" },
@@ -405,7 +414,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   };
 
   const budgetNoLimit = draft.noBudgetLimit ?? config.rebalanceDailyBudgetSats === null;
-  const numFields = (fields: { key: NumKey; label: string }[]) =>
+  const numFields = (fields: { key: NumKey; label: string; hint?: string }[]) =>
     fields.map((f) =>
       f.key === "rebalanceDailyBudgetSats" && budgetNoLimit ? (
         <div key={f.key} className="policy-field">
@@ -415,7 +424,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
           </label>
         </div>
       ) : (
-        numInput(f.key, f.label)
+        numInput(f.key, f.label, { hint: f.hint })
       ),
     );
 
@@ -573,9 +582,12 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
             </div>
             <p className="muted ap-hint">
               Each update moves a fee by at most two “Round to” steps up (up to three where a learned elasticity says
-              raising pays; four while protecting a drained channel or recovering a refill’s cost) and at most the
+              raising pays; four while protecting a drained channel or recovering a refill’s cost; a quarter of the fee,
+              at most every 6 h, for a drained channel that sold three times at its fee — the demand ramp) and at most the
               idle-ratchet’s steps down. A fee is raised only when the channel drains below its target, its flow says
-              it drains, or a floor or Min ppm needs it — a channel that routes at its price keeps it. In one update
+              it drains, or a floor or Min ppm needs it — a channel that routes at its price keeps it — and an ordinary
+              raise waits for a sale at the fee it charges now; a raise nothing sold at for 48 h goes back to the last
+              price that sold. In one update
               only: an idle channel dropping to the price that last won it flow or to the market’s price into its
               peer, a pinned fee, a new channel’s protected fee, a broken lease promise, and a fee outside Min/Max ppm
               (a fee below Min goes to Min first, then steps). “Min change” only skips fees already that close to

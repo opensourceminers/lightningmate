@@ -118,8 +118,11 @@ standalone via Docker.
   (a fee LND keeps refusing, a wallet that can't fund an open) is reported by
   every run it happens in, with one line in the run history; settings below the
   switches are saved together, after a check of every value. Fees are volume-first
-  (competitive, zero base fee) with profit floors so a channel never routes
-  below its refill cost — and every channel sold through Magma or LSPS1 is kept
+  (competitive, zero base fee); a refilled channel's fee is held at what the
+  refill was valued at while its sats route out (at most 30 days, capped at Max
+  ppm unless you opt in, released when they barely move), a raise waits for a
+  sale at the fee before it, and one nobody buys at steps back — and every
+  channel sold through Magma or LSPS1 is kept
   within the routing-fee cap its buyer was promised, for the lease; rebalances
   run only when they pass the profit check (valued at the fee the channel keeps
   after the refill, the payment capped by that check — at the planned size, the
@@ -132,7 +135,9 @@ standalone via Docker.
   write access.
 - **More forwards** — the optional **Advertise routable size** pass keeps each
   channel's gossiped max HTLC just under its spendable balance (power-of-2
-  buckets) so senders skip depleted channels, and the **Unserved demand** panel
+  buckets; under 1,024 sat, the channel's min HTLC) so senders skip depleted
+  channels — an update LND takes but the channel doesn't advertise is recorded
+  once and left alone for 6 h — and the **Unserved demand** panel
   shows the payments your node had to turn away for lack of liquidity — with
   probes, retries and HTLCs too big for any refill counted apart, so what is left
   is possible demand a refill could have carried (not a promise of income).

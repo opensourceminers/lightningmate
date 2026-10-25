@@ -144,8 +144,10 @@ export function FeeRecommendations() {
         The fees the autopilot applies when <strong>Fee automation</strong> is on — protect nearly-drained
         channels, price draining channels toward what refilling them costs, keep a price that wins flow, react to
         {" "}{POSSIBLE_DEMAND_BANNER}. Each update moves a fee by a small, bounded step toward its aim (protecting a drained channel
-        ramps faster). A fee goes up only when something says the channel drains, or a floor or your min needs it —
-        never just back toward your balanced level. Only these move in one update: an idle channel dropping to the
+        ramps faster; a drained channel that keeps selling at its fee rises by a quarter of it per move — the demand ramp). A fee
+        goes up only when something says the channel drains, or a floor or your min needs it — never just back toward your
+        balanced level — and an ordinary raise only after a sale at the fee it charges now; a raise nothing sold at for 48 h
+        steps back to the last price that sold. Only these move in one update: an idle channel dropping to the
         price that last won it flow or to what the market charges into its peer, a fee you pinned, a new
         channel&apos;s protected fee, a broken lease promise, and a fee outside your min/max (one below your min goes
         to the min, and steps on from there). Apply them now, or let the autopilot manage them.

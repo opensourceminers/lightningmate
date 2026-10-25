@@ -19,7 +19,7 @@ import fs, { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { buildDashboard } from "../src/services/dashboard.js";
-import { Autopilot, MAGMA_REPORT_SHARE_MS, feeDecision, lastAutopilotActionAt, sanitizePaused, type AreaDecision } from "../src/services/autopilot.js";
+import { Autopilot, MAGMA_REPORT_SHARE_MS, feeDecision, lastAutopilotActionAt, maxHtlcDecision, sanitizePaused, type AreaDecision } from "../src/services/autopilot.js";
 import { stateFileList } from "../src/routes/api.js";
 import { labelCostChannels } from "../src/services/rebalanceCosts.js";
 import { RebalanceLog } from "../src/services/rebalanceLog.js";
@@ -68,6 +68,26 @@ test("a fee run that changes fees says which — and one whose every update LND 
   // Every update refused: red, with LND's words.
   const r = feeDecision([plannedFeeChange("a", 1, 2)], [{ alias: "a", fromPpm: 1, toPpm: 2, ok: false, error: "LND refused: invalid policy — not retried for 6 h" }]);
   assert.deepEqual(r, { text: "1 update LND refused (LND refused: invalid policy — not retried for 6 h)", state: "error" });
+});
+
+test("'LND refused' only when LND did: a write skipped because the channel's policy couldn't be read, or one LND never answered, is 'not applied' — fee and max_htlc alike (review 2026-10-25)", () => {
+  const skipped = "skipped: current policy (cltv) unreadable — won't risk a reset — not retried for 6 h";
+  assert.deepEqual(feeDecision([plannedFeeChange("a", 1, 2)], [{ alias: "a", fromPpm: 1, toPpm: 2, ok: false, error: skipped }]), {
+    text: `1 update not applied (${skipped})`,
+    state: "error",
+  });
+  const unanswered = "503 UnexpectedErrorUpdatingRoutingFees: Connection dropped — not retried for 6 h";
+  const both = feeDecision(
+    [plannedFeeChange("a", 1, 2), plannedFeeChange("b", 1, 2)],
+    [
+      { alias: "a", fromPpm: 1, toPpm: 2, ok: false, error: "LND refused the update: invalid policy — not retried for 6 h" },
+      { alias: "b", fromPpm: 1, toPpm: 2, ok: false, error: unanswered },
+    ],
+  );
+  assert.match(both.text, /^2 updates not applied \(LND refused the update: invalid policy/);
+  const stuck = "LND took the update, but the channel still advertises 300000 max_htlc — not retried for 6 h";
+  assert.deepEqual(maxHtlcDecision([{ alias: "a", ok: false, error: stuck }]), { text: `1 not applied (${stuck})`, state: "error" });
+  assert.deepEqual(maxHtlcDecision([{ alias: "a", ok: false, error: "LND refused the update: x — not retried for 6 h" }]).text, "1 refused by LND (LND refused the update: x — not retried for 6 h)");
 });
 
 test("an area switched off says it is off — whatever it last decided — and with write mode off every area is blocked", async (t) => {

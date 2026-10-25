@@ -53,6 +53,8 @@ export function feeNode(opts: { channels: FeeChannel[]; blockHeight?: number; ch
   const node = new FakeLnd({ channels: opts.channels, blockHeight: opts.blockHeight ?? 860_000, chainBalance: opts.chainBalance ?? 0 });
   const forwards = opts.forwards ?? [];
   const fees = new Map(opts.channels.map((c) => [c.id, { ppm: c.feeRatePpm ?? 100, base: c.baseFeeMsat ?? 1000 }]));
+  /** max_htlc each channel advertises after an update set it (msat). */
+  const maxHtlcOf = new Map<string, number>();
   const byPoint = new Map(opts.channels.map((c) => [`${c.transactionId}:${c.transactionVout}`, c]));
   const writes: { outpoint: string; feeRatePpm: number; baseFeeMsat: number }[] = [];
   const requests: Record<string, unknown>[] = [];
@@ -109,7 +111,7 @@ export function feeNode(opts: { channels: FeeChannel[]; blockHeight?: number; ch
       fee_base_msat: String(base),
       fee_rate_milli_msat: String(ppm),
       last_update: Math.floor(Date.now() / 1000),
-      max_htlc_msat: String(ch.capacity * 990),
+      max_htlc_msat: String(maxHtlcOf.get(ch.id) ?? ch.capacity * 990),
       min_htlc: "1000",
       time_lock_delta: 80,
     });
@@ -146,6 +148,8 @@ export function feeNode(opts: { channels: FeeChannel[]; blockHeight?: number; ch
     const baseFeeMsat = Number(a.base_fee_msat);
     writes.push({ outpoint, feeRatePpm, baseFeeMsat });
     if (ch) fees.set(ch.id, { ppm: feeRatePpm, base: baseFeeMsat });
+    // As LND does: the max_htlc it took is what the channel advertises next.
+    if (ch && a.max_htlc_msat !== undefined && Number(a.max_htlc_msat) > 0) maxHtlcOf.set(ch.id, Number(a.max_htlc_msat));
     cb(null, { failed_updates: [] });
   });
   return Object.assign(node, {

@@ -11,6 +11,7 @@ import { getChannelsView } from "./channels.js";
 import { getOwnPubkey } from "./node.js";
 import type { OverrideMap } from "./overrides.js";
 import { activeCap, capText, clampToCap, type LeaseCap } from "./leaseCaps.js";
+import { errorText } from "./errorText.js";
 
 /**
  * A fee policy maps each channel's *current local balance ratio* to a target
@@ -241,16 +242,23 @@ export async function maxPendingByOutpoint(lnd: AuthenticatedLnd): Promise<Map<s
  * items not written yet are left out of the result (nothing was sent for
  * them). The fee autopilot's batch stops so when fee automation is switched
  * off — or all automation paused — while it writes (review of P7).
+ *
+ * `onResult`: each channel's result the moment it is known — the caller's
+ * books save it before the next write is sent.
  */
 export async function applyFees(
   readLnd: AuthenticatedLnd,
   writeLnd: AuthenticatedLnd,
   items: FeeApplyItem[],
   leaseCaps: readonly LeaseCap[] = [],
-  opts: { shouldStop?: () => boolean } = {},
+  opts: { shouldStop?: () => boolean; onResult?: (r: FeeApplyResult) => void } = {},
 ): Promise<FeeApplyResult[]> {
   const mine = await getOwnPubkey(readLnd);
   const results: FeeApplyResult[] = [];
+  const push = (r: FeeApplyResult) => {
+    results.push(r);
+    opts.onResult?.(r);
+  };
   // The lease of a confirmed channel runs from its funding block: the tip
   // tells whether it is still on. (Only asked when a promise exists.)
   const height = leaseCaps.length ? (await getWalletInfo({ lnd: readLnd })).current_block_height : 0;
@@ -281,7 +289,7 @@ export async function applyFees(
       }
 
       if (!current || current.cltv_delta === undefined) {
-        results.push({
+        push({
           id: item.id,
           ok: false,
           feeRatePpm: item.feeRatePpm,
@@ -309,18 +317,18 @@ export async function applyFees(
       });
       const refused = updateRefusal(res, item.transactionId, item.transactionVout);
       if (refused) {
-        results.push({ id: item.id, ok: false, feeRatePpm: item.feeRatePpm, ...(clampedBy ? { clampedBy } : {}), error: refused });
+        push({ id: item.id, ok: false, feeRatePpm: item.feeRatePpm, ...(clampedBy ? { clampedBy } : {}), error: refused });
         continue;
       }
 
-      results.push({ id: item.id, ok: true, feeRatePpm: item.feeRatePpm, baseFeeMsat: item.baseFeeMsat, ...(clampedBy ? { clampedBy } : {}) });
+      push({ id: item.id, ok: true, feeRatePpm: item.feeRatePpm, baseFeeMsat: item.baseFeeMsat, ...(clampedBy ? { clampedBy } : {}) });
     } catch (err) {
-      results.push({
+      push({
         id: item.id,
         ok: false,
         feeRatePpm: item.feeRatePpm,
         ...(clampedBy ? { clampedBy } : {}),
-        error: err instanceof Error ? err.message : String(err),
+        error: errorText(err),
       });
     }
   }

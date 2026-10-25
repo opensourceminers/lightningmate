@@ -103,6 +103,29 @@ balanced level of 80) and lowered again after two quiet weeks — in a 120-day s
 demand that depends on the fee, such channels sat priced out 80–90 % of the time; now they
 keep the price that routes (a test runs that loop on every preset, with and without a market).
 
+**A raise needs a sale** (review 2026-10-25). An ordinary raise — the curve, drain velocity,
+the benchmark, the replacement cost, the demand ramp — waits until the channel sold at least
+once at the fee it charges now, since that fee was set (by the fee-change log); the Why says
+so ("hold: nothing sold at X ppm since it was set — not raised toward Y ppm before a sale").
+Floors, the min/max range, pins and lease promises are not held by it. A **sale** is a forward
+out of at least 1,000 sat; the same incoming → outgoing pair within 60 s counts once (one
+payment's retries and shards) — for the demand ramp's three sales and the refill gate's proof
+alike. When the forwards couldn't be read completely, sales are unknown and the
+ordinary raises go on as before.
+
+**Step back.** A fee raised and then not sold at for 48 h, while the channel has something to
+sell (local balance minus its 1 % reserve at least max(50k, 1 % of capacity)), goes back in
+one move — paced like a lowering — to its **proven level** (the highest fee of the last 14 days
+it sold at least 3 times at; see Rebalancing) or else to its fee before that raise. The
+drained-idle hold doesn't strand it there.
+
+**On the grid.** A step lands on the “Round to” grid (a raise rounds down onto it, a lowering
+up — a 333 ppm step lands on 330 at a 10 ppm grid). A move that lands exactly stays exact — a floor, the min, a jump to the
+flow-won or market price. **In demand** (the protect rule's "wanted") needs at least 50k sat of
+refused HTLCs, not just their count. A channel younger than 30 days is never a close candidate
+("idle since it opened N d ago", not "idle for 30 days"). A top earner, which the benchmark never
+lowers, no longer shows an "idle test" it doesn't run.
+
 **The threshold.** The anti-churn threshold (`max(minChangePpm, 20% of the fee)`) judges the
 gap between the fee and the aim, not the size of one step — it used to veto the engine's own
 steps (+20, −30, +40 at step 10 were all under it), freezing draining channels low and idle
@@ -224,7 +247,7 @@ idle).
    lowered only by ratchet steps.
    - **Demand ramp** (2026-10-24): a **drained channel with buyers** — under 10 % local (the
      protect rule's "drained"), ≥ 3 forwards in 30 days, not refilled faster than it sells (14-day
-     outflow ≥ inflow), no measured elasticity below 1 — that **sold at the fee it charges now**
+     inflow at most max(1 % of capacity, 50k) above its outflow — a 2-sat inflow switched it off), no measured elasticity below 1 — that **sold at the fee it charges now**
      (three forwards out since that fee was set, by LightningMate's own stamp — the refill gate's
      proof, too) is raised by
      **a quarter of its fee per move** (rounded down onto the grid, at least the ordinary two
@@ -293,10 +316,11 @@ idle).
     - **asymmetric pacing**: a **raise** waits `max(user cooldown, 72h)` since the last apply
       (a ramp — protect or profit floor — steps at the user cooldown; the demand ramp at
       `max(user cooldown, 6h)`, at the user cooldown while within a floor ramp's reach); a
-      **lowering** steps at most **once a day**. A channel with no prior change applies
+      **lowering** steps at most once per `max(24h, user cooldown)`. A channel with no prior change applies
       immediately either way.
     - a channel whose last update failed (LND refused it, or it couldn't be sent) waits
-      **6 hours** before it is tried again — a broken lease promise excepted;
+      **6 hours** before it is tried again — a broken lease promise excepted (the wait is saved:
+      a restart no longer cuts it short);
     - at most `maxChangesPerRun` actual applies: broken lease promises first, then pins, then
       the biggest moves.
 
@@ -308,7 +332,15 @@ same refusal again is not repeated in the run history). A broken lease promise i
 every check. Every write — the autopilot's, a lease promise kept, a manual Apply or pin —
 goes through the same books: the cooldown, the run history (with the reason) and the
 fee-change log. The lease promises are checked every 10 minutes even with
-every switch off.
+every switch off. Each write is booked — and saved — as LND answers it, before the next is sent:
+a restart in the middle of a batch keeps the cooldowns and fee-log records of the writes already
+made. "LND refused" is said only of an update LND refused; one skipped (its policy unreadable)
+or never answered reads "not applied".
+
+The **Advertise routable size** pass: under 1,024 sat to forward, a channel advertises its
+min HTLC (1,024 it couldn't carry drew failed small payments that read as demand). An update LND
+says it took but the channel doesn't advertise is recorded once and left alone for 6 h (live: the
+same write every 30 minutes for 19 h).
 
 ---
 
@@ -404,17 +436,21 @@ only returns moves where the route cost is justified by what the refilled sats e
 channel earned, charges and is heading to — and of the fee the fee engine charges **after**
 the refill (asked of the engine itself, `feeAfterRefill`); the engine then **holds** that
 price while the refilled sats are in the channel (see the profit floor above), so the gate's
-estimate and the engine agree. What it **earned** is the 30-day average at the fees it had —
-which lags a higher price that sells for a month — **or the price it was paid since its fee was
-set**: at least 3 forwards out at the fee it charges now (2026-10-24). Never a price nobody
+estimate and the engine agree. (It is the engine that holds it: the rows and the confirm dialog
+promise the hold — with its limits — only while fee automation is on.) What it **earned** is the 30-day average at the fees it had —
+which lags a higher price that sells for a month — **or its proven level** (2026-10-25): the highest fee of the last 14 days at which it
+sold at least 3 times (the fee-change log's levels and the forwards; a sale as above), valued at
+what those sales paid — never above its fee now, its target or its aim. A channel the demand ramp
+moves on to ~989 ppm is refilled at the proven 820 in the same run; before, each ramp move
+reset the proof, and the refill waited for three sales at the new fee. Never a price nobody
 paid: a first version valued one refill at the untested fee, and the refill's hold kept that
 fee for up to 30 days where nobody bought (in a 60-day simulation it cut the channel's net from
 1,365 to 203 sat where demand stopped at 500 ppm). A refill valued at a proven price is **at most
 10× the sats that sold at it** (at least the 50k minimum): three 1k forwards don't carry a 443k
 refill whose hold then keeps the fee there. A pin or a floor's lift counts like any fee — only
 once three forwards were paid at it; until then the row says what would count. The **demand** the gate counts — the earnings cap and the refill's
-size — is, for a **drained** channel (under 10 % local) not refilling itself (14-day outflow ≥
-inflow), the larger of its 14-day outflow and half its 30-day one (net drain likewise); every
+size — is, for a **drained** channel (under 10 % local) not refilling itself (14-day inflow at
+most max(1 % of capacity, 50k) above its outflow), the larger of its 14-day outflow and half its 30-day one (net drain likewise); every
 other channel counts its 14 days. A drained channel can't route out, and its last 14 days
 understated it: a top earner at 1 % local had sold 2.4M in 30 days but 0.23M in 14, and every
 refill was sized and valued on the 0.23M. "What it would take" asks for the demand counted. A move passes only if its route costs at most `econRatio` of
@@ -437,6 +473,9 @@ planned from it shrink what it can give the next target. Up to three sources are
 target, the next one when no route pays from the one before; a failed source backs off for
 that target only (cooldown × 2^fails, at most ×8). A refill of ≥ 500k may split over 3 paths
 (the payment carries the invoice's feature bits — without them LND never splits).
+Never a target: a channel bought on Magma while its lease runs (its low local balance is what
+was bought), nor one younger than 30 days that hasn't routed yet. The per-target fail counts
+from before the per-pair back-off (0.7.x), never added to since, are dropped on upgrade.
 Runs at most `maxRebalancesPerRun` (the best moves that fit the budget left — a pricey best
 move no longer blocks a cheaper one; a move whose estimated fee no longer fits what is left
 after the run's earlier payments waits for the daily budget rather than going out with a
@@ -448,17 +487,26 @@ disk **before** it is sent, so a restart or a crash mid-payment (an update's shu
 37 s, a payment up to 150 s) loses nothing: the restarted process counts it at its maximum
 fee, leaves its two channels alone, and books it — fee, hold, sent counter, on the day it was
 sent — once LND says how it ended. An attempt whose wait broke off without LND saying how it
-ended counts as still in flight (no smaller size or other source is tried meanwhile). After the
+ended counts as still in flight (no smaller size or other source is tried meanwhile). Each
+attempt's pathfinding gets the time left less 10 s, in whole seconds (at most 45 s), and none
+starts with under 20 s left: LND's own failure then arrives inside the wait — before, it came
+just after the attempt was booked "in flight", and the next size never got a real try. A payment
+LND refuses outright (it has none by that id) is failed at once, with LND's reason. LND failing
+a refill before anything was sent (its first reads) fails that refill only: its cooldown is
+given back, and the run goes on with the next. After the
 shutdown signal no new attempt starts — no smaller size, no other source: only the payment
 already under way is awaited, and the refill counts as skipped, not failed. A manual
 refill is capped at what is left and refused when nothing is; it never pays beside the
 autopilot's rebalance stage (one refill at a time), nor into or out of a channel whose earlier
 payment may still land (the tab shows that payment instead of a Run button), but no longer
 holds up the rest of a run (fees, lease promises, channel opens, Magma). Run from a
-recommended row, it carries the profit gate and its price is held like an autopilot refill's. Moves the budget or the per-run limit leave for
+recommended row, it carries the profit gate and its price is held like an autopilot refill's;
+a row planned at a higher fee than the target charges now (a tab left open) is valued at the
+fee now, its cost per sat capped to match. Moves the budget or the per-run limit leave for
 later are **not** failed runs: they go into the rebalance decision ("last decision" on the
 tab), never into the run history. A drained channel the gate turns down says what a refill would need
-(earnings per sat, outflow, net drain).
+(earnings per sat at the demand-sized refill, outflow, net drain — and when that price is above
+the max ppm, that no fee it may charge pays for it).
 
 **Channels** (`runChannels`, `openPlan.ts`): opens one channel per cooldown to the best
 peer suggestion it can really open, when on-chain funds exceed the reserve. It walks down the

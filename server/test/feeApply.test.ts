@@ -16,11 +16,12 @@ import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { applyFees } from "../src/services/fees.js";
-import { MAX_HTLC_BACKOFF_MS, runMaxHtlcPass } from "../src/services/maxHtlc.js";
+import { MAX_HTLC_BACKOFF_MS, decideMaxHtlc, maxHtlcBucketSat, runMaxHtlcPass } from "../src/services/maxHtlc.js";
 import { Autopilot, FEE_RETRY_BACKOFF_MS } from "../src/services/autopilot.js";
 import { MARKET_RUN_WAIT_MS, getFeeRecommendations } from "../src/services/feeRecommend.js";
 import { GRAPH_TTL_MS } from "../src/services/suggestions.js";
 import { RebalanceLog } from "../src/services/rebalanceLog.js";
+import { FeeChangeLog } from "../src/services/feeChangeLog.js";
 import { OverridesStore } from "../src/services/overrides.js";
 import { AmbossStore } from "../src/services/ambossStore.js";
 import { EarningsLog } from "../src/services/earningsLog.js";
@@ -216,7 +217,9 @@ test("GET /channels carries what each channel charges now", async (t) => {
 // ── review repair: back-off, the lock, the why, the episode, old pins ───────
 
 /** The autopilot's in-memory retry book (writeFees). */
-const retryBook = (autopilot: Autopilot) => (autopilot as unknown as { feeRetry: Map<string, { until: number; error: string }> }).feeRetry;
+const retryBook = (autopilot: Autopilot) =>
+  ((autopilot as unknown as { state: { perChannelFeeRetry?: Record<string, { until: string; error: string }> } }).state.perChannelFeeRetry ??= {});
+const longAgo = () => new Date(Date.now() - 1).toISOString();
 const failedLines = (autopilot: Autopilot) => autopilot.getState().history.flatMap((r) => r.changes).filter((c) => !c.ok);
 
 test("an update LND keeps refusing is sent once, not every run — one request, one failed line in the run history, saying when it is tried again; the Fees tab shows the channel held", async (t) => {
@@ -232,16 +235,51 @@ test("an update LND keeps refusing is sent once, not every run — one request, 
   const report = await getFeeRecommendations(node.lnd, [], autopilot.feeCooldown(), {}, {}, new Map(), new Map(), [], { demand: new Map(), market: new Map() });
   assert.deepEqual(report.recommendations[0].blockedByGuards, ["its last fee update failed — tried again in ~6 h"]);
   // After the back-off it is tried again — the same refusal again is not news.
-  retryBook(autopilot).get("850000x1x0")!.until = Date.now() - 1;
+  retryBook(autopilot)["850000x1x0"].until = longAgo();
   await autopilot.runOnce();
   assert.equal(node.policyRequests.length, 2);
   assert.equal(failedLines(autopilot).length, 1, "the same refusal is on record once");
   // Taken at last: written and booked, the back-off cleared.
   node.refusals.clear();
-  retryBook(autopilot).get("850000x1x0")!.until = Date.now() - 1;
+  retryBook(autopilot)["850000x1x0"].until = longAgo();
   const ok = await autopilot.runOnce();
   assert.deepEqual(ok.changes.map((c) => [c.ok, c.toPpm]), [[true, 270]]);
-  assert.equal(retryBook(autopilot).has("850000x1x0"), false);
+  assert.equal("850000x1x0" in retryBook(autopilot), false);
+});
+
+test("the retry back-off is saved: after a restart (every Umbrel update) an update LND refused is not sent again at once — the new process waits out the 6 h too (review 2026-10-25)", async (t) => {
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 800_000 })] });
+  node.refusals.set(`${TX(1)}:0`, "some persistent refusal");
+  const { autopilot, dir } = autopilotOn(t, node, { enabled: true });
+  await autopilot.runOnce();
+  assert.equal(node.policyRequests.length, 1);
+  await autopilot.shutdown();
+  // A new process on the same disk.
+  const after = new Autopilot(dir, node.lnd, node.lnd, new RebalanceLog(dir), new OverridesStore(dir), new AmbossStore(dir), new EarningsLog(dir), new ServiceFeeLedger(dir, null));
+  suppressSchedulerKicks(after);
+  t.after(() => after.shutdown());
+  await after.runOnce();
+  // Before: kept in memory only — the restarted process sent it again.
+  assert.equal(node.policyRequests.length, 1, "not sent again");
+  assert.deepEqual(Object.keys(after.feeCooldown().retryAfter ?? {}), ["850000x1x0"]);
+});
+
+test("each fee write is booked and saved as LND takes it — a restart in the middle of a batch keeps the cooldowns and fee-log records of the writes already made (review 2026-10-25)", async (t) => {
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 800_000 }), channel(2, { localBalance: 800_000 })] });
+  const { autopilot, dir, saved } = autopilotOn(t, node, { enabled: true });
+  // The disk as the second write goes out — what a restart then would find.
+  const seen: { stamps: string[]; logged: string[] }[] = [];
+  let writes = 0;
+  node.beforeCall = (method) => {
+    if (method !== "default.updateChannelPolicy" || ++writes !== 2) return;
+    seen.push({ stamps: Object.keys(saved().perChannelLastApplied), logged: new FeeChangeLog(dir).all().map((r) => r.channelId) });
+  };
+  const run = await autopilot.runOnce();
+  const [first, second] = run.changes;
+  assert.deepEqual([first?.ok, second?.ok], [true, true]);
+  // Before: both were booked — and saved — only once the batch was done.
+  assert.deepEqual(seen, [{ stamps: [first.id], logged: [first.id] }]);
+  assert.deepEqual(Object.keys(saved().perChannelLastApplied).sort(), [first.id, second.id].sort());
 });
 
 test("a manual Apply never runs into the autopilot: while a run holds the lock, POST /fees/apply-recommended and POST /fees/apply answer 409, write nothing and leave the lock to its holder", async (t) => {
@@ -452,7 +490,8 @@ test("a peer back from an outage — its inbound channels still disabled in the 
 
 test("through such a gap the autopilot keeps pricing a draining channel toward its refill cost from the reference it last saw — 200 → 220, then 220 → 240 with the reference gone", async (t) => {
   const channels = [channel(1, { feeRatePpm: 200 }), channel(3, { feeRatePpm: 80 })];
-  const node = feeNode({ blockHeight: HEIGHT, channels, forwards: forwardsOut("850000x1x0", "850000x3x0", 10) });
+  const forwards = forwardsOut("850000x1x0", "850000x3x0", 10);
+  const node = feeNode({ blockHeight: HEIGHT, channels, forwards });
   const graph = withMarket(node, channels, { "850000x1x0": { intoPpm: 200, backPpm: 100 } });
   const keepAlive = setInterval(() => undefined, 1_000);
   t.after(() => clearInterval(keepAlive));
@@ -463,6 +502,8 @@ test("through such a gap the autopilot keeps pricing a draining channel toward i
   // Three days on (past the 72 h raise pause) the peer's inbound channels are disabled in the graph.
   node.override("default.describeGraph", (_a, cb) => cb(null, inboundDisabled(graph, PEER(1), node.publicKey)));
   t.mock.timers.tick(73 * 3_600_000);
+  // It sold at 220 meanwhile: a raise needs a sale at the fee it raises from.
+  forwards.push(...forwardsOut("850000x1x0", "850000x3x0", 3, { days: 1 }));
   const second = await autopilot.runOnce();
   const ch1 = second.changes.find((c) => c.id === "850000x1x0");
   // Without the memory: no reference — held at 220, short of its refill cost.
@@ -510,3 +551,45 @@ test("F09: a max_htlc update that fails outright (an error, not a refusal) is re
   await runMaxHtlcPass(node.lnd, node.lnd, backoff);
   assert.equal(asked, 2);
 });
+
+test("a channel with under 1,024 sat to forward advertises its min_htlc, not 1,024 it can't carry — senders' failed small payments read as demand that kept it raising (review 2026-10-25)", async () => {
+  assert.equal(maxHtlcBucketSat(0), 1);
+  assert.equal(maxHtlcBucketSat(500, 3), 3, "the channel's min_htlc");
+  assert.equal(maxHtlcBucketSat(1_024), 1_024);
+  assert.equal(maxHtlcBucketSat(5_000), 4_096);
+  assert.deepEqual(decideMaxHtlc(800, 1_024, 1), { change: true, toSat: 1 }, "lowered at once");
+  // On a node: 500 sat to forward → max_htlc = its min_htlc (1,000 msat).
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 500 })] });
+  const [moved] = await runMaxHtlcPass(node.lnd, node.lnd, new Map());
+  assert.deepEqual([moved.toSat, moved.ok], [1, true]);
+  assert.equal(node.policyRequests.at(-1)?.max_htlc_msat, "1000");
+});
+
+test("a max_htlc update LND takes but the channel doesn't advertise is not sent again every run — recorded once, then left alone 6 h (live: the same write every 30 min for 19 h)", async () => {
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 1_500_000 })] });
+  // LND answers OK and changes nothing.
+  node.override("default.updateChannelPolicy", (_a, cb) => cb(null, { failed_updates: [] }));
+  const backoff = new Map<string, number>();
+  const lastWrites = new Map<string, { fromSat: number | null; toSat: number }>();
+  const first = await runMaxHtlcPass(node.lnd, node.lnd, backoff, { lastWrites });
+  assert.equal(first.length, 1);
+  assert.equal(first[0].ok, true);
+  const second = await runMaxHtlcPass(node.lnd, node.lnd, backoff, { lastWrites });
+  assert.equal(second.length, 1);
+  assert.equal(second[0].ok, false);
+  assert.equal(second[0].toSat, first[0].toSat, "the same write it would have sent again");
+  assert.match(second[0].error ?? "", /^LND took the update, but the channel still advertises 1980000 max_htlc — not retried for 6 h$/);
+  assert.equal((await runMaxHtlcPass(node.lnd, node.lnd, backoff, { lastWrites })).length, 0, "left alone");
+  // After the back-off: tried once more.
+  backoff.set("850000x1x0", Date.now() - MAX_HTLC_BACKOFF_MS - 1);
+  assert.equal((await runMaxHtlcPass(node.lnd, node.lnd, backoff, { lastWrites })).length, 1);
+});
+
+test("a max_htlc update that took is written once — the next pass reads it back and leaves the channel alone", async () => {
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 1_500_000 })] });
+  const lastWrites = new Map<string, { fromSat: number | null; toSat: number }>();
+  assert.equal((await runMaxHtlcPass(node.lnd, node.lnd, new Map(), { lastWrites })).length, 1);
+  assert.equal((await runMaxHtlcPass(node.lnd, node.lnd, new Map(), { lastWrites })).length, 0);
+  assert.equal(lastWrites.size, 0, "settled: forgotten");
+});
+

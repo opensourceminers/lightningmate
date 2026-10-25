@@ -21,6 +21,9 @@ import {
   DEMAND_RAMP_HOURS,
   DEMAND_RAMP_SHARE,
   FEE_REC_DEFAULTS,
+  SALE_MIN_SATS,
+  provenLevel,
+  salesOf,
   RAISE_STEPS,
   RAMP_STEPS,
   buildRecommendation,
@@ -209,21 +212,162 @@ test("every preset: a drained channel that keeps selling at each new price rises
   );
 });
 
-test("a drained channel nobody buys from at the new price stops one step above the last price that sold — the ordinary two steps per 72 h go on, and the Why says the faster raise waits for a sale", () => {
+test("a drained channel nobody buys from at the new price stops one step above the last price that sold — and stays: no raise without a sale (it crept on 20 ppm every 72 h)", () => {
   const ch = chan({ localRatio: 0.05 });
   const sim = simulate(ch, ctx({ ppm: 350, ...drainedFlows }), 10, { sellsUpTo: 400 });
-  // 350 sold: one ramp move to 430; nothing sells at 430: ordinary steps from there.
-  assert.equal(sim.fees[1], 430, sim.fees.join("→"));
-  sim.moves.slice(1).forEach((m, i) => {
-    assert.ok(m <= RAISE_STEPS * STEP, `${sim.fees.join("→")} — a move of ${m} after the ramp stopped`);
-    assert.ok(sim.at[i + 1] - sim.at[i] >= 72 * 3_600_000, `${sim.fees.join("→")} — the raise pause`);
-  });
+  // 350 sold: one ramp move to 430; nothing sells at 430: held there.
+  assert.deepEqual(sim.fees, [350, 430], sim.fees.join("→"));
   const waiting = buildRecommendation(ch, ctx({ ppm: 430, ...drainedFlows, soldSinceChange: NO_FLOW }));
-  assert.ok(
-    waiting.reasons.includes("demand: drained (5% local), but nothing sold at 430 ppm since it was set — the faster raise waits for a sale"),
-    waiting.reasons.join(" | "),
+  assert.equal(waiting.targetPpm, 430);
+  assert.match(waiting.reasons[0], /^hold: nothing sold at 430 ppm since it was set — not raised toward \d+ ppm before a sale$/, waiting.reasons.join(" | "));
+});
+
+test("a raise needs a sale at the fee it raises from: the curve, a drain signal and the replacement cost hold without one — floors, the min, pins and lease promises still move the fee; with the history unread, the rule doesn't apply", () => {
+  // node8153's case: draining over 30 days, 57 % local, its last sale before the fee was set.
+  const flows = { f14: flow(300_000, 50_000, 10, 24), f30: flow(600_000, 100_000, 20, 48) } as const;
+  const unsold = buildRecommendation(chan({ localRatio: 0.35 }), ctx({ ppm: 80, ...flows, soldSinceChange: NO_FLOW }));
+  assert.equal(unsold.targetPpm, 80, unsold.reasons.join(" | "));
+  assert.match(unsold.reasons[0], /^hold: nothing sold at 80 ppm since it was set — not raised toward \d+ ppm before a sale/);
+  assert.ok(!unsold.reasons.some((x) => /— raised toward|pricing toward/.test(x)), `no raise claimed: ${unsold.reasons.join(" | ")}`);
+  // One sale at 80 since: raised as before.
+  const sold = buildRecommendation(chan({ localRatio: 0.35 }), ctx({ ppm: 80, ...flows, soldSinceChange: flow(20_000, 0, 1, 2) }));
+  assert.ok(sold.targetPpm > 80, sold.reasons.join(" | "));
+  // History unread (a read cut short): unknown, not "nothing sold" — raised as before.
+  assert.ok(buildRecommendation(chan({ localRatio: 0.35 }), ctx({ ppm: 80, ...flows })).targetPpm > 80);
+  // The protect ramp still lifts a drained channel in demand without a sale…
+  const protect = buildRecommendation(chan({ localRatio: 0.05 }), ctx({ ppm: 80, f14: flow(150_000, 0, 5, 12), f30: flow(300_000, 0, 10, 24), soldSinceChange: NO_FLOW }));
+  assert.equal(protect.targetPpm, 80 + RAMP_STEPS * STEP, protect.reasons.join(" | "));
+  // …the policy's min lifts a fee below it…
+  assert.equal(buildRecommendation(chan({ localRatio: 0.35 }), ctx({ ppm: 0, ...flows, soldSinceChange: NO_FLOW })).targetPpm, 25);
+  // …and a pin applies.
+  assert.equal(buildRecommendation(chan({ localRatio: 0.35 }), ctx({ ppm: 80, ...flows, soldSinceChange: NO_FLOW, override: { mode: "fixed", fixedPpm: 300 } })).targetPpm, 300);
+});
+
+test("the step-back: a raise nothing sold at for 48 h, with sats to sell, goes back to the last price that sold (or the fee before the raise) in one move — the anti-churn threshold doesn't veto it", () => {
+  const hour = 3_600_000;
+  const ch = chan({ localRatio: 0.08 }); // 160k local of 2M: 140k to sell above the reserve
+  const raisedAgo = (h: number) => ({ at: new Date(NOW - h * hour).toISOString(), fromPpm: 660, toPpm: 820 });
+  const c = (h: number, o: Partial<BuildCtx> = {}) =>
+    buildRecommendation(
+      ch,
+      ctx({ ppm: 820, ...drainedFlows, soldSinceChange: NO_FLOW, lastChange: raisedAgo(h), cooldown: { lastApplied: { [ch.id]: raisedAgo(h).at }, cooldownHours: 6 }, ...o }),
+    );
+  // 47 h: held (no sale, no raise either).
+  assert.deepEqual([c(47).targetPpm, c(47).wouldApply], [820, false], c(47).reasons.join(" | "));
+  // 49 h: back to the fee before that raise.
+  const back = c(49);
+  assert.deepEqual([back.targetPpm, back.wouldApply], [660, true], `${back.blockedByGuards.join(", ")} | ${back.reasons.join(" | ")}`);
+  assert.match(back.reasons[0], /^step back: raised 660→820 ppm 2 d ago and nothing sold at it since, with 140k to sell — back to 660 ppm, its fee before that raise/);
+  // A proven level below it wins: the last price that sold three times.
+  const proven = { ppm: 530, paidPpm: 531, sales: 3, out: 48_000, revenue: 25.5, from: new Date(NOW - 5 * 24 * hour).toISOString(), to: new Date(NOW - 3 * 24 * hour).toISOString() };
+  const toProven = c(49, { provenLevel: proven });
+  assert.equal(toProven.targetPpm, 530);
+  assert.match(toProven.reasons[0], /back to 530 ppm, the last price that sold 3 times$/);
+  // Nothing to sell (at the reserve): no step-back — there was nothing to buy.
+  const empty = buildRecommendation(
+    chan({ localRatio: 0.01 }),
+    ctx({ ppm: 820, ...drainedFlows, soldSinceChange: NO_FLOW, lastChange: raisedAgo(49), cooldown: { lastApplied: { [ch.id]: raisedAgo(49).at }, cooldownHours: 6 } }),
   );
-  assert.ok(!waiting.reasons[0].startsWith("demand:"), "the rule that set the move leads");
+  assert.equal(empty.targetPpm, 820);
+  // Something sold at 820: no step-back.
+  assert.equal(c(49, { soldSinceChange: flow(20_000, 0, 1, 16) }).targetPpm >= 820, true);
+  // Not a raise (a lowering last): no step-back.
+  assert.equal(c(49, { lastChange: { at: raisedAgo(49).at, fromPpm: 900, toPpm: 820 } }).targetPpm, 820);
+});
+
+test("a sale is a forward of at least 1,000 sat, and a burst through the same pair within a minute counts once — eleven 6–3,200-sat forwards of one sender in a minute are one buyer", () => {
+  const T = Date.parse("2026-10-15T12:00:00.000Z");
+  const fw = (sec: number, tokens: number, inId = "in-a", out = "ch") => ({ createdAt: new Date(T + sec * 1000).toISOString(), incomingChannel: inId, outgoingChannel: out, tokens, fee: 0, feeMsat: tokens });
+  const burst = [6, 40, 900, 1_200, 3_200, 2_000, 1_500, 1_100, 10, 2_500, 3_000].map((t, i) => fw(i * 5, t));
+  const sold = salesOf(burst, "ch", T - 1);
+  assert.equal(sold.forwards, 1, "one burst");
+  assert.equal(sold.out, 1_200 + 3_200 + 2_000 + 1_500 + 1_100 + 2_500 + 3_000, "the sats of its sales (≥ 1,000 each)");
+  // Spaced more than a minute apart, or through another pair: separate sales.
+  assert.equal(salesOf([fw(0, 5_000), fw(61, 5_000), fw(62, 5_000, "in-b")], "ch", T - 1).forwards, 3);
+  // Under 1,000 sat: not a sale.
+  assert.equal(salesOf([fw(0, SALE_MIN_SATS - 1)], "ch", T - 1).forwards, 0);
+  // Inflow is counted whole.
+  assert.equal(salesOf([fw(0, 500, "ch", "elsewhere")], "ch", T - 1).inn, 500);
+});
+
+test("the proven level: the highest fee a channel sold 3 times at within 14 days, from the fee-change log — a raise since doesn't erase it", () => {
+  const day = 86_400_000;
+  const at = (d: number) => new Date(NOW - d * day).toISOString();
+  const fw = (d: number, minute: number, ppm: number) => ({
+    createdAt: new Date(NOW - d * day + minute * 120_000).toISOString(),
+    incomingChannel: "in",
+    outgoingChannel: "ch",
+    tokens: 10_000,
+    fee: 0,
+    feeMsat: 10 * ppm,
+  });
+  // 350 until 6 d ago, 660 until 2 d ago, 820 since.
+  const history = [
+    { at: at(6), fromPpm: 350, toPpm: 660 },
+    { at: at(2), fromPpm: 660, toPpm: 820 },
+  ];
+  const events = [
+    ...[0, 1, 2, 3].map((m) => fw(9, m, 350)), // 4 sales at 350
+    ...[0, 1, 2].map((m) => fw(4, m, 660)), // 3 at 660
+    fw(1, 0, 820), // 1 at 820
+  ];
+  const level = provenLevel(events, "ch", history, 820, NOW);
+  assert.ok(level);
+  assert.deepEqual([level!.ppm, level!.paidPpm, level!.sales, level!.out, level!.to], [660, 660, 3, 30_000, at(2)]);
+  // Older than 14 days: not proof.
+  assert.equal(provenLevel([...[0, 1, 2].map((m) => fw(15, m, 900))], "ch", [], 900, NOW), null);
+  // No history: the current fee is the one level.
+  assert.equal(provenLevel([...[0, 1, 2].map((m) => fw(3, m, 400))], "ch", [], 400, NOW)?.ppm, 400);
+});
+
+test("'not refilled faster than it sells' tolerates inflows up to max(1 % of capacity, 50k) in 14 days — a 2-sat inflow switched a drained channel's demand off", () => {
+  const ch = chan({ localRatio: 0.05 }); // 2M: tolerance 50k
+  const base = { ppm: 400, f30: drainedFlows.f30, soldSinceChange: soldThrice } as const;
+  const ramped = 400 + demandStep(400);
+  assert.equal(buildRecommendation(ch, ctx({ ...base, f14: flow(0, 2, 0, 0) })).targetPpm, ramped);
+  assert.equal(buildRecommendation(ch, ctx({ ...base, f14: flow(100_000, 150_000, 3, 30) })).targetPpm, ramped, "50k more in than out: within");
+  assert.ok(buildRecommendation(ch, ctx({ ...base, f14: flow(100_000, 160_000, 3, 30) })).targetPpm < ramped, "60k more in: refilling itself");
+});
+
+test("'in demand' from refused HTLCs needs 50k sat refused in all — 14 tiny ones (1,694 sat) at a channel's reserve are not demand", () => {
+  const ch = chan({ localRatio: 0.4 });
+  const tiny = { attempts: 14, days: 6, sats: 1_694, medianSats: 120 };
+  assert.equal(buildRecommendation(ch, ctx({ ppm: 300, demand: tiny })).noFlowLowering, true, "idle: lowered");
+  assert.equal(buildRecommendation(ch, ctx({ ppm: 300, demand: { ...tiny, sats: 60_000 } })).noFlowLowering, false, "60k refused: in demand");
+});
+
+test("a channel under 30 days old is never a close candidate, nor 'idle for 30 days' (six blocks after an open it read 'consider closing')", () => {
+  const young = chan({ id: `${HEIGHT - 144 * 10}x1x0`, localRatio: 0.05 }); // ~10 days
+  const r = buildRecommendation(young, ctx({ ppm: 80 }));
+  assert.notEqual(r.state, "close_candidate", r.reasons.join(" | "));
+  assert.ok(!r.reasons.some((x) => /consider closing|idle for 30 days/.test(x)), r.reasons.join(" | "));
+  assert.ok(r.reasons.some((x) => /idle since it opened 10 d ago/.test(x)), r.reasons.join(" | "));
+  // Older: as before.
+  assert.equal(buildRecommendation(chan({ localRatio: 0.05 }), ctx({ ppm: 80 })).state, "close_candidate");
+});
+
+test("lowerings are paced at max(24 h, the operator's fee cooldown) — a 7-day cooldown lowered a fee 25 h after the last change", () => {
+  const ch = chan({ localRatio: 0.4 });
+  const c = (hoursAgo: number, cooldownHours: number) =>
+    buildRecommendation(ch, ctx({ ppm: 500, cooldown: { lastApplied: { [ch.id]: new Date(NOW - hoursAgo * 3_600_000).toISOString() }, cooldownHours } }));
+  assert.equal(c(25, 6).wouldApply, true);
+  assert.equal(c(25, 168).wouldApply, false);
+  assert.match(c(25, 168).blockedByGuards.join(", "), /lower pacing \(every 168 h\)/);
+  assert.equal(c(169, 168).wouldApply, true);
+});
+
+test("a top earner the benchmark keeps from a lower fee doesn't read 'idle test … testing a lower fee', nor 'exploring'", () => {
+  const ch = chan({ localRatio: 0.99, capacity: 5_500_000 });
+  const r = buildRecommendation(ch, ctx({ ppm: 30, f14: NO_FLOW, f30: flow(8_840_000, 13_880_000, 364, 418), enoughChannels: true, earnerCutoff: 400, bench: { activeChannelCount: 21, topGrossFlow14d: 1, medianGrossFlow14d: 0.1, topRevenue30d: 553, medianRevenue30d: 0, topRevenuePpm30d: 230, medianRevenuePpm30d: 0 } }));
+  assert.ok(!r.reasons.some((x) => x.startsWith("idle test")), r.reasons.join(" | "));
+  assert.notEqual(r.state, "exploring_lower_fee");
+});
+
+test("a demand-ramp move capped by its aim lands on the 'Round to' grid — 820 → 980, not 989", () => {
+  const ch = chan({ localRatio: 0.01, capacity: 3_000_000 });
+  const r = buildRecommendation(ch, ctx({ ppm: 820, ...drainedFlows, soldSinceChange: soldThrice, market: market(1, 0) }));
+  assert.equal(r.targetPpm % STEP, 0, `${r.targetPpm}: ${r.reasons.join(" | ")}`);
+  assert.ok(r.targetPpm > 820 && r.targetPpm <= r.aimPpm);
 });
 
 test("the demand ramp only where it applies: drained (under 10 % local), routed 3 times in 30 days, 3 sales at the fee since it was set, not refilled faster than it sells, and no measured elasticity below 1", () => {
@@ -473,10 +617,13 @@ test("what a channel sold since its fee was set reaches the engine (getFeeRecomm
       { id: otherId, partnerPublicKey: "02" + "22".repeat(32), capacity: 2_000_000, localBalance: 1_800_000, transactionId: "bb".repeat(32), transactionVout: 0, feeRatePpm: 50, baseFeeMsat: 0 },
     ],
     forwards: [
-      // Three before the fee was set (10 days ago, at the old fee)…
-      ...[1, 2, 3].map(() => ({ at: Date.now() - 10 * 24 * hour, inId: otherId, outId: drainedId, tokens: 50_000, feeMsat: 11_500 })),
-      // …two after it (2 h ago, at 820 ppm), and one in.
-      ...[1, 2].map(() => ({ at: Date.now() - 2 * hour, inId: otherId, outId: drainedId, tokens: 10_000, feeMsat: 8_200 })),
+      // Three before the fee was set (10 days ago, at the old fee, minutes apart)…
+      ...[0, 1, 2].map((i) => ({ at: Date.now() - 10 * 24 * hour + i * 300_000, inId: otherId, outId: drainedId, tokens: 50_000, feeMsat: 11_500 })),
+      // …two after it (2 h ago, at 820 ppm, minutes apart), a burst forward
+      // 10 s after the second (the same sale), a 500-sat one (no sale), and one in.
+      ...[0, 1].map((i) => ({ at: Date.now() - 2 * hour + i * 300_000, inId: otherId, outId: drainedId, tokens: 10_000, feeMsat: 8_200 })),
+      { at: Date.now() - 2 * hour + 310_000, inId: otherId, outId: drainedId, tokens: 2_000, feeMsat: 1_640 },
+      { at: Date.now() - 90 * 60_000, inId: otherId, outId: drainedId, tokens: 500, feeMsat: 410 },
       { at: Date.now() - hour, inId: drainedId, outId: otherId, tokens: 5_000, feeMsat: 250 },
     ],
   });
@@ -484,12 +631,18 @@ test("what a channel sold since its fee was set reaches the engine (getFeeRecomm
   const since = (await getFeeRecommendations(node.lnd, [], stamp, {}, {}, new Map(), new Map(), [], { demand: new Map(), market: new Map() })).recommendations.find(
     (r) => r.channelId === drainedId,
   )!;
-  assert.deepEqual(since.metrics.soldSinceChange, { forwards: 2, out: 20_000, revenue: 16.4 });
+  assert.deepEqual(since.metrics.soldSinceChange, { forwards: 2, out: 22_000, revenue: 18.04 });
   // No stamp: everything sold in the window.
   const all = (await getFeeRecommendations(node.lnd, [], null, {}, {}, new Map(), new Map(), [], { demand: new Map(), market: new Map() })).recommendations.find(
     (r) => r.channelId === drainedId,
   )!;
-  assert.deepEqual(all.metrics.soldSinceChange, { forwards: 5, out: 170_000, revenue: 50.9 });
+  assert.deepEqual(all.metrics.soldSinceChange, { forwards: 5, out: 172_000, revenue: 52.54 });
+  // With the fee-change log: the level before the raise (230 ppm, 3 sales 10 days ago) is proven.
+  const changes = [{ at: new Date(Date.now() - 6 * hour).toISOString(), channelId: drainedId, alias: "p", fromPpm: 230, toPpm: 820, fromBaseMsat: 0, toBaseMsat: 0, via: "autopilot" as const }];
+  const withLog = (await getFeeRecommendations(node.lnd, [], stamp, {}, {}, new Map(), new Map(), [], { demand: new Map(), market: new Map() }, changes)).recommendations.find(
+    (r) => r.channelId === drainedId,
+  )!;
+  assert.deepEqual([withLog.metrics.provenLevel?.ppm, withLog.metrics.provenLevel?.sales], [230, 3]);
 });
 
 // ── the market reference (public graph) ─────────────────────────────────────
@@ -674,8 +827,9 @@ test("every preset: an idle channel steps down at most one ratchet per move — 
 test("a drained idle channel is lowered by steps too (the curve × a measured elasticity cut 1,500 → 800 in one update), and rounding never stretches, reverses or invents a move", () => {
   const drainedIdle = buildRecommendation(chan({ localRatio: 0.05 }), ctx({ ppm: 900, elasticityMod: 0.8 }));
   assert.equal(drainedIdle.targetPpm, 900 - 3 * STEP, drainedIdle.reasons.join(" | "));
-  // A ratchet step off the grid (333 ppm, Max profit: one step of 10) stays one step.
-  assert.equal(buildRecommendation(chan({ localRatio: 0.5 }), ctx({ cfg: cfgOf(PRESETS["Max profit"]), ppm: 333 })).targetPpm, 323);
+  // A ratchet step off the grid (333 ppm, Max profit: one step of 10) stays
+  // within one step — onto the grid (2026-10-25: fees land on "Round to").
+  assert.equal(buildRecommendation(chan({ localRatio: 0.5 }), ctx({ cfg: cfgOf(PRESETS["Max profit"]), ppm: 333 })).targetPpm, 330);
   const coarse = cfgOf(PRESETS.Balanced, { stepPpm: 25 });
   // A hold holds: 333 is not "rounded" to 325.
   const held = buildRecommendation(chan({ localRatio: 0.05 }), ctx({ cfg: coarse, ppm: 333 }));
@@ -1170,12 +1324,13 @@ test("(b) a channel with possible demand, raised by the curve below its target r
 test("(c) a draining channel raised at or above its target ratio says it drains — not 'balance: 50% local (target 50%) — the balance curve puts it at ~80 ppm', the raise the Fees tab says never happens", () => {
   const draining = { f14: flow(50_000, 0, 2, 2), f30: flow(600_000, 50_000, 20, 30) } as const;
   const blind = buildRecommendation(chan(), ctx({ ppm: 45, ...draining }));
-  assert.deepEqual([blind.targetPpm, blind.aimPpm], [65, 80]);
+  // Two steps from 45, on the grid inside them (2026-10-25): 60, not 65.
+  assert.deepEqual([blind.targetPpm, blind.aimPpm], [60, 80]);
   assert.match(blind.reasons[0], /^draining: 28% of its capacity net out in 30 d \(no market reference for its refill cost\) — raised toward ~80 ppm/, blind.reasons.join(" | "));
   assertNoContradiction(blind, "draining, no market");
   // With a market whose refill cost is under the curve's level: the same, with the cost.
   const cheap = buildRecommendation(chan(), ctx({ ppm: 45, market: market(30, 10), ...draining }));
-  assert.equal(cheap.targetPpm, 65);
+  assert.equal(cheap.targetPpm, 60);
   assert.match(cheap.reasons[0], /^draining: 28% of its capacity net out in 30 d — raised toward ~80 ppm \(a refill costs ~40 ppm\)/, cheap.reasons.join(" | "));
   assertNoContradiction(cheap, "draining, cheap market");
 });
@@ -1314,27 +1469,28 @@ const drainingAt55 = (cfg: FeeRecConfig, ppm: number, into: number, back: number
     ctx({ cfg, ppm, market: market(into, back), f14: flow(300_000, 50_000, 10, 24), f30: flow(600_000, 100_000, 20, 48) }),
   );
 
-test("a move within one step bound ('free') is rounded no further than its own aim — 95 → 115 under 'pricing toward 115 ppm', not 120", () => {
+test("a move within one step bound ('free') is rounded no further than its own aim — 95 → 110 under 'pricing toward 115 ppm', not 120", () => {
   // Step 10: a refill costs ~100 ppm × 1.15 = 115, 20 ppm above the fee —
   // exactly the raise bound. Rounded to the grid it read 120: past both.
+  // On the grid inside them (2026-10-25: fees land on "Round to"): 110.
   const r = drainingAt55(cfgOf(PRESETS.Balanced), 95, 100, 0);
   assert.match(r.reasons[0], /— pricing toward 115 ppm$/, r.reasons.join(" | "));
-  assert.equal(r.targetPpm, 115);
+  assert.equal(r.targetPpm, 110);
   assert.ok(r.targetPpm - 95 <= RAISE_STEPS * STEP);
 });
 
-test("a raise on a 25-ppm grid stops at its aim and its two steps — 189 → 239, not 250", () => {
+test("a raise on a 25-ppm grid stops at its aim and its two steps — 189 → 225 on the grid, not 250", () => {
   const r = drainingAt55(cfgOf(PRESETS.Balanced, { stepPpm: 25 }), 189, 208, null);
   assert.match(r.reasons[0], /— pricing toward 239 ppm$/, r.reasons.join(" | "));
   assert.ok(r.targetPpm <= 239, `${r.targetPpm}`);
   assert.ok(r.targetPpm - 189 <= RAISE_STEPS * 25);
-  assert.equal(r.targetPpm, 239);
+  assert.equal(r.targetPpm, 225, "on the grid, inside the aim and the two steps");
 });
 
-test("a lowering toward the replacement cost lands on it, not below — 246 → 178 under 'not below 178 ppm', not 175", () => {
+test("a lowering toward the replacement cost never lands below it — 246 → 200 on a 25-ppm grid under 'not below 178 ppm', not 175", () => {
   const r = drainingAt55(cfgOf(PRESETS.Balanced, { stepPpm: 25 }), 246, 155, null);
   assert.match(r.reasons[0], /lowering toward 178 ppm, not below$/, r.reasons.join(" | "));
-  assert.equal(r.targetPpm, 178);
+  assert.equal(r.targetPpm, 200, "the grid point not below 178");
 });
 
 test("F20: rounding never turns a held fee into a raise — an off-grid fee keeps its rate and only the base fee is written", () => {
@@ -1374,3 +1530,52 @@ test("F04: two refused attempts (on two days) don't make an idle channel 'in dem
   assert.equal(three.metrics.inDemand, true);
   assert.equal(three.noFlowLowering, false);
 });
+
+test("with the forwards read cut short (more pages than the reader takes), what sold is unknown — the ordinary raises go on as before, and no level counts as proven; read completely, the same channel waits for a sale (review 2026-10-25)", async () => {
+  const id = "850000x1x0";
+  const otherId = "850000x2x0";
+  const hour = 3_600_000;
+  const channels = [
+    { id, partnerPublicKey: "02" + "11".repeat(32), capacity: 2_000_000, localBalance: 300_000, transactionId: "aa".repeat(32), transactionVout: 0, feeRatePpm: 100, baseFeeMsat: 0 },
+    { id: otherId, partnerPublicKey: "02" + "22".repeat(32), capacity: 2_000_000, localBalance: 1_700_000, transactionId: "bb".repeat(32), transactionVout: 0, feeRatePpm: 100, baseFeeMsat: 0 },
+  ];
+  // It sold before its fee was set (5 days ago), nothing since (the stamp: 6 h ago).
+  const forwards = [0, 1, 2, 3].map((i) => ({ at: Date.now() - 5 * 24 * hour + i * 600_000, inId: otherId, outId: id, tokens: 100_000, feeMsat: 10_000 }));
+  const stamp = { lastApplied: { [id]: new Date(Date.now() - 6 * hour).toISOString() }, cooldownHours: 6 };
+  const recOf = async (node: ReturnType<typeof feeNode>) =>
+    (await getFeeRecommendations(node.lnd, [], stamp, {}, {}, new Map(), new Map(), [], { demand: new Map(), market: new Map() })).recommendations.find(
+      (r) => r.channelId === id,
+    )!;
+  const complete = await recOf(feeNode({ blockHeight: HEIGHT, channels, forwards }));
+  assert.ok(complete.reasons.some((x) => /^hold: nothing sold at 100 ppm since it was set/.test(x)), complete.reasons.join(" | "));
+  assert.equal(complete.targetPpm, 100);
+
+  const cut = feeNode({ blockHeight: HEIGHT, channels, forwards });
+  const chan = (s: string) => {
+    const [b, t, o] = s.split("x").map((n) => BigInt(n));
+    return ((b << 40n) | (t << 16n) | o).toString();
+  };
+  const event = (ms: number, inId: string, outId: string, tokens: number, feeMsat: number) => ({
+    amt_in: String(tokens + Math.floor(feeMsat / 1000)),
+    amt_in_msat: String(tokens * 1000 + feeMsat),
+    amt_out: String(tokens),
+    amt_out_msat: String(tokens * 1000),
+    chan_id_in: chan(inId),
+    chan_id_out: chan(outId),
+    fee: String(Math.floor(feeMsat / 1000)),
+    fee_msat: String(feeMsat),
+    timestamp: String(Math.floor(ms / 1000)),
+    timestamp_ns: String(BigInt(Math.floor(ms)) * 1_000_000n),
+  });
+  // A node busier than the reader's 100 pages: every page holds one more forward (elsewhere).
+  cut.override("default.forwardingHistory", (a, cb) => {
+    const offset = Number(a.index_offset ?? 0);
+    const page = offset === 0 ? forwards.map((f) => event(f.at, f.inId, f.outId, f.tokens, f.feeMsat)) : [event(Date.now() - hour, "850000x8x0", "850000x9x0", 5_000, 500)];
+    cb(null, { forwarding_events: page, last_offset_index: String(offset + page.length) });
+  });
+  const unknown = await recOf(cut);
+  assert.ok(!unknown.reasons.some((x) => /nothing sold at/.test(x)), unknown.reasons.join(" | "));
+  assert.ok(unknown.targetPpm > 100, `raised as before: ${unknown.targetPpm}`);
+  assert.equal(unknown.metrics.provenLevel, null);
+});
+

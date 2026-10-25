@@ -41,7 +41,9 @@ export const REBALANCE_POLICY_FIELDS: { key: keyof RebalancePolicy; label: strin
     key: "maxAmountSats",
     label: "Max refill per move (sat)",
     step: 10_000,
-    hint: "The most one refill moves. A move is also never more than a quarter of the channel or what the source can spare.",
+    hint:
+      "The most one refill moves. A move is also never more than 1.5× the channel's net drain (what it is expected to sell), a quarter " +
+      "of the channel, what the source can spare above its own share — and, valued at a price it proved, 10× what sold at that price.",
   },
 ];
 
@@ -135,6 +137,8 @@ export function stalePlanRefusal(e: unknown): string | null {
 export function confirmRefillText(
   r: Pick<RebalanceRecommendation, "recommendedAmount" | "alias" | "maxFeeSats" | "maxCostPpm" | "sourceCandidates" | "expectedRevenuePpm">,
   b: RebalanceBudget | null | undefined,
+  /** Fee automation is on: only then does the fee engine hold the price. */
+  feeAutomation = true,
 ): string {
   const amount = r.recommendedAmount ?? 0;
   const cap = r.maxFeeSats ?? Math.ceil((amount * (r.maxCostPpm ?? 0)) / 1_000_000);
@@ -145,8 +149,9 @@ export function confirmRefillText(
       ? "There is no daily limit on rebalance fees."
       : `It counts toward today's rebalance budget (${sats(left)} sat left)${left < cap ? ", which caps it" : ""}.`;
   const hold =
-    r.expectedRevenuePpm != null
-      ? ` The fee engine then keeps this channel's fee at ≥ ${r.expectedRevenuePpm} ppm — what the refill is valued at — until the refilled sats have routed out (at most 30 days), as after an autopilot refill.`
+    r.expectedRevenuePpm != null && feeAutomation
+      ? ` The fee engine then keeps this channel's fee at ≥ ${r.expectedRevenuePpm} ppm — what the refill is valued at — until the refilled sats have routed out ` +
+        "(at most 30 days, never above your Max ppm unless you let a refill's cost lift it, and released a week on if they barely move), as after an autopilot refill."
       : "";
   return (
     `Move ${satsCompact(amount)} into ${r.alias} from ${r.sourceCandidates[0]?.alias ?? "a source channel"} ` +
@@ -199,10 +204,13 @@ export function refillOutcome(
  *  promise), that fee, which the moved sats are then valued at. (Compared
  *  with the estimate from BEFORE the refill: the gate's value is already the
  *  lower of the two, so comparing with it never showed the second case.) */
-export function afterRefillText(r: Pick<RebalanceRecommendation, "postRefillPpm" | "expectedRevenuePpm" | "preRefillPpm">): string | null {
+export function afterRefillText(
+  r: Pick<RebalanceRecommendation, "postRefillPpm" | "expectedRevenuePpm" | "preRefillPpm">,
+  /** Fee automation is on: the hold is the fee engine's — off, nothing holds it. */
+  feeAutomation = true,
+): string | null {
   if (r.postRefillPpm == null || r.expectedRevenuePpm == null) return null;
-  return r.postRefillPpm < (r.preRefillPpm ?? r.expectedRevenuePpm)
-    ? `after the refill: ~${r.postRefillPpm} ppm (valued at that)`
-    : `after the refill: kept at ≥ ${r.expectedRevenuePpm} ppm until the refilled sats have routed out`;
+  if (r.postRefillPpm < (r.preRefillPpm ?? r.expectedRevenuePpm)) return `after the refill: ~${r.postRefillPpm} ppm (valued at that)`;
+  return feeAutomation ? `after the refill: kept at ≥ ${r.expectedRevenuePpm} ppm until the refilled sats have routed out` : null;
 }
 

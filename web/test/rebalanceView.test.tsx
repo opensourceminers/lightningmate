@@ -84,6 +84,25 @@ test("today's budget line counts manual runs and payments in flight; a profitabl
   );
 });
 
+test("the dialog and the rows promise the hold only with fee automation on — and with its limits: 30 days at most, Max ppm, released when the sats barely move (review 2026-10-25)", () => {
+  const rec = {
+    recommendedAmount: 400_000,
+    alias: "router",
+    maxFeeSats: 100,
+    maxCostPpm: 320,
+    expectedRevenuePpm: 400,
+    sourceCandidates: [{ channelId: "s", alias: "src", localRatio: 0.9, spareSats: 1_000_000, keepRatio: 0.55, reason: "" }],
+  } as unknown as RebalanceRecommendation;
+  assert.match(
+    confirmRefillText(rec, budget(), true),
+    /keeps this channel's fee at ≥ 400 ppm — what the refill is valued at — until the refilled sats have routed out \(at most 30 days, never above your Max ppm unless you let a refill's cost lift it, and released a week on if they barely move\)/,
+  );
+  assert.doesNotMatch(confirmRefillText(rec, budget(), false), /keeps this channel's fee/);
+  assert.equal(afterRefillText({ postRefillPpm: 400, expectedRevenuePpm: 400, preRefillPpm: 400 }, false), null);
+  // Repriced by a pin or a lease promise: that holds without the engine too.
+  assert.equal(afterRefillText({ postRefillPpm: 300, expectedRevenuePpm: 300, preRefillPpm: 400 }, false), "after the refill: ~300 ppm (valued at that)");
+});
+
 test("a refill the engine reprices lower after it (a pin, a lease promise) says so — the moved sats are valued at that fee", () => {
   // The gate's value is already the lower of the estimate (400) and the fee
   // after the refill (300): compared with it, this case never showed.
@@ -172,7 +191,7 @@ test("a Run from the tab carries its plan's time: a row whose target was refille
 test("the confirm dialog says the refill's price is then held, as after an autopilot refill", () => {
   assert.match(
     confirmRefillText(recommended(), budget({ leftSats: 5_000 })),
-    /The fee engine then keeps this channel's fee at ≥ 400 ppm — what the refill is valued at — until the refilled sats have routed out \(at most 30 days\), as after an autopilot refill\./,
+    /The fee engine then keeps this channel's fee at ≥ 400 ppm — what the refill is valued at — until the refilled sats have routed out \(at most 30 days, never above your Max ppm unless you let a refill's cost lift it, and released a week on if they barely move\), as after an autopilot refill\./,
   );
   assert.doesNotMatch(confirmRefillText(recommended({ expectedRevenuePpm: null }), budget()), /keeps this channel's fee/);
 });

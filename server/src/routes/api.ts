@@ -555,6 +555,8 @@ export function createApiRouter(
           await autopilot.feeElasticityModifiers(),
           autopilot.flowAnchors(),
           autopilot.capital.leaseCaps(),
+          {},
+          autopilot.feeChanges(),
         ),
       );
     }),

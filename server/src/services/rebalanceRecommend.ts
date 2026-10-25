@@ -11,12 +11,19 @@ import {
   type RefillFeeCap,
 } from "./rebalance.js";
 import {
+  CLOSE_CANDIDATE_MIN_DAYS,
   DEMAND_RAMP_LOCAL,
   DEMAND_RAMP_SALES,
+  LOW_FLOW_FORWARDS,
+  LOW_FLOW_GRACE_DAYS,
+  PROVEN_WINDOW_DAYS,
+  REFILL_INFLOW_TOLERANCE_SATS,
+  REFILL_INFLOW_TOLERANCE_SHARE,
   feeAfterRefill,
   runFeeEngine,
   type BuildCtx,
   type FeeEngineInputs,
+  type FeeRecConfig,
   type FeeRecommendation,
   type FeeRecState,
 } from "./feeRecommend.js";
@@ -273,6 +280,8 @@ export interface RebalanceRecReport {
    *  refilled since. */
   generatedAt: string;
   config: RebalanceRecConfig;
+  /** Fee automation is on: the engine holds a refill's value (absent: on). */
+  feeAutomation?: boolean;
   summary: RebalanceRecSummary;
   refill: RefillNote;
   recommendations: RebalanceRecommendation[];
@@ -376,7 +385,11 @@ export function classify(ch: ChannelView, fee: FeeRecommendation | undefined, cf
   // ended — a 1M refill into a channel inflows were refilling for free).
   const half30 = (n: number | undefined): number => Math.round((n ?? 0) / 2);
   const net14 = routedOut14d - routedIn14d;
-  const drainedNow = ch.localRatio < DRAINED_LOCAL && net14 >= 0;
+  // (Up to max(1 % of capacity, 50k) more in than out still counts as not
+  // refilling itself: a 2-sat inflow switched a drained channel's demand
+  // off — "demand too small (0k)", review.)
+  const inflowTolerance = Math.max(REFILL_INFLOW_TOLERANCE_SHARE * ch.capacity, REFILL_INFLOW_TOLERANCE_SATS);
+  const drainedNow = ch.localRatio < DRAINED_LOCAL && net14 >= -inflowTolerance;
   const sells14d = drainedNow ? Math.max(routedOut14d, half30(m?.routedOut30d)) : routedOut14d;
   const expectedNetDrain14d = Math.max(0, drainedNow ? Math.max(net14, half30(m?.routedOut30d) - half30(m?.routedIn30d)) : net14);
   const demandSizedAmount = clamp0(
@@ -457,18 +470,26 @@ export function classify(ch: ChannelView, fee: FeeRecommendation | undefined, cf
     return rec;
   }
 
-  // §6 dead / weak-peer target → close candidate, never rebalance
-  if (fee?.state === "close_candidate" || m?.peerGate === "weak") {
+  // new channel without history — before the close-candidate check (review:
+  // a 2-day-old bought inbound channel read "consider closing")
+  if (m?.channelAgeDays != null && m.channelAgeDays < cfg.newChannelProtectionDays) {
+    rec.state = "watching";
+    rec.reasons.push(`new channel (${m.channelAgeDays}d) — not enough history to prove a profitable refill`);
+    return rec;
+  }
+
+  // §6 dead / weak-peer target → close candidate, never rebalance — once it
+  // has had the 30 days its flow is judged over
+  const young = m?.channelAgeDays != null && m.channelAgeDays < CLOSE_CANDIDATE_MIN_DAYS;
+  if (fee?.state === "close_candidate" || (m?.peerGate === "weak" && !young)) {
     rec.state = "close_candidate";
     rec.blockedBy.push("weak peer / no 30d flow");
     rec.reasons.push("drained but weak peer / no proven 30d flow — not refilling a dead channel; consider closing");
     return rec;
   }
-
-  // new channel without history
-  if (m?.channelAgeDays != null && m.channelAgeDays < cfg.newChannelProtectionDays) {
+  if (m?.peerGate === "weak" && young) {
     rec.state = "watching";
-    rec.reasons.push(`new channel (${m.channelAgeDays}d) — not enough history to prove a profitable refill`);
+    rec.reasons.push(`young channel (${m.channelAgeDays}d) with no flow yet — its 30 days aren't up; not refilled before it has routed`);
     return rec;
   }
 
@@ -509,15 +530,18 @@ export function classify(ch: ChannelView, fee: FeeRecommendation | undefined, cf
   //
   // What it earned, though, is a 30-day average at the fees it had: after
   // the demand ramp raised a drained channel, that lags a price that sells
-  // for a month. So a price PROVEN since the fee was set counts too: at least
-  // PROVEN_SALES forwards out at the fee it charges now (fee.metrics.
-  // soldSinceChange), valued at what they paid. Never a price nobody paid:
-  // a refill valued at an untested fee held that fee for up to 30 days
-  // (review 2026-10-24: in a 60-day simulation it cut the channel's net
-  // from 1,365 to 203 sat where demand stopped at 500 ppm).
+  // for a month. So a PROVEN price counts too: the highest fee level it sold
+  // PROVEN_SALES times at within PROVEN_WINDOW_DAYS (fee.metrics.provenLevel,
+  // from the fee-change log), valued at what those sales paid. Never a price
+  // nobody paid: a refill valued at an untested fee held that fee for up to
+  // 30 days (review 2026-10-24: in a 60-day simulation it cut the channel's
+  // net from 1,365 to 203 sat where demand stopped at 500 ppm). And not only
+  // the CURRENT fee's sales: the same run's fee stage raised a ramping
+  // channel before this check read them, and the proof was gone every time
+  // (review 2026-10-25: three reviewers, no refill in 2,880 runs).
   const sold = m?.soldSinceChange;
-  const provenPpm =
-    sold && sold.forwards >= PROVEN_SALES && sold.out > 0 ? Math.round((sold.revenue / sold.out) * 1_000_000) : null;
+  const level = m?.provenLevel ?? null;
+  const provenPpm = level && level.out > 0 ? level.paidPpm : null;
   const earned = Math.max(rec.revenuePpm30d, provenPpm ?? 0);
   const expectedRevenuePpm = Math.round(Math.min(earned, rec.currentPpm || earned, fee?.targetPpm ?? Infinity, fee?.aimPpm ?? Infinity));
   // Valued at a proven price (it lifted the value): the refill is sized to
@@ -525,15 +549,15 @@ export function classify(ch: ChannelView, fee: FeeRecommendation | undefined, cf
   // least the minimum refill) — so three 1k forwards don't carry a 443k
   // refill whose hold then keeps the fee there (review 2).
   const valuedAtProven = provenPpm != null && expectedRevenuePpm > rec.revenuePpm30d;
-  const provenCap = valuedAtProven ? Math.max(cfg.minRebalanceAmount, PROVEN_REFILL_MULTIPLE * (sold?.out ?? 0)) : Infinity;
+  const provenCap = valuedAtProven ? Math.max(cfg.minRebalanceAmount, PROVEN_REFILL_MULTIPLE * (level?.out ?? 0)) : Infinity;
   // (Said behind the line that names the candidate, below. A proven price
   // within rounding of the 30-day one says nothing.)
   const valueNote = valuedAtProven
     ? provenPpm! >= rec.revenuePpm30d * 1.05
-      ? `valued at ${expectedRevenuePpm} ppm: it sold ${sold!.forwards} times at its fee since it was set (${provenPpm} ppm paid; ${rec.revenuePpm30d} ppm over 30 d) — a refill of at most ${k(provenCap)}, ${PROVEN_REFILL_MULTIPLE}× what sold at it`
+      ? `valued at ${expectedRevenuePpm} ppm: it sold ${level!.sales} times at ${level!.ppm} ppm ${level!.to ? `until ${level!.to.slice(0, 10)}` : "since it was set"} (${provenPpm} ppm paid; ${rec.revenuePpm30d} ppm over 30 d) — a refill of at most ${k(provenCap)}, ${PROVEN_REFILL_MULTIPLE}× what sold at it`
       : null
     : rec.currentPpm > rec.revenuePpm30d * 1.05
-      ? `its fee now (${rec.currentPpm} ppm) counts once it sold ${PROVEN_SALES} times at it (now ${sold?.forwards ?? 0}) — until then the ${rec.revenuePpm30d} ppm it earned in 30 d decides`
+      ? `its fee now (${rec.currentPpm} ppm) counts once it sold ${PROVEN_SALES} times at it within ${PROVEN_WINDOW_DAYS} d (now ${sold?.forwards ?? 0} since it was set) — until then the ${rec.revenuePpm30d} ppm it earned in 30 d decides`
       : null;
   rec.preRefillPpm = expectedRevenuePpm;
   rec.expectedRevenuePpm = expectedRevenuePpm;
@@ -694,6 +718,8 @@ export function wouldTake(
   rec: RebalanceRecommendation,
   cfg: RebalanceRecConfig,
   replacementCostPpm: number | null,
+  /** The operator's max fee (ppm): a price above it can't be charged. */
+  maxPpm: number | null = null,
 ): string | null {
   const r = rec.expectedRevenuePpm ?? rec.revenuePpm30d;
   const minNet = cfg.minExpectedNetProfitSats;
@@ -740,7 +766,18 @@ export function wouldTake(
         largest,
       );
     }
-    return `${head} at a ~${c} ppm route it needs earnings of ≥ ${needPpm} ppm (now ${r} ppm) on a refill of up to ${k(largest)}`;
+    // On the refill its demand sizes — what the planner tries — not the most
+    // the channel takes (review: "≥ 636 ppm on a refill of up to 750k" for a
+    // 448k plan that needed ~726).
+    const sized = rec.demandSizedAmount > 0 && rec.demandSizedAmount < largest ? Math.round(rec.demandSizedAmount) : largest;
+    const needAt = Math.max(Math.ceil(c / cfg.profitShare), Math.ceil(c + (minNet * 1_000_000) / sized));
+    const overMax = maxPpm != null && needAt > maxPpm ? ` — more than your max of ${maxPpm} ppm: no fee it may charge pays for a refill this way` : "";
+    return withDemand(
+      sized < largest
+        ? `${head} at a ~${c} ppm route it needs earnings of ≥ ${needAt} ppm (now ${r} ppm) on the ${k(sized)} refill its demand sizes${overMax}`
+        : `${head} at a ~${c} ppm route it needs earnings of ≥ ${needAt} ppm (now ${r} ppm) on a refill of up to ${k(largest)}${overMax}`,
+      sized,
+    );
   }
   // The payback limit: a refill's fee must be earned back within
   // maxPaybackDays of the channel's routing revenue.
@@ -783,6 +820,38 @@ export interface PlanInput {
   overrides: OverrideMap;
   soldLeases: readonly SoldLease[];
   currentBlock: number;
+  /** Channels this node bought on Magma (their inbound) — never refilled
+   *  while the lease runs (lease blocks from their open; unknown: 4,320). */
+  boughtLeases?: readonly { channelId: string; leaseBlocks: number | null }[];
+  /** Fee automation is on (absent: on) — only then does the fee engine hold
+   *  a refill's value (refillHoldText). */
+  feeAutomation?: boolean;
+}
+
+/**
+ * What a row says becomes of the fee after its refill. With fee automation
+ * on, the engine holds what the refill was valued at while the refilled sats
+ * are in the channel — 30 days at most, never above the max ppm (unless the
+ * operator lets a floor lift it), released a week on when they barely move
+ * (LOW_FLOW_*). With it off nothing holds it (review 2026-10-25: the rows
+ * promised the hold either way, and never said its limits).
+ */
+export function refillHoldText(valuePpm: number, cfg: Pick<FeeRecConfig, "maxPpm" | "floorAboveMax"> | undefined, feeAutomation: boolean): string {
+  if (!feeAutomation) return "fee automation is off: nothing holds its fee after the refill";
+  const cap = cfg && !cfg.floorAboveMax ? cfg.maxPpm : null;
+  return (
+    `after the refill the fee engine keeps it at ≥ ${cap !== null ? Math.min(valuePpm, cap) : valuePpm} ppm until the refilled sats have routed out ` +
+    `(at most 30 d${cap !== null ? `, never above your max of ${cap} ppm` : ""}; released after ${LOW_FLOW_GRACE_DAYS} d with under ${LOW_FLOW_FORWARDS} forwards out in 14 d)`
+  );
+}
+
+/** A channel bought on Magma, its lease still running at `height`: its
+ *  balance is the inbound it was bought for — "drained" by design. */
+export function boughtAndLeased(channelId: string, bought: PlanInput["boughtLeases"], height: number): boolean {
+  const opened = Number(channelId.split("x")[0]);
+  return (bought ?? []).some(
+    (b) => standardChannelId(b.channelId) === channelId && Number.isFinite(opened) && (height <= 0 || height < opened + (b.leaseBlocks ?? 4320)),
+  );
 }
 
 /**
@@ -798,7 +867,19 @@ export async function planRebalances(input: PlanInput, probeRoute: RouteProbe): 
   const chById = new Map(input.channels.map((c) => [c.id, c]));
   const active = input.channels.filter((c) => c.active);
   const pool = buildSourcePool(active, feeById, overrides, cfg, input);
-  const recs = active.map((ch) => classify(ch, feeById.get(ch.id), cfg, overrides));
+  const recs = active.map((ch) => {
+    const rec = classify(ch, feeById.get(ch.id), cfg, overrides);
+    // Bought on Magma for its inbound: refilling it would buy back the very
+    // outbound the seller's push gave away (review: not excluded).
+    if (rec.state !== "not_needed" && boughtAndLeased(ch.id, input.boughtLeases, input.currentBlock)) {
+      rec.state = "watching";
+      rec.wouldRebalance = false;
+      rec.recommendedAmount = null;
+      rec.blockedBy.push("bought on Magma");
+      rec.reasons.unshift("bought on Magma for its inbound, its lease still running — never refilled: its low local balance is what was bought");
+    }
+    return rec;
+  });
 
   // What each target's refill could earn: the most valuable get the sources
   // (and the probes) first; possible demand breaks a tie.
@@ -889,7 +970,7 @@ export async function planRebalances(input: PlanInput, probeRoute: RouteProbe): 
     const repriced = p.postPpm < (rec.preRefillPpm ?? p.value);
     const after = repriced
       ? `after the refill the fee engine takes it to ~${p.postPpm} ppm — the moved sats are valued at that`
-      : `after the refill the fee engine keeps it at ≥ ${p.value} ppm until the refilled sats have routed out (at most 30 d)`;
+      : refillHoldText(p.value, input.contextOf(rec.channelId)?.cfg, input.feeAutomation !== false);
     if (p.passes) {
       rec.state = "route_found_profitable";
       rec.wouldRebalance = true;
@@ -924,7 +1005,7 @@ export async function planRebalances(input: PlanInput, probeRoute: RouteProbe): 
       (rec.state === "unprofitable_skip" && !rec.blockedBy.includes("no safe source channel")) ||
       (rec.state === "watching" && !rec.blockedBy.length && rec.reasons.some((x) => /revenue|demand too small/.test(x)));
     if (turnedDown) {
-      const line = wouldTake(rec, cfg, feeById.get(rec.channelId)?.metrics.replacementCostPpm ?? null);
+      const line = wouldTake(rec, cfg, feeById.get(rec.channelId)?.metrics.replacementCostPpm ?? null, input.contextOf(rec.channelId)?.cfg.maxPpm ?? null);
       if (line) rec.reasons.push(line);
     }
     if (rec.inDemand && rec.state !== "not_needed") {
@@ -964,6 +1045,10 @@ export interface RebalanceRecOptions {
   recOverrides?: Partial<RebalanceRecConfig>;
   /** Channels sold through Magma or LSPS1 (capital.soldLeases()). */
   soldLeases?: readonly SoldLease[];
+  /** Channels bought on Magma (PlanInput.boughtLeases). */
+  boughtLeases?: PlanInput["boughtLeases"];
+  /** Fee automation is on (PlanInput.feeAutomation). */
+  feeAutomation?: boolean;
 }
 
 /**
@@ -992,8 +1077,10 @@ export async function getRebalanceRecommendations(
       overrides: engine.channelOverrides ?? {},
       soldLeases: opts.soldLeases ?? [],
       currentBlock: run.currentBlock,
+      boughtLeases: opts.boughtLeases ?? [],
+      feeAutomation: opts.feeAutomation !== false,
     },
     (source, target, amount) => estimateCost(lnd, ownKey, source, target, amount, cfg.probeCeilingPpm),
   );
-  return { generatedAt, config: cfg, ...plan };
+  return { generatedAt, config: cfg, feeAutomation: opts.feeAutomation !== false, ...plan };
 }

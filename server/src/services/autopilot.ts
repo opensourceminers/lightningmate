@@ -459,6 +459,12 @@ interface PersistedState {
   config: AutopilotConfig;
   lastRunAt: string | null;
   perChannelLastApplied: Record<string, string>;
+  /** Fee updates that failed, per channel: not retried before `until` (the
+   *  engine's guard, via feeCooldown), and the failure — the same one again
+   *  is not news for the run history (writeFees). Saved: a restart (every
+   *  Umbrel update) no longer sends an update LND keeps refusing once more
+   *  at once (review 2026-10-25). */
+  perChannelFeeRetry?: Record<string, { until: string; error: string }>;
   perTargetLastRebalanced: Record<string, string>;
   lastChannelOpenAt: string | null;
   /** Set when the open behind lastChannelOpenAt ended unclearly (the peer's
@@ -488,10 +494,6 @@ interface PersistedState {
   /** Flow-won price memory per channel: an open no-flow lowering episode
    *  (episodeAt) and/or the ppm at which routing last returned (anchor). */
   perChannelFlowAnchor?: Record<string, { episodeAt?: string; anchorPpm?: number; anchorAt?: string }>;
-  /** Consecutive failed rebalances per target, from before the back-off was
-   *  kept per source and target (P3): still honoured until the target's next
-   *  success, never added to. */
-  perTargetRebalanceFails?: Record<string, number>;
   /** Failed refills per source → target pair ("src>tgt"): that pair backs
    *  off (cooldown × 2^fails, at most ×8); the target's other sources don't
    *  (review a2: one dead route blocked the target for days). */
@@ -696,9 +698,13 @@ export function feeDecision(
   // Every write that failed in the pass — one LND refused the same way as
   // last time included (a `repeat`, left out of the run history only): its
   // own words, LND's reason (review of P7: a repeat read "the same refusal
-  // as before", with no reason at all).
+  // as before", with no reason at all). "LND refused" only when it did (its
+  // answer, updateRefusal): a channel skipped because its policy couldn't
+  // be read, or a write LND never answered, was "not applied" (review
+  // 2026-10-25: both read "LND refused").
   const refused = failed.length;
-  const refusedText = refused ? `${refused} update${refused === 1 ? "" : "s"} LND refused (${failed[0].error ?? "failed"})` : "";
+  const verb = failed.every((c) => /^LND refused/.test(c.error ?? "")) ? "LND refused" : "not applied";
+  const refusedText = refused ? `${refused} update${refused === 1 ? "" : "s"} ${verb} (${failed[0].error ?? "failed"})` : "";
   if (ok.length) {
     const shown = ok.slice(0, 3).map((c) => `${c.alias} ${c.fromPpm}→${c.toPpm} ppm`);
     return {
@@ -730,7 +736,7 @@ function guardWords(guard: string): string {
   if (/max changes per run/.test(guard)) return "over the per-run limit (next run)";
   if (/excluded/.test(guard)) return "excluded by you";
   if (/inactive/.test(guard)) return "inactive";
-  if (/last fee update failed/.test(guard)) return "waiting after an update LND refused";
+  if (/last fee update failed/.test(guard)) return "waiting after an update that failed";
   return guard;
 }
 
@@ -747,7 +753,10 @@ export function maxHtlcDecision(
   if (!moved.length) {
     return stopped ? { text: halt, state: "waiting" } : { text: "every channel's advertised size is current — nothing to gossip", state: "idle" };
   }
-  const refused = failed.length ? `${failed.length} refused by LND (${failed[0].error ?? "refused"})` : "";
+  // (An update LND took that didn't stick, or one it never answered, was
+  // not refused.)
+  const verb = failed.every((m) => /^LND refused/.test(m.error ?? "")) ? "refused by LND" : "not applied";
+  const refused = failed.length ? `${failed.length} ${verb} (${failed[0].error ?? "failed"})` : "";
   if (!ok) return { text: [refused, halt].filter(Boolean).join(" · "), state: "error" };
   return { text: [`${ok} channel${ok === 1 ? "'s" : "s'"} advertised size moved`, refused, halt].filter(Boolean).join(" · "), state: "acted" };
 }
@@ -824,6 +833,18 @@ export const LEASE_PROMISE_CHECK_MS = 10 * 60_000;
  *  sent), the autopilot leaves that channel's fee alone this long — a broken
  *  lease promise excepted (writeFees). */
 export const FEE_RETRY_BACKOFF_MS = 6 * 3_600_000;
+
+/** The saved fee retry back-off, made safe: entries with a time that parses
+ *  and a reason only (feeCooldown and writeFees read them). */
+export function sanitizeFeeRetry(raw: unknown): Record<string, { until: string; error: string }> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, { until: string; error: string }> = {};
+  for (const [id, r] of Object.entries(raw as Record<string, unknown>)) {
+    const e = (r ?? {}) as { until?: unknown; error?: unknown };
+    if (typeof e.until === "string" && Number.isFinite(Date.parse(e.until)) && typeof e.error === "string") out[id] = { until: e.until, error: e.error };
+  }
+  return out;
+}
 /** How often rebalance payments still in flight are asked about between
  *  runs — also with every automation off (a manual one must end on record). */
 export const INFLIGHT_REBALANCE_CHECK_MS = 2 * 60_000;
@@ -1170,11 +1191,9 @@ export class Autopilot {
   private leaseTimer: NodeJS.Timeout | undefined;
   /** max_htlc updates LND refused, per channel (runMaxHtlcPass backs off). */
   private readonly maxHtlcBackoff = new Map<string, number>();
-  /** Fee updates that failed, per channel: not retried before `until` (the
-   *  engine's guard, via feeCooldown), and the failure — the same one again
-   *  is not news for the run history (writeFees). In memory: a restart
-   *  tries once more. */
-  private readonly feeRetry = new Map<string, { until: number; error: string }>();
+  /** The last max_htlc update applied per channel: one that didn't take is
+   *  not resent every run (runMaxHtlcPass). */
+  private readonly maxHtlcLastWrites = new Map<string, { fromSat: number | null; toSat: number }>();
   /** Every applied fee change (D15) — what fee outcomes and the elasticity
    *  learner measure; never the run history. */
   readonly feeLog: FeeChangeLog;
@@ -1359,10 +1378,16 @@ export class Autopilot {
       ),
     );
     this.state.perChannelLastApplied ??= {};
+    this.state.perChannelFeeRetry = sanitizeFeeRetry(this.state.perChannelFeeRetry);
     this.state.perTargetLastRebalanced ??= {};
     // Today's rebalance spend is read from the rebalance log now
     // (rebalanceBudget) — the separate counter is gone.
     delete (this.state as { perDayRebalanceSpend?: unknown }).perDayRebalanceSpend;
+    // So is the per-target fail count from before the back-off was kept per
+    // source → target pair (0.7.x): never added to since, it was cleared only
+    // by a success — a target with 3 old fails waited 8× its cooldown for
+    // good (review 2026-10-25). The pairs back off now.
+    delete (this.state as { perTargetRebalanceFails?: unknown }).perTargetRebalanceFails;
     // Sizing used to ride along with auto-pricing. Upgrading must keep exactly
     // the behaviour an install had, so one-shot:
     //   - config from before the switch existed: inherit auto-pricing's value;
@@ -1405,7 +1430,7 @@ export class Autopilot {
   feeCooldown(): CooldownInput {
     const now = Date.now();
     const retryAfter: Record<string, string> = {};
-    for (const [id, r] of this.feeRetry) if (r.until > now) retryAfter[id] = new Date(r.until).toISOString();
+    for (const [id, r] of Object.entries(this.state.perChannelFeeRetry ?? {})) if (Date.parse(r.until) > now) retryAfter[id] = r.until;
     return {
       lastApplied: this.state.perChannelLastApplied,
       cooldownHours: this.state.config.cooldownMinutes / 60,
@@ -1956,14 +1981,12 @@ export class Autopilot {
   }
 
   /** A target is refilled at most once per cooldown, whatever the outcome
-   *  (no hammering a dead route) — longer while a count from before the
-   *  per-pair back-off still stands. */
+   *  (no hammering a dead route); a pair whose refills failed backs off on
+   *  its own (pairBackingOff). */
   private rebalanceCooldownOk(targetId: string, cooldownMin: number): boolean {
     const last = this.state.perTargetLastRebalanced[targetId];
     if (!last) return true;
-    const fails = this.state.perTargetRebalanceFails?.[targetId] ?? 0;
-    const mult = Math.min(8, 2 ** fails);
-    return (Date.now() - new Date(last).getTime()) / 60_000 >= cooldownMin * mult;
+    return (Date.now() - new Date(last).getTime()) / 60_000 >= cooldownMin;
   }
 
   /** A source → target pair whose refills failed waits cooldown × 2^fails
@@ -1977,8 +2000,7 @@ export class Autopilot {
   }
 
   /** The books after a refill attempt (the autopilot's or a manual one):
-   *  every failed pair backs off, the paying pair (and the target's old
-   *  count) is cleared. */
+   *  every failed pair backs off, the paying pair is cleared. */
   private notePairs(targetId: string, res: Pick<RebalanceExecResult, "ok" | "sourceId" | "failedSourceIds" | "inFlight">): void {
     const pairs = (this.state.perPairRebalanceFails ??= {});
     const nowIso = new Date().toISOString();
@@ -1989,10 +2011,7 @@ export class Autopilot {
       const key = `${src}>${targetId}`;
       pairs[key] = { fails: Math.min(3, (pairs[key]?.fails ?? 0) + 1), at: nowIso };
     }
-    if (res.ok) {
-      delete pairs[`${res.sourceId}>${targetId}`];
-      delete this.state.perTargetRebalanceFails?.[targetId];
-    }
+    if (res.ok) delete pairs[`${res.sourceId}>${targetId}`];
   }
 
   /**
@@ -2140,6 +2159,11 @@ export class Autopilot {
    * `shouldStop` (the fee autopilot's batch): asked before each write — the
    * writes after it says yes are not sent; `notSent` counts them. Nothing
    * is booked for them (no cooldown, no back-off): they were never written.
+   *
+   * Each write is booked — and saved — as LND answers it, before the next is
+   * sent: a restart in the middle of a batch (an Umbrel update) lost the
+   * cooldowns and log records of the writes LND had taken, and the restarted
+   * process sent them again (review 2026-10-25).
    */
   private async writeFees(
     writeLnd: AuthenticatedLnd,
@@ -2148,45 +2172,43 @@ export class Autopilot {
     opts: { quietRepeats?: boolean; shouldStop?: () => boolean } = {},
   ): Promise<{ changes: AutopilotChange[]; notSent: number }> {
     if (writes.length === 0) return { changes: [], notSent: 0 };
-    const results = await this.feeApply(
-      writeLnd,
-      writes.map(({ id, transactionId, transactionVout, feeRatePpm, baseFeeMsat }) => ({ id, transactionId, transactionVout, feeRatePpm, baseFeeMsat })),
-      opts.shouldStop ? { shouldStop: opts.shouldStop } : {},
-    );
-    const answered = new Set((results as FeeApplyResult[]).map((r) => r.id));
-    const notSent = writes.filter((w) => !answered.has(w.id)).length;
     const byId = new Map(writes.map((w) => [w.id, w]));
     const fa = (this.state.perChannelFlowAnchor ??= {});
-    const nowMs = Date.now();
-    const nowIso = new Date(nowMs).toISOString();
-    const logged: FeeChangeRecord[] = [];
+    const retry = (this.state.perChannelFeeRetry ??= {});
     const changes: AutopilotChange[] = [];
-    for (const res of results as FeeApplyResult[]) {
+    const booked = new Set<FeeApplyResult>();
+    const book = (res: FeeApplyResult) => {
+      if (booked.has(res)) return;
+      booked.add(res);
       const w = byId.get(res.id);
+      const nowMs = Date.now();
+      const nowIso = new Date(nowMs).toISOString();
       const toBaseMsat = res.baseFeeMsat ?? w?.baseFeeMsat;
       const why = w?.why;
       let error = res.error;
       let repeat = false;
       if (res.ok) {
-        this.feeRetry.delete(res.id);
+        delete retry[res.id];
         this.state.perChannelLastApplied[res.id] = nowIso;
         // Applied a no-flow lowering → open (or refresh) the flow-won episode.
         if (w?.noFlowLowering) fa[res.id] = { ...fa[res.id], episodeAt: nowIso };
-        logged.push({
-          at: nowIso,
-          channelId: res.id,
-          alias: w?.alias ?? res.id,
-          fromPpm: w?.fromPpm ?? 0,
-          toPpm: res.feeRatePpm,
-          fromBaseMsat: w?.fromBaseMsat ?? null,
-          toBaseMsat: toBaseMsat ?? null,
-          via,
-          ...(why || res.clampedBy ? { why: [why, res.clampedBy].filter(Boolean).join("; ") } : {}),
-        });
+        this.feeLog.append([
+          {
+            at: nowIso,
+            channelId: res.id,
+            alias: w?.alias ?? res.id,
+            fromPpm: w?.fromPpm ?? 0,
+            toPpm: res.feeRatePpm,
+            fromBaseMsat: w?.fromBaseMsat ?? null,
+            toBaseMsat: toBaseMsat ?? null,
+            via,
+            ...(why || res.clampedBy ? { why: [why, res.clampedBy].filter(Boolean).join("; ") } : {}),
+          },
+        ]);
       } else {
         const raw = res.error ?? "failed";
-        repeat = opts.quietRepeats === true && this.feeRetry.get(res.id)?.error === raw;
-        this.feeRetry.set(res.id, { until: nowMs + FEE_RETRY_BACKOFF_MS, error: raw });
+        repeat = opts.quietRepeats === true && retry[res.id]?.error === raw;
+        retry[res.id] = { until: new Date(nowMs + FEE_RETRY_BACKOFF_MS).toISOString(), error: raw };
         if (!w?.leaseBreach) error = `${raw} — not retried for ${Math.round(FEE_RETRY_BACKOFF_MS / 3_600_000)} h`;
       }
       changes.push({
@@ -2203,9 +2225,17 @@ export class Autopilot {
         ...(res.ok ? {} : { error }),
         ...(repeat ? { repeat: true } : {}),
       });
-    }
-    this.feeLog.append(logged);
-    this.persist();
+      this.persist();
+    };
+    const results = await this.feeApply(
+      writeLnd,
+      writes.map(({ id, transactionId, transactionVout, feeRatePpm, baseFeeMsat }) => ({ id, transactionId, transactionVout, feeRatePpm, baseFeeMsat })),
+      { ...(opts.shouldStop ? { shouldStop: opts.shouldStop } : {}), onResult: book },
+    );
+    // (Whatever was not booked as it came — none, with applyFees — now.)
+    for (const res of results as FeeApplyResult[]) book(res);
+    const answered = new Set((results as FeeApplyResult[]).map((r) => r.id));
+    const notSent = writes.filter((w) => !answered.has(w.id)).length;
     return { changes, notSent };
   }
 
@@ -2515,35 +2545,46 @@ export class Autopilot {
         continue;
       }
       // (The books start the target's cooldown — refillBooks.)
-      const res = await this.refillBooks({ targetId: r.channelId, via: "autopilot", holdPpm: r.expectedRevenuePpm }).settle((hooks) =>
-        this.rebalanceExec(
-          writeLnd,
-          {
-            targetId: r.channelId,
-            sourceId: sources[0].id,
-            sources,
-            amountSats: r.recommendedAmount as number,
-            econRatio: rebalancePolicy.econRatio,
-            maxFeePpm: r.maxCostPpm ?? undefined,
-            // The gate's limits at every size — and never more than is left today.
-            maxFeeSats: Math.min(r.maxCostSatsByPayback ?? Infinity, live.leftSats ?? Infinity),
-            ...(r.expectedRevenuePpm != null
-              ? { gate: { revenuePpm: r.expectedRevenuePpm, demandSats: r.earningDemandSats, minNetSats: r.minNetProfitSats } }
-              : {}),
-            // The plan's route cost, for the executor's fitted size
-            // (fitBelowPlanned) — which this run hardly ever reaches: a move
-            // whose estimated fee is more than the budget left waits for the
-            // budget (the backstop above) before any size is tried, and the
-            // plan's size already fits its other limits. It is a manual
-            // run's (POST /rebalance/execute), whose cap — the budget left,
-            // what the dialog promised — can be below the plan's.
-            ...(r.estimatedRouteCostPpm != null ? { routeCostPpm: r.estimatedRouteCostPpm } : {}),
-          },
-          // Inside the refill too, no attempt starts after the shutdown
-          // signal — or once auto-rebalance is off.
-          { ...hooks, shouldStop: () => (halted.why = this.stopWhy("rebalanceEnabled")) ?? false },
-        ),
-      );
+      let res: RebalanceExecResult;
+      try {
+        res = await this.refillBooks({ targetId: r.channelId, via: "autopilot", holdPpm: r.expectedRevenuePpm }).settle((hooks) =>
+          this.rebalanceExec(
+            writeLnd,
+            {
+              targetId: r.channelId,
+              sourceId: sources[0].id,
+              sources,
+              amountSats: r.recommendedAmount as number,
+              econRatio: rebalancePolicy.econRatio,
+              maxFeePpm: r.maxCostPpm ?? undefined,
+              // The gate's limits at every size — and never more than is left today.
+              maxFeeSats: Math.min(r.maxCostSatsByPayback ?? Infinity, live.leftSats ?? Infinity),
+              ...(r.expectedRevenuePpm != null
+                ? { gate: { revenuePpm: r.expectedRevenuePpm, demandSats: r.earningDemandSats, minNetSats: r.minNetProfitSats } }
+                : {}),
+              // The plan's route cost, for the executor's fitted size
+              // (fitBelowPlanned) — which this run hardly ever reaches: a move
+              // whose estimated fee is more than the budget left waits for the
+              // budget (the backstop above) before any size is tried, and the
+              // plan's size already fits its other limits. It is a manual
+              // run's (POST /rebalance/execute), whose cap — the budget left,
+              // what the dialog promised — can be below the plan's.
+              ...(r.estimatedRouteCostPpm != null ? { routeCostPpm: r.estimatedRouteCostPpm } : {}),
+            },
+            // Inside the refill too, no attempt starts after the shutdown
+            // signal — or once auto-rebalance is off.
+            { ...hooks, shouldStop: () => (halted.why = this.stopWhy("rebalanceEnabled")) ?? false },
+          ),
+        );
+      } catch (err) {
+        // LND failed the refill before anything was sent (the executor's
+        // first reads: "waiting to start, RPC services not available"): that
+        // refill's error, given its cooldown back (settle) — the stage goes
+        // on with the next planned one (review 2026-10-25: one such answer
+        // ended the stage, and the target sat out its cooldown unrefilled).
+        out.push({ alias: r.alias, amountSats: r.recommendedAmount ?? 0, feeSats: null, costPpm: null, ok: false, error: `not started: ${errText(err)}` });
+        continue;
+      }
       if (res.stopped) {
         // A deliberate skip (D15), like the moves planned after it: a source
         // whose attempt failed before the signal backs off (refillBooks).
@@ -2739,9 +2780,24 @@ export class Autopilot {
         this.persist();
       },
     };
+    // Nothing was sent after all: no attempt, so no cooldown.
+    const giveCooldownBack = () => {
+      if (sent.size > 0) return;
+      if (cooldownBefore === undefined) delete this.state.perTargetLastRebalanced[meta.targetId];
+      else this.state.perTargetLastRebalanced[meta.targetId] = cooldownBefore;
+    };
     const settle = async (exec: (hooks: RefillHooks) => Promise<RebalanceExecResult>): Promise<RebalanceExecResult> => {
       try {
-        const res = await exec(hooks);
+        let res: RebalanceExecResult;
+        try {
+          res = await exec(hooks);
+        } catch (err) {
+          // The executor threw before its first attempt (LND didn't answer
+          // its reads) — or after one, if ever: then the cooldown stays.
+          giveCooldownBack();
+          this.persist();
+          throw err;
+        }
         this.notePairs(meta.targetId, res);
         if (res.inFlight) {
           const { paymentId, maxFeeSats } = res.inFlight;
@@ -2765,10 +2821,7 @@ export class Autopilot {
           // nothing for the log — nothing was paid, and what failed before
           // it backs off (notePairs above). Nothing sent at all: no attempt,
           // no cooldown.
-          if (sent.size === 0) {
-            if (cooldownBefore === undefined) delete this.state.perTargetLastRebalanced[meta.targetId];
-            else this.state.perTargetLastRebalanced[meta.targetId] = cooldownBefore;
-          }
+          giveCooldownBack();
         } else {
           // Its fee belongs to the budget day it was sent on, like a payment
           // that ends after a restart.
@@ -5623,6 +5676,7 @@ export class Autopilot {
         const halted: { why: string | null } = { why: null };
         const moved = await runMaxHtlcPass(this.readLnd, writeLnd, this.maxHtlcBackoff, {
           shouldStop: () => (halted.why = this.stopWhy("maxHtlcEnabled")) !== null,
+          lastWrites: this.maxHtlcLastWrites,
         });
         this.explain("maxHtlc", () => maxHtlcDecision(moved, halted.why));
         return moved;
@@ -5737,9 +5791,10 @@ export class Autopilot {
       this.flowAnchors(),
       this.capital.leaseCaps(),
       marketWaitMs !== undefined ? { marketWaitMs } : {},
+      this.feeLog.all(),
     );
   }
-  private feeApply(writeLnd: AuthenticatedLnd, items: FeeApplyItem[], opts: { shouldStop?: () => boolean } = {}) {
+  private feeApply(writeLnd: AuthenticatedLnd, items: FeeApplyItem[], opts: { shouldStop?: () => boolean; onResult?: (r: FeeApplyResult) => void } = {}) {
     // The last gate: a sold channel's fee never leaves its lease promise.
     return applyFees(this.readLnd, writeLnd, items, this.capital.leaseCaps(), opts);
   }
@@ -5759,8 +5814,19 @@ export class Autopilot {
         elasticity: await this.feeElasticityModifiers(),
         flowAnchors: this.flowAnchors(),
         leaseCaps: this.capital.leaseCaps(),
+        feeHistory: this.feeLog.all(),
       },
-      { recOverrides: this.rebalanceRecOverrides(), soldLeases: this.capital.soldLeases() },
+      {
+        recOverrides: this.rebalanceRecOverrides(),
+        soldLeases: this.capital.soldLeases(),
+        // Only with fee automation on does the engine hold a refill's value.
+        feeAutomation: this.state.config.enabled,
+        // Bought on Magma: never a refill target while its lease runs.
+        boughtLeases: this.purchases
+          .list()
+          .filter((p) => !!p.channelId)
+          .map((p) => ({ channelId: p.channelId as string, leaseBlocks: p.leaseBlocks })),
+      },
     );
   }
   private rebalanceExec(writeLnd: AuthenticatedLnd, params: RebalanceExecParams, opts: RebalanceExecOptions = {}) {

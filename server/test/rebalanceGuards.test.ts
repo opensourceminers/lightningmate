@@ -13,6 +13,8 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   FEE_REC_DEFAULTS,
   buildRecommendation,
@@ -89,13 +91,12 @@ const planFor = (target: string) => ({ ...plannedRebalance(target, 500), estimat
 type Books = {
   state: {
     perTargetLastRebalanced: Record<string, string>;
-    perTargetRebalanceFails?: Record<string, number>;
     perPairRebalanceFails?: Record<string, { fails: number; at: string }>;
   };
 };
 
-test("a target's fail count from before the per-pair back-off is honoured (3 fails: 8× the cooldown) — and a paid refill clears it, so the next refill waits only 1×", async (t) => {
-  const { autopilot, seams } = autopilotWith(
+test("a target's fail count from before the per-pair back-off (0.7.x) is dropped on upgrade — never added to since, only a success cleared it: with 3 old fails a target waited 8× its cooldown for good — so it waits its cooldown alone (review 2026-10-25)", async (t) => {
+  const { autopilot, seams, dir } = autopilotWith(
     t,
     { rebalanceEnabled: true, rebalanceDailyBudgetSats: 10_000, rebalanceCooldownMinutes: COOLDOWN_MIN },
     { perTargetRebalanceFails: { [T]: 3 }, perTargetLastRebalanced: { [T]: minutesAgo(2 * COOLDOWN_MIN) } },
@@ -107,18 +108,9 @@ test("a target's fail count from before the per-pair back-off is honoured (3 fai
     return paidRebalance(p);
   };
   await autopilot.runOnce();
-  assert.deepEqual(sent, [], "two cooldowns after its last try, a target with 3 old fails still waits (8×)");
-  assert.match(autopilot.getState().decisions.rebalance?.text ?? "", /refilled or tried within its cooldown/);
-
-  // A paid refill into it (by hand: not held back by the cooldown) …
-  const res = await autopilot.rebalanceByHand({ targetId: T, sourceId: S, amountSats: 100_000, econRatio: 0.8 });
-  assert.equal(res?.ok, true);
-  const books = (autopilot as unknown as Books).state;
-  assert.equal(books.perTargetRebalanceFails?.[T], undefined, "a paid refill clears the old count");
-  // … and two cooldowns after it, the autopilot refills it again.
-  books.perTargetLastRebalanced[T] = minutesAgo(2 * COOLDOWN_MIN);
-  await autopilot.runOnce();
-  assert.deepEqual(sent, [T, T]);
+  assert.deepEqual(sent, [T], "two cooldowns after its last try: refilled (before: 8× — it waited)");
+  const saved = JSON.parse(readFileSync(join(dir, "autopilot.json"), "utf8")) as Record<string, unknown>;
+  assert.equal(saved.perTargetRebalanceFails, undefined, "gone from the disk too");
 });
 
 test("a source → target pair whose refills failed backs off cooldown × 2^fails — two fails: still waiting after 2×, tried after 5× — and never longer than 8×", async (t) => {
@@ -148,6 +140,38 @@ test("a source → target pair whose refills failed backs off cooldown × 2^fail
   delete books.perTargetLastRebalanced[T];
   await autopilot.runOnce();
   assert.deepEqual(sent, [pair, pair], "9× after the last failure: the ×8 cap has passed");
+});
+
+test("a refill LND fails before anything is sent (its first reads: 'waiting to start') is that refill's error, not the stage's — the target gets its cooldown back, nothing is logged, and the next planned refill still runs (review 2026-10-25)", async (t) => {
+  t.mock.method(console, "log", () => undefined);
+  const U = "800002x1x0";
+  const { autopilot, seams, dir } = autopilotWith(t, {
+    rebalanceEnabled: true,
+    rebalanceDailyBudgetSats: 10_000,
+    maxRebalancesPerRun: 2,
+    rebalanceCooldownMinutes: COOLDOWN_MIN,
+  });
+  seams.rebalanceReport = async () => ({ recommendations: [planFor(T), { ...planFor(U), selectedSourceChannel: "800003x1x0" }] });
+  const calls: string[] = [];
+  seams.rebalanceExec = async (_w, p: RebalanceExecParams) => {
+    calls.push(p.targetId);
+    if (p.targetId === T) throw [503, "UnexpectedGetChannelsError", { err: { details: "waiting to start, RPC services not available" } }];
+    return paidRebalance(p);
+  };
+  const run = await autopilot.runOnce();
+  // Before: the throw ended the stage — U never ran — and T sat out its cooldown.
+  assert.deepEqual(calls, [T, U], "the next refill still ran");
+  assert.deepEqual(
+    run.rebalances.map((r) => [r.ok, r.error ?? null]),
+    [
+      [false, "not started: 503 UnexpectedGetChannelsError: waiting to start, RPC services not available"],
+      [true, null],
+    ],
+  );
+  const saved = JSON.parse(readFileSync(join(dir, "autopilot.json"), "utf8")) as { perTargetLastRebalanced: Record<string, string> };
+  assert.equal(saved.perTargetLastRebalanced[T], undefined, "no attempt: no cooldown — tried again next run");
+  assert.ok(saved.perTargetLastRebalanced[U]);
+  assert.equal(new RebalanceLog(dir).recent(5).length, 1, "only the paid refill is in the log");
 });
 
 // ── fee_adjust_first ─────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ import {
   createInvoice,
   decodePaymentRequest,
   getFeeRates,
+  getPayment,
   getRouteToDestination,
   getWalletInfo,
   payViaPaymentDetails,
@@ -166,6 +167,17 @@ export function fitBelowPlanned(cap: RefillFeeCap, planned: number, costPpm: num
 // Pathfinding budget per attempt. Generous because over a dev SSH tunnel each
 // route attempt is a slow round-trip; on Umbrel (direct) it resolves far quicker.
 const PATHFINDING_TIMEOUT_MS = 45_000;
+/** No attempt starts with less than this left of the hard limit (or a
+ *  quarter of the limit, if that is less): LND would still be searching when
+ *  the wait ends, and its failure arrived just after the executor had booked
+ *  the payment "still in flight" — the second and third sources never got a
+ *  real try (review 2026-10-25: every attempt June–October ran LND's full
+ *  pathfinding time). */
+export const MIN_ATTEMPT_LEFT_MS = 20_000;
+/** LND's pathfinding gets the time left minus this (or a third of what is
+ *  left, if less), in whole seconds: the library rounds to seconds and turns
+ *  0 into LND's 25 s default. */
+const PATHFINDING_MARGIN_MS = 10_000;
 
 /**
  * Hard wall-clock limit for one rebalance, all sources and amounts together.
@@ -422,7 +434,16 @@ export async function executeRebalance(
   if (budgetPpm <= 0) {
     return { ...base, error: "target earns 0 ppm — set an outbound fee or a max fee (ppm)" };
   }
-  const cap: RefillFeeCap = { maxCostPpm: budgetPpm, maxFeeSats: params.maxFeeSats ?? null, earnings: params.gate ?? null };
+  // A gate from a plan made at a higher fee (a tab left open; the fee was
+  // lowered since) values the moved sats at the fee now, and caps the cost
+  // per sat to match — the hold is booked at that fee too (review: planned at
+  // 820, the fee now 400: a 267-sat cap on a refill that now earns 179).
+  const gate = params.gate && targetPpm !== undefined && targetPpm < params.gate.revenuePpm ? { ...params.gate, revenuePpm: targetPpm } : (params.gate ?? null);
+  const gatedBudget = gate && gate !== params.gate ? Math.min(budgetPpm, Math.floor(gate.revenuePpm * params.econRatio)) : budgetPpm;
+  if (gatedBudget <= 0) {
+    return { ...base, budgetPpm: 0, error: `the target's fee (${targetPpm} ppm) leaves no room for a refill at the plan's value — reload the plan` };
+  }
+  const cap: RefillFeeCap = { maxCostPpm: gatedBudget, maxFeeSats: params.maxFeeSats ?? null, earnings: gate };
 
   const ownKey = await getOwnPubkey(readLnd);
   // The CLTV ceiling is relative to the tip; without a height, LND's default applies.
@@ -430,7 +451,7 @@ export async function executeRebalance(
     .then((w) => w.current_block_height)
     .catch(() => null);
 
-  const withTarget = { ...base, budgetPpm, targetSentBefore: target.totalSent, ...(targetPpm !== undefined ? { targetPpm } : {}) };
+  const withTarget = { ...base, budgetPpm: gatedBudget, targetSentBefore: target.totalSent, ...(targetPpm !== undefined ? { targetPpm } : {}) };
   const failedSourceIds: string[] = [];
   let lastErr: unknown = null;
   let tried = false;
@@ -465,7 +486,8 @@ export async function executeRebalance(
     const planned = Math.min(params.amountSats, spare);
     for (const amount of adaptiveAmounts(planned, fitBelowPlanned(cap, planned, params.routeCostPpm))) {
       const left = deadline - Date.now();
-      if (left <= 0) {
+      const hardLimit = opts.hardTimeoutMs ?? REBALANCE_HARD_TIMEOUT_MS;
+      if (left < Math.min(MIN_ATTEMPT_LEFT_MS, hardLimit / 4)) {
         lastErr ??= new Error("rebalance time limit reached");
         break;
       }
@@ -524,7 +546,7 @@ export async function executeRebalance(
           // nil — "not splitting") and max_paths changes nothing.
           features: decoded.features,
           max_paths: amount >= MULTI_PATH_MIN_SATS ? MULTI_PATH_MAX_PATHS : 1,
-          pathfinding_timeout: Math.min(PATHFINDING_TIMEOUT_MS, left),
+          pathfinding_timeout: pathfindingMs(left),
           ...(tip ? { max_timeout_height: tip + REBALANCE_MAX_TIMEOUT_BLOCKS } : {}),
         });
         const paid = await waitAtMost(paying, left);
@@ -548,6 +570,15 @@ export async function executeRebalance(
         };
       } catch (err) {
         lastErr = err;
+        // An error LND made no payment of (refused outright — "permission
+        // denied", nothing created): failed at once, with LND's reason — not
+        // "still in flight" with the budget held until LightningMate restarts
+        // (review 2026-10-25). Nothing else is tried: LND would refuse it too.
+        if (sent !== null && !paymentFailed(err) && (await paymentAbsent(writeLnd, sent))) {
+          opts.onEnd?.(sent, "failed");
+          failedSourceIds.push(spec.id);
+          return { ...attemptedHere, error: `LND refused the payment (${describePayError(err, budgetPpm)}) — it has none by that id: nothing was sent` };
+        }
         if (sent !== null && !paymentFailed(err)) {
           // The wait broke off and LND hasn't said how the payment ended: it
           // may still land. Not a failure — and no smaller amount or other
@@ -575,3 +606,24 @@ export async function executeRebalance(
     error: tried ? describePayError(lastErr, budgetPpm) : lastErr instanceof Error ? lastErr.message : "nothing to try",
   };
 }
+
+/** LND's pathfinding time for an attempt with `leftMs` of the hard limit
+ *  left: that minus a margin (PATHFINDING_MARGIN_MS, or a third of it), in
+ *  whole seconds, at least 1 s and at most PATHFINDING_TIMEOUT_MS. */
+export function pathfindingMs(leftMs: number): number {
+  const margin = Math.min(PATHFINDING_MARGIN_MS, Math.floor(leftMs / 3));
+  return Math.max(1_000, Math.min(PATHFINDING_TIMEOUT_MS, Math.floor((leftMs - margin) / 1_000) * 1_000));
+}
+
+/** LND has no payment by this id (it never left this node): the library's
+ *  SentPaymentNotFound. Any other answer — pending, settled, failed, or no
+ *  answer at all — is not "absent". */
+async function paymentAbsent(lnd: AuthenticatedLnd, id: string): Promise<boolean> {
+  try {
+    await getPayment({ lnd, id });
+    return false;
+  } catch (err) {
+    return Array.isArray(err) && err[1] === "SentPaymentNotFound";
+  }
+}
+

@@ -11,7 +11,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { REBALANCE_MAX_TIMEOUT_BLOCKS, executeRebalance } from "../src/services/rebalance.js";
+import { REBALANCE_MAX_TIMEOUT_BLOCKS, executeRebalance, pathfindingMs } from "../src/services/rebalance.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
 import { BUYER, autopilotWith, failedRebalance, paidRebalance, plannedRebalance, sellerSetup, type AutopilotSeams } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
@@ -264,3 +264,60 @@ test("a manual rebalance still in flight is tracked: logged as it really ended (
   assert.deepEqual(saved().pendingRebalances, []);
   assert.equal(api.autopilot.rebalanceBudget().spentSats, 19, "the manual refill's real 12 sat and the autopilot's 7");
 });
+
+test("LND's pathfinding time ends before the executor stops waiting: the time left less 10 s (less a third of it when that is less), in whole seconds, 1–45 s", () => {
+  assert.equal(pathfindingMs(150_000), 45_000);
+  assert.equal(pathfindingMs(54_900), 44_000);
+  assert.equal(pathfindingMs(30_000), 20_000);
+  // Review: after three timed-out attempts the fourth got 14.6 s — the
+  // library rounded that to 15 s, and LND was still searching when the wait
+  // ended.
+  assert.equal(pathfindingMs(14_600), 9_000);
+  assert.equal(pathfindingMs(1_400), 1_000);
+  for (const left of [1_500, 2_700, 9_999, 14_600, 20_000, 44_999, 60_000]) {
+    const ms = pathfindingMs(left);
+    assert.ok(ms < left && ms % 1_000 === 0, `${left} ms left → ${ms} ms`);
+  }
+});
+
+test("an attempt LND gives up on is booked failed, not in flight — its pathfinding ends inside the wait, and no attempt starts too late for that — so the next size gets a real try (review: every refill June–October ended 'in flight' at LND's full time)", async () => {
+  const node = rebalanceNode();
+  node.payOutcome = "hang";
+  // LND gives up once its pathfinding time is over, 30 ms later.
+  node.beforeCall = (method, args) => {
+    if (method !== "router.sendPaymentV2") return;
+    const id = Buffer.from(args.payment_hash as Buffer).toString("hex");
+    setTimeout(() => node.resolvePayment(id, "fail"), Number(args.timeout_seconds) * 1_000 + 30);
+  };
+  const ends: string[] = [];
+  const res = await executeRebalance(
+    node.lnd,
+    node.lnd,
+    { targetId: "800001x1x0", sourceId: "800002x1x0", amountSats: 400_000, econRatio: 0.8 },
+    { hardTimeoutMs: 4_000, onEnd: (_id, outcome) => ends.push(outcome) },
+  );
+  // Before: 3.95 s left → a 4 s pathfinding time — LND failed it 80 ms after
+  // the executor had booked it "still in flight", and nothing else was tried.
+  assert.equal(res.inFlight, undefined, res.error);
+  const sent = node.callsTo("router.sendPaymentV2");
+  assert.ok(sent.length >= 2, `the next size was tried (${sent.length} sent)`);
+  assert.deepEqual(ends, sent.map(() => "failed"));
+  assert.match(res.error ?? "", /^no route within budget/);
+});
+
+test("a payment LND refuses outright (a macaroon without offchain:write) is booked failed at once, with LND's reason — LND made no payment, so no budget stays held 'in flight' (review 2026-10-25)", async () => {
+  const node = rebalanceNode();
+  const ends: string[] = [];
+  const res = await executeRebalance(
+    node.lnd,
+    node.withoutPermission("router.sendPaymentV2"),
+    { targetId: "800001x1x0", sourceId: "800002x1x0", amountSats: 400_000, econRatio: 0.8 },
+    { onEnd: (_id, outcome) => ends.push(outcome) },
+  );
+  assert.equal(res.inFlight, undefined);
+  assert.deepEqual(ends, ["failed"], "one attempt: LND refuses a smaller one just the same");
+  assert.match(res.error ?? "", /^LND refused the payment \(.*permission denied.*\) — it has none by that id: nothing was sent$/);
+  assert.deepEqual(res.failedSourceIds, ["800002x1x0"]);
+  assert.equal(node.payments.size, 0);
+});
+

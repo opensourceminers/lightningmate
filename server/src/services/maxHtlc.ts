@@ -2,6 +2,7 @@ import { getChannel, getChannels, updateRoutingFees, type AuthenticatedLnd } fro
 import { getOwnPubkey } from "./node.js";
 import { getAlias } from "./aliases.js";
 import { channelMaxPendingMsat, updateRefusal } from "./fees.js";
+import { errorText } from "./errorText.js";
 
 /**
  * Dynamic max_htlc — advertise only what a channel can actually forward.
@@ -34,7 +35,7 @@ export interface MaxHtlcChange {
   error?: string;
 }
 
-/** Never advertise below this — keeps max_htlc sane on drained channels. */
+/** The smallest bucket advertised while a channel can forward anything. */
 const MIN_BUCKET_SAT = 1_024;
 /** Spendable must clear the target bucket by this factor before we raise. */
 const RAISE_HEADROOM = 1.1;
@@ -42,9 +43,15 @@ const RAISE_HEADROOM = 1.1;
  *  retried — and recorded as applied — every 30-minute run). */
 export const MAX_HTLC_BACKOFF_MS = 6 * 3_600_000;
 
-/** Largest power of two ≤ spendable (floored to the minimum bucket). */
-export function maxHtlcBucketSat(spendableSat: number): number {
-  if (spendableSat < MIN_BUCKET_SAT) return MIN_BUCKET_SAT;
+/**
+ * Largest power of two ≤ spendable. Below the smallest bucket: the
+ * channel's min_htlc — the least LND accepts (`minHtlcSat`, at least 1 sat).
+ * A channel at its reserve advertised 1,024 sat it couldn't forward: senders
+ * tried small payments that failed, and those failures read as "possible
+ * demand" that kept the channel protected and raising (review 2026-10-25).
+ */
+export function maxHtlcBucketSat(spendableSat: number, minHtlcSat = 1): number {
+  if (spendableSat < MIN_BUCKET_SAT) return Math.max(1, minHtlcSat);
   return 2 ** Math.floor(Math.log2(spendableSat));
 }
 
@@ -52,8 +59,9 @@ export function maxHtlcBucketSat(spendableSat: number): number {
 export function decideMaxHtlc(
   spendableSat: number,
   currentMaxSat: number | null,
+  minHtlcSat = 1,
 ): { change: boolean; toSat: number } {
-  const bucket = maxHtlcBucketSat(spendableSat);
+  const bucket = maxHtlcBucketSat(spendableSat, minHtlcSat);
   if (currentMaxSat == null) return { change: true, toSat: bucket };
   if (bucket === currentMaxSat) return { change: false, toSat: bucket };
   // Lower immediately; raise only with headroom over the bucket floor.
@@ -81,8 +89,14 @@ export async function runMaxHtlcPass(
   readLnd: AuthenticatedLnd,
   writeLnd: AuthenticatedLnd,
   backoff: Map<string, number> = new Map(),
-  opts: { shouldStop?: () => boolean } = {},
+  opts: {
+    shouldStop?: () => boolean;
+    /** The last update applied per channel (kept by the caller): one that
+     *  LND took but the channel doesn't advertise is not sent again. */
+    lastWrites?: Map<string, { fromSat: number | null; toSat: number }>;
+  } = {},
 ): Promise<MaxHtlcChange[]> {
+  const lastWrites = opts.lastWrites ?? new Map<string, { fromSat: number | null; toSat: number }>();
   const [{ channels }, mine] = await Promise.all([getChannels({ lnd: readLnd }), getOwnPubkey(readLnd)]);
   const out: MaxHtlcChange[] = [];
   const now = Date.now();
@@ -109,7 +123,29 @@ export async function runMaxHtlcPass(
     if (!current || current.cltv_delta === undefined || current.fee_rate === undefined) continue;
 
     const currentMaxSat = current.max_htlc_mtokens ? Math.floor(Number(current.max_htlc_mtokens) / 1000) : null;
-    const { change, toSat } = decideMaxHtlc(spendable, currentMaxSat);
+    const minHtlcSat = current.min_htlc_mtokens ? Math.ceil(Number(current.min_htlc_mtokens) / 1000) : 1;
+    const { change, toSat } = decideMaxHtlc(spendable, currentMaxSat, minHtlcSat);
+    // The last update LND said OK to, and the channel still advertises what
+    // it replaced: it didn't take. Sent again every 30 min, it flooded the
+    // run history and the network (live: 19 h of 300,000 → 1,048,576 on one
+    // channel, review 2026-10-25) — recorded once, then left alone like a
+    // refusal.
+    const last = lastWrites.get(c.id);
+    if (last && currentMaxSat !== last.toSat) {
+      lastWrites.delete(c.id);
+      if (change && toSat === last.toSat && currentMaxSat === last.fromSat) {
+        backoff.set(c.id, now);
+        out.push({
+          id: c.id,
+          alias: await getAlias(readLnd, c.partner_public_key),
+          fromSat: currentMaxSat,
+          toSat,
+          ok: false,
+          error: `LND took the update, but the channel still advertises ${currentMaxSat ?? "no"} max_htlc — not retried for ${MAX_HTLC_BACKOFF_MS / 3_600_000} h`,
+        });
+        continue;
+      }
+    } else if (last) lastWrites.delete(c.id);
     if (!change) continue;
     if (opts.shouldStop?.()) break;
 
@@ -138,6 +174,7 @@ export async function runMaxHtlcPass(
         continue;
       }
       backoff.delete(c.id);
+      lastWrites.set(c.id, { fromSat: currentMaxSat, toSat });
       out.push({
         id: c.id,
         alias: await getAlias(readLnd, c.partner_public_key),
@@ -153,7 +190,7 @@ export async function runMaxHtlcPass(
         fromSat: currentMaxSat,
         toSat,
         ok: false,
-        error: err instanceof Error ? err.message : String(err),
+        error: errorText(err),
       });
     }
   }

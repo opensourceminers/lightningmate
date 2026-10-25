@@ -19,8 +19,8 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { PROVEN_REFILL_MULTIPLE, PROVEN_SALES, REBAL_REC_DEFAULTS, classify, planRebalances, wouldTake, type RouteProbe } from "../src/services/rebalanceRecommend.js";
-import { FEE_REC_DEFAULTS, buildRecommendation, type BuildCtx, type Flow } from "../src/services/feeRecommend.js";
+import { PROVEN_REFILL_MULTIPLE, PROVEN_SALES, REBAL_REC_DEFAULTS, boughtAndLeased, classify, planRebalances, wouldTake, type RouteProbe } from "../src/services/rebalanceRecommend.js";
+import { FEE_REC_DEFAULTS, buildRecommendation, type BuildCtx, type Flow, type ProvenLevel } from "../src/services/feeRecommend.js";
 import type { ChannelView } from "../src/services/channels.js";
 
 const NOW = Date.parse("2026-10-24T12:00:00.000Z");
@@ -50,6 +50,11 @@ const view = (o: Partial<ChannelView> & { id: string; localBalance: number }): C
   };
 };
 
+/** The level `sold` makes at `ppm` — proven with PROVEN_SALES sales. */
+const levelOf = (ppm: number, sold: Flow): ProvenLevel | null =>
+  sold.forwards >= PROVEN_SALES && sold.out > 0
+    ? { ppm, paidPpm: Math.round((sold.revenue / sold.out) * 1_000_000), sales: sold.forwards, out: sold.out, revenue: sold.revenue, from: new Date(NOW - 86_400_000).toISOString(), to: null }
+    : null;
 const ctxOf = (ch: ChannelView, ppm: number, f14: Flow, f30: Flow, sold: Flow = NONE, o: Partial<BuildCtx> = {}): BuildCtx => ({
   cfg: { ...FEE_REC_DEFAULTS, stepPpm: 10, minChangePpm: 25 },
   rate: { fee_rate: ppm, base_fee_mtokens: "0", transaction_id: ch.transactionId, transaction_vout: ch.transactionVout },
@@ -57,6 +62,7 @@ const ctxOf = (ch: ChannelView, ppm: number, f14: Flow, f30: Flow, sold: Flow = 
   f14,
   f30,
   soldSinceChange: sold,
+  provenLevel: levelOf(ppm, sold),
   currentBlock: HEIGHT,
   records: [],
   bench: { activeChannelCount: 2, topGrossFlow14d: 0, medianGrossFlow14d: 0, topRevenue30d: 0, medianRevenue30d: 0, topRevenuePpm30d: 0, medianRevenuePpm30d: 0 },
@@ -138,14 +144,14 @@ test("the live case: no refill at the 230 ppm it earned, nor at a raised fee nob
   assert.ok((rec.expectedNetProfitSats ?? 0) >= REBAL_REC_DEFAULTS.minExpectedNetProfitSats, `net ${rec.expectedNetProfitSats}`);
   assert.equal(rec.selectedSourceChannel, idle.id);
   assert.ok(
-    rec.reasons.includes("valued at 820 ppm: it sold 3 times at its fee since it was set (820 ppm paid; 230 ppm over 30 d) — a refill of at most 480k, 10× what sold at it"),
+    rec.reasons.includes("valued at 820 ppm: it sold 3 times at 820 ppm since it was set (820 ppm paid; 230 ppm over 30 d) — a refill of at most 480k, 10× what sold at it"),
     rec.reasons.join(" | "),
   );
   // Two sales aren't proof yet — and the row says what would count.
   const two = await planAt(820, soldAt(820, PROVEN_SALES - 1));
   assert.equal(two.rec.wouldRebalance, false);
   assert.ok(
-    two.rec.reasons.includes("its fee now (820 ppm) counts once it sold 3 times at it (now 2) — until then the 230 ppm it earned in 30 d decides"),
+    two.rec.reasons.includes("its fee now (820 ppm) counts once it sold 3 times at it within 14 d (now 2 since it was set) — until then the 230 ppm it earned in 30 d decides"),
     two.rec.reasons.join(" | "),
   );
 });
@@ -198,3 +204,60 @@ test("'what it would take' asks for the demand the gate counted — not the raw 
   const short = wouldTake(thin.rec, REBAL_REC_DEFAULTS, 502) ?? "";
   assert.match(short, /of outflow \(half its 30 days, as it is drained\) \(now 200k\)/, short);
 });
+
+test("the proof survives the raise it led to: proven at 820, the same run's fee stage moved it on (nothing sold since) — the refill is still valued at the 820 that sold (three reviewers: never a refill while a ramp climbs)", async () => {
+  // The fee is 980 now, nothing sold at it; the level before (820) sold 3 times.
+  const proven: ProvenLevel = { ppm: 820, paidPpm: 820, sales: 3, out: 48_000, revenue: 39.36, from: new Date(NOW - 3 * 86_400_000).toISOString(), to: new Date(NOW - 3_600_000).toISOString() };
+  const { rec } = await planAt(980, NONE, { ctx: { provenLevel: proven } });
+  assert.equal(rec.expectedRevenuePpm, 820, rec.reasons.join(" | "));
+  assert.equal(rec.wouldRebalance, true, rec.reasons.join(" | "));
+  assert.ok(
+    rec.reasons.some((x) => x.startsWith(`valued at 820 ppm: it sold 3 times at 820 ppm until ${proven.to!.slice(0, 10)}`)),
+    rec.reasons.join(" | "),
+  );
+});
+
+test("a channel bought on Magma for its inbound is never a refill target while its lease runs — its low local balance is what was bought", async () => {
+  const bought = view({ id: "859000x1x0", peerAlias: "seller", localBalance: 30_000 });
+  const report = await planRebalances(
+    {
+      channels: [bought, idle],
+      fees: [buildRecommendation(bought, ctxOf(bought, 820, f14, f30, NONE, { provenLevel: levelOf(820, flow(48_000, 0, 3, 39.36)) })), buildRecommendation(idle, ctxOf(idle, 25, NONE, NONE))],
+      contextOf: (id) => (id === bought.id ? ctxOf(bought, 820, f14, f30) : ctxOf(idle, 25, NONE, NONE)),
+      cfg: REBAL_REC_DEFAULTS,
+      overrides: {},
+      soldLeases: [],
+      currentBlock: HEIGHT,
+      boughtLeases: [{ channelId: "859000x1x0", leaseBlocks: 4320 }],
+    },
+    routeAt(502),
+  );
+  const rec = report.recommendations.find((r) => r.channelId === bought.id)!;
+  assert.deepEqual([rec.state, rec.wouldRebalance], ["watching", false], rec.reasons.join(" | "));
+  assert.match(rec.reasons[0], /^bought on Magma for its inbound, its lease still running — never refilled/);
+  // After the lease (opened at 859,000 + 4,320 blocks): like any channel.
+  assert.equal(boughtAndLeased("859000x1x0", [{ channelId: "859000x1x0", leaseBlocks: 4320 }], 863_321), false);
+  const numeric = String((859000n << 40n) | (1n << 16n)); // the same channel as a short channel id
+  assert.equal(boughtAndLeased("859000x1x0", [{ channelId: numeric, leaseBlocks: null }], 860_000), true, "a numeric id, the default lease");
+});
+
+test("a young channel with no flow yet is not a close candidate in the rebalancer either — the new-channel check comes first, and a weak peer is judged after 30 days", () => {
+  const young = view({ id: `${HEIGHT - 144 * 2}x1x0`, localBalance: 30_000 }); // ~2 days
+  const r = classify(young, buildRecommendation(young, ctxOf(young, 80, NONE, NONE)), REBAL_REC_DEFAULTS, {});
+  assert.notEqual(r.state, "close_candidate", r.reasons.join(" | "));
+  assert.match(r.reasons[0], /^new channel \(2d\)/);
+  const tenDays = view({ id: `${HEIGHT - 144 * 10}x1x0`, localBalance: 30_000 });
+  const t = classify(tenDays, buildRecommendation(tenDays, ctxOf(tenDays, 80, NONE, NONE)), REBAL_REC_DEFAULTS, {});
+  assert.notEqual(t.state, "close_candidate", t.reasons.join(" | "));
+  assert.match(t.reasons[0], /^young channel \(10d\) with no flow yet/);
+});
+
+test("a drained channel's demand basis tolerates inflows up to max(1 % of capacity, 50k) in 14 days — bitcoinwell's 2 sat in switched it off ('demand too small (0k)')", () => {
+  const drainedBw = view({ id: "850000x1x0", capacity: 1_000_000, localBalance: 12_000 });
+  const bw = (inn: number) =>
+    classify(drainedBw, buildRecommendation(drainedBw, ctxOf(drainedBw, 350, flow(0, inn, 0, 0), flow(1_780_000, 1_500_000, 15, 186))), REBAL_REC_DEFAULTS, {});
+  assert.equal(bw(2).earningDemandSats, 890_000, "2 sat in: still drained, half its 30-day outflow");
+  assert.equal(bw(50_000).earningDemandSats, 890_000, "50k in: within the tolerance");
+  assert.equal(bw(60_000).earningDemandSats, 0, "60k in, nothing out: refilling itself");
+});
+

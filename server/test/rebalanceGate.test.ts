@@ -67,11 +67,11 @@ test("the gate's fee cap at a size: min(amount × max ppm, payback cap, what it 
 });
 
 /** A drained 3M target at 400 ppm and a full 3M source, on a fake LND. */
-function refillNode() {
+function refillNode(targetPpm = 400) {
   return feeNode({
     blockHeight: HEIGHT,
     channels: [
-      { id: "850000x1x0", partnerPublicKey: PEER(1), capacity: 3_000_000, localBalance: 450_000, transactionId: TX(1), transactionVout: 0, feeRatePpm: 400, baseFeeMsat: 0 },
+      { id: "850000x1x0", partnerPublicKey: PEER(1), capacity: 3_000_000, localBalance: 450_000, transactionId: TX(1), transactionVout: 0, feeRatePpm: targetPpm, baseFeeMsat: 0 },
       { id: "850000x2x0", partnerPublicKey: PEER(2), capacity: 3_000_000, localBalance: 2_700_000, transactionId: TX(2), transactionVout: 0, feeRatePpm: 100, baseFeeMsat: 0 },
       { id: "850000x3x0", partnerPublicKey: PEER(3), capacity: 3_000_000, localBalance: 1_800_000, transactionId: TX(3), transactionVout: 0, feeRatePpm: 100, baseFeeMsat: 0 },
     ],
@@ -357,7 +357,7 @@ const sourceCtx = () =>
   ctxOf({ rate: { fee_rate: 100, base_fee_mtokens: "0", transaction_id: TX(2), transaction_vout: 0 }, f14: flow(0, 0, 0, 0), f30: flow(0, 50_000, 1, 0), market: undefined });
 
 /** planRebalances over these channels, with routes at `routePpm`. */
-async function plan(target: ChannelView, targetCtx: BuildCtx, routePpm: number) {
+async function plan(target: ChannelView, targetCtx: BuildCtx, routePpm: number, feeAutomation = true) {
   const contexts = new Map<string, BuildCtx>([
     [target.id, targetCtx],
     ["850000x2x0", sourceCtx()],
@@ -373,10 +373,23 @@ async function plan(target: ChannelView, targetCtx: BuildCtx, routePpm: number) 
       overrides: {},
       soldLeases: [],
       currentBlock: HEIGHT,
+      feeAutomation,
     },
     probe,
   );
 }
+
+test("a row promises the hold only with fee automation on — and says its limits: 30 days at most, your max ppm, released when the sats barely move (review 2026-10-25)", async () => {
+  const on = (await plan(drained5M(), ctxOf(), 250)).recommendations.find((r) => r.channelId === "850000x1x0")!;
+  assert.ok(
+    on.reasons.some((x) => /keeps it at ≥ 400 ppm until the refilled sats have routed out \(at most 30 d, never above your max of \d+ ppm; released after 7 d with under 3 forwards out in 14 d\)/.test(x)),
+    on.reasons.join(" | "),
+  );
+  const off = (await plan(drained5M(), ctxOf(), 250, false)).recommendations.find((r) => r.channelId === "850000x1x0")!;
+  assert.equal(off.state, "route_found_profitable");
+  assert.ok(!off.reasons.some((x) => /keeps it at/.test(x)), off.reasons.join(" | "));
+  assert.ok(off.reasons.some((x) => /fee automation is off: nothing holds its fee after the refill/.test(x)), off.reasons.join(" | "));
+});
 
 test("the gate values the moved sats at the fee the engine charges after the refill — and booked as the autopilot books it, the engine keeps exactly that", async () => {
   const { recommendations } = await plan(drained5M(), ctxOf(), 250);
@@ -601,7 +614,9 @@ test("a fee that isn't a whole sat is reckoned high when a size is fitted: 1.11M
 });
 
 test("the executor tries the largest size the cap allows at the plan's route cost before the halves — when today's budget left no longer covers the planned size — each attempt with the gate's own cap", async () => {
-  const node = refillNode();
+  // (The target charges the 1,000 ppm the gate values it at: a gate above
+  // the fee now is a stale plan, capped at that fee — tested on its own.)
+  const node = refillNode(1000);
   node.payOutcome = "fail"; // no route: every size is tried
   // Earning 1,000 ppm on 2M of outflow, a 600 ppm route probed: 1.25M costs
   // 750 sat, but only 500 sat of today's budget is left.
@@ -627,7 +642,7 @@ test("the executor tries the largest size the cap allows at the plan's route cos
     ],
   );
   // The planned size fits at the probed cost: nothing in between.
-  const fits = refillNode();
+  const fits = refillNode(1000);
   fits.payOutcome = "fail";
   await executeRebalance(fits.lnd, fits.lnd, {
     targetId: "850000x1x0",
@@ -665,3 +680,23 @@ test("the autopilot hands the executor the plan's route cost — and the manual 
   assert.equal(manual[0]?.routeCostPpm, 250);
   assert.equal((await api.request("POST", "/rebalance/execute", { ...body, routeCostPpm: "cheap" })).status, 400);
 });
+
+test("a manual run from a plan made at a higher fee is valued at the fee now — its cap is what the refill earns at 400 ppm, not at the 820 the row was planned at (a tab left open; the fee lowered since)", async () => {
+  const node = refillNode(400);
+  node.payOutcome = "fail";
+  const res = await executeRebalance(node.lnd, node.lnd, {
+    targetId: "850000x1x0",
+    sourceId: "850000x2x0",
+    amountSats: 448_000,
+    econRatio: 0.8,
+    maxFeePpm: 656,
+    gate: { revenuePpm: 820, demandSats: 1_200_000, minNetSats: 100 },
+    routeCostPpm: 502,
+  });
+  assert.equal(res.ok, false);
+  assert.equal(res.budgetPpm, 320, "400 ppm × 0.8, not the plan's 656");
+  // 448k earns 179 sat at 400 ppm: at most 79 sat of fee nets the 100 sat minimum.
+  const [first] = sentPayments(node);
+  assert.deepEqual([first.sats, first.maxFee], [448_000, 79]);
+});
+
