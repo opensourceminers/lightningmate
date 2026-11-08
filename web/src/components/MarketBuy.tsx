@@ -7,8 +7,12 @@ import { Scanning } from "./Scanning";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
 import { buyConfirmMessage } from "../magmaView";
+import { InfoTip } from "./InfoTip";
 
 const fmt = (n: number): string => Math.round(n).toLocaleString("en-US");
+
+/** The offers shown at first: the ranking's top is what a buyer picks from. */
+const TOP_OFFERS = 10;
 
 /**
  * Buying inbound on Magma: the offers ranked for THIS node at the size it
@@ -33,6 +37,7 @@ export function MarketBuy() {
   const [orderState, setOrderState] = useState<OrderState | null>(null);
   /** The offer the user picked. None: Amboss matches a seller for a dollar amount. */
   const [pick, setPick] = useState<BuyOffer | null>(null);
+  const [showAllOffers, setShowAllOffers] = useState(false);
 
   const size = Math.max(0, Math.floor(Number(sizeText) || 0));
 
@@ -230,7 +235,7 @@ export function MarketBuy() {
               </tr>
             </thead>
             <tbody>
-              {offers.map((o) => {
+              {(showAllOffers ? offers : offers.slice(0, TOP_OFFERS)).map((o) => {
                 const blocked = o.conditions.filter((c) => c.pass === false);
                 const unknown = o.conditions.filter((c) => c.pass === null);
                 return (
@@ -278,11 +283,18 @@ export function MarketBuy() {
               })}
             </tbody>
           </table>
+          {offers.length > TOP_OFFERS ? (
+            <button className="reset" onClick={() => setShowAllOffers((v) => !v)}>
+              {showAllOffers ? `Show the top ${TOP_OFFERS}` : `Show all ${offers.length} offers`}
+            </button>
+          ) : null}
           <p className="muted reason">
-            Ranked for your node at {fmt(data?.sizeSats ?? size)} sat: offers you can buy from first, then those that sell this size,
-            then those that promise a routing-fee cap (without one, the inbound is only as useful as the seller's fees allow), then by
-            cost per year of guaranteed lease — a 180-day lease can cost more up front and still be cheaper per year. Totals include
-            Amboss's own fee, which it charges by order size.{" "}
+            Ranked for your node at {fmt(data?.sizeSats ?? size)} sat.
+            <InfoTip label="How offers are ranked">
+              Offers you can buy from first, then those that sell this size, then those that promise a routing-fee cap (without one, the
+              inbound is only as useful as the seller's fees allow), then by cost per year of guaranteed lease — a 180-day lease can cost
+              more up front and still be cheaper per year. Totals include Amboss's own fee, which it charges by order size.{" "}
+            </InfoTip>{" "}
             {pick ? "You picked a seller, so the order goes to them." : "Without a pick, Amboss chooses the seller for you — the ranking is then only advice."}
           </p>
         </>

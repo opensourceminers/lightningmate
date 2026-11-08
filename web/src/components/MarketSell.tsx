@@ -28,6 +28,7 @@ import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
 import { failedOfferWrite } from "../statusNotes";
 import { EligibilityCard, HowAmbossPicks, OfferPromiseNote, SellDiagnosticsCard } from "./MagmaSellInfo";
+import { InfoTip } from "./InfoTip";
 import {
   STANDARD_LEASE_BLOCKS,
   baseFeeFollow,
@@ -376,9 +377,11 @@ export function MarketSell() {
       ) : null}
       {rec && pendingOrdersBanner(rec.sell) ? <div className="magma-warn-banner">⚠ {pendingOrdersBanner(rec.sell)}</div> : null}
       <p className="sell-lede muted">
-        Amboss decides who gets an order — mostly sellers with a track record. LightningMate makes selling correct and reliable; it
-        can't make Amboss pick you.
-        {feeBps > 0 ? ` A ${feeBps / 100}% service fee on completed sales supports Lightning Mate’s development.` : ""}
+        Amboss decides who gets an order.
+        <InfoTip label="About selling">
+          Mostly sellers with a track record. LightningMate makes selling correct and reliable; it can't make Amboss pick you.
+          {feeBps > 0 ? ` A ${feeBps / 100}% service fee on completed sales supports Lightning Mate’s development.` : ""}
+        </InfoTip>
       </p>
 
       <h3 className="sub">{offers.length > 1 ? "Your offers" : "Your offer"}</h3>
@@ -673,20 +676,25 @@ export function MarketSell() {
               </div>
               <div className="magma-warns">
                 <div className="muted">
+                How this price was worked out
+                <InfoTip label="How this price was worked out">
+                <span className="info-line">
                   • {r0.market.sizeBand} band · lease {leaseDays} days · profit floor {r0.economics.profitFloorEffectivePpm} ppm
                   {r0.recommended.feeRateCapPpm !== null ? ` · fee promise ≤ ${r0.recommended.feeRateCapPpm} ppm + ${r0.recommended.baseFeeCapSats} sat` : ""}
                   {r0.market.myRank ? ` · your rank #${r0.market.myRank} of ${r0.market.segmentCount}` : ""}
-                </div>
-                <div className="muted">
+                </span>
+                <span className="info-line">
                   • {rec.sell.medianOrderSat ? `median real order ${satsCompact(rec.sell.medianOrderSat)} · ` : ""}standard lease {rec.sell.standardLeaseBlocks} blocks · ~
                   {rec.sell.onchainOpenCostSat} sat to open on-chain
                   {rec.sell.projectedMonthlySat > 0 ? ` · ≈ ${sats(rec.sell.projectedMonthlySat)} sat/mo from your own sales of the last 30 days` : ""}
                   {rec.sell.pricingMode === "auto" ? ` · auto level ${Math.round(rec.sell.adaptiveLevel * 100)}%` : ""}
                   {recAt ? ` · as of ${new Date(recAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}
-                </div>
+                </span>
                 {[...rec.sell.reasons.slice(1), ...r0.reasons].map((w, i) => (
-                  <div key={`r${i}`} className="muted">• {w}</div>
+                  <span key={`r${i}`} className="info-line">• {w}</span>
                 ))}
+                </InfoTip>
+                </div>
                 {rec.sell.warnings.map((w, i) => (
                   <div key={`sw${i}`} className="sug-warn">⚠ {w}</div>
                 ))}

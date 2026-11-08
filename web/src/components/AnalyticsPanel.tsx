@@ -9,6 +9,7 @@ import { CHANNEL_PNL_CAPTION, channelPnlRows, forwardsReadNote, magmaLeasesKpi, 
 import { SkeletonPanel } from "./Skeleton";
 import { ForwardsPanel } from "./ForwardsPanel";
 import { Sparkline } from "./Sparkline";
+import { InfoTip } from "./InfoTip";
 
 type Sub = "performance" | "forwards";
 
@@ -389,10 +390,10 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
             <section className="panel">
               <div className="panel-head">
                 <h2>
-                  Fee changes{" "}
-                  <span className="muted">
-                    · revenue per day until the next change (≤ {outcomes.fees.windowDays} d) vs before it, net of the rest of the node
-                  </span>
+                  Fee changes
+                  <InfoTip label="How fee changes are measured">
+                    Revenue per day until the next change (≤ {outcomes.fees.windowDays} d) vs before it, net of the rest of the node.
+                  </InfoTip>
                 </h2>
               </div>
               <p className="muted small">{outcomes.fees.note}</p>

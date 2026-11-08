@@ -7,6 +7,7 @@ import { leaseTag, offlineLabel } from "../closeView";
 import { CloseChannelDialog } from "./CloseChannelDialog";
 import { FeeOverrideControl } from "./FeeOverrideControl";
 import { EmptyState } from "./Skeleton";
+import { InfoTip } from "./InfoTip";
 
 const ROLE_LABEL: Record<ChannelRole, string> = {
   source: "source",
@@ -151,12 +152,15 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
       </table>
       {rows.length === 0 ? <EmptyState icon="⚡">No channels to show.</EmptyState> : null}
       <p className="hint">
+        What the columns mean
+        <InfoTip label="What the columns mean">
         <strong>Roles</strong>: <em>source</em> mostly receives, <em>sink</em> mostly sends,
         <em> router</em> is balanced. <strong>Fee now</strong>: what the channel charges to forward out.{" "}
         <strong>Autopilot fee</strong>: <code>auto</code> follows the policy, <code>fixed</code> pins a fee (it
         starts at the current one; confirm with Enter or Pin — fee automation then sets it, or Apply on the Fees
         tab; saving it changes nothing on the node by itself), <code>excluded</code> keeps the autopilot off this
         channel.
+        </InfoTip>
       </p>
 
       {closeTarget ? (

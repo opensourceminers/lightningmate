@@ -16,6 +16,7 @@ import { WRITE_MODE_HINT, promisedSpend, spendPromisedQuestion } from "../status
 import { Scanning } from "./Scanning";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
+import { InfoTip } from "./InfoTip";
 
 type NumKey = "count" | "minChannels" | "maxStaleDays";
 
@@ -189,16 +190,17 @@ export function SuggestionsPanel() {
         {data ? <span className="muted">graph age {Math.round(data.graphAgeSec / 60)}m</span> : null}
       </div>
 
-      <div className="dryrun-banner">
-        Open channels where your node already sees demand — not just where the graph looks big. Scored locally from
-        the LND graph <strong>and your own forwards</strong>: demand fit, quality of new reach, your node's current
-        need, and portfolio diversity.
-        {canWrite ? (
-          <> Hit <strong>Open</strong> to fund a channel at the suggested size (editable).</>
-        ) : (
+      <p className="muted lede">
+        Peers where your node already sees demand.
+        {canWrite ? null : (
           <> Opening is <strong>disabled</strong> — {WRITE_MODE_HINT}.</>
         )}
-      </div>
+        <InfoTip label="How peers are scored">
+          Scored locally from the LND graph <strong>and your own forwards</strong>: demand fit, quality of new reach, your node's
+          current need, and portfolio diversity — not just where the graph looks big. <strong>Open</strong> funds a channel at the
+          suggested size (editable).
+        </InfoTip>
+      </p>
 
       {data ? (
         <div className="sug-need">
@@ -290,7 +292,7 @@ export function SuggestionsPanel() {
                         ))}
                       </div>
                     ) : null}
-                    <div className="muted reason">{s.reasons[0]}</div>
+                    <div className="muted reason" title={s.reasons[0]}>{s.reasons[0]?.split(" — ")[0]}</div>
                   </td>
                   <td className="num strong" title="share of your outbound flow whose neighbourhood this touches">
                     {data?.hasDemandData ? (s.demandFlowSharePct > 0 ? `${s.demandFlowSharePct}%` : "—") : "n/a"}

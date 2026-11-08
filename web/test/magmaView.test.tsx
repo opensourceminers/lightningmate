@@ -428,8 +428,9 @@ test("Market → Sell's promise note and the seller explainer claim only what th
   // amboss.tech and upkept with auto-size off.
   const note = renderToStaticMarkup(<OfferPromiseNote caps={{ feeRateCapPpm: 2200, baseFeeCapSats: 1 }} leaseBlocks={4032} standardLeaseBlocks={4320} />);
   assert.doesNotMatch(note, /Every offer promises/);
-  assert.match(note, /An offer you create or save on this page — or one the autopilot lists — promises buyers a routing fee of at most <b>2200 ppm \+ 1 sat<\/b> for the lease/);
-  assert.match(note, /with auto-size on, the autopilot gives the other offers it manages the same promise/);
+  assert.match(note, /Fee promise to buyers: at most <b>2200 ppm \+ 1 sat<\/b> for the lease/);
+  assert.match(note, /An offer you create or save on this page — or one the autopilot lists — makes this promise/);
+  assert.match(note, /with auto-size on, the autopilot gives\s+the other offers it manages the same one/);
   assert.match(note, /Otherwise an offer \(one made on amboss\.tech, say\) keeps whatever promise it has — (&quot;|")none(&quot;|") below if it has none/);
   assert.match(note, /The fee autopilot keeps each sold channel within the cap its order locked/);
   assert.match(note, /The standard lease is 4320 blocks \(30 days\)\./);

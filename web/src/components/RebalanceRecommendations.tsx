@@ -26,6 +26,7 @@ import {
 } from "../rebalanceView";
 import { useUi } from "./Overlay";
 import { caretButtonProps } from "../a11y";
+import { InfoTip } from "./InfoTip";
 
 const STATE_LABEL: Record<RebalanceRecState, string> = {
   not_needed: "ok",
@@ -163,7 +164,10 @@ export function RebalanceRecommendations() {
         {s ? <span className="change-badge">{s.profitableRecommendations} worth doing</span> : null}
       </div>
 
-      <div className="dryrun-banner">
+      <p className="muted lede">
+        Refills that pay back.
+        {canWrite ? null : " Running is disabled (read-only macaroon)."}
+        <InfoTip label="How refills are chosen">
         Rebalance only when it pays back — and never refill liquidity Fee Autopilot says is being sold too cheaply
         (raise the fee first). A refill is valued at the fee the fee engine charges after it
         {data?.feeAutomation === false
@@ -172,8 +176,8 @@ export function RebalanceRecommendations() {
         ; its payment can't pay more than that check allows. The autopilot runs the
         profitable ones when <strong>Auto-rebalance</strong> is on; you can also run one now — checked and held the
         same way.
-        {canWrite ? null : <> Running is disabled (read-only macaroon).</>}
-      </div>
+        </InfoTip>
+      </p>
       {budgetLine(data?.budget) ? <p className="muted small">{budgetLine(data?.budget)}</p> : null}
 
       {demand && demandSum?.kind === "sorting" ? (
@@ -185,14 +189,14 @@ export function RebalanceRecommendations() {
         <>
           <h3 className="sub">
             Unserved demand <span className="muted">· refused forwards, {demandSum.window}</span>
-          </h3>
-          <div className="dryrun-banner">
+            <InfoTip label="What unserved demand is">
             Payments that wanted to route through these channels but were <strong>refused for lack of
             outbound liquidity</strong>. Most refused HTLCs are not demand: probes (≥ 90% of the channel), retries of
             the same amount and HTLCs bigger than half the channel are counted apart, and only the rest — attempts a
             refilled channel could have carried — is <em>possible</em> demand. A refill still has to pass the profit
             check below.
-          </div>
+            </InfoTip>
+          </h3>
           <table className="fee-table">
             <thead>
               <tr>
@@ -233,9 +237,10 @@ export function RebalanceRecommendations() {
       {!data && !error ? <p className="muted">Probing routes…</p> : null}
 
       {data?.refill ? (
-        <div className="magma-crosslink">
-          💡 <strong>Refilling outbound:</strong> {data.refill.note}
-        </div>
+        <p className="muted ap-hint">
+          What refilling costs right now
+          <InfoTip label="What refilling costs right now">{data.refill.note}</InfoTip>
+        </p>
       ) : null}
 
       {s ? (

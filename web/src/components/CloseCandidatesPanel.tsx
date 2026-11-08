@@ -8,6 +8,7 @@ import { satsCompact } from "../format";
 import { leaseTag, offlineLabel } from "../closeView";
 import { CloseChannelDialog, type CloseTarget } from "./CloseChannelDialog";
 import { EmptyState } from "./Skeleton";
+import { InfoTip } from "./InfoTip";
 
 const scoreClass = (s: number) => (s >= 55 ? "u-high" : s >= 35 ? "u-medium" : "u-low");
 
@@ -80,14 +81,15 @@ export function CloseCandidatesPanel() {
         ) : null}
       </div>
 
-      <div className="dryrun-banner">
-        Dead-weight channels worth closing — judged on real flow, P&amp;L, weak-peer signals and how much unique reach
-        they actually add. Honest about what a close <strong>frees</strong>: you only ever reclaim your local balance,
-        and a channel the peer opened to you gives up free inbound.
+      <p className="muted lede">
+        Channels that earn too little to keep.
         {canWrite ? null : <> Closing is <strong>disabled</strong> (read-only).</>}
-      </div>
-
-      {magmaHint ? <div className="magma-crosslink">💡 {magmaHint}</div> : null}
+        <InfoTip label="How channels are judged">
+          Judged on real flow, P&amp;L, weak-peer signals and how much unique reach they actually add. Honest about what a close{" "}
+          <strong>frees</strong>: you only ever reclaim your local balance, and a channel the peer opened to you gives up free inbound.
+          {magmaHint ? <span className="info-line">💡 {magmaHint}</span> : null}
+        </InfoTip>
+      </p>
 
       {rows.length === 0 ? (
         <EmptyState icon="✅">Nothing to close — every channel is earning, reachable or strategic.</EmptyState>
@@ -126,7 +128,7 @@ export function CloseCandidatesPanel() {
                         {c.opportunityCandidates.length ? <span className="sug-badge swap">⇄ swap</span> : null}
                         {c.warnings.length ? <span className="sug-badge warn">⚠ {c.warnings.length}</span> : null}
                       </div>
-                      <div className="muted reason">{c.reasons[0]}</div>
+                      <div className="muted reason" title={c.reasons[0]}>{c.reasons[0]?.split(" — ")[0]}</div>
                     </td>
                     <td className="num strong">{satsCompact(c.capitalFreedSats)}</td>
                     <td className="num">{c.inboundLiquidityLostSats > 0 ? satsCompact(c.inboundLiquidityLostSats) : "—"}</td>

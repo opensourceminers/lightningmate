@@ -13,7 +13,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { isValidElement, type ReactElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import {
+import { shortStatus,
   STATE_CHIP,
   allAutomationOff,
   areaStatusView,
@@ -301,7 +301,7 @@ test("LSP mode is not part of the pause: with it on, the dialog, the banner, the
   assert.match(panel, /const lspModeOn = server\.lspModeOn \?\? false;/);
   assert.match(panel, /pauseAllAutomation\(\{\n\s+config,\n\s+lspModeOn,/);
   assert.match(panel, /All automation paused \{timeAgo\(paused\.at\)\} — \{pausedText\(lspModeOn\)\}\./);
-  assert.match(panel, /<span className="muted">\{pauseHint\(lspModeOn\)\}<\/span>/);
+  assert.match(panel, /<InfoTip text=\{pauseHint\(lspModeOn\)\}/);
   assert.match(panel, /toast\(pausedToast\(next\.lspModeOn \?\? false\), "success"\)/);
   assert.doesNotMatch(panel, /Resume brings back what was on"/);
 });
@@ -746,10 +746,11 @@ test("a dialog keeps Tab inside it — wrapping around — and the confirm and c
   }
 });
 
-test("help that was only a hover tooltip opens on a tap: an (i) button that says whether it is open", () => {
+test("help that was only a hover tooltip opens on a tap: a ? button that says whether it is open", () => {
   const html = renderToStaticMarkup(<InfoTip text="what it means" label="About it" />);
   assert.match(html, /<button type="button" class="info-btn" aria-expanded="false" aria-label="About it"/);
-  assert.doesNotMatch(html, /what it means/, "closed until asked");
+  // In the page but hidden until asked: a closed tip takes no room, and its text stays what it is.
+  assert.match(html, /<span class="info-text" role="note" hidden="">what it means<\/span>/, "closed until asked");
   const score = readFileSync(new URL("../src/components/HealthScore.tsx", import.meta.url), "utf8");
   assert.match(score, /<InfoTip text=\{c\.hint\}/);
   assert.doesNotMatch(score, /title=\{c\.hint\}/);
@@ -761,7 +762,7 @@ test("help that was only a hover tooltip opens on a tap: an (i) button that says
 
 // Review of P7: InfoTip stopped every key from reaching its parents — inside
 // a dialog, Esc would no longer close it and Tab would leave its focus trap.
-test("the (i) button keeps only the keys it acts on (Enter, Space) from its parent — Esc and Tab go on to a dialog", () => {
+test("the ? button keeps only the keys it acts on (Enter, Space) from its parent — Esc and Tab go on to a dialog", () => {
   const stopped = (key: string) => {
     let s = false;
     infoTipKeyDown({ key, stopPropagation: () => void (s = true) });
@@ -863,4 +864,23 @@ test("a rebalance window with no hour in it (24 → 0) is refused at the field b
   assert.match(REBALANCE_WINDOW_HINT, /Equal hours \(0 and 24, or 5 and 5\) mean any time/);
   assert.match(PER_RUN_HINTS.maxChangesPerRun, /^0 = the autopilot writes no fee change \(it still shows what it would change\) — except the 10-minute check that lowers a sold channel's fee to what its buyer was promised\./);
   assert.match(PER_RUN_HINTS.maxRebalancesPerRun, /^0 = no refill runs automatically/);
+});
+
+test("an area's row says what it did in a few words: the first clause, no offer id, no 'nothing to change'; the whole text stays on its details", () => {
+  assert.equal(shortStatus("no fee needed changing — 22 channels checked: 12 already at their target"), "No fee needed changing");
+  assert.equal(
+    shortStatus("1 offer listed (00479f19… 20,000,000 sat, 250,000–5,000,000 per order at 4,280 ppm + 284 sat), nothing to change"),
+    "1 offer listed (20,000,000 sat, 250,000–5,000,000 per order at 4,280 ppm + 284 sat)",
+  );
+  assert.equal(shortStatus("a channel was opened 1170 min ago — the next open waits for the 1440-minute cooldown"), "A channel was opened 1170 min ago");
+  assert.equal(shortStatus("repriced offer 00479f19… · offer 00479f19…: not listed up to 5 sat yet"), "Repriced offer");
+  assert.ok(shortStatus("x".repeat(300)).length <= 110);
+});
+
+test("the autopilot page is rows with details, and selling's capital can be everything free", () => {
+  const panel = readFileSync(new URL("../src/components/AutopilotPanel.tsx", import.meta.url), "utf8");
+  assert.match(panel, /Everything free/);
+  assert.match(panel, /capTop/);
+  assert.doesNotMatch(panel, /className="subnav"/, "no second row of tabs");
+  assert.match(panel, /The autopilot manages my offer/);
 });

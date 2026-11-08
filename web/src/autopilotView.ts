@@ -83,6 +83,14 @@ export function areaStatusView(s: AreaStatus | undefined, nowMs = Date.now()): S
   return { tone: chip.tone, chip: chip.label, text: s.text, when: s.at ? `${ago(s.at, nowMs)}${repeats}` : null, lastError };
 }
 
+/** A decision in a row's few words: its first clause, without an offer's id
+ *  (the whole text is on the area's details). */
+export function shortStatus(text: string): string {
+  const first = text.split(/ — | · (?=[a-zA-Z])/)[0].replace(/\b[0-9a-z-]{4,}…\s*/gi, "").replace(/, nothing to change$/, "").trim();
+  const cut = first.length > 110 ? `${first.slice(0, 109).trimEnd()}…` : first;
+  return cut.charAt(0).toUpperCase() + cut.slice(1);
+}
+
 // ── Strategy presets: what a click changes ──────────────────────────────────
 
 export interface PresetChange {

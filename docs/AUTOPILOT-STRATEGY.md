@@ -748,7 +748,8 @@ listed 2M. Listed capital goes with sales (≤ 5M: 2 of 33 offers sold; 5–50M:
 2026-10-17 — a correlation). What the wallet limits moves in steps of 500,000 sat, a step counting
 once it is cleared by 50,000 sat, and the window's max stays that far under the limit, so the
 wallet's small moves don't rewrite the offer; a shortage cuts to the step below, never under the
-largest order it takes. With auto-relist off what a sale took stays out, and with several offers
+largest order it takes. The page's "Everything free" sets the cap to the top of its range, so the
+listing follows what is free on chain after the reserve, at every run. With auto-relist off what a sale took stays out, and with several offers
 they share the capital as they are set. A size floor the mempool raised stays up for 6 h (the engine
 prices the window that really stands), so fees hovering around a step don't move it all day. The
 Magma decision says why an offer was written.

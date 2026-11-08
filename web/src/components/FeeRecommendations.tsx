@@ -5,6 +5,7 @@ import type { AutopilotChange, FeeMode, FeeRecReport, FeeRecState, OverrideMap }
 import { satsCompact, timeAgo } from "../format";
 import { applyChannelIds, baseChange, marketRefText } from "../feeView";
 import { FeeOverrideControl } from "./FeeOverrideControl";
+import { InfoTip } from "./InfoTip";
 
 const STATE_LABEL: Record<FeeRecState, string> = {
   normal: "normal",
@@ -140,7 +141,10 @@ export function FeeRecommendations() {
         </div>
       </div>
 
-      <div className="dryrun-banner">
+      <p className="muted lede">
+        What the autopilot sets for each channel, and why.
+        {canWrite ? null : " Applying is disabled (read-only macaroon)."}
+        <InfoTip label="How fees are set">
         The fees the autopilot applies when <strong>Fee automation</strong> is on — protect nearly-drained
         channels, price draining channels toward what refilling them costs, keep a price that wins flow, react to
         {" "}{POSSIBLE_DEMAND_BANNER}. Each update moves a fee by a small, bounded step toward its aim (protecting a drained channel
@@ -152,8 +156,8 @@ export function FeeRecommendations() {
         price that last won it flow or to what the market charges into its peer, a fee you pinned, a new
         channel&apos;s protected fee, a broken lease promise, and a fee outside your min/max (one below your min goes
         to the min, and steps on from there). Apply them now, or let the autopilot manage them.
-        {canWrite ? null : <> Applying is disabled (read-only macaroon).</>}
-      </div>
+        </InfoTip>
+      </p>
 
       {error ? <p className="banner error">{error}</p> : null}
       {!data && !error ? <p className="muted">Computing recommendations…</p> : null}
@@ -178,7 +182,7 @@ export function FeeRecommendations() {
               ) : null;
             })()}
             <InDemandChip count={data.recommendations.filter((r) => r.metrics.inDemand).length} />
-            <span className="feerec-bench muted">
+            <InfoTip label="What the figures are measured against">
               node median {data.nodeBenchmarks.medianGrossFlow14d.toFixed(2)}× flow/14d ·{" "}
               {Math.round(data.nodeBenchmarks.medianRevenuePpm30d)} ppm earned (median)
               {data.marketReferenced ? ` · market reference for ${data.marketReferenced} channels (public graph)` : ""}
@@ -188,7 +192,7 @@ export function FeeRecommendations() {
                   ? `learned elasticity on ${data.elasticityLearned} channel${data.elasticityLearned === 1 ? "" : "s"}`
                   : "no channel has enough measured fee changes to learn from yet"}
               </span>
-            </span>
+            </InfoTip>
           </div>
 
           <table className="fee-table feerec-table">
@@ -243,13 +247,12 @@ export function FeeRecommendations() {
                         </td>
                         <td className="ov-cell" onClick={(e) => e.stopPropagation()}>
                           <FeeOverrideControl
-                            variant="buttons"
                             ov={overrides[r.channelId]}
                             currentPpm={r.currentPpm}
                             onSave={(mode, ppm) => setOv(r.channelId, mode, ppm)}
                           />
                         </td>
-                        <td className="muted reason">{r.reasons[0]}</td>
+                        <td className="muted reason" title={r.reasons[0]}>{r.reasons[0].split(" — ")[0]}</td>
                       </tr>
                       {isOpen ? (
                         <tr className="feerec-detail-row">

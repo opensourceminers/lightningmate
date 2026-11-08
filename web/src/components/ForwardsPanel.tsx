@@ -5,6 +5,7 @@ import { sats, satsCompact, timeAgo } from "../format";
 import { MIN_DEMAND_DAYS, demandHeadline, demandSummary } from "../feeView";
 import { flowHint, forwardsReadNote } from "../analyticsView";
 import { Sparkline } from "./Sparkline";
+import { InfoTip } from "./InfoTip";
 
 const WINDOWS = [7, 30, 90];
 type Metric = "fees" | "volume" | "count";
@@ -122,12 +123,12 @@ export function ForwardsPanel() {
           <div className="dryrun-banner warn">
             <strong>{demandHeadline(d)}</strong> — possible demand of {satsCompact(d.sats)} sat
             {d.missedFeesSats ? <> (~{sats(d.missedFeesSats)} sat in fees at your current rates)</> : null}.{" "}
-            <span className="muted">
+            <InfoTip label="What was counted">
               Of {d.raw} refused HTLCs in {d.rawWindow}, {d.probes} looked like probes (≥ 90% of the channel), {d.retries} were
               retries of the same amount
               {d.oversized ? `, ${d.oversized} were bigger than half the channel` : ""}
               {d.unclassified ? `, ${d.unclassified} could not be sorted` : ""} — not counted.
-            </span>
+            </InfoTip>
           </div>
         );
       })()}
@@ -210,11 +211,13 @@ export function ForwardsPanel() {
 
       {data && data.corridors.length > 0 ? (
         <>
-          <h3 className="sub">Routing corridors <span className="muted">· where flow actually goes</span></h3>
-          <p className="hint" style={{ marginTop: 0 }}>
-            The channel pairs carrying your flow — liquidity comes IN one side and goes OUT the other. A
-            corridor needs both ends; closing either the source or the sink kills the route.
-          </p>
+          <h3 className="sub">
+            Routing corridors <span className="muted">· where flow actually goes</span>
+            <InfoTip label="About corridors">
+              The channel pairs carrying your flow — liquidity comes IN one side and goes OUT the other. A corridor needs both ends; closing
+              either the source or the sink kills the route.
+            </InfoTip>
+          </h3>
           <table className="fee-table">
             <thead>
               <tr>

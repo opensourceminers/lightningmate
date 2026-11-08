@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 
 /**
- * The keys the (i) button acts on itself — Enter and Space press it — and so
+ * The keys the ? button acts on itself — Enter and Space press it — and so
  * keeps from a clickable parent (a tile opens on them too). Every other key
  * goes on: Esc must still close a dialog the tip sits in, and Tab still move
  * within its focus trap (review of P7: every key was stopped).
@@ -18,7 +18,7 @@ export function infoTipKeyDown(e: { key: string; stopPropagation(): void }): voi
  * open (aria-expanded); a click on it never reaches a clickable parent (a
  * tile, a row).
  */
-export function InfoTip({ text, label = "What this means" }: { text: string; label?: string }) {
+export function InfoTip({ text, children, label = "What this means" }: { text?: string; children?: ReactNode; label?: string }) {
   const [open, setOpen] = useState(false);
   return (
     <span className="info-tip">
@@ -34,13 +34,12 @@ export function InfoTip({ text, label = "What this means" }: { text: string; lab
         }}
         onKeyDown={infoTipKeyDown}
       >
-        ⓘ
+        ?
       </button>
-      {open ? (
-        <span className="info-text" role="note">
-          {text}
-        </span>
-      ) : null}
+      <span className="info-text" role="note" hidden={!open}>
+        {text}
+        {children}
+      </span>
     </span>
   );
 }

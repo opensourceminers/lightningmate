@@ -3,6 +3,7 @@ import { api } from "../api";
 import type { LnPlusPoolNode, LnPlusStatus, LnPlusSwap, LnPlusSwapsResponse } from "../types";
 import { satsCompact } from "../format";
 import { lnplusDirectNote } from "../privacyView";
+import { InfoTip } from "./InfoTip";
 
 /**
  * lightningnetwork.plus — the second liquidity market, and a different trade.
@@ -25,9 +26,14 @@ function RankChip({ rank, rankName }: { rank: number; rankName?: string }) {
   );
 }
 
+/** The pool nodes shown at first (the rest behind a button). */
+const TOP_NODES = 10;
+
 function PoolTable({ nodes }: { nodes: LnPlusPoolNode[] }) {
+  const [showAll, setShowAll] = useState(false);
   if (!nodes.length) return <div className="muted pad">No pool nodes returned right now.</div>;
   return (
+    <>
     <table className="fee-table">
       <thead>
         <tr>
@@ -40,7 +46,7 @@ function PoolTable({ nodes }: { nodes: LnPlusPoolNode[] }) {
         </tr>
       </thead>
       <tbody>
-        {nodes.map((n) => (
+        {(showAll ? nodes : nodes.slice(0, TOP_NODES)).map((n) => (
           <tr key={n.pubkey}>
             <td>
               <div className="sug-peer">
@@ -63,6 +69,12 @@ function PoolTable({ nodes }: { nodes: LnPlusPoolNode[] }) {
         ))}
       </tbody>
     </table>
+      {nodes.length > TOP_NODES ? (
+        <button className="reset" onClick={() => setShowAll((v) => !v)}>
+          {showAll ? `Show the top ${TOP_NODES}` : `Show all ${nodes.length} nodes`}
+        </button>
+      ) : null}
+    </>
   );
 }
 
@@ -227,9 +239,11 @@ export function LnPlusPanel() {
       ) : null}
 
       <p className="muted pad">
-        LN+ trades channels for channels or for liquidity credits, not for sats. Joining commits you
-        to opening a channel within 48 hours and keeping it open for the full term, so the app shows
-        you what you qualify for and leaves the commitment to you.
+        What you qualify for on LN+; joining stays your decision.
+        <InfoTip label="About LN+">
+          LN+ trades channels for channels or for liquidity credits, not for sats. Joining commits you to opening a channel within 48 hours
+          and keeping it open for the full term, so the app shows you what you qualify for and leaves the commitment to you.
+        </InfoTip>
       </p>
 
       {error ? <div className="sug-warn pad">⚠ {error}</div> : null}

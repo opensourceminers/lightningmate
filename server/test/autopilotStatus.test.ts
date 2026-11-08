@@ -169,14 +169,14 @@ test("Magma: no offer and auto-pricing off says why none is listed; no Amboss ke
   assert.equal((blocked.last as AreaDecision | undefined)?.text, m.text, "what it last decided stays at hand");
 });
 
-test("Magma with an offer listed and nothing to change says what is listed — the offer's window and price — not just 'managed'", async (t) => {
+test("Magma with an offer listed and nothing to change says what is listed — how much, the offer's window and price — not just 'managed'", async (t) => {
   quiet(t);
   const { autopilot, magma } = sellerSetup(t, { chainBalance: 20_000_000 });
   magma.addOffer({ id: "offer-abcdef12", minSats: 1_000_000, maxSats: 2_000_000, totalSats: 2_000_000, feeRatePpm: 1200, baseFeeSats: 852 });
   await autopilot.runOnce();
   const m = autopilot.getState().status.magma;
   assert.equal(m.state, "idle");
-  assert.match(m.text, /^1 offer listed \(offer-ab… 1,000,000–2,000,000 sat at 1,200 ppm \+ 852 sat\), nothing to change — their terms are yours; the autopilot only keeps them fundable$/);
+  assert.match(m.text, /^1 offer listed \(offer-ab… [\d,]+ sat, 1,000,000–2,000,000 per order at 1,200 ppm \+ 852 sat\), nothing to change — their terms are yours; the autopilot only keeps them fundable$/);
 });
 
 test("a refill still in flight is no failure (yet): not counted as failed, and the rebalance decision says it is in flight", async (t) => {

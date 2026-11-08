@@ -1,5 +1,6 @@
 import type { Eligibility, SellDiagnostics } from "../types";
 import { CHECK_MARK, SELLER_SCORE_COPY, VERDICT } from "../magmaView";
+import { InfoTip } from "./InfoTip";
 
 /**
  * The honest part of Market → Sell: can this node sell at all (live numbers
@@ -200,14 +201,17 @@ export function OfferPromiseNote({
 }) {
   return (
     <p className="muted ap-hint">
-      An offer you create or save on this page — or one the autopilot lists — promises buyers a routing fee of at most{" "}
+      Fee promise to buyers: at most{" "}
       <b>
         {caps.feeRateCapPpm} ppm + {caps.baseFeeCapSats} sat
       </b>{" "}
-      for the lease; with auto-size on, the autopilot gives the other offers it manages the same promise. Otherwise an offer
-      (one made on amboss.tech, say) keeps whatever promise it has — "none" below if it has none. The fee autopilot keeps each
-      sold channel within the cap its order locked (and clamps manual fee changes too).
-      {leaseBlocks !== standardLeaseBlocks ? ` The standard lease is ${standardLeaseBlocks} blocks (30 days).` : ""}
+      for the lease.
+      <InfoTip label="About the fee promise">
+        An offer you create or save on this page — or one the autopilot lists — makes this promise; with auto-size on, the autopilot gives
+        the other offers it manages the same one. Otherwise an offer (one made on amboss.tech, say) keeps whatever promise it has — "none"
+        below if it has none. The fee autopilot keeps each sold channel within the cap its order locked (and clamps manual fee changes too).
+        {leaseBlocks !== standardLeaseBlocks ? ` The standard lease is ${standardLeaseBlocks} blocks (30 days).` : ""}
+      </InfoTip>
     </p>
   );
 }

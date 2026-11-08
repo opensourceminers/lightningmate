@@ -4791,7 +4791,7 @@ export class Autopilot {
     // What is on Amboss, so "nothing to change" says what it left as it is.
     const shown = listed
       .slice(0, 2)
-      .map((o) => `${o.id.slice(0, 8)}… ${fmtSat(o.minSizeSats)}–${fmtSat(o.maxSizeSats)} sat at ${fmtSat(o.feeRatePpm)} ppm + ${fmtSat(o.baseFeeSats)} sat`);
+      .map((o) => `${o.id.slice(0, 8)}… ${fmtSat(o.availableSats)} sat, ${fmtSat(o.minSizeSats)}–${fmtSat(o.maxSizeSats)} per order at ${fmtSat(o.feeRatePpm)} ppm + ${fmtSat(o.baseFeeSats)} sat`);
     return {
       text:
         `${enabled} offer${enabled === 1 ? "" : "s"} listed${shown.length ? ` (${shown.join("; ")}${enabled > 2 ? "; …" : ""})` : ""}` +
