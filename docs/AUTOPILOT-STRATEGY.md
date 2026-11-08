@@ -635,7 +635,17 @@ channel earns) are not planned yet.
 **Magma** — two parts. The **order lane** (every 45 s, its own busy flag, never the main
 run's lock) accepts orders with a hold invoice, opens the channel, reports it, settles once
 Amboss confirms it and rejects at once what it can't serve — every step recorded in a
-per-order journal first. It decides on new orders only while Liquidity provision is on (a
+per-order journal first. A buyer it can't reach is not among those: the order stays open, the
+lane dials again every 3 minutes, says why it can't reach the buyer (LND's own answer for each
+address), and rejects without another dial once the approval deadline is 4 minutes off, the longest
+a dial and the gap to the next pass can take. A dial waits for LND's answer, 90 s in all: onions first
+(the quick way through a Tor proxy), each address with its share of the time, tried again if time
+is left. Once a pass has spent that long on dials the other orders wait for the next, the buyers not
+yet dialed first, so silent buyers don't hold up a reachable one (a buyer never dialed with its deadline
+close still gets its try). A paid order's dial is bound by its deadline too, and past it the payment
+is released rather than a channel opened. While an order is pending no offer's window or listing moves up. Before 0.8.7 a dial gave up after 1.5 s, so nearly every
+buyer not already connected was turned down within seconds
+(a 2,436 sat order on 2026-10-31, 5.3 s into its two-hour window). It decides on new orders only while Liquidity provision is on (a
 paused lane neither accepts nor rejects one); an order it accepted itself it carries to its
 end either way, and with selling on it also opens the channel of an order accepted by hand
 (Market → Orders says who opens a paid order's channel). A decision made by hand wins over the
@@ -682,7 +692,9 @@ while it is within max(50 sat, 20 %) of it. Beyond that it follows **at once whe
 them), **else once the market's base has held at its level for 1.5 h** (a level that moves
 beyond the tolerance starts the clock afresh, so a median one listing moves back and forth is
 never followed), and **never sooner than 6 h after its last base move** (the autopilot stamps
-each verified one). The clock also starts afresh when the offer's base moves by hand. Market →
+each verified one). **Within a day of a base move it follows only a level that has held for 12 h**,
+however far off (0 excepted): the median of a few offers jumps between two levels, and 284 ↔ 852 sat
+counted as "far off" both ways, moving the live offer's base every 6–9 h for days. The clock also starts afresh when the offer's base moves by hand. Market →
 Sell shows a pending move beside the base fee ("→ 284 at 17:14") and says why in its reasons.
 (Until 2026-10-25 every move waited a day: the live offer kept its 0 for 24 h.) A base that
 moves keeps the offer's price at the representative size √(min·max) — the rate makes up
@@ -720,12 +732,26 @@ offer is taken off the market again. A new offer is listed automatically only wh
 selling check is better than "not realistic". Optional auto-relist, and optional auto-close
 at a lease's end: the sale's own channel by its funding outpoint (txid and vout), never one a
 running lease is listed on, kept open when under a quarter of it is on our side (the rest is
-inbound worth keeping) or it earns at least what a sat of this node's month-old channels earns
+inbound worth keeping) or it routes at about what its capital earns sold again — on the coins a
+close would free, at least 5,000 ppm a year and what a sat of this node's month-old channels earns
+(the node's own average alone, ~340 ppm/yr live, let 56 sat a month keep a 2M channel off the market)
 — and kept when that can't be told (the forwarding history not read in full, no channel list):
 never closed on a guess — and closed at LND's economy rate, never above the maximum on-chain
 fee rate (`channelMaxFeeRate`), never without an estimate. Right before each close it asks
 again whether selling or auto-close was switched off, or the stage given up. Each reason a
 channel is kept is one line in the order's history (not one per run as its figures move). A 1% service fee applies to completed sales.
+
+**How much is listed (0.8.7).** With auto-size and auto-relist, a node's one offer lists what the
+capital cap (`sellMaxDeploySats`) and the wallet allow, and takes orders up to the max channel size.
+Before, it listed only its largest order: a 10M cap listed 5M, and 4.6M spendable with a 2M window
+listed 2M. Listed capital goes with sales (≤ 5M: 2 of 33 offers sold; 5–50M: 4 of 10, review
+2026-10-17 — a correlation). What the wallet limits moves in steps of 500,000 sat, a step counting
+once it is cleared by 50,000 sat, and the window's max stays that far under the limit, so the
+wallet's small moves don't rewrite the offer; a shortage cuts to the step below, never under the
+largest order it takes. With auto-relist off what a sale took stays out, and with several offers
+they share the capital as they are set. A size floor the mempool raised stays up for 6 h (the engine
+prices the window that really stands), so fees hovering around a step don't move it all day. The
+Magma decision says why an offer was written.
 
 **Never an order below cost (review 2026-10-25).** The order lane turns down an order that
 pays less than opening and closing its channel costs on chain at today's fee rate (its

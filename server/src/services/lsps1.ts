@@ -28,7 +28,7 @@ import { getMagmaRecommendations, MAGMA_V2_DEFAULTS } from "./magmaRecommend.js"
 import { onchainCosts } from "./nodeEconomics.js";
 import { saleFeeConfig, type ServiceFeeLedger } from "./serviceFee.js";
 import { checkPeerListing, couldNotConnect, ensureConnected, fundChannel, isPendingChannelsLimit, isPreBroadcastRefusal, opensBlocked } from "./channelOps.js";
-import { HODL_CANCEL_MARGIN_BLOCKS, cancelHodl, createHodl, heldUntilHeightOf, newHodlSecret, settleHodl } from "./hodl.js";
+import { INVOICE_NOT_FOUND, HODL_CANCEL_MARGIN_BLOCKS, cancelHodl, createHodl, heldUntilHeightOf, newHodlSecret, settleHodl } from "./hodl.js";
 import {
   CapitalLedger,
   channelsWith,
@@ -229,7 +229,7 @@ function isMissingInvoice(err: unknown): boolean {
   } catch {
     // circular: the detail alone
   }
-  return /unable to locate invoice|InvoiceNotFound/i.test(text);
+  return INVOICE_NOT_FOUND.test(text);
 }
 
 // ── orders ────────────────────────────────────────────────────────────────────

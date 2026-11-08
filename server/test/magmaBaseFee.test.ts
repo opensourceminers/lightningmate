@@ -21,6 +21,8 @@ import { sanitizeBaseMoves } from "../src/services/autopilot.js";
 import {
   BASE_FEE_FAR_FACTOR,
   BASE_FEE_MOVE_GAP_MS,
+  BASE_FEE_RESETTLE_MS,
+  BASE_FEE_RESETTLE_WINDOW_MS,
   BASE_FEE_STABLE_MS,
   BASE_FEE_TOLERANCE,
   baseFeeFollow,
@@ -246,7 +248,7 @@ test("a market base that moves to another level while it differs starts the 1.5 
   assert.equal(offer.baseFeeSats, 380);
 });
 
-test("at most one base move per 6 h: after one, the next difference — even a far one — waits until 6 h after it, and the reason says so", async (t) => {
+test("a base that moved within the last day follows only a level that has held for 12 h — even a far one, or it would jump with the median of a few offers", async (t) => {
   quiet(t);
   const s = pricedMarket(t);
   const { autopilot, magma, market } = s;
@@ -259,16 +261,24 @@ test("at most one base move per 6 h: after one, the next difference — even a f
   // The market moves far (to 1,500 sat: over 2 × 568).
   for (let i = 0; i < 20; i++) market.addOffer({ totalSats: 2_000_000, minSats: 1_000_000, maxSats: 2_000_000, feeRatePpm: 3000, baseFeeSats: 1500, sellerScore: 50 });
   await autopilot.runOnce();
-  assert.equal(offer.baseFeeSats, 568, "within 6 h of the last move: waits");
+  assert.equal(offer.baseFeeSats, 568, "within a day of the last move: waits");
   const rec = await recOf(s, offer.id);
-  assert.equal(rec.baseFeeFollowsAt, new Date(Date.parse(movedAt) + BASE_FEE_MOVE_GAP_MS).toISOString());
-  assert.ok(rec.reasons.some((r) => r.endsWith("UTC, 6 h after its last base change") && r.startsWith("comparable offers charge 1500 sat base (it has 568)")), rec.reasons.join(" | "));
+  assert.ok(rec.baseFeeFollowsAt, "says when");
+  const inHours = (Date.parse(rec.baseFeeFollowsAt) - Date.now()) / 3_600_000;
+  assert.ok(inHours > 11.9 && inHours <= 12, `held for 12 h: ${inHours}`);
+  assert.ok(rec.reasons.some((r) => r.endsWith("once that has held for 12 h: it changed within the last day") && r.startsWith("comparable offers charge")), JSON.stringify(rec.reasons));
+  // Six hours on, and the market's level has only held that long: still waits.
   movedAgo(s, offer.id, 6.1);
+  differedFor(s, offer.id, 6);
   await autopilot.runOnce();
-  assert.equal(offer.baseFeeSats, 1500, "6 h later: followed");
+  assert.equal(offer.baseFeeSats, 568, "the gap is over, the level hasn't held");
+  differedFor(s, offer.id, 12.1);
+  movedAgo(s, offer.id, 12.2);
+  await autopilot.runOnce();
+  assert.equal(offer.baseFeeSats, 1500, "held for 12 h: followed");
 });
 
-test("baseFeeFollow, the rule itself: far off (under ½ × or over 2 ×, 0 among them) at once; else after 1.5 h at the market's level; never sooner than 6 h after the last move", () => {
+test("baseFeeFollow, the rule itself: far off (under ½ × or over 2 ×, 0 among them) at once; else after 1.5 h at the market's level; never sooner than 6 h after the last move; within a day of one only a level that held 12 h", () => {
   const now = Date.parse("2026-10-25T12:00:00.000Z");
   const ago = (h: number) => new Date(now - h * 3_600_000).toISOString();
   assert.equal(BASE_FEE_FAR_FACTOR, 2);
@@ -277,9 +287,21 @@ test("baseFeeFollow, the rule itself: far off (under ½ × or over 2 ×, 0 among
   assert.deepEqual(baseFeeFollow(200, 284, undefined, now), { at: now + BASE_FEE_STABLE_MS, why: "settling" }, "first seen now");
   assert.deepEqual(baseFeeFollow(200, 284, { since: ago(1) }, now), { at: now + 0.5 * 3_600_000, why: "settling" });
   assert.deepEqual(baseFeeFollow(200, 284, { since: ago(2) }, now), { at: null, why: "stable" });
-  assert.deepEqual(baseFeeFollow(200, 284, { since: ago(2), movedAt: ago(5) }, now), { at: now + 3_600_000, why: "gap" });
-  assert.deepEqual(baseFeeFollow(0, 284, { movedAt: ago(1) }, now), { at: now + 5 * 3_600_000, why: "gap" }, "far, but within 6 h of a move");
-  assert.deepEqual(baseFeeFollow(200, 284, { since: ago(0.5), movedAt: ago(5.9) }, now), { at: now + 3_600_000, why: "settling" }, "the later of the two");
+  assert.deepEqual(baseFeeFollow(200, 284, { since: ago(2), movedAt: ago(5) }, now), { at: now + 10 * 3_600_000, why: "resettling" }, "moved within the day: the level must hold 12 h");
+  assert.deepEqual(baseFeeFollow(0, 284, { movedAt: ago(1) }, now), { at: now + 5 * 3_600_000, why: "gap" }, "0 stays far off, within the 6 h gap");
+  assert.deepEqual(baseFeeFollow(0, 284, { movedAt: ago(7) }, now), { at: null, why: "far" }, "0 after the gap: at once");
+  assert.deepEqual(baseFeeFollow(200, 284, { since: ago(0.5), movedAt: ago(5.9) }, now), { at: now + 11.5 * 3_600_000, why: "resettling" });
+  // 284 ↔ 852: "far off" both ways, the median of a few offers jumping.
+  assert.deepEqual(baseFeeFollow(284, 852, { since: ago(1), movedAt: ago(7) }, now), { at: now + 11 * 3_600_000, why: "resettling" });
+  assert.deepEqual(baseFeeFollow(852, 284, { since: ago(3), movedAt: ago(4) }, now), { at: now + 9 * 3_600_000, why: "resettling" });
+  assert.deepEqual(baseFeeFollow(284, 852, { since: ago(13), movedAt: ago(14) }, now), { at: null, why: "stable" }, "it held: followed");
+  // It says the time it really moves: the day's end, if that comes first.
+  assert.deepEqual(baseFeeFollow(284, 852, { since: ago(0), movedAt: ago(20) }, now), { at: now + 4 * 3_600_000, why: "resettling" });
+  assert.deepEqual(baseFeeFollow(200, 284, { since: ago(0), movedAt: ago(23.5) }, now), { at: now + BASE_FEE_STABLE_MS, why: "resettling" }, "not far off: the plain rule's 1.5 h then");
+  // A day after the last move the plain rule again.
+  assert.deepEqual(baseFeeFollow(284, 852, { since: ago(1), movedAt: ago(25) }, now), { at: null, why: "far" });
+  assert.deepEqual(baseFeeFollow(200, 284, { since: ago(2), movedAt: ago(25) }, now), { at: null, why: "stable" });
+  assert.deepEqual(baseFeeFollow(200, 284, { since: ago(0.5), movedAt: ago(25) }, now), { at: now + 3_600_000, why: "settling" });
 });
 
 test("a clock started against another base of the offer's doesn't count: an edit on amboss.tech after a day-long difference is not followed at once — the clock starts afresh", async (t) => {
@@ -384,6 +406,7 @@ test("a base going down to the market's is refused where the smallest order woul
 test("anti-churn: a base within max(50 sat, 20 % of the market's) stays the offer's — a median that wobbles never rewrites it; one further off goes to the market's", async (t) => {
   assert.deepEqual(BASE_FEE_TOLERANCE, { minSats: 50, share: 0.2 });
   assert.deepEqual([BASE_FEE_STABLE_MS, BASE_FEE_MOVE_GAP_MS], [90 * 60_000, 6 * 3_600_000]);
+  assert.deepEqual([BASE_FEE_RESETTLE_MS, BASE_FEE_RESETTLE_WINDOW_MS], [12 * 3_600_000, 24 * 3_600_000]);
   assert.equal(preferredBaseFeeSats(540, 568), 540);
   assert.equal(preferredBaseFeeSats(681, 568), 681, "113 sat off: within 20 % of 568 (113.6)");
   assert.equal(preferredBaseFeeSats(682, 568), 568);

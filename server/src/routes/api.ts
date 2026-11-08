@@ -640,7 +640,7 @@ export function createApiRouter(
           ...autopilot.onchainLockAlerts(),
           ...leasePromiseAlerts(autopilot.leasePromiseFailures()),
           ...autopilot.refillLockAlerts(),
-        ]),
+        ], (c) => autopilot.uptime.offlineInfo(c)?.hours ?? null),
       );
     }),
   );

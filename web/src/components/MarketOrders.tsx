@@ -257,7 +257,8 @@ export function MarketOrders() {
         Orders buyers placed on your offers. <strong>Accept</strong> creates a hold invoice for the fee,
         then — once the buyer has paid — <strong>Open channel</strong> funds the channel to the buyer; the
         payment settles only when Amboss confirms the channel. The Autopilot can do this automatically
-        (enable <strong>Liquidity provision</strong>); orders it can't serve are rejected right away.
+        (enable <strong>Liquidity provision</strong>); orders it can't serve are rejected right away, and a
+        buyer it can't reach is dialed again until shortly before the deadline.
       </div>
       {laneNote ? <p className="banner error">{laneNote}</p> : null}
       {error ? <p className="banner error">{error}</p> : null}

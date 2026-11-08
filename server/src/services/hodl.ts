@@ -107,15 +107,19 @@ export interface HodlStatus {
   expiresAt: string | null;
 }
 
+/** LND answers an unknown hash with "unable to locate invoice" — or, while it
+ *  has no invoice at all, "there are no existing invoices" (only a real LND
+ *  showed it: on regtest, a node's very first sale failed its accept). */
+export const INVOICE_NOT_FOUND = /unable to locate invoice|no existing invoices|InvoiceNotFound/i;
+
 /** LND's view of a HODL invoice. "missing" when LND has no such invoice. */
 export async function hodlStatus(lnd: AuthenticatedLnd, id: string): Promise<HodlStatus> {
   let inv: GetInvoiceResult;
   try {
     inv = await getInvoice({ lnd, id });
   } catch (err) {
-    // LND answers an unknown hash with "unable to locate invoice".
     const text = Array.isArray(err) ? JSON.stringify(err) : String(err);
-    if (/unable to locate invoice|InvoiceNotFound/i.test(text)) {
+    if (INVOICE_NOT_FOUND.test(text)) {
       return { state: "missing", request: null, mtokens: 0n, heldMtokens: 0n, heldUntilHeight: null, expiresAt: null };
     }
     throw err;

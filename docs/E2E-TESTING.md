@@ -2,7 +2,7 @@
 
 The automated suites (`npm test`) drive every money path against a fake LND
 and fake Amboss APIs — they never touch a real node, a real payment or a real
-Amboss account. Two paths depend on what only the real systems do, and have
+Amboss account. `server/e2e/` adds real LND nodes on regtest (next section). Two paths depend on what only the real systems do, and have
 **not been run end to end yet**:
 
 - **A. Selling on Amboss Magma** — the seller API on `magma.amboss.tech`, the
@@ -15,6 +15,32 @@ these paths (see [RELEASING.md](RELEASING.md)), and note the results in the
 release notes. Each step says what to look at; "Download diagnostics"
 (Settings) gives the order journal's view (`magma.recentOrders`), the lane's
 status and each area's last decision without exposing the Amboss key.
+
+---
+
+## Regtest: a whole sale against real LND nodes
+
+`server/e2e/` runs what the fakes can't show, on your machine, with no real money: a real
+`bitcoind` and three real LND nodes (seller, hub, buyer). The seller dials through a slow SOCKS
+proxy, as a node with Tor does. Only Amboss stays the suite's fake, its requests checked against
+the saved schema, so sections A and B below are still needed for what the live services answer.
+Two things only a real LND showed: `ConnectPeer` answers at once unless the dial is temporary (every
+buyer not already connected read as unreachable), and a node without any invoice yet answers "there
+are no existing invoices" (its first sale failed its accept).
+
+```sh
+# LND_DIR and BITCOIN_DIR: unpacked release folders (lnd, lncli / bitcoind, bitcoin-cli),
+# REGTEST_DIR: an empty folder with a short path. Use LND's version from your node.
+server/e2e/regtest.sh up
+cd server
+node --import tsx e2e/dial.ts   # how a dial behaves with circuits of 0–35 s and refused addresses
+server/e2e/regtest.sh up        # (fresh chain and nodes for the next one)
+node --import tsx e2e/sale.ts   # accept, held payment, channel, report, settle, close, and a refund
+server/e2e/regtest.sh down
+```
+
+Run it before a release that changes how LightningMate talks to LND on a money path. Each line
+says PASS or FAIL; the exit code says whether all passed.
 
 ---
 

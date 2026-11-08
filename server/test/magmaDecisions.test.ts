@@ -8,7 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { JsonStore } from "../src/store.js";
 import { magmaRefusalAlerts } from "../src/services/alerts.js";
-import { refusalKindOf } from "../src/services/magmaDesk.js";
+import { BUYER_DIALS, refusalKindOf } from "../src/services/magmaDesk.js";
 import { internalError } from "./helpers/magma.js";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
 import {
@@ -86,7 +86,7 @@ test("an accept whose preimage can't be saved fails closed: the order is rejecte
   assert.equal(capital.reservedSat(), 0, "nothing stays reserved");
 });
 
-test("orders outside the caps, or to an unreachable buyer, are rejected too — each with its reason", async (t) => {
+test("orders outside the caps are rejected too, each with its reason; a buyer that can't be reached is not", async (t) => {
   quiet(t);
   const unreachable = "02" + "ee".repeat(32);
   const { autopilot, node, magma, dir } = sellerSetup(t, { config: { sellMaxChannelSats: 4_000_000, sellMaxDeploySats: 5_000_000 } });
@@ -106,10 +106,243 @@ test("orders outside the caps, or to an unreachable buyer, are rejected too — 
   const over = magma.addSale({ buyerPubkey: BUYER, sizeSats: 3_500_000 });
   await autopilot.pollSellOrders();
   const reason = (id: string) => entryOnDisk(dir, id)?.reason ?? "";
-  for (const id of [big.id, far.id, over.id]) assert.equal(magma.sales.get(id)?.status, "SELLER_REJECTED", id);
+  for (const id of [big.id, over.id]) assert.equal(magma.sales.get(id)?.status, "SELLER_REJECTED", id);
   assert.match(reason(big.id), /above your max channel size/);
-  assert.match(reason(far.id), /unreachable/);
   assert.match(reason(over.id), /deploy cap reached/);
+  assert.equal(magma.sales.get(far.id)?.status, "WAITING_FOR_SELLER_APPROVAL", "the order still waits");
+  assert.match(entryOnDisk(dir, far.id)?.lastError ?? "", /the buyer's node couldn't be reached \(1\.2\.3\.4:9735: dial tcp: i\/o timeout\)/);
+});
+
+// Order cbebc117, 2026-10-31: a 2,436 sat sale turned down 5.3 s into a two-hour
+// window as "the buyer's node is unreachable", with the buyer reachable.
+test("a buyer that can't be reached: dialed again every few minutes, the lane says why, accepted once reached — rejected only with its deadline close", async (t) => {
+  quiet(t);
+  const away = "02" + "ee".repeat(32);
+  const { autopilot, node, magma, dir } = sellerSetup(t, { config: { sellMaxChannelSats: 4_000_000, sellMaxDeploySats: 5_000_000 } });
+  let reachable = false;
+  node.override("default.connectPeer", (a, cb) => {
+    const pk = (a.addr as { pubkey: string }).pubkey;
+    if (!reachable) return cb({ details: "dial tcp: i/o timeout" });
+    if (!node.peers.includes(pk)) node.peers.push(pk);
+    cb(null, {});
+  });
+  const sale = magma.addSale({ buyerPubkey: away, sizeSats: 1_000_000, timeout: IN_AN_HOUR() });
+  await autopilot.pollSellOrders();
+  assert.equal(magma.sales.get(sale.id)?.status, "WAITING_FOR_SELLER_APPROVAL");
+  assert.equal(magma.count("RejectOrder"), 0);
+  assert.equal(entryOnDisk(dir, sale.id)?.phase, "seen");
+  assert.match(autopilot.getState().magmaLane?.error ?? "", /^could not decide 1 order \(the buyer's node couldn't be reached \(1\.2\.3\.4:9735: dial tcp: i\/o timeout\)\)/);
+  const dials = node.callsTo("default.connectPeer").length;
+  const lines = entryOnDisk(dir, sale.id)?.events.length;
+
+  // The next passes (45 s apart): not dialed again yet, no new line on its record.
+  await autopilot.pollSellOrders();
+  assert.equal(node.callsTo("default.connectPeer").length, dials, "a dial over Tor would hold up the lane's other orders");
+  assert.equal(entryOnDisk(dir, sale.id)?.events.length, lines);
+  assert.match(autopilot.getState().magmaLane?.error ?? "", /couldn't be reached/, "the status still says so");
+
+  // Minutes later it dials again, and the buyer is back.
+  const memory = (autopilot.magma as unknown as { buyerDials: Map<string, { at: number; what: string }> }).buyerDials;
+  memory.get(sale.id)!.at = Date.now() - 4 * 60_000;
+  reachable = true;
+  await autopilot.pollSellOrders();
+  assert.ok(node.callsTo("default.connectPeer").length > dials);
+  assert.equal(magma.sales.get(sale.id)?.status, "WAITING_FOR_BUYER_PAYMENT", "accepted");
+  assert.equal(memory.has(sale.id), false);
+});
+
+test("silent buyers don't hold up a reachable one: a pass spends its dial budget, the next goes on with who hasn't been dialed", async (t) => {
+  quiet(t);
+  const was = { ...BUYER_DIALS };
+  BUYER_DIALS.passBudgetMs = 1;
+  t.after(() => Object.assign(BUYER_DIALS, was));
+  const dead = [1, 2, 3, 4].map((n) => "02" + String(n).repeat(2).padStart(2, "e").repeat(32).slice(0, 64));
+  const { autopilot, node, magma } = sellerSetup(t, { config: { sellMaxChannelSats: 4_000_000, sellMaxDeploySats: 50_000_000 } });
+  node.override("default.connectPeer", (a, cb) => {
+    const pk = (a.addr as { pubkey: string }).pubkey;
+    if (dead.includes(pk)) return void setTimeout(() => cb({ details: "dial tcp: i/o timeout" }), 3);
+    if (!node.peers.includes(pk)) node.peers.push(pk);
+    cb(null, {});
+  });
+  for (const pk of dead) magma.addSale({ buyerPubkey: pk, sizeSats: 1_000_000, timeout: IN_AN_HOUR() });
+  const reachable = magma.addSale({ buyerPubkey: BUYER, sizeSats: 1_000_000, timeout: IN_AN_HOUR() });
+  const dialedPerPass: number[] = [];
+  for (let pass = 0; pass < 5; pass++) {
+    const before = new Set(node.callsTo("default.connectPeer").map((c) => (c.addr as { pubkey: string }).pubkey)).size;
+    await autopilot.pollSellOrders();
+    dialedPerPass.push(new Set(node.callsTo("default.connectPeer").map((c) => (c.addr as { pubkey: string }).pubkey)).size - before);
+  }
+  assert.ok(Math.max(...dialedPerPass) <= 2, `one silent buyer per pass: ${dialedPerPass}`);
+  assert.equal(dialedPerPass.reduce((a, b) => a + b, 0), 5, "everyone had a turn");
+  assert.equal(magma.sales.get(reachable.id)?.status, "WAITING_FOR_BUYER_PAYMENT");
+  assert.equal(magma.count("RejectOrder"), 0);
+  // All the silent ones due again, and a new order arrives: never dialed, so it goes first.
+  const memory = (autopilot.magma as unknown as { buyerDials: Map<string, { at: number; what: string }> }).buyerDials;
+  for (const d of memory.values()) d.at = Date.now() - 4 * 60_000;
+  const another = "03" + "ab".repeat(32);
+  const late = magma.addSale({ buyerPubkey: another, sizeSats: 1_000_000, timeout: IN_AN_HOUR() });
+  await autopilot.pollSellOrders();
+  assert.equal(magma.sales.get(late.id)?.status, "WAITING_FOR_BUYER_PAYMENT", "not behind the silent ones");
+});
+
+test("the deadline close and the buyer silent: turned down now, without another dial that could outlast it; a reject that failed is sent again", async (t) => {
+  quiet(t);
+  const away = "02" + "ee".repeat(32);
+  const { autopilot, node, magma, dir } = sellerSetup(t, { config: { sellMaxChannelSats: 4_000_000, sellMaxDeploySats: 5_000_000 } });
+  node.override("default.connectPeer", (_a, cb) => cb({ details: "dial tcp: i/o timeout" }));
+  const sale = magma.addSale({ buyerPubkey: away, sizeSats: 1_000_000, timeout: IN_AN_HOUR() });
+  await autopilot.pollSellOrders();
+  const dials = node.callsTo("default.connectPeer").length;
+  // 3.5 minutes left, and a redial due.
+  const memory = (autopilot.magma as unknown as { buyerDials: Map<string, { at: number; what: string }> }).buyerDials;
+  memory.get(sale.id)!.at = Date.now() - 4 * 60_000;
+  sale.timeout = new Date(Date.now() + 3.5 * 60_000).toISOString();
+  magma.behave.RejectOrder = (n) => (n === 0 ? "throw" : "ok");
+  await autopilot.pollSellOrders();
+  assert.equal(node.callsTo("default.connectPeer").length, dials, "not dialed again");
+  assert.equal(magma.count("RejectOrder"), 1);
+  assert.equal(magma.sales.get(sale.id)?.status, "WAITING_FOR_SELLER_APPROVAL", "Amboss answered with an error");
+  assert.ok(memory.has(sale.id), "the record stays until the reject is confirmed");
+  await autopilot.pollSellOrders();
+  assert.equal(node.callsTo("default.connectPeer").length, dials, "the reject is sent again, not another dial");
+  assert.equal(magma.sales.get(sale.id)?.status, "SELLER_REJECTED");
+  assert.match(entryOnDisk(dir, sale.id)?.reason ?? "", /^could not decide on it in time: the buyer's node couldn't be reached/);
+  assert.equal(memory.has(sale.id), false);
+});
+
+test("the run history keeps one line for a buyer away, whatever LND says from dial to dial; the order's record has its words", async (t) => {
+  quiet(t);
+  const away = "02" + "ee".repeat(32);
+  const { autopilot, node, magma, dir } = sellerSetup(t, { config: { sellMaxChannelSats: 4_000_000, sellMaxDeploySats: 5_000_000 } });
+  let n = 0;
+  node.override("default.connectPeer", (_a, cb) => cb({ details: `socks connect tcp: circuit ${n++} failed` }));
+  const sale = magma.addSale({ buyerPubkey: away, sizeSats: 1_000_000, timeout: IN_AN_HOUR() });
+  const memory = (autopilot.magma as unknown as { buyerDials: Map<string, { at: number; what: string }> }).buyerDials;
+  for (let pass = 0; pass < 4; pass++) {
+    await autopilot.pollSellOrders();
+    memory.get(sale.id)!.at = Date.now() - 4 * 60_000;
+  }
+  const lines = autopilot.getState().history.filter((r) => r.sells.some((x) => x.orderId === sale.id));
+  assert.equal(lines.length, 1, JSON.stringify(lines).slice(0, 400));
+  assert.match(entryOnDisk(dir, sale.id)?.lastError ?? "", /circuit \d+ failed/);
+});
+
+test("selling switched off while the lane keeps dialing: the record says the order is the operator's, not 'couldn't be reached'", async (t) => {
+  quiet(t);
+  const away = "02" + "ee".repeat(32);
+  const { autopilot, node, magma, dir } = sellerSetup(t, { config: { sellMaxChannelSats: 4_000_000, sellMaxDeploySats: 5_000_000 } });
+  node.override("default.connectPeer", (_a, cb) => cb({ details: "dial tcp: i/o timeout" }));
+  const sale = magma.addSale({ buyerPubkey: away, sizeSats: 1_000_000, timeout: IN_AN_HOUR() });
+  await autopilot.pollSellOrders();
+  autopilot.setConfig({ ...autopilot.getState().config, sellEnabled: false });
+  await autopilot.pollSellOrders();
+  assert.equal(magma.sales.get(sale.id)?.status, "WAITING_FOR_SELLER_APPROVAL");
+  const entry = entryOnDisk(dir, sale.id);
+  assert.equal(entry?.lastError, undefined);
+  assert.equal(entry?.decision?.action, "skip");
+});
+
+test("a paid order whose buyer is away: dialed again after the gap too, not every pass", async (t) => {
+  quiet(t);
+  const { autopilot, node, magma, dir } = sellerSetup(t, { config: { sellMaxChannelSats: 4_000_000, sellMaxDeploySats: 5_000_000 } });
+  const sale = magma.addSale({ buyerPubkey: BUYER, sizeSats: 1_000_000, timeout: IN_AN_HOUR() });
+  await autopilot.pollSellOrders();
+  magma.buyerPays(sale.id, node);
+  node.peers = node.peers.filter((p) => p !== BUYER);
+  let reachable = false;
+  node.override("default.connectPeer", (a, cb) => {
+    if (!reachable) return cb({ details: "dial tcp: i/o timeout" });
+    node.peers.push((a.addr as { pubkey: string }).pubkey);
+    cb(null, {});
+  });
+  await autopilot.pollSellOrders();
+  const dials = node.callsTo("default.connectPeer").length;
+  assert.equal(entryOnDisk(dir, sale.id)?.phase, "held", "the payment stays held");
+  await autopilot.pollSellOrders();
+  assert.equal(node.callsTo("default.connectPeer").length, dials, "not every pass");
+  const memory = (autopilot.magma as unknown as { buyerDials: Map<string, { at: number; what: string }> }).buyerDials;
+  memory.get(sale.id)!.at = Date.now() - 4 * 60_000;
+  reachable = true;
+  await autopilot.pollSellOrders();
+  assert.ok(node.callsTo("default.connectPeer").length > dials);
+  assert.equal(node.pending.length, 1, "the channel is opened");
+  assert.equal(memory.has(sale.id), false);
+});
+
+test("a paid order: a dial that outlasts the deadline opens nothing — the payment goes back; no free channel for an order Amboss has ended", async (t) => {
+  quiet(t);
+  const { autopilot, node, magma, dir } = sellerSetup(t, { config: { sellMaxChannelSats: 4_000_000, sellMaxDeploySats: 5_000_000 } });
+  const sale = magma.addSale({ buyerPubkey: BUYER, sizeSats: 1_000_000, timeout: IN_AN_HOUR() });
+  await autopilot.pollSellOrders();
+  magma.buyerPays(sale.id, node);
+  node.peers = node.peers.filter((p) => p !== BUYER);
+  node.override("default.connectPeer", (a, cb) =>
+    void setTimeout(() => {
+      node.peers.push((a.addr as { pubkey: string }).pubkey);
+      cb(null, {});
+    }, 1_500),
+  );
+  sale.timeout = new Date(Date.now() + 500).toISOString();
+  await autopilot.pollSellOrders();
+  assert.equal(node.pending.length, 0, "no channel");
+  assert.equal(entryOnDisk(dir, sale.id)?.phase, "cancelled");
+  assert.match(entryOnDisk(dir, sale.id)?.reason ?? "", /no answer within 1 s/, "the dial's budget ends with the deadline, and the record says why");
+});
+
+test("a paid order's buyer away: one counted history line whatever LND says, and the lane's status says so", async (t) => {
+  quiet(t);
+  const { autopilot, node, magma, dir } = sellerSetup(t, { config: { sellMaxChannelSats: 4_000_000, sellMaxDeploySats: 5_000_000 } });
+  const sale = magma.addSale({ buyerPubkey: BUYER, sizeSats: 1_000_000, timeout: IN_AN_HOUR() });
+  await autopilot.pollSellOrders();
+  magma.buyerPays(sale.id, node);
+  node.peers = node.peers.filter((p) => p !== BUYER);
+  let n = 0;
+  node.override("default.connectPeer", (_a, cb) => cb({ details: `socks connect tcp: circuit ${n++} failed` }));
+  const memory = (autopilot.magma as unknown as { buyerDials: Map<string, { at: number; what: string }> }).buyerDials;
+  const before = autopilot.getState().history.length;
+  for (let pass = 0; pass < 4; pass++) {
+    await autopilot.pollSellOrders();
+    if (pass === 1) memory.get(sale.id)!.at = Date.now() - 4 * 60_000;
+  }
+  assert.equal(autopilot.getState().history.length - before, 1, JSON.stringify(autopilot.getState().history.slice(0, 3)).slice(0, 500));
+  assert.match(autopilot.getState().magmaLane?.error ?? "", /^can't reach the buyer of 1 paid order yet \(couldn't connect/);
+  assert.match(entryOnDisk(dir, sale.id)?.lastError ?? "", /circuit \d+ failed/);
+});
+
+test("deadlines close and the budget spent: a buyer never dialed still gets its try — the silent one doesn't cost the reachable one its sale", async (t) => {
+  quiet(t);
+  const was = { ...BUYER_DIALS };
+  BUYER_DIALS.passBudgetMs = 1;
+  t.after(() => Object.assign(BUYER_DIALS, was));
+  const away = "02" + "ee".repeat(32);
+  const { autopilot, node, magma } = sellerSetup(t, { config: { sellMaxChannelSats: 4_000_000, sellMaxDeploySats: 5_000_000 } });
+  node.override("default.connectPeer", (a, cb) => {
+    const pk = (a.addr as { pubkey: string }).pubkey;
+    if (pk === away) return void setTimeout(() => cb({ details: "dial tcp: i/o timeout" }), 3);
+    if (!node.peers.includes(pk)) node.peers.push(pk);
+    cb(null, {});
+  });
+  const silent = magma.addSale({ buyerPubkey: away, sizeSats: 1_000_000, timeout: new Date(Date.now() + 2.9 * 60_000).toISOString() });
+  const reachable = magma.addSale({ buyerPubkey: BUYER, sizeSats: 1_000_000, timeout: new Date(Date.now() + 3 * 60_000).toISOString() });
+  await autopilot.pollSellOrders();
+  assert.equal(magma.sales.get(silent.id)?.status, "SELLER_REJECTED");
+  assert.equal(magma.sales.get(reachable.id)?.status, "WAITING_FOR_BUYER_PAYMENT", "dialed, reached, accepted");
+});
+
+test("a buyer that stays away is rejected shortly before the deadline, with what LND said — never left to time out", async (t) => {
+  quiet(t);
+  const away = "02" + "ee".repeat(32);
+  const { autopilot, node, magma, dir } = sellerSetup(t, { config: { sellMaxChannelSats: 4_000_000, sellMaxDeploySats: 5_000_000 } });
+  node.override("default.connectPeer", (_a, cb) => cb({ details: "dial tcp: i/o timeout" }));
+  const sale = magma.addSale({ buyerPubkey: away, sizeSats: 1_000_000, timeout: IN_AN_HOUR() });
+  await autopilot.pollSellOrders();
+  assert.equal(magma.sales.get(sale.id)?.status, "WAITING_FOR_SELLER_APPROVAL");
+  // The clock runs down between two dials: the lane doesn't wait for the next.
+  sale.timeout = new Date(Date.now() + 3 * 60_000).toISOString();
+  await autopilot.pollSellOrders();
+  assert.equal(magma.sales.get(sale.id)?.status, "SELLER_REJECTED");
+  assert.match(entryOnDisk(dir, sale.id)?.reason ?? "", /^could not decide on it in time: the buyer's node couldn't be reached \(1\.2\.3\.4:9735: dial tcp: i\/o timeout\) — rejected rather than left to time out$/);
+  assert.equal((autopilot.magma as unknown as { buyerDials: Map<string, unknown> }).buyerDials.has(sale.id), false, "forgotten");
 });
 
 // Review of P1b: the alert for every turned-down order advised "raise the caps
@@ -126,7 +359,7 @@ test("each refusal records what it was about, and only a cap or the wallet gets 
     cb(null, {});
   });
   const big = magma.addSale({ buyerPubkey: BUYER, sizeSats: 4_500_000 });
-  const far = magma.addSale({ buyerPubkey: unreachable, sizeSats: 1_000_000 });
+  const far = magma.addSale({ buyerPubkey: unreachable, sizeSats: 1_000_000, timeout: new Date(Date.now() + 60_000).toISOString() });
   const asset = magma.addSale({ buyerPubkey: BUYER, assetType: "TAPROOT_ASSET" });
   await autopilot.pollSellOrders();
   // The wallet short: the next order can't be funded.

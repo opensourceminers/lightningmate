@@ -347,7 +347,7 @@ test("an unreachable peer backs off 1 day, then 7, then 30 — and its repeated 
   // The next run (a minute later): not dialed — and no failed run either.
   const second = await s.autopilot.runOnce();
   assert.deepEqual(second.channels, []);
-  assert.equal(s.node.callsTo("default.connectPeer").length, 1, "not asked again inside its back-off");
+  assert.equal(s.node.callsTo("default.connectPeer").length, 2, "its address tried twice in the first run, not asked again inside its back-off");
   assert.match(s.autopilot.getState().decisions.channels?.text ?? "", /^no channel opened — gone: refused an open \(couldn't connect to .*\) — tried again in ~\d+ h$/);
 
   // After the day: tried, refused again → 7 days; then → 30 days.

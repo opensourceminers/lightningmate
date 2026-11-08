@@ -149,6 +149,39 @@ test("a finished lease's channel that routes well — it earned at least what a 
   assert.equal(s.closes().length, 1);
 });
 
+test("the node's own low average is no bar: a sold channel that earned above it, but under what its capital earns sold again, closes (56 sat a month kept a 2M channel out of the market)", async (t) => {
+  quiet(t);
+  const s = closer(t);
+  const txid = "cd".repeat(32);
+  s.node.channels.push({ id: "850000x5x0", partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 1_500_000, transactionId: txid, transactionVout: 0 });
+  // ~340 ppm/yr on its 2M, and the idle channel beside it halves the node's average.
+  s.node.channels.push({ id: "850000x6x0", partnerPublicKey: OTHER, capacity: 2_000_000, localBalance: 1_000_000, transactionId: "ef".repeat(32), transactionVout: 0 });
+  forwardsEarning(s.node, "850000x5x0", 56);
+  s.magma.addSale({ buyerPubkey: BUYER, status: "CHANNEL_MONITORING_FINISHED", transactionId: `${txid}:0` });
+  await s.autopilot.runOnce();
+  assert.equal(s.closes().length, 1, "closed: the capital goes back on the market");
+});
+
+test("what a sold channel earns is measured on the coins a close frees, and a close passes on the most it may pay", async (t) => {
+  quiet(t);
+  const s = closer(t);
+  const txid = "cd".repeat(32);
+  // 400 sat in 30 days: 2,433 ppm/yr on its 2M, 8,111 on the 600k a close frees.
+  s.node.channels.push({ id: "850000x5x0", partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 600_000, transactionId: txid, transactionVout: 0 });
+  forwardsEarning(s.node, "850000x5x0", 400);
+  s.magma.addSale({ buyerPubkey: BUYER, status: "CHANNEL_MONITORING_FINISHED", transactionId: `${txid}:0` });
+  await s.autopilot.runOnce();
+  assert.deepEqual(s.closes(), [], "selling 600k again wouldn't earn that");
+
+  const other = closer(t);
+  const id2 = "ce".repeat(32);
+  other.node.channels.push({ id: "850000x7x0", partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 1_990_000, transactionId: id2, transactionVout: 0 });
+  other.magma.addSale({ buyerPubkey: BUYER, status: "CHANNEL_MONITORING_FINISHED", transactionId: `${id2}:0` });
+  await other.autopilot.runOnce();
+  const [call] = other.node.callsTo("default.closeChannel");
+  assert.equal(Number(call.max_fee_per_vbyte), other.autopilot.getState().config.channelMaxFeeRate, "LND would otherwise negotiate up to 3× the rate");
+});
+
 test("a finished lease's channel closes at LND's economy rate, never above the operator's maximum for on-chain fees — and not without an estimate", async (t) => {
   quiet(t);
   // No estimate from LND: not closed (before: at LND's 6-block rate, whatever it was).

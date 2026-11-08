@@ -156,6 +156,21 @@ const REJECT_MARGIN_MS = 2 * 60_000;
  *  match is not missed). It does not stay 0 "until settled": the order of
  *  2026-10-23 read 0 in every fee part from its first read to its end. */
 const ZERO_FEE_GRACE_MS = 60_000;
+/** Dialing buyers (over Tor a dial can take a minute and a half), the lane being
+ *  one walk through its orders. Mutable for tests.
+ *  - redialMs: a buyer that couldn't be reached is dialed again after this long;
+ *  - passBudgetMs: once a pass has spent this long dialing, the other orders wait
+ *    for the next: four silent buyers outlasted the five-minute pass, every pass,
+ *    and a reachable buyer's order behind them waited an hour and a half;
+ *  - rejectMarginMs: a buyer that hasn't answered is turned down this long before
+ *    the approval deadline, without another dial: dial plus pass gap, or the
+ *    order times out on us. */
+export const BUYER_DIALS = { redialMs: 3 * 60_000, passBudgetMs: 90_000, rejectMarginMs: 4 * 60_000 };
+/** What the run history says of a buyer away: one counted line. The order's
+ *  record and the lane's status carry LND's words, which vary from dial to dial. */
+const BUYER_AWAY = "the buyer's node couldn't be reached yet — trying again";
+/** A dial ends this long before the order's deadline (dialBudgetFor). */
+const DIAL_DEADLINE_SLACK_MS = 30_000;
 /** An invoice billed from an order's fee parts (fees.seller read 0) must be
  *  an offer's price for the order's size to within this many sats. */
 const PARTS_MATCH_SATS = 1;
@@ -510,6 +525,10 @@ interface LanePass {
   /** What each order the lane could not decide on this pass ran into — a
    *  check before the accept that could not be made — for the lane's status. */
   undecided: string[];
+  /** How long this pass has spent dialing buyers (BUYER_DIALS.passBudgetMs). */
+  dialSpentMs: number;
+  /** Paid orders whose buyer couldn't be reached yet, for the lane's status. */
+  buyersAway: string[];
   /** Amboss's listing of your sold capital (the deploy cap's share) failed in
    *  this pass: not asked again for every further new order (each time up to
    *  its deadline) — those orders wait for the next pass, or are rejected. */
@@ -552,6 +571,10 @@ const unreadText = (unread: string[]): string =>
  *  before the accept could not be made; the next pass tries again). */
 const undecidedText = (undecided: string[]): string =>
   `could not decide ${undecided.length === 1 ? "1 order" : `${undecided.length} orders`} (${undecided[0]})`;
+
+/** Paid orders whose channel waits for their buyer to be reached. */
+const buyersAwayText = (away: string[]): string =>
+  `can't reach the buyer of ${away.length === 1 ? "1 paid order" : `${away.length} paid orders`} yet (${away[0]})`;
 
 /** Orders a pass left alone: a given-up pass still waits on a step of theirs. */
 const stuckText = (ids: string[]): string =>
@@ -616,6 +639,9 @@ export class MagmaDesk {
   /** Funding outpoints ("txid:vout") of finished leases, learned once per
    *  process. */
   private readonly finishedTxids = new Map<string, string | null>();
+  /** Orders whose buyer couldn't be reached: when it was last dialed, and why
+   *  that failed (decide). A restart simply dials again. */
+  private readonly buyerDials = new Map<string, { at: number; what: string }>();
   /** A finished lease's channel kept open, and why (said once per process). */
   private readonly closeKept = new Map<string, string>();
   /** Orders whose last read Amboss refused or failed, whatever the failure
@@ -942,6 +968,8 @@ export class MagmaDesk {
       unread: [],
       outages: 0,
       undecided: [],
+      dialSpentMs: 0,
+      buyersAway: [],
       deployedFailure: null,
       answered: false,
       own: "",
@@ -1012,6 +1040,7 @@ export class MagmaDesk {
       const leftOver = [
         pass.unread.length > 0 ? unreadText(pass.unread) : null,
         pass.undecided.length > 0 ? undecidedText(pass.undecided) : null,
+        pass.buyersAway.length > 0 ? buyersAwayText(pass.buyersAway) : null,
         stuck.length > 0 ? stuckText(stuck) : null,
       ].filter((t): t is string => t !== null);
       const problem: { text: string; retrying: boolean } | null = pass.lndOnly
@@ -1062,14 +1091,33 @@ export class MagmaDesk {
       const e = this.journal.get(id);
       return e !== undefined && e.phase !== "seen";
     };
+    const timeouts = new Map(fresh.map((o) => [o.id, o.timeout]));
+    const deadlineOf = (id: string): number => {
+      const at = timeouts.get(id) ?? this.journal.get(id)?.timeout ?? null;
+      return at === null ? Infinity : Date.parse(at);
+    };
+    // A silent buyer's order with its deadline close: its reject needs no dial,
+    // and comes before whatever may spend the pass dialing.
+    const rejectDue = (id: string): boolean =>
+      !atStake(id) && this.buyerDials.has(id) && deadlineOf(id) - Date.now() <= BUYER_DIALS.rejectMarginMs;
     return ids
-      .map((id, i) => ({ id, i, stake: atStake(id), tried: this.unreadOrders.get(id) }))
+      .map((id, i) => ({ id, i, stake: atStake(id), due: rejectDue(id), tried: this.unreadOrders.get(id) }))
       .sort((a, b) => {
         const unreadA = a.tried !== undefined;
         const unreadB = b.tried !== undefined;
         if (unreadA !== unreadB) return unreadA ? 1 : -1;
         if (unreadA && unreadB && a.tried !== b.tried) return (a.tried as number) - (b.tried as number);
+        if (a.due !== b.due) return a.due ? -1 : 1;
         if (a.stake !== b.stake) return a.stake ? -1 : 1;
+        // Never dialed first, then the one dialed longest ago: a reachable
+        // buyer's order isn't kept behind the silent ones. Never dialed: the
+        // earliest deadline first.
+        const dialedA = this.buyerDials.get(a.id)?.at ?? 0;
+        const dialedB = this.buyerDials.get(b.id)?.at ?? 0;
+        if (dialedA !== dialedB) return dialedA - dialedB;
+        const leftA = deadlineOf(a.id);
+        const leftB = deadlineOf(b.id);
+        if (dialedA === 0 && leftA !== leftB) return leftA - leftB;
         return a.i - b.i;
       })
       .map((x) => x.id);
@@ -1221,6 +1269,12 @@ export class MagmaDesk {
           // of ours was tied to, until it timed out on the operator.
           else if ((!entry || entry.phase === "seen") && (cfg.sellEnabled || entry?.via === "manual" || entry?.decision?.action === "accept")) {
             out.push(...(await this.decide(order, pass)));
+          } else if (entry?.phase === "seen" && this.buyerDials.delete(id)) {
+            // Selling went off while the lane kept dialing its buyer: the
+            // order's record says it is the operator's now, not "couldn't be
+            // reached" until it times out.
+            entry.lastError = undefined;
+            out.push(this.skip(entry, SELLING_OFF_SKIP));
           }
           break;
         case "WAITING_FOR_BUYER_PAYMENT":
@@ -1238,7 +1292,7 @@ export class MagmaDesk {
             }
           }
           if (!TERMINAL_PHASES.has(entry.phase)) {
-            out.push(...(await this.fulfil(entry, order, { auto: entry.via === "autopilot" || cfg.sellEnabled })));
+            out.push(...(await this.fulfil(entry, order, { auto: entry.via === "autopilot" || cfg.sellEnabled }, pass)));
           }
           break;
         default:
@@ -1685,6 +1739,20 @@ export class MagmaDesk {
    * an order sat "seen" with Amboss's bare "Internal server error" on record,
    * under a lane reporting "ok", until it timed out on us.
    */
+  /** An order waiting for its buyer to be reached (or its turn to dial): the
+   *  next passes come back to it. */
+  private buyerAway(entry: MagmaJournalEntry, what: string, pass: LanePass): MagmaSellAction[] {
+    pass.undecided.push(what);
+    return [{ orderId: entry.orderId, action: "error", sizeSats: entry.sizeSats, ok: false, error: BUYER_AWAY }];
+  }
+
+  /** How long a dial for this order may take: past its approval deadline an
+   *  answer is of no use, and a reject must still go out. */
+  private dialBudgetFor(order: SaleOrder): number | undefined {
+    if (order.timeout === null) return undefined;
+    return Math.max(1_000, Date.parse(order.timeout) - Date.now() - DIAL_DEADLINE_SLACK_MS);
+  }
+
   private async undecided(entry: MagmaJournalEntry, order: SaleOrder, what: string, pass: LanePass): Promise<MagmaSellAction[]> {
     const rejected = await this.rejectUndecided(entry, order, what, pass);
     if (rejected) return rejected;
@@ -1703,8 +1771,9 @@ export class MagmaDesk {
     order: SaleOrder,
     what: string,
     pass: LanePass,
+    marginMs = REJECT_MARGIN_MS,
   ): Promise<MagmaSellAction[] | null> {
-    if (!this.nearDeadline(order, REJECT_MARGIN_MS) || this.deadlinePassed(order)) return null;
+    if (!this.nearDeadline(order, marginMs) || this.deadlinePassed(order)) return null;
     const out = await this.rejectOrder(entry, `could not decide on it in time: ${what} — rejected rather than left to time out`);
     if (phaseOf(entry) !== "rejected") pass.undecided.push(what);
     return out;
@@ -1810,7 +1879,22 @@ export class MagmaDesk {
     // The check is awaited (LND's wallet, maybe Amboss's listing).
     if (sellingOff()) return [this.skip(entry, SELLING_OFF_SKIP)];
     if (lacking) return this.rejectOrder(entry, lacking.reason, lacking.kind);
-    const reached = await this.connectBuyer(order);
+    const dialed = this.buyerDials.get(order.id);
+    if (dialed) {
+      // The deadline close and the buyer silent: turned down now, without
+      // another dial (one that fails also says so again before the next pass).
+      const rejected = await this.rejectUndecided(entry, order, dialed.what, pass, BUYER_DIALS.rejectMarginMs);
+      if (rejected) return rejected;
+      if (Date.now() - dialed.at < BUYER_DIALS.redialMs) return this.buyerAway(entry, dialed.what, pass);
+    }
+    // Its turn in a later pass: unless its deadline is close and it has never
+    // been dialed. It isn't turned down without one try.
+    if (pass.dialSpentMs >= BUYER_DIALS.passBudgetMs && (dialed || !this.nearDeadline(order, BUYER_DIALS.rejectMarginMs))) {
+      return this.buyerAway(entry, dialed?.what ?? "other orders' buyers were dialed first", pass);
+    }
+    const dialStart = Date.now();
+    const reached = await this.connectBuyer(order, this.dialBudgetFor(order));
+    pass.dialSpentMs += Date.now() - dialStart;
     // Dialing the buyer can take a minute and a half over Tor: Liquidity
     // provision may have been switched off — or all automation paused —
     // meanwhile (review of P7: the lane accepted on the switch it read when
@@ -1828,7 +1912,20 @@ export class MagmaDesk {
       pass.problem ??= reached.blocked;
       return this.rejectOrder(entry, `this node can't check its connection to the buyer: ${reached.blocked}`);
     }
-    if (!reached.ok) return this.rejectOrder(entry, "the buyer's node is unreachable");
+    if (!reached.ok) {
+      // Not turned down for one failed dial: Tor circuits fail at random, and
+      // the approval window is hours long (order cbebc117, 2026-10-31: 2,436
+      // sat rejected 5.3 s in, with a reachable buyer). Dialed again until the
+      // deadline is close: then it is rejected, never left to time out. The
+      // lane says why, and the order's record keeps LND's answer.
+      const what = `the buyer's node couldn't be reached${reached.why ? ` (${reached.why})` : ""}`;
+      this.buyerDials.set(order.id, { at: Date.now(), what });
+      const rejected = await this.rejectUndecided(entry, order, what, pass, BUYER_DIALS.rejectMarginMs);
+      if (rejected) return rejected;
+      this.noteError(entry, what);
+      return this.buyerAway(entry, what, pass);
+    }
+    this.buyerDials.delete(order.id);
     if (this.halted()) return [this.skip(entry, this.stopping ? "shutting down" : "the lane's pass was given up")];
     return this.acceptOrder(entry, order, fee, "autopilot", pass);
   }
@@ -2249,6 +2346,9 @@ export class MagmaDesk {
       this.noteError(entry, "Amboss refused the reject");
       return [{ ...base, ok: false, error: `${reason} — Amboss refused the reject` }];
     }
+    // (Kept until it is confirmed: a reject that failed is sent again, not
+    // turned into another dial with the deadline running out.)
+    this.buyerDials.delete(entry.orderId);
     entry.reason = reason;
     entry.refusalKind = kind;
     this.toPhase(entry, "rejected", `rejected: ${reason}`);
@@ -2282,6 +2382,7 @@ export class MagmaDesk {
     entry: MagmaJournalEntry,
     order: SaleOrderDetail,
     how: { auto: boolean; manual?: boolean },
+    pass?: LanePass | null,
   ): Promise<MagmaSellAction[]> {
     const out: MagmaSellAction[] = [];
     if (entry.phase === "accepting" || entry.phase === "accepted") {
@@ -2303,7 +2404,7 @@ export class MagmaDesk {
         this.journal.note(entry);
         return out;
       }
-      out.push(...(await this.openFor(entry, order)));
+      out.push(...(await this.openFor(entry, order, pass)));
     }
     if (entry.phase === "funded") {
       out.push(...(await this.report(entry)));
@@ -2322,16 +2423,36 @@ export class MagmaDesk {
    * the mutex: the payment is checked once more, then the capital; the intent
    * is saved before the open and the outpoint right after.
    */
-  private async openFor(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<MagmaSellAction[]> {
+  private async openFor(entry: MagmaJournalEntry, order: SaleOrderDetail, pass?: LanePass | null): Promise<MagmaSellAction[]> {
     const base = { orderId: entry.orderId, action: "open" as const, sizeSats: entry.sizeSats };
     const unfit = await this.cannotOpen(entry, order);
     if (unfit) return unfit;
-    const reached = await this.connectBuyer(order);
+    // In the lane's walk a buyer away is dialed as for a new order; a click dials now.
+    if (pass) {
+      const dialed = this.buyerDials.get(entry.orderId);
+      if ((dialed && Date.now() - dialed.at < BUYER_DIALS.redialMs) || pass.dialSpentMs >= BUYER_DIALS.passBudgetMs) {
+        pass.buyersAway.push(dialed?.what ?? "other orders' buyers were dialed first");
+        return [{ ...base, ok: false, error: BUYER_AWAY }];
+      }
+    }
+    const dialStart = Date.now();
+    const reached = await this.connectBuyer(order, this.dialBudgetFor(order));
+    if (pass) pass.dialSpentMs += Date.now() - dialStart;
+    if (reached.ok) this.buyerDials.delete(entry.orderId);
+    // (Not a macaroon's want of peers:read: nothing to wait out once it's fixed.)
+    else if (!reached.blocked) this.buyerDials.set(entry.orderId, { at: Date.now(), what: couldNotConnect(entry.buyerPubkey, reached.why) });
     // A macaroon LND won't list peers to blocks every open — the operator's
     // to fix (and restart): the payment stays held while there is time, as
     // for a buyer that is away, and is released with this reason after.
     if (!reached.ok) {
-      return reached.blocked ? this.openFailed(entry, order, reached.blocked, true) : this.openFailed(entry, order, couldNotConnect(entry.buyerPubkey));
+      if (reached.blocked) return this.openFailed(entry, order, reached.blocked, true);
+      const what = couldNotConnect(entry.buyerPubkey, reached.why);
+      const failed = await this.openFailed(entry, order, what);
+      // Still trying: one counted line in the run history (LND's words vary from
+      // dial to dial, and are on the order's record), and the lane's status says so.
+      if (phaseOf(entry) !== "held") return failed;
+      if (pass) pass.buyersAway.push(what);
+      return failed.map((a) => ({ ...a, error: BUYER_AWAY }));
     }
     if (this.halted()) return [{ ...base, ok: false, error: this.stopping ? "shutting down" : "the lane's pass was given up" }];
     return this.deps.capital.mutex.run("magma open", async (): Promise<MagmaSellAction[]> => {
@@ -2406,7 +2527,10 @@ export class MagmaDesk {
    */
   private async cannotOpen(entry: MagmaJournalEntry, order: SaleOrder): Promise<MagmaSellAction[] | null> {
     const base = { orderId: entry.orderId, action: "open" as const, sizeSats: entry.sizeSats };
-    if (entry.openAttempts > 0 && !this.timeLeftToOpen(entry, order)) {
+    // Past the deadline, first attempt or not: Amboss has ended the order or is
+    // about to, and a channel opened now would be a free one (a dial can take a
+    // minute and a half, and this runs again after it).
+    if (this.deadlinePassed(order) || (entry.openAttempts > 0 && !this.timeLeftToOpen(entry, order))) {
       return [{ ...base, ok: false, error: "no time left to open the channel" }, ...(await this.release(entry, "the channel could not be opened in time"))];
     }
     if (!entry.invoice) return null; // paid by a plain invoice (before the journal): nothing held
@@ -3057,7 +3181,11 @@ export class MagmaDesk {
           return { ok: false, code: "permission", message: `Not accepted: this node can't check its connection to the buyer — ${reached.blocked}.` };
         }
         if (!reached.ok) {
-          return { ok: false, code: "unreachable", message: "The buyer's node is unreachable right now — rejecting the order is safer than accepting it." };
+          return {
+            ok: false,
+            code: "unreachable",
+            message: `The buyer's node couldn't be reached just now${reached.why ? ` (${reached.why})` : ""}. The order is yours now, the lane no longer retries it: try again while there is time, or reject it if the buyer stays away.`,
+          };
         }
         const [res] = await this.acceptOrder(mine, order, fee, "manual", null);
         return this.result(mine, res, /capital/.test(res?.error ?? "") ? "capital" : undefined);
@@ -3524,7 +3652,7 @@ export class MagmaDesk {
               text: `kept open: ${Math.round(ch.local_balance).toLocaleString("en-US")} of its ${Math.round(ch.capacity).toLocaleString("en-US")} sat are on our side — the rest is inbound worth keeping`,
             }
           : well === true
-            ? { why: "routes", text: "kept open: it routes well (it earns at least what a sat of this node's channels earns)" }
+            ? { why: "routes", text: "kept open: it routes well (it earns at least about what selling its capital again would)" }
             : !terms
               ? { why: "terms", text: "not closed yet: no on-chain fee estimate to close it at an economy rate" }
               : well === null
@@ -3551,7 +3679,7 @@ export class MagmaDesk {
       }
       // Again right before the close: the reads above may have taken a while.
       if (stop()) break;
-      const res = await closeChannelByOutpoint(writeLnd, ch.transaction_id, ch.transaction_vout, false, terms?.feeRate ?? undefined);
+      const res = await closeChannelByOutpoint(writeLnd, ch.transaction_id, ch.transaction_vout, false, terms?.feeRate ?? undefined, terms?.maxFeeRate);
       const entry = this.journal.get(o.id);
       if (entry && res.ok) {
         entry.closedAt = now();
@@ -3631,11 +3759,15 @@ export class MagmaDesk {
    *  LND won't list its peers to the write macaroon (no peers:read), so no
    *  buyer's connection can be checked: this node's setup, never the buyer's
    *  node being unreachable (MissingPermission). */
-  private async connectBuyer(order: SaleOrderDetail): Promise<{ ok: true } | { ok: false; blocked: string | null }> {
+  private async connectBuyer(order: SaleOrderDetail, budgetMs?: number): Promise<{ ok: true } | { ok: false; blocked: string | null; why: string | null }> {
+    const dialErrors = new Map<string, string>();
+    const why = () => [...dialErrors].map(([socket, error]) => (socket ? `${socket}: ${error}` : error)).join("; ") || null;
     try {
-      return (await this.lndConnect(order.buyerPubkey, order.sockets)) ? { ok: true } : { ok: false, blocked: null };
+      return (await this.lndConnect(order.buyerPubkey, order.sockets, (socket, error) => dialErrors.set(socket, error), budgetMs))
+        ? { ok: true }
+        : { ok: false, blocked: null, why: why() };
     } catch (err) {
-      return { ok: false, blocked: err instanceof MissingPermission ? err.message : null };
+      return { ok: false, blocked: err instanceof MissingPermission ? err.message : null, why: why() };
     }
   }
 
@@ -3680,8 +3812,8 @@ export class MagmaDesk {
   private lndOpen(p: OpenChannelParams) {
     return fundChannel(this.deps.writeLnd!, p);
   }
-  private lndConnect(pubkey: string, sockets: string[]) {
-    return ensureConnected(this.deps.writeLnd!, pubkey, sockets);
+  private lndConnect(pubkey: string, sockets: string[], onDialError?: (socket: string, error: string) => void, budgetMs?: number) {
+    return ensureConnected(this.deps.writeLnd!, pubkey, sockets, onDialError, budgetMs);
   }
   /** This node's public key (cached per LND connection). */
   private ownPubkey(): Promise<string> {

@@ -266,7 +266,16 @@ export function serviceFeeAlerts(ledger: Pick<ServiceFeeLedger, "problems">): Al
 
 /** Derive actionable alerts from the current node state (read-only), plus any
  *  `extra` app-level alerts. Node trouble never hides the extras. */
-export async function getAlerts(lnd: AuthenticatedLnd, extra: Alert[] = []): Promise<Alert[]> {
+/** A peer away this long is no blip: its channel's balance is stuck (the peer
+ *  behind 55 % of a node's fee income was gone five weeks, with only the
+ *  count of offline channels to show for it). */
+export const OFFLINE_ALERT_HOURS = 7 * 24;
+
+export async function getAlerts(
+  lnd: AuthenticatedLnd,
+  extra: Alert[] = [],
+  offlineHours?: (c: Awaited<ReturnType<typeof getChannelsView>>[number]) => number | null,
+): Promise<Alert[]> {
   const alerts: Alert[] = [...extra];
   let node: Awaited<ReturnType<typeof getNodeSummary>>;
   let channels: Awaited<ReturnType<typeof getChannelsView>>;
@@ -284,6 +293,16 @@ export async function getAlerts(lnd: AuthenticatedLnd, extra: Alert[] = []): Pro
   const inactive = channels.filter((c) => !c.active).length;
   if (inactive > 0) {
     alerts.push({ level: "warn", message: `${inactive} channel${inactive > 1 ? "s" : ""} offline` });
+  }
+  for (const c of channels) {
+    const hours = offlineHours?.(c) ?? null;
+    if (hours === null || hours < OFFLINE_ALERT_HOURS || c.localBalance <= 0) continue;
+    alerts.push({
+      level: "warn",
+      message:
+        `${c.peerAlias || c.id} has been offline for ${Math.floor(hours / 24)} days — ${c.localBalance.toLocaleString("en-US")} sat of yours are stuck in that channel, earning nothing. ` +
+        "If it isn't coming back, Channels → Close gets them back.",
+    });
   }
 
   if (node.balances.onchainConfirmedSats < LOW_ONCHAIN_SATS) {

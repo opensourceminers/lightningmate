@@ -82,6 +82,12 @@ export interface MagmaV2Config {
   /** Offers whose terms the operator took over (OfferControl.manual): the
    *  autopilot leaves their lease alone, whatever auto-size says. */
   operatorOfferIds: string[];
+  /** Offers whose size floor stays up for now (autoSizedWindow's holdFloor): the
+   *  engine prices the window the upkeep will really write. */
+  heldFloorOfferIds: string[];
+  /** Orders are pending: the upkeep moves no offer's window (nor is it priced
+   *  for one it won't get). */
+  windowsHeld: boolean;
   /** Per offer: since when the market's base fee has stood at its level and
    *  differed from the offer's beyond BASE_FEE_TOLERANCE (the autopilot keeps
    *  the clock, baseFeeDiffers), the offer's base it was started against — a
@@ -127,6 +133,8 @@ export const MAGMA_V2_DEFAULTS: MagmaV2Config = {
   offerFeeCaps: null,
   autoSizeLease: false,
   operatorOfferIds: [],
+  heldFloorOfferIds: [],
+  windowsHeld: false,
   baseMoves: {},
   sellableNowSat: null,
   laneOpens: () => false,
@@ -365,10 +373,17 @@ export const BASE_FEE_TOLERANCE = { minSats: 50, share: 0.2 } as const;
  *    BASE_FEE_TOLERANCE of the level it moved to) for BASE_FEE_STABLE_MS:
  *    a small segment's median, flipped back and forth by one listing, is
  *    never followed;
- *  - either way at most one base move per BASE_FEE_MOVE_GAP_MS. */
+ *  - either way at most one base move per BASE_FEE_MOVE_GAP_MS;
+ *  - a base that moved within BASE_FEE_RESETTLE_WINDOW_MS follows only a level
+ *    that has held for BASE_FEE_RESETTLE_MS, far off or not (0 excepted): the
+ *    median of a few offers jumps between two levels, and 284 ↔ 852 is "far
+ *    off" both ways. The live offer's base moved every 6–9 h for days
+ *    (2026-11-02 to 11-08) while the price at its representative size stayed. */
 export const BASE_FEE_STABLE_MS = 90 * 60_000;
 export const BASE_FEE_MOVE_GAP_MS = 6 * 3_600_000;
 export const BASE_FEE_FAR_FACTOR = 2;
+export const BASE_FEE_RESETTLE_MS = 12 * 3_600_000;
+export const BASE_FEE_RESETTLE_WINDOW_MS = 24 * 3_600_000;
 
 /** When an offer's base follows the market's (null: now), or why not yet. */
 export function baseFeeFollow(
@@ -376,17 +391,25 @@ export function baseFeeFollow(
   market: number,
   clock: { since?: string; movedAt?: string } | undefined,
   nowMs: number,
-): { at: number | null; why: "far" | "stable" | "gap" | "settling" } {
-  const far = own * BASE_FEE_FAR_FACTOR < market || own > market * BASE_FEE_FAR_FACTOR;
+): { at: number | null; why: "far" | "stable" | "gap" | "settling" | "resettling" } {
   const movedMs = clock?.movedAt ? Date.parse(clock.movedAt) : NaN;
+  const dayEnd = movedMs + BASE_FEE_RESETTLE_WINDOW_MS;
+  const justMoved = Number.isFinite(movedMs) && nowMs < dayEnd && own > 0;
+  const farOff = own * BASE_FEE_FAR_FACTOR < market || own > market * BASE_FEE_FAR_FACTOR;
+  const far = !justMoved && farOff;
   const gapEnd = Number.isFinite(movedMs) ? movedMs + BASE_FEE_MOVE_GAP_MS : -Infinity;
   const sinceMs = clock?.since ? Date.parse(clock.since) : NaN;
   // Without a clock the market's base is seen for the first time now.
-  const stableEnd = (Number.isFinite(sinceMs) ? sinceMs : nowMs) + BASE_FEE_STABLE_MS;
+  const since = Number.isFinite(sinceMs) ? sinceMs : nowMs;
+  // Moved within the day: 12 h at the level, or the plain rule once the day is
+  // over, whichever comes first.
+  const stableEnd = justMoved
+    ? Math.min(since + BASE_FEE_RESETTLE_MS, farOff ? dayEnd : Math.max(dayEnd, since + BASE_FEE_STABLE_MS))
+    : since + BASE_FEE_STABLE_MS;
   const due = far ? gapEnd : Math.max(gapEnd, stableEnd);
   if (due <= nowMs) return { at: null, why: far ? "far" : "stable" };
   // Held by the gap after its last base move, or while the market's settles.
-  return { at: due, why: far || gapEnd >= stableEnd ? "gap" : "settling" };
+  return { at: due, why: far || gapEnd >= stableEnd ? "gap" : justMoved ? "resettling" : "settling" };
 }
 
 /**
@@ -490,14 +513,17 @@ export function autoSizedWindow(
   off: { minSizeSats: number; maxSizeSats: number },
   wantMin: number,
   wantMax: number,
+  /** The floor was raised a moment ago: it doesn't come down yet (the upkeep's
+   *  OFFER_FLOOR_HOLD_MS; the engine asks the same, or it prices another window). */
+  holdFloor = false,
 ): { minSizeSats: number; maxSizeSats: number } | null {
   if (!(wantMin > 0) || wantMax < wantMin) return null;
   const widens = wantMax > off.maxSizeSats * 1.2;
-  const lowersFloor = wantMin < off.minSizeSats * 0.8;
+  const lowersFloor = !holdFloor && wantMin < off.minSizeSats * 0.8;
   const raisesFloor = wantMin > off.minSizeSats * 1.2;
   if (!widens && !lowersFloor && !raisesFloor) return null;
   return {
-    minSizeSats: raisesFloor ? wantMin : Math.min(wantMin, off.minSizeSats),
+    minSizeSats: raisesFloor ? wantMin : holdFloor ? off.minSizeSats : Math.min(wantMin, off.minSizeSats),
     maxSizeSats: Math.max(wantMax, off.maxSizeSats),
   };
 }
@@ -623,7 +649,9 @@ export async function getMagmaRecommendations(
         : cfg.minSellSizeSat;
     // The ceiling is whatever capital allows. Every sat of headroom buys reach:
     // the median real order is several times what a 1M–1,25M window can take.
-    const ceiling = clamp(deployableCapitalSat, 0, cfg.maxSellSizeSat);
+    // (Not more than can be sold now: on a big wallet with the cap nearly used,
+    // an offer was priced for a window its upkeep would never write.)
+    const ceiling = clamp(Math.min(deployableCapitalSat, cfg.sellableNowSat ?? Number.POSITIVE_INFINITY), 0, cfg.maxSellSizeSat);
     const max = Math.max(minViable, Math.floor(ceiling / 50_000) * 50_000);
     return { min: Math.min(minViable, max), max, minViable };
   })();
@@ -728,7 +756,7 @@ export async function getMagmaRecommendations(
     // (autoSizedWindow — the upkeep's reshape writes the same), not for the
     // one it has: the representative size, and with it the profit floor,
     // moves with it.
-    const sized = offer && autoLease(offer) ? autoSizedWindow(offer, sellWindow.min, sellWindow.max) : null;
+    const sized = offer && autoLease(offer) && !cfg.windowsHeld ? autoSizedWindow(offer, sellWindow.min, sellWindow.max, cfg.heldFloorOfferIds.includes(offer.id)) : null;
     const minSize = sized?.minSizeSats ?? offer?.minSizeSats ?? sellWindow.min;
     const maxSize = sized?.maxSizeSats ?? offer?.maxSizeSats ?? sellWindow.max;
     // Priced for the lease the offer carries after the next write: a 90-day
@@ -890,7 +918,9 @@ export async function getMagmaRecommendations(
       reasons.push(
         follow.why === "gap"
           ? `comparable offers charge ${marketBase} sat base (it has ${offer.baseFeeSats}) — its base follows at ${at} UTC, 6 h after its last base change`
-          : `comparable offers charge ${marketBase} sat base (it has ${offer.baseFeeSats}) — its base follows at ${at} UTC, once that has held for 1.5 h`,
+          : follow.why === "resettling"
+            ? `comparable offers charge ${marketBase} sat base (it has ${offer.baseFeeSats}) — its base follows at ${at} UTC, once that has held for 12 h: it changed within the last day`
+            : `comparable offers charge ${marketBase} sat base (it has ${offer.baseFeeSats}) — its base follows at ${at} UTC, once that has held for 1.5 h`,
       );
     }
     if (offer && baseRefusedSat !== null && marketBase !== null) {

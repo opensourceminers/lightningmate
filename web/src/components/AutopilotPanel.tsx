@@ -104,8 +104,11 @@ export const CHANNEL_OPEN_HINT =
   "peer — no peer is held back for it, and the next run tries again. A peer's refusal before anything is broadcast moves " +
   "on to the next suggestion; an open that ends unclearly (also one cut off by a restart) starts the cooldown, as an open does.";
 
-const SELL_NUM_FIELDS: { key: NumKey; label: string }[] = [
-  { key: "sellMaxDeploySats", label: "Max capital deployed (sat)" },
+/** What the capital cap does to the listed offer. */
+export const DEPLOY_CAP_HINT =
+  "What may be sold and listed at once. With auto-size and auto-relist your offer lists this much, as far as the wallet can fund it.";
+const SELL_NUM_FIELDS: { key: NumKey; label: string; hint?: string }[] = [
+  { key: "sellMaxDeploySats", label: "Max capital deployed (sat)", hint: DEPLOY_CAP_HINT },
   { key: "sellMaxChannelSats", label: "Max channel size / order (sat)" },
   { key: "sellReserveSats", label: "Keep on-chain reserve (sat)" },
 ];

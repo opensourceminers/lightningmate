@@ -243,29 +243,67 @@ async function graphSockets(lnd: AuthenticatedLnd, pubkey: string): Promise<stri
   }
 }
 
-/** One connection attempt may take this long (Tor circuits are slow). */
-const CONNECT_ATTEMPT_MS = 30_000;
+/** One connection attempt may take this long (measured 2026-11-08 through a
+ *  node's Tor proxy: an onion address answered after 4 s, a clearnet one after
+ *  35 s, or not within 45 s). */
+const CONNECT_ATTEMPT_MS = 45_000;
 /** All addresses of one peer together get at most this long. */
 const CONNECT_BUDGET_MS = 90_000;
+/** How many times each address is tried within that budget. */
+const CONNECT_ROUNDS = 2;
+/** After a dial that went through, LND lists the peer once the two have
+ *  exchanged their first messages: looked for this often, half a second apart. */
+const CONNECT_LISTED_CHECKS = 20;
+/** The library's own ListPeers, right after a dial that went through. */
+const NOT_LISTED_YET = /FailedToSuccessfullyConnectToRemotePeer/;
 
 /**
- * Dial one address: two attempts (the library's own default is ten, with
- * exponential backoff — about 50 s per call before, and it was called three
- * times per address, so an unreachable peer took minutes), then verify the
- * peer shows up as connected (the handshake can take a moment).
+ * Dial one address and wait for the outcome, then verify the peer shows up as
+ * connected. `is_temporary` is what makes it wait: without it the library
+ * sends perm: true, and LND's ConnectPeer then answers at once and dials in
+ * the background ("Otherwise, the call will be synchronous", lightning.proto).
+ * Looking for the peer 1.5 s later found it only if it was already there:
+ * a buyer behind a Tor circuit took longer, and every such Magma order was
+ * turned down within seconds as "the buyer's node is unreachable" (order
+ * cbebc117, 2026-10-31: rejected after 5.3 s of a two-hour window; reproduced
+ * on regtest, server/e2e/dial.ts). A channel makes the connection persistent
+ * once it is open.
  * @throws MissingPermission when LND won't list its peers to this client.
  */
-async function dial(lnd: AuthenticatedLnd, pubkey: string, socket: string): Promise<boolean> {
+async function dial(
+  lnd: AuthenticatedLnd,
+  pubkey: string,
+  socket: string,
+  timeoutMs: number,
+  onDialError?: (socket: string, error: string) => void,
+): Promise<boolean> {
+  let failure: string | null = null;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await addPeer({ lnd, public_key: pubkey, socket, retry_count: 1, retry_delay: 1_000, timeout: CONNECT_ATTEMPT_MS });
-  } catch {
-    // "already connected", a dial error — or the library's own ListPeers
-    // after ConnectPeer refused (no peers:read) — verify below either way
+    // LND's own timeout doesn't bind a dial through its Tor proxy (regtest: an
+    // answer after 100 s of a 45 s timeout), so the attempt ends here. Should
+    // the dial still get through, the next look finds the peer connected.
+    await Promise.race([
+      addPeer({ lnd, public_key: pubkey, socket, is_temporary: true, retry_count: 1, timeout: timeoutMs }),
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`no answer within ${Math.ceil(timeoutMs / 1000)} s`)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } catch (err) {
+    // "already connected" answers success. The library's own ListPeers after
+    // ConnectPeer refused (no peers:read) lands here too: isConnected below
+    // says so.
+    const text = errorText(err);
+    if (!NOT_LISTED_YET.test(text)) failure = text.replace(/^503 UnexpectedErrorAddingPeer: /, "");
+  } finally {
+    clearTimeout(timer);
   }
-  for (let check = 0; check < 3; check++) {
+  for (let check = failure === null ? CONNECT_LISTED_CHECKS : 1; check > 0; check--) {
     if (await isConnected(lnd, pubkey)) return true;
-    await sleep(500);
+    if (check > 1) await sleep(500);
   }
+  onDialError?.(socket, failure ?? "connected, but LND doesn't list the peer");
   return false;
 }
 
@@ -273,30 +311,50 @@ async function dial(lnd: AuthenticatedLnd, pubkey: string, socket: string): Prom
  * Make sure there's a live connection to the peer before funding a channel —
  * otherwise openChannel fails with RemotePeerDisconnected. Dials each given
  * socket in turn, then the addresses the graph knows, within one overall
- * budget. Before, one missing or stale socket meant "peer offline" at once,
+ * budget (onDialError hears why each attempt failed; socket "": no address). Before, one missing or stale socket meant "peer offline" at once,
  * even when the buyer listed another address or the graph had a working one.
  *
  * @throws MissingPermission when LND won't list its peers to this client (no
  * peers:read): no connection can be checked, so none is dialed — this node's
  * setup to fix, not the peer's absence.
  */
-export async function ensureConnected(lnd: AuthenticatedLnd, pubkey: string, sockets: string[] = []): Promise<boolean> {
+export async function ensureConnected(
+  lnd: AuthenticatedLnd,
+  pubkey: string,
+  sockets: string[] = [],
+  onDialError?: (socket: string, error: string) => void,
+  budgetMs = CONNECT_BUDGET_MS,
+): Promise<boolean> {
   if (await isConnected(lnd, pubkey)) return true;
-  const deadline = Date.now() + CONNECT_BUDGET_MS;
-  const tried = new Set<string>();
-  const attempt = async (socket: string): Promise<boolean> => {
-    if (!socket || tried.has(socket) || Date.now() >= deadline) return false;
-    tried.add(socket);
-    return dial(lnd, pubkey, socket);
-  };
-  for (const socket of sockets) if (await attempt(socket)) return true;
-  for (const socket of await graphSockets(lnd, pubkey)) if (await attempt(socket)) return true;
+  const deadline = Date.now() + Math.min(budgetMs, CONNECT_BUDGET_MS);
+  const addresses = dialOrder([...sockets, ...(await graphSockets(lnd, pubkey))]);
+  if (addresses.length === 0) onDialError?.("", "no address of it is known");
+  // Tor circuits fail at random, and LND gives a handshake only five seconds
+  // once the circuit stands: a second try while the budget lasts. In the first
+  // round each address gets its share of what is left: two that stay silent
+  // used up the budget, and a live third was never dialed.
+  for (let round = 0; round < CONNECT_ROUNDS; round++) {
+    for (const [i, socket] of addresses.entries()) {
+      const left = deadline - Date.now();
+      if (left <= 0) return false;
+      const share = round === 0 ? left / (addresses.length - i) : left;
+      if (await dial(lnd, pubkey, socket, Math.min(CONNECT_ATTEMPT_MS, Math.ceil(share)), onDialError)) return true;
+    }
+  }
   return false;
 }
 
+/** The addresses to dial: each once, as LND takes them (host:port), onions
+ *  first. They are the quick way through a Tor proxy (4 s against 35 s or more
+ *  for a clearnet address, measured 2026-11-08), and cost little without one. */
+function dialOrder(sockets: string[]): string[] {
+  const hosts = [...new Set(sockets.map((s) => s.replace(/^[0-9a-f]{66}@/i, "")).filter(Boolean))];
+  return [...hosts.filter((s) => /\.onion(:\d+)?$/i.test(s)), ...hosts.filter((s) => !/\.onion(:\d+)?$/i.test(s))];
+}
+
 /** The error text of a peer that could not be connected (a pre-broadcast refusal). */
-export const couldNotConnect = (pubkey: string): string =>
-  `couldn't connect to ${pubkey.slice(0, 12)}… — the peer looks offline. Try again later.`;
+export const couldNotConnect = (pubkey: string, why?: string | null): string =>
+  `couldn't connect to ${pubkey.slice(0, 12)}… — the peer looks offline. Try again later.${why ? ` (${why})` : ""}`;
 
 /** A peer connection for an open: made — or not, and then why, in words an
  *  open's failure can carry. `blocked`: not the peer's doing but this node's
@@ -316,8 +374,11 @@ export async function connectForOpen(
   params: Pick<OpenChannelParams, "pubkey" | "socket" | "sockets">,
 ): Promise<PeerConnection> {
   const sockets = [...(params.socket ? [params.socket] : []), ...(params.sockets ?? [])];
+  const dialErrors: string[] = [];
   try {
-    return (await ensureConnected(writeLnd, params.pubkey, sockets)) ? { ok: true } : { ok: false, error: couldNotConnect(params.pubkey) };
+    return (await ensureConnected(writeLnd, params.pubkey, sockets, (socket, error) => void (socket && dialErrors.push(`${socket}: ${error}`))))
+      ? { ok: true }
+      : { ok: false, error: couldNotConnect(params.pubkey, dialErrors.join("; ")) };
   } catch (err) {
     if (err instanceof MissingPermission) return { ok: false, error: err.message, blocked: true };
     throw err;
@@ -384,6 +445,9 @@ export async function closeChannelByOutpoint(
   transactionVout: number,
   isForce: boolean,
   feeRate?: number,
+  /** The most a cooperative close may pay (sat/vB): LND otherwise negotiates up
+   *  to three times `feeRate`. */
+  maxFeeRate?: number,
 ): Promise<CloseChannelResult> {
   try {
     const res = await closeChannel(
@@ -394,6 +458,7 @@ export async function closeChannelByOutpoint(
             transaction_id: transactionId,
             transaction_vout: transactionVout,
             ...(feeRate && feeRate > 0 ? { tokens_per_vbyte: Math.round(feeRate) } : {}),
+            ...(maxFeeRate && maxFeeRate > 0 ? { max_tokens_per_vbyte: Math.round(maxFeeRate) } : {}),
           },
     );
     return { ok: true, transactionId: res.transaction_id };

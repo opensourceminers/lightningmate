@@ -957,6 +957,27 @@ export function lastAutopilotActionAt(
   return line?.at ?? null;
 }
 
+/** Why the offer was just written, for the Magma decision: without it a day of
+ *  "repriced offer 00479f19…" lines couldn't be told apart afterwards. */
+const offerWriteWhy = (entries: OfferSyncEntry[], offerId: string): string => {
+  const why = entries.find((e) => e.offerId === offerId)?.lastWrite?.reason;
+  return why ? `: ${why}` : "";
+};
+
+/** A sold channel stays open after its lease only if it routes at this yield
+ *  or better: about what its capital earns sold again (~5,080 ppm/yr on the
+ *  live node's comparison, 2026-10-26). The node's own average alone was no bar:
+ *  ~340 ppm/yr there, so 56 sat a month kept a 2M channel out of the market. */
+const SOLD_CHANNEL_KEEP_PPM_YEAR = 5_000;
+/** What a managed offer lists moves in steps this big (see offer upkeep) … */
+const OFFER_DEPTH_STEP_SATS = 500_000;
+/** … and a step, or a window's max at the wallet's limit, stays this far under
+ *  what can be funded: the wallet's small moves don't reach it. */
+const OFFER_DEPTH_MARGIN_SATS = 50_000;
+/** A size floor raised by the mempool stays up this long: fees hovering around
+ *  a step moved it up and down all day (20 offer writes in 13 hours, 2026-11-05). */
+const OFFER_FLOOR_HOLD_MS = 6 * 3_600_000;
+
 /** What an offer write did, in the Magma decision ("repriced offer 1a2b…"). */
 const OFFER_VERB: Partial<Record<SellActionKind, string>> = {
   reprice: "repriced",
@@ -1206,6 +1227,12 @@ interface OfferCtx {
    *  out, each one's open (with its own fee and anchor-reserve step) can be
    *  funded (capital.ts listableSat), within the deploy cap's headroom. */
   listable: (minSizeSats: number) => number;
+  /** What the capital cap still allows (with `listable` at it, the wallet isn't the limit). */
+  capRoomSat: number;
+  /** How many offers this node has, listed or not. */
+  offersKnown: number;
+  /** The capital check after a spend (offerCapitalNow): it only cuts. */
+  capitalOnly: boolean;
   /** The engine's price for the offer, and the lease that price is for
    *  (magmaRecommend.ts prices each offer for the lease it carries after the
    *  autopilot's next write). `why`: what the move is, when it isn't the
@@ -1235,9 +1262,9 @@ interface OfferCtx {
 }
 
 /** The capital side of OfferCtx, from one spendable reading. */
-function sellable(sp: Spendable, headroomSat: number, maxChannelSats: number): Pick<OfferCtx, "maxOrder" | "listable"> {
+function sellable(sp: Spendable, headroomSat: number, maxChannelSats: number): Pick<OfferCtx, "maxOrder" | "listable" | "capRoomSat"> {
   const listable = (minSizeSats: number) => floor10k(Math.min(listableSat(sp, minSizeSats), headroomSat));
-  return { listable, maxOrder: (minSizeSats: number) => floor10k(Math.min(listable(minSizeSats), maxChannelSats)) };
+  return { listable, capRoomSat: floor10k(headroomSat), maxOrder: (minSizeSats: number) => floor10k(Math.min(listable(minSizeSats), maxChannelSats)) };
 }
 
 const fmtSat = (n: number): string => Math.round(n).toLocaleString("en-US");
@@ -1517,6 +1544,13 @@ export class Autopilot {
    *  LEASE_PROMISE_CHECK_MS, whatever the switches say. */
   private leaseTimer: NodeJS.Timeout | undefined;
   /** max_htlc updates LND refused, per channel (runMaxHtlcPass backs off). */
+  /** When auto-size last raised an offer's size floor (OFFER_FLOOR_HOLD_MS).
+   *  In memory: a restart at worst lets a floor come down early. */
+  private readonly offerFloorRaisedAt = new Map<string, number>();
+  private offerFloorHeld(id: string): boolean {
+    const raised = this.offerFloorRaisedAt.get(id);
+    return raised !== undefined && Date.now() - raised < OFFER_FLOOR_HOLD_MS;
+  }
   private readonly maxHtlcBackoff = new Map<string, number>();
   /** The last max_htlc update applied per channel: one that didn't take is
    *  not resent every run (runMaxHtlcPass). */
@@ -1888,6 +1922,8 @@ export class Autopilot {
     offerFeeCaps: OfferFeeCaps;
     autoSizeLease: boolean;
     operatorOfferIds: string[];
+    heldFloorOfferIds: string[];
+    windowsHeld: boolean;
     baseMoves: Record<string, { since?: string; offerBase?: number; movedAt?: string }>;
   } {
     const c = this.state.config;
@@ -1907,6 +1943,8 @@ export class Autopilot {
       operatorOfferIds: Object.entries(this.state.offerControl ?? {})
         .filter(([, control]) => !!control.manual)
         .map(([id]) => id),
+      heldFloorOfferIds: [...this.offerFloorRaisedAt.keys()].filter((id) => this.offerFloorHeld(id)),
+      windowsHeld: this.magma.ordersPending() > 0,
       // Since when each offer's base has differed from the market's, at the
       // market's present level, and when its base last moved (baseFeeFollow).
       baseMoves: Object.fromEntries(
@@ -4094,8 +4132,9 @@ export class Autopilot {
   /** For the close of a finished lease's channel (MagmaDesk
    *  closeFinishedLeases): the economy fee rate a close pays now, the
    *  operator's maximum for on-chain fees, and whether a channel routes well
-   *  enough to keep — it earned (30 days) at least what a sat of this node's
-   *  month-old channels earned, capacity-weighted — null when that can't be
+   *  enough to keep — it earned (30 days), on the coins a close would free, at
+   *  least what a sat of this node's month-old channels earned, capacity-weighted,
+   *  and at least SOLD_CHANNEL_KEEP_PPM_YEAR — null when that can't be
    *  told: the forwarding history not read in full, or the channel list
    *  not read (final review 2026-10-25: a failed read made every sold
    *  channel "not routing well", and auto-close closed them). */
@@ -4109,18 +4148,19 @@ export class Autopilot {
     const ev = earning?.evidence;
     const nodePpm = earning?.ppmYear ?? (ev && ev.capacitySat > 0 ? (ev.earnedSat / ev.capacitySat) * (365 / 30) * 1_000_000 : null);
     const earned = new Map((report?.perChannel ?? []).map((c) => [c.channelId, c.feesEarnedSats]));
-    const capacity = new Map((chans ?? []).map((c) => [c.id, c.capacity]));
+    const local = new Map((chans ?? []).map((c) => [c.id, c.localBalance]));
     const known = report !== null && report.complete && chans !== null;
     return {
       feeRate,
       maxFeeRate: this.state.config.channelMaxFeeRate,
       routesWell: (channelId) => {
         const sat = earned.get(channelId) ?? 0;
-        const cap = capacity.get(channelId) ?? 0;
-        if (!known || cap <= 0) return null;
+        const coins = local.get(channelId);
+        if (!known || coins === undefined) return null;
         if (sat <= 0) return false;
-        const ppm = (sat / cap) * (365 / 30) * 1_000_000;
-        return nodePpm === null || ppm >= nodePpm;
+        // On the coins a close would free: that is what could be sold again.
+        const ppm = (sat / Math.max(coins, 1)) * (365 / 30) * 1_000_000;
+        return ppm >= Math.max(nodePpm ?? 0, SOLD_CHANNEL_KEEP_PPM_YEAR);
       },
     };
   }
@@ -4364,6 +4404,32 @@ export class Autopilot {
       return [...out, { orderId: "offers", action: "error", sizeSats: 0, ok: false, error: message }];
     };
 
+    // The offers before the capital: an order that locks part of an offer after
+    // this read is in the capital read below (sold, or pending), and one that
+    // locked before it is in what the offer shows. The other way round it was in
+    // neither, and with listing up to the cap it was listed a second time.
+    let offers: MyOffer[];
+    // When the listing below was asked for: an operator's click recorded
+    // since then is newer than what it shows (see settleStatusRecords).
+    let readAt = Date.now();
+    let own: string;
+    try {
+      own = await getOwnPubkey(this.readLnd);
+    } catch (err) {
+      // LND still starting: nothing to do with Amboss.
+      return failed(`could not work out the sellable capital: ${errText(err)}`);
+    }
+    try {
+      // This node's offers only: one Amboss account can list offers for
+      // several nodes, and another node's are not ours to reprice, resize,
+      // enable or disable.
+      readAt = Date.now();
+      offers = await getMyOffers(key, own);
+      this.amboss.markValid();
+    } catch (err) {
+      if (isAuthError(err)) await this.amboss.recheckAfterRefusal();
+      return failed(`could not read your offers from Amboss: ${errText(err)}`);
+    }
     // What can be sold right now: the coins (D5 reserve, minus what other
     // buyers were promised and what their opens will need) and the deploy
     // cap's headroom.
@@ -4384,6 +4450,8 @@ export class Autopilot {
           .then((f) => ({ acceptFloorSat: f.sats, acceptFloorLive: f.live }))
           .catch(() => ({ acceptFloorSat: null, acceptFloorLive: false }))),
         listedElsewhere: 0,
+        offersKnown: offers.length,
+        capitalOnly: opts.capitalOnly === true,
         ordersPending: this.magma.ordersPending(),
       };
     } catch (err) {
@@ -4391,22 +4459,6 @@ export class Autopilot {
       return failed(`could not work out the sellable capital: ${errText(err)}`);
     }
 
-    let offers: MyOffer[];
-    // When the listing below was asked for: an operator's click recorded
-    // since then is newer than what it shows (see settleStatusRecords).
-    let readAt = Date.now();
-    try {
-      // This node's offers only: one Amboss account can list offers for
-      // several nodes, and another node's are not ours to reprice, resize,
-      // enable or disable.
-      const own = await getOwnPubkey(this.readLnd);
-      readAt = Date.now();
-      offers = await getMyOffers(key, own);
-      this.amboss.markValid();
-    } catch (err) {
-      if (isAuthError(err)) await this.amboss.recheckAfterRefusal();
-      return failed(`could not read your offers from Amboss: ${errText(err)}`);
-    }
     // Given up while the listing was on its way: nothing of this stage is
     // written any more — not the offers' sync record, not what it prunes;
     // a newer run's stands (final review 2026-10-25, PROBE-MAGMA-STAGE-LATE:
@@ -4515,7 +4567,9 @@ export class Autopilot {
         ? sell.recommendedMinSizeSat
         : Math.max(sell.recommendedMinSizeSat, floorAtOwnPrice());
       const room = ctx.maxOrder(Math.min(wantMin, off.minSizeSats));
-      const wantMax = Math.max(wantMin, Math.min(sell.recommendedMaxSizeSat, room));
+      // At the wallet's or the cap's limit, a little under it (OFFER_DEPTH_MARGIN_SATS).
+      const roomBelow = room < cfg.sellMaxChannelSats ? Math.max(wantMin, room - OFFER_DEPTH_MARGIN_SATS) : room;
+      const wantMax = Math.max(wantMin, Math.min(sell.recommendedMaxSizeSat, roomBelow));
       if (wantMax < wantMin || room < wantMin) return null;
       // Only on a MEANINGFUL difference (autoSizedWindow, ±20 %): a window
       // much narrower than what can be funded, a floor above what is
@@ -4523,7 +4577,7 @@ export class Autopilot {
       // itself moves with the mempool, both ways (review 2026-10-25: at
       // 10 sat/vB the engine wanted 850k and the offer kept 250k). The engine
       // priced the offer for this same window (magmaRecommend buildSell).
-      return autoSizedWindow(off, wantMin, wantMax);
+      return autoSizedWindow(off, wantMin, wantMax, this.offerFloorHeld(off.id));
     };
 
     const entries: OfferSyncEntry[] = [];
@@ -4721,7 +4775,7 @@ export class Autopilot {
       const what = done.map((a) =>
         a.action === "create"
           ? "listed a new offer"
-          : `${OFFER_VERB[a.action] ?? a.action} offer ${a.orderId.slice(0, 8)}…${a.action === "disable" && a.error ? ` (${a.error})` : ""}`,
+          : `${OFFER_VERB[a.action] ?? a.action} offer ${a.orderId.slice(0, 8)}…${a.action === "disable" && a.error ? ` (${a.error})` : offerWriteWhy(entries, a.orderId)}`,
       );
       return {
         text: `${what.join(", ")}${bad.length ? ` — ${bad.length} change${bad.length === 1 ? "" : "s"} failed (${bad[0].error ?? "failed"})` : ""}${extra}`,
@@ -5540,7 +5594,11 @@ export class Autopilot {
         repriced = true;
         reasons.push(listAt.why ?? `priced at the engine's ${fmtSat(listAt.feeRatePpm)} ppm + ${fmtSat(listAt.baseFeeSats)} sat`);
       }
-      if (shape) {
+      if (shape && ctx.ordersPending > 0) {
+        // What a pending order holds isn't sold yet: a wider window lists it a
+        // second time, and the next order is turned down for capital.
+        notes.push("size window left as it is: an order waits for approval or is being served");
+      } else if (shape) {
         w.minSizeSats = shape.minSizeSats;
         w.maxSizeSats = shape.maxSizeSats;
         w.availableSats = Math.max(w.availableSats, shape.maxSizeSats);
@@ -5615,21 +5673,57 @@ export class Autopilot {
     }
     // Shared with this node's other offers: what they list is not this one's.
     const listable = Math.max(0, ctx.listable(w.minSizeSats) - ctx.listedElsewhere);
-    if (!manual && cfg.sellAutoRelist && w.availableSats < w.maxSizeSats && w.maxSizeSats <= listable) {
+    const fundableMax = Math.max(w.minSizeSats, ctx.maxOrder(w.minSizeSats));
+    // (Its max as it will be: an earlier cut's wish above what can be funded
+    // kept an offer listed with nothing for sale.)
+    const topUpTo = Math.min(w.maxSizeSats, fundableMax);
+    if (!manual && cfg.sellAutoRelist && w.availableSats < topUpTo && topUpTo <= listable) {
       if (holdBack) {
         notes.push(`not topped back up: ${pendingNote()}`);
       } else {
-        w.availableSats = w.maxSizeSats;
+        w.availableSats = topUpTo;
         kind = "relist";
         reasons.push("sold out — topped back up");
+      }
+    }
+    // With auto-size and auto-relist the offer lists what the capital cap and
+    // the wallet allow, not just its largest order: a cap of 10M listed 5M, a
+    // window of up to 2M on 4.6M spendable listed 2M — and offers with little
+    // listed rarely sell (≤ 5M: 2 of 33; 5–50M: 4 of 10, review 2026-10-17). In
+    // whole steps, a step of the wallet's counting once what can be listed clears
+    // it by a margin, so that its small moves (a fee estimate, a reserve) don't
+    // rewrite it. Only for a node's one offer: several share the capital as they
+    // are set. Auto-relist off keeps its meaning: what a sale took stays out.
+    const depthManaged = !manual && cfg.sellAutoSize && cfg.sellAutoRelist && ctx.offersKnown <= 1;
+    const walletLimited = listable < ctx.capRoomSat - ctx.listedElsewhere;
+    const depth = Math.floor(Math.max(0, listable - (walletLimited ? OFFER_DEPTH_MARGIN_SATS : 0)) / OFFER_DEPTH_STEP_SATS) * OFFER_DEPTH_STEP_SATS;
+    // (Not in the capital check after a spend: that only cuts.)
+    if (depthManaged && !ctx.capitalOnly && w.availableSats < depth && (!walletLimited || depth - off.availableSats >= OFFER_DEPTH_MARGIN_SATS)) {
+      if (holdBack) {
+        notes.push(`not listed up to ${fmtSat(depth)} sat yet: ${pendingNote()}`);
+      } else {
+        w.availableSats = depth;
+        kind = "resize";
+        reasons.push(`listed up to the ${fmtSat(depth)} sat your capital cap and the wallet allow`);
       }
     }
     // Never advertise what can't be funded (shared capital, D4/D5).
     const wantMax = w.maxSizeSats;
     const wantListed = w.availableSats;
-    w.maxSizeSats = Math.min(w.maxSizeSats, Math.max(w.minSizeSats, ctx.maxOrder(w.minSizeSats)));
-    w.availableSats = Math.min(w.availableSats, listable);
+    w.maxSizeSats = Math.min(w.maxSizeSats, fundableMax);
+    // Down to the step below — never under the largest order it takes, nor over
+    // what can be funded: a listing under its max sells nothing bigger, and
+    // the engine reads it as "exhausted".
+    if (w.availableSats > listable) w.availableSats = depthManaged ? Math.min(listable, Math.max(depth, w.maxSizeSats)) : listable;
+    if (depthManaged && walletLimited) {
+      // Up by less than the margin, at the wallet's limit, isn't worth a write:
+      // a wallet hovering there gave capital cuts and give-backs of 10–20k, run
+      // after run. With room to spare what a cut took goes back, however little.
+      if (w.maxSizeSats > off.maxSizeSats && w.maxSizeSats - off.maxSizeSats < OFFER_DEPTH_MARGIN_SATS && fundableMax - wantMax < OFFER_DEPTH_MARGIN_SATS && off.maxSizeSats >= w.minSizeSats) w.maxSizeSats = off.maxSizeSats;
+      if (w.availableSats > off.availableSats && w.availableSats - off.availableSats < OFFER_DEPTH_MARGIN_SATS && listable - wantListed < OFFER_DEPTH_MARGIN_SATS && off.availableSats >= w.maxSizeSats) w.availableSats = off.availableSats;
+    }
     w.totalSizeSats = off.lockedSats + w.availableSats;
+    if (w.minSizeSats > off.minSizeSats) this.offerFloorRaisedAt.set(off.id, Date.now());
     if (w.maxSizeSats < off.maxSizeSats) {
       kind = "resize";
       reasons.push(`max channel cut to the ${w.maxSizeSats} sat that can be funded`);

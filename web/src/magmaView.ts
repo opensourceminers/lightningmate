@@ -362,7 +362,7 @@ export function baseFeeFollow(
     cell: `→ ${market} ${when}`,
     title:
       `Comparable offers charge ${market} sat base; the autopilot moves this offer's base there ${r.baseFeeFollowsAt ? `at ${time(r.baseFeeFollowsAt)}` : "at its next run"} ` +
-      "— right away when the base is far off, else once the market's has held for 1.5 h, and at most once every 6 h. " +
+      "— right away when the base is far off, else once the market's has held for 1.5 h; at most once every 6 h, and within a day of a move only to a level that has held for 12 h. " +
       "The rate makes up the rest, so a channel of the offer's typical size costs the same.",
   };
 }
