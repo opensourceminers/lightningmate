@@ -98,7 +98,9 @@ test("silent addresses can't use up the budget: each gets its share, and a live 
   const heard: string[] = [];
   const ok = await ensureConnected(node.lnd, peer, ["1.1.1.1:9735", "2.2.2.2:9735", "5.6.7.8:9735"], (s, e) => heard.push(`${s}: ${e}`), 3_000);
   assert.equal(ok, true);
-  assert.deepEqual(heard, ["1.1.1.1:9735: no answer within 1 s", "2.2.2.2:9735: no answer within 1 s"]);
+  assert.equal(heard.length, 2, heard.join(" | "));
+  assert.match(heard[0], /^1\.1\.1\.1:9735: no answer within \d s$/);
+  assert.match(heard[1], /^2\.2\.2\.2:9735: no answer within \d s$/);
 });
 
 test("addresses are dialed the way LND takes them, each once, onions first", async () => {

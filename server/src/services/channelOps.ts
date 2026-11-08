@@ -286,7 +286,7 @@ async function dial(
     await Promise.race([
       addPeer({ lnd, public_key: pubkey, socket, is_temporary: true, retry_count: 1, timeout: timeoutMs }),
       new Promise((_resolve, reject) => {
-        timer = setTimeout(() => reject(new Error(`no answer within ${Math.ceil(timeoutMs / 1000)} s`)), timeoutMs);
+        timer = setTimeout(() => reject(new Error(`no answer within ${Math.max(1, Math.round(timeoutMs / 1000))} s`)), timeoutMs);
         timer.unref?.();
       }),
     ]);
