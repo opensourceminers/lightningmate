@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import type { DailyBucket, ForwardsReport, UnservedDemandReport } from "../types";
 import { sats, satsCompact, timeAgo } from "../format";
@@ -187,7 +188,7 @@ export function ForwardsPanel() {
             const hint = flowHint(c);
             return (
               <tr key={c.channelId} className={hint.urgent ? "row-urgent" : ""}>
-                <td className="an-alias" title={c.alias}>{c.alias}</td>
+                <td className="an-alias" title={c.alias}><NodeLink channelId={c.channelId} alias={c.alias} /></td>
                 <td><span className={`flow-tag ${hint.cls}`}>{hint.label}</span></td>
                 <td className="num">{c.forwardCount}</td>
                 <td className="num">{satsCompact(c.routedOutSats)}</td>
@@ -231,9 +232,9 @@ export function ForwardsPanel() {
               {data.corridors.map((c) => (
                 <tr key={`${c.inChannel}>${c.outChannel}`}>
                   <td className="corridor-route">
-                    <span className="corridor-in" title={c.inAlias}>{c.inAlias}</span>
+                    <span className="corridor-in" title={c.inAlias}><NodeLink channelId={c.inChannel} alias={c.inAlias} /></span>
                     <span className="corridor-arrow">→</span>
-                    <span className="corridor-out" title={c.outAlias}>{c.outAlias}</span>
+                    <span className="corridor-out" title={c.outAlias}><NodeLink channelId={c.outChannel} alias={c.outAlias} /></span>
                   </td>
                   <td className="num">{c.forwards}</td>
                   <td className="num">{satsCompact(c.routedSats)}</td>

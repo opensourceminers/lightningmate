@@ -41,6 +41,8 @@ import type { AUTOPILOT_CONFIG_BOUNDS } from "./services/autopilotConfig.js";
 import type { OpenChannelResult as ChannelOpsOpenResult } from "./services/channelOps.js";
 import type { FeeEstimates, OnchainState as WalletState, SendBudget, SendResult } from "./services/onchain.js";
 import type { ChannelView as LndChannel } from "./services/channels.js";
+import type { NodeFacts, NodeSearchHit } from "./services/nodeDetail.js";
+import type { PublicNodeRecord } from "./services/nodeLookup.js";
 import type { ChannelLease } from "./services/leases.js";
 import type { OfflineInfo } from "./services/channelUptime.js";
 import type { BuyQuote, OrderState as AmbossOrderState } from "./services/amboss.js";
@@ -67,6 +69,9 @@ import type { YieldEvidence } from "./services/openPlan.js";
 // ── the server's own types, as the API sends them ───────────────────────────
 
 export type { Alert } from "./services/alerts.js";
+export type { NodeAssessment } from "./services/suggestRecommend.js";
+export type { NodeChannelFacts, NodeClosedChannel, NodeConnection, NodeEvent, NodeNetwork, NodeSearchHit } from "./services/nodeDetail.js";
+export type { PublicNodeRecord } from "./services/nodeLookup.js";
 export type { BuyQuote, MagmaOffer, MarketView, OfferCondition } from "./services/amboss.js";
 export type {
   AreaDecision,
@@ -185,6 +190,8 @@ export type ChannelView = LndChannel & {
   lease: ChannelLease | null;
   /** How long its peer has been away (null: online). */
   offline: OfflineInfo | null;
+  /** Days since its funding confirmed (null: still pending, or not known). */
+  ageDays: number | null;
 };
 
 /** How this node's payment for a purchase stands ("unclear": only the pay
@@ -272,12 +279,49 @@ export type ChannelSuggestion = SuggestionV2 & { neverOpen: boolean };
 /** GET /suggestions. */
 export type SuggestionsResponse = Omit<SuggestV2Report, "suggestions"> & { suggestions: ChannelSuggestion[] };
 
+/** GET /nodes/detail: one node, from LND and this app's records alone. */
+export type NodeDetail = NodeFacts & {
+  /** This node's channels with it (open, opening, closing), as on GET /channels. */
+  channels: ChannelView[];
+  /** It is on the operator's "never open automatically" list. */
+  neverOpen: boolean;
+};
+
+/** GET /nodes/detail, /nodes/assessment and /nodes/public: which node. */
+export interface NodeQuery {
+  pubkey: string;
+}
+
+/** GET /nodes/search: part of an alias, or the start of a key. */
+export interface NodeSearchQuery {
+  q: string;
+}
+
+/** GET /nodes/search. */
+export interface NodeSearchResponse {
+  hits: NodeSearchHit[];
+  graphAgeSec: number;
+}
+
+/** GET /nodes/public: what other services say about a node, asked only when
+ *  its details are opened. "off": the operator switched it off;
+ *  "unavailable": the lookup failed or is backing off. */
+export interface NodePublicInfo {
+  lnplus: LnPlusNode | null;
+  lnplusState: "ok" | "off" | "unavailable";
+  record: PublicNodeRecord | null;
+  /** "unknown": mempool.space answered and doesn't know the node. */
+  recordState: "ok" | "off" | "unknown" | "unavailable";
+  recordError: string | null;
+}
+
 /** Where LightningMate's own lookups go (GET /privacy): all through Tor
  *  when the app has Umbrel's proxy. */
 export interface PrivacyInfo {
   /** Umbrel's Tor proxy (host:port), or null: everything goes direct. */
   torProxy: string | null;
   lnplusLookups: boolean;
+  nodeLookups: boolean;
   destinations: { service: string; what: string; active: boolean; viaTor: boolean }[];
 }
 

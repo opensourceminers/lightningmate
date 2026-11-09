@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import type { LnPlusPoolNode, LnPlusStatus, LnPlusSwap, LnPlusSwapsResponse } from "../types";
 import { satsCompact } from "../format";
@@ -50,9 +51,7 @@ function PoolTable({ nodes }: { nodes: LnPlusPoolNode[] }) {
           <tr key={n.pubkey}>
             <td>
               <div className="sug-peer">
-                <a href={n.profileUrl} target="_blank" rel="noreferrer noopener">
-                  {n.alias}
-                </a>
+                <NodeLink pubkey={n.pubkey} alias={n.alias} />
                 <RankChip rank={n.rank} rankName={n.rankName} />
                 {n.alreadyPeered ? <span className="sug-badge">already a peer</span> : null}
               </div>

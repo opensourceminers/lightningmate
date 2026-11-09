@@ -9,6 +9,9 @@ export interface AppSettings {
    *  peer picking, the Pool and Swaps views. Off: no LN+ request at all
    *  (cached answers are still used). */
   lnplusLookups: boolean;
+  /** Look a node up on mempool.space when its details are opened: where it
+   *  runs and since when. Off: no such request at all. */
+  nodeLookups: boolean;
   /** LSP mode (experimental): answer LSPS1 (bLIP-51) requests from wallets. Off by default. */
   lspModeEnabled: boolean;
 }
@@ -18,6 +21,8 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // On, as since LN+ came in (0.7.4) — with Umbrel's Tor proxy its lookups
   // go through Tor; without one, Settings says they leave from this IP.
   lnplusLookups: true,
+  // One node at a time, only when the operator opens it, through Tor.
+  nodeLookups: true,
   lspModeEnabled: false,
 };
 
@@ -42,6 +47,7 @@ export class SettingsStore {
     this.settings = {
       fiatCurrency: stored.fiatCurrency ?? DEFAULT_SETTINGS.fiatCurrency,
       lnplusLookups: stored.lnplusLookups ?? DEFAULT_SETTINGS.lnplusLookups,
+      nodeLookups: stored.nodeLookups ?? DEFAULT_SETTINGS.nodeLookups,
       lspModeEnabled: stored.lspModeEnabled ?? DEFAULT_SETTINGS.lspModeEnabled,
     };
   }

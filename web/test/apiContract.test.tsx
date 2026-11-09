@@ -130,6 +130,9 @@ test("every body a route composes is checked against its contract type where it 
     ["OfferUpdateResult", "OfferUpdateResult"],
     ["OfferToggleResult", "OfferToggleResult"],
     ["OfferAutomationResult", "OfferAutomationResult"],
+    ["NodeDetail", "NodeDetail"],
+    ["NodeSearchResponse", "NodeSearchResponse"],
+    ["NodePublicInfo", "NodePublicInfo"],
   ] as const;
   for (const [name, local] of composed) {
     assert.match(contract, new RegExp(`export (interface|type) ${name}\\b`), `${name} is declared in the contract`);

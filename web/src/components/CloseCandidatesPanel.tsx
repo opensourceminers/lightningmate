@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useState } from "react";
+import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import { caretButtonProps } from "../a11y";
 import { sharedMagmaReport } from "../magmaReport";
@@ -120,7 +121,7 @@ export function CloseCandidatesPanel() {
                     </td>
                     <td>
                       <div className="sug-peer">
-                        {c.alias}{" "}
+                        <NodeLink pubkey={c.peerPubkey} alias={c.alias} />{" "}
                         {c.active ? "" : <span className="muted">· {offlineLabel(c.offline) ?? "offline"}</span>}
                       </div>
                       <div className="sug-badges">
@@ -214,7 +215,7 @@ export function CloseCandidatesPanel() {
           <ul className="close-aside">
             {data.pending.map((p) => (
               <li key={p.channelId}>
-                <strong>{p.alias}</strong> · {satsCompact(p.capacitySats)} · {p.status === "pending_open" ? "opening" : p.timelockBlocks ? `closing — funds back in ~${p.timelockBlocks} blocks` : "closing"}
+                <strong><NodeLink channelId={p.channelId} alias={p.alias} /></strong> · {satsCompact(p.capacitySats)} · {p.status === "pending_open" ? "opening" : p.timelockBlocks ? `closing — funds back in ~${p.timelockBlocks} blocks` : "closing"}
                 {leaseTag(p.lease) ? <span className="tag tag-lease">{leaseTag(p.lease)}</span> : null}
               </li>
             ))}
@@ -230,7 +231,7 @@ export function CloseCandidatesPanel() {
               .filter((p) => p.lease)
               .map((p) => (
                 <li key={p.channelId}>
-                  <strong>{p.alias}</strong> — {p.reason}
+                  <strong><NodeLink channelId={p.channelId} alias={p.alias} /></strong> — {p.reason}
                 </li>
               ))}
           </ul>

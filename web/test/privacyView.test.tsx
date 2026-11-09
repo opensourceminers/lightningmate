@@ -16,6 +16,7 @@ import type { PrivacyInfo } from "../src/types";
 const info = (o: Partial<PrivacyInfo> = {}): PrivacyInfo => ({
   torProxy: null,
   lnplusLookups: true,
+  nodeLookups: true,
   destinations: [
     { service: "Amboss public market data (api.amboss.space, magma.amboss.tech)", what: "Magma market data", active: true, viaTor: false },
     { service: "lightningnetwork.plus", what: "node reputations — your own node's public key included", active: true, viaTor: false },

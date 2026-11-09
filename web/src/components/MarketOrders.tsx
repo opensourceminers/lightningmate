@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import { sharedMagmaReport } from "../magmaReport";
 import { useVisibleInterval } from "../usePolledData";
@@ -28,6 +29,12 @@ function localDetail(o: MyOrder): string | undefined {
   if (!l) return undefined;
   return l.lastError ?? l.reason ?? l.decision?.reason ?? undefined;
 }
+
+/** The buyer's node key: an order may name it with its address (key@host:port). */
+const buyerKey = (o: Pick<MyOrder, "destination">): string | null => {
+  const key = o.destination.split("@")[0];
+  return /^[0-9a-f]{66}$/i.test(key) ? key.toLowerCase() : null;
+};
 
 export function MarketOrders() {
   const ui = useUi();
@@ -291,6 +298,7 @@ export function MarketOrders() {
           <thead>
             <tr>
               <th>When</th>
+              <th>Buyer</th>
               <th className="num">Size</th>
               <th className="num">Fee</th>
               <th>Status</th>
@@ -302,6 +310,9 @@ export function MarketOrders() {
             {orders.map((o) => (
               <tr key={o.id}>
                 <td className="muted">{new Date(o.createdAt).toLocaleString()}</td>
+                <td>
+                  <NodeLink pubkey={buyerKey(o)} alias={o.buyerAlias} />
+                </td>
                 <td className="num">{satsCompact(o.sizeSats)}</td>
                 <td className="num">{o.feeSats > 0 ? o.feeSats.toLocaleString() : "—"}</td>
                 <td title={`${o.status}${localDetail(o) ? ` · ${localDetail(o)}` : ""}`}>

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { COPY_FAILED, copyText } from "../clipboard";
 import { QRCodeSVG } from "qrcode.react";
 import { api } from "../api";
 import type { OnchainState, OnchainTx, PriceInfo, SendPreview } from "../types";
@@ -57,9 +58,12 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
     }
   };
 
-  const copyAddr = () => {
+  const copyAddr = async () => {
     if (!address) return;
-    void navigator.clipboard.writeText(address);
+    if (!(await copyText(address))) {
+      toast(COPY_FAILED, "error");
+      return;
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   };

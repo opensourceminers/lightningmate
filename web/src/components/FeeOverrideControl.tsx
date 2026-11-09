@@ -114,6 +114,8 @@ export function FeeOverrideControl({
             onKeyDown={(e) => {
               if (e.key === "Enter") confirm(draft ?? seed);
               if (e.key === "Escape") {
+                // This edit alone: not the node details the control may sit in.
+                e.stopPropagation();
                 setDraft(null);
                 setError(null);
               }

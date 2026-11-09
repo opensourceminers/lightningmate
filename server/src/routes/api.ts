@@ -26,6 +26,12 @@ import type {
   ChannelView as ApiChannelView,
   DaysQuery,
   EligibilityQuery,
+  NodeAssessment,
+  NodeDetail,
+  NodePublicInfo,
+  NodeQuery,
+  NodeSearchQuery,
+  NodeSearchResponse,
   FeeApplyRequest,
   FeeApplyResponse,
   FeePreviewQuery,
@@ -92,10 +98,12 @@ import { getNodeScore } from "../services/score.js";
 import type { Config } from "../config.js";
 import { getNodeSummary, getOwnPubkey } from "../services/node.js";
 import { getChannelsView } from "../services/channels.js";
+import { getNodeFacts, searchGraph } from "../services/nodeDetail.js";
+import { lookupPublicNode } from "../services/nodeLookup.js";
 import { getFlowSummary, getForwardsReport, parseTzOffset, readForwardEvents } from "../services/forwards.js";
 import { getFeePreview, type FeeApplyItem, type FeePolicy } from "../services/fees.js";
-import { type SuggestionPolicy } from "../services/suggestions.js";
-import { getChannelSuggestionsV2, getCloseSuggestionsV2 } from "../services/suggestRecommend.js";
+import { buildGraphCache, type SuggestionPolicy } from "../services/suggestions.js";
+import { assessNode, getChannelSuggestionsV2, getCloseSuggestionsV2, scidAgeDays } from "../services/suggestRecommend.js";
 import { channelLeases, leaseProtection, standardChannelId } from "../services/leases.js";
 import { BOUGHT_INBOUND_METHOD, amortizedPurchaseCost, boughtInboundRoi } from "../services/inboundRoi.js";
 import { labelCostChannels, rebalanceCosts } from "../services/rebalanceCosts.js";
@@ -491,30 +499,125 @@ export function createApiRouter(
   // lease (sold on Magma or over LSPS1, or bought on Magma — the table tags
   // it and the close dialog asks before breaking it), and how long its peer
   // has been away (a short outage is no reason to force-close).
+  const channelsWithFees = async (): Promise<ApiChannelView[]> => {
+    const [channels, rates, height] = await Promise.all([
+      getChannelsView(lnd),
+      getFeeRates({ lnd }).catch(() => null),
+      currentHeight(),
+    ]);
+    const nowMs = Date.now();
+    autopilot.uptime.observe(channels, nowMs);
+    const leases = channelLeases(channels, autopilot.leaseSources(), height, nowMs);
+    const rateById = new Map((rates?.channels ?? []).map((c) => [c.id, c]));
+    return channels.map((c) => {
+      const r = rateById.get(c.id);
+      return {
+        ...c,
+        feeRatePpm: r ? r.fee_rate : null,
+        baseFeeMsat: r ? Number(r.base_fee_mtokens) : null,
+        lease: leases.get(c.id) ?? null,
+        offline: autopilot.uptime.offlineInfo(c, nowMs),
+        ageDays: scidAgeDays(c.id, height),
+      } satisfies ApiChannelView;
+    });
+  };
   router.get(
     "/channels",
     wrap(async (_req, res) => {
-      const [channels, rates, height] = await Promise.all([
-        getChannelsView(lnd),
-        getFeeRates({ lnd }).catch(() => null),
-        currentHeight(),
+      res.json(await channelsWithFees());
+    }),
+  );
+
+  // ── One node ────────────────────────────────────────────────────────────────
+  // The node details the UI opens from wherever a node is named — on a query
+  // of its own each, so a slow one (the graph's first read, a lookup through
+  // Tor) never holds up the rest.
+
+  /** The asked-for key, lower case — or a 400 said and null. */
+  const nodeKey = (pubkey: unknown, res: Response): string | null => {
+    if (!isPubkey(pubkey)) {
+      res.status(400).json({ error: "bad_request", message: "valid pubkey (66 hex) required." });
+      return null;
+    }
+    return pubkey.toLowerCase();
+  };
+
+  // From LND and this app's own records only: nothing leaves the machine.
+  router.get(
+    "/nodes/detail",
+    wrap(async (req, res) => {
+      const pubkey = nodeKey(queryOf<NodeQuery>(req).pubkey, res);
+      if (!pubkey) return;
+      const all = await channelsWithFees();
+      const channels = all.filter((c) => c.peerPubkey === pubkey);
+      const closing = channels.find((c) => c.status === "pending_close")?.peerAlias;
+      const facts = await getNodeFacts(lnd, pubkey, {
+        channelIds: channels.map((c) => c.id),
+        feeChanges: autopilot.feeChanges(),
+        refills: rebalanceLog.successes(),
+        ...(closing && !all.some((c) => c.peerAlias === closing && c.peerPubkey !== pubkey) ? { closingAlias: closing } : {}),
+      });
+      res.json({
+        ...facts,
+        channels,
+        neverOpen: Object.prototype.hasOwnProperty.call(autopilot.neverOpenPeers(), pubkey),
+      } satisfies NodeDetail);
+    }),
+  );
+
+  // Scored the way the suggestions score: reads the whole graph (and LN+,
+  // if on), so its first read after a start can take a while.
+  router.get(
+    "/nodes/assessment",
+    wrap(async (req, res) => {
+      const pubkey = nodeKey(queryOf<NodeQuery>(req).pubkey, res);
+      if (!pubkey) return;
+      res.json((await assessNode(lnd, pubkey, lnplus)) satisfies NodeAssessment);
+    }),
+  );
+
+  // What other services say about it: one node, when it is opened, through
+  // Tor like every lookup — never a list of this node's peers.
+  router.get(
+    "/nodes/public",
+    wrap(async (req, res) => {
+      const pubkey = nodeKey(queryOf<NodeQuery>(req).pubkey, res);
+      if (!pubkey) return;
+      const [profile, looked] = await Promise.all([
+        lnplus.lookup(pubkey).catch(() => null),
+        settings.get().nodeLookups
+          ? lookupPublicNode(pubkey).then(
+              (record) => ({ record, state: record ? ("ok" as const) : ("unknown" as const), error: null }),
+              (err: unknown) => ({ record: null, state: "unavailable" as const, error: err instanceof Error ? err.message : String(err) }),
+            )
+          : Promise.resolve({ record: null, state: "off" as const, error: null }),
       ]);
-      const nowMs = Date.now();
-      autopilot.uptime.observe(channels, nowMs);
-      const leases = channelLeases(channels, autopilot.leaseSources(), height, nowMs);
-      const rateById = new Map((rates?.channels ?? []).map((c) => [c.id, c]));
-      res.json(
-        channels.map((c) => {
-          const r = rateById.get(c.id);
-          return {
-            ...c,
-            feeRatePpm: r ? r.fee_rate : null,
-            baseFeeMsat: r ? Number(r.base_fee_mtokens) : null,
-            lease: leases.get(c.id) ?? null,
-            offline: autopilot.uptime.offlineInfo(c, nowMs),
-          } satisfies ApiChannelView;
-        }),
-      );
+      res.json({
+        lnplus: profile,
+        lnplusState: !lnplus.isEnabled() ? "off" : !profile && lnplus.isPaused() ? "unavailable" : "ok",
+        record: looked.record,
+        recordState: looked.state,
+        recordError: looked.error,
+      } satisfies NodePublicInfo);
+    }),
+  );
+
+  // Any node, by part of its alias or the start of its key: from the graph LND
+  // already has, nothing leaves the machine.
+  router.get(
+    "/nodes/search",
+    wrap(async (req, res) => {
+      const { q } = queryOf<NodeSearchQuery>(req);
+      const typed = typeof q === "string" ? q.trim() : "";
+      if (typed.length < 2 || typed.length > 300) {
+        res.status(400).json({ error: "bad_request", message: "q (2–300 characters) required." });
+        return;
+      }
+      const [graph, channels] = await Promise.all([buildGraphCache(lnd), getChannelsView(lnd)]);
+      res.json({
+        hits: searchGraph(graph, new Set(channels.map((c) => c.peerPubkey)), typed),
+        graphAgeSec: Math.round((Date.now() - graph.at) / 1000),
+      } satisfies NodeSearchResponse);
     }),
   );
 
@@ -1428,6 +1531,9 @@ export function createApiRouter(
     }),
   );
 
+  /** The nodes a click is opening a channel to right now. */
+  const manualOpens = new Set<string>();
+
   // Open a channel to a peer — real on-chain action, requires write access.
   router.post(
     "/channels/open",
@@ -1455,46 +1561,59 @@ export function createApiRouter(
         res.status(400).json({ error: "bad_request", message: "spendPromised must be true or false." });
         return;
       }
-      // The routing fee it starts with: the one the fee engine protects a new
-      // channel at — not LND's default (stock: 1 sat + 1 ppm).
-      const routing = autopilot.initialRoutingFee();
-      const params = {
-        pubkey,
-        socket: socket ? String(socket) : undefined,
-        localTokens: amount,
-        feeRate: fee ?? undefined,
-        isPrivate: Boolean(isPrivate),
-        routingFeePpm: routing.feeRatePpm,
-        routingBaseFeeMsat: routing.baseFeeMsat,
-      };
-      // Coins promised to buyers are not the click's to spend (unless the
-      // operator confirmed exactly that): a cheap look before the dial, so a
-      // peer isn't dialed for an open that would be refused anyway.
-      const early = spendPromised ? null : await promisedSpendRefusal(lnd, autopilot.capital, amount, { newChannel: true });
-      if (early) {
-        refusePromisedSpend(res, early);
+      // One open to a node at a time: the dial alone can take a minute and a
+      // half, and a second click (another tab, a form opened again) would only
+      // wait its turn at the mutex and fund a second channel.
+      const opener = pubkey.toLowerCase();
+      if (manualOpens.has(opener)) {
+        res.status(409).json({ error: "open_in_flight", message: "An open to this node is already under way." });
         return;
       }
-      // Dial first, outside the mutex (over Tor that can take a minute and a
-      // half) — then the open itself, taken in turn with every other on-chain
-      // commitment (Magma, LSPS1, autopilot opens), so none of those can check
-      // the balance while this open is spending it.
-      const connected = await connectForOpen(writeLnd, params);
-      if (!connected.ok) {
-        res.json({ ok: false, pubkey, localTokens: amount, error: connected.error } satisfies ApiOpenChannelResult);
-        return;
+      manualOpens.add(opener);
+      try {
+        // The routing fee it starts with: the one the fee engine protects a new
+        // channel at — not LND's default (stock: 1 sat + 1 ppm).
+        const routing = autopilot.initialRoutingFee();
+        const params = {
+          pubkey,
+          socket: socket ? String(socket) : undefined,
+          localTokens: amount,
+          feeRate: fee ?? undefined,
+          isPrivate: Boolean(isPrivate),
+          routingFeePpm: routing.feeRatePpm,
+          routingBaseFeeMsat: routing.baseFeeMsat,
+        };
+        // Coins promised to buyers are not the click's to spend (unless the
+        // operator confirmed exactly that): a cheap look before the dial, so a
+        // peer isn't dialed for an open that would be refused anyway.
+        const early = spendPromised ? null : await promisedSpendRefusal(lnd, autopilot.capital, amount, { newChannel: true });
+        if (early) {
+          refusePromisedSpend(res, early);
+          return;
+        }
+        // Dial first, outside the mutex (over Tor that can take a minute and a
+        // half) — then the open itself, taken in turn with every other on-chain
+        // commitment (Magma, LSPS1, autopilot opens), so none of those can check
+        // the balance while this open is spending it.
+        const connected = await connectForOpen(writeLnd, params);
+        if (!connected.ok) {
+          res.json({ ok: false, pubkey, localTokens: amount, error: connected.error } satisfies ApiOpenChannelResult);
+          return;
+        }
+        const done = await autopilot.capital.mutex.run("manual open", async (): Promise<{ refusal: PromisedSpendRefusal } | { opened: OpenChannelResult }> => {
+          // Again, with the balance as it is now: an order may have been
+          // accepted (or paid) while the peer was dialed.
+          const refusal = spendPromised ? null : await promisedSpendRefusal(lnd, autopilot.capital, amount, { newChannel: true });
+          return refusal ? { refusal } : { opened: await fundChannel(writeLnd, params) };
+        });
+        // Coins spent outside the main run: the offers' capital, within seconds.
+        if ("opened" in done && done.opened.ok) autopilot.recheckOfferCapital();
+        if ("refusal" in done) refusePromisedSpend(res, done.refusal);
+        // An open also says the routing fee the channel starts with.
+        else res.json((done.opened.ok ? { ...done.opened, startingFee: routing } : done.opened) satisfies ApiOpenChannelResult);
+      } finally {
+        manualOpens.delete(opener);
       }
-      const done = await autopilot.capital.mutex.run("manual open", async (): Promise<{ refusal: PromisedSpendRefusal } | { opened: OpenChannelResult }> => {
-        // Again, with the balance as it is now: an order may have been
-        // accepted (or paid) while the peer was dialed.
-        const refusal = spendPromised ? null : await promisedSpendRefusal(lnd, autopilot.capital, amount, { newChannel: true });
-        return refusal ? { refusal } : { opened: await fundChannel(writeLnd, params) };
-      });
-      // Coins spent outside the main run: the offers' capital, within seconds.
-      if ("opened" in done && done.opened.ok) autopilot.recheckOfferCapital();
-      if ("refusal" in done) refusePromisedSpend(res, done.refusal);
-      // An open also says the routing fee the channel starts with.
-      else res.json((done.opened.ok ? { ...done.opened, startingFee: routing } : done.opened) satisfies ApiOpenChannelResult);
     }),
   );
 
@@ -1503,7 +1622,7 @@ export function createApiRouter(
     res.json(settings.get());
   });
   router.post("/settings", (req, res) => {
-    const { fiatCurrency, lspModeEnabled, lnplusLookups } = bodyOf<SettingsPatch>(req);
+    const { fiatCurrency, lspModeEnabled, lnplusLookups, nodeLookups } = bodyOf<SettingsPatch>(req);
     const patch: Parameters<typeof settings.set>[0] = {};
     if (fiatCurrency !== undefined) {
       if (!isOneOf(fiatCurrency, FIAT_CURRENCIES)) {
@@ -1518,6 +1637,13 @@ export function createApiRouter(
         return;
       }
       patch.lnplusLookups = lnplusLookups;
+    }
+    if (nodeLookups !== undefined) {
+      if (typeof nodeLookups !== "boolean") {
+        res.status(400).json({ error: "bad_request", message: "nodeLookups must be true or false." });
+        return;
+      }
+      patch.nodeLookups = nodeLookups;
     }
     if (lspModeEnabled !== undefined) {
       if (typeof lspModeEnabled !== "boolean") {
@@ -1545,6 +1671,7 @@ export function createApiRouter(
     res.json({
       torProxy: proxy ? `${proxy.host}:${proxy.port}` : null,
       lnplusLookups: s.lnplusLookups,
+      nodeLookups: s.nodeLookups,
       destinations: [
         {
           service: "Amboss public market data (api.amboss.space, magma.amboss.tech)",
@@ -1563,7 +1690,7 @@ export function createApiRouter(
         },
         {
           service: "lightningnetwork.plus",
-          what: "node reputations for peer picking, the Pool and Swaps views — your own node's public key included",
+          what: "node reputations for peer picking, the Pool and Swaps views, and any node whose details you open — your own node's public key included",
           active: s.lnplusLookups,
           viaTor: viaTor(),
         },
@@ -1571,6 +1698,12 @@ export function createApiRouter(
           service: "mempool.space",
           what: "the BTC price, only while a fiat currency is chosen",
           active: s.fiatCurrency !== "off",
+          viaTor: viaTor(),
+        },
+        {
+          service: "mempool.space",
+          what: "one node's public record (where it runs, since when), only when you open that node's details",
+          active: s.nodeLookups,
           viaTor: viaTor(),
         },
         {

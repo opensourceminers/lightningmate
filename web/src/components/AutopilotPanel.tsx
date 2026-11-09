@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import type { AreaStatus, AutopilotConfigPatch, AutopilotRun, AutopilotState, DecisionArea, MagmaV2Report, SellDiagnostics } from "../types";
 import { satsCompact, timeAgo } from "../format";
@@ -890,9 +891,11 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
           ) : (
             <ul className="ap-history">
               {server.history.map((run, i) => {
-                const items: { ok: boolean; pending?: boolean; label: string; why?: string; error?: string }[] = [
+                const items: { ok: boolean; pending?: boolean; label: string; why?: string; error?: string; channelId?: string; alias?: string }[] = [
                   ...(run.changes ?? []).map((c) => ({
                     ok: c.ok,
+                    channelId: c.id,
+                    alias: c.alias,
                     // Every change says why (the engine's reason, a lease
                     // promise kept, or by hand).
                     label: historyFeeLine(c),
@@ -901,15 +904,18 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                   })),
                   ...(run.rebalances ?? []).map((r) => ({
                     ok: r.ok,
+                    alias: r.alias,
                     // Still in flight: not a failure (yet) — amber, not a red ✗.
                     pending: r.inFlight,
                     label: `Rebalance · ${r.alias}${r.ok ? ` — ${r.feeSats} sat` : r.inFlight ? " — still in flight" : ""}`,
                     error: r.error,
                   })),
-                  ...(run.channels ?? []).map((c) => ({ ok: c.ok, label: `Open · ${c.alias}${c.ok ? ` — ${satsCompact(c.sizeSats)}` : ""}`, error: c.error })),
+                  ...(run.channels ?? []).map((c) => ({ ok: c.ok, alias: c.alias, label: `Open · ${c.alias}${c.ok ? ` — ${satsCompact(c.sizeSats)}` : ""}`, error: c.error })),
                   ...(run.sells ?? []).map((s) => ({ ok: s.ok, label: `Magma ${s.action} · ${satsCompact(s.sizeSats)}`, error: s.error })),
                   ...(run.maxHtlc ?? []).map((m) => ({
                     ok: m.ok,
+                    channelId: m.id,
+                    alias: m.alias,
                     label: `Max HTLC · ${m.alias}: ${m.fromSat != null ? satsCompact(m.fromSat) : "—"}→${satsCompact(m.toSat)}`,
                     error: m.error,
                   })),
@@ -948,7 +954,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                                 </button>
                               ) : (
                                 <span className={it.ok ? "ap-line-ok" : it.pending ? "ap-line-wait" : "ap-line-fail"}>
-                                  {mark} {it.label}
+                                  {mark} <NodeLink channelId={it.channelId} alias={it.alias}>{it.label}</NodeLink>
                                 </span>
                               )}
                               {it.why ? <div className="muted small ap-why">{it.why}</div> : null}

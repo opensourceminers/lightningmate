@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { COPY_FAILED, copyText } from "../clipboard";
 import { QRCodeSVG } from "qrcode.react";
 import { api } from "../api";
 import { WRITE_MODE_HINT } from "../statusNotes";
@@ -49,9 +50,12 @@ export function PaymentsPanel({ price }: { price?: PriceInfo | null }) {
     }
   };
 
-  const copyInvoice = () => {
+  const copyInvoice = async () => {
     if (!invoice) return;
-    void navigator.clipboard.writeText(invoice.request);
+    if (!(await copyText(invoice.request))) {
+      toast(COPY_FAILED, "error");
+      return;
+    }
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   };

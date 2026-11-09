@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { copyText } from "../clipboard";
 import { goTo } from "../nav";
 import { api } from "../api";
 import {
@@ -311,9 +312,8 @@ export function MarketSell() {
   };
 
   const copyId = (id: string) => {
-    void navigator.clipboard?.writeText(id).then(
-      () => ui.toast("Offer id copied — a buyer can order from it directly (market.order.create).", "success"),
-      () => ui.toast(id, "info"),
+    void copyText(id).then((copied) =>
+      copied ? ui.toast("Offer id copied — a buyer can order from it directly (market.order.create).", "success") : ui.toast(id, "info"),
     );
   };
 

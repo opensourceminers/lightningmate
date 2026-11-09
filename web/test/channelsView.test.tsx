@@ -65,7 +65,7 @@ test("the Open form says what an open costs at the chosen rate, what is left, an
   assert.equal(l.fee, "it starts at 80 ppm + 0 msat routing fee — the fee engine's new-channel fee, not LND's default");
   assert.equal(startingFeeText({ feeRatePpm: 150, baseFeeMsat: 1_000 }), "it starts at 150 ppm + 1,000 msat routing fee — the fee engine's new-channel fee, not LND's default");
   // The form sends the chosen rate (before: only pubkey, socket and size).
-  const panel = readFileSync(new URL("../src/components/SuggestionsPanel.tsx", import.meta.url), "utf8");
+  const panel = readFileSync(new URL("../src/components/OpenChannelForm.tsx", import.meta.url), "utf8");
   assert.match(panel, /\{l\.fee \? <div>\{l\.fee\}<\/div> : null\}/);
   assert.match(panel, /\{result\.startingFee \? ` · \$\{startingFeeText\(result\.startingFee\)\}` : ""\}/);
   assert.match(panel, /\.\.\.\(rate > 0 \? \{ feeRate: rate \} : \{\}\)/);

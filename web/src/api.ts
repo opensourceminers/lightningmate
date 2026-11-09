@@ -1,4 +1,10 @@
 import type {
+  NodeAssessment,
+  NodeDetail,
+  NodePublicInfo,
+  NodeQuery,
+  NodeSearchQuery,
+  NodeSearchResponse,
   Alert,
   AlertAckRequest,
   AlertAckResult,
@@ -187,8 +193,8 @@ function queryString(query: object | undefined): string {
  * (`/pnl?days=${days}`), and a parameter renamed on one side passed every
  * check — the page silently got the route's default.
  */
-async function get<T, Q extends object = NoQuery>(path: string, query?: Q): Promise<T> {
-  return handle<T>(await fetch(`/api${path}${queryString(query)}`, { headers: authHeaders() }));
+async function get<T, Q extends object = NoQuery>(path: string, query?: Q, signal?: AbortSignal): Promise<T> {
+  return handle<T>(await fetch(`/api${path}${queryString(query)}`, { headers: authHeaders(), signal }));
 }
 
 /** The body of a POST that acts without one: an empty JSON object (the
@@ -224,6 +230,10 @@ export const api = {
   node: () => get<NodeSummary>("/node"),
   dashboard: () => get<DashboardData, TzQuery>("/dashboard", { tz: tzOffsetMin() }),
   channels: () => get<ChannelView[]>("/channels"),
+  nodeDetail: (pubkey: string) => get<NodeDetail, NodeQuery>("/nodes/detail", { pubkey }),
+  nodeAssessment: (pubkey: string) => get<NodeAssessment, NodeQuery>("/nodes/assessment", { pubkey }),
+  nodePublic: (pubkey: string) => get<NodePublicInfo, NodeQuery>("/nodes/public", { pubkey }),
+  nodeSearch: (q: string, signal?: AbortSignal) => get<NodeSearchResponse, NodeSearchQuery>("/nodes/search", { q }, signal),
   flows: (days?: number) => get<FlowSummary, DaysQuery>("/flows", { days }),
   pnl: (days: number) => get<PnlSummary, DaysQuery>("/pnl", { days }),
   score: () => get<NodeScore>("/score"),

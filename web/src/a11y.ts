@@ -39,7 +39,21 @@ export function trapTab(current: number, count: number, shift: boolean): number 
   return current === -1 || current >= count - 1 ? 0 : null;
 }
 
-const FOCUSABLE = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+const FOCUSABLE = 'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])';
+
+/** Tab can land on it: what a closed `<details>` hides can't take focus, its
+ *  own `<summary>` can (unless a closed one around it hides that too). */
+function notHiddenByFold(el: HTMLElement): boolean {
+  const closed = el.closest("details:not([open])");
+  if (!closed) return true;
+  if (el.tagName !== "SUMMARY" || el.parentElement !== closed) return false;
+  return !closed.parentElement?.closest("details:not([open])");
+}
+
+/** The dialogs open now, oldest first: only the newest answers the keyboard.
+ *  (A close dialog over the node details: Esc closes the dialog alone, and Tab
+ *  stays in it.) */
+const openDialogs: object[] = [];
 
 /**
  * A dialog's keyboard behaviour while `open`: focus moves into it (its first
@@ -54,9 +68,12 @@ export function useDialogFocus(ref: RefObject<HTMLElement | null>, open: boolean
     const el = ref.current;
     if (!el) return;
     const before = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const focusables = () => Array.from(el.querySelectorAll<HTMLElement>(FOCUSABLE));
+    const focusables = () => Array.from(el.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(notHiddenByFold);
+    const self = {};
+    openDialogs.push(self);
     (focusables()[0] ?? el).focus();
     const onKey = (e: globalThis.KeyboardEvent) => {
+      if (openDialogs[openDialogs.length - 1] !== self) return;
       if (e.key === "Escape") {
         e.preventDefault();
         close.current();
@@ -72,6 +89,7 @@ export function useDialogFocus(ref: RefObject<HTMLElement | null>, open: boolean
     document.addEventListener("keydown", onKey);
     return () => {
       document.removeEventListener("keydown", onKey);
+      openDialogs.splice(openDialogs.indexOf(self), 1);
       before?.focus?.();
     };
   }, [open, ref]);

@@ -23,7 +23,15 @@ standalone via Docker.
   activity (a rebalance as one line, channel opens and closes named), your
   **top channels** (fees earned out plus those of the flow they brought in)
   and graph-based **peer suggestions**.
-- **Channels** — live balance bars with source / sink / router roles, scored
+- **Node details** — click a node in any list, or find any node by alias or
+  key: where you stand with it in one sentence, what its channel earned, what it
+  charges, its place in the network, how it scores as a peer, and everything an
+  expert wants under Advanced. From LND and this app's records; its public
+  record (where it runs, since when) comes from mempool.space and its
+  reputation from LN+, for that one node, through Tor when Umbrel gives the app
+  its proxy. Each can be switched off under Settings → Privacy.
+- **Channels** — live balance bars, what each channel earned, more columns on
+  request, scored
   peer suggestions, and close candidates — never a channel still opening or
   closing, or one inside its lease (sold on Magma or over LSPS1, or bought on
   Magma; the table tags those). A sale older than the app's order journal is

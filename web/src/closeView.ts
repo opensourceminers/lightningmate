@@ -38,7 +38,7 @@ const MAX_CSV_BLOCKS = 2_016;
 const SWEEP_VBYTES = 110;
 
 /** "~1 day", "~14 days" for a number of blocks. */
-const daysText = (blocks: number) => {
+export const daysText = (blocks: number) => {
   const d = Math.max(1, Math.round(blocks / 144));
   return `~${d} day${d === 1 ? "" : "s"}`;
 };

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { COPY_FAILED, copyText } from "../clipboard";
 import { api } from "../api";
 import { pageHidden } from "../usePolledData";
 import type { AmbossKeyCheck, AppSettings, FiatCurrency, LspStatus, PrivacyInfo } from "../types";
@@ -136,7 +137,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
     }
   };
 
-  const savePrivacy = async (patch: { lnplusLookups?: boolean }) => {
+  const savePrivacy = async (patch: { lnplusLookups?: boolean; nodeLookups?: boolean }) => {
     setBusy(true);
     setError(null);
     try {
@@ -184,8 +185,11 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
     }
   };
 
-  const copyUri = (uri: string) => {
-    void navigator.clipboard.writeText(uri);
+  const copyUri = async (uri: string) => {
+    if (!(await copyText(uri))) {
+      ui.toast(COPY_FAILED, "error");
+      return;
+    }
     setUriCopied(true);
     setTimeout(() => setUriCopied(false), 1500);
   };
@@ -198,9 +202,12 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
   const preferredUri = (l: LspStatus) =>
     l.uris.find((u) => u.includes(".onion")) ?? l.uris[0] ?? l.pubkey;
 
-  const copyBuyerGuide = () => {
+  const copyBuyerGuide = async () => {
     if (!lsp) return;
-    void navigator.clipboard.writeText(lspBuyerGuide(preferredUri(lsp)));
+    if (!(await copyText(lspBuyerGuide(preferredUri(lsp))))) {
+      ui.toast(COPY_FAILED, "error");
+      return;
+    }
     setGuideCopied(true);
     setTimeout(() => setGuideCopied(false), 1500);
   };
@@ -226,8 +233,11 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
     }
   };
 
-  const copySig = () => {
-    void navigator.clipboard.writeText(signature);
+  const copySig = async () => {
+    if (!(await copyText(signature))) {
+      ui.toast(COPY_FAILED, "error");
+      return;
+    }
     setSigCopied(true);
     setTimeout(() => setSigCopied(false), 1500);
   };
@@ -271,13 +281,22 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
               onChange={(v) => void savePrivacy({ lnplusLookups: v })}
               label="LN+ lookups"
             />
-            <span className="muted">LN+ lookups: peer reputations from lightningnetwork.plus — your node's own key included</span>
+            <span className="muted">LN+ lookups: peer reputations from lightningnetwork.plus, for any node whose details you open too — your node's own key included</span>
+          </div>
+          <div className="amboss-row" style={{ marginTop: 10 }}>
+            <Switch
+              checked={privacy.nodeLookups}
+              disabled={busy}
+              onChange={(v) => void savePrivacy({ nodeLookups: v })}
+              label="Public node records"
+            />
+            <span className="muted">Public node records: where a node runs and since when, from mempool.space — one node, only when you open its details.</span>
           </div>
           <details className="set-more">
             <summary>Where each lookup goes</summary>
             <ul className="close-aside">
               {privacy.destinations.map((d) => (
-                <li key={d.service}>{destinationLine(d)}</li>
+                <li key={`${d.service}:${d.what}`}>{destinationLine(d)}</li>
               ))}
             </ul>
           </details>

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import { pageHidden } from "../usePolledData";
 import type { BuyOffer, BuyOffersResponse, OrderState } from "../types";
@@ -241,7 +242,9 @@ export function MarketBuy() {
                 return (
                   <tr key={o.offerId} className={o.eligible === false ? "inactive" : ""}>
                     <td title={o.sellerPubkey}>
-                      <code>{o.sellerPubkey.slice(0, 14)}…</code>
+                      <NodeLink pubkey={o.sellerPubkey}>
+                        <code>{o.sellerPubkey.slice(0, 14)}…</code>
+                      </NodeLink>
                     </td>
                     <td className="num">{o.sellerScore.toFixed(1)}</td>
                     <td className="num" title={`${o.leaseBlocks} blocks`}>

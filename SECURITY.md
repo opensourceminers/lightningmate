@@ -12,10 +12,12 @@ security@opensourceminers.de (please don't open a public issue first).
 - **Outbound traffic, said plainly.** Your node stays Tor-only, but
   LightningMate's own lookups are the app's, not the node's. Beyond LND, the
   app talks to:
-  - **LN+ (lightningnetwork.plus)**: node reputations for picking peers and
-    for the Pool and Swaps views. This includes a lookup of this node's own
+  - **LN+ (lightningnetwork.plus)**: node reputations for picking peers, for
+    the Pool and Swaps views, and for any node whose details you open, your
+    current peers too. This includes a lookup of this node's own
     public key. LN+ lookups are **on by default**; switch them off under
-    Settings → Privacy ("LN+ lookups").
+    Settings → Privacy ("LN+ lookups"). That switch is separate from the one
+    for mempool.space's node records.
   - **Amboss**: public Magma market data from api.amboss.space and
     magma.amboss.tech (offers, recent sales, the dollar rate, and this node's
     public seller score, so its public key too). This is read **with or
@@ -24,7 +26,10 @@ security@opensourceminers.de (please don't open a public issue first).
     key, the app also reads and manages your offers, orders and purchases
     (magma.amboss.tech for everything that acts). Those calls carry the key
     and are tied to your Amboss account.
-  - **mempool.space**: the BTC price, only while a fiat currency is chosen.
+  - **mempool.space**: the BTC price, only while a fiat currency is chosen;
+    and one node's public record (where it runs, since when), only when you
+    open that node's details, unless switched off in Settings → Privacy. Never
+    a list of your peers. Through Tor, its onion service is asked.
   - **The service-fee lightning address**: an LNURL-pay lookup after a
     completed liquidity sale with the service fee enabled.
 

@@ -16,6 +16,8 @@
  * local HTTP/HTTPS servers (what the services would be).
  */
 import { test, type TestContext } from "node:test";
+import { clearNodeLookupCache, lookupPublicNode } from "../src/services/nodeLookup.js";
+import { getBtcPrice } from "../src/services/price.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
@@ -23,7 +25,7 @@ import http from "node:http";
 import https from "node:https";
 import net, { type AddressInfo } from "node:net";
 import { join } from "node:path";
-import { HttpTimeoutError, httpRequest, setOutboundRouting, torVia, viaTor } from "../src/services/http.js";
+import { HttpTimeoutError, httpRequest, mempoolBase, setOutboundRouting, torVia, viaTor } from "../src/services/http.js";
 import { ambossGql } from "../src/services/amboss.js";
 import { __resetEligibilityCache } from "../src/services/magmaEligibility.js";
 import { socksFetch, torProxyFromEnv } from "../src/services/torProxy.js";
@@ -150,6 +152,26 @@ test("through the proxy the destination is sent by NAME (Tor resolves it — no 
   assert.equal(web.seen[0].host, "lightningnetwork.plus");
 });
 
+test("mempool.space leaves Tor exits unanswered: through Tor the price and a node's record ask its onion service, without a proxy its website", async (t) => {
+  restoreRouting(t);
+  clearNodeLookupCache();
+  const web = await webServer(t);
+  const socks = await socksServer(t, () => web.port);
+  installFetchMock(t);
+  setOutboundRouting({ proxy: socks.proxy });
+  const onion = "mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion";
+  await getBtcPrice("CHF");
+  await lookupPublicNode("02" + "ab".repeat(32));
+  assert.deepEqual(socks.asked, [
+    { host: onion, port: 80 },
+    { host: onion, port: 80 },
+  ]);
+  assert.deepEqual(web.seen.map((s) => s.host), [onion, onion]);
+  assert.equal(mempoolBase(), `http://${onion}`);
+  setOutboundRouting({ proxy: null });
+  assert.equal(mempoolBase(), "https://mempool.space");
+});
+
 test("with a proxy every request goes through Tor — LN+, the price, Amboss with and without the API key, the fee lookup — and none goes direct; without one, every request goes direct", async (t) => {
   restoreRouting(t);
   const web = await webServer(t);
@@ -261,6 +283,7 @@ test("LN+ can be switched off: no LN+ request at all — the views say so — an
     ["Amboss account (magma.amboss.tech)", false, false],
     ["lightningnetwork.plus", false, false],
     ["mempool.space", false, false],
+    ["mempool.space", true, false],
     ["the service-fee lightning address", true, false],
   ]);
   // With Umbrel's proxy every one goes through Tor — the account calls (with
@@ -275,6 +298,7 @@ test("LN+ can be switched off: no LN+ request at all — the views say so — an
     ["Amboss public market data (api.amboss.space, magma.amboss.tech)", true],
     ["Amboss account (magma.amboss.tech)", true],
     ["lightningnetwork.plus", true],
+    ["mempool.space", true],
     ["mempool.space", true],
     ["the service-fee lightning address", true],
   ]);

@@ -1,4 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
+import { useNodeChanges } from "../nodeNav";
+import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import { caretButtonProps } from "../a11y";
 import type { AutopilotChange, FeeMode, FeeRecReport, FeeRecState, OverrideMap } from "../types";
@@ -73,6 +75,10 @@ export function FeeRecommendations() {
   const [applying, setApplying] = useState(false);
   const [applied, setApplied] = useState<AutopilotChange[] | null>(null);
   const [overrides, setOverrides] = useState<OverrideMap>({});
+  // A fee mode saved in a node's details: this list shows it too.
+  useNodeChanges(({ overrides: saved }) => {
+    if (saved) setOverrides(saved);
+  });
   const [showAll, setShowAll] = useState(false);
   const [open, setOpen] = useState<Set<string>>(new Set());
   const toggle = (id: string) =>
@@ -227,7 +233,7 @@ export function FeeRecommendations() {
                           <button {...caretButtonProps(isOpen, () => toggle(r.channelId), `Why: ${r.alias}`)}>{isOpen ? "▾" : "▸"}</button>
                         </td>
                         <td>
-                          {r.alias}
+                          <NodeLink channelId={r.channelId} alias={r.alias} />
                           {m.isTopEarner ? <span className="top-earner" title="top earner"> ★</span> : null}
                         </td>
                         <td className="num">{pct(m.localRatio)}</td>

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import { sharedMagmaReport } from "../magmaReport";
 import type { BoughtInboundResponse, ChannelView, ForwardsReport, MagmaV2Report, OutcomesReport, RebalanceCostsResponse } from "../types";
@@ -112,7 +113,7 @@ export function ChannelProfitability({ rows }: { rows: ChannelPnlRow[] }) {
             {rows.map((r) => (
               <tr key={r.channelId} className={r.contributionSats < 0 ? "pnl-loser" : ""}>
                 <td className="an-alias">
-                  {r.alias}
+                  <NodeLink channelId={r.channelId} alias={r.alias} />
                   {r.status === "closed" ? <span className="muted"> · closed</span> : null}
                 </td>
                 <td>
@@ -172,7 +173,7 @@ function RefillsTable({ outcomes }: { outcomes: OutcomesReport }) {
           {r.items.slice(0, 12).map((i) => (
             <tr key={`${i.targetId}-${i.at}`} className={i.status === "measuring" ? "muted" : ""}>
               <td className="an-alias" title={`sent ${timeAgo(i.at)}`}>
-                {i.alias}
+                <NodeLink channelId={i.targetId} alias={i.alias} />
               </td>
               <td className="num">{satsCompact(i.amountSats)}</td>
               <td className="num cost">−{sats(i.costSats)}</td>
@@ -217,7 +218,7 @@ export function BoughtInbound({ data }: { data: BoughtInboundResponse }) {
           {data.items.map((p) => (
             <tr key={p.orderId}>
               <td className="an-alias" title={`order ${p.orderId} · ${p.leaseDays}-day lease ${p.running ? `until ${p.leaseEndsAt.slice(0, 10)} (so far)` : "ended"}`}>
-                {p.alias || p.channelId || "channel not found"}
+                {p.alias ? <NodeLink channelId={p.channelId} alias={p.alias} /> : p.channelId || "channel not found"}
               </td>
               <td className="num">{satsCompact(p.sizeSats)}</td>
               <td className="num cost">−{sats(p.costSats)}</td>
@@ -410,7 +411,7 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
                 <tbody>
                   {outcomes.fees.items.slice(0, 12).map((f, i) => (
                     <tr key={`${f.channelId}-${i}`}>
-                      <td className="an-alias">{f.alias}</td>
+                      <td className="an-alias"><NodeLink channelId={f.channelId} alias={f.alias} /></td>
                       <td className="num">
                         {f.fromPpm} <span className={f.raised ? "delta-up" : "delta-down"}>→ {f.toPpm}</span>
                       </td>

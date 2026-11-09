@@ -55,7 +55,7 @@ test("on an LND that won't estimate for one block (before 0.20), the 'fast' rate
   assert.equal(fastRateHint({ fastTarget: 2 }), "~2 blocks");
   assert.equal(fastRateHint({ fastTarget: 1 }), "next block");
   assert.equal(fastRateHint({ fastTarget: null }), "next block");
-  for (const file of ["CloseChannelDialog.tsx", "SuggestionsPanel.tsx"]) {
+  for (const file of ["CloseChannelDialog.tsx", "OpenChannelForm.tsx"]) {
     const src = readFileSync(new URL(`../src/components/${file}`, import.meta.url), "utf8");
     assert.match(src, /fastRateHint\((fees|estimate\.fees)\)/, file);
   }

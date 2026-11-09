@@ -11,6 +11,7 @@ import type { OverrideMap } from "./overrides.js";
 import {
   buildGraphCache,
   DEFAULT_SUGGESTION_POLICY,
+  type GraphCache,
   type NodeMeta,
   type NodeStat,
   type SuggestionPolicy,
@@ -255,14 +256,29 @@ function feeReasonableness(avgFee: number): number {
   return 0.2;
 }
 
-export async function getChannelSuggestionsV2(
-  lnd: AuthenticatedLnd,
-  overrides: Partial<SuggestV2Config> = {},
-  /** Optional LN+ reputation source. Omit it and scoring is exactly as before. */
-  lnplus?: LnPlusStore,
-): Promise<SuggestV2Report> {
-  const policy = { ...SUGGEST_V2_DEFAULTS, ...overrides };
+/** Everything scoring a node reads, once per request. */
+interface SuggestInputs {
+  graph: GraphCache;
+  channels: ChannelView[];
+  ownKey: string;
+  torOnly: boolean;
+  closedDays: Map<string, number>;
+  closeHistoryKnown: boolean;
+  now: number;
+  staleMs: number;
+  peers: Set<string>;
+  ourMedianChan: number;
+  reachable: Set<string>;
+  nodeNeed: NodeNeed;
+  nodeNeedReason: string;
+  peerWeights: { pubkey: string; weight: number }[];
+  totalDemand: number;
+  hasDemandData: boolean;
+  demandWeight: Map<string, number>;
+  peerTags: Map<string, Set<number>>;
+}
 
+async function readSuggestInputs(lnd: AuthenticatedLnd, policy: SuggestV2Config): Promise<SuggestInputs> {
   const [graph, channels, ownKey, flow, info, closed] = await Promise.all([
     buildGraphCache(lnd),
     getChannelsView(lnd),
@@ -341,33 +357,84 @@ export async function getChannelSuggestionsV2(
     const ps = graph.stats.get(pubkey);
     if (ps) for (const n of ps.neighbors) tag(n);
   });
-
-  // ── Eligible candidates (same filters as v1) ────────────────────────────────
   const staleMs = policy.maxStaleDays * 86_400_000;
-  const eligible: { pk: string; stat: NodeStat; meta: NodeMeta }[] = [];
-  for (const [pk, stat] of graph.stats) {
-    if (pk === ownKey || peers.has(pk)) continue;
-    if (stat.degree < policy.minChannels) continue;
-    if (stat.enabledCount === 0) continue;
-    const meta = graph.meta.get(pk);
-    if (!meta) continue;
-    if (now - meta.updatedAt > staleMs) continue;
-    if (policy.requireClearnet && !meta.hasClearnet) continue;
+  return {
+    graph,
+    channels,
+    ownKey,
+    torOnly,
+    closedDays,
+    closeHistoryKnown,
+    now,
+    staleMs,
+    peers,
+    ourMedianChan,
+    reachable,
+    nodeNeed,
+    nodeNeedReason,
+    peerWeights,
+    totalDemand,
+    hasDemandData,
+    demandWeight,
+    peerTags,
+  };
+}
+
+/** Why the suggestions leave a node out (none: it is a candidate). */
+function whyNotCandidate(pk: string, stat: NodeStat, meta: NodeMeta | undefined, inp: SuggestInputs, policy: SuggestV2Config): string[] {
+  const why: string[] = [];
+  if (pk === inp.ownKey) why.push("it is your own node");
+  if (inp.peers.has(pk)) why.push("you already have a channel with it");
+  if (stat.degree < policy.minChannels) why.push(`it has ${stat.degree} channel${stat.degree === 1 ? "" : "s"} (suggestions start at ${policy.minChannels})`);
+  if (stat.enabledCount === 0) why.push("none of its channels is enabled");
+  if (!meta) {
+    why.push("it has not announced itself");
+  } else {
+    if (inp.now - meta.updatedAt > inp.staleMs) why.push(`its last announcement is ${Math.round((inp.now - meta.updatedAt) / 86_400_000).toLocaleString("en-US")} days old (suggestions stop at ${policy.maxStaleDays})`);
+    if (policy.requireClearnet && !meta.hasClearnet) why.push("it has no clearnet address");
+  }
+  return why;
+}
+
+interface Candidate {
+  pk: string;
+  stat: NodeStat;
+  meta: NodeMeta;
+}
+
+function eligibleCandidates(inp: SuggestInputs, policy: SuggestV2Config): Candidate[] {
+  const eligible: Candidate[] = [];
+  for (const [pk, stat] of inp.graph.stats) {
+    const meta = inp.graph.meta.get(pk);
+    if (!meta || whyNotCandidate(pk, stat, meta, inp, policy).length > 0) continue;
     eligible.push({ pk, stat, meta });
   }
+  return eligible;
+}
 
-  if (eligible.length === 0) {
-    return {
-      policy,
-      nodeNeed,
-      nodeNeedReason,
-      hasDemandData,
-      suggestions: [],
-      graphAgeSec: Math.round((now - graph.at) / 1000),
-      lnplus: { enabled: !!lnplus && lnplus.isEnabled(), checked: 0, known: 0, paused: lnplus?.isPaused() ?? false, error: null },
-      portfolioSummary: { selectedCount: 0, estimatedNewReach: 0, estimatedWeightedNewReach: 0, demandCoveragePct: 0 },
-    };
-  }
+interface Scored {
+  e: { pk: string; stat: NodeStat; meta: NodeMeta };
+  avgFee: number;
+  newReachNodes: string[];
+  weightedNewReach: number;
+  qualityReachCount: number;
+  graphScore: number;
+  demandScore: number;
+  weightedReachScore: number;
+  roleFitScore: number;
+  economicsScore: number;
+  demandOverlapCount: number;
+  demandFlowSharePct: number;
+  rawScore: number;
+  /** LN+ reputation, filled in later for the shortlist only (may stay null). */
+  lnplus: LnPlusNode | null;
+  /** Multiplier the LN+ reputation applies to rawScore (1 = no data). */
+  trustMultiplier: number;
+}
+
+/** Score `candidates` against each other: each one's parts and its raw score. */
+function scoreCandidates(inp: SuggestInputs, candidates: Candidate[]) {
+  const { graph, now, staleMs, reachable, demandWeight, peerTags, peerWeights, totalDemand, nodeNeed, hasDemandData } = inp;
 
   // Global liquidity-depth bound (over the whole graph, for node quality).
   let maxLogDepth = 0;
@@ -397,30 +464,10 @@ export async function getChannelSuggestionsV2(
     return q;
   };
 
-  interface Scored {
-    e: { pk: string; stat: NodeStat; meta: NodeMeta };
-    avgFee: number;
-    newReachNodes: string[];
-    weightedNewReach: number;
-    qualityReachCount: number;
-    graphScore: number;
-    demandScore: number;
-    weightedReachScore: number;
-    roleFitScore: number;
-    economicsScore: number;
-    demandOverlapCount: number;
-    demandFlowSharePct: number;
-    rawScore: number;
-    /** LN+ reputation, filled in later for the shortlist only (may stay null). */
-    lnplus: LnPlusNode | null;
-    /** Multiplier the LN+ reputation applies to rawScore (1 = no data). */
-    trustMultiplier: number;
-  }
-
   // First pass: per-candidate raw components.
   let maxDemandRaw = 0;
   const demandRawByPk = new Map<string, number>();
-  const pre = eligible.map((e) => {
+  const pre = candidates.map((e) => {
     const { stat } = e;
     const newReachNodes: string[] = [];
     for (const n of stat.neighbors) if (!reachable.has(n)) newReachNodes.push(n);
@@ -544,6 +591,176 @@ export async function getChannelSuggestionsV2(
     };
   });
 
+  return { pre, scored, nodeQuality };
+}
+
+/** A scored candidate as the API and the list show it. `rank` and `overlap`:
+ *  its place among the picks (0, 0: judged on its own). */
+function toSuggestion(inp: SuggestInputs, policy: SuggestV2Config, s: Scored, overlap: number, rank: number): SuggestionV2 {
+  const { ourMedianChan, hasDemandData, closedDays, closeHistoryKnown, nodeNeed, torOnly, now } = inp;
+  const { stat, meta, pk } = { ...s.e, pk: s.e.pk };
+  const avgChan = avgChanOf(stat);
+
+  // Size v2: geometric base, nudged by demand strength and candidate risk.
+  const base = Math.sqrt(ourMedianChan * (avgChan || ourMedianChan));
+  const demandMul = s.demandScore >= 0.6 ? 1.25 : s.demandScore <= 0.25 ? 0.75 : 1;
+  const strong = s.demandScore >= 0.6 && s.weightedReachScore >= 0.4 && s.economicsScore >= 0.6;
+  const riskMul = strong ? 1.1 : s.economicsScore < 0.4 ? 0.85 : 1;
+  const recommendedSizeSats = Math.min(
+    policy.maxSizeSats,
+    Math.max(policy.minSizeSats, roundTo100k(base * demandMul * riskMul)),
+  );
+  const sizeReason =
+    `geometric mean of your ${(ourMedianChan / 1e6).toFixed(1)}M median and the peer's ${(avgChan / 1e6).toFixed(1)}M avg channel` +
+    (demandMul > 1 ? ", sized up for strong demand" : demandMul < 1 ? ", sized down for weak demand" : "");
+
+  // Reasons (human, ranked by what actually drove the score).
+  const reasons: string[] = [];
+  if (hasDemandData && s.demandFlowSharePct >= 5) {
+    reasons.push(
+      `Demand fit: adjacent to peers involved in ${s.demandFlowSharePct}% of your ${policy.demandWindowDays}d outbound flow.`,
+    );
+  }
+  if (s.qualityReachCount > 0) {
+    reasons.push(
+      `Quality reach: ${s.newReachNodes.length} new 2-hop nodes, ${s.qualityReachCount} of them active/high-quality routers.`,
+    );
+  } else if (s.newReachNodes.length > 0) {
+    reasons.push(`Opens ${s.newReachNodes.length} new 2-hop destination${s.newReachNodes.length === 1 ? "" : "s"}.`);
+  }
+  if (rank > 0 && overlap <= 0.34) {
+    reasons.push("Diversifies your portfolio: covers a different cluster than the higher-ranked picks.");
+  }
+  const activityShare = stat.degree ? stat.recentUpdates / stat.degree : 0;
+  if (activityShare >= 0.5 && s.avgFee <= 1200) {
+    reasons.push("Moderate fees and fresh policies — an actively maintained router.");
+  }
+  if (reasons.length === 0) reasons.push(`${stat.degree} channels · ${(stat.totalCapacity / 1e8).toFixed(1)} BTC.`);
+
+  // Warnings (honest caveats).
+  const warnings: string[] = [];
+  const oversat = Math.max(0, (Math.log(stat.degree) - Math.log(250)) / (Math.log(4000) - Math.log(250)));
+  if (oversat > 0.5 && s.demandScore < 0.3) {
+    warnings.push("Large hub: useful reach, but it overlaps heavily with peers you already connect to.");
+  }
+  if (s.avgFee > 2000) warnings.push("High average fees: handy for reach, less attractive for profitable routing.");
+  const closedDaysAgo = closedDays.get(pk) ?? null;
+  if (closedDaysAgo !== null) {
+    warnings.push(`You closed a channel with this node ${closedDaysAgo === 0 ? "recently" : `${closedDaysAgo} days ago`} — the autopilot doesn't reopen to it within ${RECENT_CLOSE_DAYS} days.`);
+  } else if (!closeHistoryKnown) {
+    warnings.push("LND didn't say its block height or its closed channels — whether you closed a channel with it lately is unknown, so the autopilot doesn't open to it until it does.");
+  }
+  if (meta.sockets.length === 0) warnings.push("It advertises no address — it can only be opened to while it is connected to you.");
+  if (hasDemandData && s.demandScore < 0.15) {
+    warnings.push("Low demand evidence: this pick rests mainly on graph topology.");
+  }
+  const needCaveat = needWarning(nodeNeed);
+  if (needCaveat) warnings.push(needCaveat);
+
+  // Badges (compact, for the row).
+  const badges: string[] = [];
+  if (hasDemandData && s.demandScore >= 0.5) badges.push("demand fit");
+  if (rank > 0 && overlap <= 0.34) badges.push("new cluster");
+  if (activityShare >= 0.5) badges.push("active router");
+  if (s.avgFee > 0 && s.avgFee <= 600) badges.push("moderate fees");
+  if (avgChan >= 5_000_000) badges.push("high liquidity");
+
+  // LN+ reputation: the one signal the graph cannot carry — whether real
+  // operators have dealt with this node and would do it again.
+  const lp = s.lnplus;
+  if (lp) {
+    const ratings = lp.positiveRatings + lp.negativeRatings;
+    if (lp.rank >= 7) badges.push(`LN+ ${lp.rankName || `rank ${lp.rank}`}`);
+    if (lp.prime) badges.push("LN+ Prime");
+    if (lp.negativeRatings > 0 && lp.negativeRatings >= lp.positiveRatings) {
+      warnings.push(
+        `LN+ peers rate this node poorly: ${lp.positiveRatings} positive vs ${lp.negativeRatings} negative.`,
+      );
+    } else if (ratings >= 5 && lp.positiveRatings > lp.negativeRatings) {
+      reasons.push(
+        `Vouched for on LN+: rank ${lp.rank}/10${lp.rankName ? ` (${lp.rankName})` : ""}, ${lp.positiveRatings} positive rating${lp.positiveRatings === 1 ? "" : "s"} from real operators.`,
+      );
+    }
+  }
+
+  const usefulness: SuggestionV2["usefulness"] =
+    s.rawScore >= 0.55 ? "high" : s.rawScore >= 0.35 ? "medium" : "low";
+
+  const sockets = dialOrder(meta.sockets, torOnly);
+  return {
+    pubkey: pk,
+    alias: meta.alias,
+    socket: sockets[0] ?? "",
+    sockets,
+    hasClearnet: meta.hasClearnet,
+    channels: stat.degree,
+    capacitySats: stat.totalCapacity,
+    avgChannelSats: Math.round(avgChan),
+    avgFeePpm: Math.round(s.avgFee),
+    lastSeenDays: Math.round((now - meta.updatedAt) / 86_400_000),
+    score: Math.round(s.rawScore * 100),
+    graphScore: Math.round(s.graphScore * 100) / 100,
+    demandScore: Math.round(s.demandScore * 100) / 100,
+    weightedReachScore: Math.round(s.weightedReachScore * 100) / 100,
+    roleFitScore: Math.round(s.roleFitScore * 100) / 100,
+    economicsScore: Math.round(s.economicsScore * 100) / 100,
+    newReach: s.newReachNodes.length,
+    weightedNewReach: Math.round(s.weightedNewReach * 10) / 10,
+    qualityReachCount: s.qualityReachCount,
+    demandOverlapCount: s.demandOverlapCount,
+    demandFlowSharePct: s.demandFlowSharePct,
+    portfolioOverlap: Math.round(overlap * 100) / 100,
+    recommendedSizeSats,
+    sizeReason,
+    usefulness,
+    badges,
+    reasons,
+    warnings,
+    lnplus: lp
+      ? {
+          rank: lp.rank,
+          rankName: lp.rankName,
+          prime: lp.prime,
+          verified: lp.verified,
+          positiveRatings: lp.positiveRatings,
+          negativeRatings: lp.negativeRatings,
+          profileUrl: lp.profileUrl,
+          scoreEffectPct: Math.round((s.trustMultiplier - 1) * 100),
+        }
+      : null,
+    peerMinChannelSats: lp && lp.minChannelSizeSats > 0 ? lp.minChannelSizeSats : null,
+    closedDaysAgo,
+    ...(closeHistoryKnown ? {} : { closeHistoryKnown: false as const }),
+  };
+}
+
+export async function getChannelSuggestionsV2(
+  lnd: AuthenticatedLnd,
+  overrides: Partial<SuggestV2Config> = {},
+  /** Optional LN+ reputation source. Omit it and scoring is exactly as before. */
+  lnplus?: LnPlusStore,
+): Promise<SuggestV2Report> {
+  const policy = { ...SUGGEST_V2_DEFAULTS, ...overrides };
+
+  const inp = await readSuggestInputs(lnd, policy);
+  const { graph, nodeNeed, nodeNeedReason, hasDemandData, peerWeights, totalDemand, now } = inp;
+  const eligible = eligibleCandidates(inp, policy);
+
+  if (eligible.length === 0) {
+    return {
+      policy,
+      nodeNeed,
+      nodeNeedReason,
+      hasDemandData,
+      suggestions: [],
+      graphAgeSec: Math.round((now - graph.at) / 1000),
+      lnplus: { enabled: !!lnplus && lnplus.isEnabled(), checked: 0, known: 0, paused: lnplus?.isPaused() ?? false, error: null },
+      portfolioSummary: { selectedCount: 0, estimatedNewReach: 0, estimatedWeightedNewReach: 0, demandCoveragePct: 0 },
+    };
+  }
+
+  const { pre, scored, nodeQuality } = scoreCandidates(inp, eligible);
+
   // ── Greedy portfolio diversification ────────────────────────────────────────
   // Pick from the strongest pool, each round preferring the candidate whose new
   // reach overlaps least with what's already selected — so 12 picks don't all
@@ -600,143 +817,7 @@ export async function getChannelSuggestionsV2(
     for (const n of best.newReachNodes) reachSet.add(n);
   }
 
-  // ── Materialise the output ──────────────────────────────────────────────────
-  const suggestions: SuggestionV2[] = selected.map(({ s, overlap, rank }) => {
-    const { stat, meta, pk } = { ...s.e, pk: s.e.pk };
-    const avgChan = avgChanOf(stat);
-
-    // Size v2: geometric base, nudged by demand strength and candidate risk.
-    const base = Math.sqrt(ourMedianChan * (avgChan || ourMedianChan));
-    const demandMul = s.demandScore >= 0.6 ? 1.25 : s.demandScore <= 0.25 ? 0.75 : 1;
-    const strong = s.demandScore >= 0.6 && s.weightedReachScore >= 0.4 && s.economicsScore >= 0.6;
-    const riskMul = strong ? 1.1 : s.economicsScore < 0.4 ? 0.85 : 1;
-    const recommendedSizeSats = Math.min(
-      policy.maxSizeSats,
-      Math.max(policy.minSizeSats, roundTo100k(base * demandMul * riskMul)),
-    );
-    const sizeReason =
-      `geometric mean of your ${(ourMedianChan / 1e6).toFixed(1)}M median and the peer's ${(avgChan / 1e6).toFixed(1)}M avg channel` +
-      (demandMul > 1 ? ", sized up for strong demand" : demandMul < 1 ? ", sized down for weak demand" : "");
-
-    // Reasons (human, ranked by what actually drove the score).
-    const reasons: string[] = [];
-    if (hasDemandData && s.demandFlowSharePct >= 5) {
-      reasons.push(
-        `Demand fit: adjacent to peers involved in ${s.demandFlowSharePct}% of your ${policy.demandWindowDays}d outbound flow.`,
-      );
-    }
-    if (s.qualityReachCount > 0) {
-      reasons.push(
-        `Quality reach: ${s.newReachNodes.length} new 2-hop nodes, ${s.qualityReachCount} of them active/high-quality routers.`,
-      );
-    } else if (s.newReachNodes.length > 0) {
-      reasons.push(`Opens ${s.newReachNodes.length} new 2-hop destinations.`);
-    }
-    if (rank > 0 && overlap <= 0.34) {
-      reasons.push("Diversifies your portfolio: covers a different cluster than the higher-ranked picks.");
-    }
-    const activityShare = stat.degree ? stat.recentUpdates / stat.degree : 0;
-    if (activityShare >= 0.5 && s.avgFee <= 1200) {
-      reasons.push("Moderate fees and fresh policies — an actively maintained router.");
-    }
-    if (reasons.length === 0) reasons.push(`${stat.degree} channels · ${(stat.totalCapacity / 1e8).toFixed(1)} BTC.`);
-
-    // Warnings (honest caveats).
-    const warnings: string[] = [];
-    const oversat = Math.max(0, (Math.log(stat.degree) - Math.log(250)) / (Math.log(4000) - Math.log(250)));
-    if (oversat > 0.5 && s.demandScore < 0.3) {
-      warnings.push("Large hub: useful reach, but it overlaps heavily with peers you already connect to.");
-    }
-    if (s.avgFee > 2000) warnings.push("High average fees: handy for reach, less attractive for profitable routing.");
-    const closedDaysAgo = closedDays.get(pk) ?? null;
-    if (closedDaysAgo !== null) {
-      warnings.push(`You closed a channel with this node ${closedDaysAgo === 0 ? "recently" : `${closedDaysAgo} days ago`} — the autopilot doesn't reopen to it within ${RECENT_CLOSE_DAYS} days.`);
-    } else if (!closeHistoryKnown) {
-      warnings.push("LND didn't say its block height or its closed channels — whether you closed a channel with it lately is unknown, so the autopilot doesn't open to it until it does.");
-    }
-    if (meta.sockets.length === 0) warnings.push("It advertises no address — it can only be opened to while it is connected to you.");
-    if (hasDemandData && s.demandScore < 0.15) {
-      warnings.push("Low demand evidence: this pick rests mainly on graph topology.");
-    }
-    const needCaveat = needWarning(nodeNeed);
-    if (needCaveat) warnings.push(needCaveat);
-
-    // Badges (compact, for the row).
-    const badges: string[] = [];
-    if (hasDemandData && s.demandScore >= 0.5) badges.push("demand fit");
-    if (rank > 0 && overlap <= 0.34) badges.push("new cluster");
-    if (activityShare >= 0.5) badges.push("active router");
-    if (s.avgFee > 0 && s.avgFee <= 600) badges.push("moderate fees");
-    if (avgChan >= 5_000_000) badges.push("high liquidity");
-
-    // LN+ reputation: the one signal the graph cannot carry — whether real
-    // operators have dealt with this node and would do it again.
-    const lp = s.lnplus;
-    if (lp) {
-      const ratings = lp.positiveRatings + lp.negativeRatings;
-      if (lp.rank >= 7) badges.push(`LN+ ${lp.rankName || `rank ${lp.rank}`}`);
-      if (lp.prime) badges.push("LN+ Prime");
-      if (lp.negativeRatings > 0 && lp.negativeRatings >= lp.positiveRatings) {
-        warnings.push(
-          `LN+ peers rate this node poorly: ${lp.positiveRatings} positive vs ${lp.negativeRatings} negative.`,
-        );
-      } else if (ratings >= 5 && lp.positiveRatings > lp.negativeRatings) {
-        reasons.push(
-          `Vouched for on LN+: rank ${lp.rank}/10${lp.rankName ? ` (${lp.rankName})` : ""}, ${lp.positiveRatings} positive rating${lp.positiveRatings === 1 ? "" : "s"} from real operators.`,
-        );
-      }
-    }
-
-    const usefulness: SuggestionV2["usefulness"] =
-      s.rawScore >= 0.55 ? "high" : s.rawScore >= 0.35 ? "medium" : "low";
-
-    const sockets = dialOrder(meta.sockets, torOnly);
-    return {
-      pubkey: pk,
-      alias: meta.alias,
-      socket: sockets[0] ?? "",
-      sockets,
-      hasClearnet: meta.hasClearnet,
-      channels: stat.degree,
-      capacitySats: stat.totalCapacity,
-      avgChannelSats: Math.round(avgChan),
-      avgFeePpm: Math.round(s.avgFee),
-      lastSeenDays: Math.round((now - meta.updatedAt) / 86_400_000),
-      score: Math.round(s.rawScore * 100),
-      graphScore: Math.round(s.graphScore * 100) / 100,
-      demandScore: Math.round(s.demandScore * 100) / 100,
-      weightedReachScore: Math.round(s.weightedReachScore * 100) / 100,
-      roleFitScore: Math.round(s.roleFitScore * 100) / 100,
-      economicsScore: Math.round(s.economicsScore * 100) / 100,
-      newReach: s.newReachNodes.length,
-      weightedNewReach: Math.round(s.weightedNewReach * 10) / 10,
-      qualityReachCount: s.qualityReachCount,
-      demandOverlapCount: s.demandOverlapCount,
-      demandFlowSharePct: s.demandFlowSharePct,
-      portfolioOverlap: Math.round(overlap * 100) / 100,
-      recommendedSizeSats,
-      sizeReason,
-      usefulness,
-      badges,
-      reasons,
-      warnings,
-      lnplus: lp
-        ? {
-            rank: lp.rank,
-            rankName: lp.rankName,
-            prime: lp.prime,
-            verified: lp.verified,
-            positiveRatings: lp.positiveRatings,
-            negativeRatings: lp.negativeRatings,
-            profileUrl: lp.profileUrl,
-            scoreEffectPct: Math.round((s.trustMultiplier - 1) * 100),
-          }
-        : null,
-      peerMinChannelSats: lp && lp.minChannelSizeSats > 0 ? lp.minChannelSizeSats : null,
-      closedDaysAgo,
-      ...(closeHistoryKnown ? {} : { closeHistoryKnown: false as const }),
-    };
-  });
+  const suggestions: SuggestionV2[] = selected.map(({ s, overlap, rank }) => toSuggestion(inp, policy, s, overlap, rank));
 
   const estimatedNewReach = reachSet.size;
   let estimatedWeightedNewReach = 0;
@@ -773,6 +854,53 @@ export async function getChannelSuggestionsV2(
     },
   };
 }
+
+/** How much one node would add, or does add, judged the way the suggestions judge. */
+export interface NodeAssessment {
+  graphAgeSec: number;
+  /** A peer: how many nodes two hops away only it reaches, what a close loses. */
+  uniqueReach: number | null;
+  /** Any other node, scored as the suggestions score it — on or off their list. */
+  candidate: SuggestionV2 | null;
+  /** What keeps it off the suggestions, in words (none: nothing does, though
+   *  the list still shows only the best few). */
+  notSuggestedBecause: string[];
+}
+
+export async function assessNode(
+  lnd: AuthenticatedLnd,
+  pubkey: string,
+  lnplus?: LnPlusStore,
+  overrides: Partial<SuggestV2Config> = {},
+): Promise<NodeAssessment> {
+  const policy = { ...SUGGEST_V2_DEFAULTS, ...overrides };
+  const inp = await readSuggestInputs(lnd, policy);
+  const { graph, now } = inp;
+  const none = { graphAgeSec: Math.round((now - graph.at) / 1000), uniqueReach: null, candidate: null, notSuggestedBecause: [] as string[] };
+  if (pubkey === inp.ownKey) return none;
+  if (inp.peers.has(pubkey)) return { ...none, uniqueReach: uniqueReachCounter(inp.channels, graph, inp.ownKey)(pubkey) };
+  const stat = graph.stats.get(pubkey);
+  const meta = graph.meta.get(pubkey);
+  if (!stat || !meta) return { ...none, notSuggestedBecause: [meta ? "it has no public channels" : "your node's view of the network doesn't have it"] };
+
+  // Against the same field as the list, itself included: the score is the
+  // one the list would give it.
+  const eligible = eligibleCandidates(inp, policy);
+  if (!eligible.some((e) => e.pk === pubkey)) eligible.push({ pk: pubkey, stat, meta });
+  const scored = scoreCandidates(inp, eligible).scored.find((s) => s.e.pk === pubkey);
+  if (!scored) return none;
+  if (lnplus) {
+    const profiles = await lnplus.enrich([pubkey], 1).catch(() => new Map<string, LnPlusNode>());
+    const profile = profiles.get(pubkey) ?? lnplus.peek(pubkey) ?? null;
+    if (profile) {
+      scored.lnplus = profile;
+      scored.trustMultiplier = lnplusTrustMultiplier(profile);
+      scored.rawScore *= scored.trustMultiplier;
+    }
+  }
+  return { ...none, candidate: toSuggestion(inp, policy, scored, 0, 0), notSuggestedBecause: whyNotCandidate(pubkey, stat, meta, inp, policy) };
+}
+
 
 // ── Close Suggestions v2 ──────────────────────────────────────────────────────
 // Which channels are dead weight worth closing — but honest about whether a close
@@ -911,7 +1039,7 @@ export interface CloseInput {
 
 /** Days since the block a channel was funded in (its short channel id), or
  *  null when that or the height now is unknown. */
-function scidAgeDays(channelId: string, heightNow: number): number | null {
+export function scidAgeDays(channelId: string, heightNow: number): number | null {
   const block = Number(channelId.split("x")[0]);
   if (!Number.isFinite(block) || block <= 0 || !(heightNow > 0) || block > heightNow) return null;
   return (heightNow - block) / 144;
@@ -1213,6 +1341,24 @@ export function rankCloseCandidates(input: CloseInput): CloseV2Report {
   };
 }
 
+/** Reach cover: how many of our peers reach each 2-hop node. uniqueReach for a
+ *  channel = nodes only its peer reaches → what we'd actually lose by closing it. */
+function uniqueReachCounter(channels: readonly Pick<ChannelView, "peerPubkey">[], graph: GraphCache, ownKey: string): (peerPubkey: string) => number {
+  const peersSet = new Set(channels.map((c) => c.peerPubkey));
+  const cover = new Map<string, number>();
+  for (const c of channels) {
+    const ps = graph.stats.get(c.peerPubkey);
+    if (ps) for (const n of ps.neighbors) cover.set(n, (cover.get(n) ?? 0) + 1);
+  }
+  return (peerPubkey) => {
+    const ps = graph.stats.get(peerPubkey);
+    if (!ps) return 0;
+    let u = 0;
+    for (const n of ps.neighbors) if (cover.get(n) === 1 && !peersSet.has(n) && n !== ownKey) u += 1;
+    return u;
+  };
+}
+
 export async function getCloseSuggestionsV2(
   lnd: AuthenticatedLnd,
   rebalanceRecords: RebalanceRecord[],
@@ -1242,21 +1388,7 @@ export async function getCloseSuggestionsV2(
   // A fresh observation: the offline durations below include this moment.
   ctx.uptime?.observe(channels, nowMs);
 
-  // Reach cover: how many of our peers reach each 2-hop node. uniqueReach for a
-  // channel = nodes only its peer reaches → what we'd actually lose by closing it.
-  const peersSet = new Set(channels.map((c) => c.peerPubkey));
-  const cover = new Map<string, number>();
-  for (const c of channels) {
-    const ps = graph.stats.get(c.peerPubkey);
-    if (ps) for (const n of ps.neighbors) cover.set(n, (cover.get(n) ?? 0) + 1);
-  }
-  const uniqueReachOf = (peerPubkey: string): number => {
-    const ps = graph.stats.get(peerPubkey);
-    if (!ps) return 0;
-    let u = 0;
-    for (const n of ps.neighbors) if (cover.get(n) === 1 && !peersSet.has(n) && n !== ownKey) u += 1;
-    return u;
-  };
+  const uniqueReachOf = uniqueReachCounter(channels, graph, ownKey);
 
   return rankCloseCandidates({
     channels,

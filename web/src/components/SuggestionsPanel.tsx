@@ -1,26 +1,27 @@
 import { Fragment, useEffect, useState } from "react";
+import { COPY_FAILED, copyText } from "../clipboard";
 import { api } from "../api";
 import { caretButtonProps } from "../a11y";
 import type {
   ChannelSuggestion,
   NodeNeed,
   OpenChannelResult,
-  OpenEstimate,
   SuggestionPolicy,
   SuggestionsResponse,
 } from "../types";
 import { sats, satsCompact } from "../format";
-import { fastRateHint } from "../onchainView";
-import { openLines, startingFeeText } from "../openView";
-import { WRITE_MODE_HINT, promisedSpend, spendPromisedQuestion } from "../statusNotes";
+import { WRITE_MODE_HINT } from "../statusNotes";
+import { useNodeChanges } from "../nodeNav";
+import { NodeLink } from "./NodeLink";
+import { NodeSearch } from "./NodeSearch";
+import { OpenChannelForm, OpenResultLine } from "./OpenChannelForm";
+import { useUi } from "./Overlay";
 import { Scanning } from "./Scanning";
 import { EmptyState } from "./Skeleton";
-import { useUi } from "./Overlay";
 import { InfoTip } from "./InfoTip";
 
 type NumKey = "count" | "minChannels" | "maxStaleDays";
 
-const MIN_CHANNEL_SATS = 20_000;
 const DEFAULTS = { count: 12, minChannels: 8, maxStaleDays: 21, requireClearnet: false };
 
 const CONTROLS: { key: NumKey; label: string; hint: string }[] = [
@@ -49,15 +50,21 @@ const BREAKDOWN: { key: keyof ChannelSuggestion; label: string }[] = [
 ];
 
 function CopyButton({ pubkey }: { pubkey: string }) {
+  const ui = useUi();
   const [copied, setCopied] = useState(false);
   return (
     <button
       className="row-btn ghost"
       onClick={(e) => {
         e.stopPropagation();
-        void navigator.clipboard.writeText(pubkey);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
+        void copyText(pubkey).then((ok) => {
+          if (!ok) {
+            ui.toast(COPY_FAILED, "error");
+            return;
+          }
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        });
       }}
       title={pubkey}
     >
@@ -67,7 +74,6 @@ function CopyButton({ pubkey }: { pubkey: string }) {
 }
 
 export function SuggestionsPanel() {
-  const ui = useUi();
   const [draft, setDraft] = useState(DEFAULTS);
   const [data, setData] = useState<SuggestionsResponse | null>(null);
   const [loading, setLoading] = useState(false);
@@ -77,12 +83,7 @@ export function SuggestionsPanel() {
 
   // Open-channel flow state
   const [openFor, setOpenFor] = useState<string | null>(null);
-  const [size, setSize] = useState(0);
-  const [opening, setOpening] = useState(false);
   const [result, setResult] = useState<OpenChannelResult | null>(null);
-  // The fee it pays (sat/vB) and what it would cost and leave.
-  const [estimate, setEstimate] = useState<OpenEstimate | null>(null);
-  const [rate, setRate] = useState(0);
 
   const load = async (policy: Partial<SuggestionPolicy>) => {
     setLoading(true);
@@ -112,59 +113,15 @@ export function SuggestionsPanel() {
       return n;
     });
 
+  // "Never open automatically" set from a node's details: this list says so too.
+  useNodeChanges(({ neverOpen }) => {
+    if (!neverOpen) return;
+    setData((d) => (d ? { ...d, suggestions: d.suggestions.map((x) => (x.pubkey === neverOpen.pubkey ? { ...x, neverOpen: neverOpen.never } : x)) } : d));
+  });
+
   const startOpen = (s: ChannelSuggestion) => {
     setOpenFor(s.pubkey);
-    setSize(s.recommendedSizeSats);
     setResult(null);
-    setEstimate(null);
-    // Economy by default: an open is rarely urgent.
-    api
-      .openEstimate(s.recommendedSizeSats)
-      .then((e) => {
-        setEstimate(e);
-        setRate(e.fees.economy ?? e.fees.normal ?? e.fees.fast ?? 0);
-      })
-      .catch(() => setEstimate(null));
-  };
-
-  const submitOpen = async (s: ChannelSuggestion) => {
-    setOpening(true);
-    setResult(null);
-    const open = (spendPromised: boolean) =>
-      api.channelOpen({
-        pubkey: s.pubkey,
-        socket: s.socket,
-        localTokens: size,
-        ...(rate > 0 ? { feeRate: rate } : {}),
-        ...(spendPromised ? { spendPromised } : {}),
-      });
-    try {
-      let res: OpenChannelResult;
-      try {
-        res = await open(false);
-      } catch (e) {
-        // Coins promised to buyers: only with an explicit yes that names them.
-        const promised = promisedSpend(e);
-        if (!promised) throw e;
-        const yes = await ui.confirm({
-          title: "Spend coins promised to buyers?",
-          message: spendPromisedQuestion(promised),
-          confirmLabel: "Open anyway",
-          danger: true,
-        });
-        if (!yes) {
-          setResult({ ok: false, pubkey: s.pubkey, localTokens: size, error: promised.message });
-          return;
-        }
-        res = await open(true);
-      }
-      setResult(res);
-      if (res.ok) setOpenFor(null);
-    } catch (e) {
-      setResult({ ok: false, pubkey: s.pubkey, localTokens: size, error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      setOpening(false);
-    }
   };
 
   // The channel autopilot's "never open automatically" list — the row's
@@ -201,6 +158,8 @@ export function SuggestionsPanel() {
           suggested size (editable).
         </InfoTip>
       </p>
+
+      <NodeSearch />
 
       {data ? (
         <div className="sug-need">
@@ -269,7 +228,7 @@ export function SuggestionsPanel() {
                   </td>
                   <td>
                     <div className="sug-peer">
-                      {s.alias} {s.hasClearnet ? "🌐" : "🧅"}
+                      <NodeLink pubkey={s.pubkey} alias={s.alias} /> {s.hasClearnet ? "🌐" : "🧅"}
                       {s.lnplus ? (
                         <a
                           className={`lnp-chip${s.lnplus.scoreEffectPct < 0 ? " neg" : ""}`}
@@ -385,64 +344,17 @@ export function SuggestionsPanel() {
                   <tr className="open-row">
                     <td></td>
                     <td colSpan={7}>
-                      <div className="open-form">
-                        <span>Open channel to <strong>{s.alias}</strong></span>
-                        <label className="policy-field inline">
-                          <span>Size (sat)</span>
-                          <input
-                            type="number"
-                            min={MIN_CHANNEL_SATS}
-                            step={100_000}
-                            value={size}
-                            onChange={(e) => setSize(Math.max(0, Number(e.target.value) || 0))}
-                          />
-                        </label>
-                        <span className="field-label">On-chain fee</span>
-                        <div className="fee-grid">
-                          {(
-                            [
-                              ["economy", "Economy", "~hours"],
-                              ["normal", "Normal", "~30 min"],
-                              ["fast", "Fast", estimate ? fastRateHint(estimate.fees) : "next block"],
-                            ] as const
-                          ).map(([key, label, hint]) => {
-                            const r = estimate?.fees[key] ?? null;
-                            return (
-                              <button
-                                key={key}
-                                type="button"
-                                className={`fee-card ${r !== null && rate === r ? "selected" : ""}`}
-                                disabled={r === null || opening}
-                                onClick={() => r !== null && setRate(r)}
-                              >
-                                <span className="fee-card-label">{label}</span>
-                                <span className="fee-card-rate">{r ?? "–"}</span>
-                                <span className="fee-card-hint">{hint}</span>
-                              </button>
-                            );
-                          })}
-                        </div>
-                        <label className="policy-field inline">
-                          <span>sat/vB</span>
-                          <input type="number" min={1} value={rate || ""} onChange={(e) => setRate(Math.max(0, Math.round(Number(e.target.value) || 0)))} />
-                        </label>
-                        <button className="primary-btn" disabled={opening || size < MIN_CHANNEL_SATS} onClick={() => submitOpen(s)}>
-                          {opening ? "Opening…" : `Open ${satsCompact(size)} sat channel`}
-                        </button>
-                        <button className="reset" disabled={opening} onClick={() => setOpenFor(null)}>Cancel</button>
-                        {!s.socket ? <span className="muted">no address known — may fail to connect</span> : null}
-                        <span className="open-warn">⚠ real on-chain transaction</span>
-                      </div>
-                      {(() => {
-                        const l = openLines(size, rate || null, estimate);
-                        return l.cost ? (
-                          <div className="open-estimate muted small">
-                            {[l.cost, l.left, l.payback].filter(Boolean).join(" · ")}
-                            {l.fee ? <div>{l.fee}</div> : null}
-                            {l.warn ? <div className="sug-warn">⚠ {l.warn}</div> : null}
-                          </div>
-                        ) : null;
-                      })()}
+                      <OpenChannelForm
+                        pubkey={s.pubkey}
+                        alias={s.alias}
+                        socket={s.socket}
+                        initialSize={s.recommendedSizeSats}
+                        onResult={(res) => {
+                          setResult(res);
+                          if (res.ok) setOpenFor(null);
+                        }}
+                        onCancel={() => setOpenFor(null)}
+                      />
                     </td>
                   </tr>
                 ) : null}
@@ -450,14 +362,7 @@ export function SuggestionsPanel() {
                   <tr className="open-row">
                     <td></td>
                     <td colSpan={7}>
-                      {result.ok ? (
-                        <span className="open-ok">
-                          ✓ Channel opening — funding tx {result.transactionId?.slice(0, 16)}…
-                          {result.startingFee ? ` · ${startingFeeText(result.startingFee)}` : ""}
-                        </span>
-                      ) : (
-                        <span className="ap-fail">✗ {result.error}</span>
-                      )}
+                      <OpenResultLine result={result} />
                     </td>
                   </tr>
                 ) : null}

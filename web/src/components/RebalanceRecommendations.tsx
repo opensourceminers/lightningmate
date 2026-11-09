@@ -1,4 +1,6 @@
 import { Fragment, useEffect, useState } from "react";
+import { useNodeChanges } from "../nodeNav";
+import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import type {
   FeeMode,
@@ -80,6 +82,10 @@ export function RebalanceRecommendations() {
   const [log, setLog] = useState<RebalanceLogResponse | null>(null);
   const [running, setRunning] = useState<string | null>(null);
   const [overrides, setOverrides] = useState<OverrideMap>({});
+  // A fee mode saved in a node's details: this list shows it too.
+  useNodeChanges(({ overrides: saved }) => {
+    if (saved) setOverrides(saved);
+  });
   const [open, setOpen] = useState<Set<string>>(new Set());
   const toggle = (id: string) =>
     setOpen((s) => {
@@ -217,7 +223,7 @@ export function RebalanceRecommendations() {
                 .slice(0, 8)
                 .map((d) => (
                   <tr key={d.outChannel}>
-                    <td>{d.alias}</td>
+                    <td><NodeLink channelId={d.outChannel} alias={d.alias} /></td>
                     <td className="num">{d.demandCount}</td>
                     <td className="num">{d.demandCount ? sats(d.demandSats) : "—"}</td>
                     <td className="num">{d.demandMedianSats != null ? satsCompact(d.demandMedianSats) : "—"}</td>
@@ -287,7 +293,7 @@ export function RebalanceRecommendations() {
                       <td className="feerec-caret">
                         <button {...caretButtonProps(isOpen, () => toggle(r.channelId), `Details: ${r.alias}`)}>{isOpen ? "▾" : "▸"}</button>
                       </td>
-                      <td>{r.alias}</td>
+                      <td><NodeLink channelId={r.channelId} alias={r.alias} /></td>
                       <td className="num">{pct(r.localRatio)}</td>
                       <td>
                         <span className={`feerec-state ${STATE_CLASS[r.state]}`}>{STATE_LABEL[r.state]}</span>

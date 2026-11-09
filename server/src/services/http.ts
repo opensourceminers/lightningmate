@@ -24,9 +24,12 @@ export const HTTP_TIMEOUTS = {
    *  and acts on what actually happened. */
   ambossMutationMs: 25_000,
   lnplusMs: 10_000,
-  priceMs: 10_000,
+  /** Through Tor a new circuit to an onion service can take several seconds. */
+  priceMs: 20_000,
   /** LNURL-pay lookups for the service fee. */
   lnurlMs: 15_000,
+  /** One node's public record, when its details are opened (see priceMs). */
+  nodeLookupMs: 20_000,
 };
 
 /**
@@ -76,6 +79,18 @@ export function viaTor(): boolean {
  */
 export function torVia(): string {
   return viaTor() ? " through Tor" : "";
+}
+
+/**
+ * Where mempool.space answers. It leaves requests from Tor exits unanswered
+ * (measured 2026-11-09: three of three stalled past 45 s, while its onion
+ * service answered in 3–8 s), so through Tor its own onion service is asked:
+ * plain http is fine there, Tor encrypts to the service itself. Before, the
+ * BTC price failed on every Tor install from 0.8.5 on and the fiat figures
+ * stayed empty.
+ */
+export function mempoolBase(): string {
+  return viaTor() ? "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion" : "https://mempool.space";
 }
 
 export class HttpTimeoutError extends Error {

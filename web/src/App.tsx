@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "./api";
 import { setNavHandler } from "./nav";
+import { rememberChannels, useNodeChanges } from "./nodeNav";
 import { AlertsBar } from "./components/AlertsBar";
 import { AnalyticsPanel } from "./components/AnalyticsPanel";
 import { AutopilotPanel } from "./components/AutopilotPanel";
@@ -9,6 +10,7 @@ import { ChannelsPanel } from "./components/ChannelsPanel";
 import { Footer } from "./components/Footer";
 import { LogoutButton } from "./components/LogoutButton";
 import { MarketPanel } from "./components/MarketPanel";
+import { NodePanelHost } from "./components/NodePanel";
 import { Overview } from "./components/Overview";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { SkeletonPanel } from "./components/Skeleton";
@@ -59,6 +61,16 @@ export function App() {
     setNavHandler(navigate);
     return () => setNavHandler(null);
   }, []);
+
+  // Who a channel id or alias belongs to, for the node details (nodeNav.ts).
+  useEffect(() => {
+    if (channels.data) rememberChannels(channels.data);
+  }, [channels.data]);
+
+  // A channel opened or closed from a node's details: the list at once.
+  useNodeChanges((change) => {
+    if (change.channels) channels.refresh();
+  });
 
   const anyError = node.error ?? channels.error;
   const initialLoading = node.loading && !node.data;
@@ -150,6 +162,7 @@ export function App() {
       </div>
 
       <Footer version={version} />
+      <NodePanelHost />
     </div>
   );
 }
