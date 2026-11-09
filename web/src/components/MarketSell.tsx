@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { copyText } from "../clipboard";
 import { goTo } from "../nav";
 import { api } from "../api";
@@ -26,7 +26,6 @@ import type {
 } from "../types";
 import { sats, satsCompact } from "../format";
 import { ppmText } from "../nodeView";
-import { Fold } from "./Fold";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
 import { failedOfferWrite } from "../statusNotes";
@@ -43,6 +42,7 @@ import {
   offerSizeWarning,
   pendingOrdersBanner,
   priceDraft,
+  priceHoldNote,
   pricedLeaseWarning,
   freeOfferNote,
   sellSummary,
@@ -349,20 +349,18 @@ export function MarketSell() {
   // The offer form only when it is wanted: editing, a price button pressed,
   // no offer yet, or "Create another offer" (it sat open under everything,
   // with a paragraph of fine print, on every visit).
-  const sellProblems = diag?.checks.filter((c) => c.status === "problem").length ?? 0;
   const formOpen = editingId !== null || draft !== null || showForm || (connected !== null && offers.length === 0);
+  // Below the price: what "edit" or a price button opened has to come into view.
+  const formRef = useRef<HTMLElement>(null);
+  const formAsked = editingId ?? (draft !== null || showForm ? "new" : null);
+  useEffect(() => {
+    if (formAsked !== null) formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [formAsked]);
+
+  const holdNote = r0 ? priceHoldNote(r0, mine, managedPrice) : null;
 
   return (
-    <section className="panel">
-      <div className="panel-head">
-        <h2>{offers.length > 1 ? "Your offers" : "Your offer"}</h2>
-        {a ? (
-          <span className="muted">
-            {a.mySellerScore != null ? `seller score ${a.mySellerScore.toFixed(1)} · ` : ""}
-            {a.filledOrdersAllTime} sold · {sats(a.netProfitSat)} sat net
-          </span>
-        ) : null}
-      </div>
+    <div className="sell">
       {keyCheck === "unreachable" ? (
         <p className="banner">
           Amboss is unreachable right now — retrying. Your key stays connected; selling resumes when Amboss answers again.
@@ -377,6 +375,7 @@ export function MarketSell() {
         <p className="banner error">The autopilot could not update your offer on Amboss: {failedOfferWrite(sync)}</p>
       ) : null}
       {rec && pendingOrdersBanner(rec.sell) ? <div className="magma-warn-banner">⚠ {pendingOrdersBanner(rec.sell)}</div> : null}
+
       <p className="sell-lede muted">
         {cfg ? (
           <>
@@ -395,24 +394,50 @@ export function MarketSell() {
         </InfoTip>
       </p>
 
-      {connected === null ? (
-        <p className="muted">Loading…</p>
-      ) : offers.length === 0 ? (
-        <EmptyState icon="🏷️">No offer yet — create one below.</EmptyState>
-      ) : (
-        <table className="fee-table">
-          <thead>
-            <tr>
-              <th>Status</th>
-              <th className="num">Size range</th>
-              <th className="num">Total</th>
-              <th className="num">Price</th>
-              <th className="num">Lease</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {offers.map((o) => {
+      {a || r0 ? (
+        <div className="sell-stats">
+          {a ? (
+            <div className="an-card">
+              <span className="an-card-label">Seller score</span>
+              <span className="an-card-val">{a.mySellerScore != null ? a.mySellerScore.toFixed(1) : "—"}</span>
+              <span className="an-card-sub">
+                {a.filledOrdersAllTime} sold · {sats(a.netProfitSat)} sat net
+              </span>
+            </div>
+          ) : null}
+          {evPerYear !== null ? (
+            <div className="an-card" title="Expected sales a year (offers like yours) × what one sale nets at the recommended price">
+              <span className="an-card-label">Expected</span>
+              <span className={`an-card-val ${evPerYear > 0 ? "green" : ""}`}>≈ {sats(evPerYear)}</span>
+              <span className="an-card-sub">sat a year</span>
+            </div>
+          ) : null}
+          {r0 ? (
+            <div className={`an-card ${r0.economics.beatsRouting ? "good" : ""}`}>
+              <span className="an-card-label">One sale nets</span>
+              <span className={`an-card-val ${r0.economics.beatsRouting ? "green" : ""}`}>{sats(r0.economics.netLeaseProfitSat)}</span>
+              <span className="an-card-sub">sat at the recommended price · {r0.economics.leaseApy}% a year</span>
+            </div>
+          ) : null}
+          {rec ? (
+            <div className="an-card">
+              <span className="an-card-label">Routing earns</span>
+              <span className="an-card-val">{asPct(rec.sell.adjustedRoutingPpmPerYear)}</span>
+              <span className="an-card-sub">a year on capital</span>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      <div className={`sell-grid ${rec && r0 ? "two" : ""}`}>
+        <section className="panel sell-offers">
+          <h2>{offers.length > 1 ? "Your offers" : "Your offer"}</h2>
+          {connected === null ? (
+            <p className="muted">Loading…</p>
+          ) : offers.length === 0 ? (
+            <EmptyState icon="🏷️">No offer yet — create one below.</EmptyState>
+          ) : (
+            offers.map((o) => {
               const active = o.status === "ENABLED";
               const owner = ownerOf(o);
               const oddLease = leaseToKeep(o.minBlockLength, rec?.sell.standardLeaseBlocks ?? STANDARD_LEASE_BLOCKS) !== o.minBlockLength;
@@ -420,175 +445,139 @@ export function MarketSell() {
               const keep = keepDisabledAction(o, controls[o.id]);
               const follow = baseFeeFollow(o, rec, autoPriced(o));
               return (
-                <tr key={o.id} className={active ? "" : "inactive"}>
-                  <td>
-                    {active ? "🟢 active" : `⚪ ${o.status.toLowerCase()}`}
-                    <div className="muted small" title={owner.title}>
-                      {owner.label}
-                    </div>
-                  </td>
-                  <td className="num">
-                    {satsCompact(o.minSizeSats)}–{satsCompact(o.maxSizeSats)}
-                  </td>
-                  <td className="num">{satsCompact(o.totalSizeSats)}</td>
-                  <td className={`num ${free ? "delta-up" : ""}`} title={free ? "No price: buyers would get a channel for free" : (follow?.title ?? ppmText(o.feeRatePpm))}>
-                    {o.feeRatePpm.toLocaleString("en-US")} ppm{free ? " ⚠" : ""}
-                    <div className="muted small">
-                      + {o.baseFeeSats} sat base
-                      {follow ? <span className="base-follow"> {follow.cell}</span> : null}
-                    </div>
-                  </td>
-                  <td className={`num ${oddLease ? "delta-up" : ""}`} title={`${o.minBlockLength} blocks${oddLease ? " — not the standard lease buyers use" : ""}`}>
-                    {Math.round(o.minBlockLength / 144)}d{oddLease ? " ⚠" : ""}
-                    <div className="muted small" title="The routing fee promised to buyers for the lease">
-                      {o.feeRateCapPpm ? `fee ≤ ${o.feeRateCapPpm} ppm + ${o.baseFeeCapSats ?? 0} sat` : "no fee promise"}
-                    </div>
-                  </td>
-                  <td>
-                    <div className="row-actions">
-                      <button className="row-btn ghost" disabled={busy} onClick={() => startEdit(o)}>
-                        edit
+                <div key={o.id} className={`offer-card ${active ? "" : "inactive"}`}>
+                  <div className="offer-card-head">
+                    <span className={`offer-state ${active ? "on" : ""}`}>{active ? "active" : o.status.toLowerCase()}</span>
+                    <span className="muted small" title={owner.title}>
+                      terms: {owner.label}
+                    </span>
+                  </div>
+                  <div className={`offer-price ${free ? "delta-up" : ""}`} title={free ? "No price: buyers would get a channel for free" : (follow?.title ?? ppmText(o.feeRatePpm))}>
+                    {o.feeRatePpm.toLocaleString("en-US")} <span className="offer-unit">ppm</span>
+                    <span className="offer-base">
+                      {" "}
+                      + {o.baseFeeSats} <span className="offer-unit">sat</span>
+                    </span>
+                    {free ? " ⚠" : ""}
+                    {follow ? <span className="base-follow"> {follow.cell}</span> : null}
+                  </div>
+                  <dl className="node-facts">
+                    <dt>Order size</dt>
+                    <dd>
+                      {satsCompact(o.minSizeSats)} – {satsCompact(o.maxSizeSats)}
+                    </dd>
+                    <dt>Listed</dt>
+                    <dd>{satsCompact(o.totalSizeSats)} sat</dd>
+                    <dt>Lease</dt>
+                    <dd className={oddLease ? "delta-up" : ""} title={`${o.minBlockLength} blocks${oddLease ? " — not the standard lease buyers use" : ""}`}>
+                      {Math.round(o.minBlockLength / 144)} days{oddLease ? " ⚠" : ""}
+                    </dd>
+                    <dt title="The routing fee promised to buyers for the lease">Fee promise</dt>
+                    <dd>{o.feeRateCapPpm ? `≤ ${o.feeRateCapPpm} ppm + ${o.baseFeeCapSats ?? 0} sat` : "none"}</dd>
+                  </dl>
+                  <div className="offer-actions">
+                    <button className="row-btn ghost" disabled={busy} onClick={() => startEdit(o)}>
+                      edit
+                    </button>
+                    <button
+                      className="row-btn ghost"
+                      disabled={togglingId !== null || (!active && free)}
+                      title={
+                        !active && free
+                          ? autoPriced(o) && enginePriced(o)
+                            ? freeOfferNote(controls[o.id], true, true)
+                            : "Set a price first (edit): listed like this, buyers would get a channel for free"
+                          : undefined
+                      }
+                      onClick={() => void toggle(o)}
+                    >
+                      {togglingId === o.id ? "…" : active ? "disable" : "enable"}
+                    </button>
+                    {keep ? (
+                      <button className="row-btn ghost" disabled={togglingId !== null} title={keep.title} onClick={() => void keepDisabled(o)}>
+                        {keep.label}
                       </button>
-                      <button
-                        className="row-btn ghost"
-                        disabled={togglingId !== null || (!active && free)}
-                        title={
-                          !active && free
-                            ? autoPriced(o) && enginePriced(o)
-                              ? freeOfferNote(controls[o.id], true, true)
-                              : "Set a price first (edit): listed like this, buyers would get a channel for free"
-                            : undefined
-                        }
-                        onClick={() => void toggle(o)}
-                      >
-                        {togglingId === o.id ? "…" : active ? "disable" : "enable"}
+                    ) : null}
+                    {owner.yours && cfg?.sellEnabled ? (
+                      <button className="row-btn ghost" title="Let the autopilot manage this offer's terms again" onClick={() => void handBack(o, true)}>
+                        hand to autopilot
                       </button>
-                      {keep ? (
-                        <button className="row-btn ghost" disabled={togglingId !== null} title={keep.title} onClick={() => void keepDisabled(o)}>
-                          {keep.label}
-                        </button>
-                      ) : null}
-                      {owner.yours && cfg?.sellEnabled ? (
-                        <button className="row-btn ghost" title="Let the autopilot manage this offer's terms again" onClick={() => void handBack(o, true)}>
-                          hand to autopilot
-                        </button>
-                      ) : null}
-                      {!owner.yours && cfg?.sellEnabled ? (
-                        <button className="row-btn ghost" title="Keep this offer's terms as they are: the autopilot only keeps it fundable" onClick={() => void handBack(o, false)}>
-                          take over
-                        </button>
-                      ) : null}
-                      <button className="row-btn ghost" title="Copy the offer id: a buyer can order from this offer directly" onClick={() => copyId(o.id)}>
-                        copy id
+                    ) : null}
+                    {!owner.yours && cfg?.sellEnabled ? (
+                      <button className="row-btn ghost" title="Keep this offer's terms as they are: the autopilot only keeps it fundable" onClick={() => void handBack(o, false)}>
+                        take over
                       </button>
-                    </div>
-                  </td>
-                </tr>
+                    ) : null}
+                    <button className="row-btn ghost" title="Copy the offer id: a buyer can order from this offer directly" onClick={() => copyId(o.id)}>
+                      copy id
+                    </button>
+                  </div>
+                </div>
               );
-            })}
-          </tbody>
-        </table>
-      )}
+            })
+          )}
 
-      {offers
-        .filter((o) => o.status !== "ENABLED" && o.feeRatePpm <= 0 && o.baseFeeSats <= 0)
-        .slice(0, 1)
-        .map((o) => (
-          <p key={`free-${o.id}`} className="sug-warn">
-            ⚠ {freeOfferNote(controls[o.id], autoPriced(o), enginePriced(o))}
-          </p>
-        ))}
-      {(sync?.offers ?? [])
-        // While selling is on: with it off, nothing turns them down.
-        .filter((e) => !!cfg?.sellEnabled && e.amboss.status === "ENABLED" && e.turnedDownUnderSat !== undefined)
-        .map((e) => (
-          <p key={`under-${e.offerId}`} className="sug-warn">
-            ⚠ {turnedDownLine(e, !!controls[e.offerId]?.manual)}
-          </p>
-        ))}
-      {error ? <p className="banner error">{error}</p> : null}
-      {rec && r0 ? (
-        <div className="sell-price-line">
-          <span className={`feerec-state ${SELL_STATE_CLASS[r0.state]}`}>{SELL_STATE_LABEL[r0.state]}</span>
-          <span className="muted">
-            {r0.current ? `yours ${r0.current.effectiveFeePpm} → recommended ${r0.recommended.effectiveFeePpm} ppm` : `recommended ${r0.recommended.effectiveFeePpm} ppm`}
-          </span>
-        </div>
-      ) : null}
-      {r0?.warnings.length ? (
-        <div className="magma-warns">
-          {r0.warnings.map((w, i) => (
-            <div key={`w${i}`} className="sug-warn">⚠ {w}</div>
-          ))}
-        </div>
-      ) : null}
-      <Fold id="sell-by-hand" title="Edit and price by hand" forceOpen={editingId !== null || draft !== null || showForm || (connected !== null && offers.length === 0)}>
-      {formOpen ? (
-        <div className="offer-form">
-          <h4 className="sub">{editingId ? "Edit your offer" : offers.length ? "Another offer (it lists a second one)" : "New offer"}</h4>
-          <div className="policy-controls">
-            {FIELDS.map((f) => (
-              <label key={f.key} className="policy-field">
-                <span>{f.label}</span>
-                <input type="number" min={0} value={form[f.key]} onChange={(e) => setNum(f.key, Number(e.target.value))} />
-                {/* On the page, not only in a tooltip (touch screens have none). */}
-                <span className="field-hint">{f.hint}</span>
-              </label>
+          {offers
+            .filter((o) => o.status !== "ENABLED" && o.feeRatePpm <= 0 && o.baseFeeSats <= 0)
+            .slice(0, 1)
+            .map((o) => (
+              <p key={`free-${o.id}`} className="sug-warn">
+                ⚠ {freeOfferNote(controls[o.id], autoPriced(o), enginePriced(o))}
+              </p>
             ))}
-            <button className="primary-btn" disabled={busy} onClick={() => void submit()}>
-              {busy ? (editingId ? "Saving…" : "Creating…") : editingId ? "Save changes" : offers.length ? "Create another offer" : "Create offer"}
+          {(sync?.offers ?? [])
+            // While selling is on: with it off, nothing turns them down.
+            .filter((e) => !!cfg?.sellEnabled && e.amboss.status === "ENABLED" && e.turnedDownUnderSat !== undefined)
+            .map((e) => (
+              <p key={`under-${e.offerId}`} className="sug-warn">
+                ⚠ {turnedDownLine(e, !!controls[e.offerId]?.manual)}
+              </p>
+            ))}
+          {!formOpen && offers.length > 0 ? (
+            <button className="row-btn ghost add-offer" onClick={() => setShowForm(true)}>
+              + Create another offer
             </button>
-            {editingId || draft || showForm ? (
-              <button
-                className="reset"
-                disabled={busy}
-                onClick={() => {
-                  cancelEdit();
-                  setShowForm(false);
-                }}
-              >
-                Cancel
-              </button>
-            ) : null}
-          </div>
-          {feeCaps ? <OfferPromiseNote caps={feeCaps} leaseBlocks={form.minBlockLength} standardLeaseBlocks={STANDARD_LEASE_BLOCKS} /> : null}
-          {sizeWarning ? <p className="sug-warn">⚠ {sizeWarning}</p> : null}
-        </div>
-      ) : offers.length > 0 ? (
-        <button className="row-btn ghost add-offer" onClick={() => setShowForm(true)}>
-          + Create another offer
-        </button>
-      ) : null}
+          ) : null}
+        </section>
 
-      {rec && r0 ? (
-        <>
-          <h3 className="sub">Price</h3>
-          <div className="magma-price-card">
-            <div className="magma-price-head">
+        {rec && r0 ? (
+          <section className="panel sell-price">
+            <div className="sell-price-head">
+              <h2>Price</h2>
               <span className={`feerec-state ${SELL_STATE_CLASS[r0.state]}`}>{SELL_STATE_LABEL[r0.state]}</span>
-              {r0.current ? (
-                <span>
-                  yours <b>{r0.current.effectiveFeePpm}</b> → recommended{" "}
-                  <b className={r0.recommended.effectiveFeePpm > r0.current.effectiveFeePpm ? "delta-up" : r0.recommended.effectiveFeePpm < r0.current.effectiveFeePpm ? "delta-down" : ""}>
-                    {r0.recommended.effectiveFeePpm}
-                  </b>{" "}
-                  ppm
-                </span>
-              ) : (
-                <span>
-                  recommended <b>{r0.recommended.effectiveFeePpm} ppm</b> ({r0.recommended.feeRatePpm} + {r0.recommended.baseFeeSat} base)
-                </span>
-              )}
-              {evPerYear !== null ? (
-                <span className={`magma-verdict ${evPerYear > 0 ? "win" : "lose"}`} title="Expected sales a year (offers like yours) × what one sale nets at the recommended price">
-                  expected ≈ {sats(evPerYear)} sat/yr
-                </span>
-              ) : null}
             </div>
+            <div className="sell-price-figures">
+              {r0.current ? (
+                <div>
+                  <span className="an-card-label">Yours</span>
+                  <b>
+                    {r0.current.effectiveFeePpm.toLocaleString("en-US")} <span className="offer-unit">ppm</span>
+                  </b>
+                </div>
+              ) : null}
+              <div>
+                <span className="an-card-label">Recommended</span>
+                <b className={r0.current ? (r0.recommended.effectiveFeePpm > r0.current.effectiveFeePpm ? "delta-up" : r0.recommended.effectiveFeePpm < r0.current.effectiveFeePpm ? "delta-down" : "") : ""}>
+                  {r0.recommended.effectiveFeePpm.toLocaleString("en-US")} <span className="offer-unit">ppm</span>
+                </b>
+                {r0.current ? null : (
+                  <span className="muted small">
+                    {r0.recommended.feeRatePpm} + {r0.recommended.baseFeeSat} base
+                  </span>
+                )}
+              </div>
+              <div>
+                <span className="an-card-label">Buyers paid</span>
+                <b>
+                  {clearing ? clearing.medianPpm.toLocaleString("en-US") : "—"} {clearing ? <span className="offer-unit">ppm</span> : null}
+                </b>
+              </div>
+            </div>
+            {holdNote ? <p className="sell-note">{holdNote}</p> : null}
             <div className="magma-price-meta muted">
               {clearing
-                ? `buyers paid ${clearing.p25Ppm}–${clearing.p75Ppm} ppm (median ${clearing.medianPpm}) in ${clearing.count} sales of the last ${clearing.windowDays} days · one sale at the recommended price nets ~${sats(r0.economics.netLeaseProfitSat)} sat`
-                : `no sale history: priced against listed asks (median ${r0.market.median} ppm) · one sale at the recommended price nets ~${sats(r0.economics.netLeaseProfitSat)} sat`}
+                ? `buyers paid ${clearing.p25Ppm}–${clearing.p75Ppm} ppm (median ${clearing.medianPpm}) in ${clearing.count} sales of the last ${clearing.windowDays} days`
+                : `no sale history: priced against listed asks (median ${r0.market.median} ppm)`}
             </div>
             {(() => {
               const m = r0.market;
@@ -609,12 +598,10 @@ export function MarketSell() {
                     <i className="magma-pin rec" style={{ left: `${pos(recv)}%` }} title={`recommended ${recv} ppm`} />
                   </div>
                   <div className="magma-slider-legend">
-                    <span className="muted">cheap</span>
                     <span className="magma-leg"><i className="magma-dot band" />market</span>
                     <span className="magma-leg"><i className="magma-dot median" />listed median {m.median}</span>
                     {cur != null ? <span className="magma-leg"><i className="magma-dot cur" />you {cur}</span> : null}
                     <span className="magma-leg"><i className="magma-dot rec" />rec {recv}</span>
-                    <span className="muted">dear</span>
                   </div>
                 </div>
               );
@@ -660,6 +647,13 @@ export function MarketSell() {
                 — or edit the offer to take it over — to price it by hand.
               </p>
             ) : null}
+            {r0.warnings.length ? (
+              <div className="magma-warns">
+                {r0.warnings.map((w, i) => (
+                  <div key={`w${i}`} className="sug-warn">⚠ {w}</div>
+                ))}
+              </div>
+            ) : null}
             <details className="price-more">
               <summary>Why this price</summary>
               {summary ? (
@@ -679,63 +673,82 @@ export function MarketSell() {
                   <span className="muted">{summary.line}</span>
                 </div>
               ) : null}
-              <div className="magma-compare">
-                <div className="magma-stat">
-                  <span className="magma-stat-label">Routing yield</span>
-                  <span className="magma-stat-val">
-                    {asPct(rec.sell.adjustedRoutingPpmPerYear)} <span className="muted">/yr on capital</span>
-                  </span>
-                </div>
-                <span className="magma-vs">vs</span>
-                <div className={`magma-stat ${r0.economics.beatsRouting ? "good" : ""}`}>
-                  <span className="magma-stat-label">One sale at the recommended price</span>
-                  <span className="magma-stat-val">
-                    {r0.economics.leaseApy}% <span className="muted">/yr net · {sats(r0.economics.netLeaseProfitSat)} sat net per sale</span>
-                  </span>
-                </div>
-              </div>
               <div className="magma-warns">
                 <div className="muted">
-                How this price was worked out
-                <InfoTip label="How this price was worked out">
-                <span className="info-line">
-                  • {r0.market.sizeBand} band · lease {leaseDays} days · profit floor {r0.economics.profitFloorEffectivePpm} ppm
-                  {r0.recommended.feeRateCapPpm !== null ? ` · fee promise ≤ ${r0.recommended.feeRateCapPpm} ppm + ${r0.recommended.baseFeeCapSats} sat` : ""}
-                  {r0.market.myRank ? ` · your rank #${r0.market.myRank} of ${r0.market.segmentCount}` : ""}
-                </span>
-                <span className="info-line">
-                  • {rec.sell.medianOrderSat ? `median real order ${satsCompact(rec.sell.medianOrderSat)} · ` : ""}standard lease {rec.sell.standardLeaseBlocks} blocks · ~
-                  {rec.sell.onchainOpenCostSat} sat to open on-chain
-                  {rec.sell.projectedMonthlySat > 0 ? ` · ≈ ${sats(rec.sell.projectedMonthlySat)} sat/mo from your own sales of the last 30 days` : ""}
-                  {rec.sell.pricingMode === "auto" ? ` · auto level ${Math.round(rec.sell.adaptiveLevel * 100)}%` : ""}
-                  {recAt ? ` · as of ${new Date(recAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}
-                </span>
-                {[...rec.sell.reasons.slice(1), ...r0.reasons].map((w, i) => (
-                  <span key={`r${i}`} className="info-line">• {w}</span>
-                ))}
-                </InfoTip>
+                  <span className="info-line">
+                    • {r0.market.sizeBand} band · lease {leaseDays} days · profit floor {r0.economics.profitFloorEffectivePpm} ppm
+                    {r0.recommended.feeRateCapPpm !== null ? ` · fee promise ≤ ${r0.recommended.feeRateCapPpm} ppm + ${r0.recommended.baseFeeCapSats} sat` : ""}
+                    {r0.market.myRank ? ` · your rank #${r0.market.myRank} of ${r0.market.segmentCount}` : ""}
+                  </span>
+                  <span className="info-line">
+                    • {rec.sell.medianOrderSat ? `median real order ${satsCompact(rec.sell.medianOrderSat)} · ` : ""}standard lease {rec.sell.standardLeaseBlocks} blocks · ~
+                    {rec.sell.onchainOpenCostSat} sat to open on-chain
+                    {rec.sell.projectedMonthlySat > 0 ? ` · ≈ ${sats(rec.sell.projectedMonthlySat)} sat/mo from your own sales of the last 30 days` : ""}
+                    {rec.sell.pricingMode === "auto" ? ` · auto level ${Math.round(rec.sell.adaptiveLevel * 100)}%` : ""}
+                    {recAt ? ` · as of ${new Date(recAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : ""}
+                  </span>
+                  {[...rec.sell.reasons.slice(1), ...r0.reasons].map((w, i) => (
+                    <span key={`r${i}`} className="info-line">• {w}</span>
+                  ))}
                 </div>
                 {rec.sell.warnings.map((w, i) => (
                   <div key={`sw${i}`} className="sug-warn">⚠ {w}</div>
                 ))}
               </div>
             </details>
+          </section>
+        ) : rec && summary ? (
+          <section className="panel sell-price">
+            <div className="sug-need">
+              <span className="sug-need-tag">{summary.label}</span>
+              <span className="muted">{summary.line}</span>
+            </div>
+          </section>
+        ) : null}
+      </div>
+
+      {formOpen ? (
+        <section className="panel offer-form" ref={formRef}>
+          <h2>{editingId ? "Edit your offer" : offers.length ? "Another offer (it lists a second one)" : "New offer"}</h2>
+          <div className="policy-controls">
+            {FIELDS.map((f) => (
+              <label key={f.key} className="policy-field">
+                <span>{f.label}</span>
+                <input type="number" min={0} value={form[f.key]} onChange={(e) => setNum(f.key, Number(e.target.value))} />
+                {/* On the page, not only in a tooltip (touch screens have none). */}
+                <span className="field-hint">{f.hint}</span>
+              </label>
+            ))}
           </div>
-        </>
-      ) : rec && summary ? (
-        <div className="sug-need">
-          <span className="sug-need-tag">{summary.label}</span>
-          <span className="muted">{summary.line}</span>
-        </div>
+          <div className="apply-row">
+            <button className="primary-btn" disabled={busy} onClick={() => void submit()}>
+              {busy ? (editingId ? "Saving…" : "Creating…") : editingId ? "Save changes" : offers.length ? "Create another offer" : "Create offer"}
+            </button>
+            {editingId || draft || showForm ? (
+              <button
+                className="reset"
+                disabled={busy}
+                onClick={() => {
+                  cancelEdit();
+                  setShowForm(false);
+                }}
+              >
+                Cancel
+              </button>
+            ) : null}
+          </div>
+          {feeCaps ? <OfferPromiseNote caps={feeCaps} leaseBlocks={form.minBlockLength} standardLeaseBlocks={STANDARD_LEASE_BLOCKS} /> : null}
+          {sizeWarning ? <p className="sug-warn">⚠ {sizeWarning}</p> : null}
+        </section>
       ) : null}
-      </Fold>
+      {error ? <p className="banner error">{error}</p> : null}
       {recView.error ? <p className="banner error">{reportErrorText(recView)}</p> : null}
 
-      <Fold id="sell-check" title="Can this node sell?" note={sellProblems > 0 ? `${sellProblems} to look at` : undefined}>
+      <section className="panel sell-check">
         <EligibilityCard e={elig} busy={eligBusy} onRefresh={() => loadEligibility(true)} />
         <SellDiagnosticsCard d={diag} onFix={(tab, sub) => goTo(tab, sub)} />
         <HowAmbossPicks usdOrderSat={elig?.usdOrders?.minOrderSat ?? null} usdAtOwnPriceSat={elig?.usdOrders?.atOwnPriceSat ?? null} feeTiers={elig?.feeTiers ?? null} feeBps={feeBps} />
-      </Fold>
-    </section>
+      </section>
+    </div>
   );
 }

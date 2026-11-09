@@ -812,7 +812,8 @@ test("no internal engine badges ('v1', 'v2') on the panels; the LN+ tables scrol
   const lnplus = readFileSync(new URL("../src/components/LnPlusPanel.tsx", import.meta.url), "utf8");
   assert.doesNotMatch(lnplus, /className="table"/);
   const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
-  assert.match(css, /table\.channels, \.fee-table, \.feerec-table, \.table \{\n\s+display: block; overflow-x: auto;/);
+  assert.match(lnplus, /<div className="table-scroll">\s*<table className="fee-table/);
+  assert.match(css, /\.table-scroll \{ overflow-x: auto;/);
 });
 
 test("opening and closing channels live together under Channels — the Overview's suggested peers lead there", () => {

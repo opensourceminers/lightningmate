@@ -254,6 +254,10 @@ export function Overview({
           </button>
         </p>
       ) : null}
+      <div className="hero-row">
+        <HealthScore />
+        <PnlOverview price={price} />
+      </div>
       {dash ? <WhatNeedsYou d={dash} channels={channels} onNavigate={onNavigate} /> : null}
       {dash ? <KpiRow d={dash} price={price} /> : null}
       {dash ? (
@@ -272,12 +276,6 @@ export function Overview({
           </Fold>
         </>
       ) : null}
-      <Fold id="ov-health" title="Node health and profit">
-        <div className="hero-row">
-          <HealthScore />
-          <PnlOverview price={price} />
-        </div>
-      </Fold>
       {channels ? (
         <Fold id="ov-map" title="Liquidity map">
           <LiquidityMap channels={channels} />

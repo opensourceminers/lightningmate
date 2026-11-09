@@ -201,7 +201,8 @@ export function FeeRecommendations() {
             </InfoTip>
           </div>
 
-          <table className="fee-table feerec-table">
+          <div className="table-scroll">
+<table className="fee-table feerec-table t-fees">
             <thead>
               <tr>
                 <th></th>
@@ -235,12 +236,16 @@ export function FeeRecommendations() {
                         <td>
                           <NodeLink channelId={r.channelId} alias={r.alias} />
                           {m.isTopEarner ? <span className="top-earner" title="top earner"> ★</span> : null}
+                          <div className="sm-only reb-sm-state">
+                            <span className={`feerec-state ${STATE_CLASS[r.state]}`}>{STATE_LABEL[r.state]}</span>
+                            {r.wouldApply ? <span className="apply-yes" title="would change"> ✓</span> : null}
+                          </div>
                         </td>
                         <td className="num">{pct(m.localRatio)}</td>
                         <td className="num">
                           <span className="muted">{r.currentPpm}</span> → <strong className={cls}>{r.targetPpm}</strong>
                           {r.aimPpm !== r.targetPpm && !r.pinned ? (
-                            <span className="muted small" title="where the engine is heading — it moves by small steps">
+                            <span className="muted small fee-aim" title="where the engine is heading — it moves by small steps">
                               {" "}
                               (aim {r.aimPpm})
                             </span>
@@ -329,6 +334,7 @@ export function FeeRecommendations() {
                 })}
             </tbody>
           </table>
+</div>
         </>
       ) : null}
     </section>

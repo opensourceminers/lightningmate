@@ -95,7 +95,8 @@ export function CloseCandidatesPanel() {
       {rows.length === 0 ? (
         <EmptyState icon="✅">Nothing to close — every channel is earning, reachable or strategic.</EmptyState>
       ) : (
-        <table className="fee-table feerec-table">
+        <div className="table-scroll">
+<table className="fee-table feerec-table t-close">
           <thead>
             <tr>
               <th></th>
@@ -130,6 +131,10 @@ export function CloseCandidatesPanel() {
                         {c.warnings.length ? <span className="sug-badge warn">⚠ {c.warnings.length}</span> : null}
                       </div>
                       <div className="muted reason" title={c.reasons[0]}>{c.reasons[0]?.split(" — ")[0]}</div>
+                      <div className="sm-only muted small">
+                        inbound lost {c.inboundLiquidityLostSats > 0 ? satsCompact(c.inboundLiquidityLostSats) : "—"} · P&amp;L 60 d{" "}
+                        {c.pnl60dSats === 0 ? "—" : `${c.pnl60dSats > 0 ? "+" : ""}${c.pnl60dSats}`}
+                      </div>
                     </td>
                     <td className="num strong">{satsCompact(c.capitalFreedSats)}</td>
                     <td className="num">{c.inboundLiquidityLostSats > 0 ? satsCompact(c.inboundLiquidityLostSats) : "—"}</td>
@@ -204,6 +209,7 @@ export function CloseCandidatesPanel() {
             })}
           </tbody>
         </table>
+</div>
       )}
 
       {data?.pending.length ? (

@@ -98,16 +98,17 @@ export function App() {
             className={`conn ${node.error ? "down" : node.data ? "up" : "wait"}`}
             title={node.error ? "Disconnected — retrying" : node.data ? "Connected" : "Connecting"}
           >
-            <i /> {node.error ? "reconnecting" : node.data ? "connected" : "connecting"}
+            <i /> <span className="conn-word">{node.error ? "reconnecting" : node.data ? "connected" : "connecting"}</span>
           </span>
           <button
             className="refresh"
+            aria-label="Refresh"
             onClick={() => {
               node.refresh();
               channels.refresh();
             }}
           >
-            ↻ refresh
+            ↻<span className="refresh-word"> refresh</span>
           </button>
         </div>
       </header>

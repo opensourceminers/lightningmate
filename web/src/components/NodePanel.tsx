@@ -97,7 +97,9 @@ function ChannelCard({
       </div>
       <BalanceBar ratio={c.localRatio} />
       <div className="node-channel-sides muted small">
-        <span>{satsCompact(c.localBalance)} yours</span>
+        <span>
+          {satsCompact(c.localBalance)} yours · {Math.round(c.localRatio * 100)}%
+        </span>
         <span>{satsCompact(c.remoteBalance)} theirs</span>
       </div>
       {lease || away || c.private ? (

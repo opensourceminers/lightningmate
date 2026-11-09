@@ -169,7 +169,8 @@ export function ForwardsPanel() {
       <h3 className="sub">
         Per channel{data?.perChannel.length ? <span className="muted"> · {data.perChannel.length}</span> : null}
       </h3>
-      <table className="fee-table">
+      <div className="table-scroll">
+<table className="fee-table t-fw-peers">
         <thead>
           <tr>
             <th>Peer</th>
@@ -206,6 +207,7 @@ export function ForwardsPanel() {
           })}
         </tbody>
       </table>
+</div>
       {!loading && data && data.perChannel.length === 0 ? (
         <p className="muted empty">No forwards in this window yet.</p>
       ) : null}
@@ -219,7 +221,8 @@ export function ForwardsPanel() {
               either the source or the sink kills the route.
             </InfoTip>
           </h3>
-          <table className="fee-table">
+          <div className="table-scroll">
+<table className="fee-table t-fw-routes">
             <thead>
               <tr>
                 <th>Route <span className="muted">· in → out</span></th>
@@ -243,13 +246,15 @@ export function ForwardsPanel() {
               ))}
             </tbody>
           </table>
+</div>
         </>
       ) : null}
 
       {data && data.recent.length > 0 ? (
         <>
           <h3 className="sub">Recent forwards</h3>
-          <table className="fee-table">
+          <div className="table-scroll">
+<table className="fee-table t-fw-recent">
             <thead>
               <tr>
                 <th>When</th>
@@ -262,13 +267,17 @@ export function ForwardsPanel() {
               {data.recent.map((e, i) => (
                 <tr key={`${e.createdAt}-${i}`}>
                   <td className="muted">{timeAgo(e.createdAt)}</td>
-                  <td>{e.incoming} → {e.outgoing}</td>
+                  <td>
+                    {e.incoming} → {e.outgoing}
+                    <div className="sm-only muted small">{timeAgo(e.createdAt)}</div>
+                  </td>
                   <td className="num">{satsCompact(e.tokens)} sat</td>
                   <td className="num earned">+{e.fee} sat</td>
                 </tr>
               ))}
             </tbody>
           </table>
+</div>
         </>
       ) : null}
     </section>

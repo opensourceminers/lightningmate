@@ -203,7 +203,8 @@ export function RebalanceRecommendations() {
             check below.
             </InfoTip>
           </h3>
-          <table className="fee-table">
+          <div className="table-scroll">
+<table className="fee-table t-demand">
             <thead>
               <tr>
                 <th>Out channel</th>
@@ -236,6 +237,7 @@ export function RebalanceRecommendations() {
                 ))}
             </tbody>
           </table>
+</div>
         </>
       ) : null}
 
@@ -264,7 +266,8 @@ export function RebalanceRecommendations() {
       ) : null}
 
       {data ? (
-        <table className="fee-table feerec-table">
+        <div className="table-scroll">
+<table className="fee-table feerec-table t-reb">
           <thead>
             <tr>
               <th></th>
@@ -287,36 +290,51 @@ export function RebalanceRecommendations() {
             ) : (
               rows.map((r) => {
                 const isOpen = open.has(r.channelId);
+                const stateCell = (
+                  <>
+                    <span className={`feerec-state ${STATE_CLASS[r.state]}`}>{STATE_LABEL[r.state]}</span>
+                    {budgetBlocked(r, data.budget) ? (
+                      <span className="feerec-state s-cost" title="Today's fee budget can't pay for it now — it waits for the reset (00:00 UTC)">
+                        {" "}budget-blocked
+                      </span>
+                    ) : null}
+                    {/* The Run action in the row itself — it was only
+                        inside the opened row (a11y). It asks first. */}
+                    {r.wouldRebalance && canWrite && !inFlightThrough(r, data.inFlight) ? (
+                      <button
+                        className="row-btn"
+                        disabled={running === r.channelId}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void execute(r);
+                        }}
+                      >
+                        {running === r.channelId ? "Running…" : "Run…"}
+                      </button>
+                    ) : null}
+                  </>
+                );
                 return (
                   <Fragment key={r.channelId}>
                     <tr className={`feerec-row ${r.wouldRebalance ? "changing" : ""}`} onClick={() => toggle(r.channelId)}>
                       <td className="feerec-caret">
                         <button {...caretButtonProps(isOpen, () => toggle(r.channelId), `Details: ${r.alias}`)}>{isOpen ? "▾" : "▸"}</button>
                       </td>
-                      <td><NodeLink channelId={r.channelId} alias={r.alias} /></td>
-                      <td className="num">{pct(r.localRatio)}</td>
                       <td>
-                        <span className={`feerec-state ${STATE_CLASS[r.state]}`}>{STATE_LABEL[r.state]}</span>
-                        {budgetBlocked(r, data.budget) ? (
-                          <span className="feerec-state s-cost" title="Today's fee budget can't pay for it now — it waits for the reset (00:00 UTC)">
-                            {" "}budget-blocked
-                          </span>
-                        ) : null}
-                        {/* The Run action in the row itself — it was only
-                            inside the opened row (a11y). It asks first. */}
-                        {r.wouldRebalance && canWrite && !inFlightThrough(r, data.inFlight) ? (
-                          <button
-                            className="row-btn"
-                            disabled={running === r.channelId}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              void execute(r);
-                            }}
-                          >
-                            {running === r.channelId ? "Running…" : "Run…"}
-                          </button>
-                        ) : null}
+                        <NodeLink channelId={r.channelId} alias={r.alias} />
+                        <div className="sm-only reb-sm">
+                          <div className="reb-sm-state">{stateCell}</div>
+                          {r.estimatedRouteCostPpm != null || r.expectedPaybackDays != null || r.expectedNetProfitSats != null ? (
+                            <div className="muted small">
+                              cost {r.estimatedRouteCostPpm ?? "—"}
+                              {r.maxCostPpm != null ? ` / ${r.maxCostPpm}` : ""} ppm · payback {r.expectedPaybackDays != null ? `${r.expectedPaybackDays} d` : "—"} · net{" "}
+                              {r.expectedNetProfitSats != null ? `${r.expectedNetProfitSats >= 0 ? "+" : ""}${r.expectedNetProfitSats}` : "—"}
+                            </div>
+                          ) : null}
+                        </div>
                       </td>
+                      <td className="num">{pct(r.localRatio)}</td>
+                      <td>{stateCell}</td>
                       <td className="num">{r.recommendedAmount ? satsCompact(r.recommendedAmount) : "—"}</td>
                       <td className="num">
                         {r.estimatedRouteCostPpm != null ? `${r.estimatedRouteCostPpm}` : "—"}
@@ -390,6 +408,7 @@ export function RebalanceRecommendations() {
             )}
           </tbody>
         </table>
+</div>
       ) : null}
 
       {log && log.records.length ? (

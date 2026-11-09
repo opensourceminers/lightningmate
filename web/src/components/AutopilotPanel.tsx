@@ -440,22 +440,24 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     const b = boundsFor(server.bounds, path);
     const text = draft.nums[path];
     const err = check.fieldErrors[path];
+    const id = `ap-field-${path}`;
     return (
       <div key={path} className={`policy-field ${text !== undefined ? "changed" : ""}`}>
-        <label>
-          <span>{label}</span>
-          <input
-            type="number"
-            min={b?.min}
-            max={b?.max}
-            step={opts.step ?? (b && !b.integer ? "any" : 1)}
-            value={text ?? (savedNum(config, path) ?? "")}
-            aria-invalid={err ? true : undefined}
-            disabled={writeOff}
-            onChange={(e) => setNum(path, e.target.value)}
-          />
-        </label>
-        {opts.hint ? <InfoTip text={opts.hint} label={`About ${label}`} /> : null}
+        <div className="pf-head">
+          <label htmlFor={id}>{label}</label>
+          {opts.hint ? <InfoTip text={opts.hint} label={`About ${label}`} /> : null}
+        </div>
+        <input
+          id={id}
+          type="number"
+          min={b?.min}
+          max={b?.max}
+          step={opts.step ?? (b && !b.integer ? "any" : 1)}
+          value={text ?? (savedNum(config, path) ?? "")}
+          aria-invalid={err ? true : undefined}
+          disabled={writeOff}
+          onChange={(e) => setNum(path, e.target.value)}
+        />
         {err ? <span className="field-error">{err}</span> : b ? <span className="field-hint">{rangeText(b)}</span> : null}
       </div>
     );
@@ -466,10 +468,10 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     fields.map((f) =>
       f.key === "rebalanceDailyBudgetSats" && budgetNoLimit ? (
         <div key={f.key} className="policy-field">
-          <label>
-            <span>{f.label}</span>
-            <input type="text" value="No limit" disabled />
-          </label>
+          <div className="pf-head">
+            <label htmlFor={`ap-field-${f.key}`}>{f.label}</label>
+          </div>
+          <input id={`ap-field-${f.key}`} type="text" value="No limit" disabled />
         </div>
       ) : (
         numInput(f.key, f.label, { hint: f.hint })
@@ -638,7 +640,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   };
 
   return (
-    <div>
+    <div className="ap-page">
       <div className="ap-strategy">
         <div className="ap-strategy-head">
           <span className="ap-strategy-title">Strategy</span>

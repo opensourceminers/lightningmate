@@ -143,6 +143,8 @@ test("listed asks are compared at the offer's own lease: a 90-day offer is not '
   assert.ok(r.economics.profitFloorEffectivePpm > 2_952, `the 90-day floor tops every 30-day ask: ${r.economics.profitFloorEffectivePpm}`);
   // Before: "do_not_list_uncompetitive" — "profitable price is above current market".
   assert.equal(r.state, "well_priced", r.reasons.join(" | "));
+  // The page says from how far off the autopilot would rewrite the offer: 10 %, at least 25 ppm.
+  assert.equal(r.repriceThresholdPpm, Math.round(Math.max(25, r.recommended.effectiveFeePpm * 0.1)));
   // The asks as 90-day prices: three times the 30-day ones.
   assert.ok(r.market.p75 > 3 * 2_600 && r.market.p75 < 3 * 3_000, `p75 at 90 days: ${r.market.p75}`);
 });

@@ -201,7 +201,8 @@ export function SuggestionsPanel() {
       {loading ? <Scanning label="SCANNING THE NETWORK GRAPH" /> : null}
       {error ? <p className="banner error">{error}</p> : null}
 
-      <table className="fee-table feerec-table">
+      <div className="table-scroll">
+<table className="fee-table feerec-table t-sug">
         <thead>
           <tr>
             <th></th>
@@ -371,6 +372,7 @@ export function SuggestionsPanel() {
           })}
         </tbody>
       </table>
+</div>
       {rows.length === 0 && !loading && !error ? (
         <EmptyState icon="🔍">No suggestions — try lowering “Min channels” or widening “Max stale”.</EmptyState>
       ) : null}

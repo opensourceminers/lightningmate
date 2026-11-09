@@ -98,7 +98,8 @@ test("Market → Sell: from which size orders are turned down, no 'too dear to f
   assert.equal(turnedDownLine({ offerId: "x", turnedDownUnderSat: undefined }, true), null);
   const sell = src("MarketSell");
   assert.doesNotMatch(sell, /too dear to fill/);
-  assert.match(sell, /One sale at the recommended price/);
+  assert.match(sell, /One sale nets/);
+  assert.match(sell, /sat at the recommended price/);
   assert.match(sell, /turnedDownLine\(e,/);
   assert.match(renderToStaticMarkup(<HowAmbossPicks usdOrderSat={null} feeBps={50} />), /The 0\.5% service fee applies only to completed sales\./);
   assert.doesNotMatch(renderToStaticMarkup(<HowAmbossPicks usdOrderSat={null} feeBps={0} />), /service fee applies/);

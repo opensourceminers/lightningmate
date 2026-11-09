@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import { pageHidden } from "../usePolledData";
@@ -221,7 +221,8 @@ export function MarketBuy() {
 
       {offers.length > 0 ? (
         <>
-          <table className="fee-table">
+          <div className="table-scroll">
+<table className="fee-table t-buy">
             <thead>
               <tr>
                 <th>Seller</th>
@@ -240,7 +241,8 @@ export function MarketBuy() {
                 const blocked = o.conditions.filter((c) => c.pass === false);
                 const unknown = o.conditions.filter((c) => c.pass === null);
                 return (
-                  <tr key={o.offerId} className={o.eligible === false ? "inactive" : ""}>
+                  <Fragment key={o.offerId}>
+                  <tr className={`has-sm-row ${o.eligible === false ? "inactive" : ""}`}>
                     <td title={o.sellerPubkey}>
                       <NodeLink pubkey={o.sellerPubkey}>
                         <code>{o.sellerPubkey.slice(0, 14)}…</code>
@@ -282,10 +284,20 @@ export function MarketBuy() {
                       </button>
                     </td>
                   </tr>
+                  <tr className={`sm-row ${o.eligible === false ? "inactive" : ""}`}>
+                    <td colSpan={9}>
+                      {satsCompact(o.minSizeSats)}–{satsCompact(Math.min(o.maxSizeSats, o.availableSats))}
+                      {o.fits ? "" : " ⚠"} · {(o.costPpmPerYear / 10_000).toFixed(2)}% a year · {o.feeRateCapPpm ? `≤ ${o.feeRateCapPpm} ppm` : "no fee promise"}
+                      {o.eligible === false ? <div className="sug-warn">✗ {blocked[0]?.text ?? ""}</div> : null}
+                      {o.eligible === null ? <div>? {unknown[0]?.text ?? ""}</div> : null}
+                    </td>
+                  </tr>
+                  </Fragment>
                 );
               })}
             </tbody>
           </table>
+</div>
           {offers.length > TOP_OFFERS ? (
             <button className="reset" onClick={() => setShowAllOffers((v) => !v)}>
               {showAllOffers ? `Show the top ${TOP_OFFERS}` : `Show all ${offers.length} offers`}

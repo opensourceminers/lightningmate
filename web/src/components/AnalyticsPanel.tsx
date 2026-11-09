@@ -92,7 +92,8 @@ export function ChannelProfitability({ rows }: { rows: ChannelPnlRow[] }) {
       {rows.length === 0 ? (
         <p className="muted empty">No routing or rebalancing in this window yet.</p>
       ) : (
-        <table className="fee-table">
+        <div className="table-scroll">
+<table className="fee-table t-an-channels">
           <thead>
             <tr>
               <th>Channel</th>
@@ -142,6 +143,7 @@ export function ChannelProfitability({ rows }: { rows: ChannelPnlRow[] }) {
             ))}
           </tbody>
         </table>
+</div>
       )}
     </section>
   );
@@ -158,7 +160,8 @@ function RefillsTable({ outcomes }: { outcomes: OutcomesReport }) {
         </h2>
       </div>
       <p className="muted small">{r.method}</p>
-      <table className="fee-table">
+      <div className="table-scroll">
+<table className="fee-table t-an-refills">
         <thead>
           <tr>
             <th>Channel</th>
@@ -189,6 +192,7 @@ function RefillsTable({ outcomes }: { outcomes: OutcomesReport }) {
           ))}
         </tbody>
       </table>
+</div>
     </section>
   );
 }
@@ -203,7 +207,8 @@ export function BoughtInbound({ data }: { data: BoughtInboundResponse }) {
         </h2>
       </div>
       <p className="muted small">{data.method}</p>
-      <table className="fee-table">
+      <div className="table-scroll">
+<table className="fee-table t-an-bought">
         <thead>
           <tr>
             <th>Channel</th>
@@ -232,6 +237,7 @@ export function BoughtInbound({ data }: { data: BoughtInboundResponse }) {
           ))}
         </tbody>
       </table>
+</div>
     </section>
   );
 }
@@ -398,7 +404,8 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
                 </h2>
               </div>
               <p className="muted small">{outcomes.fees.note}</p>
-              <table className="fee-table">
+              <div className="table-scroll">
+<table className="fee-table t-an-fees">
                 <thead>
                   <tr>
                     <th>Channel</th>
@@ -431,6 +438,7 @@ export function AnalyticsPanel({ initialSub }: { initialSub?: string }) {
                   ))}
                 </tbody>
               </table>
+</div>
             </section>
           ) : null}
         </>

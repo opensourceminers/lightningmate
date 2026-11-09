@@ -199,7 +199,7 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
         </div>
       </section>
 
-      <div className="pay-grid">
+      <div className="pay-grid oc-grid">
         {/* ── Receive ───────────────────────────────────────── */}
         <section className="panel">
           <div className="panel-head"><h2>Receive on-chain</h2></div>
@@ -246,7 +246,7 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
               <button className="row-btn" disabled={!canWrite || sending} onClick={() => void fillMax()} title="The most that can go while the on-chain reserve and the coins promised to buyers stay">
                 Max
               </button>
-              <label className="muted">
+              <label className="muted oc-sendall">
                 <input type="checkbox" checked={sendAll} disabled={!canWrite || sending} onChange={(e) => setSendAll(e.target.checked)} /> Send everything
                 (empty the wallet — LND keeps only its anchor reserve)
               </label>
@@ -265,7 +265,8 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
       {/* ── Transactions ──────────────────────────────────── */}
       <section className="panel">
         <div className="panel-head"><h2>Transactions</h2></div>
-        <table className="fee-table">
+        <div className="table-scroll">
+<table className="fee-table t-chain">
           <tbody>
             {txs.slice(0, 12).map((t) => (
               <tr key={t.id}>
@@ -284,6 +285,7 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
             ))}
           </tbody>
         </table>
+</div>
         {txs.length === 0 ? <p className="muted empty">No on-chain transactions yet.</p> : null}
       </section>
     </div>

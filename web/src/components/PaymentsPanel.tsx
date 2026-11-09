@@ -233,7 +233,8 @@ export function PaymentsPanel({ price }: { price?: PriceInfo | null }) {
         <div className="pay-grid">
           <div>
             <h3 className="sub">Received</h3>
-            <table className="fee-table">
+            <div className="table-scroll">
+<table className="fee-table t-recv">
               <tbody>
                 {(activity?.invoices ?? []).slice(0, 8).map((i) => (
                   <tr key={i.id}>
@@ -244,11 +245,13 @@ export function PaymentsPanel({ price }: { price?: PriceInfo | null }) {
                 ))}
               </tbody>
             </table>
+</div>
             {!activity?.invoices.length ? <p className="muted empty">No invoices yet.</p> : null}
           </div>
           <div>
             <h3 className="sub">Sent</h3>
-            <table className="fee-table">
+            <div className="table-scroll">
+<table className="fee-table t-sent">
               <tbody>
                 {(activity?.payments ?? []).slice(0, 8).map((p) => (
                   <tr key={p.id}>
@@ -260,6 +263,7 @@ export function PaymentsPanel({ price }: { price?: PriceInfo | null }) {
                 ))}
               </tbody>
             </table>
+</div>
             {!activity?.payments.length ? <p className="muted empty">No payments yet.</p> : null}
           </div>
         </div>

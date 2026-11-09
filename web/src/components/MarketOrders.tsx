@@ -163,7 +163,8 @@ export function MarketOrders() {
   const purchaseBlock = purchases.length ? (
     <>
       <h3 className="sub">Purchases · inbound you bought</h3>
-      <table className="fee-table">
+      <div className="table-scroll">
+<table className="fee-table t-purchases">
         <thead>
           <tr>
             <th>When</th>
@@ -189,6 +190,7 @@ export function MarketOrders() {
           ))}
         </tbody>
       </table>
+</div>
     </>
   ) : null;
 
@@ -203,7 +205,8 @@ export function MarketOrders() {
           channel is opening — failures refund automatically.
         </InfoTip>
       </h3>
-      <table className="fee-table">
+      <div className="table-scroll">
+<table className="fee-table t-lsp">
         <thead>
           <tr>
             <th>When</th>
@@ -225,6 +228,7 @@ export function MarketOrders() {
           ))}
         </tbody>
       </table>
+</div>
     </>
   ) : null;
 
@@ -294,7 +298,8 @@ export function MarketOrders() {
       ) : orders.length === 0 ? (
         <EmptyState icon="📭">No orders yet.</EmptyState>
       ) : (
-        <table className="fee-table">
+        <div className="table-scroll">
+<table className="fee-table t-orders">
           <thead>
             <tr>
               <th>When</th>
@@ -312,6 +317,7 @@ export function MarketOrders() {
                 <td className="muted">{new Date(o.createdAt).toLocaleString()}</td>
                 <td>
                   <NodeLink pubkey={buyerKey(o)} alias={o.buyerAlias} />
+                  <div className="sm-only muted small">{new Date(o.createdAt).toLocaleString()}</div>
                 </td>
                 <td className="num">{satsCompact(o.sizeSats)}</td>
                 <td className="num">{o.feeSats > 0 ? o.feeSats.toLocaleString() : "—"}</td>
@@ -342,6 +348,7 @@ export function MarketOrders() {
             ))}
           </tbody>
         </table>
+</div>
       )}
 
       {purchaseBlock}

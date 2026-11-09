@@ -239,16 +239,16 @@ test("the Channels table's notes: what is worth saying about a channel, nothing 
   assert.deepEqual(texts(channel({ private: true })), ["private"]);
 });
 
-test("the table shows four columns; the rest are on request, and a row names its node as a button", () => {
+test("the table says what a channel is and does in each row; the rest are on request, and a row names its node as a button", () => {
   const html = renderToStaticMarkup(<ChannelTable channels={[channel({ peerAlias: `<script>alert("x")</script>` })]} />);
   const heads = html.slice(html.indexOf("<thead>"), html.indexOf("</thead>"));
-  assert.equal((heads.match(/<th[ >]/g) ?? []).length, 4);
-  assert.match(heads, />Node</);
-  assert.doesNotMatch(heads, /Flow|Routed|Fee now|Autopilot fee/);
+  for (const h of ["Node", "Size", "Fee", "Earned", "Forwards", "Note"]) assert.match(heads, new RegExp(`>${h}<`), h);
+  assert.doesNotMatch(heads, /Routed|Autopilot fee/);
+  assert.match(html, /opened by you/);
   assert.match(html, /More columns/);
   assert.doesNotMatch(html, /<script>/, "an alias is text, whatever it says");
   const src = readFileSync(new URL("../src/components/ChannelTable.tsx", import.meta.url), "utf8");
-  for (const id of ["role", "sent", "received", "fee", "auto", "close"]) assert.match(src, new RegExp(`has\\("${id}"\\)`), id);
+  for (const id of ["sent", "received", "auto", "close"]) assert.match(src, new RegExp(`has\\("${id}"\\)`), id);
   // A chosen column stays chosen, in this browser.
   assert.match(src, /writeRemembered\(COLUMNS_KEY/);
   // The controls in a row stay controls.

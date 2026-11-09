@@ -170,6 +170,9 @@ export interface MagmaSellRecommendation {
   state: MagmaSellOfferState;
   shouldReprice: boolean;
   repriceDirection: "up" | "down" | "none";
+  /** How far the price may be from the recommendation before it is rewritten:
+   *  the offer isn't touched for every small move of the market (ppm). */
+  repriceThresholdPpm: number;
   /** The reprice is for the base fee alone: the offer's price at the
    *  representative size √(min·max) stays (a price the reprice threshold
    *  leaves alone), split anew with the market's base — `recommended` is that
@@ -936,6 +939,7 @@ export async function getMagmaRecommendations(
     let mode: "create" | "update" | "hold" = offer ? "update" : "create";
     let shouldReprice = false;
     let repriceDirection: "up" | "down" | "none" = "none";
+    const repriceThreshold = Math.max(cfg.minRepriceDeltaPpm, recommended.effectiveFeePpm * cfg.relativeRepriceThreshold);
 
     if (offer && offer.status !== "ENABLED") {
       state = "inactive";
@@ -964,13 +968,12 @@ export async function getMagmaRecommendations(
       repriceDirection = "up";
     } else if (current) {
       const delta = recommended.effectiveFeePpm - current.effectiveFeePpm;
-      const threshold = Math.max(cfg.minRepriceDeltaPpm, recommended.effectiveFeePpm * cfg.relativeRepriceThreshold);
-      if (delta > threshold) {
+      if (delta > repriceThreshold) {
         state = "underpriced";
         shouldReprice = true;
         repriceDirection = "up";
         reasons.push(`underpriced — you could charge ${Math.round((delta / Math.max(current.effectiveFeePpm, 1)) * 100)}% more`);
-      } else if (delta < -threshold) {
+      } else if (delta < -repriceThreshold) {
         state = "overpriced";
         shouldReprice = true;
         repriceDirection = "down";
@@ -1022,6 +1025,7 @@ export async function getMagmaRecommendations(
       state,
       shouldReprice,
       repriceDirection,
+      repriceThresholdPpm: Math.round(repriceThreshold),
       ...(baseOnly ? { baseOnly } : {}),
       ...(offer ? { baseFeeMarketSat: marketBase, baseFeeDiffers: baseDiffers } : {}),
       ...(offer && baseHeld && follow?.at != null ? { baseFeeFollowsAt: new Date(follow.at).toISOString() } : {}),

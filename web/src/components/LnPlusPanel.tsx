@@ -35,7 +35,8 @@ function PoolTable({ nodes }: { nodes: LnPlusPoolNode[] }) {
   if (!nodes.length) return <div className="muted pad">No pool nodes returned right now.</div>;
   return (
     <>
-    <table className="fee-table">
+    <div className="table-scroll">
+<table className="fee-table t-pool">
       <thead>
         <tr>
           <th>Node</th>
@@ -58,6 +59,9 @@ function PoolTable({ nodes }: { nodes: LnPlusPoolNode[] }) {
               <div className="muted reason">
                 {n.positiveRatings} positive / {n.negativeRatings} negative ratings
               </div>
+              <div className="sm-only muted small">
+                from {satsCompact(n.minChannelSizeSats)} · {n.openChannels} channels · {n.connection || (n.reachableOverTor ? "Tor" : "Clearnet")}
+              </div>
             </td>
             <td className="num strong">{satsCompact(n.creditsBalanceSats)}</td>
             <td className="num">{satsCompact(n.minChannelSizeSats)}</td>
@@ -68,6 +72,7 @@ function PoolTable({ nodes }: { nodes: LnPlusPoolNode[] }) {
         ))}
       </tbody>
     </table>
+</div>
       {nodes.length > TOP_NODES ? (
         <button className="reset" onClick={() => setShowAll((v) => !v)}>
           {showAll ? `Show the top ${TOP_NODES}` : `Show all ${nodes.length} nodes`}
@@ -93,7 +98,8 @@ function SwapsTable({ data }: { data: LnPlusSwapsResponse }) {
           {data.me.prime ? " · LN+ Prime" : " · not Prime"}
         </span>
       </div>
-      <table className="fee-table">
+      <div className="table-scroll">
+<table className="fee-table t-swaps">
         <thead>
           <tr>
             <th>Swap</th>
@@ -109,6 +115,7 @@ function SwapsTable({ data }: { data: LnPlusSwapsResponse }) {
           ))}
         </tbody>
       </table>
+</div>
     </>
   );
 }
@@ -128,6 +135,9 @@ function SwapRow({ swap: s }: { swap: LnPlusSwap }) {
         </div>
         <div className="muted reason">
           {s.participants.length} participant{s.participants.length === 1 ? "" : "s"} · {s.statusText}
+        </div>
+        <div className="sm-only muted small">
+          {s.durationMonths} mo · {s.openSeats}/{s.maxParticipants} seats
         </div>
       </td>
       <td className="num strong">{satsCompact(s.capacitySats)}</td>

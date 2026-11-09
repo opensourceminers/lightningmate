@@ -3,8 +3,7 @@ import { useNodeChanges } from "../nodeNav";
 import { api } from "../api";
 import type { ChannelRole, ChannelView, FeeMode, OverrideMap } from "../types";
 import { satsCompact } from "../format";
-import { feeText } from "../feeView";
-import { channelNotes, type ChannelNote } from "../nodeView";
+import { ageText, channelNotes, type ChannelNote } from "../nodeView";
 import { openNode } from "../nodeNav";
 import { readRememberedList, writeRemembered } from "../remembered";
 import { usePolledData } from "../usePolledData";
@@ -26,19 +25,16 @@ export function BalanceBar({ ratio }: { ratio: number }) {
   return (
     <div className="bal-bar" title={`${pct}% on your side`}>
       <div className="bal-local" style={{ width: `${pct}%` }} />
-      <span className="bal-pct">{pct}%</span>
     </div>
   );
 }
 
-type SortKey = "capacity" | "localRatio" | "earned" | "totalSent" | "totalReceived";
+type SortKey = "capacity" | "localRatio" | "earned" | "forwards" | "fee" | "totalSent" | "totalReceived";
 
-/** The columns anyone can add to the four every row has. */
+/** The columns anyone can add to those every row has. */
 const EXTRA_COLUMNS = [
-  { id: "role", label: "Flow" },
   { id: "sent", label: "Routed out" },
   { id: "received", label: "Routed in" },
-  { id: "fee", label: "Fee now" },
   { id: "auto", label: "Autopilot fee" },
   { id: "close", label: "Close" },
 ] as const;
@@ -85,6 +81,10 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
   const flows = new Map((report.data?.perChannel ?? []).map((f) => [f.channelId, f]));
   const flowsLoaded = report.data !== null && report.data.complete;
   const earned = (c: ChannelView) => flows.get(c.id)?.feesEarnedSats ?? 0;
+  const forwards = (c: ChannelView) => {
+    const f = flows.get(c.id);
+    return f ? f.forwardCount + f.inboundForwardCount : 0;
+  };
 
   const has = (id: ExtraColumn) => extra.includes(id);
   const toggleColumn = (id: ExtraColumn) => {
@@ -93,7 +93,7 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
     writeRemembered(COLUMNS_KEY, JSON.stringify(next));
   };
 
-  const sortValue = (c: ChannelView) => (sort === "earned" ? earned(c) : c[sort]);
+  const sortValue = (c: ChannelView) => (sort === "earned" ? earned(c) : sort === "forwards" ? forwards(c) : sort === "fee" ? (c.feeRatePpm ?? -1) : c[sort]);
   const rows = channels
     .filter((c) => (onlyActive ? c.active : true))
     .slice()
@@ -114,6 +114,8 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
           <select value={sort} onChange={(e) => setSort(e.target.value as SortKey)}>
             <option value="capacity">sort: size</option>
             <option value="earned">sort: earned</option>
+            <option value="forwards">sort: forwards</option>
+            <option value="fee">sort: fee</option>
             <option value="localRatio">sort: your side %</option>
             <option value="totalSent">sort: routed out</option>
             <option value="totalReceived">sort: routed in</option>
@@ -121,21 +123,24 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
         </div>
       </div>
 
+      <div className="table-scroll">
       <table className="channels channels-simple">
         <thead>
           <tr>
             <th>Node</th>
+            <th className="num hide-sm">Size</th>
             <th className="bal-col">
-              Size<span className="ct-long-word"> · your side</span>
+              <span className="ct-long-word">Yours ⟷ theirs</span>
+              <span className="ct-short-word">Size</span>
             </th>
+            <th className="num hide-sm">Fee</th>
             <th className="num">
               Earned<span className="ct-long-word"> 30 d</span>
             </th>
+            <th className="num hide-sm">Forwards</th>
             <th className="ct-note-col">Note</th>
-            {has("role") ? <th>Flow</th> : null}
             {has("sent") ? <th className="num">Routed out</th> : null}
             {has("received") ? <th className="num">Routed in</th> : null}
-            {has("fee") ? <th className="num">Fee now</th> : null}
             {has("auto") ? <th>Autopilot fee</th> : null}
             {has("close") ? <th></th> : null}
           </tr>
@@ -147,6 +152,7 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
             const pending = pendingClose || pendingOpen;
             const flow = flows.get(c.id);
             const notes = channelNotes(c, flow, flowsLoaded);
+            const age = ageText(c.ageDays);
             return (
               <tr
                 key={c.id}
@@ -154,19 +160,51 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
                 onClick={() => openNode({ pubkey: c.peerPubkey, alias: c.peerAlias })}
               >
                 <td>
-                  <span className={`status ${pending ? "pending" : c.active ? "on" : "off"}`} />
-                  <NodeLink pubkey={c.peerPubkey} alias={c.peerAlias} />
-                  {notes.length > 0 ? (
-                    <div className="ct-note-inline">
-                      <Notes notes={notes} />
+                  <div className="ct-node">
+                    <span className={`status ${pending ? "pending" : c.active ? "on" : "off"}`} />
+                    <div className="ct-node-text">
+                      <NodeLink pubkey={c.peerPubkey} alias={c.peerAlias} />
+                      <div className="ct-sub">
+                        {c.initiator === "local" ? "opened by you" : "opened by them"}
+                        {age ? ` · ${age}` : ""} · {ROLE_LABEL[c.role]}
+                      </div>
+                      {pending ? null : (
+                        <div className="ct-sub sm-only">
+                          {c.feeRatePpm == null ? "" : `${c.feeRatePpm.toLocaleString("en-US")} ppm`}
+                          {report.data === null ? "" : `${c.feeRatePpm == null ? "" : " · "}${forwards(c).toLocaleString("en-US")} forwards`}
+                        </div>
+                      )}
+                      {notes.length > 0 ? (
+                        <div className="ct-note-inline">
+                          <Notes notes={notes} />
+                        </div>
+                      ) : null}
                     </div>
-                  ) : null}
-                </td>
-                <td className="bal-col">
-                  <div className="bal-cell">
-                    <span className="bal-cap">{satsCompact(c.capacity)}</span>
-                    <BalanceBar ratio={c.localRatio} />
                   </div>
+                </td>
+                <td className="num hide-sm strong">{satsCompact(c.capacity)}</td>
+                <td className="bal-col">
+                  <div className="bal-cap-sm">{satsCompact(c.capacity)}</div>
+                  <BalanceBar ratio={c.localRatio} />
+                  <div className="bal-sides">
+                    <span>
+                      {satsCompact(c.localBalance)} <span className="bal-pct">{Math.round(c.localRatio * 100)}%</span>
+                    </span>
+                    <span>{satsCompact(c.remoteBalance)}</span>
+                  </div>
+                </td>
+                <td className="num hide-sm" title="what this channel charges to forward out now">
+                  {pending || c.feeRatePpm == null ? (
+                    <span className="muted">—</span>
+                  ) : (
+                    <>
+                      {c.feeRatePpm.toLocaleString("en-US")} ppm
+                      <div className="muted small">
+                        {(c.feeRatePpm / 10_000).toLocaleString("en-US", { maximumFractionDigits: 4 })} %
+                        {c.baseFeeMsat ? ` + ${c.baseFeeMsat % 1000 === 0 ? `${c.baseFeeMsat / 1000} sat` : `${c.baseFeeMsat} msat`}` : ""}
+                      </div>
+                    </>
+                  )}
                 </td>
                 <td className="num">
                   {report.data === null || pending ? <span className="muted">—</span> : <span className="strong">{earned(c).toLocaleString("en-US")}</span>}
@@ -177,21 +215,12 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
                     </div>
                   ) : null}
                 </td>
+                <td className="num hide-sm">{report.data === null || pending ? <span className="muted">—</span> : forwards(c).toLocaleString("en-US")}</td>
                 <td className="ct-note-col">
                   <Notes notes={notes} />
                 </td>
-                {has("role") ? (
-                  <td>
-                    <span className={`role role-${c.role}`}>{ROLE_LABEL[c.role]}</span>
-                  </td>
-                ) : null}
                 {has("sent") ? <td className="num">{satsCompact(c.totalSent)}</td> : null}
                 {has("received") ? <td className="num">{satsCompact(c.totalReceived)}</td> : null}
-                {has("fee") ? (
-                  <td className="num" title="what this channel charges to forward out now">
-                    {pending ? <span className="muted">—</span> : feeText(c.feeRatePpm, c.baseFeeMsat)}
-                  </td>
-                ) : null}
                 {has("auto") ? (
                   <td onClick={stay}>
                     {pending ? (
@@ -219,6 +248,7 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
           })}
         </tbody>
       </table>
+      </div>
       {rows.length === 0 ? <EmptyState icon="⚡">No channels to show.</EmptyState> : null}
 
       <div className="ct-foot">
@@ -226,8 +256,9 @@ export function ChannelTable({ channels }: { channels: ChannelView[] }) {
           Click a node for its details.
           <InfoTip label="What the columns mean">
             <strong>Earned</strong>: the fees of the forwards that left through this channel. <strong>Brought in</strong>: the fees
-            earned elsewhere on the forwards that came in through it; closing it would lose those too. <strong>Your side</strong>: the
-            share of the channel you can send. <strong>Autopilot fee</strong>: <code>auto</code> follows the policy, <code>fixed</code>{" "}
+            earned elsewhere on the forwards that came in through it; closing it would lose those too. <strong>Yours ⟷ theirs</strong>:
+            who holds the channel's coins: you can send what is yours. <strong>Fee</strong>: what it charges to forward out now.{" "}
+            <strong>Autopilot fee</strong>: <code>auto</code> follows the policy, <code>fixed</code>{" "}
             pins a fee (it starts at the current one; confirm with Enter or Pin — fee automation then sets it, or Apply on the Fees
             tab; saving it changes nothing on the node by itself), <code>excluded</code> keeps the autopilot off this channel.
           </InfoTip>

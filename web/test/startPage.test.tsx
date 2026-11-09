@@ -15,6 +15,7 @@ import { SETUP_GOALS, setupLines, setupPatch, setupProblem, withoutSelling, type
 import { advancedChanged, baselineConfig, EMPTY_DRAFT, resetToBaseline, type AdvancedSet, type Draft } from "../src/autopilotForm";
 import { buildPresets, matchesPreset, SELLING_KEYS } from "../src/presets";
 import { GLOSSARY } from "../src/components/SettingsPanel";
+import { priceHoldNote } from "../src/magmaView";
 import type { AutopilotConfig, ChannelView, DashboardData } from "../src/types";
 
 const read = (f: string) => readFileSync(new URL(`../src/${f}`, import.meta.url), "utf8");
@@ -250,11 +251,10 @@ test("Settings is a gear in the top bar, not a tab; a link to it still works", (
 test("selling has one home for its settings: Market → Sell shows the offer and points there", () => {
   const sell = read("components/MarketSell.tsx");
   assert.match(sell, /settings under Autopilot → Selling/);
-  assert.match(sell, /<Fold id="sell-by-hand"/);
-  assert.match(sell, /<Fold id="sell-check"/);
+  assert.doesNotMatch(sell, /<Fold /, "price and figures in view, nothing to unfold");
   assert.doesNotMatch(sell, /v2-badge/);
-  // An edit under way, or no offer yet, opens what it needs.
-  assert.match(sell, /forceOpen=\{editingId !== null \|\| draft !== null \|\| showForm \|\| \(connected !== null && offers\.length === 0\)\}/);
+  // An edit under way, or no offer yet, shows its form.
+  assert.match(sell, /const formOpen = editingId !== null \|\| draft !== null \|\| showForm \|\| \(connected !== null && offers\.length === 0\)/);
   const panel = read("components/AutopilotPanel.tsx");
   assert.match(panel, /goTo\("market", "sell"\)/);
 });
@@ -293,12 +293,28 @@ test("idle channels lead to the table that marks them, not a list that may leave
   assert.deepEqual([todo[0].tab, todo[0].sub], ["channels", undefined]);
 });
 
-test("Market → Sell keeps what is wrong in view: the price's state and its warnings above the folds, a problem count on the check", () => {
+test("Market → Sell shows the price and why it stays: yours against the recommendation, within the threshold, the state and warnings in view", () => {
   const sell = read("components/MarketSell.tsx");
-  const fold = sell.indexOf('<Fold id="sell-by-hand"');
-  assert.ok(sell.indexOf("sell-price-line") < fold && sell.indexOf("sell-price-line") > 0);
-  assert.ok(sell.indexOf("r0.warnings.map") < fold && sell.indexOf("r0.warnings.map") > 0);
-  assert.match(sell, /note=\{sellProblems > 0 \? `\$\{sellProblems\} to look at` : undefined\}/);
+  assert.match(sell, /SELL_STATE_LABEL\[r0\.state\]/);
+  assert.match(sell, /r0\.warnings\.map/);
+  assert.match(sell, /priceHoldNote\(r0, mine, managedPrice\)/);
+  const r = { state: "well_priced", current: { effectiveFeePpm: 4534 }, recommended: { effectiveFeePpm: 4263 }, shouldReprice: false, repriceThresholdPpm: 426 };
+  const offer = { feeRatePpm: 4280, baseFeeSats: 284 };
+  assert.equal(
+    priceHoldNote(r, offer, true),
+    "Your 4,280 ppm + 284 sat comes to 4,534 ppm on a typical order. That is 271 ppm above the recommendation, and the autopilot only rewrites an offer from 426 ppm off, so it doesn't change for every small move of the market.",
+  );
+  assert.equal(priceHoldNote(r, offer, false), "Your 4,280 ppm + 284 sat comes to 4,534 ppm on a typical order. That is 271 ppm above the recommendation: within 426 ppm counts as well priced.");
+  assert.match(priceHoldNote({ ...r, current: { effectiveFeePpm: 4100 } }, { feeRatePpm: 4100, baseFeeSats: 0 }, true) ?? "", /^That is 163 ppm below the recommendation/);
+  // Nothing to explain: about to be rewritten, already there, or no offer yet.
+  assert.equal(priceHoldNote({ ...r, shouldReprice: true }, offer, true), null);
+  assert.equal(priceHoldNote({ ...r, current: { effectiveFeePpm: 4263 } }, offer, true), null);
+  assert.equal(priceHoldNote({ ...r, current: null }, undefined, true), null);
+  // Only a well-priced offer is "held": an offer that is off, exhausted or not worth listing has another story.
+  for (const state of ["inactive", "exhausted", "do_not_list_floor", "unprofitable"]) {
+    assert.equal(priceHoldNote({ ...r, state }, offer, true), null, state);
+  }
+  assert.equal(priceHoldNote({ ...r, current: { effectiveFeePpm: 5000 } }, offer, true), null, "past the threshold it isn't held");
 });
 
 test("the first start saves once, after selling's own dialog: nothing runs while it is up, and a no leaves no selling settings behind", () => {
@@ -319,4 +335,22 @@ test("a feed row says a thing once", () => {
   assert.equal(activityTitle({ kind: "channel_open", title: "Channel open" }), "Channel open");
   assert.equal(activityTitle({ kind: "channel_close", title: "Sunny Sarah" }), "Channel close · Sunny Sarah");
   assert.equal(activityTitle({ kind: "onchain_in", title: "On-chain receive" } as never), "On-chain in");
+});
+
+test("a phone hides table columns, never what a decision rests on: each stays in the row itself", () => {
+  const read = (f: string) => readFileSync(new URL(`../src/components/${f}.tsx`, import.meta.url), "utf8");
+  // Why an offer can't be bought, its sizes and promise.
+  assert.match(read("MarketBuy"), /className=\{`sm-row[\s\S]*?✗ \{blocked\[0\]\?\.text/);
+  // A refill's state and its Run button; its payback and net.
+  const reb = read("RebalanceRecommendations");
+  assert.match(reb, /sm-only reb-sm[\s\S]*?\{stateCell\}[\s\S]*?payback[\s\S]*?net/);
+  assert.match(reb, /<td>\{stateCell\}<\/td>/);
+  // What a close gives up, above its button.
+  assert.match(read("CloseCandidatesPanel"), /sm-only muted small[\s\S]*?inbound lost[\s\S]*?P&amp;L 60 d/);
+  // A fee's state; a channel's fee and forwards.
+  assert.match(read("FeeRecommendations"), /sm-only reb-sm-state[\s\S]*?STATE_LABEL\[r\.state\]/);
+  assert.match(read("ChannelTable"), /ct-sub sm-only[\s\S]*?forwards/);
+  const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
+  assert.match(css, /\.sm-only, \.sm-row \{ display: none; \}/);
+  assert.match(css, /\.sm-only \{ display: block;/);
 });

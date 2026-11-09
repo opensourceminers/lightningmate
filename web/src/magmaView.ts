@@ -585,6 +585,27 @@ export const PURCHASE_LABEL: Record<PurchaseState, string> = {
   order_failed: "failed on Amboss · refunded",
 };
 
+/**
+ * Why an offer stays at its price while another is recommended: the two apart
+ * by less than the threshold is no reason to rewrite it. Its rate and base add
+ * up to the "yours" figure on a typical order. Null: nothing to explain.
+ */
+export function priceHoldNote(
+  r: { state: string; current: { effectiveFeePpm: number } | null; recommended: { effectiveFeePpm: number }; shouldReprice: boolean; repriceThresholdPpm: number },
+  offer: { feeRatePpm: number; baseFeeSats: number } | undefined,
+  autoPriced: boolean,
+): string | null {
+  if (r.state !== "well_priced" || !r.current || r.shouldReprice) return null;
+  const gap = r.current.effectiveFeePpm - r.recommended.effectiveFeePpm;
+  if (gap === 0 || Math.abs(gap) > r.repriceThresholdPpm) return null;
+  const n = (v: number) => v.toLocaleString("en-US");
+  const yours = offer && offer.baseFeeSats > 0 ? `Your ${n(offer.feeRatePpm)} ppm + ${n(offer.baseFeeSats)} sat comes to ${n(r.current.effectiveFeePpm)} ppm on a typical order. ` : "";
+  const apart = `That is ${n(Math.abs(gap))} ppm ${gap > 0 ? "above" : "below"} the recommendation`;
+  return autoPriced
+    ? `${yours}${apart}, and the autopilot only rewrites an offer from ${n(r.repriceThresholdPpm)} ppm off, so it doesn't change for every small move of the market.`
+    : `${yours}${apart}: within ${n(r.repriceThresholdPpm)} ppm counts as well priced.`;
+}
+
 /** The Overview's lease benchmark line (D12): live, or that selling isn't
  *  realistic for this node — never a constant. */
 export function leaseBenchmarkLine(b: LeaseBenchmark | undefined): string | null {

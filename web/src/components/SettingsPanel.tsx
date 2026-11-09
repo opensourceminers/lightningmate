@@ -289,7 +289,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
           ) : (
             <div className="dryrun-banner">{privacySummary(privacy)}</div>
           )}
-          <div className="amboss-row" style={{ marginTop: 10 }}>
+          <div className="amboss-row set-toggle" style={{ marginTop: 10 }}>
             <Switch
               checked={privacy.lnplusLookups}
               disabled={busy}
@@ -298,7 +298,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
             />
             <span className="muted">LN+ lookups: peer reputations from lightningnetwork.plus, for any node whose details you open too — your node's own key included</span>
           </div>
-          <div className="amboss-row" style={{ marginTop: 10 }}>
+          <div className="amboss-row set-toggle" style={{ marginTop: 10 }}>
             <Switch
               checked={privacy.nodeLookups}
               disabled={busy}
