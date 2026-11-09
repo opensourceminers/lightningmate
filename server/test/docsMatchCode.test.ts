@@ -21,8 +21,8 @@ import { FEE_REC_DEFAULTS } from "../src/services/feeRecommend.js";
 import { DEFAULT_CONFIG } from "../src/services/autopilotConfig.js";
 import { DEFAULT_POLICY } from "../src/services/fees.js";
 import { LOOPBACK_HOSTS } from "../src/exposure.js";
-import { SHUTDOWN_GRACE_MS, SHUTDOWN_WAIT_MS } from "../src/shutdown.js";
-import { MANUAL_ACCEPT_SKIP, NOT_REJECTED_ACCEPT_SENT } from "../src/services/magmaDesk.js";
+import { SHUTDOWN_GRACE_MS } from "../src/shutdown.js";
+import { AMBOSS_LEASES_MAX_AGE_MS, MANUAL_ACCEPT_SKIP, NOT_REJECTED_ACCEPT_SENT } from "../src/services/magmaDesk.js";
 import { autopilotWith } from "./helpers/autopilot.js";
 import { quiet } from "./helpers/lifecycle.js";
 
@@ -76,11 +76,12 @@ test("the README and SECURITY.md say what the server does about where requests c
   assert.ok(stopTimeoutS * 1000 >= SHUTDOWN_GRACE_MS, `--stop-timeout ${stopTimeoutS} is shorter than the app's ${SHUTDOWN_GRACE_MS / 1000} s shutdown`);
   const prose = readme.replace(/\s+/g, " ");
   assert.match(prose, new RegExp(`# --stop-timeout ${stopTimeoutS}: Docker kills a container 10 s after \`docker stop\` by default; # the app takes up to ${SHUTDOWN_GRACE_MS / 1000} s to let work under way finish and save its state`));
-  assert.match(prose, new RegExp(`up to ${SHUTDOWN_WAIT_MS / 1000} seconds to finish`), "the wait for work under way");
-  assert.match(prose, new RegExp(`exits, within ${SHUTDOWN_GRACE_MS / 1000} seconds of the signal: hence the recipe's \`--stop-timeout ${stopTimeoutS}\``));
-  // P4: the Amboss lease listing is asked again when the kept copy is over an hour old — not "hourly".
-  assert.doesNotMatch(readme, /asked again hourly/);
-  assert.match(readme, /ask\s+Amboss for it again only when the copy is over an hour old/);
+  // P4: the Amboss lease listing is asked again when the kept copy is over an hour old — not
+  // "hourly". The README is short now; the strategy doc says it.
+  const strategy = read("docs/AUTOPILOT-STRATEGY.md");
+  assert.equal(AMBOSS_LEASES_MAX_AGE_MS, 3_600_000);
+  assert.doesNotMatch(strategy, /asked again hourly/);
+  assert.match(strategy, /ask\s+Amboss for it again only when the copy is over an hour old/);
   // The cross-site defence, as SECURITY.md documents it.
   assert.match(security, /Sec-Fetch-Site:\s+cross-site/);
   assert.match(security, /every POST must be JSON/);
@@ -196,11 +197,11 @@ test("the store manifest here is the next release's: category bitcoin, and relea
 // quote the reason the Orders tab shows as the code words it.
 test("the docs say a decision made by hand wins over the Magma order lane, for an order the lane isn't working on — a reject Amboss didn't confirm is sent again, an accept that didn't go through leaves the order to the operator, a click mid-step waits, and an accept already sent is completed first", () => {
   const prose = (doc: string) => doc.replace(/\s+/g, " ");
-  const readme = prose(read("README.md"));
+  // The README is short now and leaves this to the two docs below.
   const security = prose(read("SECURITY.md"));
   const strategyProse = prose(strategy);
   const desk = read("server/src/services/magmaDesk.ts");
-  for (const [name, doc] of [["README.md", readme], ["SECURITY.md", security], ["AUTOPILOT-STRATEGY.md", strategyProse]] as const) {
+  for (const [name, doc] of [["SECURITY.md", security], ["AUTOPILOT-STRATEGY.md", strategyProse]] as const) {
     // Review of P9, round 3: "always wins" — while a click that comes as the
     // lane is deciding or acting on that same order waits for that step (one
     // action per order at a time), and finds the order accepted or rejected:
@@ -282,10 +283,6 @@ test("the docs say a decision made by hand wins over the Magma order lane, for a
   assert.match(
     strategyProse,
     /The lane carrying out the operator's decision \(their reject sent again, their accept completed\) is recorded as theirs \(the run history's `via: "manual"`\): the Overview's "Last change by the autopilot" leaves it out\./,
-  );
-  assert.match(
-    readme,
-    /A click that can't read the order \(Amboss or LND not answering\) counts too once the autopilot has the order on record as awaiting your decision/,
   );
   for (const [name, doc] of [["SECURITY.md", security], ["AUTOPILOT-STRATEGY.md", strategyProse]] as const) {
     assert.match(

@@ -524,7 +524,8 @@ promised less. The autopilot's own run doesn't get there that way: a move whose 
 is more than the budget left waits for the daily budget before any size is tried (below).
 Sources: never a channel younger than 14 days, a private one, one sold through Magma or LSPS1
 in its lease (or one whose Magma lease Amboss still lists as running — a sale the order
-journal never recorded too), one with any net outflow in 14 days, a top earner or the node's single best
+journal never recorded too; the listing is kept on disk, and the close list and a close ask
+Amboss for it again only when the copy is over an hour old), one with any net outflow in 14 days, a top earner or the node's single best
 earner; each gives at most its balance above its own target share + 5 %, and the moves
 planned from it shrink what it can give the next target. Up to three sources are tried per
 target, the next one when no route pays from the one before; a failed source backs off for
