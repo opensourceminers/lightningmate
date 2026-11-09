@@ -11,7 +11,7 @@
  * pass run within a deadline — given up past it, writing nothing when the
  * call answers late — and fee writes have a lock of their own: the
  * lease-promise check or an Apply under way no longer makes a scheduled run
- * (or the run Liquidity provision's switch-on kicks) a silent no-op.
+ * (or the run selling's switch-on kicks) a silent no-op.
  */
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
@@ -281,7 +281,7 @@ test("a lease-promise check, an Apply or a fee set by hand whose LND read never 
   assert.equal(feeLockOf(autopilot).busy, false);
 });
 
-test("Liquidity provision switched on while the lease-promise check runs: the run kicked for it does the offer upkeep — before, it was skipped and none followed", async (t) => {
+test("Selling switched on while the lease-promise check runs: the run kicked for it does the offer upkeep — before, it was skipped and none followed", async (t) => {
   quiet(t);
   const { autopilot, seams } = autopilotWith(t, { enabled: false });
   withLeaseCap(autopilot);

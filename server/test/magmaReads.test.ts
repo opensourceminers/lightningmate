@@ -568,11 +568,11 @@ test("a key Amboss revokes while the lane checks an order's capital (the listing
 });
 
 // Review of P10, round 2: a failed read or a refused key noted on an order's
-// record stayed once Amboss showed the order again. With Liquidity provision
+// record stayed once Amboss showed the order again. With selling
 // switched off, a paused lane decides nothing that would replace it: Market →
 // Orders and the recent orders said the key was refused — for a key that
 // works — until the order timed out on the operator.
-test("a key Amboss refused while the lane checked an order's capital, Liquidity provision switched off since: once the key works and Amboss shows the order again, its record no longer says the key is refused", async (t) => {
+test("a key Amboss refused while the lane checked an order's capital, selling switched off since: once the key works and Amboss shows the order again, its record no longer says the key is refused", async (t) => {
   quiet(t);
   const { autopilot, magma, dir, amboss } = sellerSetup(t);
   const sale = magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });

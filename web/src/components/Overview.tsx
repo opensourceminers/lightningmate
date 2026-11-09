@@ -2,17 +2,21 @@ import { api } from "../api";
 import type { ActivityItem, ChannelView, DashboardData, DecisionArea, NodeSummary, PriceInfo } from "../types";
 import { fiat, sats, satsCompact, timeAgo } from "../format";
 import { usePolledData } from "../usePolledData";
-import { AREA_LABEL, STATE_CHIP, autopilotDigest, autopilotTileFoot } from "../autopilotView";
+import { AREA_LABEL, STATE_CHIP, autopilotTileFoot } from "../autopilotView";
+import { openNode } from "../nodeNav";
+import { todoItems } from "../todoView";
+import { Fold } from "./Fold";
 import { InfoTip } from "./InfoTip";
+import { SetupWizard } from "./SetupWizard";
 import { SummaryBar } from "./SummaryBar";
 import { HealthScore } from "./HealthScore";
 import { PnlOverview } from "./PnlOverview";
 import { LiquidityMap } from "./LiquidityMap";
 import { Sparkline } from "./Sparkline";
 import { TopChannelsTile } from "./TopChannelsTile";
-import { leaseBenchmarkLine, refusalDigest } from "../magmaView";
+import { leaseBenchmarkLine } from "../magmaView";
 import { pctFromPpm } from "../yieldView";
-import { ACTIVITY_LABEL, activitySub, foldActivity, noForwardsIn7d, rollingForwardsLine } from "../analyticsView";
+import { activitySub, activityTitle, foldActivity, noForwardsIn7d, rollingForwardsLine } from "../analyticsView";
 import { SuggestedPeersTile } from "./SuggestedPeersTile";
 
 function signed(value: number): string {
@@ -88,7 +92,6 @@ function RecentActivity({ items }: { items: ActivityItem[] }) {
   const rows = foldActivity(items, ACTIVITY_ROWS);
   return (
     <section className="panel">
-      <div className="panel-head"><h2>Recent activity</h2></div>
       {rows.length === 0 ? (
         <p className="muted empty">Nothing yet — forwards and payments will show here.</p>
       ) : (
@@ -99,7 +102,7 @@ function RecentActivity({ items }: { items: ActivityItem[] }) {
               <span className={`feed-dot k-${a.kind}`} />
               <div className="feed-main">
                 <span className="feed-title">
-                  {ACTIVITY_LABEL[a.kind] ?? a.kind} · {a.title}
+                  {activityTitle(a)}
                   {a.count > 1 ? <span className="feed-count"> ×{a.count}</span> : null}
                 </span>
                 <span className="feed-sub">{activitySub(a, satsCompact)}</span>
@@ -114,10 +117,11 @@ function RecentActivity({ items }: { items: ActivityItem[] }) {
   );
 }
 
-/** "Today" digest — one glanceable strip answering "what happened / what needs
- *  me?", built purely from data the Overview already loads. Each item jumps to
- *  the right tab. */
-function DigestStrip({
+/**
+ * What needs you today, each line leading to where it is dealt with. With
+ * nothing to do it says so: the page's first question has an answer either way.
+ */
+function WhatNeedsYou({
   d,
   channels,
   onNavigate,
@@ -126,51 +130,44 @@ function DigestStrip({
   channels?: ChannelView[] | null;
   onNavigate?: (tab: string, sub?: string) => void;
 }) {
-  const a = d.autopilot;
-  const pendingOpen = channels?.filter((c) => c.status === "pending_open").length ?? 0;
-  const pendingClose = channels?.filter((c) => c.status === "pending_close").length ?? 0;
-
-  const items: { key: string; text: string; warn?: boolean; tab: string; sub?: string }[] = [];
-  // The last run with what THAT run did (failures too), the last change as
-  // its own item, and any area in error or blocked (autopilotView.ts).
-  for (const it of autopilotDigest(a)) items.push({ ...it, tab: "autopilot" });
-  if (noForwardsIn7d(d)) {
-    items.push({
-      key: "noflow",
-      text: "No forwards in 7 days — check fees & liquidity",
-      warn: true,
-      tab: "autopilot",
-      sub: "fees",
-    });
-  }
-  // Magma orders the lane turned down (caps, capital, unreachable buyer):
-  // each is a lease fee not earned — say so where it is seen first.
-  const refusals = refusalDigest(a.magmaRefusals, a.magmaRefusalReason);
-  if (refusals) items.push({ key: "magma-refusals", text: refusals, warn: true, tab: "market", sub: "orders" });
-  if (pendingOpen > 0) {
-    items.push({
-      key: "popen",
-      text: `${pendingOpen} channel${pendingOpen > 1 ? "s" : ""} opening — waiting for confirmation`,
-      tab: "channels",
-    });
-  }
-  if (pendingClose > 0) {
-    items.push({
-      key: "pclose",
-      text: `${pendingClose} channel${pendingClose > 1 ? "s" : ""} closing`,
-      tab: "channels",
-    });
-  }
-  if (items.length === 0) return null;
-
+  const { todo, footnote } = todoItems(d, channels);
+  // An alert stands above the page (AlertsBar): no all-clear beneath it.
+  const alerts = usePolledData(api.alerts, 60_000).data ?? [];
   return (
-    <div className="digest">
-      {items.map((it) => (
-        <button key={it.key} className={`digest-item ${it.warn ? "warn" : ""}`} onClick={() => onNavigate?.(it.tab, it.sub)}>
-          {it.text} <span className="go" aria-hidden>↗</span>
-        </button>
-      ))}
-    </div>
+    <section className="panel todo">
+      {todo.length === 0 ? (
+        <p className="todo-none">
+          <span className="todo-ok" aria-hidden>
+            ✓
+          </span>{" "}
+          {alerts.length > 0 ? "Nothing else needs you right now." : "Nothing needs you right now."}
+        </p>
+      ) : (
+        <>
+          <h2>What needs you</h2>
+          <ul className="todo-list">
+            {todo.map((it) => (
+              <li key={it.key}>
+                <button
+                  type="button"
+                  className={`todo-item ${it.warn ? "warn" : ""}`}
+                  onClick={() => {
+                    if (it.node) openNode(it.node);
+                    else if (it.tab) onNavigate?.(it.tab, it.sub);
+                  }}
+                >
+                  <span>{it.text}</span>
+                  <span className="go" aria-hidden>
+                    ↗
+                  </span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {footnote ? <p className="muted small todo-foot">{footnote}</p> : null}
+    </section>
   );
 }
 
@@ -247,6 +244,7 @@ export function Overview({
 
   return (
     <div className="overview">
+      <SetupWizard onChanged={polled.refresh} />
       <SummaryBar node={node} price={price} />
       {polled.error ? (
         <p className="banner error">
@@ -256,13 +254,8 @@ export function Overview({
           </button>
         </p>
       ) : null}
+      {dash ? <WhatNeedsYou d={dash} channels={channels} onNavigate={onNavigate} /> : null}
       {dash ? <KpiRow d={dash} price={price} /> : null}
-      {dash ? <DigestStrip d={dash} channels={channels} onNavigate={onNavigate} /> : null}
-      <div className="hero-row">
-        <HealthScore />
-        <PnlOverview price={price} />
-      </div>
-      {channels ? <LiquidityMap channels={channels} /> : null}
       {dash ? (
         <>
           {/* Three tiles side by side, the same height — the autopilot's status
@@ -274,8 +267,21 @@ export function Overview({
             <TopChannelsTile onOpen={() => onNavigate?.("analytics", "pnl")} />
             <SuggestedPeersTile onOpen={() => onNavigate?.("channels", "open")} />
           </div>
-          <RecentActivity items={dash.activity} />
+          <Fold id="ov-activity" title="Recent activity" defaultOpen>
+            <RecentActivity items={dash.activity} />
+          </Fold>
         </>
+      ) : null}
+      <Fold id="ov-health" title="Node health and profit">
+        <div className="hero-row">
+          <HealthScore />
+          <PnlOverview price={price} />
+        </div>
+      </Fold>
+      {channels ? (
+        <Fold id="ov-map" title="Liquidity map">
+          <LiquidityMap channels={channels} />
+        </Fold>
       ) : null}
     </div>
   );

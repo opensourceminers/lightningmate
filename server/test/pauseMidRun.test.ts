@@ -351,8 +351,8 @@ test("Magma: a sold-out offer is not topped up by a run that was paused before t
   assert.equal(offer.totalSats, 2_000_000);
   const d = s.autopilot.getState().decisions.magma;
   assert.equal(d?.state, "waiting");
-  assert.match(d?.text ?? "", /Liquidity provision was switched off during the run — no further offer change was made/);
-  assert.match(s.autopilot.offerSyncStatus().offers[0]?.differences.join(" ") ?? "", /not changed: Liquidity provision was switched off during the run/);
+  assert.match(d?.text ?? "", /Selling was switched off during the run — no further offer change was made/);
+  assert.match(s.autopilot.offerSyncStatus().offers[0]?.differences.join(" ") ?? "", /not changed: Selling was switched off during the run/);
 });
 
 /** A sold channel whose lease is over (CHANNEL_MONITORING_FINISHED), with auto-close on. */
@@ -601,7 +601,7 @@ test("the order lane: a pause while the HODL invoice is made, and making it fail
 
 // ── review of P7 (final): a paused lane never turns an order down on its own ──
 //
-// acceptOrder neither accepts nor rejects once Liquidity provision is off —
+// acceptOrder neither accepts nor rejects once selling is off —
 // but decide() still sent RejectOrder after a pause: it awaits the first
 // capital check and the buyer's dial (up to ~90 s over Tor), its capital
 // catch went on to "could not decide on it in time" near the deadline, and

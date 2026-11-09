@@ -6,7 +6,7 @@ import type { AutopilotBounds, AutopilotConfig, AutopilotConfigPatch, FeePolicy,
  * model. The five automation switches (and the presets, and pause) act at
  * once — they are actions, and each that moves capital asks first when
  * switched on: the channel autopilot and auto-rebalance (switchOnConfirm),
- * Liquidity provision (its own dialog), the presets and Resume. Every
+ * selling (its own dialog), the presets and Resume. Every
  * setting below them — numbers, check boxes, the pricing level
  * — is a draft until "Save changes": a sticky bar on every sub-tab says what
  * is unsaved, Save and Discard act on all of it, and a draft survives leaving
@@ -55,6 +55,62 @@ export const EMPTY_DRAFT: Draft = { nums: {}, flags: {} };
 
 export const draftIsEmpty = (d: Draft): boolean =>
   Object.keys(d.nums).length === 0 && Object.keys(d.flags).length === 0 && d.pricingMode === undefined && d.noBudgetLimit === undefined;
+
+/** The settings under one area's Advanced. */
+export interface AdvancedSet {
+  paths: readonly NumPath[];
+  flags?: readonly FlagKey[];
+  pricingMode?: boolean;
+}
+
+/**
+ * What an area's Advanced settings are measured against: the factory settings,
+ * with the strategy in force over them (a strategy's own values aren't
+ * something someone changed by hand). `strategy`: that strategy built on the
+ * defaults, or null with none in force.
+ */
+export function baselineConfig(defaults: AutopilotConfig, strategy: AutopilotConfigPatch | null): AutopilotConfig {
+  if (!strategy) return defaults;
+  return {
+    ...defaults,
+    ...strategy,
+    policy: { ...defaults.policy, ...strategy.policy },
+    rebalancePolicy: { ...defaults.rebalancePolicy, ...strategy.rebalancePolicy },
+  } as AutopilotConfig;
+}
+
+/** How many of them differ from the baseline, with what is typed but unsaved. */
+export function advancedChanged(set: AdvancedSet, draft: Draft, config: AutopilotConfig, baseline: AutopilotConfig): number {
+  let changed = 0;
+  for (const path of set.paths) {
+    const typed = draft.nums[path];
+    const shown = typed !== undefined && typed.trim() !== "" && Number.isFinite(Number(typed)) ? Number(typed) : savedNum(config, path);
+    if (shown !== savedNum(baseline, path)) changed += 1;
+  }
+  for (const key of set.flags ?? []) {
+    if ((draft.flags[key] ?? config[key]) !== baseline[key]) changed += 1;
+  }
+  if (set.pricingMode && (draft.pricingMode ?? config.sellPricingMode) !== baseline.sellPricingMode) changed += 1;
+  return changed;
+}
+
+/** The draft with these settings back at the baseline: nothing changes until
+ *  it is saved, and the unsaved bar lists what would. */
+export function resetToBaseline(set: AdvancedSet, draft: Draft, config: AutopilotConfig, baseline: AutopilotConfig): Draft {
+  const nums = { ...draft.nums };
+  const flags = { ...draft.flags };
+  for (const path of set.paths) {
+    const want = savedNum(baseline, path);
+    if (want === null || want === savedNum(config, path)) delete nums[path];
+    else nums[path] = String(want);
+  }
+  for (const key of set.flags ?? []) {
+    if (baseline[key] === config[key]) delete flags[key];
+    else flags[key] = baseline[key];
+  }
+  const pricingMode = set.pricingMode ? (baseline.sellPricingMode === config.sellPricingMode ? undefined : baseline.sellPricingMode) : draft.pricingMode;
+  return { ...draft, nums, flags, pricingMode };
+}
 
 export function boundsFor(bounds: AutopilotBounds | undefined, path: NumPath): NumberBounds | undefined {
   const [section, key] = path.split(".") as [string, string | undefined];
@@ -185,7 +241,7 @@ export function windowEverOpen(start: number, end: number): boolean {
  * its own switch — as the presets and Resume ask before the same effect
  * (review 2026-10-25: the channel autopilot and auto-rebalance saved at once,
  * while this file said each asks first). Null: no confirmation (fee
- * automation and max_htlc move no funds; Liquidity provision has its own
+ * automation and max_htlc move no funds; selling has its own
  * dialog, SellingSwitch.tsx; switching anything off never asks).
  */
 export function switchOnConfirm(
@@ -200,7 +256,7 @@ export function switchOnConfirm(
         "It opens channels with your on-chain funds, on its own: to the best suggestion it can actually open, " +
         `${config.channelSizeSats ? `${sats(config.channelSizeSats)} each` : "sized automatically"}, keeping ${sats(config.channelReserveSats)} on chain, ` +
         `at most ${config.channelMaxFeeRate} sat/vB. With enough routing history an open must also pay back what opening and closing cost; without it, only that fee rate cap applies. ` +
-        "While Liquidity provision is on, routing opens leave the coins your offers can list to Magma when leasing them is expected to earn more — how much is decided each run. " +
+        "While selling is on, routing opens leave the coins your offers can list to Magma when leasing them is expected to earn more — how much is decided each run. " +
         "A channel ties its funds up until it is closed — and closing costs an on-chain fee again.",
       confirmLabel: "Turn on",
     };

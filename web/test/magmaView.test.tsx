@@ -135,7 +135,7 @@ test("'keep disabled' is offered for an offer a switch-on is to list — and onl
   assert.equal(keepDisabledAction({ status: "DISABLED" }, { disabledByHandAt: "2026-10-24T10:00:00Z" }), null);
   assert.equal(keepDisabledAction({ status: "DISABLED" }, undefined), null);
   assert.equal(keepDisabledAction({ status: "ENABLED" }, { listOnAt: "2026-10-24T10:00:00Z" }), null);
-  assert.match(OFFER_AUTOMATION_HINT, /a disable sticks while Liquidity provision stays on \(switching it on lists your disabled offers again; "keep disabled" on Market → Sell keeps one off\)/);
+  assert.match(OFFER_AUTOMATION_HINT, /a disable sticks while selling stays on \(switching it on lists your disabled offers again; "keep disabled" on Market → Sell keeps one off\)/);
 });
 
 test("the Orders tab never calls an order paid that LightningMate didn't hold the payment for", () => {
@@ -238,7 +238,7 @@ test("a6/m3: the diagnostics card lists every check with its mark, opens on prob
     generatedAt: "2026-10-20T10:00:00.000Z",
     checks: [
       { id: "key", status: "ok", label: "Amboss key", detail: "valid" },
-      { id: "provision", status: "problem", label: "Liquidity provision", detail: "off — orders wait for you", fix: { tab: "autopilot", sub: "magma", label: "Turn on" } },
+      { id: "provision", status: "problem", label: "Selling", detail: "off — orders wait for you", fix: { tab: "autopilot", sub: "magma", label: "Turn on" } },
       { id: "eligibility", status: "info", label: "Can this node sell?", detail: "Not realistic yet" },
     ],
     offers: [],
@@ -313,14 +313,14 @@ test("D19: 'How Amboss picks sellers' explains the matching — no 'size, not pr
   assert.doesNotMatch(dated, /on recent fills/);
 });
 
-test("D9: Market opens on Buy, and Sell is labelled advanced; a deep link opens the asked sub-tab", () => {
+test("D9: Market opens on Buy; a deep link opens the asked sub-tab", () => {
   const html = renderToStaticMarkup(
     <OverlayProvider>
       <MarketPanel />
     </OverlayProvider>,
   );
   assert.match(html, /class="subtab active"[^>]*>Buy</);
-  assert.match(html, />Sell \(advanced\)</);
+  assert.match(html, />Sell</);
   const orders = renderToStaticMarkup(
     <OverlayProvider>
       <MarketPanel initialSub="orders" />
@@ -359,9 +359,9 @@ test("offer ownership: a disable by hand is shown as such, whoever sets the term
   assert.equal(mine.label, "yours");
   assert.match(mine.title, /lists it again once it can be funded/);
   assert.doesNotMatch(mine.title, /never enables/);
-  assert.match(disabled.title, /or switch Liquidity provision off and on again/);
+  assert.match(disabled.title, /or switch selling off and on again/);
   const switchedOn = offerOwner({ listOnAt: "2026-10-24T10:00:00Z" }, true);
-  assert.match(switchedOn.title, /Liquidity provision was switched on with it disabled: the autopilot lists it once it has a price and its smallest channel can be funded/);
+  assert.match(switchedOn.title, /Selling was switched on with it disabled: the autopilot lists it once it has a price and its smallest channel can be funded/);
 });
 
 test("rec 5: 'Apply recommended' puts the engine's window into the edit, and every price button the lease its price is for — an odd lease becomes the standard; saving an odd one is warned about", () => {
@@ -411,7 +411,7 @@ test("a 90-day offer's price buttons fill in its 90-day price with its 90-day le
   assert.equal(pricedLeaseWarning(12_960, null), null, "no price button: the operator's own price");
 });
 
-test("Autopilot → Magma's ownership note says what the upkeep does: a disable by hand only unlists, the promise comes with auto-size, and with every switch off only fundability is kept", () => {
+test("Autopilot → Selling's ownership note says what the upkeep does: a disable by hand only unlists, the promise comes with auto-size, and with every switch off only fundability is kept", () => {
   // Before: "An offer you edit, create or disable by hand … is yours" (a
   // status click no longer takes the terms over) and "Every offer promises
   // buyers a routing-fee cap" (written even with every switch off).
@@ -441,7 +441,7 @@ test("Market → Sell's promise note and the seller explainer claim only what th
   const how = renderToStaticMarkup(<HowAmbossPicks usdOrderSat={null} />);
   assert.doesNotMatch(how, /keeps the offer well-formed/);
   assert.match(how, /with auto-size on, it also gives the offers it manages the standard 30-day lease, a routing-fee promise/);
-  assert.match(how, /With Liquidity provision on, LightningMate fulfils orders fast and safely and keeps every offer within what it can fund/);
+  assert.match(how, /With selling on, LightningMate fulfils orders fast and safely and keeps every offer within what it can fund/);
 });
 
 test("a purchase whose failure only the pay call reported is not called failed — LND is asked how it ended", () => {

@@ -227,6 +227,13 @@ export function trendBadge(fr: Pick<ForwardsReport, "trend"> & Partial<Pick<Forw
 
 // ── Activity feed ────────────────────────────────────────────────────────────
 
+/** A feed row's headline: the title only when it adds to the kind ("Channel
+ *  open · Channel open", "On-chain in · On-chain receive" said it twice). */
+export function activityTitle(a: Pick<ActivityItem, "kind" | "title">): string {
+  const label = ACTIVITY_LABEL[a.kind] ?? a.kind;
+  return a.title === label || a.title === "On-chain receive" ? label : `${label} · ${a.title}`;
+}
+
 export const ACTIVITY_LABEL: Record<ActivityItem["kind"], string> = {
   forward: "Routed",
   received: "Received",

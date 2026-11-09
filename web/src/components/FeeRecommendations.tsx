@@ -206,7 +206,7 @@ export function FeeRecommendations() {
               <tr>
                 <th></th>
                 <th>Channel</th>
-                <th className="num">Local</th>
+                <th className="num">Your side</th>
                 <th className="num">Current → Target</th>
                 <th>State</th>
                 <th>Manage</th>

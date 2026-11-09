@@ -148,7 +148,7 @@ import { getAlerts, leasePromiseAlerts, magmaPartsAlerts, magmaRefusalAlerts, of
 import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
 import { SlidingWindowLimiter } from "../services/rateLimit.js";
 import { acknowledgeStoreIncident } from "../store.js";
-import { ConfigValidationError } from "../services/autopilotConfig.js";
+import { DEFAULT_CONFIG, ConfigValidationError } from "../services/autopilotConfig.js";
 import { buyFromOffer, buyLiquidity, cancelPurchase, getMarket, getOffers, getOrder, isAuthError } from "../services/amboss.js";
 import { rankBuyOffers, type BuyerFacts } from "../services/magmaBuy.js";
 import { feeTiers, publicBook } from "../services/magmaEligibility.js";
@@ -931,7 +931,7 @@ export function createApiRouter(
   // own" were untrue with it on). It runs only with write access.
   const lspModeOn = (): boolean => settings.get().lspModeEnabled && !!writeLnd;
   /** The autopilot's state as the pages get it. */
-  const autopilotView = (): AutopilotState => ({ ...autopilot.getState(), lspModeOn: lspModeOn() });
+  const autopilotView = (): AutopilotState => ({ ...autopilot.getState(), lspModeOn: lspModeOn(), defaults: DEFAULT_CONFIG });
 
   // Autopilot status/config.
   router.get("/autopilot", (_req, res) => {
@@ -1007,7 +1007,7 @@ export function createApiRouter(
   );
 
   // "Pause all automation": every switch off at once, what was on kept for
-  // "Resume" — which switches them back on, Liquidity provision excepted
+  // "Resume" — which switches them back on, selling excepted
   // (switching selling on is its own decision, with the selling check, D9).
   // LSP mode is not among them (lspModeOn above).
   router.post("/autopilot/pause", (_req, res) => {
@@ -1273,7 +1273,7 @@ export function createApiRouter(
     "/dashboard",
     wrap(async (req, res) => {
       const nowMs = Date.now();
-      const [report, ln, onchain, channels, leaseBenchmark, ownPubkey, closed] = await Promise.all([
+      const [report, ln, onchain, channels, leaseBenchmark, ownPubkey, closed, height] = await Promise.all([
         getForwardsReport(lnd, 30, { tzOffsetMin: parseTzOffset(queryOf<TzQuery>(req).tz), nowMs }),
         getLnActivity(lnd, 10),
         getOnchainTxs(lnd, 10),
@@ -1281,6 +1281,7 @@ export function createApiRouter(
         autopilot.leaseBenchmark(),
         getOwnPubkey(lnd).catch(() => undefined),
         getClosedChannels({ lnd }).catch((): GetClosedChannelsResult => ({ channels: [] })),
+        currentHeight(),
       ]);
       const totalCapacitySats = channels.reduce((s, c) => s + c.capacity, 0);
       // This node's own capital in its channels (pending ones earn nothing yet).
@@ -1315,6 +1316,21 @@ export function createApiRouter(
         const alias = await getAlias(lnd, c.partner_public_key);
         for (const id of ids) closeTitles.set(id, id === c.close_transaction_id ? alias : `${alias} — sweep`);
       }
+      // Coins doing nothing: open, online, past their first month, outside any
+      // lease, not set aside by the operator ("excluded"), and no forward used
+      // them in the window.
+      const routed = new Set(report.perChannel.filter((f) => f.forwardCount + f.inboundForwardCount > 0).map((f) => f.channelId));
+      const leased = channelLeases(channels, autopilot.leaseSources(), height, nowMs);
+      const setAside = overrides.all();
+      const idle = channels.filter(
+        (c) =>
+          c.status === "open" &&
+          c.active &&
+          !routed.has(c.id) &&
+          !leased.get(c.id)?.running &&
+          setAside[c.id]?.mode !== "exclude" &&
+          (scidAgeDays(c.id, height) ?? 0) >= report.windowDays,
+      );
       res.json(
         buildDashboard(
           report,
@@ -1332,6 +1348,7 @@ export function createApiRouter(
             ownPubkey,
             channelTxids: { opens, closes, closingNow, closeTitles },
             lspModeOn: lspModeOn(),
+            idleChannels: report.complete ? { count: idle.length, localSats: idle.reduce((sum, c) => sum + c.localBalance, 0) } : null,
           },
         ),
       );
@@ -1622,7 +1639,7 @@ export function createApiRouter(
     res.json(settings.get());
   });
   router.post("/settings", (req, res) => {
-    const { fiatCurrency, lspModeEnabled, lnplusLookups, nodeLookups } = bodyOf<SettingsPatch>(req);
+    const { fiatCurrency, lspModeEnabled, lnplusLookups, nodeLookups, setupDone } = bodyOf<SettingsPatch>(req);
     const patch: Parameters<typeof settings.set>[0] = {};
     if (fiatCurrency !== undefined) {
       if (!isOneOf(fiatCurrency, FIAT_CURRENCIES)) {
@@ -1644,6 +1661,13 @@ export function createApiRouter(
         return;
       }
       patch.nodeLookups = nodeLookups;
+    }
+    if (setupDone !== undefined) {
+      if (typeof setupDone !== "boolean") {
+        res.status(400).json({ error: "bad_request", message: "setupDone must be true or false." });
+        return;
+      }
+      patch.setupDone = setupDone;
     }
     if (lspModeEnabled !== undefined) {
       if (typeof lspModeEnabled !== "boolean") {
@@ -2455,7 +2479,7 @@ export function createApiRouter(
   });
 
   // "Why don't I sell?" — the diagnosis checklist answered from the live
-  // state: version, write mode, key, Liquidity provision and the automation
+  // state: version, write mode, key, selling and the automation
   // switches, the order lane, the offer vs the engine's target (price,
   // window, lease, fee promise), the last offer write, recent orders and
   // how they ended, and whether this node can realistically sell at all.
@@ -2688,7 +2712,7 @@ export function createApiRouter(
   // — it is not idempotent — so a caller that wants a STATE says so (`want`):
   // the offer is read right before, flipped only when it isn't in that state
   // already, and an answer that isn't the wanted state is an error. (Turning
-  // Liquidity provision off flipped every offer it had listed a moment
+  // selling off flipped every offer it had listed a moment
   // before: one the autopilot had disabled in between was ENABLED again, and
   // a failed flip was swallowed while the dialog said "disabled".)
   router.post(

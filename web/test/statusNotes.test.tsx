@@ -149,7 +149,7 @@ test("the order lane's note says 'retrying' only where the next pass can clear i
   assert.doesNotMatch(note ?? "", /retrying/);
   // Nothing to report: no note.
   assert.equal(laneBanner(lane({ ok: true })), null);
-  assert.equal(laneBanner(lane({ ok: null, idle: "Liquidity provision is off" })), null);
+  assert.equal(laneBanner(lane({ ok: null, idle: "Selling is off" })), null);
   assert.equal(laneBanner(undefined), null);
   // An older server without the flag: as before.
   assert.equal(laneBanner(lane({ error: outage, retrying: undefined })), `Order lane: ${outage} — retrying.`);

@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { Fold } from "./Fold";
 import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import type { AreaStatus, AutopilotConfigPatch, AutopilotRun, AutopilotState, DecisionArea, MagmaV2Report, SellDiagnostics } from "../types";
@@ -25,12 +26,16 @@ import {
   EMPTY_DRAFT,
   PER_RUN_HINTS,
   REBALANCE_WINDOW_HINT,
+  advancedChanged,
+  baselineConfig,
   boundsFor,
   checkDraft,
   draftIsEmpty,
   draftStore,
+  resetToBaseline,
   savedNum,
   switchOnConfirm,
+  type AdvancedSet,
   type Draft,
   type FlagKey,
   type NumKey,
@@ -98,7 +103,7 @@ export const CHANNEL_OPEN_HINT =
   "rated poorly on LN+, of low usefulness or marked “never auto” is never opened to automatically, nor one that advertises " +
   "no address to dial unless it is connected already. Auto size shrinks to what can be spent (rounded down to 100,000 sat, " +
   "never below 1,000,000 sat nor the peer's minimum); a fixed size is never shrunk. " +
-  "With Liquidity provision on, the coins your Magma offer can list (within your deploy cap) wait for Magma while selling " +
+  "With selling on, the coins your Magma offer can list (within your deploy cap) wait for Magma while selling " +
   "them is expected to earn more than a routing channel; the rest stays free for routing opens, and the note says how much " +
   "is held. The reserve is what an open leaves on chain — LND's own anchor reserve (10,000 sat per anchor channel, up to " +
   "100,000) wins when it is larger, and the open's fee comes on top. " +
@@ -171,7 +176,7 @@ export function PresetPreview({ preset, config }: { preset: Preset; config: Auto
           </li>
         ))}
       </ul>
-      <p className="modal-msg muted">Liquidity provision (Magma selling) is never changed by a preset.</p>
+      <p className="modal-msg muted">Selling is never changed by a preset.</p>
     </>
   );
 }
@@ -392,7 +397,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   );
 
   /**
-   * Liquidity provision is an explicit decision (D9): switching it on shows
+   * selling is an explicit decision (D9): switching it on shows
    * whether this node can realistically sell (live, from Amboss's public
    * book — the dialog opens at once and the verdict follows); switching it
    * off while offers are still listed offers to disable them too — otherwise
@@ -541,6 +546,38 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     return text !== undefined && text.trim() !== "" && Number.isFinite(Number(text)) ? Number(text) : (savedNum(config, path) ?? 0);
   };
   const feeDraftOpen = FEE_NUM_FIELDS.some((f) => draft.nums[f.key] !== undefined) || POLICY_FIELDS.some((f) => draft.nums[`policy.${f.key}`] !== undefined);
+
+  // Each area's Advanced says how many of its settings differ from what the
+  // strategy in force sets (or the factory's, with none), and can put them
+  // back: as unsaved changes, so nothing moves before "Save changes".
+  const activePreset = PRESETS.find((p) => matchesPreset(p.cfg));
+  const baseline = baselineConfig(server.defaults, activePreset ? (buildPresets(server.defaults).find((p) => p.id === activePreset.id)?.cfg ?? null) : null);
+  const ADVANCED: Record<"fees" | "rebalancing" | "channels" | "magma", AdvancedSet> = {
+    fees: { paths: [...FEE_NUM_FIELDS.map((f) => f.key), ...POLICY_FIELDS.map((f): NumPath => `policy.${f.key}`)], flags: ["feeFloorAboveMax"] },
+    rebalancing: {
+      paths: [...REB_NUM_FIELDS.filter((f) => f.key !== "rebalanceDailyBudgetSats").map((f) => f.key), ...REB_POLICY_FIELDS.map((f): NumPath => `rebalancePolicy.${f.key}`)],
+    },
+    channels: { paths: CHANNEL_NUM_FIELDS.map((f) => f.key) },
+    magma: { paths: SELL_NUM_FIELDS.map((f) => f.key), pricingMode: true },
+  };
+  /** An area's Advanced section: remembered open or closed, its changes counted. */
+  const advanced = (area: keyof typeof ADVANCED, children: ReactNode, forceOpen = false) => {
+    const set = ADVANCED[area];
+    const changed = advancedChanged(set, draft, config, baseline);
+    return (
+      <Fold id={`ap-${area}`} title="Advanced" note={changed > 0 ? `${changed} changed` : undefined} className="ap-customize" forceOpen={forceOpen}>
+        {children}
+        {changed > 0 ? (
+          <div className="ap-reset">
+            <button className="reset" disabled={busy || writeOff} onClick={() => setDraft(resetToBaseline(set, draft, config, baseline))}>
+              Reset to {activePreset ? `“${activePreset.label}”` : "defaults"}
+            </button>
+            <span className="muted small">Nothing changes until you save.</span>
+          </div>
+        ) : null}
+      </Fold>
+    );
+  };
 
   // The areas: a switch, what it did last, and its details under the list.
   const AREAS: { id: Exclude<Sub, "history">; title: string; field: BoolKey; area: DecisionArea; help: string; onSwitch?: (v: boolean) => void }[] = [
@@ -720,25 +757,28 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
         <>
           <StatusLine area="fees" status={status?.fees} />
           {config.maxHtlcEnabled ? <StatusLine area="maxHtlc" status={status?.maxHtlc} /> : null}
-          <details className="ap-customize" open={feeDraftOpen || undefined}>
-            <summary>Advanced</summary>
-            {toggleRow(
-              "maxHtlcEnabled",
-              "Advertise routable size",
-              "Keeps each channel's max HTLC just under its spendable balance, so fewer forwards fail through you.",
-            )}
-            <div className="policy-controls">
-              {numFields(FEE_NUM_FIELDS)}
-              {POLICY_FIELDS.map((f) => numInput(`policy.${f.key}`, f.label, { hint: f.hint }))}
-            </div>
-            <p className="muted ap-hint">
-              How far one update moves a fee
-              <InfoTip label="How far one update moves a fee">{FEE_MOVE_HINT}</InfoTip>
-            </p>
-            <div className="ap-checks">
-              {flagBox("feeFloorAboveMax", "Let a channel’s refill cost (profit floor) lift its fee above Max ppm — off: the floor stops at Max ppm")}
-            </div>
-          </details>
+          {advanced(
+            "fees",
+            <>
+              {toggleRow(
+                "maxHtlcEnabled",
+                "Advertise routable size",
+                "Keeps each channel's max HTLC just under its spendable balance, so fewer forwards fail through you.",
+              )}
+              <div className="policy-controls">
+                {numFields(FEE_NUM_FIELDS)}
+                {POLICY_FIELDS.map((f) => numInput(`policy.${f.key}`, f.label, { hint: f.hint }))}
+              </div>
+              <p className="muted ap-hint">
+                How far one update moves a fee
+                <InfoTip label="How far one update moves a fee">{FEE_MOVE_HINT}</InfoTip>
+              </p>
+              <div className="ap-checks">
+                {flagBox("feeFloorAboveMax", "Let a channel’s refill cost (profit floor) lift its fee above Max ppm — off: the floor stops at Max ppm")}
+              </div>
+            </>,
+            feeDraftOpen,
+          )}
           {unsavedBar}
           <FeeRecommendations />
         </>
@@ -746,35 +786,39 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
         <>
           <StatusLine area="rebalance" status={status?.rebalance} />
           {budgetLine(server.rebalanceBudget) ? <p className="muted ap-hint">{budgetLine(server.rebalanceBudget)}</p> : null}
-          <details className="ap-customize">
-            <summary>Advanced</summary>
-            <div className="policy-controls">
-              {numFields(REB_NUM_FIELDS.filter((f) => f.key !== "rebalanceDailyBudgetSats"))}
-              {REB_POLICY_FIELDS.map((f) => numInput(`rebalancePolicy.${f.key}`, f.label, { step: f.step, hint: f.hint }))}
-            </div>
-            <p className="muted ap-hint">
-              When a refill runs
-              <InfoTip label="When a refill runs">
-                A refill runs only when its route costs at most your share of what the refilled sats are expected to earn,
-                it nets at least the minimum, and pays back in time — its payment can't pay more than that, nor more than is
-                left of today's budget. The hours and the budget's day are UTC. {REMOVED_SETTINGS_NOTE}
-              </InfoTip>
-            </p>
-          </details>
+          {advanced(
+            "rebalancing",
+            <>
+              <div className="policy-controls">
+                {numFields(REB_NUM_FIELDS.filter((f) => f.key !== "rebalanceDailyBudgetSats"))}
+                {REB_POLICY_FIELDS.map((f) => numInput(`rebalancePolicy.${f.key}`, f.label, { step: f.step, hint: f.hint }))}
+              </div>
+              <p className="muted ap-hint">
+                When a refill runs
+                <InfoTip label="When a refill runs">
+                  A refill runs only when its route costs at most your share of what the refilled sats are expected to earn,
+                  it nets at least the minimum, and pays back in time — its payment can't pay more than that, nor more than is
+                  left of today's budget. The hours and the budget's day are UTC. {REMOVED_SETTINGS_NOTE}
+                </InfoTip>
+              </p>
+            </>,
+          )}
           {unsavedBar}
           <RebalanceRecommendations />
         </>
       ) : sub === "channels" ? (
         <>
           <StatusLine area="channels" status={status?.channels} />
-          <details className="ap-customize">
-            <summary>Advanced</summary>
-            <div className="policy-controls">{numFields(CHANNEL_NUM_FIELDS)}</div>
-            <p className="muted ap-hint">
-              How it decides
-              <InfoTip label="How the channel autopilot decides" text={CHANNEL_OPEN_HINT} />
-            </p>
-          </details>
+          {advanced(
+            "channels",
+            <>
+              <div className="policy-controls">{numFields(CHANNEL_NUM_FIELDS)}</div>
+              <p className="muted ap-hint">
+                How it decides
+                <InfoTip label="How the channel autopilot decides" text={CHANNEL_OPEN_HINT} />
+              </p>
+            </>,
+          )}
           {unsavedBar}
           <p className="muted ap-hint">
             The peers it would open to, and opening one by hand:{" "}
@@ -793,6 +837,12 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
             </p>
           ) : null}
           <SellDiagnosticsCard d={diag} onFix={(tab, s) => goTo(tab, s)} />
+          <p className="muted ap-hint">
+            Your offer, its price and your orders:{" "}
+            <button className="linklike" onClick={() => goTo("market", "sell")}>
+              Market → Sell
+            </button>
+          </p>
           <div className="ap-checks">
             <label className="check ap-check">
               <input type="checkbox" checked={offerManaged} disabled={busy || writeOff} onChange={(e) => setOfferManaged(e.target.checked)} />
@@ -800,8 +850,8 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
               <InfoTip label="What managing the offer means" text={OFFER_AUTOMATION_HINT} />
             </label>
           </div>
-          <details className="ap-customize">
-            <summary>Advanced</summary>
+          {advanced(
+            "magma",
             <div className="ap-customize-body">
               <h3 className="sub">
                 Offer pricing
@@ -845,8 +895,8 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                 </InfoTip>
               </h3>
               <div className="policy-controls">{numFields(SELL_NUM_FIELDS)}</div>
-            </div>
-          </details>
+            </div>,
+          )}
           {magma?.sell.capitalLimited ? (
             <div className="ap-reach">
               Right now only {satsCompact(magma.sell.effectiveMaxOrderSat)} can be funded on-chain (after the reserve and the coins
@@ -916,7 +966,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                     ok: m.ok,
                     channelId: m.id,
                     alias: m.alias,
-                    label: `Max HTLC · ${m.alias}: ${m.fromSat != null ? satsCompact(m.fromSat) : "—"}→${satsCompact(m.toSat)}`,
+                    label: `Routable size · ${m.alias}: ${m.fromSat != null ? satsCompact(m.fromSat) : "—"}→${satsCompact(m.toSat)}`,
                     error: m.error,
                   })),
                   // A stage that threw (the others still ran).

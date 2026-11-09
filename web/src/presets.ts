@@ -15,7 +15,7 @@ import type { AutopilotConfig, AutopilotConfigPatch } from "./types";
  * says so instead of promising "loose rebalancing".
  *
  * No preset touches Magma selling (D9): selling stays off unless the operator
- * switches Liquidity provision on themselves, after seeing whether their node
+ * switches selling on themselves, after seeing whether their node
  * can realistically sell. ("Balanced — Recommended" used to switch selling on,
  * and "Max profit" switched channel opens OFF to leave capital "for leasing" —
  * for nodes whose offers never sold.)
@@ -59,7 +59,7 @@ export function buildPresets(config: Pick<AutopilotConfig, "policy" | "rebalance
     {
       id: "balanced",
       label: "Balanced",
-      desc: "Compete for flow at sensible fees, refill a drained channel when the profit check passes, open channels as funds allow (with Liquidity provision on, not the coins held for Magma). Recommended.",
+      desc: "Compete for flow at sensible fees, refill a drained channel when the profit check passes, open channels as funds allow (with selling on, not the coins held for Magma). Recommended.",
       cfg: {
         enabled: true,
         rebalanceEnabled: true,

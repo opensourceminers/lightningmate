@@ -563,7 +563,7 @@ test("every log line carries its time — and a line that already has one is not
 
 // ── review of P7, round 1: what the package relied on without a test ─────────
 
-test("a key Amboss rejects is 'blocked' for Liquidity provision — whatever the lane last decided", async (t) => {
+test("a key Amboss rejects is 'blocked' for selling — whatever the lane last decided", async (t) => {
   quiet(t);
   const { autopilot, amboss } = sellerSetup(t);
   assert.notEqual(autopilot.getState().status.magma.state, "blocked");

@@ -269,7 +269,7 @@ export function RebalanceRecommendations() {
             <tr>
               <th></th>
               <th>Channel</th>
-              <th className="num">Local</th>
+              <th className="num">Your side</th>
               <th>State</th>
               <th className="num">Amount</th>
               <th className="num">Cost / max</th>

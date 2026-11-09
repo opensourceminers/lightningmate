@@ -82,7 +82,7 @@ test("after a restart the stored privacy settings are in force — LN+ lookups o
   assert.ok(privacy.destinations.length > 0 && privacy.destinations.every((d) => d.viaTor), JSON.stringify(privacy.destinations));
   // The old route and the clearnet address (read-only here: never announced)
   // have left the file; the operator's own settings stayed.
-  assert.deepEqual(JSON.parse(readFileSync(join(dataDir, "settings.json"), "utf8")), { fiatCurrency: "off", lnplusLookups: false, nodeLookups: true, lspModeEnabled: false });
+  assert.deepEqual(JSON.parse(readFileSync(join(dataDir, "settings.json"), "utf8")), { fiatCurrency: "off", lnplusLookups: false, nodeLookups: true, lspModeEnabled: false, setupDone: true });
   // Without the switch wired into the LN+ store, this asked LN+.
   const pool = await fetch(`http://127.0.0.1:${port}/api/lnplus/pool`);
   assert.equal(pool.status, 409);

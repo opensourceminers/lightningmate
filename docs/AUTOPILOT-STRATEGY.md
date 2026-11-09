@@ -34,7 +34,7 @@ if enabled, it runs four independent sub-autopilots in order:
 3. **Channels** — open a channel to a well-scored peer if on-chain funds allow.
 4. **Magma** — keep our offer fundable and well-formed, reprice/relist it if asked, optionally
    auto-close finished leases. (Orders themselves are fulfilled by a separate 45-second order
-   lane, never by this loop.) Off by default: selling is opt-in (Liquidity provision).
+   lane, never by this loop.) Off by default: selling is opt-in (Selling).
 
 Each sub-autopilot has its own on/off switch and detailed settings. Every action is a
 **dry-run recommendation** first (shown in the UI), and only applied when its autopilot is
@@ -74,7 +74,7 @@ stages (each writes the whole policy back, so one must never land between the ot
 and write), the 10-minute lease-promise check and a manual Apply or fee set by hand. A
 scheduled run that comes due while the lease-promise check or an Apply is under way runs —
 its fee stage waits for the lock — instead of being skipped without a trace, and the run
-the Liquidity provision switch-on kicks is not lost either. A manual fee write that finds
+the selling switch-on kicks is not lost either. A manual fee write that finds
 the lock taken answers "Fees are being written right now … — try again in a moment".
 
 The run history keeps one line for the same successful changes run after run (the same fee
@@ -424,7 +424,7 @@ then (one the operator clicked is theirs and goes out). An accept whose mark can
 lane rejects it when its approval deadline is close, never leaving it to time out; a paused lane
 leaves it to the operator — as either lane does an order whose accept the operator clicked.
 **Resume** switches those
-back on — Liquidity provision excepted, whose switch-on is its own decision with the selling
+back on — Selling excepted, whose switch-on is its own decision with the selling
 check in front of you (D9). LSP mode (Settings) is no switch of the autopilot's: the pause leaves
 it on — it keeps answering wallet orders and opening their channels — and the pause dialog, the
 paused banner and the Overview say so while it is on.
@@ -463,7 +463,7 @@ richer forwards.
 it is; Max profit no longer switches channel opens off.)
 
 **No preset touches Magma selling** (no `sell*` key at all). Selling stays off unless the
-operator switches **Liquidity provision** on themselves — after a confirmation that shows a
+operator switches **Selling** on themselves — after a confirmation that shows a
 live check of whether the node can realistically sell (offers like its would-be offer, by
 Amboss fee tier and seller score, and how often they fill). Earlier versions had "Balanced"
 switch selling on and "Max profit" switch channel opens *off* to "lease idle capital rather
@@ -602,7 +602,7 @@ answered counts it as unclear, so the cooldown runs from it. One this process st
 goes out before. The on-chain mutex held for over 10 minutes is an alert naming
 its holder. Waits and deferrals are the stage's decision note, never failed runs; a refusal is one line
 of history, not one per run. Every open takes the shared on-chain mutex and capital ledger.
-**Capital gate (`leaveForMagma`, D10):** with Liquidity provision on, the coins Magma can
+**Capital gate (`leaveForMagma`, D10):** with selling on, the coins Magma can
 list — spendable, within the deploy cap's headroom — are held for it when ALL of these hold:
 Amboss accepts the key and an offer of this node is listed (enabled); the selling check says
 better than "not realistic" (offers like this node's sell at least about once a year); and
@@ -645,7 +645,7 @@ yet dialed first, so silent buyers don't hold up a reachable one (a buyer never 
 close still gets its try). A paid order's dial is bound by its deadline too, and past it the payment
 is released rather than a channel opened. While an order is pending no offer's window or listing moves up. Before 0.8.7 a dial gave up after 1.5 s, so nearly every
 buyer not already connected was turned down within seconds
-(a 2,436 sat order on 2026-10-31, 5.3 s into its two-hour window). It decides on new orders only while Liquidity provision is on (a
+(a 2,436 sat order on 2026-10-31, 5.3 s into its two-hour window). It decides on new orders only while selling is on (a
 paused lane neither accepts nor rejects one); an order it accepted itself it carries to its
 end either way, and with selling on it also opens the channel of an order accepted by hand
 (Market → Orders says who opens a paid order's channel). A decision made by hand wins over the
@@ -658,7 +658,7 @@ may have reached Amboss is completed first, whatever the selling switch says, an
 meanwhile is refused ("Not rejected: the earlier accept of this order was already sent and is
 being confirmed with Amboss, so it can't be withdrawn."), though Amboss may still show the order
 awaiting approval. A click that finds neither (Amboss or LND not answering) records nothing:
-with Liquidity provision on, the lane may decide that order before the operator tries again. A
+with selling on, the lane may decide that order before the operator tries again. A
 click that arrives while the lane is already deciding or acting on that same order — its capital
 check, its dial of the buyer (up to about a minute and a half over Tor), its own accept or
 reject, or the resend of an earlier reject of the operator's — waits for that step to finish
@@ -676,7 +676,7 @@ decide ("your accept didn't go through"): the lane neither accepts it nor turns 
 for its caps, which don't bind a manual pick, nor near its deadline. The lane carrying out the
 operator's decision (their reject sent again, their accept completed) is recorded as theirs (the
 run history's `via: "manual"`): the Overview's "Last change by the autopilot" leaves it out. The
-**offer upkeep** (`runSell`, in the main run, only with Liquidity provision on) keeps each offer
+**offer upkeep** (`runSell`, in the main run, only with selling on) keeps each offer
 fundable (cut,
 disabled while its smallest channel can't be funded, listed again once it can — its terms,
 price and the size that can be funded, written and read back before the listing), gives it the
@@ -709,7 +709,7 @@ offer-automation switch off, capital safety is all the autopilot does to an offe
 lease and routing-fee promise stay as they are). An offer the operator created or edited
 by hand is theirs: the autopilot changes none of its price or lease — capital safety still
 cuts its max channel and total to what can be funded (and gives them back once there is
-room); enabling or disabling it by hand decides only whether it is listed. Switching Liquidity provision on lists the offers
+room); enabling or disabling it by hand decides only whether it is listed. Switching selling on lists the offers
 that were disabled at that moment — its switch-off disables them — as LightningMate's last
 offer sync showed them, those still disabled at the first offer read after the switch (with
 no sync kept yet, every offer disabled at that read), each once it has a price and its

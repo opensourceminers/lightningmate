@@ -61,8 +61,9 @@ login, non-sensitive totals only); the official one does not.
   fund-moving action is confirmed; a least-privilege baked macaroon is supported
   (see SECURITY.md)
 
-What it does: channels with balance bars + roles, a Forwards routing report, a
-Profit & Loss overview, a node health score, graph-based channel suggestions, a
+What it does: first-start questions and a start page that says what needs you,
+details for any node, channels with what each earned, a Forwards routing report,
+a Profit & Loss overview, a node health score, graph-based channel suggestions, a
 Lightning + on-chain wallet, an Amboss Magma marketplace (buy & sell channel
 liquidity), profit-aware rebalancing, and an autopilot that tunes fees / runs
 profitable rebalances / opens channels / fulfils Magma sell orders on safe

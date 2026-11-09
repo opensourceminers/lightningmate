@@ -81,6 +81,10 @@ export interface DashboardData {
   /** Where the rebalancing figures come from (pnl.ts PnlSummary). */
   rebalanceSource: "lnd" | "log";
   leaseBenchmark: LeaseBenchmark;
+  /** Open channels older than the window that no forward used in it, and this
+   *  node's coins in them (null: the forwards couldn't be read in full, so
+   *  this can't be told). */
+  idleChannels: { count: number; localSats: number } | null;
   activity: ActivityItem[];
   autopilot: {
     fees: boolean;
@@ -198,6 +202,7 @@ export function buildDashboard(
     channelTxids?: ChannelTxids;
     /** LSP mode is on (and can run: write access). */
     lspModeOn?: boolean;
+    idleChannels?: DashboardData["idleChannels"];
   } = { ownCapitalSats: totalCapacitySats, rebalanceFeesSats: 0, leaseBenchmark: { status: "unknown", grossAprPct: null, sales: null, windowDays: null, text: "" }, magmaRefusals: [] },
 ): DashboardData {
   const activity: ActivityItem[] = [];
@@ -304,6 +309,7 @@ export function buildDashboard(
     rebalanceFeesSats: extra.rebalanceFeesSats,
     rebalanceSource: extra.rebalanceSource ?? "log",
     leaseBenchmark: extra.leaseBenchmark,
+    idleChannels: extra.idleChannels ?? null,
     activity: activity.slice(0, 14),
     autopilot: {
       fees: autopilot.config.enabled,

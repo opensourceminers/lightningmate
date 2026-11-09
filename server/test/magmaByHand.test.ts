@@ -13,7 +13,7 @@
  * own on its next pass:
  *  - the operator rejects, Amboss's RejectOrder fails (HTTP 502, a timeout):
  *    the record said "reject not confirmed … will try again", but nothing sent
- *    it again. With Liquidity provision on (or once it was switched on) the
+ *    it again. With selling on (or once it was switched on) the
  *    next pass ACCEPTED the order the operator had refused — HODL invoice,
  *    coins reserved, AcceptOrder — and once paid, the lane opened its channel;
  *  - the operator accepts an order above the lane's caps (a manual pick isn't
@@ -442,7 +442,7 @@ test("the operator's accept, its answer lost, its invoice cancelled in LND durin
 });
 
 // Review of P10: the same two hand-backs of an accept of the LANE's own, with
-// Liquidity provision switched off since — its answer lost, its invoice grown
+// selling switched off since — its answer lost, its invoice grown
 // too old to send again (resumeAccept), or cancelled in LND during a pass that
 // couldn't read the order (maintainFromLnd). The paused lane left the record
 // alone: Market → Orders said "Waiting for you to accept · seen" with "within
@@ -450,7 +450,7 @@ test("the operator's accept, its answer lost, its invoice cancelled in LND durin
 // order nothing of ours was tied to, until it timed out on the operator.
 
 /** The lane's own accept, sent with selling on, its answer lost (an HTTP
- *  error: Amboss didn't take it) — then Liquidity provision is switched off. */
+ *  error: Amboss didn't take it) — then selling is switched off. */
 async function laneAcceptLost(s: Setup): Promise<string> {
   const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
   s.magma.behave.AcceptOrder = "throw";

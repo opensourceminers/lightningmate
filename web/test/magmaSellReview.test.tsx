@@ -75,9 +75,9 @@ test("who lists a free offer again is said as the autopilot does it", () => {
   assert.doesNotMatch(src("MarketSell"), /Listing it again is your click\./);
 });
 
-test("an offer's owner says what the autopilot still does — and with Liquidity provision off, that it lists nothing again until it is on", () => {
+test("an offer's owner says what the autopilot still does — and with selling off, that it lists nothing again until it is on", () => {
   const off = offerOwner({ autoDisabledAt: "2026-10-20T00:00:00.000Z" }, false);
-  assert.equal(off.title, "Liquidity provision is off: nothing manages this offer. The autopilot disabled it for lack of capital; with Liquidity provision on, it lists it again once it can be funded.");
+  assert.equal(off.title, "Selling is off: nothing manages this offer. The autopilot disabled it for lack of capital; with selling on, it lists it again once it can be funded.");
   const mine = offerOwner({ manual: { since: "2026-10-20T10:00:00Z", why: "you edited this offer" } }, true);
   assert.match(mine.title, /changes none of its price or lease; it only keeps it fundable: its max channel and total are cut to what can be funded/);
   assert.match(offerOwner({ costDisabledAt: "2026-10-25T10:00:00Z" }, true).title, /pay less than opening and closing their channels cost at today's fee rate — it lists it again once they pay for them/);
@@ -86,7 +86,7 @@ test("an offer's owner says what the autopilot still does — and with Liquidity
 test("switching selling off says what becomes of orders under way — one accepted by hand waits for your open", () => {
   assert.equal(
     disableSellingMessage(0),
-    "Turn off Liquidity provision? Orders the autopilot accepted are still carried to their end (opened, settled or refunded); one you accepted by hand waits for you to open its channel on Market → Orders once it is paid.",
+    "Turn off selling? Orders the autopilot accepted are still carried to their end (opened, settled or refunded); one you accepted by hand waits for you to open its channel on Market → Orders once it is paid.",
   );
 });
 

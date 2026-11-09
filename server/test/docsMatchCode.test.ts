@@ -257,7 +257,7 @@ test("the docs say a decision made by hand wins over the Magma order lane, for a
     // other is still left as it was, and the docs say so.
     assert.doesNotMatch(doc, /a click on Accept or Reject makes the order/, name);
     assert.match(doc, /(click that finds neither \(Amboss or LND not answering\)|otherwise it) records nothing/, name);
-    assert.match(doc, /with Liquidity provision on, the (lane|autopilot) may decide that order/, name);
+    assert.match(doc, /with selling on, the (lane|autopilot) may decide that order/, name);
   }
   // The desk's own account of it (its header comment) claims no more than
   // the docs.

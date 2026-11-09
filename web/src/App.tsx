@@ -30,7 +30,6 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "wallet", label: "Wallet" },
   { id: "analytics", label: "Analytics" },
   { id: "autopilot", label: "Autopilot" },
-  { id: "settings", label: "Settings" },
 ];
 
 export function App() {
@@ -84,6 +83,16 @@ export function App() {
           <span className="brand-sub">Lightning node manager</span>
         </span>
         <div className="topbar-right">
+          <button
+            type="button"
+            className={`gear ${tab === "settings" ? "active" : ""}`}
+            aria-label="Settings"
+            title="Settings"
+            aria-pressed={tab === "settings"}
+            onClick={() => navigate("settings")}
+          >
+            <TabIcon id="settings" />
+          </button>
           <LogoutButton />
           <span
             className={`conn ${node.error ? "down" : node.data ? "up" : "wait"}`}
@@ -152,7 +161,7 @@ export function App() {
         ) : null}
 
         {/* Keyed by the requested jump: a link to Market → Orders (or
-            Autopilot → Magma) from a panel already on that tab must still
+            Autopilot → Selling) from a panel already on that tab must still
             land there — the panels read initialSub only when they mount. */}
         {tab === "market" ? <MarketPanel key={subKey} initialSub={pendingSub} /> : null}
         {tab === "wallet" ? <WalletPanel price={price.data} /> : null}

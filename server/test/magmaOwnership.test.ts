@@ -8,7 +8,7 @@
  * is disabled while its smallest channel can't be funded, and listed again
  * once it can.
  *
- * Before: with Liquidity provision on, a manual "disable" was reverted within
+ * Before: with selling on, a manual "disable" was reverted within
  * half an hour (every DISABLED offer was re-enabled), manual price edits were
  * overwritten unrecorded, size and lease edits under a "relist" entry. Then
  * (review P1b) a manual ENABLE took the offer over: the autopilot stopped
@@ -29,7 +29,7 @@ import { HTTP_TIMEOUTS } from "../src/services/http.js";
 import type { AfterHook } from "./helpers/tmp.js";
 import { until } from "./helpers/wait.js";
 
-/** The API with Liquidity provision on (auto-size on: it would fix the lease). */
+/** The API with selling on (auto-size on: it would fix the lease). */
 async function sellingApi(t: AfterHook, chainBalance = 5_000_000) {
   const http = installFetchMock(t);
   http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));

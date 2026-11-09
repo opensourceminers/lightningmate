@@ -353,7 +353,7 @@ test("the lane's status doesn't outlive what it describes: after an outage, a la
   assert.equal(lane.ok, null, "neither failing nor working: idle");
   assert.equal(lane.error, null);
   assert.equal(lane.retrying, false);
-  assert.match(lane.idle ?? "", /Liquidity provision is off/);
+  assert.match(lane.idle ?? "", /Selling is off/);
   assert.ok(lane.lastTickAt);
 
   // The same without a key.

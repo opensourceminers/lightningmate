@@ -100,8 +100,8 @@ export function stateAlerts(dataDir: string): Alert[] {
  *  accept Amboss refused, a deadline) more capital would not have helped, and
  *  the alert used to say it would. */
 const REFUSAL_ADVICE: Record<MagmaRefusal["kind"], string> = {
-  cap: "If you want orders like it, raise the caps on Autopilot → Magma; see Market → Orders.",
-  capital: "If you want orders like it, add on-chain funds to the wallet (or lower the reserve on Autopilot → Magma); see Market → Orders.",
+  cap: "If you want orders like it, raise the caps on Autopilot → Selling; see Market → Orders.",
+  capital: "If you want orders like it, add on-chain funds to the wallet (or lower the reserve on Autopilot → Selling); see Market → Orders.",
   other: "See Market → Orders for the order.",
 };
 
@@ -152,11 +152,11 @@ export function offerPriceAlerts(
       turnedDownUnderSat?: number;
       /** Set when the operator owns the offer's terms, when the autopilot
        *  took it off the market for being free, or when it is to be listed
-       *  since Liquidity provision was switched on. */
+       *  since selling was switched on. */
       control?: { manual?: unknown; freeDisabledAt?: string; listOnAt?: string };
     }[];
   },
-  /** Liquidity provision on and not paused: the autopilot acts on offers. */
+  /** selling on and not paused: the autopilot acts on offers. */
   selling: boolean,
   /** Auto-pricing on: the autopilot prices (and lists again) the offers whose
    *  terms are its own. */
@@ -176,7 +176,7 @@ export function offerPriceAlerts(
                 ? "Its terms are yours, so LightningMate takes it off the market within minutes; set its price on Market → Sell, then enable it."
                 : "LightningMate puts its last price back within minutes, or takes it off the market if it knows none.") +
               " Orders that don't cover their channel's on-chain cost are turned away meanwhile."
-            : "Liquidity provision is off (or paused), so nothing changes it: set its price on Market → Sell or disable it, and reject any order it gets."),
+            : "Selling is off (or paused), so nothing changes it: set its price on Market → Sell or disable it, and reject any order it gets."),
       });
     } else if (e.amboss.status !== "ENABLED" && e.control?.freeDisabledAt && free) {
       // Who lists it again, said exactly (review 2026-10-25: "LightningMate
@@ -198,12 +198,12 @@ export function offerPriceAlerts(
           `LightningMate lists it once it has one${e.control.manual || !autoPricing ? "." : " (it prices it itself once it knows a price)."}`,
       });
     } else if (e.amboss.status === "ENABLED" && !selling && e.lastWrite?.by === "autopilot" && e.lastWrite.action === "disable" && !e.lastWrite.ok) {
-      // Listed with Liquidity provision off, LightningMate's disable not taken
+      // Listed with selling off, LightningMate's disable not taken
       // (one being listed when selling went off, or a capital disable).
       alerts.push({
         level: "warn",
         message:
-          `Your Magma offer ${id} is listed although Liquidity provision is off — LightningMate tried to take it off the market and couldn't ` +
+          `Your Magma offer ${id} is listed although selling is off — LightningMate tried to take it off the market and couldn't ` +
           `(${e.lastWrite.error ?? "no answer"}). Disable it on Market → Sell: meanwhile its orders wait for your decision on Market → Orders.`,
       });
     } else if (e.amboss.status !== "ENABLED" && e.listingWaits === "lease") {

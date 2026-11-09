@@ -28,7 +28,7 @@ export function MarketPanel({ initialSub }: { initialSub?: string }) {
     <div>
       <div className="subnav">
         {tab("buy", "Buy")}
-        {tab("sell", "Sell (advanced)", "Selling liquidity on Magma: Amboss decides which seller gets an order")}
+        {tab("sell", "Sell", "Selling liquidity on Magma: Amboss decides which seller gets an order")}
         {tab("orders", "Orders")}
         {tab("lnplus", "LN+")}
       </div>

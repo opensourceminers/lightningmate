@@ -19,7 +19,7 @@ export function LiquidityMap({ channels }: { channels: ChannelView[] }) {
         <h2>
           Liquidity map <span className="muted">· {active.length} channels</span>
         </h2>
-        <span className="mini-tag">{outPct}% outbound</span>
+        <span className="mini-tag">{outPct}% on your side</span>
       </div>
       <div className="liqmap">
         <span className="liqmap-mid" />
@@ -28,15 +28,15 @@ export function LiquidityMap({ channels }: { channels: ChannelView[] }) {
             className="liqmap-cell"
             key={c.id}
             style={{ flexGrow: c.capacity }}
-            title={`${c.peerAlias} · ${percent(c.localRatio)} local · ${satsCompact(c.capacity)} sat`}
+            title={`${c.peerAlias} · ${percent(c.localRatio)} on your side · ${satsCompact(c.capacity)} sat`}
           >
             <div className="liqmap-local" style={{ height: `${c.localRatio * 100}%` }} />
           </div>
         ))}
       </div>
       <div className="liqmap-legend">
-        <span><i className="sw local" /> local · outbound (can send)</span>
-        <span><i className="sw remote" /> remote · inbound (can receive)</span>
+        <span><i className="sw local" /> your side (you can send)</span>
+        <span><i className="sw remote" /> their side (you can receive)</span>
       </div>
     </section>
   );

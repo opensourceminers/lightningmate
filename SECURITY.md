@@ -101,7 +101,7 @@ security@opensourceminers.de (please don't open a public issue first).
   pass — paused or not — until Amboss confirms it or the order ends, and that
   order is never accepted; after an accept that didn't go through, the lane
   neither accepts the order nor turns it down. A click that finds neither
-  (Amboss or LND not answering) records nothing: with Liquidity provision on,
+  (Amboss or LND not answering) records nothing: with selling on,
   the lane may decide that order before you try again. A click that arrives
   while the lane is already deciding or acting on that same order — its
   capital check, its dial of the buyer (up to about a minute and a half over

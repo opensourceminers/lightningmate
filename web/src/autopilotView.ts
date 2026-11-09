@@ -32,7 +32,7 @@ export const AREA_LABEL: Record<DecisionArea, string> = {
   fees: "Fee automation",
   rebalance: "Auto-rebalance",
   channels: "Channel autopilot",
-  magma: "Liquidity provision",
+  magma: "Selling",
   maxHtlc: "Routable size",
 };
 
@@ -109,7 +109,7 @@ const SWITCH_LABEL: Record<AutomationSwitch, string> = {
   rebalanceEnabled: "Auto-rebalance",
   channelEnabled: "Channel autopilot",
   maxHtlcEnabled: "Advertise routable size",
-  sellEnabled: "Liquidity provision (Magma)",
+  sellEnabled: "Selling (Magma)",
 };
 
 const POLICY_LABEL: Partial<Record<keyof AutopilotConfig["policy"], string>> = {
@@ -137,7 +137,7 @@ export function presetChanges(config: AutopilotConfig, preset: AutopilotConfigPa
     if (to === undefined || to === config[k]) continue;
     const capital =
       to && k === "channelEnabled"
-        ? "opens channels with your on-chain funds, at most at your max on-chain fee rate — and, once this node's routing history is enough to judge it, only when an open pays back — not with the coins held for Magma while Liquidity provision is on"
+        ? "opens channels with your on-chain funds, at most at your max on-chain fee rate — and, once this node's routing history is enough to judge it, only when an open pays back — not with the coins held for Magma while selling is on"
         : to && k === "rebalanceEnabled"
           ? `pays routing fees for refills — up to ${budget === null ? "no daily limit" : `${sats(budget)} sat a day`}`
           : to && k === "sellEnabled"
@@ -218,7 +218,7 @@ export function pauseLines(config: Pick<AutopilotConfig, AutomationSwitch>): str
   if (config.rebalanceEnabled) lines.push("Auto-rebalance — no further refill is paid (a payment already under way ends on record)");
   if (config.channelEnabled) lines.push("Channel autopilot — no further channel is opened (an open already being broadcast completes)");
   if (config.maxHtlcEnabled) lines.push("Advertise routable size — max HTLC stays as it is");
-  if (config.sellEnabled) lines.push("Liquidity provision — no new Magma order is accepted and no offer is changed (orders already taken on are carried to their end)");
+  if (config.sellEnabled) lines.push("Selling — no new Magma order is accepted and no offer is changed (orders already taken on are carried to their end)");
   return lines;
 }
 
@@ -259,7 +259,7 @@ export function resumeLines(was: readonly AutomationSwitch[]): { lines: string[]
   return {
     lines,
     sellingNote: was.includes("sellEnabled")
-      ? "Liquidity provision was on too: it stays off — switch it on again on Autopilot → Magma, which shows whether this node can sell."
+      ? "Selling was on too: it stays off — switch it on again on Autopilot → Selling, which shows whether this node can sell."
       : null,
   };
 }

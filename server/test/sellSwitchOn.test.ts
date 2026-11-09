@@ -1,5 +1,5 @@
 /**
- * Switching Liquidity provision on lists the offers again (2026-10-24).
+ * Switching selling on lists the offers again (2026-10-24).
  *
  * Switching it off disables every listed offer "by hand" (the switch's
  * dialog), and a disable by hand sticks — so switching back on listed none:
@@ -69,7 +69,7 @@ function pricedMarket(t: AfterHook, chainBalance = 8_000_000, config: Record<str
 
 const later = () => new Promise((r) => setTimeout(r, 5));
 
-test("switching Liquidity provision on lists the offers its switch-off disabled — in the first run, whoever owns their terms, and their terms stay", async (t) => {
+test("switching selling on lists the offers its switch-off disabled — in the first run, whoever owns their terms, and their terms stay", async (t) => {
   quiet(t);
   const s = sellerSetup(t, { chainBalance: 8_000_000 });
   const { autopilot, magma } = s;
@@ -97,7 +97,7 @@ test("switching Liquidity provision on lists the offers its switch-off disabled 
     const e = entryOf(autopilot, o.id);
     assert.equal(e?.lastWrite?.action, "enable");
     assert.equal(e?.lastWrite?.by, "autopilot");
-    assert.match(e?.lastWrite?.reason ?? "", new RegExp(`^Liquidity provision was switched on with it disabled — it has a price, and its smallest channel can be funded — listed at ${whose}$`));
+    assert.match(e?.lastWrite?.reason ?? "", new RegExp(`^Selling was switched on with it disabled — it has a price, and its smallest channel can be funded — listed at ${whose}$`));
     assert.equal(controlOf(autopilot, o.id).listOnAt, undefined, "done: nothing left to list");
   }
   // Listed once: the next run has nothing to flip.
@@ -120,7 +120,7 @@ test("after the switch-on, an offer that can't be funded or has no price stays o
   assert.deepEqual([big.status, free.status], ["DISABLED", "DISABLED"]);
   assert.match(
     entryOf(autopilot, big.id)?.differences.join("; ") ?? "",
-    /Liquidity provision was switched on, so it is listed again once its smallest channel \(1,000,000 sat\) can be funded — [\d,]+ sat sellable after the reserve, promised orders and the deploy cap; "keep disabled" on Market → Sell keeps it off/,
+    /Selling was switched on, so it is listed again once its smallest channel \(1,000,000 sat\) can be funded — [\d,]+ sat sellable after the reserve, promised orders and the deploy cap; "keep disabled" on Market → Sell keeps it off/,
   );
   // (Fundable: capital safety's own refusal — it never lists an offer without a price.)
   assert.match(entryOf(autopilot, free.id)?.differences.join("; ") ?? "", /left as it is: it has no price on Amboss \(0 ppm \+ 0 sat\) — listed again once it has one/);
@@ -418,10 +418,10 @@ test("selling switched off while a flip that lists an offer is on its way — th
     assert.equal(e?.lastWrite?.action, "disable");
     assert.match(e?.lastWrite?.reason ?? "", /was switched off during the run while it was being listed — taken off the market again/);
     if (undo === "taken") {
-      assert.ok(!alerts.some((m) => m.includes("listed although Liquidity provision is off")), alerts.join(" | "));
+      assert.ok(!alerts.some((m) => m.includes("listed although selling is off")), alerts.join(" | "));
     } else {
       assert.equal(offer.status, "ENABLED");
-      assert.ok(alerts.some((m) => m.includes(`${offer.id.slice(0, 8)}… is listed although Liquidity provision is off`)), alerts.join(" | "));
+      assert.ok(alerts.some((m) => m.includes(`${offer.id.slice(0, 8)}… is listed although selling is off`)), alerts.join(" | "));
     }
   }
 });

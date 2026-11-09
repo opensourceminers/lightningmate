@@ -1,3 +1,4 @@
+import { readdirSync } from "node:fs";
 import { JsonStore } from "../store.js";
 
 export type FiatCurrency = "off" | "USD" | "EUR" | "GBP" | "CHF";
@@ -14,6 +15,10 @@ export interface AppSettings {
   nodeLookups: boolean;
   /** LSP mode (experimental): answer LSPS1 (bLIP-51) requests from wallets. Off by default. */
   lspModeEnabled: boolean;
+  /** The first-start questions are answered or skipped. Only a new install
+   *  ever sees them: one that already has settings or an autopilot on disk
+   *  counts as done. */
+  setupDone: boolean;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -24,12 +29,23 @@ export const DEFAULT_SETTINGS: AppSettings = {
   // One node at a time, only when the operator opens it, through Tor.
   nodeLookups: true,
   lspModeEnabled: false,
+  setupDone: true,
 };
 
 /** What 0.8.4 and before kept beside the settings: a Tor route (every
  *  request goes through Tor now, http.ts) and a clearnet address LSP mode
  *  announced in the node graph (LSP mode is Tor-only now, lsps1.ts). */
 type StoredSettings = Partial<AppSettings> & { torRoute?: unknown; lspClearnetAddress?: unknown };
+
+/** Settings or an autopilot on disk, a backup or a recovered copy included
+ *  (settings.json.bak, autopilot.json.corrupt-…): a node that has run before. */
+function hasStateFile(dataDir: string): boolean {
+  try {
+    return readdirSync(dataDir).some((name) => /^(settings|autopilot)\.json/.test(name));
+  } catch {
+    return false;
+  }
+}
 
 /** Persisted user settings (currency, …). */
 export class SettingsStore {
@@ -40,8 +56,9 @@ export class SettingsStore {
   private legacyClearnet: string;
 
   constructor(dataDir: string) {
+    const isNewInstall = !hasStateFile(dataDir);
     this.store = new JsonStore<AppSettings>(dataDir, "settings.json");
-    const stored: StoredSettings = this.store.read(DEFAULT_SETTINGS);
+    const stored: StoredSettings = this.store.read({ ...DEFAULT_SETTINGS, setupDone: !isNewInstall });
     this.legacyClearnet = typeof stored.lspClearnetAddress === "string" ? stored.lspClearnetAddress.trim() : "";
     // Only today's settings: an older version's leave the file at the next save.
     this.settings = {
@@ -49,7 +66,11 @@ export class SettingsStore {
       lnplusLookups: stored.lnplusLookups ?? DEFAULT_SETTINGS.lnplusLookups,
       nodeLookups: stored.nodeLookups ?? DEFAULT_SETTINGS.nodeLookups,
       lspModeEnabled: stored.lspModeEnabled ?? DEFAULT_SETTINGS.lspModeEnabled,
+      setupDone: stored.setupDone ?? !isNewInstall,
     };
+    // Said on disk at once: the autopilot's file appears right after this, and
+    // the questions must survive a restart before they are answered.
+    if (isNewInstall) this.store.write(this.settings);
   }
 
   get(): AppSettings {

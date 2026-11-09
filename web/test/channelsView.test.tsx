@@ -109,7 +109,7 @@ test("review 2026-10-25: the close dialog preselects the economy rate; the chann
   assert.match(CHANNEL_OPEN_HINT, /Auto size shrinks to what can be spent/);
   assert.match(enableSellingPendingMessage(), /Routing opens of the channel autopilot then wait for the coins your offer can list/);
   const presets = readFileSync(new URL("../src/presets.ts", import.meta.url), "utf8");
-  assert.match(presets, /open channels as funds allow \(with Liquidity provision on, not the coins held for Magma\)/);
+  assert.match(presets, /open channels as funds allow \(with selling on, not the coins held for Magma\)/);
 });
 
 test("a suggestion can be put on the channel autopilot's 'never open automatically' list from its row", () => {

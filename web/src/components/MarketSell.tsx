@@ -25,6 +25,8 @@ import type {
   SellDiagnostics,
 } from "../types";
 import { sats, satsCompact } from "../format";
+import { ppmText } from "../nodeView";
+import { Fold } from "./Fold";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
 import { failedOfferWrite } from "../statusNotes";
@@ -266,7 +268,7 @@ export function MarketSell() {
       const ok = await ui.confirm({
         title: "Disable offer",
         message:
-          "Disable this offer? While Liquidity provision stays on it stays disabled until you enable it again — switching Liquidity provision " +
+          "Disable this offer? While selling stays on it stays disabled until you enable it again — switching selling " +
           "off and on lists your disabled offers again. Its terms stay with whoever sets them now.",
         confirmLabel: "Disable",
       });
@@ -347,14 +349,13 @@ export function MarketSell() {
   // The offer form only when it is wanted: editing, a price button pressed,
   // no offer yet, or "Create another offer" (it sat open under everything,
   // with a paragraph of fine print, on every visit).
+  const sellProblems = diag?.checks.filter((c) => c.status === "problem").length ?? 0;
   const formOpen = editingId !== null || draft !== null || showForm || (connected !== null && offers.length === 0);
 
   return (
     <section className="panel">
       <div className="panel-head">
-        <h2>
-          Sell liquidity <span className="v2-badge">advanced</span>
-        </h2>
+        <h2>{offers.length > 1 ? "Your offers" : "Your offer"}</h2>
         {a ? (
           <span className="muted">
             {a.mySellerScore != null ? `seller score ${a.mySellerScore.toFixed(1)} · ` : ""}
@@ -377,6 +378,16 @@ export function MarketSell() {
       ) : null}
       {rec && pendingOrdersBanner(rec.sell) ? <div className="magma-warn-banner">⚠ {pendingOrdersBanner(rec.sell)}</div> : null}
       <p className="sell-lede muted">
+        {cfg ? (
+          <>
+            Selling is <strong>{cfg.sellEnabled ? "on" : "off"}</strong>
+            {" · "}
+            <button className="linklike" onClick={() => goTo("autopilot", "magma")}>
+              settings under Autopilot → Selling
+            </button>
+            {" · "}
+          </>
+        ) : null}
         Amboss decides who gets an order.
         <InfoTip label="About selling">
           Mostly sellers with a track record. LightningMate makes selling correct and reliable; it can't make Amboss pick you.
@@ -384,7 +395,6 @@ export function MarketSell() {
         </InfoTip>
       </p>
 
-      <h3 className="sub">{offers.length > 1 ? "Your offers" : "Your offer"}</h3>
       {connected === null ? (
         <p className="muted">Loading…</p>
       ) : offers.length === 0 ? (
@@ -396,11 +406,8 @@ export function MarketSell() {
               <th>Status</th>
               <th className="num">Size range</th>
               <th className="num">Total</th>
-              <th className="num">Fee rate</th>
-              <th className="num">Base fee</th>
+              <th className="num">Price</th>
               <th className="num">Lease</th>
-              <th className="num">Fee promise</th>
-              <th>Terms set by</th>
               <th></th>
             </tr>
           </thead>
@@ -414,25 +421,29 @@ export function MarketSell() {
               const follow = baseFeeFollow(o, rec, autoPriced(o));
               return (
                 <tr key={o.id} className={active ? "" : "inactive"}>
-                  <td>{active ? "🟢 active" : `⚪ ${o.status.toLowerCase()}`}</td>
+                  <td>
+                    {active ? "🟢 active" : `⚪ ${o.status.toLowerCase()}`}
+                    <div className="muted small" title={owner.title}>
+                      {owner.label}
+                    </div>
+                  </td>
                   <td className="num">
                     {satsCompact(o.minSizeSats)}–{satsCompact(o.maxSizeSats)}
                   </td>
                   <td className="num">{satsCompact(o.totalSizeSats)}</td>
-                  <td className={`num ${free ? "delta-up" : ""}`} title={free ? "No price: buyers would get a channel for free" : undefined}>
-                    {o.feeRatePpm} ppm{free ? " ⚠" : ""}
-                  </td>
-                  <td className="num" title={follow?.title}>
-                    {o.baseFeeSats}
-                    {follow ? <span className="base-follow"> {follow.cell}</span> : null}
+                  <td className={`num ${free ? "delta-up" : ""}`} title={free ? "No price: buyers would get a channel for free" : (follow?.title ?? ppmText(o.feeRatePpm))}>
+                    {o.feeRatePpm.toLocaleString("en-US")} ppm{free ? " ⚠" : ""}
+                    <div className="muted small">
+                      + {o.baseFeeSats} sat base
+                      {follow ? <span className="base-follow"> {follow.cell}</span> : null}
+                    </div>
                   </td>
                   <td className={`num ${oddLease ? "delta-up" : ""}`} title={`${o.minBlockLength} blocks${oddLease ? " — not the standard lease buyers use" : ""}`}>
                     {Math.round(o.minBlockLength / 144)}d{oddLease ? " ⚠" : ""}
+                    <div className="muted small" title="The routing fee promised to buyers for the lease">
+                      {o.feeRateCapPpm ? `fee ≤ ${o.feeRateCapPpm} ppm + ${o.baseFeeCapSats ?? 0} sat` : "no fee promise"}
+                    </div>
                   </td>
-                  <td className="num" title="The routing fee promised to buyers for the lease">
-                    {o.feeRateCapPpm ? `≤ ${o.feeRateCapPpm} ppm + ${o.baseFeeCapSats ?? 0} sat` : "none"}
-                  </td>
-                  <td title={owner.title}>{owner.label}</td>
                   <td>
                     <div className="row-actions">
                       <button className="row-btn ghost" disabled={busy} onClick={() => startEdit(o)}>
@@ -495,6 +506,23 @@ export function MarketSell() {
             ⚠ {turnedDownLine(e, !!controls[e.offerId]?.manual)}
           </p>
         ))}
+      {error ? <p className="banner error">{error}</p> : null}
+      {rec && r0 ? (
+        <div className="sell-price-line">
+          <span className={`feerec-state ${SELL_STATE_CLASS[r0.state]}`}>{SELL_STATE_LABEL[r0.state]}</span>
+          <span className="muted">
+            {r0.current ? `yours ${r0.current.effectiveFeePpm} → recommended ${r0.recommended.effectiveFeePpm} ppm` : `recommended ${r0.recommended.effectiveFeePpm} ppm`}
+          </span>
+        </div>
+      ) : null}
+      {r0?.warnings.length ? (
+        <div className="magma-warns">
+          {r0.warnings.map((w, i) => (
+            <div key={`w${i}`} className="sug-warn">⚠ {w}</div>
+          ))}
+        </div>
+      ) : null}
+      <Fold id="sell-by-hand" title="Edit and price by hand" forceOpen={editingId !== null || draft !== null || showForm || (connected !== null && offers.length === 0)}>
       {formOpen ? (
         <div className="offer-form">
           <h4 className="sub">{editingId ? "Edit your offer" : offers.length ? "Another offer (it lists a second one)" : "New offer"}</h4>
@@ -531,7 +559,6 @@ export function MarketSell() {
           + Create another offer
         </button>
       ) : null}
-      {error ? <p className="banner error">{error}</p> : null}
 
       {rec && r0 ? (
         <>
@@ -633,13 +660,6 @@ export function MarketSell() {
                 — or edit the offer to take it over — to price it by hand.
               </p>
             ) : null}
-            {r0.warnings.length ? (
-              <div className="magma-warns">
-                {r0.warnings.map((w, i) => (
-                  <div key={`w${i}`} className="sug-warn">⚠ {w}</div>
-                ))}
-              </div>
-            ) : null}
             <details className="price-more">
               <summary>Why this price</summary>
               {summary ? (
@@ -708,11 +728,14 @@ export function MarketSell() {
           <span className="muted">{summary.line}</span>
         </div>
       ) : null}
+      </Fold>
       {recView.error ? <p className="banner error">{reportErrorText(recView)}</p> : null}
 
-      <EligibilityCard e={elig} busy={eligBusy} onRefresh={() => loadEligibility(true)} />
-      <SellDiagnosticsCard d={diag} onFix={(tab, sub) => goTo(tab, sub)} />
-      <HowAmbossPicks usdOrderSat={elig?.usdOrders?.minOrderSat ?? null} usdAtOwnPriceSat={elig?.usdOrders?.atOwnPriceSat ?? null} feeTiers={elig?.feeTiers ?? null} feeBps={feeBps} />
+      <Fold id="sell-check" title="Can this node sell?" note={sellProblems > 0 ? `${sellProblems} to look at` : undefined}>
+        <EligibilityCard e={elig} busy={eligBusy} onRefresh={() => loadEligibility(true)} />
+        <SellDiagnosticsCard d={diag} onFix={(tab, sub) => goTo(tab, sub)} />
+        <HowAmbossPicks usdOrderSat={elig?.usdOrders?.minOrderSat ?? null} usdAtOwnPriceSat={elig?.usdOrders?.atOwnPriceSat ?? null} feeTiers={elig?.feeTiers ?? null} feeBps={feeBps} />
+      </Fold>
     </section>
   );
 }

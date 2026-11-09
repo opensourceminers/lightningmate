@@ -74,7 +74,7 @@ export interface MagmaV2Config {
    *  part of every recommended offer. Null: none (the engine alone). */
   offerFeeCaps: OfferFeeCaps | null;
   /** Who sets each offer's lease next (autopilot.ts): with auto-size on (and
-   *  Liquidity provision), the autopilot gives every offer whose terms aren't
+   *  selling), the autopilot gives every offer whose terms aren't
    *  the operator's the standard lease in its next write — such an offer is
    *  priced for the standard lease. Every other offer is priced for the lease
    *  it keeps (keptLeaseBlocks). */

@@ -430,6 +430,8 @@ export interface CloseChannelResult {
   ok: boolean;
   transactionId?: string;
   error?: string;
+  /** Not closed yet, but not failed either: LND goes on with the close. */
+  stillClosing?: boolean;
 }
 
 /**
@@ -439,6 +441,14 @@ export interface CloseChannelResult {
  * `feeRate` (sat/vByte) only applies to a cooperative close — a force-close
  * broadcasts the pre-signed commitment tx whose fee was fixed at open time.
  */
+/** LND's words when the peer holds out for more than a cooperative close may
+ *  pay (three times the rate asked for, unless told otherwise). */
+const CLOSE_FEE_REFUSED = /fee proposal exceeds max fee/i;
+/** Before, this read "Close failed" while the channel went on to close, and
+ *  someone believing it might force-close a channel already on its way. */
+export const CLOSE_FEE_REFUSED_TEXT =
+  "The peer wants more than three times the fee you chose, so this round ended without a closing transaction. The channel is shutting down all the same: LND normally finishes the close with the peer at its own fee estimate, usually within minutes. Wait for it. If it still hasn't closed after a few hours, a force-close remains possible.";
+
 export async function closeChannelByOutpoint(
   writeLnd: AuthenticatedLnd,
   transactionId: string,
@@ -463,6 +473,9 @@ export async function closeChannelByOutpoint(
     );
     return { ok: true, transactionId: res.transaction_id };
   } catch (err) {
-    return { ok: false, error: describe(err) };
+    const error = describe(err);
+    // The shutdown is out: LND goes on with the peer, this was only the
+    // first round of haggling over the fee (seen on regtest with LND 0.21).
+    return !isForce && !maxFeeRate && CLOSE_FEE_REFUSED.test(error) ? { ok: false, stillClosing: true, error: CLOSE_FEE_REFUSED_TEXT } : { ok: false, error };
   }
 }

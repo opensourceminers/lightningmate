@@ -10,7 +10,7 @@ import type { MagmaLaneStatus, MyOrder, OfferSyncStatus } from "./types";
  * The error of an offer write that did not land, for an offer that is STILL
  * out of sync with what the autopilot wants — or null.
  *
- * Shown whenever Liquidity provision is on (the capital clamp and the
+ * Shown whenever selling is on (the capital clamp and the
  * enable/disable writes run with auto-pricing off too), and only while the
  * offer is out of sync: once a later write lands, an old failure is history,
  * not a problem to show.

@@ -200,6 +200,8 @@ export class FakeLnd {
   routingFeeMsat = 2_000;
   /** Next channel opens: succeed (pending channel) or fail with this LND status text. */
   openFailure: string | null = null;
+  /** The next closes' stream ends in this error (LND's words). */
+  closeFailure: string | null = null;
   /** Every gRPC call, in order. */
   readonly calls: { method: string; args: GrpcArgs }[] = [];
   /** Runs as each call arrives, before LND acts on it — e.g. to look at the
@@ -830,6 +832,10 @@ export class FakeLnd {
       const i = this.channels.findIndex((c) => c.transactionId === txid && c.transactionVout === point.output_index);
       if (i < 0) {
         s.emit("error", { details: "unable to find channel" });
+        return;
+      }
+      if (this.closeFailure) {
+        s.emit("error", { details: this.closeFailure });
         return;
       }
       const [c] = this.channels.splice(i, 1);

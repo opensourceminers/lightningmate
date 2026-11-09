@@ -19,29 +19,36 @@ version: "0.7.7"
 tagline: Profit-aware management & autopilot for your Lightning node
 description: >-
   Lightning Mate manages your Lightning node so you don't have to babysit it.
-  It connects automatically to your Umbrel Lightning (LND) node.
+  It connects automatically to your Umbrel Lightning (LND) node and asks three
+  short questions the first time you open it: what the node is for, how much the
+  app may use, and what that will do.
 
 
-  See channels with live balance bars and source / sink / router roles, a full
-  Forwards routing report, and a Profit & Loss overview (routing revenue vs
-  channel-open and rebalancing costs). Get scored channel-peer suggestions from
+  The start page says what needs you today. Click any node for its details: how
+  its channel is doing, what it earned, what each side charges and its place in
+  the network, or how it scores as a peer if you are thinking of opening a
+  channel. Every setting is still there for those who want it, under Advanced.
+
+
+  See what each channel earned, a routing report, and a Profit & Loss overview
+  (routing revenue against every cost). Get scored channel-peer suggestions from
   the network graph and open channels in a click, plus a node health score.
 
 
   Flip on the Autopilot and the node tunes its own pricing, runs only profitable
-  rebalances, and opens channels to top peers — all on recommended settings with
-  safe caps and cooldowns.
+  rebalances, and opens channels to top peers, on recommended settings with safe
+  caps and cooldowns.
 
 
   Buy and sell channel liquidity on the Amboss Magma marketplace right inside the
-  app: purchase inbound, list your own offer, and let the Autopilot fulfil orders
-  — opening channels to buyers within your capital, channel-size and on-chain
-  reserve caps.
+  app: purchase inbound, list your own offer, and let the Autopilot fulfil orders,
+  opening channels to buyers within your capital, channel-size and on-chain
+  reserve caps. Amboss decides which seller gets an order.
 
 
   LSP mode (experimental) turns your node into a Lightning Service Provider: wallets
   speaking the open LSPS1 standard (bLIP-51) can buy inbound channels from you
-  directly — priced automatically, paid via a hold invoice that only settles
+  directly, priced automatically, paid via a hold invoice that only settles
   once the channel is opening, refunded automatically on any failure. Off by
   default.
 
@@ -49,57 +56,62 @@ description: >-
   Lightning Mate signs in with the per-app password Umbrel generates for it
   (shown when you open the app), so no other app on your server can read your
   node or move your funds.
-# DRAFT notes for the next release — what the 2026-10 review fixes change.
-# Before publishing, check them against the release's code and its manual
-# end-to-end results (docs/E2E-TESTING.md, docs/RELEASING.md). Never claim that
-# price or size wins orders or raises the seller score (D11, D19): Amboss
-# decides which seller gets an order. (The published 0.7.7 notes claimed that
-# size decides whether a buyer can be matched — disproven; they must not be
-# copied out again. server/test/docsMatchCode.test.ts refuses them.)
+# DRAFT notes for 0.9.0, the next version in both stores. Before publishing, check
+# them against the release's code and its manual end-to-end results
+# (docs/E2E-TESTING.md, docs/RELEASING.md). Never claim that price or size wins
+# orders or raises the seller score (D11, D19): Amboss decides which seller gets
+# an order. (The published 0.7.7 notes claimed that size decides whether a buyer
+# can be matched — disproven; they must not be copied out again.
+# server/test/docsMatchCode.test.ts refuses them.)
 releaseNotes: |-
-  A reliability and honesty release: Magma selling moves to Amboss's new
-  Magma API, and every part of the autopilot says what it decided and why.
+  Lightning Mate is now as easy to use as it is thorough: the page says what
+  needs you, and every setting is still there when you want it.
 
-  Magma selling (off by default)
-  - Orders are accepted with a hold invoice: the buyer's payment settles only
-    once Amboss confirms the channel, and every failure refunds it.
-  - Each order step is recorded before it happens, so a restart never opens a
-    second channel, and an order the node can't serve is rejected at once
-    rather than left to time out.
-  - Offers carry the standard 30-day lease and a routing-fee promise, which
-    the fee autopilot keeps for every channel sold.
-  - A live check shows how often offers like yours sell. Amboss decides which
-    seller gets an order, mostly by track record; price and size don't buy a
-    match, and the app no longer says they do.
-  - Turning selling on is its own confirmed step; no preset turns it on.
+    Easier
+    - A new install asks three short questions: what the node is for, how much
+      the app may use, and what that will do. Skip them if you know better.
+    - The start page opens with what needs you today, each line leading to where
+      it is dealt with. Health, profit and the liquidity map open on a click.
+    - Autopilot is one page: your strategy, one row per area with its switch and
+      what it did last, and your limits. "Advanced" says how many settings you
+      changed and can put them back.
+    - Long explanations moved behind a "?". Settings has what the words mean.
 
-  Autopilot
-  - Fees move toward an aim in bounded steps, rise only when a channel drains,
-    and a draining channel is priced against what refilling it costs.
-  - A refill never pays more than the profit check allowed; the daily budget
-    survives restarts and counts refills run by hand.
-  - Automatic channel opens pay a capped fee rate and, where the node's
-    routing yield is measured, must pay back their on-chain cost within a
-    year; a peer that is briefly offline is no reason to close.
-  - Presets show what they change before they apply, "Pause all automation"
-    switches every autopilot automation off at once (LSP mode, a Settings
-    switch, keeps running and says so), and each area says what it last
-    decided and why.
+    Node details
+    - Click a node's name almost anywhere: one sentence says where you stand with
+      it, then its channel, what it earned, what each side charges and its place
+      in the network.
+    - A node without a channel is scored the way the suggestions score it. Find
+      any node by alias, key or key@host:port, and open a channel to it.
+    - The Channels table shows four columns, with more on request.
 
-  Profit & loss
-  - Every cost counts: closes and their sweeps, rebalances made with any tool,
-    inbound bought on Magma.
+    Selling on Magma (off by default)
+    - Orders are accepted with a hold invoice: the buyer's payment settles only
+      once Amboss confirms the channel, and every failure refunds it. Each step is
+      recorded before it happens, so a restart never opens a second channel.
+    - A buyer's node that takes a while to answer over Tor is dialed again until
+      shortly before the order's deadline, not turned down at once.
+    - Your offer can follow what is free on chain, and a sold channel can close
+      itself after its lease unless it earns as much as selling again.
+    - Amboss decides which seller gets an order, mostly by track record. Price and
+      size don't buy a match, and the app doesn't say they do.
 
-  Wallet and LSP mode
-  - An on-chain send shows its fee in sats and asks again before it overpays
-    or dips into the reserve.
-  - LSP mode (experimental, off by default) accepts the order request of
-    ZEUS's embedded node; orders are paced and capped.
+    Autopilot
+    - Fees move in bounded steps and rise only when a channel drains; a refill
+      never pays more than the profit check allowed; automatic opens wait for a
+      fair fee rate and, where the node's routing yield is measured, must pay back;
+      a peer briefly offline is no reason to close.
+    - "Pause all" switches every automation off at once, and each area says what
+      it last decided and why.
 
-  Privacy and security
-  - With Umbrel's Tor proxy, the app's own lookups (LN+, the BTC price, Amboss
-    market data) go through Tor; Settings → Privacy lists every destination.
-  - The API refuses requests a browser marks as cross-site.
+    Profit & loss
+    - Every cost counts: closes and their sweeps, rebalances made with any tool,
+      inbound bought on Magma.
+
+    Privacy and security
+    - With Umbrel's Tor proxy, every lookup the app makes goes through Tor; Settings
+      → Privacy lists each destination and its switch.
+    - The API refuses requests a browser marks as cross-site.
 developer: opensourceminers.de
 website: https://opensourceminers.de
 dependencies:

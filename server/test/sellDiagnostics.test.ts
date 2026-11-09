@@ -2,7 +2,7 @@
  * "Why don't I sell?" answered automatically (m3-sellpath:diagnosis-checklist,
  * a6-ux:sell-diagnosis-hidden): GET /amboss/sell-diagnostics reports, from the
  * live state, every gate the review had to check by hand — version, write mode,
- * key, Liquidity provision and the automation, the order lane, the offer vs
+ * key, selling and the automation, the order lane, the offer vs
  * the engine's target (price, window, lease, fee promise), the last offer
  * write, recent orders and how they ended, and the eligibility verdict.
  */

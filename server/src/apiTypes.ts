@@ -37,7 +37,7 @@
 import type { SuggestionV2, SuggestV2Report } from "./services/suggestRecommend.js";
 import type { AmbossKeyStatus } from "./services/ambossStore.js";
 import type { AutomationSwitch, Autopilot, AutopilotChange, AutopilotRun, OfferControl, OfferSyncStatus } from "./services/autopilot.js";
-import type { AUTOPILOT_CONFIG_BOUNDS } from "./services/autopilotConfig.js";
+import type { AUTOPILOT_CONFIG_BOUNDS, AutopilotConfig } from "./services/autopilotConfig.js";
 import type { OpenChannelResult as ChannelOpsOpenResult } from "./services/channelOps.js";
 import type { FeeEstimates, OnchainState as WalletState, SendBudget, SendResult } from "./services/onchain.js";
 import type { ChannelView as LndChannel } from "./services/channels.js";
@@ -223,6 +223,8 @@ export type AutopilotState = ReturnType<Autopilot["getState"]> & {
   /** LSP mode (Settings) answering wallet orders. Not one of the
    *  autopilot's switches: "Pause all automation" leaves it on. */
   lspModeOn: boolean;
+  /** The factory settings: what "N changed" and its reset measure against. */
+  defaults: AutopilotConfig;
 };
 
 /** GET /api/health — open (no login needed). */

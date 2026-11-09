@@ -1,7 +1,7 @@
 /** @jsxRuntime automatic */
 /** @jsxImportSource react */
 /**
- * The Liquidity provision switch (D9; review P1b): switching on opens the
+ * The selling switch (D9; review P1b): switching on opens the
  * confirmation at once — the selling check follows when Amboss answers —
  * and switching off with offers listed reports success only when none is
  * listed any more.

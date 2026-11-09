@@ -1602,7 +1602,7 @@ test("a clearnet address 0.8.4 announced is withdrawn once at start and leaves t
   assert.deepEqual(addressUpdates().map((a) => a.address_updates), [[{ action: 1, address: "203.0.113.7:9735" }]]);
   await until(() => !("lspClearnetAddress" in JSON.parse(readFileSync(join(dir, "settings.json"), "utf8"))), "forgotten");
   assert.equal(lsp.settings.legacyClearnetAddress(), "");
-  assert.deepEqual(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")), { fiatCurrency: "off", lnplusLookups: true, nodeLookups: true, lspModeEnabled: true });
+  assert.deepEqual(JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")), { fiatCurrency: "off", lnplusLookups: true, nodeLookups: true, lspModeEnabled: true, setupDone: true });
   assert.equal("announcedSocket" in (await lsp.svc.status()), false);
 
   // The next start has nothing to withdraw.

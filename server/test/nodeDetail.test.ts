@@ -567,3 +567,115 @@ test("the Privacy card says LN+ is asked about a node you open", async (t) => {
   const row = (await api.request("GET", "/privacy")).body.destinations.find((d: { service: string }) => d.service === "lightningnetwork.plus");
   assert.match(row.what, /any node whose details you open/);
 });
+
+test("GET /autopilot says the factory settings, for what Advanced measures against", async (t) => {
+  const { node } = setup();
+  const api = await startApi(t, { node });
+  const res = await api.request("GET", "/autopilot");
+  assert.equal(res.body.defaults.policy.minPpm, 25);
+  assert.equal(res.body.defaults.enabled, false);
+  assert.equal(res.body.defaults.sellMaxChannelSats, 2_000_000);
+  // The answer to a save says it too.
+  const saved = await api.request("POST", "/autopilot", { intervalMinutes: 40 });
+  assert.equal(saved.body.config.intervalMinutes, 40);
+  assert.equal(saved.body.defaults.intervalMinutes, 30);
+});
+
+test("a new install hasn't done its first-start questions; one with anything on disk has — so an update never asks", async (t) => {
+  const fresh = await startApi(t, { node: setup().node });
+  assert.equal((await fresh.request("GET", "/settings")).body.setupDone, false);
+  assert.equal((await fresh.request("POST", "/settings", { setupDone: "yes" })).status, 400);
+  const done = await fresh.request("POST", "/settings", { setupDone: true });
+  assert.equal(done.body.setupDone, true);
+
+  for (const [file, body] of [
+    ["settings.json", { fiatCurrency: "EUR" }],
+    ["autopilot.json", {}],
+  ] as const) {
+    const dir = makeTempDir(t);
+    writeFileSync(join(dir, file), JSON.stringify(body));
+    const old = await startApi(t, { node: setup().node, dir });
+    assert.equal((await old.request("GET", "/settings")).body.setupDone, true, file);
+  }
+  // Not answered yet, the questions survive a restart — though the autopilot's
+  // file exists by then. Answered, they stay answered.
+  const dir = makeTempDir(t);
+  const first = await startApi(t, { node: setup().node, dir });
+  const restarted = await startApi(t, { node: setup().node, dir });
+  assert.equal((await restarted.request("GET", "/settings")).body.setupDone, false);
+  await first.request("POST", "/settings", { setupDone: true });
+  const again = await startApi(t, { node: setup().node, dir });
+  assert.equal((await again.request("GET", "/settings")).body.setupDone, true);
+});
+
+test("the dashboard counts idle channels: open, online, past the window, outside a lease, and routing nothing — and says nothing when it can't tell", async (t) => {
+  const OLD = HEIGHT - 8_640; // 60 days
+  const NEW = HEIGHT - 1_440; // 10 days
+  const P = (n: number) => PK(90 + n);
+  const channels: FeeChannel[] = [
+    { id: `${OLD}x1x0`, partnerPublicKey: P(1), capacity: 4_000_000, localBalance: 3_000_000, transactionId: TX(61), transactionVout: 0, feeRatePpm: 100, baseFeeMsat: 0 },
+    { id: `${OLD}x2x0`, partnerPublicKey: P(2), capacity: 4_000_000, localBalance: 2_000_000, transactionId: TX(62), transactionVout: 0, feeRatePpm: 100, baseFeeMsat: 0 },
+    { id: `${NEW}x3x0`, partnerPublicKey: P(3), capacity: 4_000_000, localBalance: 1_000_000, transactionId: TX(63), transactionVout: 0, feeRatePpm: 100, baseFeeMsat: 0 },
+  ];
+  const node = feeNode({
+    blockHeight: HEIGHT,
+    channels,
+    forwards: [{ at: Date.now() - 60_000, inId: `${NEW}x3x0`, outId: `${OLD}x2x0`, tokens: 100_000, feeMsat: 1_000 }],
+  });
+  node.override("default.closedChannels", (_a, cb) => cb(null, { channels: [] }));
+  node.override("default.getTransactions", (_a, cb) => cb(null, { transactions: [], first_index: "0", last_index: "0" }));
+  node.override("default.listPayments", (_a, cb) => cb(null, { payments: [], first_index_offset: "0", last_index_offset: "0" }));
+  const api = await startApi(t, { node });
+  const http = installFetchMock(t);
+  http.on(/./, () => new Response("{}", { status: 503 }));
+  api.settings.set({ lnplusLookups: false });
+  const res = await api.request("GET", "/dashboard");
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.deepEqual(res.body.idleChannels, { count: 1, localSats: 3_000_000 }, "only the old one no forward used");
+});
+
+test("a close whose fee the peer refuses isn't called failed: LND goes on with it, so nobody is sent to force-close", async (t) => {
+  const { node } = setup();
+  const api = await startApi(t, { node });
+  const close = { transactionId: TX(1), transactionVout: 0, feeRate: 2 };
+  // LND's words, as seen on regtest (0.21).
+  node.closeFailure = "unable to process close msg: latest fee proposal exceeds max fee: 0.00000933 BTC > 0.00000900 BTC";
+  const refused = await api.request("POST", "/channels/close", close);
+  assert.equal(refused.status, 200);
+  assert.equal(refused.body.ok, false);
+  assert.equal(refused.body.stillClosing, true);
+  assert.match(refused.body.error, /shutting down all the same/);
+  assert.match(refused.body.error, /Wait for it\./);
+  // Any other failure is one.
+  node.closeFailure = "peer is offline";
+  const other = await api.request("POST", "/channels/close", close);
+  assert.equal(other.body.ok, false);
+  assert.equal(other.body.stillClosing, undefined);
+  assert.match(other.body.error, /peer is offline/);
+});
+
+test("a node that has run before never gets the first-start questions, whatever is left of its files", async (t) => {
+  for (const file of ["settings.json.bak", "autopilot.json.bak", "autopilot.json.corrupt-1731150000"]) {
+    const dir = makeTempDir(t);
+    writeFileSync(join(dir, file), "{}");
+    const api = await startApi(t, { node: setup().node, dir });
+    assert.equal((await api.request("GET", "/settings")).body.setupDone, true, file);
+  }
+});
+
+test("a channel the operator set aside isn't called idle", async (t) => {
+  const OLD = HEIGHT - 8_640;
+  const P = PK(97);
+  const channels: FeeChannel[] = [{ id: `${OLD}x1x0`, partnerPublicKey: P, capacity: 4_000_000, localBalance: 3_000_000, transactionId: TX(71), transactionVout: 0, feeRatePpm: 100, baseFeeMsat: 0 }];
+  const node = feeNode({ blockHeight: HEIGHT, channels });
+  node.override("default.closedChannels", (_a, cb) => cb(null, { channels: [] }));
+  node.override("default.getTransactions", (_a, cb) => cb(null, { transactions: [], first_index: "0", last_index: "0" }));
+  node.override("default.listPayments", (_a, cb) => cb(null, { payments: [], first_index_offset: "0", last_index_offset: "0" }));
+  const api = await startApi(t, { node });
+  const http = installFetchMock(t);
+  http.on(/./, () => new Response("{}", { status: 503 }));
+  api.settings.set({ lnplusLookups: false });
+  assert.deepEqual((await api.request("GET", "/dashboard")).body.idleChannels, { count: 1, localSats: 3_000_000 });
+  await api.request("POST", "/overrides", { channelId: `${OLD}x1x0`, mode: "exclude" });
+  assert.deepEqual((await api.request("GET", "/dashboard")).body.idleChannels, { count: 0, localSats: 0 });
+});

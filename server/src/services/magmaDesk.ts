@@ -183,7 +183,7 @@ const ORDER_HEIGHT_SLACK_SHARE = 0.1;
 /** An order the lane was deciding when selling was switched off (or all
  *  automation paused): nothing was promised — it is the operator's now. */
 export const SELLING_OFF_SKIP =
-  "Liquidity provision was switched off before it was accepted — nothing was promised; accept or reject it on Market → Orders";
+  "Selling was switched off before it was accepted — nothing was promised; accept or reject it on Market → Orders";
 /** An order the operator took into their own hands whose accept didn't go
  *  through: nothing was promised, and it is theirs to decide — the lane
  *  neither accepts nor rejects it (byHand). */
@@ -955,7 +955,7 @@ export class MagmaDesk {
       return this.idle("no Amboss key, and no order of yours in flight");
     }
     if (!cfg.sellEnabled && mine.length === 0) {
-      return this.idle("Liquidity provision is off, and no order of yours is in flight");
+      return this.idle("Selling is off, and no order of yours is in flight");
     }
     this.laneBusy = true;
     this.passUnderWay = scope;
@@ -1247,7 +1247,7 @@ export class MagmaDesk {
           // rejected — and once it was paid, opened its channel.
           else if (entry && rejectByHand(entry)) out.push(...(await this.rejectOrder(entry, REJECTED_BY_YOU)));
           // The lane's own reject that Amboss didn't confirm ("will try
-          // again"), with Liquidity provision switched off — or all
+          // again"), with selling switched off — or all
           // automation paused — since: nothing sends it again (the lane
           // decides nothing now). The order is the operator's, and its record
           // says so; the retry it promised goes. (Before, it kept "will try
@@ -1257,7 +1257,7 @@ export class MagmaDesk {
             entry.lastErrorAt = undefined;
             out.push(this.skip(entry, SELLING_OFF_SKIP));
           }
-          // A new order is the lane's to decide while Liquidity provision is
+          // A new order is the lane's to decide while selling is
           // on. One the operator is deciding is taken up whatever the switch
           // says — only to say so on its record: decide() leaves it to them.
           // So is one whose accept by the lane was handed back (its invoice
@@ -1783,7 +1783,7 @@ export class MagmaDesk {
    * The lane's decision on an order waiting for approval: accept, or reject
    * at once when it cannot be served — never let it time out.
    *
-   * Only while Liquidity provision is on, asked live — before anything is
+   * Only while selling is on, asked live — before anything is
    * decided and again after every wait (the capital check, the dial): a
    * paused lane never turns an order down on its own, as it never accepts
    * one (acceptOrder); the order is the operator's (SELLING_OFF_SKIP). D6's
@@ -2085,7 +2085,7 @@ export class MagmaDesk {
     this.backToSeen(entry);
     // Never sent: the count of accepts Amboss refused stays true (MAX_ACCEPT_ATTEMPTS).
     entry.acceptAttempts = Math.max(0, entry.acceptAttempts - 1);
-    this.journal.event(entry, "Liquidity provision was switched off before the accept was sent — its invoice was released, nothing promised");
+    this.journal.event(entry, "Selling was switched off before the accept was sent — its invoice was released, nothing promised");
     const skipped = this.skip(entry, SELLING_OFF_SKIP); // saved: the reservation is gone on disk too
     if (inv) await this.lndCancel(inv.id).catch(() => undefined);
     return skipped;
@@ -2097,7 +2097,7 @@ export class MagmaDesk {
    * offered (unmarkedAccept says why for a resend), the order is back to
    * "seen", nothing reserved. A running lane tries again on its next pass;
    * with the approval deadline close, it rejects the order instead of
-   * leaving it to time out. A paused lane — Liquidity provision
+   * leaving it to time out. A paused lane — Selling
    * off, or all automation paused, asked live — turns nothing down on its
    * own: the order is the operator's (SELLING_OFF_SKIP), as in decide(). A
    * click is only told. (Review of P8, round 2: a resend whose mark couldn't
@@ -2269,7 +2269,7 @@ export class MagmaDesk {
    * timeout, a crash after `acceptSentAt` was saved): sent again with the
    * same invoice while that still has its 48 h — the step under way is
    * completed, whatever the switch says now. Never sent (a crash between the
-   * invoice and the accept): with Liquidity provision off since — or all
+   * invoice and the accept): with selling off since — or all
    * automation paused — the lane's accept is withdrawn as if the pause had
    * come before it (withdrawAccept: back to "seen", coins and invoice
    * released, the attempt not counted); a click's is the operator's own and

@@ -36,6 +36,8 @@ cd server
 node --import tsx e2e/dial.ts   # how a dial behaves with circuits of 0–35 s and refused addresses
 server/e2e/regtest.sh up        # (fresh chain and nodes for the next one)
 node --import tsx e2e/sale.ts   # accept, held payment, channel, report, settle, close, and a refund
+server/e2e/regtest.sh up
+node --import tsx e2e/nodePanel.ts  # a node's details through the app's routes: open by hand, fee mode, close
 server/e2e/regtest.sh down
 ```
 
@@ -50,7 +52,7 @@ says PASS or FAIL; the exit code says whether all passed.
 
 - **Seller (node A)**: LightningMate in write mode — with the admin macaroon
   or the least-privilege one SECURITY.md lists, which needs `peers:read`
-  (Autopilot → Magma must not show "blocked … lacks peers:read") — an Amboss
+  (Autopilot → Selling must not show "blocked … lacks peers:read") — an Amboss
   API key of account X with node A on it (Settings → Amboss: "valid"),
   on-chain coins of at least the test channel size plus the on-chain reserve
   and the funding fee.
@@ -61,7 +63,7 @@ says PASS or FAIL; the exit code says whether all passed.
 
 **1. Offer and selling switch (node A)**
 
-1. Market → Sell: read the selling check. Switch **Liquidity provision** on
+1. Market → Sell: read the selling check. Switch **Selling** on
    (the confirmation shows the check again).
 2. Create an offer whose size window covers the test size, or let the
    autopilot list one (auto-price). Check the offer as Amboss stores it
@@ -108,7 +110,7 @@ says PASS or FAIL; the exit code says whether all passed.
 
 **5. Channel open and report (node A)**
 
-8. The lane opens the channel to B (with Liquidity provision on, or for an
+8. The lane opens the channel to B (with selling on, or for an
    order it accepted itself; an order accepted by hand with selling off waits
    for "Open channel" — the Orders tab says which). The journal records
    `opening` before the open and the funding outpoint right after it

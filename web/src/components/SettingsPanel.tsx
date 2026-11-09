@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState } from "react";
 import { COPY_FAILED, copyText } from "../clipboard";
 import { api } from "../api";
 import { pageHidden } from "../usePolledData";
@@ -6,6 +6,7 @@ import type { AmbossKeyCheck, AppSettings, FiatCurrency, LspStatus, PrivacyInfo 
 import { lspBuyerGuide, lspIgnoredLine, lspReachText, lspRecoveryLine } from "../lspView";
 import { destinationLine, privacySummary } from "../privacyView";
 import { BackupCard } from "./BackupCard";
+import { Fold } from "./Fold";
 import { AmbossKeyStatus } from "./AmbossKeyStatus";
 import { LspActivity } from "./LspActivity";
 import { Switch, RunState } from "./Switch";
@@ -20,6 +21,20 @@ const CURRENCIES: { value: FiatCurrency; label: string }[] = [
   { value: "EUR", label: "EUR €" },
   { value: "GBP", label: "GBP £" },
   { value: "CHF", label: "CHF" },
+];
+
+/** The few words the app can't do without. */
+export const GLOSSARY: [string, string][] = [
+  ["sat", "The smallest unit of bitcoin: 100,000,000 sat are 1 BTC."],
+  ["Channel", "Coins locked between your node and one other, so payments between you are instant. Opening and closing one costs an on-chain fee."],
+  ["Your side, their side", "Who holds a channel's coins right now. You can send what is on your side (outbound) and receive what is on theirs (inbound)."],
+  ["Forward", "A payment between two others that passes through your node, for a small fee."],
+  ["ppm", "Parts per million, how routing fees are written: 1,000 ppm is 0.1 % of the amount."],
+  ["Refill (rebalance)", "Paying yourself across the network, to move coins back to the side of a channel that ran out."],
+  ["Peer", "A node you are connected to, or have a channel with."],
+  ["Offer, lease", "An offer sells channels on Amboss Magma. A lease is how long you promise to keep a sold channel open."],
+  ["HTLC", "One payment in flight through a channel. Max HTLC is the largest one a channel says it can take."],
+  ["On-chain", "Your normal bitcoin wallet on this node, as opposed to the coins in channels."],
 ];
 
 export function SettingsPanel({ onChange, version }: { onChange: () => void; version?: string }) {
@@ -456,6 +471,17 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
           ) : null}
         </details>
       ) : null}
+
+      <Fold id="words" title="What the words mean">
+        <dl className="node-facts glossary">
+          {GLOSSARY.map(([word, meaning]) => (
+            <Fragment key={word}>
+              <dt>{word}</dt>
+              <dd>{meaning}</dd>
+            </Fragment>
+          ))}
+        </dl>
+      </Fold>
 
       <h3 className="sub">About</h3>
       <div className="apply-row">

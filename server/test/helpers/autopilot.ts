@@ -126,7 +126,7 @@ export function autopilotAt(t: AfterHook, dir: string, node: FakeLnd) {
 export const BUYER = "02" + "ab".repeat(32);
 
 /**
- * Magma selling on a fake node against a fake Magma API: Liquidity provision
+ * Magma selling on a fake node against a fake Magma API: Selling
  * on, auto-pricing/sizing/relisting off (no market reads), generous caps.
  * `restart()` builds a NEW autopilot on the same data dir, node and Amboss —
  * what a process restart sees: the disk and LND, nothing from memory.

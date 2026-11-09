@@ -375,7 +375,7 @@ test("each refusal records what it was about, and only a cap or the wallet gets 
   );
   assert.equal(entryOnDisk(dir, big.id)?.refusalKind, "cap", "kept on the order's record");
   const alerts = Object.fromEntries(magmaRefusalAlerts(autopilot.magma).map((a) => [a.id, a.message]));
-  assert.match(alerts[`magma:${big.id}`], /above your max channel size .* If you want orders like it, raise the caps on Autopilot → Magma/);
+  assert.match(alerts[`magma:${big.id}`], /above your max channel size .* If you want orders like it, raise the caps on Autopilot → Selling/);
   assert.match(alerts[`magma:${poor.id}`], /not enough on-chain capital.* If you want orders like it, add on-chain funds to the wallet/);
   for (const id of [far.id, asset.id]) {
     // Before: "If you want orders like it, raise the caps or fund the wallet".

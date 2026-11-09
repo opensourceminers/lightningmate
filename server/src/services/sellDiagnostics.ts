@@ -13,7 +13,7 @@ import { priceFitsLease } from "./magmaHistory.js";
  * an offer untouched or unsold, and the only way to tell them apart was a
  * numbered list of things to check by hand across four screens and the
  * container logs: which version runs, is write mode on, is the key valid, is
- * Liquidity provision on, did the last offer write land, does the offer on
+ * selling on, did the last offer write land, does the offer on
  * Amboss carry what the engine wants, did orders arrive and how did they end.
  *
  * Each check here is one of those questions, answered from the live state,
@@ -46,7 +46,7 @@ export interface OfferTermsView {
 export interface OfferDiagnosis {
   offerId: string;
   /** Who sets its terms: the autopilot, you (you took it over), or nobody
-   *  (Liquidity provision off). */
+   *  (Selling off). */
   owner: "autopilot" | "you" | "nobody";
   amboss: OfferTermsView;
   /** What the engine would list: its price, the lease that price is for
@@ -227,22 +227,22 @@ export function buildSellDiagnostics(input: DiagnosticsInput): SellDiagnostics {
     add({
       id: "provision",
       status: input.canWrite ? "ok" : "problem",
-      label: "Liquidity provision",
+      label: "Selling",
       detail: input.canWrite
         ? "On — the order lane accepts, opens and rejects orders; the offer is kept fundable."
         : "On, but it can't run: write mode is off.",
-      fix: { tab: "autopilot", sub: "magma", label: "Autopilot → Magma" },
+      fix: { tab: "autopilot", sub: "magma", label: "Autopilot → Selling" },
     });
   } else {
     add({
       id: "provision",
       status: enabled.length > 0 ? "problem" : "info",
-      label: "Liquidity provision",
+      label: "Selling",
       detail:
         enabled.length > 0
           ? "Off while an offer is listed: new orders wait for your decision on Market → Orders, and time out if nobody decides — which Amboss counts against your seller score. Turn it on, or disable the offer."
           : "Off — selling is off (the default).",
-      fix: { tab: "autopilot", sub: "magma", label: "Autopilot → Magma" },
+      fix: { tab: "autopilot", sub: "magma", label: "Autopilot → Selling" },
     });
   }
   const autos = [

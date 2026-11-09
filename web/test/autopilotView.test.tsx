@@ -115,7 +115,7 @@ test("a preset says exactly what it changes before it applies — what moves cap
   const by = Object.fromEntries(changes.map((x) => [x.label, x]));
   assert.equal(
     by["Channel autopilot"]?.capital,
-    "opens channels with your on-chain funds, at most at your max on-chain fee rate — and, once this node's routing history is enough to judge it, only when an open pays back — not with the coins held for Magma while Liquidity provision is on",
+    "opens channels with your on-chain funds, at most at your max on-chain fee rate — and, once this node's routing history is enough to judge it, only when an open pays back — not with the coins held for Magma while selling is on",
   );
   assert.equal(by["Auto-rebalance"]?.capital, "pays routing fees for refills — up to 10,000 sat a day");
   assert.deepEqual([by["Fee automation"]?.from, by["Fee automation"]?.to], ["off", "on"]);
@@ -126,7 +126,7 @@ test("a preset says exactly what it changes before it applies — what moves cap
   assert.equal(presetConfirmLines(config({ ...balanced.cfg, policy: { ...c.policy, ...balanced.cfg.policy }, rebalancePolicy: { ...c.rebalancePolicy, ...balanced.cfg.rebalancePolicy } } as Partial<AutopilotConfig>), balanced.cfg), null);
   const html = renderToStaticMarkup(<PresetPreview preset={balanced} config={c} />);
   assert.match(html, /<li class="capital">Channel autopilot: off → <strong>on<\/strong> — opens channels with your on-chain funds/);
-  assert.match(html, /Liquidity provision \(Magma selling\) is never changed by a preset\./);
+  assert.match(html, /Selling is never changed by a preset\./);
   // The panel asks before it applies (before: save(p.cfg) on the click).
   const panel = readFileSync(new URL("../src/components/AutopilotPanel.tsx", import.meta.url), "utf8");
   assert.match(panel, /onClick=\{\(\) => void applyPreset\(p\)\}/);
@@ -205,7 +205,7 @@ test("resume switches back on what was on — selling excepted, with the reason"
   assert.deepEqual(pauseLines(config()), []);
   const r = resumeLines(["enabled", "channelEnabled", "sellEnabled"]);
   assert.deepEqual(r.lines, ["Fee automation", "Channel autopilot"]);
-  assert.match(r.sellingNote ?? "", /^Liquidity provision was on too: it stays off — switch it on again on Autopilot → Magma/);
+  assert.match(r.sellingNote ?? "", /^Selling was on too: it stays off — switch it on again on Autopilot → Selling/);
   assert.equal(resumeLines(["enabled"]).sellingNote, null);
 });
 
@@ -261,7 +261,7 @@ test("the digest pairs the last run's time with THAT run's counts, counts failur
   assert.deepEqual(did.map((i) => i.text), ["Autopilot 3m ago: 2 fees adjusted · 1 rebalance — next run in ~27 min"]);
   // An area that is blocked or failing is on the Overview too.
   const blocked = autopilotDigest(ap({ sell: true, status: { magma: { state: "blocked", text: "no Amboss API key — connect one in Settings", at: null } } }), NOW);
-  assert.ok(blocked.some((i) => i.text === "Liquidity provision blocked: no Amboss API key — connect one in Settings" && i.warn && i.sub === "magma"));
+  assert.ok(blocked.some((i) => i.text === "Selling blocked: no Amboss API key — connect one in Settings" && i.warn && i.sub === "magma"));
   // Paused: said first — without promising more than the pause does.
   assert.equal(autopilotDigest(ap({ fees: false, pausedAt: iso(120) }), NOW)[0].text, "All automation paused 2h ago — nothing new starts on its own");
   // An area that is off is never listed as blocked (a read-only node).
@@ -798,7 +798,7 @@ test("a paid sale says who opens its channel — the autopilot, or you — and s
   assert.equal(orderStatusLabel("WAITING_FOR_CHANNEL_OPEN", "SELL"), "Paid — waiting for you to open the channel");
   // A purchase is the seller's to open, whatever the flag.
   assert.equal(orderStatusLabel("WAITING_FOR_CHANNEL_OPEN", "BUY", true), "Paid — waiting for the seller to open the channel");
-  assert.equal(acceptedToast(true), "Order accepted — while Liquidity provision is on, the autopilot opens the channel once the buyer has paid.");
+  assert.equal(acceptedToast(true), "Order accepted — while selling is on, the autopilot opens the channel once the buyer has paid.");
   assert.equal(acceptedToast(false), "Order accepted — open the channel once the buyer has paid.");
   const orders = readFileSync(new URL("../src/components/MarketOrders.tsx", import.meta.url), "utf8");
   assert.match(orders, /ui\.toast\(deskDoneToast\(r, acceptedToast\(r\.opensItself === true\)\), "success"\)/);
@@ -841,7 +841,7 @@ test("switching the channel autopilot or auto-rebalance on asks first, saying wh
   // Final review 2026-10-25: the payback check needs routing history, and
   // routing opens leave Magma what it can list — the confirmation says both.
   assert.match(open?.message ?? "", /With enough routing history an open must also pay back what opening and closing cost; without it, only that fee rate cap applies\./);
-  assert.match(open?.message ?? "", /While Liquidity provision is on, routing opens leave the coins your offers can list to Magma when leasing them is expected to earn more — how much is decided each run\./);
+  assert.match(open?.message ?? "", /While selling is on, routing opens leave the coins your offers can list to Magma when leasing them is expected to earn more — how much is decided each run\./);
   assert.doesNotMatch(open?.message ?? "", /only when an open pays back/);
   const refill = switchOnConfirm("rebalanceEnabled", c);
   assert.equal(refill?.title, "Turn on auto-rebalance?");

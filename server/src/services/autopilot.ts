@@ -388,7 +388,7 @@ export interface OfferFields {
  *    the autopilot changes is capital safety's: an offer whose smallest
  *    channel can't be funded is disabled — whoever owns its terms — and
  *    listed again once it can be, since listing it was the last thing the
- *    operator chose. Switching Liquidity provision on is such a choice too:
+ *    operator chose. Switching selling on is such a choice too:
  *    every offer disabled then is listed again once it has a price and can be
  *    funded (listOnAt) — the switch-off disables them, so before, switching
  *    back on left each to be enabled by hand. A status click never takes
@@ -413,7 +413,7 @@ export interface OfferControl {
    *  (0 ppm + 0 sat) with no price of its own to put back: it stays disabled
    *  until the operator gives it a price and lists it again. */
   freeDisabledAt?: string;
-  /** Liquidity provision was switched on (when) while the offer was disabled:
+  /** selling was switched on (when) while the offer was disabled:
    *  the autopilot lists it once it has a price and its smallest channel can
    *  be funded — its terms stay with whoever has them. A click on it ends
    *  this (a disable sticks again), and so does switching selling off. */
@@ -480,7 +480,7 @@ export interface OfferSyncEntry {
 export interface OfferSyncStatus {
   /** Last time the autopilot compared its wishes with Amboss. */
   at: string | null;
-  /** Liquidity provision on: the autopilot manages the offers. */
+  /** selling on: the autopilot manages the offers. */
   managed: boolean;
   offers: OfferSyncEntry[];
   /** The last time offer upkeep itself failed (Amboss unreachable, …). */
@@ -607,7 +607,7 @@ interface PersistedState {
   offerCuts?: Record<string, OfferCut>;
   /** Per offer: who owns its terms (see OfferControl). */
   offerControl?: Record<string, OfferControl>;
-  /** Liquidity provision was switched on, and the offer upkeep hasn't read
+  /** selling was switched on, and the offer upkeep hasn't read
    *  the offers since: when, and which offers LightningMate's last offer sync
    *  showed disabled at that moment (null: there was no sync to go by) — the
    *  ones to be listed again (OfferControl.listOnAt, applySwitchOn). */
@@ -655,7 +655,7 @@ const SWITCH_WORDS: Record<AutomationSwitch, string> = {
   rebalanceEnabled: "auto-rebalance",
   channelEnabled: "the channel autopilot",
   maxHtlcEnabled: "advertising routable size",
-  sellEnabled: "Liquidity provision",
+  sellEnabled: "Selling",
 };
 
 /**
@@ -1311,7 +1311,7 @@ const openStopped = (why: string): string => `stopped: ${why} — no open was st
  *    failed open);
  *  - enabled again once it can be, only when the autopilot itself disabled it
  *    for that reason (it restores the listing the operator chose), or when
- *    the operator switched Liquidity provision on with it disabled (listOnAt)
+ *    the operator switched selling on with it disabled (listOnAt)
  *    — never one the operator disabled since. (Before, every DISABLED offer
  *    was re-enabled within the half hour, a manual "disable" included.)
  * Never without a price: capitalToggle refuses to list an offer at 0 ppm +
@@ -1607,7 +1607,7 @@ export class Autopilot {
   /** When the current main run took its lock (null when idle) — exposed so a
    *  run that takes unusually long is visible, not just a stale lastRunAt. */
   private runningSince: string | null = null;
-  /** Liquidity provision was switched on while a run was under way (the run
+  /** selling was switched on while a run was under way (the run
    *  kicked for it found that one busy): it runs one more when it ends. */
   private sellSwitchedMidRun = false;
   /** The offers' own lock: the offer capital check after a spend
@@ -1936,7 +1936,7 @@ export class Autopilot {
       onchainReserveSat: c.sellReserveSats,
       offerFeeCaps: this.offerFeeCaps(),
       // Which lease each offer is priced for: the one it carries after the
-      // offer upkeep's next write. With auto-size (and Liquidity provision)
+      // offer upkeep's next write. With auto-size (and selling)
       // that is the standard lease for every offer whose terms aren't the
       // operator's; otherwise the lease the offer keeps.
       autoSizeLease: c.sellEnabled && c.sellAutoSize,
@@ -2290,7 +2290,7 @@ export class Autopilot {
   }
 
   /**
-   * Liquidity provision switched on: the offers disabled at this moment are
+   * selling switched on: the offers disabled at this moment are
    * listed again once each has a price and can be funded. Which ones those are
    * is taken now — the offers LightningMate's last offer sync showed disabled —
    * and the first offer read after this marks those still disabled
@@ -2352,7 +2352,7 @@ export class Autopilot {
 
   /**
    * "Resume": the switches that were on before the pause, on again — except
-   * Liquidity provision: switching selling on is its own decision, made with
+   * selling: switching selling on is its own decision, made with
    * the live selling check in front of the operator (D9). Returns what was
    * switched on, and whether selling was on before the pause.
    */
@@ -2387,7 +2387,7 @@ export class Autopilot {
     return this.state.paused ? "all automation was paused during the run" : `${SWITCH_WORDS[sw]} was switched off during the run`;
   }
 
-  /** The autopilot acts on offers now: Liquidity provision on, not paused,
+  /** The autopilot acts on offers now: Selling on, not paused,
    *  write access (what the offer alerts may promise). */
   actsOnOffers(): boolean {
     return this.canWrite && this.amboss.hasKey() && !this.stopWhy("sellEnabled");
@@ -3797,7 +3797,7 @@ export class Autopilot {
       return [];
     }
 
-    // Capital engine (D10): with Liquidity provision on, the coins Magma can
+    // Capital engine (D10): with selling on, the coins Magma can
     // list are held for it — only when Magma can actually take them and is
     // expected to earn more on them (leaveForMagma) — and the rest stays free
     // for routing opens. Before, the deferral read no lease data at all (a
@@ -4321,7 +4321,7 @@ export class Autopilot {
 
   /**
    * Magma offer upkeep — the main run's share of selling (orders are the
-   * order lane's, see pollSellOrders). With Liquidity provision on, every
+   * order lane's, see pollSellOrders). With selling on, every
    * offer is kept:
    *  - fundable: it never advertises a channel the wallet can't fund after the
    *    reserve and the coins promised to other buyers, within the deploy cap.
@@ -4584,7 +4584,7 @@ export class Autopilot {
     for (const off of offers) {
       // Shutting down: offer upkeep can wait for the next start (its Amboss
       // calls must not use up the shutdown grace the order lane may still
-      // need). Liquidity provision switched off — or all automation paused —
+      // need). Selling switched off — or all automation paused —
       // since the stage began: the offers are the operator's again, left
       // exactly as they are (the pause asked them about listed offers).
       const stop = this.stopWhy("sellEnabled");
@@ -4736,7 +4736,7 @@ export class Autopilot {
   ): { text: string; state: DecisionState } | null {
     const cfg = this.state.config;
     // Blocked, not idle: with selling on, nothing will ever be listed until
-    // the operator acts — the Overview showed "Liquidity provision ON ·
+    // the operator acts — the Overview showed "Selling ON ·
     // nothing to do" (review of P7).
     if (!cfg.sellAutoReprice) {
       return { text: "no offer listed — auto-pricing is off, so the autopilot lists none: create one on Market → Sell, or turn auto-pricing on", state: "blocked" };
@@ -4828,7 +4828,7 @@ export class Autopilot {
         : "edit it on Market → Sell to give it one";
     const disabledWhy = (status: string): string =>
       control.listOnAt
-        ? `Liquidity provision was switched on, so it is listed again ${
+        ? `Selling was switched on, so it is listed again ${
             listedForFree(off)
               ? `once it has a price — Amboss has it at 0 ppm + 0 sat: ${priceSource()}`
               : !fundable
@@ -4860,7 +4860,7 @@ export class Autopilot {
     // operator's) is never left at a price of nothing: its price is written —
     // whether it is listed stays the operator's click (or capital safety's,
     // just below: so one disabled for lack of capital, or disabled when
-    // Liquidity provision was switched on, is listed in the same run once it
+    // selling was switched on, is listed in the same run once it
     // can be funded). Without this, an offer disabled at
     // 0 ppm + 0 sat — by hand after 0.8.0's partial writes, or for capital —
     // couldn't be listed again: enabling a free offer is refused, the price
@@ -5355,7 +5355,7 @@ export class Autopilot {
   }
 
   /**
-   * Liquidity provision went off — or all automation was paused — while a
+   * selling went off — or all automation was paused — while a
    * flip that lists the offer was on its way: the switch-off (its dialog
    * disables what is listed) saw nothing listed, so nobody would decide this
    * offer's orders. Off again, by state: it was just listed. Recorded as the
@@ -5431,7 +5431,7 @@ export class Autopilot {
             ? "its orders pay for their channels again at today's fee rate (the autopilot had taken it off the market below cost)"
             : byCapital
             ? "its smallest channel can be funded again (the autopilot had disabled it for lack of capital)"
-            : "Liquidity provision was switched on with it disabled — it has a price, and its smallest channel can be funded"
+            : "Selling was switched on with it disabled — it has a price, and its smallest channel can be funded"
           : `its smallest channel (${off.minSizeSats} sat) can't be funded: ${cap.sellableNow} sat sellable after the reserve, promised orders and the deploy cap`;
       const write: OfferWrite = { at: new Date().toISOString(), by: "autopilot", action, fields: { offer_id: off.id }, ok: false, reason };
       const report = (ok: boolean) =>
@@ -5462,7 +5462,7 @@ export class Autopilot {
             : "its own price (auto-pricing is off)";
         write.reason = `${reason} — listed at ${whose}, ${fmtSat(fresh.feeRatePpm)} ppm + ${fmtSat(fresh.baseFeeSats)} sat`;
       }
-      // Liquidity provision switched off (or all automation paused) since the
+      // selling switched off (or all automation paused) since the
       // run began: no flip — the operator was asked what to do with listed
       // offers when they paused, and an offer is listed again only while
       // selling is on.
@@ -5512,7 +5512,7 @@ export class Autopilot {
       if (write.ok) write.error = undefined;
       else if (!write.error) write.error = `Amboss reports the offer ${status}, not ${want}`;
       report(write.ok);
-      // Listed — while Liquidity provision went off (or all automation was
+      // Listed — while selling went off (or all automation was
       // paused) after the check above: off again (unlistAfterSwitchOff).
       const late = write.ok && want === "ENABLED" && !this.state.config.sellEnabled ? this.stopWhy("sellEnabled") : null;
       if (late) {
@@ -5790,7 +5790,7 @@ export class Autopilot {
   }
 
   /**
-   * The offers read first after Liquidity provision was switched on
+   * The offers read first after selling was switched on
    * (sellSwitchOn): each one that was disabled at the switch — as the last
    * offer sync showed it — and still is gets listed again once it has a price
    * and its smallest channel can be funded (listOnAt, capitalStatus), whoever
@@ -5857,7 +5857,7 @@ export class Autopilot {
   }
 
   /** "Let the autopilot manage it": the offer's terms are the autopilot's
-   *  again (with Liquidity provision on), from the next run. A disable by
+   *  again (with selling on), from the next run. A disable by
    *  hand still stands. */
   resumeOfferAutomation(offerId: string): void {
     this.forgetPageReport();
@@ -5866,8 +5866,8 @@ export class Autopilot {
   }
 
   /** The operator enabled or disabled the offer by hand (Market → Sell, or
-   *  turning Liquidity provision off): the listing is theirs — a disable
-   *  sticks (until they enable it, or switch Liquidity provision on again:
+   *  turning selling off): the listing is theirs — a disable
+   *  sticks (until they enable it, or switch selling on again:
    *  noteSellSwitch), an enable lists it — and the terms stay with whoever
    *  had them. */
   offerStatusSetByHand(offerId: string, status: string, read?: MyOffer): void {
@@ -6312,7 +6312,7 @@ export class Autopilot {
       fees: status("fees", c.enabled, `fee automation is off — fees change only when you set them (${leaseWords})`),
       rebalance: status("rebalance", c.rebalanceEnabled, "auto-rebalance is off — refills run only when you start one"),
       channels: status("channels", c.channelEnabled, "the channel autopilot is off — channels open only when you open them"),
-      magma: status("magma", c.sellEnabled, "Liquidity provision is off — no offer is kept and no new order is taken (orders already taken on are carried to their end)"),
+      magma: status("magma", c.sellEnabled, "Selling is off — no offer is kept and no new order is taken (orders already taken on are carried to their end)"),
       maxHtlc: status("maxHtlc", c.maxHtlcEnabled, "advertising routable size is off"),
     };
   }
@@ -7124,7 +7124,7 @@ export class Autopilot {
       this.persist();
       this.running = false;
       this.runningSince = null;
-      // Liquidity provision was switched on while this run was under way, and
+      // selling was switched on while this run was under way, and
       // the switch-on is still to be applied: the run reschedule() kicked found
       // this one busy, and this one's offer upkeep came before the switch. One
       // more now, so the offers are listed within seconds — not at the next

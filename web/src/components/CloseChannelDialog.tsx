@@ -88,6 +88,8 @@ export function CloseChannelDialog({
   const [breakLease, setBreakLease] = useState(false);
   const [refused, setRefused] = useState<ChannelLease | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** The close went out and LND goes on with it: nothing left to press. */
+  const [underWay, setUnderWay] = useState<string | null>(null);
   const offline = !channel.active;
   // Focus into the dialog, Tab kept inside it, Esc cancels — not while a
   // close is being sent (a11y).
@@ -124,6 +126,10 @@ export function CloseChannelDialog({
       if (r.ok) {
         toast(`Closing channel — ${r.transactionId?.slice(0, 12)}…`, "success");
         onClosed();
+        return;
+      }
+      if (r.stillClosing) {
+        setUnderWay(r.error ?? "");
         return;
       }
       setError(`Close failed: ${r.error}`);
@@ -174,7 +180,17 @@ export function CloseChannelDialog({
         aria-modal="true"
         aria-label={`Close the channel with ${channel.peerAlias}`}
       >
-        {step === "force" ? (
+        {underWay !== null ? (
+          <>
+            <h3 className="modal-title">The close is under way</h3>
+            <p className="modal-msg">{underWay}</p>
+            <div className="modal-actions">
+              <button className="primary-btn" onClick={onClosed}>
+                OK
+              </button>
+            </div>
+          </>
+        ) : step === "force" ? (
           <ForceCloseConfirm
             peerAlias={channel.peerAlias}
             consequences={forceCloseConsequences({ ...channel, lease }, fees?.economy ?? null)}

@@ -10,19 +10,21 @@ standalone via Docker.
 
 ## Features
 
-- **Overview** — a node **health score** (six categories on a score ring;
-  channels still opening or closing are left out, and Earnings are judged net
-  of rebalancing, on-chain and inbound costs, with lease income counted as in
-  P&L — a node too young to judge gets a provisional grade), an
-  outbound/inbound **liquidity meter**, KPIs (earned /
-  forwards with rolling 24h·7d / routed / **yield on capital**), a **Profit &
+- **First start** — a new install asks what the node is for, how much the app
+  may use, and says what that will do. It can be skipped.
+- **Overview** — what needs you today, each line leading to where it is dealt
+  with (a peer away for days, a failed run, idle channels), your balances,
+  KPIs (earned / forwards with rolling 24h·7d / routed / **yield on capital**),
+  your **top channels** (fees earned out plus those of the flow they brought in),
+  graph-based **peer suggestions** and recent activity (a rebalance as one line,
+  channel opens and closes named). A click opens a node **health score** (six
+  categories; channels still opening or closing are left out, and Earnings are
+  judged net of rebalancing, on-chain and inbound costs, with lease income counted
+  as in P&L — a node too young to judge gets a provisional grade), a **Profit &
   Loss** view (routing revenue and lease income vs every cost: channel opens,
   channel closes — worked out from the closing transactions and sweeps
-  themselves —, rebalancing by any tool, from LND's own payment history,
-  inbound bought on Magma, and the service fee), a liquidity map, recent
-  activity (a rebalance as one line, channel opens and closes named), your
-  **top channels** (fees earned out plus those of the flow they brought in)
-  and graph-based **peer suggestions**.
+  themselves —, rebalancing by any tool, from LND's own payment history, inbound
+  bought on Magma, and the service fee) and a liquidity map.
 - **Node details** — click a node in any list, or find any node by alias or
   key: where you stand with it in one sentence, what its channel earned, what it
   charges, its place in the network, how it scores as a peer, and everything an
@@ -52,7 +54,7 @@ standalone via Docker.
   recorded and followed to their channel) and, as an advanced opt-in feature,
   **sell** your own: create / edit offers and fulfil orders (accept + open a
   channel to the buyer), manually or via the autopilot. Selling is off by
-  default; before you switch **Liquidity provision** on, a live check of
+  default; before you switch **Selling** on, a live check of
   Amboss's public offer book shows whether offers like yours sell at all
   (Amboss picks sellers mostly by track record — price and size are not the
   lever below that), and a diagnostics card answers "why don't I sell?".
@@ -82,7 +84,7 @@ standalone via Docker.
   only orders awaiting approval can be rejected"). A click that can't read the
   order (Amboss or LND not answering) counts too once the autopilot has the
   order on record as awaiting your decision; otherwise it records nothing —
-  try it again (with Liquidity provision on, the autopilot may decide that
+  try it again (with selling on, the autopilot may decide that
   order first). Amboss decides which seller gets matched; the app makes the
   sell path correct and reliable.
 - **LSP mode (experimental)** — sell inbound channels **directly to wallets**
@@ -138,7 +140,7 @@ standalone via Docker.
   largest size the check allows at the route's cost, then smaller ones), within
   one daily fee budget that manual runs count toward too — on a small, low-fee
   node that is rarely; channels open to top peers;
-  with Liquidity provision on, Magma sell orders are fulfilled — all on
+  with selling on, Magma sell orders are fulfilled — all on
   recommended settings with safe caps, per-channel cooldowns and an on-chain
   reserve. Off until you enable it, and every fund-moving action is gated behind
   write access.

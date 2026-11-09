@@ -138,7 +138,7 @@ export function SellDiagnosticsCard({
 const OWNER_LABEL: Record<SellDiagnostics["offers"][number]["owner"], string> = {
   autopilot: "terms set by the autopilot",
   you: "terms set by you",
-  nobody: "not managed (Liquidity provision off)",
+  nobody: "not managed (Selling off)",
 };
 
 /** One offer as Amboss has it, next to what the engine would list — each
@@ -293,7 +293,7 @@ export function HowAmbossPicks({
           had sold, and Amboss sets no network requirement for sellers.
         </li>
         <li>
-          <b>So for a small node, price and size are not the lever.</b> With Liquidity provision on, LightningMate fulfils orders
+          <b>So for a small node, price and size are not the lever.</b> With selling on, LightningMate fulfils orders
           fast and safely and keeps every offer within what it can fund; with auto-size on, it also gives the offers it manages
           the standard 30-day lease, a routing-fee promise (which the fee autopilot keeps for every channel sold) and a size
           window it can fund. Whether Amboss sends an order is Amboss's choice.

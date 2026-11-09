@@ -216,7 +216,7 @@ async function deferralSetup(t: Parameters<typeof sellerSetup>[0], fills: (score
   return s;
 }
 
-test("D10: with Liquidity provision on, a routing open goes ahead when offers like this node's don't sell — no more 'left for Magma' on a routing-yield dispersion test", async (t) => {
+test("D10: with selling on, a routing open goes ahead when offers like this node's don't sell — no more 'left for Magma' on a routing-yield dispersion test", async (t) => {
   quiet(t);
   const s = await deferralSetup(t, () => 0);
   const run = await s.autopilot.runOnce();

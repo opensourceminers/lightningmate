@@ -12,8 +12,8 @@ import {
 import { LSP_NOT_PAUSED, pauseLines } from "../autopilotView";
 
 /**
- * Switching Liquidity provision on and off (D9) — the decisions behind the
- * Autopilot → Magma switch, kept apart from the panel so they are tested
+ * Switching selling on and off (D9) — the decisions behind the
+ * Autopilot → Selling switch, kept apart from the panel so they are tested
  * without a browser.
  *
  * On: the confirmation opens at once and shows the live selling check when it
@@ -83,12 +83,12 @@ export async function turnSellingOn(d: SellingSwitchDeps): Promise<boolean> {
     .then(([os, sync]) => offersSwitchOnLists(os, sync))
     .catch(() => null);
   const ok = await d.confirm({
-    title: "Turn on Liquidity provision?",
+    title: "Turn on selling?",
     body: <EnableSellingBody check={check} disabledOffers={disabledOffers} />,
     confirmLabel: "Turn on",
   });
   if (!ok) return false;
-  return d.save({ sellEnabled: true }, "Liquidity provision is on");
+  return d.save({ sellEnabled: true }, "Selling is on");
 }
 
 const short = (id: string) => `${id.slice(0, 8)}…`;
@@ -102,19 +102,19 @@ export async function turnSellingOff(d: SellingSwitchDeps): Promise<boolean> {
   if (listed === null) {
     // Can't tell whether an offer is still listed: say so rather than assume none.
     const ok = await d.confirm({
-      title: "Turn off Liquidity provision",
+      title: "Turn off selling",
       message:
         "Your offers could not be read from Amboss right now. If one is still listed, its new orders wait for your decision on " +
         "Market → Orders — and Amboss counts an order nobody decides against your seller score. Turn off anyway?",
       confirmLabel: "Turn off",
       danger: true,
     });
-    return ok ? d.save({ sellEnabled: false }, "Liquidity provision is off — check your offers on Market → Sell") : false;
+    return ok ? d.save({ sellEnabled: false }, "Selling is off — check your offers on Market → Sell") : false;
   }
-  if (listed.length === 0) return d.save({ sellEnabled: false }, "Liquidity provision is off");
+  if (listed.length === 0) return d.save({ sellEnabled: false }, "Selling is off");
   if (
     await d.confirm({
-      title: "Turn off Liquidity provision",
+      title: "Turn off selling",
       message: disableSellingMessage(listed.length),
       confirmLabel: "Turn off & disable offers",
       danger: true,
@@ -134,22 +134,22 @@ export async function turnSellingOff(d: SellingSwitchDeps): Promise<boolean> {
       // on: the order lane keeps handling them until the offer is disabled.
       const one = stillListed.length === 1;
       d.toast(
-        `Liquidity provision stays on: ${one ? "offer" : "offers"} ${stillListed.join(", ")} could not be disabled and ${one ? "is" : "are"} ` +
+        `Selling stays on: ${one ? "offer" : "offers"} ${stillListed.join(", ")} could not be disabled and ${one ? "is" : "are"} ` +
           `still listed. Try again, or disable ${one ? "it" : "them"} on Market → Sell.`,
         "error",
       );
       return false;
     }
-    return d.save({ sellEnabled: false }, "Liquidity provision is off; your offers are disabled");
+    return d.save({ sellEnabled: false }, "Selling is off; your offers are disabled");
   }
   if (
     await d.confirm({
-      title: "Turn off Liquidity provision only?",
+      title: "Turn off selling only?",
       message: "Your offers stay listed on Amboss, and their orders wait for your decision on Market → Orders.",
       confirmLabel: "Turn off only",
     })
   ) {
-    return d.save({ sellEnabled: false }, "Liquidity provision is off (offers still listed)");
+    return d.save({ sellEnabled: false }, "Selling is off (offers still listed)");
   }
   return false;
 }
@@ -169,7 +169,7 @@ export function PauseBody({ lines, lspModeOn = false }: { lines: string[]; lspMo
       {lspModeOn ? <p className="modal-msg">{LSP_NOT_PAUSED}</p> : null}
       <p className="modal-msg muted">
         What is already under way ends on record, and a sold channel's promised fee cap is still kept. “Resume” switches back on
-        what was on — Liquidity provision excepted, which you switch on yourself.
+        what was on, except selling, which you switch on yourself.
       </p>
     </>
   );
@@ -178,7 +178,7 @@ export function PauseBody({ lines, lspModeOn = false }: { lines: string[]; lspMo
 /**
  * "Pause all automation" (review a6-ux:presets-unconfirmed-capital: there was
  * no global off — five switches on four sub-tabs). After a confirmation that
- * says what stops — and, with Liquidity provision on and offers listed, the
+ * says what stops — and, with selling on and offers listed, the
  * same question as switching selling off: disable them too, or keep them
  * listed with their orders waiting for a decision nobody makes (D6).
  */

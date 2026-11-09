@@ -20,7 +20,7 @@ import { ApiError } from "./apiError";
 
 /**
  * The words and small decisions behind the Magma views (Market → Buy / Sell /
- * Orders, the Liquidity provision switch, the Overview) — pure, so they are
+ * Orders, the selling switch, the Overview) — pure, so they are
  * tested without a browser. Everything shown about selling is either a live
  * number from Amboss or this node, or labelled as what it is (an inference,
  * Amboss's documentation): Amboss decides which seller gets an order, and the
@@ -40,15 +40,15 @@ export const VERDICT: Record<EligibilityVerdict, { label: string; tone: "bad" | 
 export const SELLER_SCORE_COPY =
   "Amboss computes the seller score from reliability, speed and track record of completed Magma orders; settings cannot raise it.";
 
-/** What switching Liquidity provision on means — whatever the check says. */
+/** What switching selling on means — whatever the check says. */
 const ENABLE_SELLING_TERMS =
   "Amboss decides which seller gets an order — mostly sellers with a track record; LightningMate can make fulfilment correct and reliable, " +
-  "not make Amboss pick you. With Liquidity provision on, the order lane accepts (with a hold invoice), opens and rejects orders on its own, " +
+  "not make Amboss pick you. With selling on, the order lane accepts (with a hold invoice), opens and rejects orders on its own, " +
   "within your caps, and keeps your offer fundable. Routing opens of the channel autopilot then wait for the coins your offer can list " +
   "(within your deploy cap) while selling them is expected to earn more than a routing channel; the rest stays free for them.";
 
 /**
- * The confirmation before Liquidity provision is switched ON (D9): the
+ * The confirmation before selling is switched ON (D9): the
  * eligibility verdict with its live numbers, and what switching on does.
  */
 export function enableSellingMessage(e: Eligibility | null): string {
@@ -67,7 +67,7 @@ export function enableSellingPendingMessage(): string {
   return `Can this node sell on Magma? Checking Amboss's public offer book… ${ENABLE_SELLING_TERMS}`;
 }
 
-/** What switching Liquidity provision on does with the offers disabled now
+/** What switching selling on does with the offers disabled now
  *  (`disabled`: how many the server will list — those its last offer sync
  *  showed disabled and Amboss still does; null when that couldn't be told):
  *  the autopilot lists them again — the switch-off disabled them — each once
@@ -105,18 +105,18 @@ export function enableSellingOffersPendingMessage(): string {
   return "Checking your offers on Amboss…";
 }
 
-/** The confirmation before Liquidity provision is switched OFF while offers
+/** The confirmation before selling is switched OFF while offers
  *  are still listed: orders would then wait for a decision nobody makes. */
 export function disableSellingMessage(enabledOffers: number): string {
   if (enabledOffers <= 0) {
     return (
-      "Turn off Liquidity provision? Orders the autopilot accepted are still carried to their end (opened, settled or refunded); " +
+      "Turn off selling? Orders the autopilot accepted are still carried to their end (opened, settled or refunded); " +
       "one you accepted by hand waits for you to open its channel on Market → Orders once it is paid."
     );
   }
   const which = enabledOffers === 1 ? "Your offer is" : `${enabledOffers} offers are`;
   return (
-    `${which} still listed on Amboss. With Liquidity provision off, new orders wait for your decision on Market → Orders — ` +
+    `${which} still listed on Amboss. With selling off, new orders wait for your decision on Market → Orders — ` +
     "and Amboss counts an order nobody decides against your seller score. Orders the autopilot accepted are still carried to their end; " +
     "one you accepted by hand waits for you to open its channel on Market → Orders once it is paid. Disable the offer too?"
   );
@@ -159,7 +159,7 @@ const BUY_STATUS: Record<string, string> = {
 
 /** An order's status in plain words, for the side this node is on. A paid
  *  sale says who opens its channel: the order lane (`opensItself`, from the
- *  server — with Liquidity provision on, or an order the lane accepted
+ *  server — with selling on, or an order the lane accepted
  *  itself), or you (review of P7: "waiting for you to open the channel"
  *  showed while the lane was opening it). */
 export function orderStatusLabel(status: string, side: "SELL" | "BUY" | string, opensItself = false): string {
@@ -172,11 +172,11 @@ export function orderStatusLabel(status: string, side: "SELL" | "BUY" | string, 
 }
 
 /** The toast after an order is accepted by hand: who opens its channel
- *  once the buyer has paid — the order lane (Liquidity provision on), or
+ *  once the buyer has paid — the order lane (Selling on), or
  *  you ("Open channel"). */
 export function acceptedToast(opensItself: boolean): string {
   return opensItself
-    ? "Order accepted — while Liquidity provision is on, the autopilot opens the channel once the buyer has paid."
+    ? "Order accepted — while selling is on, the autopilot opens the channel once the buyer has paid."
     : "Order accepted — open the channel once the buyer has paid.";
 }
 
@@ -251,7 +251,7 @@ export function belowCostQuestion(r: { feeSats: number; floorSats: number }): st
 
 /** Does the autopilot list this disabled offer again by itself (autopilot.ts
  *  upkeepOffer)? Yes when it took it off the market — for lack of capital,
- *  below cost, or when Liquidity provision was switched on with it disabled —
+ *  below cost, or when selling was switched on with it disabled —
  *  and, for being free, when it prices the offer. Never one you disabled. */
 export function relistsItself(control: OfferControl | undefined, autoPriced: boolean): boolean {
   if (!control || control.disabledByHandAt) return false;
@@ -304,12 +304,12 @@ export function localLabel(local: Pick<MagmaOrderLocal, "phase" | "booked" | "ex
 /** Who sets an offer's terms, as the Sell tab says it — and who decides
  *  whether it is listed (your last click; capital safety aside). */
 export function offerOwner(control: OfferControl | undefined, sellEnabled: boolean): { label: string; yours: boolean; title: string } {
-  // With Liquidity provision off, nothing lists anything again until it is on.
-  const whileOn = sellEnabled ? "" : "with Liquidity provision on, ";
+  // With selling off, nothing lists anything again until it is on.
+  const whileOn = sellEnabled ? "" : "with selling on, ";
   const listing = control?.disabledByHandAt
-    ? " You disabled it: it stays disabled until you enable it (or switch Liquidity provision off and on again)."
+    ? " You disabled it: it stays disabled until you enable it (or switch selling off and on again)."
     : control?.listOnAt
-      ? ' Liquidity provision was switched on with it disabled: the autopilot lists it once it has a price and its smallest channel can be funded ("keep disabled" keeps it off).'
+      ? ' Selling was switched on with it disabled: the autopilot lists it once it has a price and its smallest channel can be funded ("keep disabled" keeps it off).'
       : control?.costDisabledAt
         ? ` The autopilot took it off the market: its orders would pay less than opening and closing their channels cost at today's fee rate — ${whileOn}it lists it again once they pay for them.`
         : control?.autoDisabledAt
@@ -325,7 +325,7 @@ export function offerOwner(control: OfferControl | undefined, sellEnabled: boole
         `smallest channel can't be funded, listed again once it can.${listing}`,
     };
   }
-  if (!sellEnabled) return { label: "not managed", yours: false, title: `Liquidity provision is off: nothing manages this offer.${listing}` };
+  if (!sellEnabled) return { label: "not managed", yours: false, title: `Selling is off: nothing manages this offer.${listing}` };
   return { label: "autopilot", yours: false, title: `Managed by the autopilot (as your Automation settings say).${listing}` };
 }
 
@@ -401,7 +401,7 @@ export function keepDisabledAction(o: Pick<MyOffer, "status">, control: OfferCon
   return {
     label: "keep disabled",
     title:
-      "Liquidity provision was switched on with this offer disabled: the autopilot lists it once it has a price and its smallest channel " +
+      "Selling was switched on with this offer disabled: the autopilot lists it once it has a price and its smallest channel " +
       "can be funded. Keep it off instead — it stays disabled until you enable it, or switch selling off and on again.",
   };
 }
@@ -614,7 +614,7 @@ export const PRICING_MODES: { id: AutopilotConfig["sellPricingMode"]; label: str
 ];
 
 /**
- * Autopilot → Magma's note on who decides what about an offer — what the
+ * Autopilot → Selling's note on who decides what about an offer — what the
  * offer upkeep really does (autopilot.ts): an edit or create by hand makes the
  * terms yours; a status click only lists or unlists (it never takes the terms
  * over); the routing-fee promise comes with auto-size; and with every
@@ -625,7 +625,7 @@ export const PRICING_MODES: { id: AutopilotConfig["sellPricingMode"]; label: str
 export const OFFER_AUTOMATION_HINT =
   "An offer you edit or create by hand on Market → Sell is yours: the autopilot leaves its terms alone (it only keeps it fundable) " +
   "until you hand it back. Enabling or disabling an offer by hand decides only whether it is listed — a disable sticks while " +
-  "Liquidity provision stays on (switching it on lists your disabled offers again; \"keep disabled\" on Market → Sell keeps one off). " +
+  "selling stays on (switching it on lists your disabled offers again; \"keep disabled\" on Market → Sell keeps one off). " +
   "With auto-size on, every offer the autopilot manages promises buyers a routing-fee cap for the lease (offers you create or edit " +
   "on Market → Sell always do); with every switch above off, the autopilot only keeps your offers fundable. The fee autopilot keeps " +
   "each sold channel within the cap its order locked.";
