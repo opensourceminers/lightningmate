@@ -319,6 +319,13 @@ export function MarketSell() {
     );
   };
 
+  // Below the price: what "edit" or a price button opened has to come into view.
+  const formRef = useRef<HTMLElement>(null);
+  const formAsked = editingId ?? (draft !== null || showForm ? "new" : null);
+  useEffect(() => {
+    if (formAsked !== null) formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }, [formAsked]);
+
   if (connected === false) {
     return (
       <section className="panel">
@@ -350,12 +357,6 @@ export function MarketSell() {
   // no offer yet, or "Create another offer" (it sat open under everything,
   // with a paragraph of fine print, on every visit).
   const formOpen = editingId !== null || draft !== null || showForm || (connected !== null && offers.length === 0);
-  // Below the price: what "edit" or a price button opened has to come into view.
-  const formRef = useRef<HTMLElement>(null);
-  const formAsked = editingId ?? (draft !== null || showForm ? "new" : null);
-  useEffect(() => {
-    if (formAsked !== null) formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-  }, [formAsked]);
 
   const holdNote = r0 ? priceHoldNote(r0, mine, managedPrice) : null;
 
