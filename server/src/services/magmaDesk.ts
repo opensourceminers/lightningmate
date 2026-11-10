@@ -179,6 +179,13 @@ export const OPEN_RETRY_WINDOW_MS = 30 * 60_000;
  *  keeps the order open; half an hour of a buyer's node away ended it
  *  "failed", the payment kept (review of the package). */
 export const LEGACY_OPEN_RETRY_MS = 38 * 3_600_000;
+/** How long before such an order's last moment to open (those 38 hours, or a
+ *  deadline of Amboss's) its wait for lower on-chain fees ends: from then on
+ *  the channel is opened whatever the fee — nothing can go back to the buyer
+ *  — with these hours left to reach a buyer who is offline just then
+ *  (openFeeFor; othervice's decision of 2026-11-10: rather wait for lower
+ *  fees than open at once at any fee). */
+export const LEGACY_FEE_WAIT_RESERVE_MS = 6 * 3_600_000;
 const MAX_ACCEPT_ATTEMPTS = 3;
 /** Reject (rather than wait) once the approval deadline is this close. */
 const REJECT_MARGIN_MS = 2 * 60_000;
@@ -2814,7 +2821,7 @@ export class MagmaDesk {
     if (unfit) return unfit;
     // Before the dial: a buyer is not dialed (up to a minute and a half over
     // Tor) for an open that waits for its fee anyway.
-    const fee = await this.openFeeFor(entry, byHand);
+    const fee = await this.openFeeFor(entry, order, byHand);
     if (fee.wait) {
       // No time left to wait in (a deadline of Amboss's for the open, minutes
       // away): the payment goes back, and the reason says what was waited
@@ -2958,24 +2965,39 @@ export class MagmaDesk {
    * order accepted and paid for is owed its channel while the sale covers
    * it, at 30 sat/vB too.
    *
-   * So does an order whose payment is not held: one accepted by an older
-   * version with a plain invoice, which settled when the buyer paid. There
-   * is nothing to give back at the end of a wait — the buyer's money is
-   * here and the channel is owed whatever it costs. (Review of the package:
-   * such an order waited like the others, and with no held payment to count
-   * the wait by it ended "failed" after half an hour — no channel, no
-   * refund, no alert, and “Open channel” refused for an order that is over.)
+   * An order whose payment is not held — one accepted by an older version
+   * with a plain invoice, which settled when the buyer paid — waits too,
+   * but its wait ends in the open, not in a refund: there is nothing to
+   * give back, the buyer's money is here and the channel is owed. It waits
+   * for lower fees (or an estimate) until LEGACY_FEE_WAIT_RESERVE_MS before
+   * its last moment to open — LEGACY_OPEN_RETRY_MS after its payment was
+   * found, or a deadline of Amboss's — and is then opened whatever the fee,
+   * with those hours left for a buyer who is offline just then
+   * (feeWaitOverFor). (First it waited like a held order, and with no held
+   * payment to count the wait by it ended "failed" after half an hour — no
+   * channel, no refund, no alert. Then it was opened at once whatever the
+   * fee: at 400 sat/vB about 70,000 sat for a sale that earned 2,400.
+   * othervice's decision of 2026-11-10: rather wait for lower fees.)
    */
   private async openFeeFor(
     entry: MagmaJournalEntry,
+    order: SaleOrder,
     byHand: boolean,
   ): Promise<{ feeRate?: number; wait?: { why: string; lower: boolean } }> {
     if (!this.deps.soldChannelOpen) return {};
     const terms = await this.deps.soldChannelOpen().catch(() => null);
     const rate = terms && terms.feeRate !== null && terms.feeRate > 0 ? terms.feeRate : null;
-    if (byHand || !entry.invoice) return rate !== null ? { feeRate: rate } : {};
+    const anyway = rate !== null ? { feeRate: rate } : {};
+    if (byHand) return anyway;
+    // Nothing held: once the wait is over, the channel is opened whatever it costs.
+    const settledUntil = entry.invoice ? null : this.feeWaitEndFor(entry, order);
+    if (settledUntil !== null && settledUntil <= Date.now()) return anyway;
+    const then =
+      settledUntil === null
+        ? ""
+        : `; the buyer's payment is settled here, so the channel is opened whatever the fee from ${new Date(settledUntil).toISOString().slice(0, 16).replace("T", " ")} UTC`;
     if (!terms || rate === null) {
-      return { wait: { why: "LND gives no on-chain fee estimate, so what opening the channel would cost is unknown", lower: false } };
+      return { wait: { why: `LND gives no on-chain fee estimate, so what opening the channel would cost is unknown${then}`, lower: false } };
     }
     const earns = Math.floor(feeSatsOf(entry) * (1 - terms.serviceFeeRate));
     const cost = rate * OPEN_TX_VBYTES;
@@ -2983,10 +3005,20 @@ export class MagmaDesk {
     const sat = (n: number) => n.toLocaleString("en-US");
     return {
       wait: {
-        why: `on-chain fees are ${sat(rate)} sat/vB: opening the channel would cost about ${sat(cost)} sat, more than the ${sat(earns)} sat this sale earns`,
+        why: `on-chain fees are ${sat(rate)} sat/vB: opening the channel would cost about ${sat(cost)} sat, more than the ${sat(earns)} sat this sale earns${then}`,
         lower: true,
       },
     };
+  }
+
+  /** When the wait for lower fees of an order paid outside a HODL invoice
+   *  ends (openFeeFor): LEGACY_FEE_WAIT_RESERVE_MS before its last moment to
+   *  open — Amboss's open deadline, or LEGACY_OPEN_RETRY_MS after its payment
+   *  was found (timeLeftToOpen counts the same). */
+  private feeWaitEndFor(entry: MagmaJournalEntry, order: SaleOrder): number {
+    const deadline = this.openDeadline(entry, order);
+    const since = entry.heldAt ? Date.parse(entry.heldAt) : Date.now();
+    return (deadline ?? since + LEGACY_OPEN_RETRY_MS) - LEGACY_FEE_WAIT_RESERVE_MS;
   }
 
   /**

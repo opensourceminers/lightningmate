@@ -661,8 +661,10 @@ the order's record says what was tried last
 ("… — last tried: …", or what it waited for: "… — it waited for lower fees until then: …"). Should LND
 name no height for a held payment, those hours cannot be counted and the window stays 30 minutes. An order
 paid outside a HODL invoice (an older version's plain invoice, settled on payment) holds nothing that
-could go back: it is tried for 38 hours after the payment was found, and opened whatever the fee —
-waiting for lower fees could only end with the money kept and no channel. If its channel cannot be
+could go back: it is tried for 38 hours after the payment was found. It waits for lower on-chain fees
+(or a fee estimate) like a held order, but its wait ends in the open, not in a refund: 6 hours before
+those 38 run out (or before a deadline of Amboss's) the channel is opened whatever the fee, with the
+6 hours left to reach a buyer who is offline just then. If its channel cannot be
 opened in that time (or before a deadline of Amboss's), the order ends with the buyer's payment kept:
 an alert says so until it is dismissed, and "Open channel" on Market → Orders takes the order up again
 for as long as Amboss lists it as waiting for its channel — otherwise the buyer is owed the payment,

@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { magmaKeptPaymentAlerts, stateAlerts } from "../src/services/alerts.js";
-import { LEGACY_OPEN_RETRY_MS, NO_PAYMENT_WAIT } from "../src/services/magmaDesk.js";
+import { LEGACY_FEE_WAIT_RESERVE_MS, LEGACY_OPEN_RETRY_MS, NO_PAYMENT_WAIT } from "../src/services/magmaDesk.js";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
 import {
   IN_AN_HOUR,
@@ -443,23 +443,153 @@ function settledLegacyOrder(t: Parameters<typeof quiet>[0], opts: Parameters<typ
 const openRatesOf = (s: ReturnType<typeof sellerSetup>) =>
   s.node.callsTo("default.openChannel").map((a) => (a.sat_per_vbyte === undefined ? undefined : Number(a.sat_per_vbyte)));
 
-test("an order paid by a settled plain invoice is opened whatever the on-chain fee — there is no held payment to give back after a wait; before, it waited and ended 'failed' with the payment kept", async (t) => {
+// othervice's decision of 2026-11-10: such an order waits for lower on-chain
+// fees too, rather than being opened at once at any fee (400 sat/vB: about
+// 70,000 sat for a sale that earned 2,400) — but its wait ends in the open,
+// not in a refund: LEGACY_FEE_WAIT_RESERVE_MS before its last moment to open
+// it is opened whatever the fee, with those hours left to reach the buyer.
+const FEE_WAIT_MS = LEGACY_OPEN_RETRY_MS - LEGACY_FEE_WAIT_RESERVE_MS;
+const estimate = (s: ReturnType<typeof sellerSetup>, satPerVbyte: number) =>
+  s.node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: String(satPerVbyte * 250) }));
+
+test("an order paid by a settled plain invoice waits for lower on-chain fees and is opened once the open costs no more than the sale earns — before, opened at once whatever the fee", async (t) => {
   const { s, sale } = settledLegacyOrder(t);
   s.node.peers.push(BUYER);
-  // 400 sat/vB: 70,000 sat for a sale of 2,436 — a held order would wait.
-  s.node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: "100000" }));
+  // 400 sat/vB: 70,000 sat for a sale of 2,436.
+  estimate(s, 400);
+  t.mock.timers.enable({ apis: ["Date"], now: Date.UTC(2030, 0, 1, 12, 0, 0) });
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), [], "before: one open, at 400 sat/vB");
+  let e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.via, e?.phase], ["legacy", "held"]);
+  // 38 hours less 6 after the payment was found.
+  assert.equal(
+    e?.lastError,
+    "on-chain fees are 400 sat/vB: opening the channel would cost about 70,000 sat, more than the 2,411 sat this sale earns; " +
+      "the buyer's payment is settled here, so the channel is opened whatever the fee from 2030-01-02 20:00 UTC" +
+      " — waiting for lower fees (“Open channel” on Market → Orders opens it anyway) — will try again",
+  );
+  const lane = s.autopilot.getState().magmaLane;
+  assert.deepEqual([lane.ok, lane.retrying], [false, true]);
+  assert.match(lane.error ?? "", /^1 paid order waits for lower on-chain fees \(on-chain fees are 400 sat\/vB/);
+  assert.equal(s.autopilot.capital.reservedSat(), 2_000_000, "its coins stay set aside");
+  // Hours on, found again on every pass and said once.
+  t.mock.timers.setTime(Date.UTC(2030, 0, 2, 6, 0, 0));
+  await s.autopilot.pollSellOrders();
+  await s.autopilot.pollSellOrders();
+  e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "held");
+  assert.equal(e?.events.filter((ev) => ev.what.startsWith("on-chain fees are 400")).length, 1);
+  assert.deepEqual(magmaKeptPaymentAlerts(s.desk), []);
+  // Down to 10 sat/vB: 1,750 sat for a sale of 2,411.
+  estimate(s, 10);
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), [10]);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
+});
+
+test("…and with fees that stay high it is opened anyway, six hours before the 38 run out: nothing could go back to the buyer after a longer wait — not before, and not ended 'failed'", async (t) => {
+  const { s, sale } = settledLegacyOrder(t);
+  s.node.peers.push(BUYER);
+  estimate(s, 400);
+  await s.autopilot.pollSellOrders();
+  const t0 = Date.parse(entryOnDisk(s.dir, sale.id)?.heldAt ?? "");
+  assert.ok(Number.isFinite(t0), "the record says when the payment was found");
+  assert.equal(LEGACY_FEE_WAIT_RESERVE_MS, 6 * 3_600_000);
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + FEE_WAIT_MS - 60_000 });
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), []);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "held");
+  t.mock.timers.setTime(t0 + FEE_WAIT_MS);
   await s.autopilot.pollSellOrders();
   assert.deepEqual(openRatesOf(s), [400], "opened, at the stated rate");
   const e = entryOnDisk(s.dir, sale.id);
-  assert.deepEqual([e?.via, e?.phase], ["legacy", "reported"]);
+  assert.equal(e?.phase, "reported");
+  assert.equal(e?.paymentKeptAt, undefined);
+  assert.deepEqual(magmaKeptPaymentAlerts(s.desk), []);
+  assert.equal(s.autopilot.getState().magmaLane.ok, true);
 });
 
-test("…and with no fee estimate from LND it is opened at the rate LND picks, as before", async (t) => {
+test("…with no fee estimate from LND it waits for one the same way, and is opened at the rate LND picks when the wait is over", async (t) => {
   const { s, sale } = settledLegacyOrder(t, { openFeeUnknown: true });
   s.node.peers.push(BUYER);
   s.node.override("wallet.estimateFee", (_a, cb) => cb({ details: "fee estimation failed" }));
   await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), []);
+  let e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "held");
+  assert.match(
+    e?.lastError ?? "",
+    /^LND gives no on-chain fee estimate, so what opening the channel would cost is unknown; the buyer's payment is settled here, so the channel is opened whatever the fee from \d{4}-\d\d-\d\d \d\d:\d\d UTC — waiting for one \(/,
+  );
+  assert.match(s.autopilot.getState().magmaLane.error ?? "", /^1 paid order waits for an on-chain fee estimate \(/);
+  const t0 = Date.parse(e?.heldAt ?? "");
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + FEE_WAIT_MS - 60_000 });
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), []);
+  t.mock.timers.setTime(t0 + FEE_WAIT_MS);
+  await s.autopilot.pollSellOrders();
   assert.deepEqual(openRatesOf(s), [undefined]);
+  e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "reported");
+});
+
+test("…a deadline of Amboss's for its channel counts instead of the 38 hours: the wait ends six hours before it, and with a deadline nearer than that the channel is opened at once", async (t) => {
+  const { s, sale } = settledLegacyOrder(t);
+  s.node.peers.push(BUYER);
+  estimate(s, 400);
+  const t0 = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 });
+  s.magma.sales.get(sale.id)!.timeout = new Date(t0 + 10 * 3_600_000).toISOString();
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), []);
+  assert.match(entryOnDisk(s.dir, sale.id)?.lastError ?? "", new RegExp(`whatever the fee from ${new Date(t0 + 4 * 3_600_000).toISOString().slice(0, 16).replace("T", " ")} UTC — waiting for lower fees`));
+  t.mock.timers.setTime(t0 + 4 * 3_600_000 - 60_000);
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), []);
+  t.mock.timers.setTime(t0 + 4 * 3_600_000);
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), [400]);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
+
+  const near = settledLegacyOrder(t);
+  near.s.node.peers.push(BUYER);
+  estimate(near.s, 400);
+  near.s.magma.sales.get(near.sale.id)!.timeout = new Date(t0 + 9 * 3_600_000).toISOString();
+  await near.s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(near.s), [400], "five hours to the deadline: no wait");
+});
+
+test("…and “Open channel” opens it during the wait, whatever the fee — once", async (t) => {
+  const { s, sale } = settledLegacyOrder(t);
+  s.node.peers.push(BUYER);
+  estimate(s, 400);
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), []);
+  const res = await s.desk.open(sale.id);
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.deepEqual(openRatesOf(s), [400]);
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), [400]);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
+});
+
+test("a buyer offline when the wait for lower fees is over is dialed for the hours that are left, and the channel opened when they are back", async (t) => {
+  const { s, sale } = settledLegacyOrder(t);
+  const back = buyerOffline(s.desk);
+  estimate(s, 400);
+  await s.autopilot.pollSellOrders();
+  const t0 = Date.parse(entryOnDisk(s.dir, sale.id)?.heldAt ?? "");
+  // The wait for the fee comes first: nobody is dialed for an open that waits.
+  assert.match(entryOnDisk(s.dir, sale.id)?.lastError ?? "", /^on-chain fees are 400 sat\/vB/);
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + FEE_WAIT_MS + 60_000 });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "held");
+  assert.match(entryOnDisk(s.dir, sale.id)?.lastError ?? "", /connection timed out.* — will try again$/);
+  back();
+  t.mock.timers.setTime(t0 + FEE_WAIT_MS + 3 * 3_600_000);
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), [400]);
   assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
 });
 

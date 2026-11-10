@@ -29,6 +29,7 @@ import {
   CANCEL_MARGIN_BLOCKS,
   CLOSE_ASKED_RETRY_MS,
   HODL_CLTV_DELTA,
+  LEGACY_FEE_WAIT_RESERVE_MS,
   LEGACY_OPEN_RETRY_MS,
   MANUAL_ACCEPT_SKIP,
   NO_PAYMENT_WAIT,
@@ -448,9 +449,19 @@ test("the docs say how long a paid order's channel may still be opened and what 
   assert.ok(flat.includes(`blocks, before: ${OPEN_RETRY_WINDOW_MS / 60_000} minutes — a buyer offline after paying is dialed again`), "what the window was");
   assert.match(flat, /nor is a `timeout` still equal to the one the order showed while it awaited approval \(kept on its record as `approvalDeadline`\)/);
   assert.ok(
-    flat.includes(`it is tried for ${LEGACY_OPEN_RETRY_MS / 3_600_000} hours after the payment was found, and opened whatever the fee`),
+    flat.includes(`it is tried for ${LEGACY_OPEN_RETRY_MS / 3_600_000} hours after the payment was found. It waits for lower on-chain fees`),
     "an order paid outside a HODL invoice",
   );
+  // othervice's decision of 2026-11-10: such an order waits for lower fees
+  // too, and is opened whatever the fee near the end of its hours.
+  const reserveHours = LEGACY_FEE_WAIT_RESERVE_MS / 3_600_000;
+  assert.ok(
+    flat.includes(
+      `${reserveHours} hours before those ${LEGACY_OPEN_RETRY_MS / 3_600_000} run out (or before a deadline of Amboss's) the channel is opened whatever the fee, with the ${reserveHours} hours left to reach a buyer`,
+    ),
+    "when its wait for lower fees ends",
+  );
+  assert.ok(LEGACY_FEE_WAIT_RESERVE_MS < LEGACY_OPEN_RETRY_MS);
   // Review of the package, second round: what follows those hours, the
   // fallback window and how often a refused open is asked again.
   assert.match(flat, /the order ends with the buyer's payment kept: an alert says so until it is dismissed, and "Open channel" on Market → Orders takes the order up again/);
