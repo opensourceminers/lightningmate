@@ -19,6 +19,7 @@ import {
   publicBookFailure,
 } from "../src/services/magmaEligibility.js";
 import { BENCHMARK_WAIT_MS } from "../src/services/autopilot.js";
+import { LEGACY_OPEN_RETRY_MS, OPEN_MIN_BLOCKS_LEFT } from "../src/services/magmaDesk.js";
 import { HTTP_TIMEOUTS } from "../src/services/http.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
 import { FakeMagma } from "./helpers/magma.js";
@@ -217,6 +218,58 @@ test("an order the lane turned down raises an alert with the reason and a digest
   const dash = (await api.request("GET", "/dashboard")).body;
   assert.equal(dash.autopilot.magmaRefusals, 1);
   assert.match(dash.autopilot.magmaRefusalReason, /deploy cap reached/);
+  assert.equal((await api.request("POST", "/alerts/ack", { id: `magma:${sale.id}` })).status, 200);
+  const after = (await api.request("GET", "/alerts")).body as { id?: string }[];
+  assert.ok(!after.some((a) => a.id === `magma:${sale.id}`), "dismissed");
+});
+
+// Review 2026-11-10, LANE-4 (and the review of its fix: the alert's place in
+// the route had no test): a paid order refunded with no channel opened.
+test("a paid order whose payment went back with no channel opened raises an alert on the alerts route — until dismissed there", async (t) => {
+  quiet(t);
+  const { api, magma } = await dashApi(t);
+  api.amboss.setKey("test-key");
+  api.autopilot.setConfig({ sellEnabled: true, sellMaxDeploySats: 20_000_000, sellMaxChannelSats: 5_000_000 });
+  const sale = magma.addSale({ buyerPubkey: BUYER, sizeSats: 2_000_000 });
+  await api.autopilot.pollSellOrders();
+  const hash = magma.buyerPays(sale.id, api.node);
+  // Found paid only when the held payment can no longer cover an open.
+  api.node.blockHeight = api.node.invoices.get(hash)!.htlcs![0].expiryHeight! - OPEN_MIN_BLOCKS_LEFT + 1;
+  await api.autopilot.pollSellOrders();
+  assert.equal(api.node.invoices.get(hash)?.state, "CANCELED");
+  const alerts = (await api.request("GET", "/alerts")).body as { id?: string; message: string }[];
+  const alert = alerts.find((a) => a.id === `magma:${sale.id}`);
+  assert.ok(alert, JSON.stringify(alerts));
+  assert.match(alert.message, /^A paid 2,000,000 sat Magma order was refunded and no channel opened: the held payment would expire before the channel could be confirmed/);
+  assert.equal((await api.request("POST", "/alerts/ack", { id: `magma:${sale.id}` })).status, 200);
+  const after = (await api.request("GET", "/alerts")).body as { id?: string }[];
+  assert.ok(!after.some((a) => a.id === `magma:${sale.id}`), "dismissed");
+});
+
+// Review of the package, second round: an order paid by a plain invoice an
+// older version accepted it with — settled, nothing to give back — whose
+// channel could not be opened ended "failed" with nobody told.
+test("an order that ended with the buyer's payment kept and no channel opened raises an alert on the alerts route — until dismissed there", async (t) => {
+  quiet(t);
+  const { api, magma } = await dashApi(t);
+  api.amboss.setKey("test-key");
+  api.autopilot.setConfig({ sellEnabled: true, sellMaxDeploySats: 20_000_000, sellMaxChannelSats: 5_000_000 });
+  const sale = magma.addSale({ buyerPubkey: BUYER, sizeSats: 2_000_000, status: "WAITING_FOR_CHANNEL_OPEN", paymentStatus: "SUCCESSFUL_PAYMENT" });
+  magma.sales.get(sale.id)!.timeout = null;
+  api.node.addPlainInvoice({ tokens: 2_436, description: `Magma order ${sale.id}`, paid: true });
+  // The buyer's node answers no dial.
+  (api.autopilot.magma as unknown as { lndConnect: () => Promise<boolean> }).lndConnect = async () => false;
+  await api.autopilot.pollSellOrders();
+  assert.equal(api.autopilot.magma.journal.get(sale.id)?.phase, "held");
+  const t0 = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + LEGACY_OPEN_RETRY_MS + 5 * 60_000 });
+  await api.autopilot.pollSellOrders();
+  assert.equal(api.autopilot.magma.journal.get(sale.id)?.phase, "failed");
+  const alerts = (await api.request("GET", "/alerts")).body as { id?: string; level: string; message: string }[];
+  const alert = alerts.find((a) => a.id === `magma:${sale.id}`);
+  assert.ok(alert, JSON.stringify(alerts));
+  assert.equal(alert.level, "warn");
+  assert.match(alert.message, /^A paid 2,000,000 sat Magma order ended with no channel opened: .*The buyer's 2,436 sat are settled here and do not go back by themselves/);
   assert.equal((await api.request("POST", "/alerts/ack", { id: `magma:${sale.id}` })).status, 200);
   const after = (await api.request("GET", "/alerts")).body as { id?: string }[];
   assert.ok(!after.some((a) => a.id === `magma:${sale.id}`), "dismissed");

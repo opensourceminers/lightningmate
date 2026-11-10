@@ -545,7 +545,12 @@ test("Amboss limiting requests at the HTTP level (429) on one order's read: the 
   assert.deepEqual(read, [newer.id], "no second request into a rate limit");
   assert.match(autopilot.getState().magmaLane.error ?? "", /^Amboss is limiting requests \(Amboss HTTP 429\) — the rest of this pass ran on LND alone/);
   assert.equal(node.invoices.get(hash)?.state, "CANCELED", "Amboss unreadable is no reason to let a held HTLC expire");
-  assert.equal(entryOnDisk(dir, newer.id)?.phase, "cancelled");
+  const e = entryOnDisk(dir, newer.id);
+  assert.equal(e?.phase, "cancelled");
+  // Review 2026-11-10, LANE-4: this is no "refunded with no channel opened"
+  // — its channel is out (the unpaid channel's own alert says what to do).
+  assert.ok(e?.heldAt && e.cancelledAt && e.fundingOutpoint, "paid, released, with a channel on record");
+  assert.deepEqual(autopilot.magma.refunds(), []);
 });
 
 test("a key Amboss revokes while the lane checks an order's capital (the listing of your sold capital refused): the pass turns to LND alone at once, under 'Amboss rejects your key'", async (t) => {

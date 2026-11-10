@@ -26,9 +26,11 @@
  * operator: the lane neither accepts nor rejects it. The operator's latest
  * click is what stands — also a click that can't read the order (Amboss or
  * LND not answering), once the lane has it on record (review of P9, round 2)
- * — except for an accept already sent whose answer was lost ("accepting"):
- * an accept that may have reached Amboss is completed first, and a Reject
- * meanwhile is refused, saying why (review of P9, final round).
+ * — also against an accept already sent whose answer was lost ("accepting"):
+ * a Reject of such an order goes out and stands (review 2026-11-10, LANE-1;
+ * before, it was refused while the accept was sent again every pass — see
+ * magmaAcceptError.test.ts). Only an accept that never went out, cut short
+ * by a stop, still refuses a Reject, saying why (review of P9, final round).
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -854,17 +856,19 @@ test("a click that can't read an order the lane is already accepting changes not
   assert.deepEqual([done?.phase, done?.via, done?.decision?.reason], ["accepted", "autopilot", "within your caps and capital"]);
 });
 
-// ── an accept already sent: completed first ──────────────────────────────────
+// ── an accept already sent, its answer lost ──────────────────────────────────
 
-// Review of P9, final round: the docs said a click "makes the order yours,
-// whatever becomes of the click", and that "their latest click stands". Not
-// for an order with an accept already sent whose answer was lost: an accept
-// that may have reached Amboss is completed first (resumeAccept — whatever the
-// switch says), and a Reject meanwhile is refused — said "Order is already
-// accepting here.", though Amboss still showed the order awaiting approval.
-// The behaviour stays; the docs say so now, and the refusal says why.
+// Review of P9, final round: an accept that may have reached Amboss was
+// completed first (resumeAccept — whatever the switch says), and a Reject
+// meanwhile was refused: "Not rejected: the earlier accept of this order was
+// already sent and is being confirmed with Amboss, so it can't be withdrawn."
+// Review 2026-11-10, LANE-1: that left the operator no way out of an accept
+// Amboss kept answering with an error — the order timed out on them. Now the
+// Reject goes out while Amboss still shows the order awaiting approval, the
+// accept's invoice is released once Amboss confirms it, and the accept is not
+// sent again.
 for (const sellEnabled of [true, false]) {
-  test(`selling ${sellEnabled ? "on" : "off"}: the operator's accept went out and its answer was lost — their Reject is refused, saying why, and the next pass completes the accept`, async (t) => {
+  test(`selling ${sellEnabled ? "on" : "off"}: the operator's accept went out and its answer was lost — their Reject goes out and stands; the accept is not sent again`, async (t) => {
     quiet(t);
     const s = sellerSetup(t, { config: { sellEnabled } });
     const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: IN_AN_HOUR() });
@@ -873,17 +877,15 @@ for (const sellEnabled of [true, false]) {
     assert.deepEqual([accepted.ok, accepted.phase], [false, "accepting"], accepted.message);
     assert.equal(s.magma.sales.get(sale.id)?.status, "WAITING_FOR_SELLER_APPROVAL", "Amboss shows it awaiting approval still");
     const click = await s.desk.reject(sale.id);
-    assert.deepEqual(click, {
-      ok: false,
-      code: "bad_status",
-      phase: "accepting",
-      message: "Not rejected: the earlier accept of this order was already sent and is being confirmed with Amboss, so it can't be withdrawn.",
-    });
+    assert.deepEqual(click, { ok: true, phase: "rejected", message: "Order rejected." });
     await s.autopilot.pollSellOrders();
-    assert.deepEqual([s.magma.count("AcceptOrder"), s.magma.count("RejectOrder")], [2, 0]);
-    assert.equal(s.magma.sales.get(sale.id)?.status, "WAITING_FOR_BUYER_PAYMENT");
+    assert.deepEqual([s.magma.count("AcceptOrder"), s.magma.count("RejectOrder")], [1, 1]);
+    assert.equal(s.magma.sales.get(sale.id)?.status, "SELLER_REJECTED");
     const e = entryOnDisk(s.dir, sale.id);
-    assert.deepEqual([e?.phase, e?.via, e?.decision?.reason], ["accepted", "manual", "accepted by you"]);
+    assert.deepEqual([e?.phase, e?.via, e?.reason, e?.invoice], ["rejected", "manual", "rejected by you", null]);
+    assert.equal([...s.node.invoices.values()].filter((i) => i.state === "OPEN").length, 0, "the accept's invoice is released");
+    assert.equal(s.autopilot.capital.reservedSat(), 0);
+    assert.deepEqual(magmaRefusalAlerts(s.autopilot.magma), []);
   });
 }
 

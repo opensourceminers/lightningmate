@@ -76,8 +76,14 @@ export interface FakeOfferState {
  *  arrives. "false": answers success:false and changes nothing. "lie":
  *  answers success:true and changes nothing. "invalid": Amboss rejects the
  *  request itself, as after a change of its schema — HTTP 400 with a GraphQL
- *  validation error — and changes nothing. */
-export type Behaviour = "ok" | "false" | "throw" | "hang" | "apply-then-hang" | "lie" | "invalid";
+ *  validation error — and changes nothing. "refuse": Amboss answers the
+ *  mutation with an error of its own, a business rule (HTTP 200 with a
+ *  GraphQL error, code BAD_REQUEST — how a GraphQL API usually turns a
+ *  mutation down), and changes nothing. */
+export type Behaviour = "ok" | "false" | "throw" | "hang" | "apply-then-hang" | "lie" | "invalid" | "refuse";
+
+/** What a "refuse" answers. */
+export const REFUSED_MESSAGE = "Invoice amount does not match the order";
 
 /** The answer of a GraphQL server to a query its schema no longer has. */
 export function schemaChanged(): Response {
@@ -169,6 +175,12 @@ export class FakeMagma {
   > = {};
   /** Answers to the read queries: "throw" (HTTP 502) or "hang". */
   readBehaviour: Behaviour = "ok";
+  /** What an order's `timeout` holds once it is accepted. The schema says
+   *  only `timeout: String`, and live it was seen on orders awaiting
+   *  approval and on ended ones (null) — nothing in between (review
+   *  2026-11-10, LANE-2). "cleared": null; "kept": the approval deadline
+   *  stays in the field. The lane must do right by the buyer either way. */
+  timeoutAfterAccept: "cleared" | "kept" = "cleared";
   /** How the offer and sales listings answer their `page` argument.
    *  "whole-list": every page is the whole list, `total` its length — what
    *  magma.amboss.tech's public offer list does (checked 2026-10-21; the
@@ -308,6 +320,7 @@ export class FakeMagma {
       if (b === "throw") return new Response("upstream error", { status: 502 });
       if (b === "hang") return hang(req);
       if (b === "invalid") return schemaChanged();
+      if (b === "refuse") return gqlError(REFUSED_MESSAGE, { code: "BAD_REQUEST" });
       if (b === "false") return { data: answer(false) };
       if (b === "lie") return { data: answer(true) };
       const ok = apply();
@@ -353,7 +366,7 @@ export class FakeMagma {
             if (!s || s.status !== "WAITING_FOR_SELLER_APPROVAL") return false;
             s.paymentRequest = String(input.payment_request);
             s.status = "WAITING_FOR_BUYER_PAYMENT";
-            s.timeout = null;
+            if (this.timeoutAfterAccept === "cleared") s.timeout = null;
             return true;
           },
           (ok) => ({ market: { order: { seller: { accept: { success: ok } } } } }),

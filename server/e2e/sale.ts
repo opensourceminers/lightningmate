@@ -8,7 +8,7 @@
  * only be seen on a live order (docs/E2E-TESTING.md, section A).
  */
 import { execSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -26,10 +26,14 @@ import {
   pay,
   type AuthenticatedLnd,
 } from "lightning";
+import { magmaRefundAlerts } from "../src/services/alerts.js";
 import { Autopilot } from "../src/services/autopilot.js";
 import { CapitalLedger } from "../src/services/capital.js";
 import { AmbossStore } from "../src/services/ambossStore.js";
 import { EarningsLog } from "../src/services/earningsLog.js";
+import { fundingHeight } from "../src/services/leaseCaps.js";
+import { OPEN_MIN_BLOCKS_LEFT } from "../src/services/magmaDesk.js";
+import type { MagmaJournalEntry } from "../src/services/magmaJournal.js";
 import { OverridesStore } from "../src/services/overrides.js";
 import { RebalanceLog } from "../src/services/rebalanceLog.js";
 import { ServiceFeeLedger } from "../src/services/serviceFee.js";
@@ -118,10 +122,25 @@ const amboss = new AmbossStore(dir);
 amboss.setKey("test-key");
 const fees = new ServiceFeeLedger(dir, null);
 const earnings = new EarningsLog(dir);
-const autopilot = new Autopilot(dir, seller, seller, new RebalanceLog(dir), new OverridesStore(dir), amboss, earnings, fees, undefined, new CapitalLedger());
+const capital = new CapitalLedger();
+const autopilot = new Autopilot(dir, seller, seller, new RebalanceLog(dir), new OverridesStore(dir), amboss, earnings, fees, undefined, capital);
 suppressSchedulerKicks(autopilot);
 const desk = autopilot.magma;
 const journalPhase = (id: string) => desk.localView(id)?.phase ?? "none";
+/** The order's record as a restart would read it. */
+const onDisk = (id: string): MagmaJournalEntry | undefined =>
+  existsSync(join(dir, "magma-orders.json"))
+    ? (JSON.parse(readFileSync(join(dir, "magma-orders.json"), "utf8")) as MagmaJournalEntry[]).find((e) => e.orderId === id)
+    : undefined;
+const heightOf = async (lnd: AuthenticatedLnd) => (await getWalletInfo({ lnd })).current_block_height;
+/** Mine up to `height`, the three nodes following. */
+async function mineTo(height: number): Promise<void> {
+  for (let at = await heightOf(seller); at < height; at = await heightOf(seller)) {
+    mine(Math.min(400, height - at));
+    const tip = Number(btc("getblockcount"));
+    await until(`the nodes at block ${tip}`, async () => (await Promise.all([seller, hub, buyer].map(heightOf))).every((h) => h >= tip), 180_000);
+  }
+}
 
 // ── the order: first the buyer can't be reached, then it can ───────────────
 const SIZE = 1_000_000;
@@ -166,6 +185,15 @@ actions = await desk.tick();
 actions = actions.some((a) => a.action === "open" && a.ok) ? actions : await desk.tick();
 const pending = await until("the sold channel pending", async () => (await getPendingChannels({ lnd: seller })).pending_channels.find((c) => c.partner_public_key === buyerKey));
 check("the channel was opened by the lane, on its own", pending.is_opening && pending.capacity === SIZE, `${pending.capacity} sat, ${pending.transaction_id.slice(0, 12)}…`);
+// The open states its fee rate (LND's 6-block estimate), and LND pays it.
+const stated = Number(/^open started at (\d+) sat\/vB$/.exec(onDisk(sale.id)?.events.find((e) => e.what.startsWith("open started at"))?.what ?? "")?.[1] ?? NaN);
+const funding = JSON.parse(btc(`getmempoolentry ${pending.transaction_id}`)) as { vsize: number; fees: { base: number } };
+const paidRate = (funding.fees.base * 1e8) / funding.vsize;
+check(
+  "the open named its fee rate, and the funding transaction pays it",
+  Number.isFinite(stated) && Math.abs(paidRate - stated) <= Math.max(1, stated * 0.05),
+  `stated ${stated} sat/vB; paid ${Math.round(funding.fees.base * 1e8)} sat for ${funding.vsize} vB = ${paidRate.toFixed(2)} sat/vB`,
+);
 await until("the funding reported to Amboss", async () => {
   await desk.tick();
   return magma.count("AddTransaction") > 0 || !!sale.transactionId;
@@ -196,6 +224,18 @@ check("it starts with a routing fee of its own, not LND's default", !!after && a
 // ── the lease ends: the channel is closed, the coins come back ─────────────
 const before = (await getChainBalance({ lnd: seller })).chain_balance;
 sale.status = "CHANNEL_MONITORING_FINISHED";
+// Amboss's word alone closes nothing: by the seller's own count (funding
+// block, the lease, a day) the lease still runs.
+const early = await desk.closeFinishedLeases();
+const leaseEnd = (fundingHeight(sold.id) ?? 0) + sale.promises.minBlockLength + 144;
+check(
+  "Amboss lists the lease as over, the node's own count doesn't: nothing is closed",
+  early.length === 0 && (await getChannels({ lnd: seller })).channels.some((c) => c.id === sold.id) && /by this node's count it runs until block/.test(onDisk(sale.id)?.events.at(-1)?.what ?? ""),
+  (onDisk(sale.id)?.events.at(-1)?.what ?? JSON.stringify(early)).slice(0, 220),
+);
+await mineTo(leaseEnd - 1);
+check("one block before the lease's end it is still open", (await desk.closeFinishedLeases()).length === 0, `block ${await heightOf(seller)} of ${leaseEnd}`);
+await mineTo(leaseEnd);
 const closing = await desk.closeFinishedLeases();
 check("at the lease's end the channel is closed, on its own", closing.some((a) => a.action === "close" && a.ok), JSON.stringify(closing).slice(0, 200));
 mine(3);
@@ -235,6 +275,109 @@ await until("the held payment released", async () => {
 }, 30_000);
 check("the buyer's payment came back", (await refund).startsWith("refused"), await refund);
 check("no second channel, no coins spent", (await getChainBalance({ lnd: seller })).chain_balance === funds.chain_balance && !(await getPendingChannels({ lnd: seller })).pending_channels.some((c) => c.is_opening), journalPhase(failing.id));
+
+// ── fees rise after the buyer paid: the open waits, then the buyer is refunded ──
+const pricey = magma.addSale({
+  buyerPubkey: buyerKey,
+  sizeSats: SIZE,
+  feeSeller: "60000",
+  timeout: new Date(Date.now() + 2 * 3_600_000).toISOString(),
+  sockets: [`127.0.0.1:${NODES.buyer.p2p}`],
+});
+await desk.tick();
+check("a third order is accepted at regtest's fee estimate", pricey.status === "WAITING_FOR_BUYER_PAYMENT", pricey.status);
+const priceyHash = parsePaymentRequest(pricey.paymentRequest ?? "").id;
+const priceyPay = pay({ lnd: buyer, request: pricey.paymentRequest ?? "", max_fee: 1_000 }).then(
+  () => "paid",
+  (err: unknown) => `refused: ${JSON.stringify(err).slice(0, 80)}`,
+);
+const priceyHeld = await until("the third payment held", async () => {
+  const i = await getInvoice({ lnd: seller, id: priceyHash });
+  return i.is_held ? i : null;
+});
+pricey.status = "WAITING_FOR_CHANNEL_OPEN";
+pricey.paymentStatus = "SUCCESSFUL_PAYMENT";
+// LND's estimate is the one thing changed here: 400 sat/vB, so the open
+// (175 vB, 70,000 sat) would cost more than the 60,000 sat the sale earns
+// (no service fee is set here).
+const wallet = (seller as unknown as { wallet: { estimateFee: (args: unknown, cb: (err: unknown, res?: { sat_per_kw: string }) => void) => void } }).wallet;
+const realEstimate = wallet.estimateFee;
+wallet.estimateFee = (_args, cb) => cb(null, { sat_per_kw: String(400 * 250) });
+const chainBefore = (await getChainBalance({ lnd: seller })).chain_balance;
+await desk.tick();
+await desk.tick();
+check(
+  "with fees above what the sale earns the lane opens nothing and keeps the payment held",
+  !(await getPendingChannels({ lnd: seller })).pending_channels.some((c) => c.is_opening) &&
+    (await getInvoice({ lnd: seller, id: priceyHash })).is_held === true &&
+    /^on-chain fees are 400 sat\/vB: opening the channel would cost about 70,000 sat, more than the 60,000 sat this sale earns/.test(onDisk(pricey.id)?.lastError ?? ""),
+  (onDisk(pricey.id)?.lastError ?? journalPhase(pricey.id)).slice(0, 200),
+);
+check("the lane's status says what it waits for", /^1 paid order waits for lower on-chain fees/.test(autopilot.getState().magmaLane?.error ?? ""), (autopilot.getState().magmaLane?.error ?? "").slice(0, 120));
+// The held payment's own height is the limit: OPEN_MIN_BLOCKS_LEFT before it
+// the open could no longer be confirmed in time.
+const heldUntil = Math.min(...priceyHeld.payments.filter((p) => p.is_held).map((p) => p.timeout));
+await mineTo(heldUntil - OPEN_MIN_BLOCKS_LEFT);
+await desk.tick();
+check("still waited for at the last block an open could be confirmed in time", (await getInvoice({ lnd: seller, id: priceyHash })).is_held === true, `block ${await heightOf(seller)}, held until ${heldUntil}`);
+await mineTo(heldUntil - OPEN_MIN_BLOCKS_LEFT + 1);
+await until("the third payment released", async () => {
+  await desk.tick();
+  return (await getInvoice({ lnd: seller, id: priceyHash })).is_canceled;
+}, 30_000);
+wallet.estimateFee = realEstimate;
+check("one block later the buyer is refunded", (await priceyPay).startsWith("refused"), await priceyPay);
+check(
+  "no channel was opened, no coins spent, nothing kept reserved",
+  !(await getPendingChannels({ lnd: seller })).pending_channels.some((c) => c.is_opening) &&
+    (await getChainBalance({ lnd: seller })).chain_balance === chainBefore &&
+    capital.reservedSat() === 0,
+  `${journalPhase(pricey.id)}: ${(onDisk(pricey.id)?.reason ?? "").slice(0, 170)}`,
+);
+const refundAlerts = magmaRefundAlerts(desk);
+check("the operator is told of the refund", refundAlerts.length === 1 && refundAlerts[0].id === `magma:${pricey.id}`, (refundAlerts[0]?.message ?? "none").slice(0, 150));
+
+// ── Amboss answers the accept with an error (HTTP 502): bounded ────────────
+magma.behave.AcceptOrder = "throw";
+const unsure = magma.addSale({
+  buyerPubkey: buyerKey,
+  sizeSats: SIZE,
+  feeSeller: "60000",
+  timeout: new Date(Date.now() + 10 * 60_000).toISOString(),
+  sockets: [`127.0.0.1:${NODES.buyer.p2p}`],
+});
+await desk.tick();
+const unsureInvoice = onDisk(unsure.id)?.invoice?.id ?? "";
+const made = unsureInvoice ? await getInvoice({ lnd: seller, id: unsureInvoice }).catch(() => null) : null;
+check(
+  "an accept answered with a 502 stays unconfirmed: its hold invoice exists, its size is reserved",
+  journalPhase(unsure.id) === "accepting" && !!made && !made.is_canceled && !made.is_held && capital.reservedSat() === SIZE && unsure.status === "WAITING_FOR_SELLER_APPROVAL",
+  `${journalPhase(unsure.id)}, reserved ${capital.reservedSat()} sat`,
+);
+// The approval deadline is a minute away: inside the reject margin.
+unsure.timeout = new Date(Date.now() + 60_000).toISOString();
+const acceptsSent = magma.count("AcceptOrder");
+await desk.tick();
+check(
+  "near the approval deadline the order is rejected, not left to time out — the accept not sent again",
+  unsure.status === "SELLER_REJECTED" && journalPhase(unsure.id) === "rejected" && magma.count("AcceptOrder") === acceptsSent,
+  `${unsure.status}, ${journalPhase(unsure.id)}: ${(onDisk(unsure.id)?.reason ?? "").slice(0, 120)}`,
+);
+check(
+  "its hold invoice is cancelled in LND and its size free again",
+  (await getInvoice({ lnd: seller, id: unsureInvoice })).is_canceled === true && capital.reservedSat() === 0,
+  `reserved ${capital.reservedSat()} sat`,
+);
+magma.behave.AcceptOrder = "ok";
+const next = magma.addSale({
+  buyerPubkey: buyerKey,
+  sizeSats: SIZE,
+  feeSeller: "60000",
+  timeout: new Date(Date.now() + 2 * 3_600_000).toISOString(),
+  sockets: [`127.0.0.1:${NODES.buyer.p2p}`],
+});
+await desk.tick();
+check("the next order is accepted as ever", next.status === "WAITING_FOR_BUYER_PAYMENT", `${next.status}; ${(onDisk(next.id)?.reason ?? "").slice(0, 120)}`);
 
 // ── done ───────────────────────────────────────────────────────────────────
 autopilot.shutdown();

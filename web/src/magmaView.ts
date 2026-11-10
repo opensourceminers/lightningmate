@@ -649,7 +649,30 @@ export const OFFER_AUTOMATION_HINT =
   "selling stays on (switching it on lists your disabled offers again; \"keep disabled\" on Market → Sell keeps one off). " +
   "With auto-size on, every offer the autopilot manages promises buyers a routing-fee cap for the lease (offers you create or edit " +
   "on Market → Sell always do); with every switch above off, the autopilot only keeps your offers fundable. The fee autopilot keeps " +
-  "each sold channel within the cap its order locked.";
+  "each sold channel within the cap its order locked. A sold channel is closed after its lease by rules of its own " +
+  "(“Auto-close channels after the lease ends” under Advanced says when one is kept), and that also works with selling switched off.";
+
+/**
+ * What "Auto-close channels after the lease ends" does and leaves (review
+ * 2026-11-10, OFFER-9): the label named none of the rules that keep a
+ * channel open, nor that it works with selling off. The figures are the
+ * server's (SOLD_CLOSE_MIN_LOCAL_SHARE, SOLD_CHANNEL_KEEP_PPM_YEAR; pinned
+ * in server/test/docsMatchCode.test.ts). The maximum binds the rate the close
+ * is asked for at, not what LND may settle on with the buyer's node
+ * (channelOps.closeFeeRefusedAtMaxText) — "never above" promised more than
+ * the close can keep; and a sale with no record here has no history to read
+ * (review of the package).
+ */
+export const AUTO_CLOSE_HINT =
+  "A sold channel is closed once its lease is over: Amboss lists it as finished and, by this node's own count, the funding block, " +
+  "the lease and a day have passed. The close is asked for at LND's economy fee rate, and not while that is above “Max on-chain fee " +
+  "for opens” — if the buyer's node insists on more, LND may still finish the close at its own estimate, which can be above that maximum. " +
+  "It stays open while less than a quarter of it is on your side (the rest is inbound worth keeping), while it routes well " +
+  "(over 30 days it earned, on the coins a close would free, at least this node's average and 5,000 ppm a year), and while the " +
+  "buyer's node is offline (a force close stays yours to decide, on Channels) — the order's history on Market → Orders says which, " +
+  "for a sale this app recorded. " +
+  "It also works with selling switched off, so the channels of a node that stopped selling are closed as their leases end; " +
+  "nothing is closed while all automation is paused.";
 
 /** A Magma order-refusal line for the Overview digest (null: none). */
 export function refusalDigest(count: number | undefined, reason: string | null | undefined): string | null {

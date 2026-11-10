@@ -448,6 +448,14 @@ const CLOSE_FEE_REFUSED = /fee proposal exceeds max fee/i;
  *  someone believing it might force-close a channel already on its way. */
 export const CLOSE_FEE_REFUSED_TEXT =
   "The peer wants more than three times the fee you chose, so this round ended without a closing transaction. The channel is shutting down all the same: LND normally finishes the close with the peer at its own fee estimate, usually within minutes. Wait for it. If it still hasn't closed after a few hours, a force-close remains possible.";
+/** The same for a close that named its maximum (the lease-end close of a sold
+ *  channel, MagmaDesk.closeFinishedLeases). Before, that case was a plain
+ *  failure: nothing said the shutdown was out, and the close was asked again
+ *  on every run — of a channel already closing, possibly at more than the
+ *  maximum it was asked with (review 2026-11-10, CHAN-5). */
+export const closeFeeRefusedAtMaxText = (maxFeeRate: number): string =>
+  `The peer wants more than the ${Math.round(maxFeeRate)} sat/vB maximum, so this round ended without a closing transaction. ` +
+  "The channel is shutting down all the same: LND normally finishes the close with the peer at its own fee estimate — which can be above that maximum.";
 
 export async function closeChannelByOutpoint(
   writeLnd: AuthenticatedLnd,
@@ -476,6 +484,8 @@ export async function closeChannelByOutpoint(
     const error = describe(err);
     // The shutdown is out: LND goes on with the peer, this was only the
     // first round of haggling over the fee (seen on regtest with LND 0.21).
-    return !isForce && !maxFeeRate && CLOSE_FEE_REFUSED.test(error) ? { ok: false, stillClosing: true, error: CLOSE_FEE_REFUSED_TEXT } : { ok: false, error };
+    return !isForce && CLOSE_FEE_REFUSED.test(error)
+      ? { ok: false, stillClosing: true, error: maxFeeRate && maxFeeRate > 0 ? closeFeeRefusedAtMaxText(maxFeeRate) : CLOSE_FEE_REFUSED_TEXT }
+      : { ok: false, error };
   }
 }

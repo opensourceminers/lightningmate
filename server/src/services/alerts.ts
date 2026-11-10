@@ -3,7 +3,7 @@ import { getChannelsView } from "./channels.js";
 import { getNodeSummary } from "./node.js";
 import { storeIncidents, type StoreIncident } from "../store.js";
 import type { ServiceFeeLedger } from "./serviceFee.js";
-import type { MagmaRefusal } from "./magmaDesk.js";
+import type { MagmaRefund, MagmaRefusal } from "./magmaDesk.js";
 
 export interface Alert {
   level: "warn" | "info";
@@ -111,6 +111,33 @@ export function magmaRefusalAlerts(desk: { refusals(): Pick<MagmaRefusal, "order
   return desk.refusals().map((r) => ({
     level: "warn" as const,
     message: `A ${Math.round(r.sizeSats).toLocaleString("en-US")} sat Magma order was turned down: ${r.reason}. ${REFUSAL_ADVICE[r.kind] ?? REFUSAL_ADVICE.other}`,
+    id: `magma:${r.orderId}`,
+  }));
+}
+
+/** Paid Magma orders whose payment went back to the buyer with no channel
+ *  opened (MagmaDesk.refunds), until dismissed: a sale lost after the buyer
+ *  had paid, and on Amboss an order the seller did not fulfil. */
+export function magmaRefundAlerts(desk: { refunds(): Pick<MagmaRefund, "orderId" | "sizeSats" | "feeSats" | "reason">[] }): Alert[] {
+  return desk.refunds().map((r) => ({
+    level: "warn" as const,
+    message:
+      `A paid ${Math.round(r.sizeSats).toLocaleString("en-US")} sat Magma order was refunded and no channel opened: ${r.reason}. ` +
+      `The buyer has their ${Math.round(r.feeSats).toLocaleString("en-US")} sat back; Amboss may count the order against your seller score. See Market → Orders for the order.`,
+    id: `magma:${r.orderId}`,
+  }));
+}
+
+/** Magma orders that ended with the buyer's payment kept and no channel
+ *  opened (MagmaDesk.paymentsKept), until dismissed: the payment settled
+ *  when the buyer paid, so nothing gives it back by itself. */
+export function magmaKeptPaymentAlerts(desk: { paymentsKept(): Pick<MagmaRefund, "orderId" | "sizeSats" | "feeSats" | "reason">[] }): Alert[] {
+  return desk.paymentsKept().map((r) => ({
+    level: "warn" as const,
+    message:
+      `A paid ${Math.round(r.sizeSats).toLocaleString("en-US")} sat Magma order ended with no channel opened: ${r.reason}. ` +
+      `The buyer's ${Math.round(r.feeSats).toLocaleString("en-US")} sat are settled here and do not go back by themselves: ` +
+      `“Open channel” on Market → Orders tries again while Amboss still lists the order as waiting for its channel; otherwise the buyer is owed the payment.`,
     id: `magma:${r.orderId}`,
   }));
 }

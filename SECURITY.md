@@ -76,12 +76,23 @@ security@opensourceminers.de (please don't open a public issue first).
   exists, and the payment is settled only once Amboss confirms the channel
   (VALID_CHANNEL_OPENING). Every failure — the open fails, the channel doesn't
   match, the held payment nears its expiry — cancels the invoice, refunding the
-  buyer. Each step is written to `magma-orders.json` before it happens, so a
+  buyer. A channel is opened only while the payment can still be held 60
+  blocks more, so none is delivered for a payment about to be released; until
+  then a buyer who is offline, missing coins, or an open that would cost more
+  on chain than the sale earns (at LND's fee estimate, which the open states;
+  with no estimate the cost is unknown) is waited for, not paid for — and a
+  paid order refunded with no channel opened raises an alert. Each step is written to `magma-orders.json` before it happens, so a
   restart never opens a second channel for an order; the accept itself is
   marked on disk before it goes out, so after a crash the order lane's own
   accept that never left is withdrawn (nothing promised) if selling was
   switched off meanwhile — one you clicked is your decision and goes out —
-  and one that may have reached Amboss is completed. An accept whose mark
+  and one that may have reached Amboss is sent again while Amboss answers
+  nothing or reports an outage. An error Amboss answers about the accept
+  itself counts as a refusal once the order still reads as awaiting approval
+  (the invoice is released; the lane rejects its own order after 3), and
+  with the approval deadline 2 minutes off the lane rejects its own order
+  whose accept is still unconfirmed rather than let it time out — the reject
+  first, the invoice released only once Amboss confirms it. An accept whose mark
   can't be saved is not sent at all: its invoice is released, and the order
   is decided again — a running lane rejects it rather than leave it to time
   out when its approval deadline is close; a paused lane leaves it to the
@@ -91,13 +102,15 @@ security@opensourceminers.de (please don't open a public issue first).
   by hand wins over the lane, for an order the lane isn't working on at that
   moment: a click on Accept or Reject that finds the order — Amboss shows it
   as this node's, awaiting approval, or the lane has it on record as awaiting
-  approval — makes the order yours, whatever becomes of the click — except
-  for an accept already sent whose answer was lost (the record says
-  "accepting"), yours or the lane's: an accept that may have reached Amboss
-  is completed first, and a Reject meanwhile is refused ("Not rejected: the
-  earlier accept of this order was already sent and is being confirmed with
-  Amboss, so it can't be withdrawn."), though Amboss may still show the order
-  awaiting approval. A reject Amboss didn't confirm is sent again on every
+  approval — makes the order yours, whatever becomes of the click — also
+  against an accept already sent that Amboss never confirmed (the record says
+  "accepting"), yours or the lane's: a Reject of such an order is sent while
+  Amboss still shows it awaiting approval, and again on every pass, the
+  accept no more; the accept's invoice is released once Amboss confirms the
+  reject. Only an accept Amboss turns out to have applied stands against it:
+  the order is accepted then, and its record says so ("Amboss had applied the
+  accept before your reject reached it — the order is accepted"). A reject
+  Amboss didn't confirm is sent again on every
   pass — paused or not — until Amboss confirms it or the order ends, and that
   order is never accepted; after an accept that didn't go through, the lane
   neither accepts the order nor turns it down. A click that finds neither

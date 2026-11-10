@@ -14,7 +14,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { openLines, startingFeeText } from "../src/openView";
 import { NEED_LABEL } from "../src/components/SuggestionsPanel";
-import { CHANNEL_OPEN_HINT } from "../src/components/AutopilotPanel";
+import { CHANNEL_MAX_FEE_HINT, CHANNEL_OPEN_HINT, DEPLOY_CAP_HINT, afterLeaseLine } from "../src/components/AutopilotPanel";
 import { enableSellingPendingMessage, freedCapitalMagmaHint, SUMMARY_LABEL } from "../src/magmaView";
 import type { OpenEstimate } from "../src/types";
 
@@ -133,7 +133,17 @@ test("the docs say what the channel autopilot and the close list do now — no '
 
 test("the channel autopilot: its fee cap is a setting, how it decides is said under its settings, and its last decision is shown", () => {
   const panel = readFileSync(new URL("../src/components/AutopilotPanel.tsx", import.meta.url), "utf8");
-  assert.match(panel, /\{ key: "channelMaxFeeRate", label: "Max on-chain fee for opens \(sat\/vB\)" \}/);
+  assert.match(panel, /\{ key: "channelMaxFeeRate", label: "Max on-chain fee for opens \(sat\/vB\)", hint: CHANNEL_MAX_FEE_HINT \}/);
+  // Review 2026-11-10, LANE-4: the setting says which opens it binds — a
+  // sold channel's open has its own limit, what the sale earns.
+  assert.match(CHANNEL_MAX_FEE_HINT, /to open a channel of its own, and the most it asks to close a sold channel after its lease at/);
+  // Review of the package: the maximum binds what the close is asked at —
+  // LND may settle above it with the buyer's node (closeFeeRefusedAtMaxText).
+  assert.match(CHANNEL_MAX_FEE_HINT, /LND may finish that close above it/);
+  assert.doesNotMatch(CHANNEL_MAX_FEE_HINT, /never above/);
+  assert.match(CHANNEL_MAX_FEE_HINT, /A channel sold on Magma is not held to it/);
+  assert.match(CHANNEL_MAX_FEE_HINT, /while that costs no more than the sale earns/);
+  assert.match(CHANNEL_MAX_FEE_HINT, /the buyer is refunded and an alert tells you/);
   // Its last decision, with its state (D16): the status line at the top of the sub-tab.
   assert.match(panel, /<StatusLine area="channels" status=\{status\?\.channels\} \/>/);
   assert.match(CHANNEL_OPEN_HINT, /paid back within a year/);
@@ -142,4 +152,19 @@ test("the channel autopilot: its fee cap is a setting, how it decides is said un
   // that is connected already is (planOpen dials only peers it must reach).
   assert.doesNotMatch(CHANNEL_OPEN_HINT, /without an address, of low usefulness/);
   assert.match(CHANNEL_OPEN_HINT, /nor one that advertises no address to dial unless it is connected already/);
+});
+
+test("“Capital to sell” says what counts against it, and how much of it sits in sold channels left open after their lease", () => {
+  // Review 2026-11-10, LANE-7: a channel whose lease was over stopped
+  // counting with its coins still in it. It counts until closed now — said
+  // in the hint, and under the limit when there are such channels.
+  assert.match(DEPLOY_CAP_HINT, /A sold channel counts with its size while its lease runs, and with what is still on your side of it after the lease — until it is closed\./);
+  assert.equal(afterLeaseLine({ channels: 1, sats: 1_990_000 }, false), "1,990,000 sat of it is in 1 sold channel still open after its lease — it counts until closed (Channels).");
+  assert.equal(afterLeaseLine({ channels: 2, sats: 3_500_000 }, false), "3,500,000 sat of it are in 2 sold channels still open after their lease — they count until closed (Channels).");
+  // Nothing to say with none, an older server, or no limit set.
+  assert.equal(afterLeaseLine({ channels: 0, sats: 0 }, false), null);
+  assert.equal(afterLeaseLine(undefined, false), null);
+  assert.equal(afterLeaseLine({ channels: 1, sats: 1_990_000 }, true), null);
+  const panel = readFileSync(new URL("../src/components/AutopilotPanel.tsx", import.meta.url), "utf8");
+  assert.match(panel, /afterLeaseLine\(server\.sellAfterLease, sellEverything\)/);
 });

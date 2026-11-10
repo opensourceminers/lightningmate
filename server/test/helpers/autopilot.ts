@@ -50,6 +50,22 @@ export interface AutopilotSeams {
   runSell: () => Promise<unknown[]>;
 }
 
+/**
+ * A sold channel's open reads 1 sat/vB while the node gives no fee estimate.
+ * The bare fake LND has none (the capital tests' sums are built on that), and
+ * a lane that doesn't know what an open costs opens no paid order's channel
+ * (review 2026-11-10, LANE-4: MagmaDesk.openFeeFor) — every test of a sale
+ * would stop at "held". An estimate a test gives the node
+ * (node.override("wallet.estimateFee", …)) is read as it is.
+ */
+export function soldOpensKnowTheirFee(autopilot: Autopilot): void {
+  const real = autopilot.soldChannelOpen.bind(autopilot);
+  autopilot.soldChannelOpen = async () => {
+    const terms = await real();
+    return terms.feeRate === null ? { ...terms, feeRate: 1 } : terms;
+  };
+}
+
 /** A peer LND is connected to for gossip (no channel with it). A live LND
  *  keeps a few such peers at all times; with none at all, the channel stage
  *  takes this node to be offline and dials nobody. */
@@ -135,7 +151,16 @@ export const BUYER = "02" + "ab".repeat(32);
  */
 export function sellerSetup(
   t: AfterHook,
-  opts: { config?: Record<string, unknown>; chainBalance?: number; payFees?: boolean; payTimeoutMs?: number; writeDenied?: string[] } = {},
+  opts: {
+    config?: Record<string, unknown>;
+    chainBalance?: number;
+    payFees?: boolean;
+    payTimeoutMs?: number;
+    writeDenied?: string[];
+    /** Leave a sold channel's open with what the fake LND says of fees — no
+     *  estimate, unless the test gives it one (see soldOpensKnowTheirFee). */
+    openFeeUnknown?: boolean;
+  } = {},
 ) {
   const http = installFetchMock(t);
   http.onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
@@ -185,6 +210,7 @@ export function sellerSetup(
       new CapitalLedger(),
     );
     suppressSchedulerKicks(ap);
+    if (!opts.openFeeUnknown) soldOpensKnowTheirFee(ap);
     started.push(ap);
     return ap;
   };
@@ -202,6 +228,7 @@ export function sellerSetup(
     capital,
   );
   suppressSchedulerKicks(autopilot);
+  if (!opts.openFeeUnknown) soldOpensKnowTheirFee(autopilot);
   started.push(autopilot);
   t.after(() => {
     for (const ap of started) ap.shutdown();

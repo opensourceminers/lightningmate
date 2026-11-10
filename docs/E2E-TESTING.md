@@ -35,7 +35,7 @@ server/e2e/regtest.sh up
 cd server
 node --import tsx e2e/dial.ts   # how a dial behaves with circuits of 0–35 s and refused addresses
 server/e2e/regtest.sh up        # (fresh chain and nodes for the next one)
-node --import tsx e2e/sale.ts   # accept, held payment, channel, report, settle, close, and a refund
+node --import tsx e2e/sale.ts   # a whole sale to the lease's end, then what can go wrong (listed below)
 server/e2e/regtest.sh up
 node --import tsx e2e/nodePanel.ts  # a node's details through the app's routes: open by hand, fee mode, close
 server/e2e/regtest.sh down
@@ -43,6 +43,28 @@ server/e2e/regtest.sh down
 
 Run it before a release that changes how LightningMate talks to LND on a money path. Each line
 says PASS or FAIL; the exit code says whether all passed.
+
+`sale.ts` takes about half an hour, most of it mining: it runs a sale to the end of its lease by
+the node's own block count (some 4,500 blocks; the three LND nodes follow in steps of 400). What
+it shows, in order:
+
+- **A whole sale**: an unreachable buyer is waited for, not turned down; accept, held payment,
+  the open at a stated fee rate — the funding transaction is read back from the mempool and pays
+  that rate —, the report to Amboss, settle, the sale booked once.
+- **The lease's end**: with Amboss listing the lease as over while the node's own count says it
+  still runs, nothing is closed; one block before the end the channel is still open; at the end
+  it is closed cooperatively and the coins are back on chain.
+- **Amboss calls a paid order off**: the buyer has the payment back, no second channel.
+- **Fees rise after the buyer paid**: with LND's estimate at 400 sat/vB the lane opens nothing
+  and keeps the payment held, its status says what it waits for; at the last block an open could
+  still be confirmed in time it still waits, one block later the buyer is refunded, nothing stays
+  reserved, and the operator's alert is there.
+- **Amboss answers an accept with an error (HTTP 502)**: the order stays unconfirmed with its
+  hold invoice and its size reserved; near the approval deadline it is rejected rather than left
+  to time out, the accept not sent again, the invoice cancelled and the size free; the next order
+  is accepted as ever.
+
+No service fee is set in that run, so "what the sale earns" is the order's whole fee there.
 
 ---
 
@@ -112,10 +134,18 @@ says PASS or FAIL; the exit code says whether all passed.
 
 8. The lane opens the channel to B (with selling on, or for an
    order it accepted itself; an order accepted by hand with selling off waits
-   for "Open channel" — the Orders tab says which). The journal records
+   for "Open channel" — the Orders tab says which; so does an order found
+   paid with no invoice of ours in LND, accepted outside LightningMate). The
+   journal records
    `opening` before the open and the funding outpoint right after it
    (`funded`), then `reported` once Amboss took the transaction
-   (`SELLER_SENT_TRANSACTION`).
+   (`SELLER_SENT_TRANSACTION`). The open states its fee rate ("open started
+   at N sat/vB" in the order's history — LND's 6-block estimate). If 175 vB at
+   that rate cost more than the order's fee after the 1 % service fee, the
+   lane waits instead ("on-chain fees are N sat/vB: opening the channel would
+   cost about …"): on regtest LND's estimate is bitcoind's fallback (about
+   25 sat/vB, 4,375 sat an open), so the test order must pay more than that,
+   or use "Open channel".
 9. The channel shows in Channels with its lease tag.
 
 **6. Confirmation and settle**

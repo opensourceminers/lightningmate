@@ -7,7 +7,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { stateAlerts } from "../src/services/alerts.js";
+import { magmaKeptPaymentAlerts, stateAlerts } from "../src/services/alerts.js";
+import { LEGACY_OPEN_RETRY_MS, NO_PAYMENT_WAIT } from "../src/services/magmaDesk.js";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
 import {
   IN_AN_HOUR,
@@ -179,17 +180,32 @@ test("the order journal is lost while a buyer's payment is held: no channel, not
   assert.doesNotMatch(alert?.message ?? "", /can no longer be tracked here/);
 });
 
-test("an order with no invoice of ours in LND (accepted with another tool) is fulfilled — but not booked as a sale", async (t) => {
+test("an order with no invoice of ours in LND (accepted with another tool): the lane opens no channel by itself — the operator's click does, and it is not booked as a sale", async (t) => {
+  // Review 2026-11-10, LANE-5. Before: the running lane opened it on
+  // Amboss's status alone — the one automatic open with no payment this node
+  // can see, and outside the caps (2,000,000 sat under a 1,000,000 cap).
   feeEnv(t);
   quiet(t);
-  const { autopilot, node, magma, dir, earnings, fees } = sellerSetup(t);
-  const sale = magma.addSale({ buyerPubkey: BUYER, status: "WAITING_FOR_CHANNEL_OPEN", paymentStatus: "SUCCESSFUL_PAYMENT" });
+  const { autopilot, node, magma, dir, earnings, fees } = sellerSetup(t, { config: { sellMaxDeploySats: 1_000_000, sellMaxChannelSats: 1_000_000 } });
+  node.peers.push(BUYER);
+  const sale = magma.addSale({ buyerPubkey: BUYER, sizeSats: 2_000_000, status: "WAITING_FOR_CHANNEL_OPEN", paymentStatus: "SUCCESSFUL_PAYMENT" });
   await autopilot.pollSellOrders();
-  assert.equal(node.callsTo("default.openChannel").length, 1, "fulfilled, as before");
-  assert.equal(entryOnDisk(dir, sale.id)?.paidInvoiceId, null);
+  await autopilot.pollSellOrders();
+  assert.equal(node.callsTo("default.openChannel").length, 0, "before: one open, 2,000,000 sat");
+  let e = entryOnDisk(dir, sale.id);
+  assert.deepEqual([e?.phase, e?.via, e?.paidInvoiceId], ["held", "legacy", null]);
+  assert.equal(e?.decision?.reason, NO_PAYMENT_WAIT);
+  assert.equal(e?.events.filter((x) => x.what === NO_PAYMENT_WAIT).length, 1, "said once, not on every pass");
+  // Market → Orders: "waiting for you to open the channel", with the button.
+  assert.equal(autopilot.magma.opensItself(sale.id), false);
+  assert.equal(autopilot.getState().magmaLane.ok, true, "nothing the lane failed at");
+  // The operator, who knows where the payment went, opens it.
+  const res = await autopilot.magma.open(sale.id);
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(node.callsTo("default.openChannel").length, 1);
   magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
   await autopilot.pollSellOrders();
-  const e = entryOnDisk(dir, sale.id);
+  e = entryOnDisk(dir, sale.id);
   assert.equal(e?.phase, "settled");
   assert.equal(earnings.recent().length, 0, "LND shows no payment to book");
   assert.equal(fees.entries().length, 0, "and no service fee is charged on it");
@@ -392,4 +408,214 @@ test("an order on record without any invoice of ours — whatever path left it s
   assert.equal(e?.phase, "settled");
   assert.equal(e?.unbooked, true);
   assert.equal(p2.magma.localView(sale.id)?.booked, false);
+});
+
+// Review of the 2026-11 fix package (LANE-4 and LANE-6 met an order paid
+// outside a HODL invoice): 0.7.x accepted with a plain invoice, which settled
+// when the buyer paid. Nothing is held, so nothing can be handed back by
+// releasing it — the buyer's money is here and the channel is owed. The
+// lane's wait for lower on-chain fees had such an order wait too, and with
+// no held payment to count the wait by it ended "failed" after half an hour:
+// no channel, no refund, no alert, and “Open channel” refused.
+type Dial = (pubkey: string, sockets: string[], onDialError?: (socket: string, error: string) => void, budgetMs?: number) => Promise<boolean>;
+function buyerOffline(desk: object): () => void {
+  const d = desk as unknown as { lndConnect: Dial };
+  const real = d.lndConnect.bind(desk);
+  let away = true;
+  d.lndConnect = async (pubkey, sockets, onDialError, budgetMs) => {
+    if (!away) return real(pubkey, sockets, onDialError, budgetMs);
+    onDialError?.("203.0.113.7:9735", "connection timed out");
+    return false;
+  };
+  return () => (away = false);
+}
+/** A 2,000,000 sat order 0.7.x accepted, paid with 2,436 sat to a plain
+ *  invoice that settled; Amboss shows no deadline (as seen live). */
+function settledLegacyOrder(t: Parameters<typeof quiet>[0], opts: Parameters<typeof sellerSetup>[1] = {}) {
+  feeEnv(t);
+  quiet(t);
+  const s = sellerSetup(t, opts);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, status: "WAITING_FOR_CHANNEL_OPEN", paymentStatus: "SUCCESSFUL_PAYMENT", sizeSats: 2_000_000 });
+  s.magma.sales.get(sale.id)!.timeout = null;
+  s.node.addPlainInvoice({ tokens: 2_436, description: `Magma order ${sale.id}`, paid: true });
+  return { s, sale };
+}
+const openRatesOf = (s: ReturnType<typeof sellerSetup>) =>
+  s.node.callsTo("default.openChannel").map((a) => (a.sat_per_vbyte === undefined ? undefined : Number(a.sat_per_vbyte)));
+
+test("an order paid by a settled plain invoice is opened whatever the on-chain fee — there is no held payment to give back after a wait; before, it waited and ended 'failed' with the payment kept", async (t) => {
+  const { s, sale } = settledLegacyOrder(t);
+  s.node.peers.push(BUYER);
+  // 400 sat/vB: 70,000 sat for a sale of 2,436 — a held order would wait.
+  s.node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: "100000" }));
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), [400], "opened, at the stated rate");
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.via, e?.phase], ["legacy", "reported"]);
+});
+
+test("…and with no fee estimate from LND it is opened at the rate LND picks, as before", async (t) => {
+  const { s, sale } = settledLegacyOrder(t, { openFeeUnknown: true });
+  s.node.peers.push(BUYER);
+  s.node.override("wallet.estimateFee", (_a, cb) => cb({ details: "fee estimation failed" }));
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), [undefined]);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
+});
+
+test("an order paid by a settled plain invoice whose buyer is offline: dialed for as long as a held payment would allow — not ended 'failed' after 30 minutes with the payment kept — and opened when the buyer is back", async (t) => {
+  const { s, sale } = settledLegacyOrder(t);
+  const back = buyerOffline(s.desk);
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "held");
+  const t0 = Date.now();
+  // Twelve hours on: before, "failed" since the 31st minute.
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + 12 * 3_600_000 });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "held");
+  assert.match(entryOnDisk(s.dir, sale.id)?.lastError ?? "", /connection timed out.* — will try again$/);
+  back();
+  t.mock.timers.setTime(t0 + 12 * 3_600_000 + 20 * 60_000);
+  await s.autopilot.pollSellOrders();
+  assert.equal(s.node.callsTo("default.openChannel").length, 1);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
+});
+
+test("…and a buyer who stays away for all that time: the order ends here, its coins free again — within the time and not before", async (t) => {
+  const { s, sale } = settledLegacyOrder(t);
+  buyerOffline(s.desk);
+  await s.autopilot.pollSellOrders();
+  const t0 = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + LEGACY_OPEN_RETRY_MS - 5 * 60_000 });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "held");
+  // (Five minutes on: a buyer away is dialed again after three.)
+  t.mock.timers.setTime(t0 + LEGACY_OPEN_RETRY_MS + 5 * 60_000);
+  await s.autopilot.pollSellOrders();
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "failed");
+  assert.match(e?.reason ?? "", /^channel open failed: couldn't connect/);
+  assert.equal(s.autopilot.capital.reservedSat(), 0);
+  assert.equal(s.node.callsTo("default.openChannel").length, 0);
+  // The buyer's payment is settled here and nothing gives it back: before,
+  // that was the end of it — no alert, nobody told (review of the package).
+  assert.ok(e?.paymentKeptAt);
+  assert.match(e?.events.at(-1)?.what ?? "", /the buyer's payment is settled here and does not go back by itself$/);
+  const alerts = magmaKeptPaymentAlerts(s.desk);
+  assert.equal(alerts.length, 1);
+  assert.deepEqual([alerts[0].level, alerts[0].id], ["warn", `magma:${sale.id}`]);
+  assert.match(
+    alerts[0].message,
+    /^A paid 2,000,000 sat Magma order ended with no channel opened: channel open failed: couldn't connect .*The buyer's 2,436 sat are settled here and do not go back by themselves: “Open channel” on Market → Orders tries again/,
+  );
+  // No two-day limit, unlike a refund: the buyer's money is still here.
+  t.mock.timers.setTime(t0 + LEGACY_OPEN_RETRY_MS + 30 * 24 * 3_600_000);
+  assert.equal(magmaKeptPaymentAlerts(s.desk).length, 1);
+  assert.equal(magmaKeptPaymentAlerts(s.restart().magma).length, 1, "after a restart too");
+  // Not a refund, and not an order turned down.
+  assert.deepEqual(s.desk.refunds(), []);
+  assert.deepEqual(s.desk.refusals(), []);
+  // Until dismissed.
+  assert.equal(s.desk.acknowledgeRefusal(sale.id), true);
+  assert.deepEqual(magmaKeptPaymentAlerts(s.desk), []);
+  assert.deepEqual(magmaKeptPaymentAlerts(s.restart().magma), []);
+});
+
+test("…and “Open channel” takes such an order up again while Amboss still waits for its channel: one channel, booked as the sale it is — before, the click was refused for an order that is over", async (t) => {
+  const { s, sale } = settledLegacyOrder(t);
+  const back = buyerOffline(s.desk);
+  await s.autopilot.pollSellOrders();
+  const t0 = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + LEGACY_OPEN_RETRY_MS + 5 * 60_000 });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "failed");
+  assert.equal(s.desk.acknowledgeRefusal(sale.id), true);
+  // The buyer is still away: the click says so, and the order is the lane's
+  // again — tried as long as one just found, with its coins set aside.
+  let res = await s.desk.open(sale.id);
+  assert.equal(res.ok, false);
+  assert.match(res.message ?? "", /couldn't be reached yet/);
+  let e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.paymentKeptAt, e?.reason], ["held", undefined, undefined]);
+  assert.equal(s.autopilot.capital.reservedSat(), 2_000_000);
+  assert.deepEqual(magmaKeptPaymentAlerts(s.desk), []);
+  t.mock.timers.setTime(t0 + LEGACY_OPEN_RETRY_MS + 20 * 3_600_000);
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "held", "20 hours after the click: still tried");
+  // The buyer is back: the lane opens the channel — once.
+  back();
+  s.node.peers.push(BUYER);
+  t.mock.timers.setTime(t0 + LEGACY_OPEN_RETRY_MS + 20 * 3_600_000 + 5 * 60_000);
+  await s.autopilot.pollSellOrders();
+  assert.equal(s.node.callsTo("default.openChannel").length, 1);
+  res = await s.desk.open(sale.id);
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(s.node.callsTo("default.openChannel").length, 1, "a second click opens nothing");
+  s.magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  await s.autopilot.pollSellOrders();
+  e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "settled");
+  assert.deepEqual(s.earnings.recent().map((r) => r.leaseSats), [2_436]);
+  assert.deepEqual(magmaKeptPaymentAlerts(s.desk), []);
+});
+
+test("…a click that cannot open it either lets the lane try for as long again, and the alert comes back when that ends — dismissed or not before", async (t) => {
+  const { s, sale } = settledLegacyOrder(t);
+  buyerOffline(s.desk);
+  await s.autopilot.pollSellOrders();
+  const t0 = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + LEGACY_OPEN_RETRY_MS + 5 * 60_000 });
+  await s.autopilot.pollSellOrders();
+  assert.equal(s.desk.acknowledgeRefusal(sale.id), true);
+  assert.equal((await s.desk.open(sale.id)).ok, false);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "held");
+  t.mock.timers.setTime(t0 + 2 * LEGACY_OPEN_RETRY_MS + 15 * 60_000);
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "failed");
+  assert.equal(magmaKeptPaymentAlerts(s.desk).length, 1, "said again");
+  // Amboss gave the order up meanwhile: the click is told so, nothing is taken up.
+  s.magma.setStatus(sale.id, "SELLER_REJECTED");
+  const res = await s.desk.open(sale.id);
+  assert.equal(res.ok, false);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "failed");
+  assert.equal(magmaKeptPaymentAlerts(s.desk).length, 1);
+  assert.equal(s.node.callsTo("default.openChannel").length, 0);
+});
+
+test("a deadline of Amboss's for such an order's channel ends it the same way: the operator is told the payment was kept", async (t) => {
+  // Review of the package: with the order's `timeout` still ahead when it
+  // was found, it ended "failed" minutes before that time — silently.
+  const { s, sale } = settledLegacyOrder(t);
+  buyerOffline(s.desk);
+  const t0 = Date.now();
+  s.magma.sales.get(sale.id)!.timeout = new Date(t0 + 3_600_000).toISOString();
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "held");
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + 3_600_000 - 5 * 60_000 });
+  await s.autopilot.pollSellOrders();
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "failed");
+  assert.ok(e?.paymentKeptAt);
+  assert.equal(magmaKeptPaymentAlerts(s.desk).length, 1);
+});
+
+test("an order with no payment of ours on record that ends with no channel raises no such alert: nothing of the buyer's is known to be here", async (t) => {
+  feeEnv(t);
+  quiet(t);
+  const s = sellerSetup(t);
+  buyerOffline(s.desk);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, sizeSats: 2_000_000, status: "WAITING_FOR_CHANNEL_OPEN", paymentStatus: "SUCCESSFUL_PAYMENT" });
+  s.magma.sales.get(sale.id)!.timeout = null;
+  await s.autopilot.pollSellOrders();
+  assert.equal((await s.desk.open(sale.id)).ok, false);
+  const t0 = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + LEGACY_OPEN_RETRY_MS + 5 * 60_000 });
+  assert.equal((await s.desk.open(sale.id)).ok, false);
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.paidInvoiceId, e?.paymentKeptAt], ["failed", null, undefined]);
+  assert.deepEqual(magmaKeptPaymentAlerts(s.desk), []);
+  assert.equal(s.desk.acknowledgeRefusal(sale.id), false);
+  // And the click is refused, as for any order that is over.
+  const res = await s.desk.open(sale.id);
+  assert.deepEqual([res.ok, res.code], [false, "bad_status"]);
 });

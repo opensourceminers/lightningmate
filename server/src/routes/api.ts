@@ -144,7 +144,7 @@ import { getBtcPrice } from "../services/price.js";
 import { outboundRouting, viaTor } from "../services/http.js";
 import type { FiatCurrency, SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, FeeMode, OverridesStore } from "../services/overrides.js";
-import { getAlerts, leasePromiseAlerts, magmaPartsAlerts, magmaRefusalAlerts, offerPriceAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
+import { getAlerts, leasePromiseAlerts, magmaKeptPaymentAlerts, magmaPartsAlerts, magmaRefundAlerts, magmaRefusalAlerts, offerPriceAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
 import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
 import { SlidingWindowLimiter } from "../services/rateLimit.js";
 import { acknowledgeStoreIncident } from "../store.js";
@@ -738,6 +738,8 @@ export function createApiRouter(
           ...stateAlerts(config.dataDir),
           ...serviceFeeAlerts(serviceFees),
           ...magmaRefusalAlerts(autopilot.magma),
+          ...magmaRefundAlerts(autopilot.magma),
+          ...magmaKeptPaymentAlerts(autopilot.magma),
           ...magmaPartsAlerts(autopilot.magma),
           ...offerPriceAlerts(autopilot.offerSyncStatus(), autopilot.actsOnOffers(), autopilot.getState().config.sellAutoReprice),
           ...autopilot.onchainLockAlerts(),

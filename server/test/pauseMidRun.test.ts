@@ -372,12 +372,17 @@ function finishedLease(t: TestContext) {
   return s;
 }
 
+/** The auto-close's own listing: the finished leases alone. (The deploy
+ *  share's listing names that status among others — a sold channel still open
+ *  after its lease counts until closed.) */
+const leaseEndListing = (filter: { status?: string[] }) => filter.status?.length === 1 && filter.status[0] === "CHANNEL_MONITORING_FINISHED";
+
 test("Magma: a pause during the offer upkeep — a finished lease's channel is not closed by that run", async (t) => {
   quiet(t);
   const s = finishedLease(t);
   let finishedListings = 0;
   s.magma.salesList = (filter) => {
-    if (filter.status?.includes("CHANNEL_MONITORING_FINISHED")) finishedListings += 1;
+    if (leaseEndListing(filter)) finishedListings += 1;
     return null;
   };
   s.magma.onRead = (op) => {
@@ -398,7 +403,7 @@ test("Magma: a pause while the finished leases are listed — no order of them i
   quiet(t);
   const s = finishedLease(t);
   s.magma.salesList = (filter) => {
-    if (filter.status?.includes("CHANNEL_MONITORING_FINISHED")) s.autopilot.pauseAll();
+    if (leaseEndListing(filter)) s.autopilot.pauseAll();
     return null;
   };
   await s.autopilot.runOnce();

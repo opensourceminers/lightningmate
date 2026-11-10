@@ -33,8 +33,10 @@ if enabled, it runs four independent sub-autopilots in order:
 2. **Rebalancing** — run profitable circular rebalances to refill channels.
 3. **Channels** — open a channel to a well-scored peer if on-chain funds allow.
 4. **Magma** — keep our offer fundable and well-formed, reprice/relist it if asked, optionally
-   auto-close finished leases. (Orders themselves are fulfilled by a separate 45-second order
-   lane, never by this loop.) Off by default: selling is opt-in (Selling).
+   auto-close finished leases (that part runs with selling off too, so a node that stopped
+   selling still gets its sold channels closed as their leases end). (Orders themselves are
+   fulfilled by a separate 45-second order lane, never by this loop.) Off by default: selling
+   is opt-in (Selling).
 
 Each sub-autopilot has its own on/off switch and detailed settings. Every action is a
 **dry-run recommendation** first (shown in the UI), and only applied when its autopilot is
@@ -643,22 +645,78 @@ a dial and the gap to the next pass can take. A dial waits for LND's answer, 90 
 (the quick way through a Tor proxy), each address with its share of the time, tried again if time
 is left. Once a pass has spent that long on dials the other orders wait for the next, the buyers not
 yet dialed first, so silent buyers don't hold up a reachable one (a buyer never dialed with its deadline
-close still gets its try). A paid order's dial is bound by its deadline too, and past it the payment
-is released rather than a channel opened. While an order is pending no offer's window or listing moves up. Before 0.8.7 a dial gave up after 1.5 s, so nearly every
+close still gets its try). A paid order's dial is bound by its deadline too: a first try goes out up to
+it, a failed open is tried again only while it is more than 10 minutes off, and then the payment
+is released rather than a channel opened. That deadline is Amboss's `timeout` only where it lies after
+the payment was held — the approval deadline left in that field is not one (review 2026-11-10: a buyer
+who paid after it was refunded at once), nor is a `timeout` still equal to the one the order showed
+while it awaited approval (kept on its record as `approvalDeadline`): a buyer who paid before that
+deadline, then offline or with fees high, was refunded 10 minutes before it instead of waited for. The hard limit is the held payment itself: a channel is opened
+only while the payment can still be held 60 blocks more (36 for the channel to confirm and Amboss to
+validate it, 24 before the payment is released). Until then — about 38 hours of the invoice's 288
+blocks, before: 30 minutes — a buyer offline after paying is dialed again every 3 minutes and missing
+coins are waited for; an open LND refuses for a reason that may pass (the buyer's node has another
+channel pending) is asked again every 3 minutes too, not on every pass. Then the buyer is refunded and
+the order's record says what was tried last
+("… — last tried: …", or what it waited for: "… — it waited for lower fees until then: …"). Should LND
+name no height for a held payment, those hours cannot be counted and the window stays 30 minutes. An order
+paid outside a HODL invoice (an older version's plain invoice, settled on payment) holds nothing that
+could go back: it is tried for 38 hours after the payment was found, and opened whatever the fee —
+waiting for lower fees could only end with the money kept and no channel. If its channel cannot be
+opened in that time (or before a deadline of Amboss's), the order ends with the buyer's payment kept:
+an alert says so until it is dismissed, and "Open channel" on Market → Orders takes the order up again
+for as long as Amboss lists it as waiting for its channel — otherwise the buyer is owed the payment,
+which the operator settles with them. **A sold channel's open states its fee rate**: LND's regular estimate (6 blocks,
+a whole rate), the one the accept floor is priced with — not the economy rate of the autopilot's own
+opens, and not capped by `channelMaxFeeRate`, for the buyer has paid and waits. The lane opens while
+the funding transaction (175 vB) at that rate costs no more than the order's fee after the service fee;
+above that, or while LND gives no estimate, the paid order waits (checked every pass, said once on its
+record, the lane's status "1 paid order waits for lower on-chain fees", or "… waits for an on-chain
+fee estimate"), for as long as the held
+payment allows an open — then the buyer is refunded. "Open channel" on Market → Orders opens it
+whatever the fee. Every paid order refunded with no channel opened raises an alert (48 h, or until
+dismissed): Amboss may count it against the seller. Before, the open named no rate: LND picked one
+hours after the accept floor was checked, and nothing looked at it. **Amboss's word alone is never income**: an order
+Amboss reports confirmed is settled, booked and charged the service fee only when this node's own
+invoice holds the payment. While that invoice is unpaid the order is looked at again for an hour (a
+payment that arrives is settled as ever; the order's record says so once, not on every pass, and the
+lane's status names the order); then the
+invoice is cancelled and the order ends here, unbooked — its coins free again, or, where its channel
+was opened outside LightningMate, kept as a completed sale that is not booked, so the lease's promises
+go on binding that channel (before, it never ended). While an order is pending no offer's window or listing moves up. Before 0.8.7 a dial gave up after 1.5 s, so nearly every
 buyer not already connected was turned down within seconds
 (a 2,436 sat order on 2026-10-31, 5.3 s into its two-hour window). It decides on new orders only while selling is on (a
 paused lane neither accepts nor rejects one); an order it accepted itself it carries to its
 end either way, and with selling on it also opens the channel of an order accepted by hand
-(Market → Orders says who opens a paid order's channel). A decision made by hand wins over the
+(Market → Orders says who opens a paid order's channel). An order it finds paid with no record here
+and no invoice of ours for it in LND (accepted on amboss.tech or with another tool while LightningMate
+was off) is the one paid order it opens no channel for: LightningMate opens none by itself for a payment
+it can't see — the order waits for "Open channel", and is never booked as a sale. A decision made by hand wins over the
 lane, for an order the lane isn't working on at that moment: a click on Accept or Reject that
 finds the order — Amboss shows it as this node's, awaiting approval, or the lane has it on record
 as awaiting approval (then even a click that can't read it) — makes the order the operator's,
-whatever becomes of the click, and their latest click stands — except for an accept already sent
-whose answer was lost (the record says "accepting"), the operator's or the lane's: an accept that
-may have reached Amboss is completed first, whatever the selling switch says, and a Reject
-meanwhile is refused ("Not rejected: the earlier accept of this order was already sent and is
-being confirmed with Amboss, so it can't be withdrawn."), though Amboss may still show the order
-awaiting approval. A click that finds neither (Amboss or LND not answering) records nothing:
+whatever becomes of the click, and their latest click stands — also against an accept already sent
+that Amboss never confirmed (the record says "accepting"), the operator's or the lane's: a Reject of
+such an order is sent while Amboss still shows it awaiting approval, and again on every pass, the
+accept no more; the accept's invoice is released once Amboss confirms the reject. Only an accept
+Amboss turns out to have applied stands against it: the order is accepted then, and its record says
+so ("Amboss had applied the accept before your reject reached it — the order is accepted"). An
+accept that never went out, cut short by a stop, still refuses a Reject ("Not rejected: an accept
+of this order was under way when LightningMate stopped — the order lane completes or withdraws it
+on its next pass."). An accept Amboss doesn't confirm is handled by what Amboss answered. No
+answer, or an outage (a timeout, a 5xx): the same accept is sent again on the next pass, whatever
+the selling switch says, for it may have reached Amboss. An error about the accept itself (a
+business rule, a 4xx, a query Amboss rejects): a refusal, once the next read shows the order still
+awaiting approval — the invoice is released, and after 3 refusals the lane rejects its own order,
+as it does after 3 answers of `success: false`. With the approval deadline 2 minutes off, the lane
+rejects its own order whose accept is still unconfirmed rather than let it time out on the seller
+— the reject first, the invoice released only once Amboss confirms it, so an accept that did reach
+Amboss is never left without its invoice; an order the operator accepted is never turned down that
+way, and a paused lane rejects nothing; past the deadline no reject is sent. Before, every such accept was sent again every 45 s
+until the order timed out, its size reserved, and a Reject of it was refused. What Amboss answered
+to each accept, reject and funding report, and each read of the order that changed, is kept on the
+order's record in `magma-orders.json` (`amboss`, the last 24, never the key or an invoice). A click
+that finds neither (Amboss or LND not answering) records nothing:
 with selling on, the lane may decide that order before the operator tries again. A
 click that arrives while the lane is already deciding or acting on that same order — its capital
 check, its dial of the buyer (up to about a minute and a half over Tor), its own accept or
@@ -733,14 +791,31 @@ offer is taken off the market again. A new offer is listed automatically only wh
 selling check is better than "not realistic". Optional auto-relist, and optional auto-close
 at a lease's end: the sale's own channel by its funding outpoint (txid and vout), never one a
 running lease is listed on, kept open when under a quarter of it is on our side (the rest is
-inbound worth keeping) or it routes at about what its capital earns sold again — on the coins a
+inbound worth keeping) or it routes well — over 30 days it earned, on the coins a
 close would free, at least 5,000 ppm a year and what a sat of this node's month-old channels earns
-(the node's own average alone, ~340 ppm/yr live, let 56 sat a month keep a 2M channel off the market)
+(the node's own average alone, ~340 ppm/yr live, let 56 sat a month keep a 2M channel off the market;
+the 5,000 is a fixed bar, not what this node's capital would earn sold again — a node that sells
+readily earns more on a new lease)
 — and kept when that can't be told (the forwarding history not read in full, no channel list):
-never closed on a guess — and closed at LND's economy rate, never above the maximum on-chain
-fee rate (`channelMaxFeeRate`), never without an estimate. Right before each close it asks
-again whether selling or auto-close was switched off, or the stage given up. Each reason a
+never closed on a guess — and the close asked for at LND's economy rate, not while that is above the
+maximum on-chain fee rate (`channelMaxFeeRate`), never without an estimate (a buyer's node that insists
+on more ends that round; LND then finishes the close at its own estimate, which can be above the maximum —
+said once on the order's record, and the close not asked again for a day). Right before each close it asks
+again whether auto-close was switched off, all automation paused, or the stage given up. Each reason a
 channel is kept is one line in the order's history (not one per run as its figures move). A 1% service fee applies to completed sales.
+
+**When a lease is over.** Amboss's status (`CHANNEL_MONITORING_FINISHED`) is not enough: the
+channel is closed only once this node's own count agrees — the funding block, the order's lease and
+a day (144 blocks) have passed, the count every by-hand close is held to. Before, the status alone
+closed it, so a status set early would have closed a channel inside its lease. The lease's length is
+the order's on record here, else Amboss's; with none on record, or the node's block height unread,
+the channel is kept. **Auto-close does not need selling on**: a lease that ends after "Liquidity
+provision" was switched off is closed all the same (before, nothing was closed until selling was on
+again); nothing is closed while all automation is paused. **The close is cooperative, always**: while
+the buyer's node is offline none is asked for (tried again when it is back; a force close stays the
+operator's to decide). A close the buyer's node refuses for its fee ("fee proposal exceeds max fee")
+is under way in LND all the same and may finish at LND's own estimate, above the maximum: the order's
+history says so once, and the close is asked again only if the channel is still open a day later.
 
 **How much is listed (0.8.7).** With auto-size and auto-relist, a node's one offer lists what the
 capital cap (`sellMaxDeploySats`) and the wallet allow, and takes orders up to the max channel size.
@@ -774,7 +849,11 @@ else (its floor rounded up), whatever the market or the routing comparison says.
 order waits for approval — or is taken on and not yet booked as a sale — nothing is
 topped up or given back, and the offers share what can be sold. The deploy cap's share is
 Amboss's listing of sold capital plus the journal's own sales funded since; when the listing
-fails, the last good one (under an hour old) stands. A spend outside the main run — a channel
+fails, the last good one (under an hour old) stands. A sold channel counts with its size while its
+lease runs, and after the lease with what is still on this node's side of it, until it is closed
+(before, it stopped counting at the lease's end with its coins still in it, and the next channel
+was sold on top — over a few terms more than the cap sat in once-sold channels); where the cap is
+the limit, the refusal's reason and the offer's note say how much of it such channels hold. A spend outside the main run — a channel
 opened by hand, an on-chain send, an LSPS1 sale's channel — has the offers' capital checked
 within seconds — no price or lease move, but the same capital and cost checks: it cuts what
 can't be funded, can raise the min channel to the smallest order that pays for its channel and

@@ -80,6 +80,12 @@ export interface MagmaJournalEntry {
   } | null;
   acceptAttempts: number;
   acceptSentAt?: string;
+  /** What Amboss answered the last accept sent, when it answered the request
+   *  itself with an error (a business rule, a 4xx, a query it rejects) — not
+   *  an outage, not a lost answer. The next pass that reads the order as
+   *  still awaiting approval takes it as a refusal (MagmaDesk.resumeAccept).
+   *  Gone once the accept is released or confirmed. */
+  acceptRefused?: string;
   heldAt?: string;
   /** Lowest CLTV expiry height of the held HTLCs (cancel before it). */
   heldUntilHeight?: number | null;
@@ -123,6 +129,12 @@ export interface MagmaJournalEntry {
   lastStatusAt?: string;
   /** Amboss's deadline for the current phase, as last seen. */
   timeout?: string | null;
+  /** The `timeout` Amboss showed while the order awaited our approval: the
+   *  approval deadline. Kept apart because `timeout` is overwritten by every
+   *  read — a `timeout` still equal to this one after the accept is that
+   *  deadline left in the field, not a deadline for opening the channel
+   *  (MagmaDesk.openDeadline). */
+  approvalDeadline?: string;
   lastError?: string;
   lastErrorAt?: string;
   /** Consecutive passes in which Amboss refused to show this order although
@@ -139,16 +151,48 @@ export interface MagmaJournalEntry {
    *  settled, that paid for it — what makes it a sale to book. null: LND has
    *  no paid invoice of ours for it (it is fulfilled, but not booked). */
   paidInvoiceId?: string | null;
+  /** Such an order ended "failed" with no channel opened: the buyer's
+   *  payment is settled here and nothing gives it back — the operator's to
+   *  put right (MagmaDesk.paymentsKept; “Open channel” tries again). */
+  paymentKeptAt?: string;
   /** The operator dismissed the alert about this order being turned down. */
   alertAckAt?: string;
   /** Lease over and channel closed by the autopilot (sellAutoClose). */
   closedAt?: string;
   closeTxid?: string;
+  /** Since when Amboss has reported this order's channel confirmed while the
+   *  invoice of ours it was accepted with is unpaid (MagmaDesk.settle;
+   *  review 2026-11-10, LANE-8). */
+  unpaidSince?: string;
+  /** A lease-end close the buyer's node refused for its fee in the first
+   *  round: the shutdown is out and LND goes on with it — not a failure, and
+   *  not asked again each run (MagmaDesk.closeFinishedLeases; CHAN-5). */
+  closeAskedAt?: string;
   /** Short event trail (newest last, bounded). */
   events: { at: string; what: string }[];
+  /** What Amboss answered about this order, as it came (newest last,
+   *  bounded): each accept, reject and funding report — "success: true",
+   *  "success: false", or the error with its HTTP status and GraphQL code —
+   *  and each read of the order whose answer differs from the one before
+   *  (status, timeout, payment status, channel, transaction, confirmations,
+   *  fees). Never the key, never an invoice. What Amboss does at each step
+   *  of a sale has only ever been simulated (review 2026-11-10, lane.md
+   *  section 2): this is where the first live sale shows it. */
+  amboss?: AmbossAnswer[];
+}
+
+/** One answer of Amboss's about an order (MagmaJournalEntry.amboss). */
+export interface AmbossAnswer {
+  at: string;
+  op: "read" | "accept" | "reject" | "report";
+  answer: string;
 }
 
 const EVENTS_KEPT = 30;
+/** Amboss's answers kept on an order's record (MagmaJournal.answered), and
+ *  the most of one answer that is kept. */
+export const ANSWERS_KEPT = 24;
+export const ANSWER_MAX_CHARS = 400;
 const TERMINAL_KEPT = 500;
 
 export class MagmaJournal {
@@ -199,6 +243,29 @@ export class MagmaJournal {
   event(entry: MagmaJournalEntry, what: string): void {
     entry.events.push({ at: new Date().toISOString(), what });
     if (entry.events.length > EVENTS_KEPT) entry.events.splice(0, entry.events.length - EVENTS_KEPT);
+  }
+
+  /** Keep what Amboss answered about an entry's order (in memory; saved
+   *  with the next write). A read's answer is kept only when it differs
+   *  from the last read on record: the lane reads every order on every pass.
+   *  `first`: the read a record was made from, in the pass that made it —
+   *  kept before what that pass sent, at the record's own time. */
+  answered(entry: MagmaJournalEntry, op: AmbossAnswer["op"], answer: string, first = false): void {
+    const kept = (entry.amboss ??= []);
+    const text = answer.length > ANSWER_MAX_CHARS ? `${answer.slice(0, ANSWER_MAX_CHARS)}…` : answer;
+    if (op === "read" && !first) {
+      const last = [...kept].reverse().find((a) => a.op === "read");
+      if (last?.answer === text) return;
+    }
+    if (first) kept.unshift({ at: entry.createdAt, op, answer: text });
+    else kept.push({ at: new Date().toISOString(), op, answer: text });
+    // Over the bound, the oldest read goes first: an accept's or a reject's
+    // answer is what a sale that went wrong is read from, and an Amboss that
+    // answers every other read with an error would push it out.
+    while (kept.length > ANSWERS_KEPT) {
+      const oldestRead = kept.findIndex((a, i) => a.op === "read" && i < kept.length - 1);
+      kept.splice(oldestRead >= 0 ? oldestRead : 0, 1);
+    }
   }
 
   /**

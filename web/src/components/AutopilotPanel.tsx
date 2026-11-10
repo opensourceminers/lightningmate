@@ -8,7 +8,7 @@ import { rangeText } from "../numField";
 import { lateStageNote, repeatsNote, runProgress } from "../statusNotes";
 import { buildPresets, matchesPreset as presetMatches, type Preset } from "../presets";
 import { NEUTRAL_PPM_HINT, historyFeeLine } from "../feeView";
-import { OFFER_AUTOMATION_HINT, PRICING_MODES } from "../magmaView";
+import { AUTO_CLOSE_HINT, OFFER_AUTOMATION_HINT, PRICING_MODES } from "../magmaView";
 import { REBALANCE_POLICY_FIELDS, REMOVED_SETTINGS_NOTE, budgetLine } from "../rebalanceView";
 import {
   AREA_LABEL,
@@ -87,11 +87,20 @@ const REB_NUM_FIELDS: { key: NumKey; label: string; hint?: string }[] = [
 ];
 // Every rebalance setting shown binds the profit gate (rebalanceView.ts).
 const REB_POLICY_FIELDS = REBALANCE_POLICY_FIELDS;
-const CHANNEL_NUM_FIELDS: { key: NumKey; label: string }[] = [
+/** Which opens "Max on-chain fee for opens" binds (review 2026-11-10,
+ *  LANE-4): the label reads as if it covered every open, and a sold
+ *  channel's never looked at it — or at any limit. */
+export const CHANNEL_MAX_FEE_HINT =
+  "The most the autopilot pays to open a channel of its own, and the most it asks to close a sold channel after its lease at (if " +
+  "the buyer's node insists on more, LND may finish that close above it). A channel sold on " +
+  "Magma is not held to it — its buyer has paid: it opens at LND's regular fee rate while that costs no more than the sale " +
+  "earns. Above that the order waits for lower fees (Market → Orders says so, and “Open channel” there opens it anyway); if " +
+  "fees stay there until the held payment runs out, the buyer is refunded and an alert tells you.";
+const CHANNEL_NUM_FIELDS: { key: NumKey; label: string; hint?: string }[] = [
   { key: "channelSizeSats", label: "Channel size (sat, 0=auto)" },
   { key: "channelReserveSats", label: "Keep on-chain reserve (sat)" },
   { key: "channelCooldownMinutes", label: "Open cooldown (min)" },
-  { key: "channelMaxFeeRate", label: "Max on-chain fee for opens (sat/vB)" },
+  { key: "channelMaxFeeRate", label: "Max on-chain fee for opens (sat/vB)", hint: CHANNEL_MAX_FEE_HINT },
 ];
 /** How the channel autopilot decides (shown under its settings). */
 export const CHANNEL_OPEN_HINT =
@@ -113,7 +122,20 @@ export const CHANNEL_OPEN_HINT =
 
 /** What the capital cap does to the listed offer. */
 export const DEPLOY_CAP_HINT =
-  "What may be sold and listed at once. With the autopilot managing your offer, the offer follows it at every run: it lists what is free on chain after what you keep, up to this limit. Coins that come back from a close are listed at the next run; a spend cuts the listing within seconds.";
+  "What may be sold and listed at once. With the autopilot managing your offer, the offer follows it at every run: it lists what is free on chain after what you keep, up to this limit. Coins that come back from a close are listed at the next run; a spend cuts the listing within seconds. " +
+  "A sold channel counts with its size while its lease runs, and with what is still on your side of it after the lease — until it is closed.";
+
+/** Under "Capital to sell": the part of the limit that sits in sold channels
+ *  still open after their lease (review 2026-11-10, LANE-7) — null with
+ *  none, or with no limit set ("Everything free"). */
+export function afterLeaseLine(after: { channels: number; sats: number } | undefined, everything: boolean): string | null {
+  if (everything || !after || after.sats <= 0) return null;
+  const one = after.channels === 1;
+  return (
+    `${after.sats.toLocaleString("en-US")} sat of it ${one ? "is" : "are"} in ${after.channels} sold channel${one ? "" : "s"} still open after ` +
+    `${one ? "its" : "their"} lease — ${one ? "it counts" : "they count"} until closed (Channels).`
+  );
+}
 /** How far one update moves a fee. */
 export const FEE_MOVE_HINT =
   "Each update moves a fee by at most two “Round to” steps up (up to three where a learned elasticity says raising pays; four while " +
@@ -500,10 +522,11 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
     </label>
   );
 
-  const flagBox = (key: FlagKey, text: string) => (
+  const flagBox = (key: FlagKey, text: string, hint?: { label: string; text: string }) => (
     <label className="check ap-check">
       <input type="checkbox" checked={flagShown(key)} disabled={busy || writeOff} onChange={(e) => setFlag(key, e.target.checked)} />
       {text}
+      {hint ? <InfoTip label={hint.label} text={hint.text} /> : null}
     </label>
   );
 
@@ -746,6 +769,7 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
               At most
             </label>
             {sellEverything ? null : numInput("sellMaxDeploySats", "sat", {})}
+            {afterLeaseLine(server.sellAfterLease, sellEverything) ? <p className="muted ap-hint">{afterLeaseLine(server.sellAfterLease, sellEverything)}</p> : null}
           </div>
           {numInput("sellReserveSats", "Keep on chain (sat)")}
           {numFields(REB_NUM_FIELDS.filter((f) => f.key === "rebalanceDailyBudgetSats"))}
@@ -887,7 +911,10 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                   "Auto-size the offer: the standard 30-day lease, the routing-fee promise, and a window from the smallest channel that pays for itself up to what can be funded",
                 )}
                 {flagBox("sellAutoRelist", "Auto-relist: list what is free, up to your capital to sell, and top up after a sale")}
-                {flagBox("sellAutoClose", "Auto-close channels after the lease ends (reclaim the capital on-chain)")}
+                {flagBox("sellAutoClose", "Auto-close channels after the lease ends (reclaim the capital on-chain)", {
+                  label: "When a sold channel is closed, and when it is kept",
+                  text: AUTO_CLOSE_HINT,
+                })}
               </div>
               <h3 className="sub">
                 Largest order

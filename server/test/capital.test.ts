@@ -18,7 +18,7 @@ import type { Lsps1Order } from "../src/services/lsps1.js";
 import { FakeLnd, type FakeChannel } from "./helpers/fakeLnd.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
 import { FakeMagma } from "./helpers/magma.js";
-import { BUYER, sellerSetup, suggestion, type AutopilotSeams } from "./helpers/autopilot.js";
+import { BUYER, sellerSetup, soldOpensKnowTheirFee, suggestion, type AutopilotSeams } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { OPENING_GRACE_MS } from "../src/services/magmaDesk.js";
 
@@ -346,6 +346,7 @@ async function lspSetup(t: TestContext, chainBalance: number) {
   const api = await startApi(t, { node });
   magma.sellerPubkey = api.node.publicKey; // this node's sales and offers
   api.amboss.setKey("test-key");
+  soldOpensKnowTheirFee(api.autopilot);
   api.autopilot.setConfig({ sellEnabled: true, sellMaxDeploySats: 50_000_000, sellMaxChannelSats: 10_000_000 });
   const lsp = api.lsps1 as unknown as LspCreate;
   lsp.quote = async () => ({ feeTotalSat: 20_000, effectivePpm: 5_000 }); // pricing is not under test
@@ -565,6 +566,7 @@ async function sellingApi(t: TestContext, node: FakeLnd) {
   const api = await startApi(t, { node });
   magma.sellerPubkey = api.node.publicKey; // this node's sales and offers
   api.amboss.setKey("test-key");
+  soldOpensKnowTheirFee(api.autopilot);
   api.autopilot.setConfig({ sellEnabled: true, sellMaxDeploySats: 50_000_000, sellMaxChannelSats: 10_000_000 });
   return { api, magma };
 }

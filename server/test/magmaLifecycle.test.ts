@@ -18,6 +18,8 @@ import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { MagmaJournalEntry } from "../src/services/magmaJournal.js";
+import { UNPAID_CONFIRMED_WAIT_MS } from "../src/services/magmaDesk.js";
+import { activeCap } from "../src/services/leaseCaps.js";
 import { JsonStore, storeIncidents } from "../src/store.js";
 import { FakeLnd, paymentHashOf } from "./helpers/fakeLnd.js";
 import { FakeMagma, acceptedInvoice } from "./helpers/magma.js";
@@ -129,28 +131,157 @@ test("INVALID_CHANNEL_OPENING: the HODL invoice is cancelled, no fee, no sale", 
   assert.equal(fees.entries().length, 0);
 });
 
-test("Amboss reporting the channel confirmed is never income on its own: an invoice of ours that holds no payment is not settled, booked or charged", async (t) => {
+test("Amboss reporting the channel confirmed is never income on its own: an invoice of ours that holds no payment is not settled, booked or charged — said once on the order's record, and after an hour the order ends, unbooked", async (t) => {
   feeEnv(t);
   quiet(t);
-  const { autopilot, node, magma, dir, earnings, fees } = sellerSetup(t);
+  const { autopilot, node, magma, dir, earnings, fees, capital } = sellerSetup(t);
   const sale = magma.addSale({ buyerPubkey: BUYER });
   await autopilot.pollSellOrders();
   const hash = acceptedInvoice(magma.sales.get(sale.id)!).id;
   // The buyer never paid — yet Amboss reports the channel valid.
   magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
-  for (let i = 0; i < 2; i++) await autopilot.pollSellOrders();
-  const e = entryOnDisk(dir, sale.id);
+  for (let i = 0; i < 4; i++) await autopilot.pollSellOrders();
+  let e = entryOnDisk(dir, sale.id);
   // Without the guard (the reviewer's mutation S1): settled, booked as a
   // 12,345 sat sale and charged the 1% — for a payment never received.
   assert.notEqual(e?.phase, "settled");
   assert.equal(e?.phase, "accepted");
-  assert.match(e?.lastError ?? "", /Amboss reports VALID_CHANNEL_OPENING, but our invoice is open — nothing to settle/);
+  const unpaid = "Amboss reports VALID_CHANNEL_OPENING, but our invoice is unpaid — nothing to settle (looked at again for an hour, then the order ends here, unbooked)";
+  assert.equal(e?.lastError, unpaid);
+  // Review 2026-11-10, LANE-8: before, the same line was written to the
+  // order's record on every pass (every 45 seconds), for as long as Amboss
+  // listed the order.
+  assert.equal(e?.events.filter((ev) => ev.what === unpaid).length, 1, "said once, not on each of the four passes");
   assert.equal(node.callsTo("invoices.settleInvoice").length, 0);
   assert.equal(node.invoices.get(hash)?.state, "OPEN");
+  // The operator is told where orders are looked at: the lane's status.
+  const lane = autopilot.getState().magmaLane;
+  assert.deepEqual([lane.ok, lane.retrying], [false, true]);
+  assert.equal(
+    lane.error,
+    `1 order is reported confirmed by Amboss while our invoice is unpaid (${sale.id}) — nothing is settled or booked; looked at again for an hour, then the order ends here, unbooked`,
+  );
+  assert.ok(capital.reservedSat() > 0, "its coins stay reserved while it is looked at");
+  // A minute short of the hour: still looked at.
+  const t0 = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + UNPAID_CONFIRMED_WAIT_MS - 60_000 });
+  await autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(dir, sale.id)?.phase, "accepted");
+  // The hour is over: before, the order never ended and its coins stayed
+  // reserved.
+  t.mock.timers.setTime(t0 + UNPAID_CONFIRMED_WAIT_MS + 60_000);
+  await autopilot.pollSellOrders();
+  e = entryOnDisk(dir, sale.id);
+  assert.equal(e?.phase, "cancelled");
+  assert.equal(e?.reason, "Amboss reports VALID_CHANNEL_OPENING, but our invoice stayed unpaid for an hour — nothing to settle, nothing booked");
+  assert.equal(e?.lastError, undefined);
+  assert.equal(node.invoices.get(hash)?.state, "CANCELED", "no payment can land on it later, with nothing left to open for it");
+  assert.equal(capital.reservedSat(), 0, "its coins are free again");
+  assert.equal(autopilot.getState().magmaLane.ok, true);
+  // And it stays ended: nothing more on its record, pass after pass.
+  const events = e?.events.length;
+  await autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(dir, sale.id)?.events.length, events);
+  assert.equal(node.callsTo("invoices.settleInvoice").length, 0);
   assert.equal(earnings.recent().length, 0, "no sale booked");
   assert.equal(fees.entries().length, 0, "no service fee");
   assert.equal(salesOnDisk(dir).length, 0);
   assert.equal(feesOnDisk(dir).length, 0);
+});
+
+test("Amboss reports the channel confirmed, our invoice unpaid, and the channel is one opened outside LightningMate: after the hour the order is kept as a completed sale that is not booked — its channel keeps the lease's promises", async (t) => {
+  feeEnv(t);
+  quiet(t);
+  const s = sellerSetup(t);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, sizeSats: 2_000_000, feeSeller: "12345", promises: { minBlockLength: 4320, feeRateCap: "2200", baseFeeCap: "1" } });
+  await s.autopilot.pollSellOrders();
+  const hash = acceptedInvoice(s.magma.sales.get(sale.id)!).id;
+  const txid = "cd".repeat(32);
+  const channelId = `${s.node.blockHeight - 3}x7x0`;
+  s.node.channels.push({ id: channelId, partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 2_000_000, transactionId: txid, transactionVout: 0 });
+  const amboss = s.magma.sales.get(sale.id)!;
+  amboss.transactionId = `${txid}:0`;
+  amboss.channelId = channelId;
+  s.magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted");
+  const t0 = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + UNPAID_CONFIRMED_WAIT_MS + 60_000 });
+  await s.autopilot.pollSellOrders();
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.unbooked, e?.fundingOutpoint], ["settled", true, `${txid}:0`]);
+  assert.equal(
+    e?.reason,
+    `Amboss reports VALID_CHANNEL_OPENING, but our invoice stayed unpaid for an hour — not booked as a sale: this node received nothing for it; its channel ${txid}:0 keeps the lease's promises`,
+  );
+  assert.equal(s.node.invoices.get(hash)?.state, "CANCELED");
+  assert.equal(s.node.callsTo("invoices.settleInvoice").length, 0);
+  assert.equal(salesOnDisk(s.dir).length, 0, "no sale booked");
+  assert.equal(feesOnDisk(s.dir).length, 0, "no service fee");
+  assert.notEqual(activeCap(s.capital.leaseCaps(), { outpoint: `${txid}:0`, channelId }, s.node.blockHeight), null, "the 2,200 ppm promise binds the channel");
+  assert.equal(s.capital.soldLeases().some((l) => l.orderId === sale.id), true, "and the rebalancer leaves it alone");
+  assert.equal(s.capital.reservedSat(), 0);
+});
+
+test("Amboss reports the channel confirmed before our invoice holds the payment, and the payment arrives within the hour: settled, booked and charged as ever", async (t) => {
+  feeEnv(t);
+  quiet(t);
+  const { autopilot, node, magma, dir } = sellerSetup(t);
+  const sale = magma.addSale({ buyerPubkey: BUYER });
+  await autopilot.pollSellOrders();
+  magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  await autopilot.pollSellOrders();
+  assert.ok(entryOnDisk(dir, sale.id)?.unpaidSince, "looked at again from now");
+  const hash = magma.buyerPays(sale.id, node);
+  magma.setStatus(sale.id, "VALID_CHANNEL_OPENING"); // (the fake's payment moved the order on)
+  const t0 = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + 30 * 60_000 });
+  await autopilot.pollSellOrders();
+  let e = entryOnDisk(dir, sale.id);
+  assert.equal(node.invoices.get(hash)?.state, "SETTLED");
+  assert.deepEqual([e?.phase, e?.unbooked, e?.unpaidSince], ["settled", undefined, undefined]);
+  assert.equal(salesOnDisk(dir).length, 1);
+  assert.equal(feesOnDisk(dir).length, 1);
+  // Long after the hour: it stays a booked sale.
+  t.mock.timers.setTime(t0 + 3 * UNPAID_CONFIRMED_WAIT_MS);
+  await autopilot.pollSellOrders();
+  e = entryOnDisk(dir, sale.id);
+  assert.equal(e?.phase, "settled");
+  assert.equal(salesOnDisk(dir).length, 1);
+});
+
+test("the hour is over and the payment arrives as the unpaid invoice is being cancelled — LND refuses the cancel: the order is not ended, and the next pass settles and books it", async (t) => {
+  // Review of the package (LANE-8): no test held the "paid after all" branch.
+  feeEnv(t);
+  quiet(t);
+  const { autopilot, node, magma, dir } = sellerSetup(t);
+  const sale = magma.addSale({ buyerPubkey: BUYER });
+  await autopilot.pollSellOrders();
+  const hash = acceptedInvoice(magma.sales.get(sale.id)!).id;
+  magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  await autopilot.pollSellOrders();
+  assert.ok(entryOnDisk(dir, sale.id)?.unpaidSince);
+  // The HTLC lands between the lane's look at the invoice and its cancel.
+  let cancels = 0;
+  node.override("invoices.cancelInvoice", (_a, cb) => {
+    cancels++;
+    node.payHoldInvoice(hash);
+    cb({ code: 9, details: "invoice already accepted" });
+  });
+  const t0 = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + UNPAID_CONFIRMED_WAIT_MS + 60_000 });
+  await autopilot.pollSellOrders();
+  let e = entryOnDisk(dir, sale.id);
+  assert.equal(cancels, 1);
+  assert.deepEqual([e?.phase, e?.unpaidSince, e?.cancelledAt], ["accepted", undefined, undefined], "not ended: the payment is held");
+  assert.equal(salesOnDisk(dir).length, 0);
+  await autopilot.pollSellOrders();
+  e = entryOnDisk(dir, sale.id);
+  assert.equal(node.invoices.get(hash)?.state, "SETTLED");
+  assert.deepEqual([e?.phase, e?.unbooked], ["settled", undefined]);
+  assert.equal(salesOnDisk(dir).length, 1, "booked as the sale it is");
+  assert.equal(feesOnDisk(dir).length, 1);
+  assert.equal(cancels, 1, "nothing cancelled after that");
 });
 
 test("Amboss reporting the channel confirmed while our invoice is gone from LND: nothing settled or booked — the order ends instead of waiting forever", async (t) => {

@@ -15,7 +15,7 @@ import {
 } from "./channelOps.js";
 import { isAuthError } from "./amboss.js";
 import { NO_EXTRA_TERMS, createOffer, getMyOffer, getMyOffers, termsOf, toggleOffer, updateOffer, type MyOffer, type OfferTerms } from "./magmaApi.js";
-import { MagmaDesk, deadlineWords, type MagmaSellAction, type SellActionKind } from "./magmaDesk.js";
+import { MagmaDesk, afterLeaseNote, deadlineWords, type MagmaSellAction, type SellActionKind } from "./magmaDesk.js";
 import { CapitalLedger, OnchainMutex, listableSat, spendableOnchain, type Spendable } from "./capital.js";
 import {
   BLOCKS_PER_YEAR,
@@ -968,7 +968,7 @@ const offerWriteWhy = (entries: OfferSyncEntry[], offerId: string): string => {
  *  or better: about what its capital earns sold again (~5,080 ppm/yr on the
  *  live node's comparison, 2026-10-26). The node's own average alone was no bar:
  *  ~340 ppm/yr there, so 56 sat a month kept a 2M channel out of the market. */
-const SOLD_CHANNEL_KEEP_PPM_YEAR = 5_000;
+export const SOLD_CHANNEL_KEEP_PPM_YEAR = 5_000;
 /** What a managed offer lists moves in steps this big (see offer upkeep) … */
 const OFFER_DEPTH_STEP_SATS = 500_000;
 /** … and a step, or a window's max at the wallet's limit, stays this far under
@@ -1694,6 +1694,7 @@ export class Autopilot {
       saleFloorSats: () => this.saleFeeFloorSats(),
       saleFloorNote: () => this.saleFloorNote(),
       soldChannelClose: () => this.soldChannelClose(),
+      soldChannelOpen: () => this.soldChannelOpen(),
       offerPrices: () => this.knownOfferPrices(),
       initialRoutingFee: () => this.initialRoutingFee(),
     });
@@ -2084,6 +2085,10 @@ export class Autopilot {
        *  deployed and what accepted orders hold — the offer upkeep's
        *  headroom (the close list's Magma hint is never more). */
       sellDeployRoomSat: Math.max(0, this.state.config.sellMaxDeploySats - this.capital.deployedSat() - this.capital.reservedSat()),
+      /** Sold Magma channels still open after their lease, and this node's
+       *  coins in them: they count against the deploy cap until closed
+       *  (review 2026-11-10, LANE-7). */
+      sellAfterLease: this.magma.afterLease(),
       lastRunAt: this.state.lastRunAt,
       /** The main run in progress, if any: since when. */
       runningSince: this.runningSince,
@@ -4009,6 +4014,26 @@ export class Autopilot {
     }
   }
 
+  /**
+   * What a sold channel's open goes by (MagmaDesk.openFeeFor; review
+   * 2026-11-10, LANE-4): the on-chain fee rate it pays now — LND's estimate
+   * for its default 6-block target, the one the accept floor is priced with
+   * (saleFeeFloor), as a whole rate (openFeeRateOf); null when LND gives
+   * none — and the service fee's share of a sale's fee. Not the economy rate
+   * of a routing open (openFeeRate): a sold channel has to confirm while the
+   * buyer's payment is held.
+   */
+  async soldChannelOpen(): Promise<{ feeRate: number | null; serviceFeeRate: number }> {
+    let feeRate: number | null = null;
+    try {
+      const { tokens_per_vbyte } = await getChainFeeRate({ lnd: this.readLnd });
+      if (Number.isFinite(tokens_per_vbyte) && tokens_per_vbyte > 0) feeRate = openFeeRateOf(tokens_per_vbyte);
+    } catch {
+      feeRate = null;
+    }
+    return { feeRate, serviceFeeRate: saleFeeConfig().bps / 10_000 };
+  }
+
   /** After a peer couldn't be reached: whether this node lost its own
    *  connection meanwhile — no peer connected at all (or LND can't say) —
    *  and then what to call it; null: other peers are connected, so the
@@ -4636,7 +4661,9 @@ export class Autopilot {
       const listed = ctx.listable(minCh);
       if (!(minCh > 0 && listed >= minCh && maxCh >= minCh)) {
         noOffer = {
-          text: `no offer listed: only ${fmtSat(listed)} sat could be listed after the reserve, promised orders and the deploy cap — below the smallest channel worth selling (${fmtSat(viable)} sat)`,
+          text:
+            `no offer listed: only ${fmtSat(listed)} sat could be listed after the reserve, promised orders and the deploy cap — below the smallest channel worth selling (${fmtSat(viable)} sat)` +
+            (ctx.capRoomSat < viable ? afterLeaseNote(this.magma.afterLease()) : ""),
           state: "waiting",
         };
       }
@@ -4704,22 +4731,31 @@ export class Autopilot {
       const d = this.upkeepDecision(offers, entries, out, notes, noOffer, cfg);
       return halted && d.state === "idle" ? { text: d.text, state: "waiting" } : d;
     });
-
-    // Lease over (Amboss: CHANNEL_MONITORING_FINISHED): close to reclaim the
-    // capital — not once the switch is off (stopWhy).
-    if (cfg.sellAutoClose && !opts.capitalOnly && !this.stopWhy("sellEnabled")) {
-      try {
-        // Asked again right before each close: the switch, auto-close itself,
-        // and whether this stage was given up (stopWhy) — the reads before a
-        // close may answer late.
-        out.push(
-          ...(await this.magma.closeFinishedLeases({ shouldStop: () => this.stopWhy("sellEnabled") !== null || !this.state.config.sellAutoClose })),
-        );
-      } catch (err) {
-        out.push({ orderId: "leases", action: "error", sizeSats: 0, ok: false, error: `closing finished leases: ${errText(err)}` });
-      }
-    }
     return out;
+  }
+
+  /**
+   * Lease over: close the sold channel to reclaim its capital ("Auto-close
+   * channels after the lease ends"; MagmaDesk.closeFinishedLeases has the
+   * rules). The magma stage's second half, after the offer upkeep — and
+   * without it: before, the close sat inside the upkeep, which ends at once
+   * with "Liquidity provision" off, so a node that stopped selling kept every
+   * finished lease's channel open, its coins neither sold nor reclaimed
+   * (review 2026-11-10, OFFER-9). Auto-close is a setting, not one of the
+   * automation switches, so "Pause all automation" does not flip it: nothing
+   * is closed while all automation is paused — nor once auto-close was
+   * switched off, the process is shutting down, or this stage was given up
+   * (asked again right before each close: the reads before one may answer
+   * late).
+   */
+  private async closeEndedLeases(): Promise<AutopilotSell[]> {
+    const stop = () => this.shuttingDown || givenUp() !== null || !!this.state.paused || !this.state.config.sellAutoClose;
+    if (stop()) return [];
+    try {
+      return await this.magma.closeFinishedLeases({ shouldStop: stop });
+    } catch (err) {
+      return [{ orderId: "leases", action: "error", sizeSats: 0, ok: false, error: `closing finished leases: ${errText(err)}` }];
+    }
   }
 
   /**
@@ -4819,7 +4855,8 @@ export class Autopilot {
     const fundable = sellableNow >= Math.max(1, off.minSizeSats);
     const lackOfCapital = () =>
       `disabled by the autopilot for lack of capital: its smallest channel (${fmtSat(off.minSizeSats)} sat) can't be funded — ` +
-      `${fmtSat(sellableNow)} sat sellable after the reserve, promised orders and the deploy cap; it is listed again once it can be`;
+      `${fmtSat(sellableNow)} sat sellable after the reserve, promised orders and the deploy cap; it is listed again once it can be` +
+      (ctx.capRoomSat < off.minSizeSats ? afterLeaseNote(this.magma.afterLease()) : "");
     const unanswered =
       "the autopilot disabled it for lack of capital, and Amboss's answer never came — the next read of the offer tells whether the disable landed";
     const priceSource = () =>
@@ -7025,7 +7062,12 @@ export class Autopilot {
         history: "rebalances",
       });
       const channels = await stage("channels", "channels", this.state.config.channelEnabled, () => this.runChannels(writeLnd), { history: "channels" });
-      const sells = await stage("magma", "magma", true, () => this.runSell(), { history: "sells", offerLock: true });
+      // The offer upkeep (with selling on), then the finished leases' channels
+      // (with auto-close on — selling on or off).
+      const sells = await stage("magma", "magma", true, async () => [...(await this.runSell()), ...(await this.closeEndedLeases())], {
+        history: "sells",
+        offerLock: true,
+      });
       // Advertised-size upkeep: only gossips when a channel's bucket moved.
       // (Its failure used to be swallowed — `.catch(() => [])` — so LND not
       // answering it left no trace; now it is the area's error.) Under the

@@ -22,7 +22,27 @@ import { DEFAULT_CONFIG } from "../src/services/autopilotConfig.js";
 import { DEFAULT_POLICY } from "../src/services/fees.js";
 import { LOOPBACK_HOSTS } from "../src/exposure.js";
 import { SHUTDOWN_GRACE_MS } from "../src/shutdown.js";
-import { AMBOSS_LEASES_MAX_AGE_MS, MANUAL_ACCEPT_SKIP, NOT_REJECTED_ACCEPT_SENT } from "../src/services/magmaDesk.js";
+import {
+  ACCEPT_BEAT_REJECT,
+  AMBOSS_LEASES_MAX_AGE_MS,
+  BUYER_DIALS,
+  CANCEL_MARGIN_BLOCKS,
+  CLOSE_ASKED_RETRY_MS,
+  HODL_CLTV_DELTA,
+  LEGACY_OPEN_RETRY_MS,
+  MANUAL_ACCEPT_SKIP,
+  NO_PAYMENT_WAIT,
+  OPEN_MIN_BLOCKS_LEFT,
+  OPEN_RETRY_MIN_TIME_LEFT_MS,
+  OPEN_RETRY_WINDOW_MS,
+  SOLD_CLOSE_MIN_LOCAL_SHARE,
+  SOLD_KEEP_BAR_TEXT,
+  UNPAID_CONFIRMED_WAIT_MS,
+} from "../src/services/magmaDesk.js";
+import { ANSWERS_KEPT } from "../src/services/magmaJournal.js";
+import { MAGMA_LEASE_MARGIN_BLOCKS } from "../src/services/leaseCaps.js";
+import { SOLD_CHANNEL_KEEP_PPM_YEAR } from "../src/services/autopilot.js";
+import { OPEN_TX_VBYTES } from "../src/services/nodeEconomics.js";
 import { autopilotWith } from "./helpers/autopilot.js";
 import { quiet } from "./helpers/lifecycle.js";
 
@@ -195,7 +215,7 @@ test("the store manifest here is the next release's: category bitcoin, and relea
 // failed, or turn down one whose accept by hand failed. The code now carries
 // out the operator's decision (magmaByHand.test.ts); the docs say so, and
 // quote the reason the Orders tab shows as the code words it.
-test("the docs say a decision made by hand wins over the Magma order lane, for an order the lane isn't working on — a reject Amboss didn't confirm is sent again, an accept that didn't go through leaves the order to the operator, a click mid-step waits, and an accept already sent is completed first", () => {
+test("the docs say a decision made by hand wins over the Magma order lane, for an order the lane isn't working on — a reject Amboss didn't confirm is sent again, an accept that didn't go through leaves the order to the operator, a click mid-step waits, and a Reject stands against an accept already sent that Amboss never confirmed", () => {
   const prose = (doc: string) => doc.replace(/\s+/g, " ");
   // The README is short now and leaves this to the two docs below.
   const security = prose(read("SECURITY.md"));
@@ -233,23 +253,34 @@ test("the docs say a decision made by hand wins over the Magma order lane, for a
     for (const [, said] of doc.matchAll(/"((?:Order is already (?:accepted|rejected)|Not rejected:)[^"]*)"/g)) {
       assert.ok(desk.includes(`"${said}"`), `${name} quotes "${said}" — no click says that (magmaDesk.ts)`);
     }
-    // Review of P9, final round: "makes the order yours, whatever becomes of
-    // the click", "their latest click stands" — while an accept already sent
-    // whose answer was lost ("accepting") is completed first, the lane's or
-    // the operator's, and a Reject meanwhile is refused, though Amboss still
-    // shows the order awaiting approval (magmaByHand.test.ts pins it). Each
-    // doc says so, quoting the refusal as the code words it, and every such
-    // claim is qualified in its own sentence.
+    // Review 2026-11-10, LANE-1: until then an accept already sent whose
+    // answer was lost ("accepting") was completed first and a Reject of it
+    // refused — while an accept Amboss answered with an error was sent again
+    // every pass until the order timed out, and could not be rejected by
+    // hand. A Reject now goes out and stands; only an accept Amboss turns
+    // out to have applied stands against it (magmaAcceptError.test.ts and
+    // magmaByHand.test.ts pin it). Each doc says so, quoting the record's
+    // reason as the code words it, and no longer states the old exception.
     assert.match(
       doc,
-      /an accept already sent whose answer was lost \([^)]*"accepting[^)]*\), (yours|the operator's) or the (lane's|autopilot's): an accept that may have reached Amboss is completed first/,
+      /also against an accept already sent that Amboss never confirmed \([^)]*"accepting[^)]*\), (yours|the operator's) or the (lane's|autopilot's): a Reject of such an order is sent while Amboss still shows it awaiting approval, and again on every pass, the accept no more; the accept's invoice is released once Amboss confirms the reject\./,
       name,
     );
-    const refused = /a Reject meanwhile is refused \("(Not rejected: [^"]*)"\), though Amboss may still show the order awaiting approval/.exec(doc)?.[1];
-    assert.equal(refused, NOT_REJECTED_ACCEPT_SENT, `${name}: the refusal, as the click words it`);
-    for (const [claim] of doc.matchAll(/(whatever becomes of the click|their latest click stands)[^.]*/g)) {
-      assert.match(claim, /except for an accept already sent whose answer was lost/, `${name}: "${claim.slice(0, 60)}…" is qualified`);
-    }
+    const beat = /Only an accept Amboss turns out to have applied stands against it: the order is accepted then, and its record says so \("([^"]*)"\)/.exec(doc)?.[1];
+    assert.equal(beat, ACCEPT_BEAT_REJECT, `${name}: the record's reason, as the code words it`);
+    assert.doesNotMatch(doc, /except for an accept already sent|an accept that may have reached Amboss is completed first|a Reject meanwhile is refused/, name);
+    // What becomes of an accept Amboss doesn't confirm, with the code's
+    // numbers: the refusals after which the lane rejects its own order, and
+    // how close to the approval deadline it rejects rather than waits.
+    const attempts = Number(/const MAX_ACCEPT_ATTEMPTS = (\d+);/.exec(desk)?.[1]);
+    const marginMin = Number(/const REJECT_MARGIN_MS = (\d+) \* 60_000;/.exec(desk)?.[1]);
+    assert.ok(attempts > 0 && marginMin > 0, "the desk's constants");
+    assert.match(doc, new RegExp(`the invoice is released[,;] (and after ${attempts} refusals the lane rejects its own order|the lane rejects its own order after ${attempts})`), name);
+    assert.match(
+      doc,
+      new RegExp(`with the approval deadline ${marginMin} minutes off,? the lane rejects its own order whose accept is still unconfirmed rather than let it time out( on the seller)? — the reject first, the invoice released only once Amboss confirms it`, "i"),
+      name,
+    );
     assert.match(doc, /reject Amboss didn't confirm (\(an error, a refusal\) )?is sent again/, name);
     // Review of P9, round 2: "a click on Accept or Reject makes the order
     // yours, whatever becomes of the click" — while a click that couldn't
@@ -265,17 +296,18 @@ test("the docs say a decision made by hand wins over the Magma order lane, for a
   const deskComments = prose(desk.replace(/^\s*\* ?/gm, ""));
   assert.doesNotMatch(deskComments, /always wins/, "magmaDesk.ts");
   assert.match(deskComments, /wins over the lane \(byHand\): .* That holds for an order the lane isn't working on when the click comes\./, "magmaDesk.ts");
-  // Review of P9, final round: the header and byHand's own account of the
-  // rule state its exception too.
+  // Review 2026-11-10, LANE-1: the header and byHand's own account of the
+  // rule say what the docs say.
   assert.match(
     deskComments,
-    /Nor does a click take back an accept already sent whose answer was lost \("accepting"\), the lane's or the operator's: an accept that may have reached Amboss is completed first, and a Reject meanwhile is refused, saying why\./,
+    /A Reject stands against an accept already sent that Amboss never confirmed \("accepting"\), the lane's or the operator's, too: the reject is sent — again on every pass, the accept no more — and only an accept Amboss turns out to have applied stands against it\./,
     "magmaDesk.ts",
   );
+  assert.doesNotMatch(deskComments, /a Reject meanwhile is refused/, "magmaDesk.ts");
   const byHandDoc = prose((/\/\*\*((?:(?!\*\/)[\s\S])*)\*\/\s*private byHand\(/.exec(desk)?.[1] ?? "").replace(/^\s*\* ?/gm, ""));
   assert.match(
     byHandDoc,
-    /their latest click is what stands: .* an accept already sent whose answer was lost \("accepting"\), the lane's or theirs: an accept that may have reached Amboss is completed first \(resumeAccept\), and a Reject meanwhile is refused/,
+    /their latest click is what stands: .* A Reject of an order with an accept already sent that Amboss never confirmed \("accepting"\), the lane's or theirs, stands too: the reject is sent — again on every pass, the accept no more — and the accept's invoice is released once Amboss confirms it \(rejectSentAccept\)\. Only an accept Amboss turns out to have applied stands against it/,
     "byHand's docblock",
   );
   // Review of P9, final round: the lane's resend of the operator's reject,
@@ -396,4 +428,91 @@ test("SECURITY.md's least-privilege macaroon holds every permission the code's L
   assert.doesNotMatch(readme, /admin\.macaroon` for write mode/);
   assert.match(readme, /\| `LND_WRITE_MACAROON` \| write mode only \(with `LM_ENABLE_WRITE=true`\)/);
   for (const env of ["LND_WRITE_MACAROON", "LND_WRITE_MACAROON_PATH", "LM_ENABLE_WRITE"]) assert.match(config, new RegExp(`process\\.env\\.${env}\\b`), env);
+});
+
+test("the docs say how long a paid order's channel may still be opened and what its open may cost — in the code's own numbers", () => {
+  // Review 2026-11-10, LANE-2, LANE-4, LANE-6.
+  const flat = strategy.replace(/\s+/g, " ");
+  const confirm = OPEN_MIN_BLOCKS_LEFT - CANCEL_MARGIN_BLOCKS;
+  assert.ok(
+    flat.includes(`only while the payment can still be held ${OPEN_MIN_BLOCKS_LEFT} blocks more (${confirm} for the channel to confirm and Amboss to validate it, ${CANCEL_MARGIN_BLOCKS} before the payment is released)`),
+    "the open window, in blocks",
+  );
+  const hours = Math.round(((HODL_CLTV_DELTA - OPEN_MIN_BLOCKS_LEFT) * 10) / 60);
+  assert.ok(flat.includes(`about ${hours} hours of the invoice's ${HODL_CLTV_DELTA} blocks`), "how long a buyer is waited for");
+  assert.match(flat, /Amboss's `timeout` only where it lies after the payment was held/);
+  // Review of the package: the windows in minutes and hours, and the rule
+  // for the approval deadline Amboss may leave in `timeout`.
+  assert.ok(flat.includes(`a failed open is tried again only while it is more than ${OPEN_RETRY_MIN_TIME_LEFT_MS / 60_000} minutes off`), "the open deadline's margin");
+  assert.equal(OPEN_RETRY_MIN_TIME_LEFT_MS, 10 * 60_000);
+  assert.ok(flat.includes(`blocks, before: ${OPEN_RETRY_WINDOW_MS / 60_000} minutes — a buyer offline after paying is dialed again`), "what the window was");
+  assert.match(flat, /nor is a `timeout` still equal to the one the order showed while it awaited approval \(kept on its record as `approvalDeadline`\)/);
+  assert.ok(
+    flat.includes(`it is tried for ${LEGACY_OPEN_RETRY_MS / 3_600_000} hours after the payment was found, and opened whatever the fee`),
+    "an order paid outside a HODL invoice",
+  );
+  // Review of the package, second round: what follows those hours, the
+  // fallback window and how often a refused open is asked again.
+  assert.match(flat, /the order ends with the buyer's payment kept: an alert says so until it is dismissed, and "Open channel" on Market → Orders takes the order up again/);
+  assert.ok(flat.includes(`those hours cannot be counted and the window stays ${OPEN_RETRY_WINDOW_MS / 60_000} minutes`), "the fallback window");
+  assert.ok(flat.includes(`is asked again every ${BUYER_DIALS.redialMs / 60_000} minutes too, not on every pass`), "a refused open's spacing");
+  assert.match(flat, /the lane's status "1 paid order waits for lower on-chain fees", or "… waits for an on-chain fee estimate"/);
+  assert.match(flat, /"… — it waited for lower fees until then: …"/);
+  // What Amboss answered, on the order's record.
+  assert.ok(flat.includes(`(\`amboss\`, the last ${ANSWERS_KEPT}, never the key or an invoice)`), "how many answers are kept");
+  assert.ok(flat.includes(`the funding transaction (${OPEN_TX_VBYTES} vB) at that rate costs no more than the order's fee after the service fee`), "the open's limit");
+  assert.match(flat, /not capped by `channelMaxFeeRate`/);
+  assert.match(flat, /Every paid order refunded with no channel opened raises an alert/);
+  // LANE-5: the one paid order the lane opens no channel for.
+  assert.match(flat, /LightningMate opens none by itself for a payment it can't see — the order waits for "Open channel"/);
+  assert.match(NO_PAYMENT_WAIT, /opens no channel by itself for a payment it can't see: waiting for you to open the channel$/);
+  const security = read("SECURITY.md").replace(/\s+/g, " ");
+  assert.ok(security.includes(`A channel is opened only while the payment can still be held ${OPEN_MIN_BLOCKS_LEFT} blocks more`));
+  assert.match(security, /an open that would cost more on chain than the sale earns/);
+  const e2e = read("docs/E2E-TESTING.md").replace(/\s+/g, " ");
+  assert.ok(e2e.includes(`If ${OPEN_TX_VBYTES} vB at that rate cost more than the order's fee after the 1 % service fee`));
+});
+
+test("the docs and the Auto-close hint say when a sold channel is closed at its lease's end, and when it is kept — in the code's own numbers", () => {
+  // Review 2026-11-10, LANE-3, OFFER-9, CHAN-5.
+  const flat = strategy.replace(/\s+/g, " ");
+  const ppm = SOLD_CHANNEL_KEEP_PPM_YEAR.toLocaleString("en-US");
+  assert.equal(SOLD_CLOSE_MIN_LOCAL_SHARE, 0.25, "“a quarter”");
+  assert.equal(CLOSE_ASKED_RETRY_MS, 24 * 3_600_000, "“a day later”");
+  assert.equal(MAGMA_LEASE_MARGIN_BLOCKS, 144, "“a day” of blocks");
+  assert.ok(flat.includes("kept open when under a quarter of it is on our side"));
+  assert.ok(flat.includes(`it routes well — over 30 days it earned, on the coins a close would free, at least ${ppm} ppm a year`));
+  assert.ok(flat.includes(`the funding block, the order's lease and a day (${MAGMA_LEASE_MARGIN_BLOCKS} blocks) have passed`));
+  assert.match(flat, /Amboss's status \(`CHANNEL_MONITORING_FINISHED`\) is not enough/);
+  assert.match(flat, /\*\*Auto-close does not need selling on\*\*.*nothing is closed while all automation is paused/);
+  assert.match(flat, /while the buyer's node is offline none is asked for/);
+  assert.match(flat, /asked again only if the channel is still open a day later/);
+  // Review of the package: the maximum binds the rate the close is asked
+  // at — not what LND may settle on with the buyer's node.
+  assert.match(flat, /the close asked for at LND's economy rate, not while that is above the maximum on-chain fee rate \(`channelMaxFeeRate`\)/);
+  assert.match(flat, /LND then finishes the close at its own estimate, which can be above the maximum/);
+  assert.match(flat, /whether auto-close was switched off, all automation paused, or the stage given up/);
+  // LANE-7: such a channel counts against the deploy cap until closed.
+  assert.match(flat, /after the lease with what is still on this node's side of it, until it is closed/);
+  // What the order's history says of a channel that routes well.
+  assert.ok(SOLD_KEEP_BAR_TEXT.includes(`at least ${ppm} ppm a year`));
+  // The web's hint on the switch itself.
+  const view = read("web/src/magmaView.ts").replace(/"\s*\+\s*"/g, "");
+  const hint = view.slice(view.indexOf("export const AUTO_CLOSE_HINT"));
+  assert.ok(hint.includes("while less than a quarter of it is on your side"));
+  assert.ok(hint.includes(`at least this node's average and ${ppm} ppm a year`));
+  assert.match(hint, /Amboss lists it as finished and, by this node's own count, the funding block, the lease and a day have passed/);
+  assert.match(hint, /It also works with selling switched off/);
+  assert.match(hint, /nothing is closed while all automation is paused/);
+  assert.match(hint, /while the buyer's node is offline \(a force close stays yours to decide, on Channels\)/);
+  assert.match(hint, /LND may still finish the close at its own estimate, which can be above that maximum/);
+  assert.match(hint, /the order's history on Market → Orders says which, for a sale this app recorded/);
+  assert.doesNotMatch(hint.slice(0, hint.indexOf("\n\n")), /never above/);
+});
+
+test("the docs say how long an order Amboss reports confirmed is looked at while our invoice is unpaid", () => {
+  // Review 2026-11-10, LANE-8.
+  const flat = strategy.replace(/\s+/g, " ");
+  assert.equal(UNPAID_CONFIRMED_WAIT_MS, 3_600_000, "“an hour”");
+  assert.match(flat, /While that invoice is unpaid the order is looked at again for an hour .* then the invoice is cancelled and the order ends here, unbooked/);
 });

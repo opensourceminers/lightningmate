@@ -10,6 +10,7 @@ import {
   isNotFoundAnswer,
   isQueryRejected,
   isRateLimited,
+  isTransientAmbossError,
 } from "./amboss.js";
 import {
   FUNDING_REPORTED_STATUSES,
@@ -53,9 +54,10 @@ import type { EarningsLog } from "./earningsLog.js";
 import type { ServiceFeeLedger } from "./serviceFee.js";
 import { errorText } from "./errorText.js";
 import { getOwnPubkey } from "./node.js";
-import type { SoldLease } from "./leaseCaps.js";
+import { fundingHeight, leaseEndHeight, type SoldLease } from "./leaseCaps.js";
 import { standardChannelId } from "./leases.js";
 import { orderFeeSat } from "./magmaRecommend.js";
+import { OPEN_TX_VBYTES } from "./nodeEconomics.js";
 
 /**
  * Magma selling, end to end, on the Magma API — the "order desk".
@@ -103,10 +105,24 @@ import { orderFeeSat } from "./magmaRecommend.js";
  * of the operator's earlier reject — finishes first, and a click that then
  * finds the order accepted or rejected says so, changing nothing: done, if
  * that is what it asked for; refused, if it asked for the other (README,
- * SECURITY.md; magmaByHand.test.ts pins it). Nor does a click take back an
- * accept already sent whose answer was lost ("accepting"), the lane's or the
- * operator's: an accept that may have reached Amboss is completed first, and
- * a Reject meanwhile is refused, saying why.
+ * SECURITY.md; magmaByHand.test.ts pins it). A Reject stands against an
+ * accept already sent that Amboss never confirmed ("accepting"), the lane's
+ * or the operator's, too: the reject is sent — again on every pass, the
+ * accept no more — and only an accept Amboss turns out to have applied
+ * stands against it.
+ *
+ * An accept Amboss doesn't confirm (review 2026-11-10, LANE-1): no answer,
+ * or an outage (a timeout, a 5xx) — the same accept is sent again on the
+ * next pass, for it may have reached Amboss; an error about the accept
+ * itself (a business rule, a 4xx, a query Amboss rejects) — a refusal, once
+ * the next read shows the order still awaiting approval: the invoice is
+ * released, and after MAX_ACCEPT_ATTEMPTS the lane rejects its own order.
+ * With the approval deadline inside REJECT_MARGIN_MS the lane rejects its
+ * own order whose accept is still unconfirmed rather than let it time out —
+ * the reject first, the invoice released once Amboss confirms it
+ * (rejectSentAccept). What Amboss answered to each accept, reject and report,
+ * and each read that changed, is kept on the order's record (journal:
+ * `amboss`).
  */
 
 /** Amboss: the HODL invoice "must expire in at least 48 hours". */
@@ -144,10 +160,25 @@ const READ_FAILED = /^(could not read the order from Amboss|Amboss refused to sh
  *  journal) keeps its reservation until its open deadline, or this long. */
 const LEGACY_HOLD_MS = 48 * 3_600_000;
 /** A transient open failure (peer offline, coins not yet confirmed) is
- *  retried on later passes while the channel-open deadline is this far away. */
-const OPEN_RETRY_MIN_TIME_LEFT_MS = 10 * 60_000;
-/** …or, when Amboss gives no deadline, for this long after the payment. */
-const OPEN_RETRY_WINDOW_MS = 30 * 60_000;
+ *  retried on later passes while the channel-open deadline is this far away
+ *  — a deadline Amboss gives for the open (openDeadline). With none, it is
+ *  retried for as long as the held payment allows an open at all
+ *  (OPEN_MIN_BLOCKS_LEFT): about 38 hours of the 288 blocks. Review
+ *  2026-11-10, LANE-6: it was 30 minutes after the payment, and a buyer
+ *  offline that long right after paying was refunded — an order ended as the
+ *  seller's failure to open, with a day and a half of the payment unused. */
+export const OPEN_RETRY_MIN_TIME_LEFT_MS = 10 * 60_000;
+/** …or, should a held payment's height be unknown (LND did not say until
+ *  when it holds it), this long after the payment. */
+export const OPEN_RETRY_WINDOW_MS = 30 * 60_000;
+/** …and for an order paid outside a HODL invoice (accepted by an older
+ *  version: a plain invoice, settled when the buyer paid) with no deadline,
+ *  this long after its payment was found — as long as a held payment would
+ *  have let the lane try. The buyer's money is here and cannot be handed
+ *  back by releasing anything, so the channel is owed for as long as Amboss
+ *  keeps the order open; half an hour of a buyer's node away ended it
+ *  "failed", the payment kept (review of the package). */
+export const LEGACY_OPEN_RETRY_MS = 38 * 3_600_000;
 const MAX_ACCEPT_ATTEMPTS = 3;
 /** Reject (rather than wait) once the approval deadline is this close. */
 const REJECT_MARGIN_MS = 2 * 60_000;
@@ -169,6 +200,29 @@ export const BUYER_DIALS = { redialMs: 3 * 60_000, passBudgetMs: 90_000, rejectM
 /** What the run history says of a buyer away: one counted line. The order's
  *  record and the lane's status carry LND's words, which vary from dial to dial. */
 const BUYER_AWAY = "the buyer's node couldn't be reached yet — trying again";
+/** Why the lane opens no channel by itself for an order found past approval
+ *  with no record here and no invoice of ours in LND (fulfil; LANE-5). */
+export const NO_PAYMENT_WAIT =
+  "Amboss shows this order paid, but LND has no invoice of ours for it (accepted outside LightningMate?) — " +
+  "LightningMate opens no channel by itself for a payment it can't see: waiting for you to open the channel";
+/** How long an order Amboss reports as confirmed is looked at again while
+ *  the invoice of ours it was accepted with is unpaid, before it ends here
+ *  unbooked (settle, endUnpaid; LANE-8). */
+export const UNPAID_CONFIRMED_WAIT_MS = 3_600_000;
+const UNPAID_CONFIRMED_NEXT = "looked at again for an hour, then the order ends here, unbooked";
+/** No invoice of ours held or settled this order's payment (book, fulfil). */
+const noPaymentOfOurs = (entry: MagmaJournalEntry): boolean => !entry.invoice && !entry.paidInvoiceId;
+/** What the run history says of a paid order whose channel waits for lower
+ *  on-chain fees: one counted line. The order's record and the lane's status
+ *  carry the rate and the sums. */
+const OPEN_FEE_WAIT = "a sold channel waits for lower on-chain fees — trying again";
+/** …and of one that waits because LND gives no fee estimate. */
+const OPEN_FEE_UNKNOWN = "a sold channel waits for an on-chain fee estimate — trying again";
+/** What a wait for the open's fee says after its reason, on the order's
+ *  record and in the lane's status (openFeeFor) — taken off again where the
+ *  wait has ended (cannotOpen): `lower` fees, or an estimate at all. */
+const OPEN_ANYWAY = "“Open channel” on Market → Orders opens it anyway";
+const feeWaitTail = (lower: boolean): string => ` — waiting for ${lower ? "lower fees" : "one"} (${OPEN_ANYWAY})`;
 /** A dial ends this long before the order's deadline (dialBudgetFor). */
 const DIAL_DEADLINE_SLACK_MS = 30_000;
 /** An invoice billed from an order's fee parts (fees.seller read 0) must be
@@ -207,15 +261,27 @@ const REJECT_STANDS = "Your reject stands: the order lane sends it again until A
  *  ending as the click asked. */
 const ALREADY_ACCEPTED = "Order is already accepted.";
 const ALREADY_REJECTED = "Order is already rejected.";
+/** What a click's reject is told when Amboss didn't confirm it and an accept
+ *  of ours for that order was sent earlier, its answer an error or lost
+ *  ("accepting"): the reject stands and is sent again, the accept is not —
+ *  but an accept Amboss turns out to have applied can't be undone, and the
+ *  click is told that too. (Review 2026-11-10, LANE-1: such a Reject was
+ *  refused outright — "…is being confirmed with Amboss, so it can't be
+ *  withdrawn" — while the accept was sent again every pass until the order
+ *  timed out on the seller.) */
+export const REJECT_STANDS_ACCEPT_SENT =
+  "Your reject stands: the order lane sends it again until Amboss confirms it or the order ends, and no longer sends the earlier accept. If that accept reached Amboss after all, the order is accepted and its record says so.";
+/** On the record of an order whose accept Amboss had applied before the
+ *  operator's reject reached it: accepted, and why. */
+export const ACCEPT_BEAT_REJECT = "Amboss had applied the accept before your reject reached it — the order is accepted";
+/** The lane's own reject of an order whose accept Amboss never confirmed,
+ *  with the approval deadline inside the reject margin. */
+const ACCEPT_UNCONFIRMED_REJECT = "Amboss did not confirm the accept before the approval deadline — rejected rather than left to time out";
 /** Why a Reject can't turn down an order with an accept of ours under way
- *  ("accepting") — the lane's or the operator's. Sent, its answer lost: it
- *  may have reached Amboss, and is completed (resumeAccept), though Amboss
- *  may still show the order awaiting approval. Cut short by a stop before it
- *  was sent: the lane's next pass completes it — or withdraws one of its own
+ *  that never went out ("accepting", cut short by a stop before it was
+ *  sent): the lane's next pass completes it — or withdraws one of its own
  *  with selling off. (Review of P9, final round: "Order is already accepting
  *  here.") */
-export const NOT_REJECTED_ACCEPT_SENT =
-  "Not rejected: the earlier accept of this order was already sent and is being confirmed with Amboss, so it can't be withdrawn.";
 const NOT_REJECTED_ACCEPT_UNSENT =
   "Not rejected: an accept of this order was under way when LightningMate stopped — the order lane completes or withdraws it on its next pass.";
 /** A click's answer, a second sentence added: the first one's own closing
@@ -322,6 +388,11 @@ export interface MagmaDeskDeps {
    *  can't be told — kept). Without it, no such channel is closed: never at
    *  any rate. */
   soldChannelClose?: () => Promise<{ feeRate: number | null; maxFeeRate: number; routesWell: (channelId: string) => boolean | null }>;
+  /** For the open of a sold channel (openFor, openFeeFor): the on-chain fee
+   *  rate it pays now (sat/vB, a whole rate; null: LND gives no estimate)
+   *  and the service fee's share of a sale's fee (Autopilot.soldChannelOpen).
+   *  Without it, the open names no rate — LND picks one — and has no limit. */
+  soldChannelOpen?: () => Promise<{ feeRate: number | null; serviceFeeRate: number }>;
   /** The prices this node's offers ask, or asked lately
    *  (Autopilot.knownOfferPrices): an invoice billed from an order's fee
    *  parts — fees.seller read 0 — must be one of them for the order's size.
@@ -338,6 +409,41 @@ export interface MagmaDeskDeps {
  *  frees little (review 2026-10-25: 20k of 2M closed, 1.98M of inbound given
  *  up). */
 export const SOLD_CLOSE_MIN_LOCAL_SHARE = 0.25;
+
+/** Amboss's status of a sale whose lease is over. */
+const LEASE_OVER_STATUS = "CHANNEL_MONITORING_FINISHED";
+
+/** Sold channels still open after their lease: how many, and what is on
+ *  this node's side of them. */
+export interface CoinsAfterLease {
+  channels: number;
+  sats: number;
+}
+
+/** Where the deploy cap is the limit: the part of it that sits in sold
+ *  channels still open after their lease, and what makes room — led in by
+ *  `lead` ("" when there is none). */
+export function afterLeaseNote(after: CoinsAfterLease, lead = "; "): string {
+  if (after.sats <= 0) return "";
+  const one = after.channels === 1;
+  return (
+    `${lead}${Math.round(after.sats).toLocaleString("en-US")} sat of the cap is in ${after.channels} sold channel${one ? "" : "s"} still open after ` +
+    `${one ? "its" : "their"} lease — closing ${one ? "it" : "them"} (Channels) or raising “Capital to sell” makes room`
+  );
+}
+
+/** What "routes well" means where a finished lease's channel is kept for it
+ *  (Autopilot.soldChannelClose holds the bar). Before, the order's history
+ *  read "it earns at least about what selling its capital again would" — a
+ *  comparison nobody makes: the bar is the node's own average and a fixed
+ *  5,000 ppm a year, well under a lease sold again at once (OFFER-9). */
+export const SOLD_KEEP_BAR_TEXT =
+  "over the last 30 days it earned, on the coins a close would free, at least what this node's channels earn on average and at least 5,000 ppm a year";
+
+/** A lease-end close whose fee the buyer's node refused in the first round is
+ *  under way in LND (CloseChannelResult.stillClosing): asked again only when
+ *  the channel is still open this long after (closeFinishedLeases; CHAN-5). */
+export const CLOSE_ASKED_RETRY_MS = 24 * 3_600_000;
 
 /** The open channel at a funding outpoint ("txid:vout"); with no vout, the
  *  one channel of that funding transaction — none when it funds several
@@ -422,6 +528,16 @@ export interface MagmaRefusal {
   at: string;
 }
 
+/** A paid order refunded with no channel opened (MagmaDesk.refunds). */
+export interface MagmaRefund {
+  orderId: string;
+  sizeSats: number;
+  /** What the buyer had paid, and got back. */
+  feeSats: number;
+  reason: string;
+  at: string;
+}
+
 /** Why the caps or the wallet can't take an order (capitalFor). */
 interface Lacking {
   kind: "cap" | "capital";
@@ -472,6 +588,35 @@ const phaseOf = (e: MagmaJournalEntry): MagmaPhase => e.phase;
  *  their decision stands — the lane sends the reject again on every pass
  *  until Amboss confirms it or the order ends (advance, couldNotRead). */
 const rejectByHand = (e: MagmaJournalEntry): boolean => e.phase === "seen" && e.via === "manual" && e.decision?.action === "reject";
+/** A reject the operator clicked for an order with an accept of ours sent
+ *  earlier and never confirmed ("accepting"), that Amboss hasn't confirmed
+ *  either: their decision stands — the lane sends the reject again on every
+ *  pass, and the accept no more (resumeAccept). */
+const rejectAsked = (e: MagmaJournalEntry): boolean => e.phase === "accepting" && e.via === "manual" && e.decision?.action === "reject";
+/** Amboss answered the request itself with an error — a business rule, a
+ *  4xx, a query it rejects: not an outage or a lost answer (those say
+ *  nothing about the request), and not a refused key. */
+const answeredWithError = (err: unknown): boolean =>
+  err instanceof AmbossError && (err.kind === "graphql" || err.kind === "http") && !isTransientAmbossError(err);
+/** An Amboss error as the order's record keeps it (MagmaJournalEntry.amboss):
+ *  its kind, HTTP status and GraphQL code with the message. */
+const ambossSays = (err: unknown): string =>
+  err instanceof AmbossError
+    ? `error (${[err.kind, err.status, err.code].filter((x) => x !== undefined).join(" ")}): ${err.message}`
+    : `error: ${msg(err)}`;
+/** An order as Amboss showed it, for the same record: what the lane's steps
+ *  hang on, and what has only ever been simulated. */
+const orderSays = (o: SaleOrder & Partial<SaleOrderDetail>): string =>
+  JSON.stringify({
+    status: o.status,
+    timeout: o.timeout,
+    payment_status: o.paymentStatus,
+    channel_id: o.channelId,
+    transaction_id: o.transactionId ?? null,
+    confirmations: o.confirmations ?? null,
+    blocks_until_closable: o.blocksUntilClosable ?? null,
+    fees: o.fees,
+  });
 /** An accept or reject of an order the operator took into their own hands
  *  (byHand) carries out their decision — the lane decides none of those
  *  (decide) — and its run-history line says so: the Overview's "Last change
@@ -529,6 +674,12 @@ interface LanePass {
   dialSpentMs: number;
   /** Paid orders whose buyer couldn't be reached yet, for the lane's status. */
   buyersAway: string[];
+  /** Paid orders whose open waits for lower on-chain fees (openFeeFor), for
+   *  the lane's status. */
+  feesHigh: string[];
+  /** Orders Amboss reports confirmed while the invoice of ours they were
+   *  accepted with is unpaid (settle; LANE-8), for the lane's status. */
+  unpaidConfirmed: string[];
   /** Amboss's listing of your sold capital (the deploy cap's share) failed in
    *  this pass: not asked again for every further new order (each time up to
    *  its deadline) — those orders wait for the next pass, or are rejected. */
@@ -576,6 +727,17 @@ const undecidedText = (undecided: string[]): string =>
 const buyersAwayText = (away: string[]): string =>
   `can't reach the buyer of ${away.length === 1 ? "1 paid order" : `${away.length} paid orders`} yet (${away[0]})`;
 
+/** Paid orders whose channel waits for lower on-chain fees — or, the first
+ *  of them, for LND to give a fee estimate at all. */
+const feesHighText = (waiting: string[]): string =>
+  `${waiting.length === 1 ? "1 paid order waits" : `${waiting.length} paid orders wait`} for ` +
+  `${waiting[0].endsWith(feeWaitTail(false)) ? "an on-chain fee estimate" : "lower on-chain fees"} (${waiting[0]})`;
+
+/** Orders Amboss reports confirmed with our invoice unpaid (settle; LANE-8). */
+const unpaidConfirmedText = (ids: string[]): string =>
+  `${ids.length === 1 ? "1 order is" : `${ids.length} orders are`} reported confirmed by Amboss while our invoice is unpaid (${ids[0]}) — ` +
+  `nothing is settled or booked; ${UNPAID_CONFIRMED_NEXT}`;
+
 /** Orders a pass left alone: a given-up pass still waits on a step of theirs. */
 const stuckText = (ids: string[]): string =>
   `${ids.length === 1 ? "1 order waits" : `${ids.length} orders wait`} on a step LND or Amboss hasn't answered (${ids[0]}) — left for a later pass`;
@@ -621,7 +783,7 @@ export class MagmaDesk {
   /** Amboss's last good listing of this node's sold capital: the sats (the
    *  orders this journal reserved then left out), when, and the orders it
    *  showed waiting for this node's approval. */
-  private deployed: { sats: number; at: number; awaiting: string[] } = { sats: 0, at: 0, awaiting: [] };
+  private deployed: { sats: number; at: number; awaiting: string[]; afterLease: CoinsAfterLease } = { sats: 0, at: 0, awaiting: [], afterLease: { channels: 0, sats: 0 } };
   /** When that listing last failed (it isn't asked again at once). */
   private deployedFailedAt = 0;
   /** This node's sales Amboss reports with a running lease and a channel,
@@ -636,12 +798,23 @@ export class MagmaDesk {
   private ambossLeasesTriedAt = 0;
   private ambossLeasesRefresh: Promise<void> | null = null;
   private readonly ambossLeasesStore: JsonStore<AmbossLeasesFile>;
-  /** Funding outpoints ("txid:vout") of finished leases, learned once per
-   *  process. */
-  private readonly finishedTxids = new Map<string, string | null>();
+  /** Finished leases as Amboss's order names them — the funding outpoint
+   *  ("txid:vout") and the lease's length in blocks (0: it says none) —
+   *  learned once per process. */
+  private readonly finishedSales = new Map<string, { point: string | null; leaseBlocks: number }>();
+  /** Lease-end closes the buyer's node refused for their fee, of sales the
+   *  journal has no record of (those it has: closeAskedAt), and when. */
+  private readonly closeAsked = new Map<string, number>();
   /** Orders whose buyer couldn't be reached: when it was last dialed, and why
    *  that failed (decide). A restart simply dials again. */
   private readonly buyerDials = new Map<string, { at: number; what: string }>();
+  /** When LND last refused each held order's open before funding, and why:
+   *  the lane asks again no sooner than it dials a buyer again
+   *  (BUYER_DIALS.redialMs). Before, such an open was asked again on every
+   *  pass — 45 seconds — each writing "open started" on the order's record:
+   *  twenty minutes pushed everything else out of its history, and such an
+   *  order is now tried for hours, not half of one (review of the package). */
+  private readonly openRefused = new Map<string, { at: number; what: string }>();
   /** A finished lease's channel kept open, and why (said once per process). */
   private readonly closeKept = new Map<string, string>();
   /** Orders whose last read Amboss refused or failed, whatever the failure
@@ -788,10 +961,52 @@ export class MagmaDesk {
       .map((e) => ({ orderId: e.orderId, sizeSats: e.sizeSats, reason: e.decision!.reason, deadline: e.timeout ?? null }));
   }
 
-  /** The operator read the alert about a turned-down order. */
+  /**
+   * Paid orders whose payment went back to the buyer with no channel opened,
+   * in the last two days, not yet dismissed (review 2026-11-10, LANE-4): a
+   * sale the buyer had paid for, lost — to on-chain fees above what it
+   * earned, a buyer who stayed away, coins that were not there — and on
+   * Amboss an order the seller did not fulfil. Before, only the order's own
+   * row on Market → Orders said so. (A payment released with a channel on
+   * record is the "unpaid channel" alert's.)
+   */
+  refunds(nowMs = Date.now()): MagmaRefund[] {
+    return this.journal
+      .all()
+      .filter(
+        (e) =>
+          e.phase === "cancelled" &&
+          !!e.heldAt &&
+          !!e.cancelledAt &&
+          !e.fundingOutpoint &&
+          !e.alertAckAt &&
+          nowMs - Date.parse(e.cancelledAt) <= 48 * 3_600_000,
+      )
+      .map((e) => ({ orderId: e.orderId, sizeSats: e.sizeSats, feeSats: feeSatsOf(e), reason: e.reason ?? "the buyer's payment was released", at: e.cancelledAt! }));
+  }
+
+  /**
+   * Orders that ended with the buyer's payment kept and no channel opened,
+   * not yet dismissed: paid by a plain invoice an older version accepted
+   * them with, which settled when the buyer paid — nothing can release it,
+   * and the channel could not be opened in all the time it was tried for
+   * (LEGACY_OPEN_RETRY_MS) or before a deadline of Amboss's. Before, such an
+   * order ended "failed" and nobody was told (review of the package). No
+   * two-day limit, unlike a refund: the buyer's money is still here.
+   */
+  paymentsKept(): MagmaRefund[] {
+    return this.journal
+      .all()
+      .filter((e) => e.phase === "failed" && !!e.paymentKeptAt && !e.fundingOutpoint && !e.alertAckAt)
+      .map((e) => ({ orderId: e.orderId, sizeSats: e.sizeSats, feeSats: feeSatsOf(e), reason: e.reason ?? "the channel could not be opened", at: e.paymentKeptAt! }));
+  }
+
+  /** The operator read the alert about a turned-down order, about a paid
+   *  one refunded (refunds), or about one whose payment was kept
+   *  (paymentsKept). */
   acknowledgeRefusal(orderId: string): boolean {
     const e = this.journal.get(orderId);
-    if (!e || e.phase !== "rejected") return false;
+    if (!e || (e.phase !== "rejected" && !(e.phase === "cancelled" && e.heldAt) && !(e.phase === "failed" && e.paymentKeptAt))) return false;
     e.alertAckAt = now();
     this.journal.note(e);
     return true;
@@ -842,7 +1057,8 @@ export class MagmaDesk {
    * for an order this node has finished with (settled, cancelled, rejected,
    * failed: its held payment released, say) or one accepted outside
    * LightningMate or by another node of the account (`external`), whatever
-   * Amboss still lists: the lane opens no channel for those (advance()).
+   * Amboss still lists: the lane opens no channel for those (advance()) —
+   * nor for one found paid with no invoice of ours in LND (NO_PAYMENT_WAIT).
    * (Review of P7: Market → Orders said "waiting for you to open the
    * channel" for orders the lane was about to open itself. Review of P8:
    * and "the autopilot opens the channel · accepted outside LightningMate"
@@ -856,6 +1072,8 @@ export class MagmaDesk {
     if (!this.deps.writeLnd || !this.deps.amboss.hasKey()) return false;
     const entry = this.journal.get(orderId);
     if (entry && (TERMINAL_PHASES.has(entry.phase) || entry.external)) return false;
+    // Paid, says Amboss, with no invoice of ours: the operator's click (fulfil).
+    if (entry?.phase === "held" && noPaymentOfOurs(entry)) return false;
     return this.deps.config().sellEnabled || (entry?.via === "autopilot" && entry.phase !== "seen");
   }
 
@@ -970,6 +1188,8 @@ export class MagmaDesk {
       undecided: [],
       dialSpentMs: 0,
       buyersAway: [],
+      feesHigh: [],
+      unpaidConfirmed: [],
       deployedFailure: null,
       answered: false,
       own: "",
@@ -1041,6 +1261,8 @@ export class MagmaDesk {
         pass.unread.length > 0 ? unreadText(pass.unread) : null,
         pass.undecided.length > 0 ? undecidedText(pass.undecided) : null,
         pass.buyersAway.length > 0 ? buyersAwayText(pass.buyersAway) : null,
+        pass.feesHigh.length > 0 ? feesHighText(pass.feesHigh) : null,
+        pass.unpaidConfirmed.length > 0 ? unpaidConfirmedText(pass.unpaidConfirmed) : null,
         stuck.length > 0 ? stuckText(stuck) : null,
       ].filter((t): t is string => t !== null);
       const problem: { text: string; retrying: boolean } | null = pass.lndOnly
@@ -1194,9 +1416,10 @@ export class MagmaDesk {
     // node's to accept, open or reject.
     if (order.sellerPubkey !== pass.own) return this.notThisNode(entry, order);
     if (entry) {
+      this.journal.answered(entry, "read", orderSays(order));
       entry.lastStatus = order.status;
       entry.lastStatusAt = now();
-      entry.timeout = order.timeout;
+      this.keepTimeout(entry, order);
       entry.refusals = undefined;
       entry.notFound = undefined;
       // Amboss has just shown the order: a failed read on record — Amboss
@@ -1212,6 +1435,14 @@ export class MagmaDesk {
         entry.lastError = undefined;
         entry.lastErrorAt = undefined;
       }
+    }
+    // The operator's reject came too late: Amboss had applied the accept sent
+    // before it. Accepted — and the record says so, not "rejected by you".
+    if (entry && rejectAsked(entry) && PAST_APPROVAL.has(order.status)) {
+      entry.decision = { at: now(), action: "accept", reason: ACCEPT_BEAT_REJECT };
+      entry.lastError = undefined;
+      entry.lastErrorAt = undefined;
+      this.journal.event(entry, ACCEPT_BEAT_REJECT);
     }
     const out: MagmaSellAction[] = [];
     try {
@@ -1232,7 +1463,7 @@ export class MagmaDesk {
         return this.acceptedElsewhere(entry, order, { auto: cfg.sellEnabled });
       }
       if (ORDER_SUCCEEDED.has(order.status)) {
-        if (entry && !TERMINAL_PHASES.has(entry.phase)) out.push(...(await this.settle(entry, order)));
+        if (entry && !TERMINAL_PHASES.has(entry.phase)) out.push(...(await this.settle(entry, order, pass)));
         return out;
       }
       switch (order.status) {
@@ -1316,6 +1547,15 @@ export class MagmaDesk {
           break;
       }
       if (entry && !TERMINAL_PHASES.has(entry.phase)) out.push(...(await this.cancelIfExpiring(entry)));
+      // A record made in this pass (a new order, decided): the read it was
+      // made from is kept with it too, before what the pass sent.
+      if (!entry) {
+        const made = this.journal.get(id);
+        if (made) {
+          this.journal.answered(made, "read", orderSays(order), true);
+          this.journal.note(made);
+        }
+      }
     } catch (err) {
       // The entry as it is now: deciding on a new order creates it.
       entry ??= this.journal.get(id);
@@ -1346,6 +1586,7 @@ export class MagmaDesk {
     // Listed as waiting on us in this very pass: the order exists, and it is
     // ours to decide — whatever its read answered.
     const listed = pass.listed?.get(id) ?? null;
+    if (entry) this.journal.answered(entry, "read", ambossSays(err));
     if (isAuthError(err)) {
       if (!(await this.keyStillValid(pass))) return entry ? this.maintainFromLnd(entry) : [];
       // The key works — Amboss refuses this one order. Before, this aborted
@@ -1488,6 +1729,14 @@ export class MagmaDesk {
     return [{ orderId: id, action: "error", sizeSats, ok: false, error }];
   }
 
+  /** The order's `timeout` as Amboss shows it now — and, while the order
+   *  awaits our approval, kept as the approval deadline too: openDeadline
+   *  tells that one from a deadline for the open by it. */
+  private keepTimeout(entry: MagmaJournalEntry, order: SaleOrder): void {
+    entry.timeout = order.timeout;
+    if (order.status === "WAITING_FOR_SELLER_APPROVAL" && order.timeout) entry.approvalDeadline = order.timeout;
+  }
+
   /** A record for an order known only from the listing (its read failed). */
   private seenFromListing(o: SaleOrder): MagmaJournalEntry {
     const entry = this.journal.create({
@@ -1499,8 +1748,8 @@ export class MagmaDesk {
       feeMsat: String(this.invoiceMsat(o)),
       lastStatus: o.status,
       lastStatusAt: now(),
-      timeout: o.timeout,
     });
+    this.keepTimeout(entry, o);
     this.journal.event(entry, "listed by Amboss as waiting for your approval");
     return entry;
   }
@@ -1710,7 +1959,7 @@ export class MagmaDesk {
       if (opts.refresh !== false) await this.refreshDeployedFor(opts.pass ?? null);
       const committed = this.deps.capital.deployedSat() + this.deps.capital.reservedSat(opts.exceptKey);
       if (committed + sizeSats > cfg.sellMaxDeploySats) {
-        return { kind: "cap", reason: `deploy cap reached (${fmt(committed)} sat already sold or promised, cap ${fmt(cfg.sellMaxDeploySats)} sat)` };
+        return { kind: "cap", reason: `deploy cap reached (${fmt(committed)} sat already sold or promised, cap ${fmt(cfg.sellMaxDeploySats)} sat${afterLeaseNote(this.afterLease())})` };
       }
     }
     return null;
@@ -1814,7 +2063,7 @@ export class MagmaDesk {
         feeMsat: String(this.invoiceMsat(order)),
       });
     entry.lastStatus = order.status;
-    entry.timeout = order.timeout;
+    this.keepTimeout(entry, order);
     if (order.timeout !== null && Date.parse(order.timeout) <= Date.now()) {
       return [this.skip(entry, "the approval deadline has passed")];
     }
@@ -2187,40 +2436,69 @@ export class MagmaDesk {
       return this.unmarkedAccept(entry, order, pass, msg(err), sentBefore !== undefined);
     }
     let ok: boolean;
+    entry.acceptRefused = undefined;
     try {
       ok = await this.ambossAccept(this.deps.amboss.getKey(), entry.orderId, inv.request!);
     } catch (err) {
-      // A refused key, or a request Amboss rejected as such (not applied):
-      // the pass deals with those (key check, lane status).
-      if (isAuthError(err) || isQueryRejected(err)) throw err;
+      this.journal.answered(entry, "accept", ambossSays(err));
+      // Amboss answered the accept itself with an error (a business rule —
+      // "invoice amount does not match", say — a 4xx, a query it rejects):
+      // that is how a GraphQL API usually refuses a mutation. Kept on the
+      // record: the next pass that reads the order as still awaiting approval
+      // takes it as a refusal, as `success: false` is (resumeAccept) — the
+      // invoice released, the attempt counted, the lane's own order rejected
+      // after MAX_ACCEPT_ATTEMPTS. Not at once: only Amboss showing the order
+      // unaccepted after the answer proves the accept was not applied.
+      // (Review 2026-11-10, LANE-1: every thrown answer counted as "maybe
+      // applied" — the same accept was sent again every pass, unbounded, its
+      // size reserved, until the order timed out on the seller.)
+      if (answeredWithError(err)) entry.acceptRefused = msg(err);
+      // A refused key, or a request Amboss rejected as such: the pass deals
+      // with those (key check, lane status).
+      if (isAuthError(err) || isQueryRejected(err)) {
+        this.journal.note(entry);
+        throw err;
+      }
       // Maybe applied, maybe not: the next pass asks Amboss (resumeAccept).
       this.noteError(entry, `accept not confirmed (${msg(err)}) — checking with Amboss on the next pass`);
       return [{ ...base, ok: false, error: entry.lastError }];
     }
+    this.journal.answered(entry, "accept", `success: ${ok}`);
     if (ok) {
       this.toPhase(entry, "accepted", "Amboss confirmed the accept");
       return [{ ...base, ok: true }];
     }
-    // Refused: release the unused invoice; the lane may try again (bounded).
-    await this.lndCancel(inv.id).catch(() => undefined);
+    return this.acceptRefused(entry, pass, "Amboss refused the accept");
+  }
+
+  /**
+   * Amboss refused the accept — `success: false`, or an error answer about
+   * the accept itself with the order still awaiting approval afterwards
+   * (resumeAccept). The unused invoice is released; the lane may try again,
+   * bounded (MAX_ACCEPT_ATTEMPTS). `pass`: the lane's, or null for a click.
+   */
+  private async acceptRefused(entry: MagmaJournalEntry, pass: LanePass | null, refused: string): Promise<MagmaSellAction[]> {
+    const base = { orderId: entry.orderId, action: "accept" as const, sizeSats: entry.sizeSats, ...theirs(entry) };
+    const inv = entry.invoice;
+    if (inv) await this.lndCancel(inv.id).catch(() => undefined);
     this.backToSeen(entry);
-    this.noteError(entry, "Amboss refused the accept");
+    this.noteError(entry, refused);
     if (entry.acceptAttempts >= MAX_ACCEPT_ATTEMPTS && entry.via === "autopilot") {
       // Paused while the accept was out: no reject of the lane's own — the
       // order (nothing promised: the invoice is released) is the operator's.
       if (!this.deps.config().sellEnabled) {
         this.skip(entry, SELLING_OFF_SKIP);
-        return [{ ...base, ok: false, error: "Amboss refused the accept" }];
+        return [{ ...base, ok: false, error: refused }];
       }
       const rejected = await this.rejectOrder(entry, `Amboss refused the accept ${entry.acceptAttempts} times`);
-      return rejected.length ? rejected : [{ ...base, ok: false, error: "Amboss refused the accept" }];
+      return rejected.length ? rejected : [{ ...base, ok: false, error: refused }];
     }
     // The operator's accept, sent again by the lane (resumeAccept): the bound
     // above is the lane's — their order is never turned down for it (byHand),
     // and its record says at once that the accept didn't go through, as a
     // click's does (accept), not "accepted by you" until the next pass.
     if (entry.via === "manual" && pass) this.skip(entry, MANUAL_ACCEPT_SKIP);
-    return [{ ...base, ok: false, error: "Amboss refused the accept" }];
+    return [{ ...base, ok: false, error: refused }];
   }
 
   /**
@@ -2312,7 +2590,46 @@ export class MagmaDesk {
       // the lane's own kept "within your caps and capital" for an order
       // nothing of ours was tied to.)
       if (!pass) return [];
+      // The operator's reject of it, not yet confirmed (rejectAsked): the
+      // order is "seen" and theirs now — their reject goes out as any other
+      // of theirs does (advance).
+      if (rejectByHand(entry)) return this.rejectOrder(entry, REJECTED_BY_YOU);
       return this.decide(order, pass);
+    }
+    if (entry.acceptSentAt) {
+      // The accept went out, and Amboss — just read — still shows the order
+      // awaiting approval. (Review 2026-11-10, LANE-1: all that followed was
+      // the same accept again, every pass, whatever its answer had been and
+      // however close the deadline — the order timed out on the seller,
+      // SELLER_FAILED_TO_REACT, with its size reserved the whole time and
+      // the operator's Reject refused.)
+      //
+      // The operator rejected it since, and Amboss hasn't confirmed that:
+      // their reject is sent again, not the accept — whatever the switch
+      // says (their decision, as in advance).
+      if (pass && rejectAsked(entry)) return this.rejectSentAccept(entry, REJECTED_BY_YOU);
+      // The lane's own, with the approval deadline inside the reject margin:
+      // rejected rather than left to time out on us (D6), whatever the
+      // accept's answer was. Never one of the operator's (byHand), and never
+      // by a paused lane.
+      if (
+        pass &&
+        entry.via === "autopilot" &&
+        this.deps.config().sellEnabled &&
+        this.nearDeadline(order, REJECT_MARGIN_MS) &&
+        !this.deadlinePassed(order)
+      ) {
+        const out = await this.rejectSentAccept(entry, ACCEPT_UNCONFIRMED_REJECT);
+        if (phaseOf(entry) !== "rejected") pass.undecided.push("Amboss confirmed neither the accept nor the reject");
+        return out;
+      }
+      // Amboss answered that accept with an error of its own, and shows the
+      // order unaccepted after it: refused (sendAccept). A click's accept
+      // goes on afresh from here, with a new invoice (accept).
+      if (entry.acceptRefused !== undefined) {
+        const out = await this.acceptRefused(entry, pass, `Amboss refused the accept (${entry.acceptRefused})`);
+        return pass ? out : [];
+      }
     }
     // The lane's own accept that never went out, with selling off by now.
     const toWithdraw = () => !entry.acceptSentAt && entry.via === "autopilot" && pass !== null && !this.deps.config().sellEnabled;
@@ -2336,12 +2653,17 @@ export class MagmaDesk {
     try {
       ok = await this.ambossReject(this.deps.amboss.getKey(), entry.orderId);
     } catch (err) {
+      this.journal.answered(entry, "reject", ambossSays(err));
       // A refused key, or a request Amboss rejected as such (not applied):
       // the pass deals with those (key check, lane status).
-      if (isAuthError(err) || isQueryRejected(err)) throw err;
+      if (isAuthError(err) || isQueryRejected(err)) {
+        this.journal.note(entry);
+        throw err;
+      }
       this.noteError(entry, `reject not confirmed (${msg(err)}) — will try again`);
       return [{ ...base, ok: false, error: `${reason} — reject failed: ${msg(err)}` }];
     }
+    this.journal.answered(entry, "reject", `success: ${ok}`);
     if (!ok) {
       this.noteError(entry, "Amboss refused the reject");
       return [{ ...base, ok: false, error: `${reason} — Amboss refused the reject` }];
@@ -2352,6 +2674,50 @@ export class MagmaDesk {
     entry.reason = reason;
     entry.refusalKind = kind;
     this.toPhase(entry, "rejected", `rejected: ${reason}`);
+    console.log(`[magma] rejected order ${entry.orderId}: ${reason}`);
+    return [{ ...base, ok: true, error: reason }];
+  }
+
+  /**
+   * Turn down an order whose accept of ours went out and was never confirmed
+   * ("accepting"), while Amboss — read just before — still shows it awaiting
+   * approval. The reject goes first and the accept's invoice stays until
+   * Amboss confirms it: an accept that reached Amboss after all is never left
+   * with a cancelled invoice. Confirmed: the invoice is released, the
+   * reservation with it, and the order ends "rejected". Not confirmed (an
+   * error, or a refusal — Amboss refuses the reject of an order it has
+   * accepted): the entry stays "accepting" with its invoice, and the next
+   * pass reads the order again — accepted by then, it goes on as a sale;
+   * still awaiting approval, the reject is sent again (resumeAccept).
+   * The decision on record changes only once Amboss confirms.
+   */
+  private async rejectSentAccept(entry: MagmaJournalEntry, reason: string): Promise<MagmaSellAction[]> {
+    const base = { orderId: entry.orderId, action: "reject" as const, sizeSats: entry.sizeSats, ...theirs(entry) };
+    let ok: boolean;
+    try {
+      ok = await this.ambossReject(this.deps.amboss.getKey(), entry.orderId);
+    } catch (err) {
+      this.journal.answered(entry, "reject", ambossSays(err));
+      if (isAuthError(err) || isQueryRejected(err)) {
+        this.journal.note(entry);
+        throw err;
+      }
+      this.noteError(entry, `reject not confirmed (${msg(err)}) — will try again`);
+      return [{ ...base, ok: false, error: `${reason} — reject failed: ${msg(err)}` }];
+    }
+    this.journal.answered(entry, "reject", `success: ${ok}`);
+    if (!ok) {
+      this.noteError(entry, "Amboss refused the reject");
+      return [{ ...base, ok: false, error: `${reason} — Amboss refused the reject` }];
+    }
+    const inv = entry.invoice;
+    if (inv) await this.lndCancel(inv.id).catch(() => undefined);
+    entry.invoice = null;
+    this.buyerDials.delete(entry.orderId);
+    entry.decision = { at: now(), action: "reject", reason };
+    entry.reason = reason;
+    entry.refusalKind = "other";
+    this.toPhase(entry, "rejected", `rejected: ${reason} — the accept sent earlier was never applied; its invoice is released`);
     console.log(`[magma] rejected order ${entry.orderId}: ${reason}`);
     return [{ ...base, ok: true, error: reason }];
   }
@@ -2404,7 +2770,23 @@ export class MagmaDesk {
         this.journal.note(entry);
         return out;
       }
-      out.push(...(await this.openFor(entry, order, pass)));
+      // Review 2026-11-10, LANE-5: an order found with no record here and no
+      // invoice of ours for it in LND (accepted on amboss.tech or with
+      // another tool while LightningMate was off) was opened by the running
+      // lane on Amboss's status alone — the one automatic open without a
+      // payment this node can see, and outside the caps (a 2,000,000 sat
+      // channel under a 1,000,000 cap). An order the lane had SEEN before it
+      // was accepted elsewhere never got one (acceptedElsewhere). Now it
+      // waits for the operator, who knows where its payment went.
+      if (!how.manual && noPaymentOfOurs(entry)) {
+        if (entry.decision?.reason !== NO_PAYMENT_WAIT) {
+          entry.decision = { at: now(), action: "wait", reason: NO_PAYMENT_WAIT };
+          this.journal.event(entry, NO_PAYMENT_WAIT);
+          this.journal.note(entry);
+        }
+        return out;
+      }
+      out.push(...(await this.openFor(entry, order, pass, how.manual === true)));
     }
     if (entry.phase === "funded") {
       out.push(...(await this.report(entry)));
@@ -2421,12 +2803,36 @@ export class MagmaDesk {
    * on-chain mutex — over Tor that can take a minute and a half, and it must
    * not hold up anyone else's open or a Magma accept's capital check. Inside
    * the mutex: the payment is checked once more, then the capital; the intent
-   * is saved before the open and the outpoint right after.
+   * is saved before the open and the outpoint right after. The open names its
+   * on-chain fee rate, and the lane's own open waits while that would cost
+   * more than the sale earns (openFeeFor); `byHand`: the operator's click,
+   * which opens whatever the fee.
    */
-  private async openFor(entry: MagmaJournalEntry, order: SaleOrderDetail, pass?: LanePass | null): Promise<MagmaSellAction[]> {
+  private async openFor(entry: MagmaJournalEntry, order: SaleOrderDetail, pass?: LanePass | null, byHand = false): Promise<MagmaSellAction[]> {
     const base = { orderId: entry.orderId, action: "open" as const, sizeSats: entry.sizeSats };
     const unfit = await this.cannotOpen(entry, order);
     if (unfit) return unfit;
+    // Before the dial: a buyer is not dialed (up to a minute and a half over
+    // Tor) for an open that waits for its fee anyway.
+    const fee = await this.openFeeFor(entry, byHand);
+    if (fee.wait) {
+      // No time left to wait in (a deadline of Amboss's for the open, minutes
+      // away): the payment goes back, and the reason says what was waited
+      // for — not "waiting", and not an open that "failed": none was tried.
+      if (!this.timeLeftToOpen(entry, order)) {
+        return [{ ...base, ok: false, error: fee.wait.why }, ...(await this.release(entry, `the channel could not be opened in time: ${fee.wait.why}`))];
+      }
+      const text = fee.wait.why + feeWaitTail(fee.wait.lower);
+      const failed = await this.openFailed(entry, order, text, true);
+      if (phaseOf(entry) !== "held") return failed;
+      if (pass) pass.feesHigh.push(text);
+      return failed.map((a) => ({ ...a, error: fee.wait!.lower ? OPEN_FEE_WAIT : OPEN_FEE_UNKNOWN }));
+    }
+    // In the lane's walk an open LND just refused waits as a dial does; a click asks now.
+    if (pass) {
+      const refused = this.openRefused.get(entry.orderId);
+      if (refused && Date.now() - refused.at < BUYER_DIALS.redialMs) return [{ ...base, ok: false, error: refused.what }];
+    }
     // In the lane's walk a buyer away is dialed as for a new order; a click dials now.
     if (pass) {
       const dialed = this.buyerDials.get(entry.orderId);
@@ -2436,7 +2842,10 @@ export class MagmaDesk {
       }
     }
     const dialStart = Date.now();
-    const reached = await this.connectBuyer(order, this.dialBudgetFor(order));
+    // (The dial's time is cut to the open deadline — not to a `timeout` that
+    // is none: openDeadline. A stale one left the dial a single second.)
+    const deadline = this.openDeadline(entry, order);
+    const reached = await this.connectBuyer(order, deadline === null ? undefined : Math.max(1_000, deadline - Date.now() - DIAL_DEADLINE_SLACK_MS));
     if (pass) pass.dialSpentMs += Date.now() - dialStart;
     if (reached.ok) this.buyerDials.delete(entry.orderId);
     // (Not a macaroon's want of peers:read: nothing to wait out once it's fixed.)
@@ -2467,7 +2876,7 @@ export class MagmaDesk {
       entry.phase = "opening";
       entry.opening = { startedAt: now(), preExisting };
       entry.openAttempts += 1;
-      this.journal.event(entry, "open started");
+      this.journal.event(entry, fee.feeRate ? `open started at ${fee.feeRate} sat/vB` : "open started");
       try {
         this.journal.commit(entry);
       } catch (err) {
@@ -2490,6 +2899,7 @@ export class MagmaDesk {
         // set a fee — forever, with fee automation off).
         description: saleTag("magma", entry.orderId),
         ...this.startingRoutingFee(entry),
+        ...(fee.feeRate ? { feeRate: fee.feeRate } : {}),
       });
       if (res.ok && res.transactionId) {
         this.recordFunding(entry, `${res.transactionId}:${res.transactionVout ?? 0}`);
@@ -2515,8 +2925,68 @@ export class MagmaDesk {
       }
       entry.phase = "held";
       entry.opening = undefined;
-      return this.openFailed(entry, order, error);
+      const failed = await this.openFailed(entry, order, error);
+      if (phaseOf(entry) === "held" && failed[0]?.error) this.openRefused.set(entry.orderId, { at: Date.now(), what: failed[0].error });
+      return failed;
     });
+  }
+
+  /**
+   * The on-chain fee rate a sold channel's open pays, and whether the lane
+   * holds the open back for it (review 2026-11-10, LANE-4; othervice's E2).
+   *
+   * Before, the open named no rate: LND picked one when the buyer had paid,
+   * hours after the accept floor was checked, and nothing looked at it — a
+   * mempool that rose in between had the channel opened for more than the
+   * sale earned, and the "Max on-chain fee for opens" setting, which reads
+   * as if it covered every open, covers the autopilot's routing opens alone.
+   *
+   * Now the rate is LND's estimate for its default 6-block target, as a
+   * whole rate (deps.soldChannelOpen) — the estimate the accept floor is
+   * priced with, and what LND picked itself: a sold channel has to confirm
+   * while the buyer's payment is held. The open states it. The limit is what
+   * the sale earns: while the funding transaction (OPEN_TX_VBYTES) at that
+   * rate would cost more than the order's fee after the service fee, the
+   * lane's own open waits — tried again on every pass for as long as the
+   * held payment allows an open at all (timeLeftToOpen, cannotOpen), then
+   * the buyer is refunded and the operator told (refunds). With no estimate
+   * from LND the cost is unknown, and the lane waits the same way.
+   *
+   * The operator's click (`byHand`) is their decision: it opens at the
+   * estimate whatever the sale earns — and without an estimate as before,
+   * at the rate LND picks. Not the "Max on-chain fee for opens" setting: an
+   * order accepted and paid for is owed its channel while the sale covers
+   * it, at 30 sat/vB too.
+   *
+   * So does an order whose payment is not held: one accepted by an older
+   * version with a plain invoice, which settled when the buyer paid. There
+   * is nothing to give back at the end of a wait — the buyer's money is
+   * here and the channel is owed whatever it costs. (Review of the package:
+   * such an order waited like the others, and with no held payment to count
+   * the wait by it ended "failed" after half an hour — no channel, no
+   * refund, no alert, and “Open channel” refused for an order that is over.)
+   */
+  private async openFeeFor(
+    entry: MagmaJournalEntry,
+    byHand: boolean,
+  ): Promise<{ feeRate?: number; wait?: { why: string; lower: boolean } }> {
+    if (!this.deps.soldChannelOpen) return {};
+    const terms = await this.deps.soldChannelOpen().catch(() => null);
+    const rate = terms && terms.feeRate !== null && terms.feeRate > 0 ? terms.feeRate : null;
+    if (byHand || !entry.invoice) return rate !== null ? { feeRate: rate } : {};
+    if (!terms || rate === null) {
+      return { wait: { why: "LND gives no on-chain fee estimate, so what opening the channel would cost is unknown", lower: false } };
+    }
+    const earns = Math.floor(feeSatsOf(entry) * (1 - terms.serviceFeeRate));
+    const cost = rate * OPEN_TX_VBYTES;
+    if (cost <= earns) return { feeRate: rate };
+    const sat = (n: number) => n.toLocaleString("en-US");
+    return {
+      wait: {
+        why: `on-chain fees are ${sat(rate)} sat/vB: opening the channel would cost about ${sat(cost)} sat, more than the ${sat(earns)} sat this sale earns`,
+        lower: true,
+      },
+    };
   }
 
   /**
@@ -2527,10 +2997,11 @@ export class MagmaDesk {
    */
   private async cannotOpen(entry: MagmaJournalEntry, order: SaleOrder): Promise<MagmaSellAction[] | null> {
     const base = { orderId: entry.orderId, action: "open" as const, sizeSats: entry.sizeSats };
-    // Past the deadline, first attempt or not: Amboss has ended the order or is
-    // about to, and a channel opened now would be a free one (a dial can take a
-    // minute and a half, and this runs again after it).
-    if (this.deadlinePassed(order) || (entry.openAttempts > 0 && !this.timeLeftToOpen(entry, order))) {
+    // Past the open deadline, first attempt or not: Amboss has ended the order
+    // or is about to, and a channel opened now would be a free one (a dial can
+    // take a minute and a half, and this runs again after it).
+    const deadline = this.openDeadline(entry, order);
+    if ((deadline !== null && deadline <= Date.now()) || (entry.openAttempts > 0 && !this.timeLeftToOpen(entry, order))) {
       return [{ ...base, ok: false, error: "no time left to open the channel" }, ...(await this.release(entry, "the channel could not be opened in time"))];
     }
     if (!entry.invoice) return null; // paid by a plain invoice (before the journal): nothing held
@@ -2541,15 +3012,56 @@ export class MagmaDesk {
     const height = (await getWalletInfo({ lnd: this.deps.readLnd })).current_block_height;
     const until = st.heldUntilHeight ?? entry.heldUntilHeight ?? null;
     if (until !== null && until - height < OPEN_MIN_BLOCKS_LEFT) {
+      // What kept the channel from being opened all that while, if anything
+      // did (a buyer away, coins unconfirmed, fees above what the sale
+      // earns): the order's record ends with it — a wait for fees without
+      // its "waiting … opens it anyway", which is over.
+      const last = entry.lastError && / — will try again$/.test(entry.lastError) ? entry.lastError.replace(/ — will try again$/, "") : null;
+      const waited = last === null ? undefined : [true, false].find((lower) => last.endsWith(feeWaitTail(lower)));
+      const tried =
+        last === null
+          ? ""
+          : waited === undefined
+            ? ` — last tried: ${last}`
+            : ` — it waited for ${waited ? "lower fees" : "a fee estimate"} until then: ${last.slice(0, -feeWaitTail(waited).length)}`;
       return [
         { ...base, ok: false, error: "the held payment expires too soon" },
         ...(await this.release(
           entry,
-          `the held payment would expire before the channel could be confirmed (${Math.max(0, until - height)} blocks left, ${OPEN_MIN_BLOCKS_LEFT} needed)`,
+          `the held payment would expire before the channel could be confirmed (${Math.max(0, until - height)} blocks left, ${OPEN_MIN_BLOCKS_LEFT} needed)${tried}`,
         )),
       ];
     }
     return null;
+  }
+
+  /**
+   * The time by which the channel must be open, as far as Amboss says one:
+   * the order's `timeout`, read as the open deadline only when it lies after
+   * the moment the buyer's payment was held. Review 2026-11-10, LANE-2: the
+   * field is documented as a nullable string and nothing more; it was seen
+   * live only on orders awaiting approval, and on ended ones (null). Whether
+   * Amboss clears it at the accept, leaves the approval deadline in it or
+   * sets a new one is unknown — and read as the open deadline whatever it
+   * held, a `timeout` left at the approval deadline refunded every buyer who
+   * paid after that moment (the invoice is good for 49 hours), the order
+   * ending as the seller's failure to open. A time that had passed before
+   * the buyer paid cannot be the deadline for what follows the payment —
+   * and neither can the very time the order showed while it awaited our
+   * approval (approvalDeadline), should the buyer pay before it: read as the
+   * open deadline, it ended a wait for lower fees or for the buyer's node
+   * ten minutes before that moment, with the payment good for a day and a
+   * half more (review of the package). The hard limit is the held payment's
+   * own height either way (cannotOpen), and Amboss ending the order ends it
+   * here (advance). Null: no deadline.
+   */
+  private openDeadline(entry: MagmaJournalEntry, order: SaleOrder): number | null {
+    if (!order.timeout) return null;
+    const at = Date.parse(order.timeout);
+    if (!Number.isFinite(at)) return null;
+    if (entry.heldAt && at <= Date.parse(entry.heldAt)) return null;
+    if (entry.approvalDeadline && at === Date.parse(entry.approvalDeadline)) return null;
+    return at;
   }
 
   /** A failed open: retried on later passes while it may still work and there
@@ -2559,16 +3071,27 @@ export class MagmaDesk {
   private async openFailed(entry: MagmaJournalEntry, order: SaleOrder, error: string, retry = isTransientOpen(error)): Promise<MagmaSellAction[]> {
     const base = { orderId: entry.orderId, action: "open" as const, sizeSats: entry.sizeSats };
     if (retry && this.timeLeftToOpen(entry, order)) {
-      this.noteError(entry, `${error} — will try again`);
-      return [{ ...base, ok: false, error: `${error} — will try again` }];
+      // Said once on the order's record while it stays the same (a wait for
+      // lower fees is found again every 45 seconds, for hours).
+      const text = `${error} — will try again`;
+      if (entry.lastError !== text) this.noteError(entry, text);
+      return [{ ...base, ok: false, error: text }];
     }
     return [{ ...base, ok: false, error }, ...(await this.release(entry, `channel open failed: ${error}`))];
   }
 
+  /** May a failed open be tried again on a later pass? While Amboss's open
+   *  deadline is far enough away; with none, while the held payment allows an
+   *  open at all — cannotOpen, which runs before every attempt, releases it
+   *  once it has fewer than OPEN_MIN_BLOCKS_LEFT blocks left (LANE-6). An
+   *  order paid outside a HODL invoice has no such height: it is tried for
+   *  LEGACY_OPEN_RETRY_MS after the payment was found. */
   private timeLeftToOpen(entry: MagmaJournalEntry, order: SaleOrder): boolean {
-    if (order.timeout) return Date.parse(order.timeout) - Date.now() > OPEN_RETRY_MIN_TIME_LEFT_MS;
+    const deadline = this.openDeadline(entry, order);
+    if (deadline !== null) return deadline - Date.now() > OPEN_RETRY_MIN_TIME_LEFT_MS;
+    if (entry.invoice && entry.heldUntilHeight) return true;
     const since = entry.heldAt ? Date.parse(entry.heldAt) : Date.now();
-    return Date.now() - since < OPEN_RETRY_WINDOW_MS;
+    return Date.now() - since < (entry.invoice ? OPEN_RETRY_WINDOW_MS : LEGACY_OPEN_RETRY_MS);
   }
 
   /** The funding outpoint is the record that prevents a second channel: saved
@@ -2576,6 +3099,7 @@ export class MagmaDesk {
    *  memory (this process never opens again), an alert says so, and after a
    *  restart the "opening" record on disk leads to the channel in LND. */
   private recordFunding(entry: MagmaJournalEntry, outpoint: string): void {
+    this.openRefused.delete(entry.orderId);
     entry.phase = "funded";
     entry.fundingOutpoint = outpoint;
     entry.fundedAt = now();
@@ -2675,12 +3199,17 @@ export class MagmaDesk {
     try {
       ok = await this.ambossAddTx(this.deps.amboss.getKey(), entry.orderId, entry.fundingOutpoint);
     } catch (err) {
+      this.journal.answered(entry, "report", ambossSays(err));
       // A refused key, or a request Amboss rejected as such (not applied):
       // the pass deals with those (key check, lane status).
-      if (isAuthError(err) || isQueryRejected(err)) throw err;
+      if (isAuthError(err) || isQueryRejected(err)) {
+        this.journal.note(entry);
+        throw err;
+      }
       this.noteError(entry, `report not confirmed (${msg(err)}) — checking with Amboss on the next pass`);
       return [{ ...base, ok: false, error: entry.lastError }];
     }
+    this.journal.answered(entry, "report", `success: ${ok}`);
     if (!ok) {
       this.noteError(entry, "Amboss did not accept the funding transaction — will report it again");
       return [{ ...base, ok: false, error: entry.lastError }];
@@ -2694,7 +3223,7 @@ export class MagmaDesk {
 
   /** Amboss confirmed the channel (VALID_CHANNEL_OPENING or later): claim the
    *  held payment, then book the sale and enqueue its service fee — once. */
-  private async settle(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<MagmaSellAction[]> {
+  private async settle(entry: MagmaJournalEntry, order: SaleOrderDetail, pass?: LanePass): Promise<MagmaSellAction[]> {
     const base = { orderId: entry.orderId, action: "settle" as const, sizeSats: entry.sizeSats };
     if (entry.phase === "opening") await this.reconcileOpening(entry);
     // Opened outside LightningMate (by hand with another tool, say): the
@@ -2728,9 +3257,21 @@ export class MagmaDesk {
         // lane asking, for as long as Amboss lists it.
         return this.release(entry, `Amboss reports ${order.status}, but our invoice is gone from LND — nothing to settle, nothing booked`);
       } else if (st.state !== "settled") {
-        this.noteError(entry, `Amboss reports ${order.status}, but our invoice is ${st.state} — nothing to settle`);
-        return [{ ...base, ok: false, error: entry.lastError }];
+        // Unpaid. Looked at again for a while (a payment that arrives is
+        // settled as ever), then the order ends here — see endUnpaid.
+        const since = Date.parse(entry.unpaidSince ?? "");
+        if (Number.isFinite(since) && Date.now() - since >= UNPAID_CONFIRMED_WAIT_MS) return this.endUnpaid(entry, order);
+        if (!Number.isFinite(since)) entry.unpaidSince = now();
+        const error = `Amboss reports ${order.status}, but our invoice is unpaid — nothing to settle (${UNPAID_CONFIRMED_NEXT})`;
+        // Said once on the order's record, not on every pass.
+        if (entry.lastError === error) {
+          entry.lastErrorAt = now();
+          this.journal.note(entry);
+        } else this.noteError(entry, error);
+        pass?.unpaidConfirmed.push(entry.orderId);
+        return [{ ...base, ok: false, error }];
       }
+      entry.unpaidSince = undefined;
     }
     entry.settledAt = now();
     // An order taken on with no fee on record (accepted before the journal,
@@ -2778,11 +3319,69 @@ export class MagmaDesk {
     this.journal.event(entry, `its channel ${entry.fundingOutpoint} was opened outside LightningMate — taken from Amboss and LND`);
   }
 
+  /**
+   * Amboss has reported the order's channel confirmed for
+   * UNPAID_CONFIRMED_WAIT_MS while the invoice of ours it was accepted with
+   * stayed unpaid: the order ends here, with nothing settled, booked or
+   * charged (review 2026-11-10, LANE-8). Before, the entry never ended: the
+   * same error was written to its record every 45 seconds for as long as
+   * Amboss listed the order, and an order that had only been accepted kept
+   * its coins reserved.
+   *
+   * The invoice is cancelled first, so no payment can arrive on it later
+   * with nothing left to open for it. With a channel on record (opened
+   * outside LightningMate and taken over from Amboss and LND) the order is
+   * kept as a completed, unbooked sale — the lease's routing-fee promise and
+   * the close protection go on binding that channel; with none it ends as
+   * cancelled, its coins free again.
+   */
+  private async endUnpaid(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<MagmaSellAction[]> {
+    const invoice = entry.invoice;
+    if (invoice) {
+      try {
+        await this.lndCancel(invoice.id);
+      } catch (err) {
+        const st = await this.lndHodlStatus(invoice.id).catch(() => null);
+        // Paid after all: the next pass settles it as ever.
+        if (st?.state === "held" || st?.state === "settled") {
+          entry.unpaidSince = undefined;
+          this.journal.note(entry);
+          return [];
+        }
+        if (st?.state !== "canceled" && st?.state !== "missing") {
+          const error = `could not cancel the unpaid HODL invoice (${msg(err)}) — will try again`;
+          if (entry.lastError !== error) this.noteError(entry, error);
+          return [{ orderId: entry.orderId, action: "cancel", sizeSats: entry.sizeSats, ok: false, error }];
+        }
+      }
+    }
+    const waited = "an hour"; // UNPAID_CONFIRMED_WAIT_MS, in the words of UNPAID_CONFIRMED_NEXT
+    entry.unpaidSince = undefined;
+    entry.lastError = undefined;
+    entry.lastErrorAt = undefined;
+    if (entry.fundingOutpoint) {
+      const what = `Amboss reports ${order.status}, but our invoice stayed unpaid for ${waited} — not booked as a sale: this node received nothing for it; its channel ${entry.fundingOutpoint} keeps the lease's promises`;
+      entry.unbooked = true;
+      entry.bookedAt = now();
+      entry.settledAt = now();
+      entry.reason = what;
+      this.toPhase(entry, "settled", what);
+      console.warn(`[magma] order ${entry.orderId}: ${what}`);
+      return [{ orderId: entry.orderId, action: "settle", sizeSats: entry.sizeSats, ok: true, error: what, transactionId: entry.fundingOutpoint.split(":")[0] }];
+    }
+    const reason = `Amboss reports ${order.status}, but our invoice stayed unpaid for ${waited} — nothing to settle, nothing booked`;
+    entry.cancelledAt = now();
+    entry.reason = reason;
+    this.toPhase(entry, "cancelled", `cancelled: ${reason}`);
+    console.warn(`[magma] order ${entry.orderId}: ${reason} — the unpaid HODL invoice was cancelled`);
+    return [{ orderId: entry.orderId, action: "cancel", sizeSats: entry.sizeSats, ok: true, error: reason }];
+  }
+
   /** Book the completed sale and enqueue the disclosed service fee. Both are
    *  idempotent per order, so a retried or recovered settle never counts twice.
    *  (Saved by the caller.) */
   private book(entry: MagmaJournalEntry): void {
-    if (!entry.invoice && !entry.paidInvoiceId) {
+    if (noPaymentOfOurs(entry)) {
       // No invoice of ours held or settled the payment (accepted with another
       // tool's invoice, or outside LightningMate altogether): nothing to book
       // as income, and no service fee on money this node can't show it
@@ -2820,8 +3419,21 @@ export class MagmaDesk {
    *  returns automatically) when we hold one. */
   private async release(entry: MagmaJournalEntry, reason: string): Promise<MagmaSellAction[]> {
     const base = { orderId: entry.orderId, action: "cancel" as const, sizeSats: entry.sizeSats };
+    this.openRefused.delete(entry.orderId);
     if (!entry.invoice) {
       entry.reason = reason;
+      // Paid by a plain invoice that settled when the buyer paid (an order an
+      // older version accepted): there is nothing to cancel, and the money
+      // stays here with no channel for it. Before, the order just ended
+      // "failed" — no alert, and “Open channel” refused for an order that is
+      // over (review of the package). Now the operator is told until they
+      // dismiss it (paymentsKept), and their click tries again (open).
+      if (entry.paidInvoiceId && !entry.fundingOutpoint) {
+        entry.paymentKeptAt = now();
+        this.toPhase(entry, "failed", `${reason} — the buyer's payment is settled here and does not go back by itself`);
+        console.warn(`[magma] order ${entry.orderId}: ${reason} — the buyer's payment is settled here, no channel was opened`);
+        return [];
+      }
       this.toPhase(entry, "failed", reason);
       return [];
     }
@@ -2871,8 +3483,9 @@ export class MagmaDesk {
    *    payment back, and the order ends here.
    *  - Only cancelled ones, or a plain one still unpaid: nothing was paid to
    *    this node — no channel.
-   *  - None at all: accepted with another tool's invoice. Fulfilled as before,
-   *    but not booked — LND shows no payment to book.
+   *  - None at all: accepted with another tool's invoice. Recorded, never
+   *    booked — LND shows no payment to book — and its channel is the
+   *    operator's "Open channel" click, not the lane's (NO_PAYMENT_WAIT).
    * Then, before any open, LND is asked whether a channel for it exists
    * already: the old code could open one and then fail to report it.
    * Every LND read comes before the record: one that fails leaves nothing
@@ -2938,7 +3551,7 @@ export class MagmaDesk {
         entry,
         paid
           ? `found waiting for its channel with no record here; paid to this node (invoice ${paid.id.slice(0, 12)}… settled)`
-          : "found waiting for its channel with no record here, and no invoice of ours for it in LND (accepted with another tool?) — fulfilled, but not booked as a sale",
+          : "found waiting for its channel with no record here, and no invoice of ours for it in LND (accepted with another tool?) — its channel is yours to open, and it is not booked as a sale",
       );
       if (found) {
         this.journal.event(entry, "a channel for it already exists — reporting that one instead of opening another");
@@ -3129,6 +3742,9 @@ export class MagmaDesk {
       // for your approval: yours to decide after all.
       this.revive(entry, order.status);
       if (entry?.phase === "accepting") {
+        // An earlier Reject of theirs that Amboss hasn't confirmed
+        // (rejectAsked) no longer stands: their latest click is this accept.
+        if (rejectAsked(entry)) entry.decision = { at: now(), action: "accept", reason: ACCEPTED_BY_YOU };
         entry.via = "manual";
         const [res] = await this.resumeAccept(entry, order, null);
         if (phaseOf(entry) !== "seen") return this.result(entry, res);
@@ -3226,6 +3842,18 @@ export class MagmaDesk {
         return { ok: false, code: "bad_status", message: `Order is ${order.status}, not ready for a channel.` };
       }
       entry ??= await this.adoptLegacy(order);
+      // An order that ended here with the buyer's payment kept (release:
+      // paid by a settled plain invoice, its channel never opened) while
+      // Amboss still waits for the channel: the click takes it up again —
+      // the channel is owed, and it is the one way left to deliver it. The
+      // lane goes on trying from here as for an order just found.
+      if (entry.phase === "failed" && entry.paymentKeptAt && entry.paidInvoiceId && !entry.invoice && !entry.fundingOutpoint) {
+        entry.heldAt = now();
+        entry.reason = undefined;
+        entry.paymentKeptAt = undefined;
+        entry.alertAckAt = undefined;
+        this.toPhase(entry, "held", "“Open channel” clicked for an order that had ended with the buyer's payment kept — trying again");
+      }
       if (TERMINAL_PHASES.has(entry.phase)) {
         return { ok: false, code: "bad_status", phase: entry.phase, message: `Order is ${entry.phase} here: ${entry.reason ?? ""}`.trim() };
       }
@@ -3314,13 +3942,26 @@ export class MagmaDesk {
       // (Before, the Reject was refused, and with selling on the lane then
       // released the accept and accepted the order afresh.)
       if (entry?.phase === "accepting" && this.acceptStale(entry)) await this.releaseStaleAccept(entry);
-      // An accept of ours under way, though Amboss still shows the order
-      // awaiting approval: completed first — one that may have reached Amboss
-      // is never withdrawn (resumeAccept). Refused, as before — now saying
-      // why (review of P9, final round: "Order is already accepting here.").
+      // An accept of ours cut short before it went out: the lane's next
+      // pass completes or withdraws it. Refused, saying why (review of P9,
+      // final round: "Order is already accepting here.").
+      if (entry?.phase === "accepting" && !entry.acceptSentAt) {
+        return { ok: false, code: "bad_status", phase: entry.phase, message: NOT_REJECTED_ACCEPT_UNSENT };
+      }
+      // An accept of ours that went out and was never confirmed — its answer
+      // an error, or lost — while Amboss, read just now, still shows the
+      // order awaiting approval: the reject goes out, and the accept's
+      // invoice is released once Amboss confirms it (rejectSentAccept). The
+      // order is the operator's from this click on and their reject stands:
+      // the lane sends it again, and the accept no more (resumeAccept).
+      // (Review 2026-11-10, LANE-1: refused — "…is being confirmed with
+      // Amboss, so it can't be withdrawn" — while the lane sent the same
+      // accept again every pass until the order timed out on the seller.)
       if (entry?.phase === "accepting") {
-        const message = entry.acceptSentAt ? NOT_REJECTED_ACCEPT_SENT : NOT_REJECTED_ACCEPT_UNSENT;
-        return { ok: false, code: "bad_status", phase: entry.phase, message };
+        const mine = this.byHand(entry, order, "reject");
+        const [res] = await this.rejectSentAccept(mine, REJECTED_BY_YOU);
+        const result = this.result(mine, res);
+        return !result.ok && rejectAsked(mine) ? { ...result, message: thenSay(result.message, REJECT_STANDS_ACCEPT_SENT) } : result;
       }
       if (entry && entry.phase !== "seen") {
         return { ok: false, code: "bad_status", phase: entry.phase, message: `Order is already ${entry.phase} here.` };
@@ -3356,11 +3997,12 @@ export class MagmaDesk {
    * (withOrder): a step the lane had begun on the order finishes first, and
    * a click that then finds it accepted or rejected says so before it gets
    * here (done, if that is what it asked for; refused, if not) — the lane's
-   * decision stands. Nor does a click get here for an order with an accept
-   * already sent whose answer was lost ("accepting"), the lane's or theirs:
-   * an accept that may have reached Amboss is completed first (resumeAccept),
-   * and a Reject meanwhile is refused (NOT_REJECTED_ACCEPT_SENT) — their
-   * latest click does not stand against it.
+   * decision stands. A Reject of an order with an accept already sent that
+   * Amboss never confirmed ("accepting"), the lane's or theirs, stands too:
+   * the reject is sent — again on every pass, the accept no more — and the
+   * accept's invoice is released once Amboss confirms it (rejectSentAccept).
+   * Only an accept Amboss turns out to have applied stands against it: the
+   * order is accepted then, and its record says so (ACCEPT_BEAT_REJECT).
    *
    * Review of P8, final round: a click whose call failed on a transient error
    * (Amboss HTTP 502, an LND blink) left the order to the lane's next pass,
@@ -3384,7 +4026,7 @@ export class MagmaDesk {
       });
     entry.via = "manual";
     entry.decision = { at: now(), action, reason: action === "reject" ? REJECTED_BY_YOU : ACCEPTED_BY_YOU };
-    entry.timeout = order.timeout;
+    this.keepTimeout(entry, order);
     entry.lastError = undefined;
     entry.lastErrorAt = undefined;
     this.journal.note(entry);
@@ -3454,8 +4096,19 @@ export class MagmaDesk {
 
   // ── the main run's share: deployed capital, finished leases ────────────────
 
-  /** Magma capital whose lease is still running, plus orders accepted outside
-   *  this journal (they will need coins too) — the deploy-cap share. */
+  /**
+   * Magma capital whose lease is still running, orders accepted outside this
+   * journal (they will need coins too), and the coins still in sold channels
+   * whose lease is over — the deploy-cap share.
+   *
+   * Review 2026-11-10, LANE-7: the cap counted running leases only. A sold
+   * channel left open after its lease (auto-close off, or kept by its rules)
+   * stopped counting with its coins still in it, and the next channel was
+   * sold on top: over a few lease terms an operator who had set "at most
+   * 2,000,000" had several times that in once-sold channels. Such a channel
+   * now counts with what is still on this node's side of it until it is
+   * closed.
+   */
   async refreshDeployed(force = false): Promise<number> {
     if (!this.deps.amboss.hasKey()) return this.deployedNow();
     if (!force && Date.now() - this.deployed.at < DEPLOYED_TTL_MS) return this.deployedNow();
@@ -3473,10 +4126,18 @@ export class MagmaDesk {
     const reserving = new Set(this.journal.reservations(0).map((r) => r.key));
     const own = await this.ownPubkey();
     let orders: Awaited<ReturnType<MagmaDesk["ambossSales"]>>["orders"];
+    let afterLease: CoinsAfterLease;
+    const running = new Set<string>(LEASE_RUNNING_STATUSES);
     try {
       ({ orders } = await this.ambossSales(this.deps.amboss.getKey(), {
-        status: [...LEASE_RUNNING_STATUSES, "WAITING_FOR_BUYER_PAYMENT", "WAITING_FOR_CHANNEL_OPEN", "WAITING_FOR_SELLER_APPROVAL"],
+        status: [...LEASE_RUNNING_STATUSES, LEASE_OVER_STATUS, "WAITING_FOR_BUYER_PAYMENT", "WAITING_FOR_CHANNEL_OPEN", "WAITING_FOR_SELLER_APPROVAL"],
       }));
+      // With the listing: LND's channels unread, the figure would miss the
+      // coins after a lease — the last good listing decides, as below.
+      afterLease = await this.coinsAfterLease(
+        orders.filter((o) => o.sellerPubkey === own && o.status === LEASE_OVER_STATUS),
+        new Set(orders.filter((o) => o.sellerPubkey === own && running.has(o.status)).map((o) => standardChannelId(o.channelId))),
+      );
     } catch (err) {
       // Only this listing failed: the last good one (under an hour old) with
       // this journal's own sales since decides; the wallet check still runs
@@ -3492,18 +4153,48 @@ export class MagmaDesk {
     // This node's sold capital only (another node of the account has its own
     // wallet); orders this journal reserves are counted as reservations
     // already; an order waiting for approval holds nothing of the wallet yet.
-    const mine = orders.filter((o) => o.sellerPubkey === own);
-    const sats = mine
-      .filter((o) => o.status !== "WAITING_FOR_SELLER_APPROVAL" && !reserving.has(`magma:${o.id}`))
-      .reduce((s, o) => s + o.sizeSats, 0);
-    this.deployed = { sats, at: askedAt, awaiting: mine.filter((o) => o.status === "WAITING_FOR_SELLER_APPROVAL").map((o) => o.id) };
-    const running = new Set<string>(LEASE_RUNNING_STATUSES);
+    const mine = orders.filter((o) => o.sellerPubkey === own && o.status !== LEASE_OVER_STATUS);
+    const sats =
+      afterLease.sats +
+      mine.filter((o) => o.status !== "WAITING_FOR_SELLER_APPROVAL" && !reserving.has(`magma:${o.id}`)).reduce((s, o) => s + o.sizeSats, 0);
+    this.deployed = { sats, at: askedAt, awaiting: mine.filter((o) => o.status === "WAITING_FOR_SELLER_APPROVAL").map((o) => o.id), afterLease };
     this.keepAmbossLeases(
       orders
         .filter((o) => o.sellerPubkey === own && running.has(o.status) && !!o.channelId)
         .map((o) => ({ orderId: o.id, channelId: o.channelId as string })),
     );
     return this.deployedNow();
+  }
+
+  /**
+   * What is still on this node's side of sold channels whose lease is over
+   * and that LND still lists open (LANE-7). The channel is the order's by
+   * its funding outpoint (this journal's record, or the one the lease-end
+   * close read from Amboss), else by the channel id Amboss lists; one that
+   * can't be told is not counted, as before. A channel another sale's lease
+   * still runs on counts there, with its size.
+   */
+  private async coinsAfterLease(finished: readonly SaleOrder[], runningIds: ReadonlySet<string | null>): Promise<CoinsAfterLease> {
+    if (finished.length === 0) return { channels: 0, sats: 0 };
+    const open = (await getChannels({ lnd: this.deps.readLnd })).channels;
+    const counted = new Set<string>();
+    let sats = 0;
+    for (const o of finished) {
+      const point = this.journal.get(o.id)?.fundingOutpoint ?? this.finishedSales.get(o.id)?.point ?? null;
+      const id = standardChannelId(o.channelId);
+      const ch = (point ? channelAtOutpoint(open, point) : undefined) ?? (id ? open.find((c) => standardChannelId(c.id) === id) : undefined);
+      if (!ch || counted.has(ch.id) || runningIds.has(standardChannelId(ch.id))) continue;
+      counted.add(ch.id);
+      sats += Math.max(0, ch.local_balance);
+    }
+    return { channels: counted.size, sats };
+  }
+
+  /** Sold channels still open after their lease, and the coins of this
+   *  node's in them — part of the deploy cap's share (the last listing's;
+   *  none once that is too old to decide on). */
+  afterLease(): CoinsAfterLease {
+    return this.lastListingUsable() ? { ...this.deployed.afterLease } : { channels: 0, sats: 0 };
   }
 
   /** The last good listing of sold capital is recent enough to decide on. */
@@ -3595,18 +4286,41 @@ export class MagmaDesk {
   }
 
   /**
-   * Close sold channels whose lease is over (CHANNEL_MONITORING_FINISHED):
-   * the sale's own channel, by its funding outpoint — txid AND vout: two
+   * Close sold channels whose lease is over: Amboss lists the order as
+   * CHANNEL_MONITORING_FINISHED AND this node's own count agrees — the
+   * funding block, the order's lease and a day (leaseEndHeight) have passed.
+   * Before, Amboss's status alone closed the channel: a status set early —
+   * monitoring stopped for another reason, an Amboss bug — closed a channel
+   * ten blocks into its lease, though every by-hand close is held to exactly
+   * that count (review 2026-11-10, LANE-3 and OFFER-9). The lease's length is
+   * the journal's, else the order's on Amboss; with none on record, or the
+   * funding block or this node's height unknown, the channel is kept.
+   *
+   * The sale's own channel, by its funding outpoint — txid AND vout: two
    * channels can share one funding transaction, and matching the txid alone
    * closed the first one LND listed, another buyer's whose lease still ran
-   * (review 2026-10-25). Never one whose lease Amboss still lists as running.
+   * (review 2026-10-25). Never one whose lease Amboss still lists as running
+   * (asked again when the listing is old: it is refreshed by the offer
+   * upkeep, which does not run with selling off).
    * Kept open when our side holds under SOLD_CLOSE_MIN_LOCAL_SHARE of it (what
    * is left is inbound worth keeping) or it routes well; closed at the
    * economy fee rate, never above the operator's maximum on-chain fee rate
    * (it paid LND's 6-block rate, whatever that was). Whether it routes well
-   * unknown (a read failed): kept — never closed on a guess. `shouldStop`
-   * (the autopilot's: selling or auto-close switched off, its stage given
-   * up) is asked before each sale and right before each close.
+   * unknown (a read failed): kept — never closed on a guess.
+   *
+   * A cooperative close, always: while the buyer's node is offline none is
+   * asked for (before: a failed close on every run), and a force close stays
+   * the operator's to decide. A close the buyer's node refuses for its fee
+   * is under way in LND all the same (channelOps, stillClosing): said once,
+   * and asked again only if the channel is still open CLOSE_ASKED_RETRY_MS
+   * later — before, a failure each run (CHAN-5).
+   *
+   * Not bound to selling being on: a lease that ends after "Liquidity
+   * provision" was switched off is closed all the same — auto-close is the
+   * operator's standing word about sold channels (OFFER-9: before, switching
+   * selling off left every finished lease's channel open). `shouldStop` (the
+   * autopilot's: auto-close switched off, all automation paused, its stage
+   * given up) is asked before each sale and right before each close.
    */
   async closeFinishedLeases(opts: { shouldStop?: () => boolean } = {}): Promise<MagmaSellAction[]> {
     const { writeLnd, amboss } = this.deps;
@@ -3618,50 +4332,105 @@ export class MagmaDesk {
     );
     if (orders.length === 0) return [];
     const open = (await getChannels({ lnd: this.deps.readLnd })).channels;
-    // Other sales' leases, as Amboss last listed them running.
-    const running = new Set(this.runningLeasesOnAmboss().map((l) => standardChannelId(l.channelId)));
+    // Other sales' leases, as Amboss lists them running.
+    const running = new Set((await this.runningLeasesFresh()).map((l) => standardChannelId(l.channelId)));
+    // This node's height, for its own count of each lease (null: not read).
+    const height = await getWalletInfo({ lnd: this.deps.readLnd }).then(
+      (i) => (i.current_block_height > 0 ? i.current_block_height : null),
+      () => null,
+    );
     let terms: Awaited<ReturnType<NonNullable<MagmaDeskDeps["soldChannelClose"]>>> | null | undefined;
     const out: MagmaSellAction[] = [];
-    // (Auto-close is selling's automation: none starts once Liquidity
-    // provision is switched off — or all automation paused, auto-close
-    // switched off, the work given up — meanwhile.)
-    const stop = () => this.stopping || !this.deps.config().sellEnabled || opts.shouldStop?.() === true;
+    const stop = () => this.stopping || opts.shouldStop?.() === true;
+    const sat = (n: number) => Math.round(n).toLocaleString("en-US");
+    /** The channels a close was asked for in this pass. */
+    const askedNow = new Set<string>();
     for (const o of orders) {
       if (stop()) break;
-      let point = this.journal.get(o.id)?.fundingOutpoint ?? this.finishedTxids.get(o.id);
-      if (point === undefined) {
+      const entry = this.journal.get(o.id);
+      let known = this.finishedSales.get(o.id);
+      if (!known && !(entry?.fundingOutpoint && entry.leaseBlocks && entry.leaseBlocks > 0)) {
         // Asked once per process — but only Amboss's answer is remembered. A
         // read that failed is asked again on the next run (before, one
         // hiccup was remembered as "no funding transaction", and that lease's
         // channel stayed open until a restart).
         const sale = await this.ambossSale(key, o.id).catch(() => null);
         if (!sale) continue;
-        point = sale.transactionId ?? null;
-        this.finishedTxids.set(o.id, point);
+        known = { point: sale.transactionId ?? null, leaseBlocks: sale.promises.minBlockLength > 0 ? sale.promises.minBlockLength : 0 };
+        this.finishedSales.set(o.id, known);
       }
+      const point = entry?.fundingOutpoint ?? known?.point;
       const ch = point ? channelAtOutpoint(open, point) : undefined;
-      if (!ch) continue; // closed already, not ours, or not which one of a shared funding
+      if (!ch) {
+        // Closed already, not ours, or not which one of a shared funding. A
+        // close asked earlier whose fee the buyer's node refused, and the
+        // sale's own channel (txid and vout) is open no more: LND went on
+        // with it. Before, that close was never on the order's record — it
+        // read "close asked … asked again in a day" for good (review of the
+        // package, CHAN-5).
+        if (entry?.closeAskedAt && entry.fundingOutpoint && !open.some((c) => `${c.transaction_id}:${c.transaction_vout}` === entry.fundingOutpoint)) {
+          entry.closedAt = now();
+          entry.closeAskedAt = undefined;
+          this.closeAsked.delete(o.id);
+          // (Not "LND finished our close": the buyer may have closed it, or
+          // the operator, by hand — the list does not say which.)
+          this.journal.event(entry, "lease over — the channel is no longer open (a close was asked for earlier)");
+          this.journal.note(entry);
+        }
+        continue;
+      }
       if (running.has(standardChannelId(ch.id))) continue; // a lease still runs on it
+      // Two finished sales can name one channel (a lease sold again on it):
+      // one close this pass, not one for each.
+      if (askedNow.has(ch.id)) continue;
+      // A close asked before, its fee refused: LND goes on with it.
+      const askedAt = entry?.closeAskedAt ? Date.parse(entry.closeAskedAt) : this.closeAsked.get(o.id);
+      if (askedAt !== undefined && Number.isFinite(askedAt) && Date.now() - askedAt < CLOSE_ASKED_RETRY_MS) continue;
+      // Over by this node's own count too?
+      const leaseBlocks = entry?.leaseBlocks && entry.leaseBlocks > 0 ? entry.leaseBlocks : (known?.leaseBlocks ?? 0);
+      const funded = fundingHeight(ch.id);
+      const ends = funded !== null && leaseBlocks > 0 ? leaseEndHeight({ source: "magma", leaseBlocks }, funded) : null;
+      const early: { why: string; text: string } | null =
+        leaseBlocks <= 0
+          ? { why: "length", text: "not closed: how long this lease runs is on no record here or at Amboss — it is not closed on Amboss's status alone" }
+          : funded === null || ends === null
+            ? { why: "funding", text: "not closed yet: the block its funding confirmed in is unknown, so the lease's end can't be counted" }
+            : height === null
+              ? { why: "height", text: "not closed yet: this node's block height couldn't be read, so the lease's end can't be counted" }
+              : height < ends
+                ? {
+                    why: "count",
+                    text:
+                      `not closed: Amboss lists the lease as over, but by this node's count it runs until block ${sat(ends)} ` +
+                      `(funded in block ${sat(funded)}, a lease of ${sat(leaseBlocks)} blocks and a day) — ${sat(ends - height)} blocks to go`,
+                  }
+                : null;
       // Is it worth closing? (Asked once per pass, when a close is due.)
-      terms ??= this.deps.soldChannelClose ? await this.deps.soldChannelClose().catch(() => null) : null;
+      if (!early) terms ??= this.deps.soldChannelClose ? await this.deps.soldChannelClose().catch(() => null) : null;
       const well = terms ? terms.routesWell(ch.id) : null;
       const keep: { why: string; text: string } | null =
-        ch.local_balance < SOLD_CLOSE_MIN_LOCAL_SHARE * ch.capacity
+        early ??
+        (ch.local_balance < SOLD_CLOSE_MIN_LOCAL_SHARE * ch.capacity
           ? {
               why: "local",
-              text: `kept open: ${Math.round(ch.local_balance).toLocaleString("en-US")} of its ${Math.round(ch.capacity).toLocaleString("en-US")} sat are on our side — the rest is inbound worth keeping`,
+              text: `kept open: ${sat(ch.local_balance)} of its ${sat(ch.capacity)} sat are on our side — the rest is inbound worth keeping`,
             }
           : well === true
-            ? { why: "routes", text: "kept open: it routes well (it earns at least about what selling its capital again would)" }
-            : !terms
-              ? { why: "terms", text: "not closed yet: no on-chain fee estimate to close it at an economy rate" }
-              : well === null
-                ? { why: "unknown", text: "not closed yet: whether it routes well couldn't be read (this node's forwarding history or channel list) — it is not closed on a guess" }
-                : terms.feeRate === null
-                  ? { why: "estimate", text: "not closed yet: LND gave no on-chain fee estimate" }
-                  : terms.feeRate > terms.maxFeeRate
-                    ? { why: "fees", text: `not closed yet: on-chain fees are ${terms.feeRate} sat/vB at the economy rate — above your ${terms.maxFeeRate} sat/vB maximum` }
-                    : null;
+            ? { why: "routes", text: `kept open: it routes well (${SOLD_KEEP_BAR_TEXT})` }
+            : !ch.is_active
+              ? {
+                  why: "offline",
+                  text: "not closed yet: the buyer's node is offline, and closing takes both sides — tried again once it is back (a force close stays yours to decide, on Channels)",
+                }
+              : !terms
+                ? { why: "terms", text: "not closed yet: no on-chain fee estimate to close it at an economy rate" }
+                : well === null
+                  ? { why: "unknown", text: "not closed yet: whether it routes well couldn't be read (this node's forwarding history or channel list) — it is not closed on a guess" }
+                  : terms.feeRate === null
+                    ? { why: "estimate", text: "not closed yet: LND gave no on-chain fee estimate" }
+                    : terms.feeRate > terms.maxFeeRate
+                      ? { why: "fees", text: `not closed yet: on-chain fees are ${terms.feeRate} sat/vB at the economy rate — above your ${terms.maxFeeRate} sat/vB maximum` }
+                      : null);
       if (keep) {
         // Said once per process for each reason (in the order's history, or
         // the log for a sale the journal doesn't know) — not each run, nor
@@ -3669,7 +4438,6 @@ export class MagmaDesk {
         // and the balance in the text made a line most runs).
         if (this.closeKept.get(o.id) !== keep.why) {
           this.closeKept.set(o.id, keep.why);
-          const entry = this.journal.get(o.id);
           if (entry) {
             this.journal.event(entry, `lease over — ${keep.text}`);
             this.journal.note(entry);
@@ -3680,12 +4448,27 @@ export class MagmaDesk {
       // Again right before the close: the reads above may have taken a while.
       if (stop()) break;
       const res = await closeChannelByOutpoint(writeLnd, ch.transaction_id, ch.transaction_vout, false, terms?.feeRate ?? undefined, terms?.maxFeeRate);
-      const entry = this.journal.get(o.id);
-      if (entry && res.ok) {
-        entry.closedAt = now();
-        entry.closeTxid = res.transactionId;
-        this.journal.event(entry, "lease over — channel closed");
-        this.journal.note(entry);
+      askedNow.add(ch.id);
+      this.closeKept.delete(o.id);
+      if (res.ok) {
+        this.closeAsked.delete(o.id);
+        if (entry) {
+          entry.closedAt = now();
+          entry.closeTxid = res.transactionId;
+          entry.closeAskedAt = undefined;
+          this.journal.event(entry, "lease over — channel closed");
+          this.journal.note(entry);
+        }
+      } else if (res.stillClosing) {
+        // The shutdown is out (CHAN-5): recorded, said once, and the close
+        // not asked again while LND may still finish it.
+        const what = `lease over — close asked at ${terms?.feeRate} sat/vB. ${res.error} Asked again in a day if the channel is still open then.`;
+        this.closeAsked.set(o.id, Date.now());
+        if (entry) {
+          entry.closeAskedAt = now();
+          this.journal.event(entry, what);
+          this.journal.note(entry);
+        } else console.log(`[magma] order ${o.id}: ${what}`);
       }
       out.push({ orderId: o.id, action: "close", sizeSats: o.sizeSats, ok: res.ok, transactionId: res.transactionId, error: res.error });
     }
@@ -3696,6 +4479,7 @@ export class MagmaDesk {
 
   private toPhase(entry: MagmaJournalEntry, phase: MagmaPhase, what: string): void {
     entry.phase = phase;
+    if (phase !== "accepting") entry.acceptRefused = undefined;
     entry.lastError = undefined;
     entry.lastErrorAt = undefined;
     this.journal.event(entry, what);
@@ -3719,6 +4503,7 @@ export class MagmaDesk {
   private backToSeen(entry: MagmaJournalEntry): void {
     entry.phase = "seen";
     entry.invoice = null;
+    entry.acceptRefused = undefined;
     entry.lastError = undefined;
     entry.lastErrorAt = undefined;
   }

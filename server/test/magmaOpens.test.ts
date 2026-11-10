@@ -8,7 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { acceptedInvoice } from "./helpers/magma.js";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
-import { OPEN_MIN_BLOCKS_LEFT, OPENING_GRACE_MS } from "../src/services/magmaDesk.js";
+import { BUYER_DIALS, OPEN_MIN_BLOCKS_LEFT, OPENING_GRACE_MS } from "../src/services/magmaDesk.js";
 import {
   entryOnDisk,
   quiet,
@@ -250,9 +250,44 @@ test("the buyer's node takes one pending channel at a time: that refusal is wait
   await autopilot.pollSellOrders();
   assert.equal(node.invoices.get(hash)?.state, "ACCEPTED", "still held — before, refunded at once");
   assert.match(entryOnDisk(dir, sale.id)?.lastError ?? "", /will try again/);
+  // Asked again as a buyer away is dialed again — after three minutes, not on
+  // every pass: before, each pass wrote "open started" on the order's record,
+  // and twenty minutes of them pushed everything else out of its history
+  // (review of the package).
+  const t0 = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + 60_000 });
+  const asked = node.callsTo("default.openChannel").length;
+  await autopilot.pollSellOrders();
+  await autopilot.pollSellOrders();
+  assert.equal(node.callsTo("default.openChannel").length, asked, "not asked again within three minutes");
+  const started = () => (entryOnDisk(dir, sale.id)?.events ?? []).filter((e) => /^open started/.test(e.what)).length;
+  assert.equal(started(), 1);
+  assert.equal(entryOnDisk(dir, sale.id)?.phase, "held");
+  assert.equal(node.invoices.get(hash)?.state, "ACCEPTED");
+  t.mock.timers.setTime(t0 + BUYER_DIALS.redialMs + 1_000);
+  await autopilot.pollSellOrders();
+  assert.equal(node.callsTo("default.openChannel").length, asked + 1, "asked again after three minutes");
+  assert.equal(started(), 2);
   node.openFailure = null; // the earlier channel confirmed
+  t.mock.timers.setTime(t0 + 2 * BUYER_DIALS.redialMs + 2_000);
   await autopilot.pollSellOrders();
   assert.equal(entryOnDisk(dir, sale.id)?.phase, "reported");
+});
+
+test("…and the operator's “Open channel” asks at once, whatever LND refused a moment ago", async (t) => {
+  quiet(t);
+  const { autopilot, node, magma, dir } = sellerSetup(t);
+  const sale = magma.addSale({ buyerPubkey: BUYER });
+  await autopilot.pollSellOrders();
+  magma.buyerPays(sale.id, node);
+  node.openFailure = "remote node pending channels exceed maximum allowed";
+  await autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(dir, sale.id)?.phase, "held");
+  node.openFailure = null;
+  const res = await autopilot.magma.open(sale.id);
+  assert.equal(res.ok, true, JSON.stringify(res));
+  assert.equal(node.callsTo("default.openChannel").length, 2);
+  assert.ok(entryOnDisk(dir, sale.id)?.fundingOutpoint);
 });
 
 test("'Open channel' on an order whose earlier open is still unclear never answers ok and never opens again", async (t) => {
