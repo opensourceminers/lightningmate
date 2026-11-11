@@ -69,13 +69,15 @@ export interface AutopilotConfig {
   /** Top a depleted offer back up (within the caps) so it keeps taking orders. */
   sellAutoRelist: boolean;
   /** Keep an enabled offer continuously priced to the current market (never below
-   *  the profit floor), instead of leaving it static. */
+   *  the profit floor — a price lifted to it is written 5 % over it, so the
+   *  mempool's next uptick isn't one more write), instead of leaving it static. */
   sellAutoReprice: boolean;
   /** Keep the offer's size window and lease length in a sane, standard shape,
    *  up to sellMaxChannelSats. Separate from pricing on purpose. */
   sellAutoSize: boolean;
   /** Pricing level when auto-pricing, on what buyers actually paid: fast (their
-   *  25th percentile — the "Low" mode; never below the profit floor), balanced
+   *  25th percentile — the "Low" mode; never below the profit floor, and 5 %
+   *  over it where the floor sets the price), balanced
    *  (the median), premium (the 75th percentile), or auto (between their 25th
    *  and 75th percentile: starts in the middle and steps up that range after
    *  each sale; it never steps down on its own, but it follows the market —

@@ -19,7 +19,7 @@ import { __resetEligibilityCache, assessEligibility, feeTiers, type BookOffer, t
 import { MAGMA_OWN_RECORD_DAYS, magmaFillsPerYear } from "../src/services/openPlan.js";
 import { ambossFeePpmFor } from "../src/services/magmaBuy.js";
 import { __setHistoryForTests } from "../src/services/magmaHistory.js";
-import { sellerSetup, suggestion, type AutopilotSeams } from "./helpers/autopilot.js";
+import { lndEstimatesFee, sellerSetup, suggestion, type AutopilotSeams } from "./helpers/autopilot.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
 import { FakeMarket, ambossFeeFor } from "./helpers/market.js";
 import { AMBOSS_API } from "./helpers/amboss.js";
@@ -506,6 +506,7 @@ test("auto-listing needs selling to be realistic: no offer is created for a node
   quiet(t);
   for (const realistic of [false, true]) {
     const s = sellerSetup(t, { chainBalance: 20_000_000, config: { sellAutoReprice: true } });
+    lndEstimatesFee(s.node);
     fillMarket(s.market, () => (realistic ? 30 : 0));
     await s.autopilot.runOnce();
     const creates = s.magma.calls.filter((c) => c.op === "CreateOffer");
@@ -525,6 +526,7 @@ test("auto-listing needs selling to be realistic: no offer is created for a node
 test("a8: the Market page and the autopilot run the engine with the same capital inputs — at 1.2M on chain with a 50k reserve both see 1.15M deployable, and the autopilot lists where the page recommends", async (t) => {
   quiet(t);
   const s = sellerSetup(t, { chainBalance: 1_200_000, config: { sellAutoReprice: true, sellReserveSats: 50_000 } });
+  lndEstimatesFee(s.node);
   // Offers like a ~1.15M listing (Amboss fee 1000) that do sell.
   for (let i = 0; i < 6; i++) s.market.addOffer({ totalSats: 1_500_000 + i * 500_000, sellerScore: i * 3, filledOrders: 24, monthsListed: 6 });
   const page = await s.autopilot.magmaReport();

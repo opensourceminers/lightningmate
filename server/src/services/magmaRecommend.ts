@@ -11,6 +11,7 @@ import { standardChannelId } from "./leases.js";
 import { errorText as errorMessage } from "./errorText.js";
 import {
   clearingFor,
+  clearingOrAll,
   demandFit,
   magmaHistoryAgeHours,
   marketActivity,
@@ -20,6 +21,7 @@ import {
   keptLeaseBlocks,
   COMMON_LEASE_BLOCKS,
   DEFAULT_LEASE_BLOCKS,
+  MIN_CLEARING_SAMPLE,
   type ClearingStats,
 } from "./magmaHistory.js";
 import type { OfferFeeCaps } from "./leaseCaps.js";
@@ -63,7 +65,8 @@ export interface MagmaV2Config {
   defaultMinBlockLength: number;
   sellPricingMode: "fast" | "balanced" | "premium" | "auto";
   /** For "auto": 0 = the low end of what buyers paid (p25), 0.5 = the
-   *  median, 1 = the top (p75) — never below the profit floor. */
+   *  median, 1 = the top (p75) — never below the profit floor (written a
+   *  margin over it, PROFIT_FLOOR_MARGIN). */
   adaptiveLevel: number;
   minFeeRatePpm: number;
   maxFeeRatePpm: number;
@@ -73,12 +76,14 @@ export interface MagmaV2Config {
   /** The routing-fee promise this node's offers carry (D7, leaseCaps.ts) —
    *  part of every recommended offer. Null: none (the engine alone). */
   offerFeeCaps: OfferFeeCaps | null;
-  /** Who sets each offer's lease next (autopilot.ts): with auto-size on (and
-   *  selling), the autopilot gives every offer whose terms aren't
-   *  the operator's the standard lease in its next write — such an offer is
-   *  priced for the standard lease. Every other offer is priced for the lease
-   *  it keeps (keptLeaseBlocks). */
+  /** Auto-size is on (and selling): the autopilot gives every offer whose
+   *  terms aren't the operator's its size window (autoSizedWindow) and, where
+   *  its lease is one no order uses, the standard one. Every offer — managed
+   *  or not — is priced for the lease it keeps (keptLeaseBlocks). */
   autoSizeLease: boolean;
+  /** Auto-relist is on. Off: what a sale took is not listed again, and
+   *  auto-size widens no window past what is still listed (autoSizedWindow). */
+  autoRelist: boolean;
   /** Offers whose terms the operator took over (OfferControl.manual): the
    *  autopilot leaves their lease alone, whatever auto-size says. */
   operatorOfferIds: string[];
@@ -102,6 +107,11 @@ export interface MagmaV2Config {
   /** Does the order lane open this paid order's channel itself
    *  (MagmaDesk.opensItself)? Such an order isn't waiting on you. */
   laneOpens: (orderId: string) => boolean;
+  /** The on-chain fee rate (sat/vB) LND last gave an estimate for (the
+   *  autopilot keeps it with the order lane's floor, saleFeeFloor). Used
+   *  while LND gives none: the lane goes on with its last known floor, and
+   *  the engine must cost a channel at the same rate. Null: never known. */
+  lastKnownFeePerVbyte: number | null;
 }
 
 export const MAGMA_V2_DEFAULTS: MagmaV2Config = {
@@ -132,13 +142,45 @@ export const MAGMA_V2_DEFAULTS: MagmaV2Config = {
   buyDesiredSizeSat: 2_000_000,
   offerFeeCaps: null,
   autoSizeLease: false,
+  autoRelist: true,
   operatorOfferIds: [],
   heldFloorOfferIds: [],
   windowsHeld: false,
   baseMoves: {},
   sellableNowSat: null,
   laneOpens: () => false,
+  lastKnownFeePerVbyte: null,
 };
+
+/**
+ * How many listed offers a price may be read from when there is no sale
+ * history (segmentFor): with fewer, the market's price is not known.
+ */
+export const MIN_LISTED_SAMPLE = 5;
+
+/**
+ * How far one step moves an offer's price when it is read from LISTED offers
+ * (no sale history): a quarter of the price it has. Asks are prices nobody
+ * has to pay, and anyone can list one.
+ */
+export const LISTED_MOVE_CAP = 0.25;
+/**
+ * How long the autopilot waits between two such steps. The cap alone bounded
+ * one run, not the move: a run every 30 minutes took an offer from 2,966 to
+ * 9,400 ppm in six runs on listings alone (review of P2 of the 2026-11
+ * programme, R2-4). A quarter every six hours is ×2.4 a day at most.
+ */
+export const LISTED_MOVE_HOLD_MS = 6 * 3_600_000;
+
+/**
+ * What a price that the profit floor sets is written with: the floor plus
+ * 5 %. The floor moves with the mempool; written exactly at it, every uptick
+ * of the fee estimate was one more write to Amboss (review 2026-11-10,
+ * OFFER-11: 6 writes in 12 runs while the estimate went from 10.0 to 10.5
+ * sat/vB). With the margin an offer is rewritten upward once the floor has
+ * passed its price, and downward as any price is: past the reprice threshold.
+ */
+export const PROFIT_FLOOR_MARGIN = 1.05;
 
 export type MagmaSellOfferState =
   | "well_priced"
@@ -147,6 +189,10 @@ export type MagmaSellOfferState =
   | "below_profit_floor"
   | "do_not_list_unprofitable"
   | "do_not_list_uncompetitive"
+  /** No sale history and too few comparable listed offers: what the market
+   *  pays isn't known. The price stays (raised only when under the floor). */
+  | "market_unknown"
+  /** Sold out: less than its smallest order is left to buy. */
   | "exhausted"
   | "inactive";
 
@@ -232,7 +278,8 @@ export interface MagmaSellRecommendation {
   /** Concrete price points for the UI buttons — for `recommended.minBlockLength`. */
   pricing: { fast: PricePoint; balanced: PricePoint; premium: PricePoint; profitFloor: PricePoint };
   /** What buyers paid for comparable leases, expressed for this offer's
-   *  lease (null: no sale history). */
+   *  lease — of every size (`allSizes`) when the offer's own band sold too
+   *  few. Null: no sale history. */
   clearing: ClearingStats | null;
   reasons: string[];
   warnings: string[];
@@ -288,6 +335,9 @@ export interface MagmaV2Report {
       | "good_to_sell"
       | "sell_only_above_profit_floor"
       | "market_too_cheap"
+      /** No sale history and too few comparable listed offers: nothing says
+       *  what the market pays, so nothing is listed automatically. */
+      | "market_unknown"
       | "insufficient_capital";
     deployableCapitalSat: number;
     recommendedSellSizeSat: number | null;
@@ -321,6 +371,14 @@ export interface MagmaV2Report {
     onchainOpenCostSat: number;
     onchainCloseCostSat: number;
     onchainFeePerVbyte: number | null;
+    /** LND gives no fee estimate right now, and gave one before: a channel is
+     *  costed at that last known rate (`lastKnownFeePerVbyte`), as the order
+     *  lane's floor is; no price is moved and no offer created until the
+     *  estimate is back. (None right now and none known from before:
+     *  `onchainFeePerVbyte` is null and this is false — a channel is costed
+     *  at built-in defaults, and the autopilot creates no offer.) */
+    feeEstimateMissing: boolean;
+    lastKnownFeePerVbyte: number | null;
     /** The order lane's accept floor at that rate (saleAcceptFloorSats): an
      *  order paying less is turned down as below cost. */
     acceptFloorSat: number;
@@ -503,6 +561,76 @@ export function minSizeCoveringSat(feeRatePpm: number, baseFeeSats: number, floo
 }
 
 /**
+ * What the smallest order of an offer the autopilot sizes has to pay: the
+ * order lane's accept floor (opening and closing its channel at today's fee
+ * rate) with room over it, and at least the minimum profit on top.
+ *
+ * Review 2026-11-10, OFFER-10 and OFFER-4: the minimum was set where the
+ * smallest order just paid the accept floor. A fee estimate a few sat/vB
+ * higher between the upkeep's write and an order — and the lane turned the
+ * offer's own smallest order down (at 10 sat/vB: listed from 950k, floor
+ * 3,250 sat; at 14 sat/vB the floor is 4,550 and that order pays 3,806),
+ * which costs seller score; and where it was taken, it netted a few sat
+ * (13 sat for 1.62M locked 30 days). Written with COVER_WRITE_MARGIN over
+ * the floor; a minimum that still pays COVER_KEEP_MARGIN over it stays, so
+ * the fee estimate's small moves rewrite nothing. The other way the same: a
+ * minimum the reshape would lower stays until its smallest order pays more
+ * than COVER_RELAX_MARGIN over the floor — an estimate creeping down a few
+ * percent a run rewrote the minimum run after run otherwise.
+ */
+export const COVER_WRITE_MARGIN = 1.25;
+export const COVER_KEEP_MARGIN = 1.12;
+export const COVER_RELAX_MARGIN = 1.4;
+export function smallestOrderPaysSat(
+  acceptFloorSat: number,
+  margin: number,
+  serviceFeeRate: number,
+  minProfitSat: number = MAGMA_V2_DEFAULTS.minNetLeaseProfitSat,
+): number {
+  return Math.max(Math.ceil(acceptFloorSat * margin), acceptFloorSat + Math.ceil(minProfitSat / Math.max(0.01, 1 - serviceFeeRate)));
+}
+
+/**
+ * The smallest order an offer the autopilot sizes takes at a price, so that
+ * it pays `smallestOrderPaysSat` — or as near to it as the capital funds:
+ * with the write margin, else the keep margin, else the bare accept floor
+ * (the first that `fundable` says an order of can be funded). Null: not even
+ * the bare floor — every order would be turned down.
+ */
+export function coveringMinSizeSat(
+  price: { feeRatePpm: number; baseFeeSats: number },
+  acceptFloorSat: number,
+  serviceFeeRate: number,
+  fundable: (sizeSat: number) => boolean,
+): { sizeSat: number; paysSat: number; keepSizeSat: number; writeSizeSat: number; bareSizeSat: number; level: "margin" | "floor" } | null {
+  const writeSat = smallestOrderPaysSat(acceptFloorSat, COVER_WRITE_MARGIN, serviceFeeRate);
+  const keepSat = smallestOrderPaysSat(acceptFloorSat, COVER_KEEP_MARGIN, serviceFeeRate);
+  const size = (sat: number) => minSizeCoveringSat(price.feeRatePpm, price.baseFeeSats, sat);
+  const sizes = { writeSizeSat: size(writeSat), keepSizeSat: size(keepSat), bareSizeSat: size(acceptFloorSat) };
+  const ok = (x: number) => Number.isFinite(x) && fundable(x);
+  if (ok(sizes.writeSizeSat)) return { sizeSat: sizes.writeSizeSat, paysSat: writeSat, level: "margin", ...sizes };
+  if (ok(sizes.keepSizeSat)) return { sizeSat: sizes.keepSizeSat, paysSat: keepSat, level: "margin", ...sizes };
+  if (ok(sizes.bareSizeSat)) return { sizeSat: sizes.bareSizeSat, paysSat: acceptFloorSat, level: "floor", ...sizes };
+  return null;
+}
+
+/**
+ * Whether the minimum an offer HAS stands where auto-size would take it
+ * lower: while its smallest order pays the keep margin over the lane's
+ * floor, and no more than the relax margin (`relaxSizeSat`: the size that
+ * pays that at the offer's price). Above that the minimum has more room than
+ * it needs and comes down to the write margin's size; under the keep margin,
+ * or where the capital funds no margin at all, it is set afresh.
+ */
+export function standingMinimumStays(
+  standingSat: number,
+  want: Pick<NonNullable<ReturnType<typeof coveringMinSizeSat>>, "level" | "keepSizeSat" | "writeSizeSat">,
+  relaxSizeSat: number,
+): boolean {
+  return want.level === "margin" && standingSat >= want.keepSizeSat && standingSat <= Math.max(relaxSizeSat, want.writeSizeSat);
+}
+
+/**
  * The window auto-size gives an offer (the autopilot's reshape): its floor
  * moves to the smallest channel that pays for itself (`wantMin`) when that
  * is well above or below the offer's (±20 %), its max widens to what can be
@@ -511,6 +639,14 @@ export function minSizeCoveringSat(feeRatePpm: number, baseFeeSats: number, floo
  * — the one it is written with — and the upkeep writes it (final review
  * 2026-10-25: priced for the old 250k–2M while the min went to 1.6M, the
  * offer went out at ~2.2× the market and came back down a run later).
+ *
+ * With auto-relist off (`listedCapSat`: what the offer still lists) the
+ * window never widens past that — what a sale took is not listed again, and
+ * a window above the listing sells nothing bigger — and stays as it is when
+ * less than the smallest channel worth selling is left (review 2026-11-10,
+ * OFFER-2: the reshape raised the listing to the window's new max, so 1M
+ * left of a 3M offer was 2M for sale again as soon as a fee move changed
+ * the window).
  */
 export function autoSizedWindow(
   off: { minSizeSats: number; maxSizeSats: number },
@@ -519,7 +655,12 @@ export function autoSizedWindow(
   /** The floor was raised a moment ago: it doesn't come down yet (the upkeep's
    *  OFFER_FLOOR_HOLD_MS; the engine asks the same, or it prices another window). */
   holdFloor = false,
+  listedCapSat: number | null = null,
 ): { minSizeSats: number; maxSizeSats: number } | null {
+  if (listedCapSat !== null) {
+    if (listedCapSat < wantMin) return null;
+    wantMax = Math.min(wantMax, listedCapSat);
+  }
   if (!(wantMin > 0) || wantMax < wantMin) return null;
   const widens = wantMax > off.maxSizeSats * 1.2;
   const lowersFloor = !holdFloor && wantMin < off.minSizeSats * 0.8;
@@ -586,9 +727,27 @@ export async function getMagmaRecommendations(
   const onchainFeePerVbyte = oc.feePerVbyte;
   cfg.defaultOpenCostSat = oc.openCostSat;
   cfg.defaultCloseCostSat = oc.closeCostSat;
+  // No estimate from LND right now, and one was known before: the order lane
+  // goes on with the floor of that rate (autopilot.ts saleFeeFloor), so a
+  // channel is costed at it here too. Before, the engine fell back to its
+  // defaults — about 1 sat/vB — and priced and sized an offer for a mempool
+  // the lane did not believe in (review 2026-11-10, OFFER-13). While it
+  // lasts no price is moved (buildSell) and no offer is created (the
+  // autopilot's create path). A node whose LND never gave an estimate — a
+  // first start, or an install from before the rate was kept — has nothing
+  // to hold on to: it keeps the defaults, as before, and says so; the
+  // autopilot creates no offer on them (review of this package, R2-6: it
+  // listed one at 4,200 ppm + 284 sat from 1M, costed at about 1 sat/vB).
+  const lastKnownFeePerVbyte =
+    cfg.lastKnownFeePerVbyte !== null && Number.isFinite(cfg.lastKnownFeePerVbyte) && cfg.lastKnownFeePerVbyte > 0 ? cfg.lastKnownFeePerVbyte : null;
+  const feeEstimateMissing = onchainFeePerVbyte === null && lastKnownFeePerVbyte !== null;
+  if (feeEstimateMissing && lastKnownFeePerVbyte !== null) {
+    cfg.defaultOpenCostSat = Math.ceil(lastKnownFeePerVbyte * cfg.openTxVbytes);
+    cfg.defaultCloseCostSat = Math.ceil(lastKnownFeePerVbyte * cfg.closeTxVbytes);
+  }
   // The order lane's accept floor at today's fee rate: a base change never lets
   // an offer's smallest order pay less than that (buildSell).
-  const acceptFloorSat = saleAcceptFloorSats(onchainFeePerVbyte, cfg.serviceFeeRate);
+  const acceptFloorSat = saleAcceptFloorSats(onchainFeePerVbyte ?? lastKnownFeePerVbyte, cfg.serviceFeeRate);
   const nowMs = Date.now();
 
   // ── Routing opportunity cost — yield ON CAPITAL (shared node-economics model).
@@ -677,12 +836,22 @@ export async function getMagmaRecommendations(
   // own minimum lease, so a 30-day ask of 3,000 ppm is the rate of a 9,000 ppm
   // 90-day one. (Unscaled, a 90-day offer's floor was held against 30-day
   // asks: "above the market" — "may not fill" — at a third of its market.)
+  //
+  // Which listings count (review 2026-11-10, OFFER-7): priced ones, with a
+  // lease the market trades (COMMON_LEASES), of a seller Amboss gives a score
+  // — one that has delivered orders. A listing with a 1-block lease counted
+  // as 4,320 times its price for a 30-day offer (three of them wrote an offer
+  // to the 50,000 ppm limit), and five listings at 1 ppm of sellers without a
+  // score cut one to its bare floor: anyone can list anything. With fewer
+  // than MIN_LISTED_SAMPLE such listings the sample is not `trusted`: no
+  // price and no verdict on the market is read from it.
+  const comparable = offers.filter((o) => (o.feeRatePpm > 0 || o.baseFeeSats > 0) && COMMON_LEASES.has(o.minBlockLength) && o.sellerScore > 0);
   const segmentFor = (repSize: number, myMin: number, myMax: number, leaseBlocks: number) => {
     const overlaps = (o: MagmaOffer) => o.maxSizeSats >= myMin && o.minSizeSats <= myMax;
-    let pool = offers.filter((o) => o.feeRatePpm > 0 || o.baseFeeSats > 0).filter(overlaps);
+    let pool = comparable.filter(overlaps);
     let fallbackLevel: "size_band" | "all_offers" = "size_band";
-    if (pool.length < 5) {
-      pool = offers.filter((o) => o.feeRatePpm > 0 || o.baseFeeSats > 0);
+    if (pool.length < MIN_LISTED_SAMPLE) {
+      pool = comparable;
       fallbackLevel = "all_offers";
     }
     const askAt = (o: MagmaOffer) =>
@@ -695,6 +864,7 @@ export async function getMagmaRecommendations(
       .sort((a, b) => a - b);
     return {
       count: pool.length,
+      trusted: pool.length >= MIN_LISTED_SAMPLE,
       fallbackLevel,
       p10: Math.round(pct(effs, 0.1)),
       p25: Math.round(pct(effs, 0.25)),
@@ -709,17 +879,20 @@ export async function getMagmaRecommendations(
   const interp = (a: number, b: number, t: number) => a + (b - a) * clamp(t, 0, 1);
   // The lease every offer should promise (D7), and the routing-fee promise.
   const standardLease = standardLeaseBlocks();
+  // The lease most sales carried lately: information — no offer is moved to it.
+  const popularLease = popularLeaseBlocks();
   const caps = cfg.offerFeeCaps;
-  /** The lease an offer is priced for: the one it carries after the next
-   *  write. A new offer gets the standard; with auto-size the autopilot gives
-   *  every offer it manages the standard; any other offer keeps a lease
-   *  buyers use (keptLeaseBlocks — the Sell tab's price buttons keep the
-   *  same one). */
+  /** Auto-size manages this offer: its window (and an odd lease) is the
+   *  autopilot's to write. */
   const autoLease = (offer: MyOffer): boolean => cfg.autoSizeLease && !cfg.operatorOfferIds.includes(offer.id);
-  const pricingLease = (offer: MyOffer | null): number => {
-    if (!offer || autoLease(offer)) return standardLease;
-    return keptLeaseBlocks(offer.minBlockLength, standardLease);
-  };
+  /** The lease an offer is priced for: the one it carries after the next
+   *  write. A new offer gets the standard; every other one keeps a lease
+   *  buyers use, at least as long as the standard (keptLeaseBlocks — the
+   *  autopilot's auto-size and the Sell tab's price buttons keep the same
+   *  one): the minimum lease is the operator's choice (review 2026-11-10,
+   *  OFFER-5; before, auto-size gave every offer it managed the lease most
+   *  sales carried, and an offer was priced for that). */
+  const pricingLease = (offer: MyOffer | null): number => (offer ? keptLeaseBlocks(offer.minBlockLength, standardLease) : standardLease);
   const leaseDays = (blocks: number) => Math.round(blocks / 144);
 
   // Turn a target effective ppm into a concrete fee_rate + base price point.
@@ -759,7 +932,7 @@ export async function getMagmaRecommendations(
     // (autoSizedWindow — the upkeep's reshape writes the same), not for the
     // one it has: the representative size, and with it the profit floor,
     // moves with it.
-    const sized = offer && autoLease(offer) && !cfg.windowsHeld ? autoSizedWindow(offer, sellWindow.min, sellWindow.max, cfg.heldFloorOfferIds.includes(offer.id)) : null;
+    const sized = offer && autoLease(offer) && !cfg.windowsHeld ? autoSizedWindow(offer, sellWindow.min, sellWindow.max, cfg.heldFloorOfferIds.includes(offer.id), cfg.autoRelist ? null : offer.availableSats) : null;
     const minSize = sized?.minSizeSats ?? offer?.minSizeSats ?? sellWindow.min;
     const maxSize = sized?.maxSizeSats ?? offer?.maxSizeSats ?? sellWindow.max;
     // Priced for the lease the offer carries after the next write: a 90-day
@@ -789,26 +962,24 @@ export async function getMagmaRecommendations(
     // So the price ladder now comes from the real fill history when we have it,
     // and the listed percentiles are only a fallback for when Amboss's history
     // endpoint is unreachable.
-    const clearing = clearingFor({ minSizeSat: minSize, maxSizeSat: maxSize, blocks: minBlock });
+    //
+    // The sales of the offer's own size band — or, where that band sold fewer
+    // than MIN_CLEARING_SAMPLE in a year, the sales of every size
+    // (clearingOrAll; review 2026-11-10, OFFER-3: one sale in the band set
+    // the whole price). Without any history the listed offers stand in, but
+    // only as a sample to be trusted (segmentFor); with neither, what the
+    // market pays is not known (`ladder` null) and the offer's price stays.
+    const clearing = clearingOrAll({ minSizeSat: minSize, maxSizeSat: maxSize, blocks: minBlock });
     const ladder = clearing
       ? { low: clearing.p25Ppm, mid: clearing.medianPpm, high: clearing.p75Ppm }
-      : { low: seg.p25, mid: seg.median, high: seg.p75 };
+      : seg.trusted
+        ? { low: seg.p25, mid: seg.median, high: seg.p75 }
+        : null;
 
     // A hard floor at the 25th percentile of REAL fills. Even the most aggressive
     // setting may not price below what a quarter of the market comfortably gets,
     // because cheapness is not what wins the match.
     const clearingFloor = clearing ? clearing.p25Ppm : 0;
-
-    const modeTarget =
-      cfg.sellPricingMode === "fast"
-        ? ladder.low
-        : cfg.sellPricingMode === "premium"
-          ? ladder.high
-          : cfg.sellPricingMode === "auto"
-            ? Math.round(interp(ladder.low, ladder.high, cfg.adaptiveLevel))
-            : ladder.mid;
-
-    const targetEff = Math.max(floorEff, clearingFloor, modeTarget);
 
     const current = offer
       ? {
@@ -818,9 +989,34 @@ export async function getMagmaRecommendations(
         }
       : null;
 
+    let modeTarget: number | null = !ladder
+      ? null
+      : cfg.sellPricingMode === "fast"
+        ? ladder.low
+        : cfg.sellPricingMode === "premium"
+          ? ladder.high
+          : cfg.sellPricingMode === "auto"
+            ? Math.round(interp(ladder.low, ladder.high, cfg.adaptiveLevel))
+            : ladder.mid;
+    // Read from listed offers, one step moves the price a quarter at most
+    // (LISTED_MOVE_CAP): the next step goes on from there — the autopilot
+    // takes one every LISTED_MOVE_HOLD_MS.
+    let moveCapped = false;
+    if (!clearing && modeTarget !== null && current) {
+      const capped = Math.round(clamp(modeTarget, current.effectiveFeePpm * (1 - LISTED_MOVE_CAP), current.effectiveFeePpm * (1 + LISTED_MOVE_CAP)));
+      moveCapped = capped !== modeTarget;
+      modeTarget = capped;
+    }
+
+    // The profit floor as a price is written with its margin (PROFIT_FLOOR_MARGIN).
+    const floorWritten = Math.ceil(floorEff * PROFIT_FLOOR_MARGIN);
+    // Market unknown: the price the offer has (a new one: the floor).
+    const targetEff = Math.max(floorWritten, clearingFloor, modeTarget ?? current?.effectiveFeePpm ?? 0);
+
     // ── Base fee ──────────────────────────────────────────────────────────────
-    // The market's: the median base of the comparable offers (none without
-    // any). An offer keeps its own while that is within BASE_FEE_TOLERANCE of
+    // The market's: the median base of the comparable offers (none without a
+    // sample of them to be trusted — a handful of listings moves no base).
+    // An offer keeps its own while that is within BASE_FEE_TOLERANCE of
     // it — and until baseFeeFollow says it follows: at once when far off,
     // else once the market's base has held for BASE_FEE_STABLE_MS (a median
     // one listing moves back and forth is never followed), at most one move
@@ -831,7 +1027,7 @@ export async function getMagmaRecommendations(
     // base doesn't: the base is spread over the whole size range — the price
     // stays put only at the representative size √(min·max), and a lower base
     // charges small orders less.
-    const marketBase = seg.count > 0 ? seg.baseMed : null;
+    const marketBase = seg.trusted ? seg.baseMed : null;
     const baseDiffers = !!offer && marketBase !== null && preferredBaseFeeSats(offer.baseFeeSats, marketBase) !== offer.baseFeeSats;
     // The clock of this difference only: one started against another base of
     // the offer's — before a base move, or an edit — is not.
@@ -858,11 +1054,15 @@ export async function getMagmaRecommendations(
     let recEcon = economics(repSize, minBlock, recommended.effectiveFeePpm);
     let beatsRouting = recEcon.leasePpmPerYear >= recommendedMinLeasePpmPerYear;
 
-    const atLeastFloor = (n: number) => Math.max(floorEff, clearingFloor, n);
+    // The buttons' prices: the market's ladder, none under the floor with its
+    // margin; with no market known, the price the offer has. "Profit floor"
+    // is the bare floor — the lowest price that still pays.
+    const atLeastFloor = (n: number) => Math.max(floorWritten, clearingFloor, n);
+    const unknownAt = current?.effectiveFeePpm ?? 0;
     const pricing = {
-      fast: pricePointFrom(atLeastFloor(ladder.low), repSize, baseFee, minBlock),
-      balanced: pricePointFrom(atLeastFloor(ladder.mid), repSize, baseFee, minBlock),
-      premium: pricePointFrom(atLeastFloor(ladder.high), repSize, baseFee, minBlock),
+      fast: pricePointFrom(atLeastFloor(ladder?.low ?? unknownAt), repSize, baseFee, minBlock),
+      balanced: pricePointFrom(atLeastFloor(ladder?.mid ?? unknownAt), repSize, baseFee, minBlock),
+      premium: pricePointFrom(atLeastFloor(ladder?.high ?? unknownAt), repSize, baseFee, minBlock),
       profitFloor: pricePointFrom(Math.max(floorEff, clearingFloor), repSize, baseFee, minBlock),
     };
 
@@ -871,7 +1071,14 @@ export async function getMagmaRecommendations(
 
     const reasons: string[] = [];
     const warnings: string[] = [];
-    if (clearing) {
+    if (clearing?.allSizes) {
+      reasons.push(
+        `priced to ${clearing.count} real sales of every size over ${clearing.windowDays}d — buyers actually paid ${clearing.p25Ppm}–${clearing.p75Ppm} ppm, median ${clearing.medianPpm}`,
+      );
+      warnings.push(
+        `fewer than ${MIN_CLEARING_SAMPLE} leases sold in your ${sizeBandLabel(minSize, maxSize)} band in a year — the clearing price comes from the sales of every size`,
+      );
+    } else if (clearing) {
       reasons.push(
         `priced to ${clearing.count} real sales in your ${sizeBandLabel(minSize, maxSize)} band over ${clearing.windowDays}d — buyers actually paid ${clearing.p25Ppm}–${clearing.p75Ppm} ppm, median ${clearing.medianPpm}`,
       );
@@ -879,10 +1086,20 @@ export async function getMagmaRecommendations(
         warnings.push(
           `few sales in your size band lately — the clearing price comes from a ${clearing.windowDays}-day window`,
         );
-    } else {
+    } else if (ladder) {
       reasons.push(`priced against ${seg.count} listed offers in your ${sizeBandLabel(minSize, maxSize)} band`);
       warnings.push(
         "no Amboss sale history available — falling back to LISTED prices, which are asks and tend to sit below what actually clears",
+      );
+      if (moveCapped)
+        reasons.push(
+          `read from listed offers, the price moves ${Math.round(LISTED_MOVE_CAP * 100)}% at a time at most — the rest follows in further steps, one every ${Math.round(LISTED_MOVE_HOLD_MS / 3_600_000)} hours`,
+        );
+    } else {
+      reasons.push(
+        `what the market pays isn't known: no Amboss sale history, and ${seg.count === 0 ? "no" : `only ${seg.count}`} comparable listed offer${seg.count === 1 ? "" : "s"} (${MIN_LISTED_SAMPLE} are needed) — ${
+          offer ? "the price stays" : "the price shown is your profit floor, not a market price"
+        }`,
       );
     }
     // (No "size, not price, is what keeps this offer idle" any more: measured
@@ -896,11 +1113,17 @@ export async function getMagmaRecommendations(
         } (it promises ${offer.minBlockLength} blocks now)`,
       );
     }
-    if (offer && offer.minBlockLength !== standardLease) {
+    // A lease no order uses is a defect of the offer; a common longer one is
+    // the operator's choice (E4) — said only where most sales ran shorter,
+    // with the measured length (before: "most buyers ask for" the standard,
+    // whatever was sold; review 2026-11-10, OFFER-5).
+    if (offer && (offer.minBlockLength < standardLease || !COMMON_LEASES.has(offer.minBlockLength))) {
       warnings.push(
-        offer.minBlockLength < standardLease || !COMMON_LEASES.has(offer.minBlockLength)
-          ? `your offer promises a ${offer.minBlockLength}-block lease — a length almost no order uses; the standard is ${standardLease} blocks (min_block_length is a minimum, so ${standardLease} serves longer leases too)`
-          : `your offer demands at least ${offer.minBlockLength} blocks; most buyers ask for ${standardLease}`,
+        `your offer promises a ${offer.minBlockLength}-block lease — a length almost no order uses; the standard is ${standardLease} blocks (min_block_length is a minimum, so ${standardLease} serves longer leases too)`,
+      );
+    } else if (offer && offer.minBlockLength > popularLease) {
+      warnings.push(
+        `your offer takes leases from ${offer.minBlockLength} blocks (${leaseDays(offer.minBlockLength)} days) up; most leases sold lately ran ${popularLease} blocks (${leaseDays(popularLease)} days), and an order for a shorter lease can't take this offer — the minimum lease is your choice`,
       );
     }
     if (offer && caps && (offer.feeRateCapPpm === null || offer.feeRateCapPpm <= 0)) {
@@ -908,7 +1131,7 @@ export async function getMagmaRecommendations(
         `your offer promises buyers no routing-fee cap — nearly every offer that sells does; the standard promise is ${caps.feeRateCapPpm} ppm + ${caps.baseFeeCapSats} sat base, kept by the fee autopilot for the lease`,
       );
     }
-    if (seg.fallbackLevel === "all_offers" && !clearing)
+    if (seg.fallbackLevel === "all_offers" && !clearing && ladder)
       warnings.push("few offers in your exact size band — compared against the whole market");
     if (mySellerScore == null) warnings.push("your seller score isn't visible yet (it appears once this node lists an offer)");
     // Per sale: what one lease at this price nets a year on its capital
@@ -953,19 +1176,38 @@ export async function getMagmaRecommendations(
       shouldReprice = true;
       repriceDirection = "up";
       reasons.push(`current price is below your profit floor (${floorEff} ppm effective) — raise it`);
-    } else if (floorEff > seg.p75) {
-      // The price that pays for the lease is above what comparable offers ask.
+    } else if (!ladder) {
+      // Nothing says what the market pays: no verdict on it, and no move.
+      // (Before, an empty book read as a market at 0 ppm: "the price that
+      // pays for this lease is above what comparable offers ask" — review
+      // 2026-11-10, OFFER-1.)
+      state = "market_unknown";
+      mode = offer ? "hold" : "create";
+    } else if (floorEff > ladder.high) {
+      // The price that pays for the lease is above what three in four buyers
+      // paid for leases like it — judged on completed sales wherever there
+      // are any, as the price itself is (OFFER-1: it was judged on the listed
+      // asks alone, and a dozen cheap listings that never sell froze the
+      // price of an offer that sold 10 % under what buyers pay). The listed
+      // asks decide only without sale history.
       // (Not "won't fill": Amboss picks sellers by score and depth, not price.)
       state = "do_not_list_uncompetitive";
-      reasons.push(`the price that pays for this lease (${floorEff} ppm effective) is above what comparable offers ask — not listed automatically`);
+      reasons.push(
+        clearing
+          ? `the price that pays for this lease (${floorEff} ppm effective) is above what buyers paid for comparable leases (${clearing.p75Ppm} ppm for three in four) — not listed automatically`
+          : `the price that pays for this lease (${floorEff} ppm effective) is above what comparable offers ask — not listed automatically`,
+      );
+      // A listed offer stays the operator's to keep; its price follows the
+      // floor down as any price follows its target (never up from here: under
+      // the floor it is raised above).
+      if (current && recommended.effectiveFeePpm - current.effectiveFeePpm < -repriceThreshold) {
+        shouldReprice = true;
+        repriceDirection = "down";
+        reasons.push(`its price (${current.effectiveFeePpm} ppm effective) is well above the floor it needs now — lowered to ${recommended.effectiveFeePpm}`);
+      }
     } else if (!beatsRouting && cfg.sellPricingMode !== "premium") {
       state = "do_not_list_unprofitable";
       reasons.push("even the recommended price barely beats routing — better to keep this capital routing");
-    } else if (offer && offer.availableSats < offer.maxSizeSats) {
-      state = "exhausted";
-      reasons.push("offer is depleted — relist at today's recommended price, not the old one");
-      shouldReprice = current ? recommended.effectiveFeePpm > current.effectiveFeePpm : false;
-      repriceDirection = "up";
     } else if (current) {
       const delta = recommended.effectiveFeePpm - current.effectiveFeePpm;
       if (delta > repriceThreshold) {
@@ -983,6 +1225,16 @@ export async function getMagmaRecommendations(
         reasons.push(
           `priced above what buyers paid for comparable leases (${current.effectiveFeePpm} ppm effective vs a recommended ${recommended.effectiveFeePpm})`,
         );
+      } else if (offer && offer.availableSats < offer.minSizeSats) {
+        // Sold out: less than its smallest order is left. (It used to be
+        // "exhausted" as soon as less than its LARGEST order was left — an
+        // offer still taking orders — and such an offer was only ever
+        // repriced upward, on any difference: 46 % above the clearing price
+        // it stayed there. Review 2026-11-10, OFFER-6: priced like any
+        // listed offer, both ways, past the threshold.)
+        state = "exhausted";
+        mode = "hold";
+        reasons.push(`sold out — less than its smallest order (${offer.minSizeSats} sat) is left to buy; relisted, it sells at this price`);
       } else {
         state = "well_priced";
         mode = "hold";
@@ -998,7 +1250,7 @@ export async function getMagmaRecommendations(
     // the rate making up the rest — the price doesn't move (never cheapened,
     // never raised under a base change). An unlistable offer isn't repriced.
     let baseOnly = false;
-    if (!shouldReprice && offer?.status === "ENABLED" && current && (state === "well_priced" || state === "exhausted")) {
+    if (!feeEstimateMissing && !shouldReprice && offer?.status === "ENABLED" && current && (state === "well_priced" || state === "exhausted")) {
       const resplit = pricePointFrom(current.effectiveFeePpm, repSize, baseFee, minBlock);
       // A move within the tolerance isn't one: a market base too big for the
       // price is cut to fit (pricePointFrom), and the next run's cut differs
@@ -1014,6 +1266,17 @@ export async function getMagmaRecommendations(
           `base fee to ${recommended.baseFeeSat} sat (it has ${current.baseFeeSat}) — what comparable offers charge, as far as it fits the price; the rate makes up the rest, so the price at the representative size (${repSize} sat, √(min·max)) stays`,
         );
       }
+    }
+    // No fee estimate: what a channel costs today isn't known, so no price is
+    // moved — the one it has was right at the last known rate, and the cost
+    // above is that rate's (OFFER-13).
+    if (feeEstimateMissing && shouldReprice) {
+      shouldReprice = false;
+      repriceDirection = "none";
+      mode = "hold";
+      reasons.push(
+        `LND gives no on-chain fee estimate right now — the price stays until it is back (a channel is costed at the last known ${lastKnownFeePerVbyte} sat/vB)`,
+      );
     }
     reasons[perSaleAt] = beatsRouting
       ? `per sale, a lease at this price nets ~${recommended.leaseApy}%/yr (after on-chain costs and the service fee) — above your routing benchmark of ${(adjustedRouting / 10000).toFixed(2)}%/yr`
@@ -1064,6 +1327,13 @@ export async function getMagmaRecommendations(
     };
   };
 
+  // Report and price card must describe the SAME band, or the page contradicts
+  // itself: the banner would quote one clearing price and the card another.
+  const primary = myOffers[0];
+  const bandMin = primary?.minSizeSats ?? sellWindow.min;
+  const bandMax = primary?.maxSizeSats ?? sellWindow.max;
+  const reportClearing = clearingOrAll({ minSizeSat: bandMin, maxSizeSat: bandMax, blocks: standardLease });
+
   const recommendations = myOffers.length
     ? myOffers.map((o) => buildSell(o))
     : deployableCapitalSat >= cfg.minSellSizeSat
@@ -1085,10 +1355,26 @@ export async function getMagmaRecommendations(
     const refSize = recommendedSellSizeSat ?? cfg.minSellSizeSat;
     const floorEff = profitFloorEffectivePpm(refSize, cfg.defaultMinBlockLength);
     const seg = segmentFor(refSize, refSize, refSize, cfg.defaultMinBlockLength);
-    if (floorEff > seg.p75) {
+    // The market: what buyers paid (the band the price card shows), else a
+    // trusted sample of listed offers, else unknown — the same rule as each
+    // offer's own verdict (buildSell; review 2026-11-10, OFFER-1: judged on
+    // the listed asks alone, an empty book or a dozen cheap listings read as
+    // "the market is cheaper than your profitable price" while the same
+    // report said what leases clear at, and nothing was listed).
+    const marketNow = reportClearing
+      ? { median: reportClearing.medianPpm, p75: reportClearing.p75Ppm }
+      : seg.trusted
+        ? { median: seg.median, p75: seg.p75 }
+        : null;
+    if (!marketNow) {
+      sellState = "market_unknown";
+      sellReasons.push(
+        `what the market pays isn't known: no Amboss sale history, and ${seg.count === 0 ? "no" : `only ${seg.count}`} comparable listed offer${seg.count === 1 ? "" : "s"} (${MIN_LISTED_SAMPLE} are needed) — no offer is created and no price follows the market until it is`,
+      );
+    } else if (floorEff > marketNow.p75) {
       sellState = "market_too_cheap";
       sellReasons.push("the market is currently cheaper than your profitable price — wait or keep routing");
-    } else if (floorEff > seg.median) {
+    } else if (floorEff > marketNow.median) {
       sellState = "sell_only_above_profit_floor";
       sellReasons.push("only list above your profit floor — the market median is below what makes leasing worthwhile");
     } else {
@@ -1096,7 +1382,7 @@ export async function getMagmaRecommendations(
       // Use the SAME number the price card + slider show (the actual per-offer or
       // create recommendation), not a separate refSize-segment median — so the
       // banner never contradicts the card.
-      const recEff = recommendations[0]?.recommended.effectiveFeePpm ?? seg.median;
+      const recEff = recommendations[0]?.recommended.effectiveFeePpm ?? marketNow.median;
       const recLease = recommendations[0]?.recommended.minBlockLength ?? standardLease;
       // Per sale only: one lease at this price beats routing the capital.
       // Whether orders come is the eligibility check's answer (shown above it
@@ -1188,8 +1474,9 @@ export async function getMagmaRecommendations(
   const onchainCostsSat = filled.length * (cfg.defaultOpenCostSat + (cfg.includeCloseCost ? cfg.defaultCloseCostSat : 0));
   const leasePpms = filled.filter((o) => o.sizeSats > 0).map((o) => (o.feeSats / o.sizeSats) * 1_000_000);
   // Listed liquidity a new buyer can still order is total − locked (Amboss).
-  const offersActive = myOffers.filter((o) => o.status === "ENABLED" && o.availableSats >= o.maxSizeSats).length;
-  const offersExhausted = myOffers.filter((o) => o.status === "ENABLED" && o.availableSats < o.maxSizeSats).length;
+  // Sold out: less than its smallest order is left (as each offer's own state).
+  const offersActive = myOffers.filter((o) => o.status === "ENABLED" && o.availableSats >= o.minSizeSats).length;
+  const offersExhausted = myOffers.filter((o) => o.status === "ENABLED" && o.availableSats < o.minSizeSats).length;
   const offersInactive = myOffers.filter((o) => o.status !== "ENABLED").length;
   const analytics: MagmaSellAnalytics = {
     mySellerScore,
@@ -1221,6 +1508,10 @@ export async function getMagmaRecommendations(
   // ── On-chain cost surfaced + spike warning (#4) ──
   const onchainOpenCostSat = cfg.defaultOpenCostSat;
   const onchainCloseCostSat = cfg.includeCloseCost ? cfg.defaultCloseCostSat : 0;
+  if (feeEstimateMissing)
+    sellWarnings.push(
+      `LND gives no on-chain fee estimate right now — a channel is costed at the last known rate (${lastKnownFeePerVbyte} sat/vB, ~${onchainOpenCostSat + onchainCloseCostSat} sat to open+close); no price is moved and no offer created until the estimate is back`,
+    );
   if (onchainFeePerVbyte != null && onchainOpenCostSat + onchainCloseCostSat > 2500)
     sellWarnings.push(
       `on-chain fees are elevated (~${onchainOpenCostSat + onchainCloseCostSat} sat to open+close) — the profit floor is raised so you won't lease at a loss`,
@@ -1243,13 +1534,6 @@ export async function getMagmaRecommendations(
       `${awaitingOpen} paid order${one(awaitingOpen, "", "s")} waiting for you to open ${one(awaitingOpen, "its channel", "their channels")} — open ${one(awaitingOpen, "it", "them")} in time, or your seller score drops`,
     );
 
-  // Report and price card must describe the SAME band, or the page contradicts
-  // itself: the banner would quote one clearing price and the card another.
-  const primary = myOffers[0];
-  const bandMin = primary?.minSizeSats ?? sellWindow.min;
-  const bandMax = primary?.maxSizeSats ?? sellWindow.max;
-  const popularLease = popularLeaseBlocks();
-  const reportClearing = clearingFor({ minSizeSat: bandMin, maxSizeSat: bandMax, blocks: standardLease });
   // The median real order: a fact about the market, shown as one — not a
   // target that would make a small seller's offer fill.
   const medianOrderSat = demandFit(0, Number.MAX_SAFE_INTEGER)?.medianOrderSat ?? null;
@@ -1286,7 +1570,7 @@ export async function getMagmaRecommendations(
   if (reportClearing && marketActivity()) {
     const act = marketActivity()!;
     sellReasons.push(
-      `the market is trading ${act.perDay} orders a day; leases in your band clear around ${reportClearing.medianPpm} ppm for ${leaseDays(standardLease)} days`,
+      `the market is trading ${act.perDay} orders a day; leases ${reportClearing.allSizes ? "of every size" : "in your band"} clear around ${reportClearing.medianPpm} ppm for ${leaseDays(standardLease)} days`,
     );
   }
 
@@ -1322,6 +1606,8 @@ export async function getMagmaRecommendations(
       onchainOpenCostSat,
       onchainCloseCostSat,
       onchainFeePerVbyte,
+      feeEstimateMissing,
+      lastKnownFeePerVbyte,
       acceptFloorSat,
       pendingSellerOrders: pendingSeller,
       pendingSellerOpens: awaitingOpen,

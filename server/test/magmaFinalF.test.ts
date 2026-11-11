@@ -16,7 +16,8 @@ import assert from "node:assert/strict";
 import { WORK_DEADLINES_MS } from "../src/services/autopilot.js";
 import { LANE_PASS_DEADLINE } from "../src/services/magmaDesk.js";
 import { __setHistoryForTests } from "../src/services/magmaHistory.js";
-import { minSizeCoveringSat, saleAcceptFloorSats } from "../src/services/magmaRecommend.js";
+import { COVER_WRITE_MARGIN, minSizeCoveringSat, saleAcceptFloorSats, smallestOrderPaysSat } from "../src/services/magmaRecommend.js";
+import { saleFeeConfig } from "../src/services/serviceFee.js";
 import { magmaPartsAlerts, offerPriceAlerts } from "../src/services/alerts.js";
 import { BUYER, plannedFeeChange, sellerSetup, type AutopilotSeams } from "./helpers/autopilot.js";
 import { IN_AN_HOUR, entryOnDisk, feeEnv, quiet, walletBalance, keepFileAlive } from "./helpers/lifecycle.js";
@@ -244,7 +245,7 @@ test("the live offer at 20 sat/vB: its min goes up and it is priced for that win
 
 // ── a free offer's price, judged at that price ───────────────────────────────
 
-test("an offer Amboss lists for free gets its last price back judged at that price: at 20 sat/vB its min goes up to the smallest order that pays for its channel (before: put back with its old min — orders under it turned down by the lane)", async (t) => {
+test("an offer Amboss lists for free gets its last price back judged at that price: at 20 sat/vB its min goes up to the smallest order that pays for its channel with room over it (before: put back with its old min — orders under it turned down by the lane)", async (t) => {
   quiet(t);
   const s = sellerSetup(t, { config: { sellAutoSize: true } });
   setFee(s.node, 1);
@@ -258,7 +259,9 @@ test("an offer Amboss lists for free gets its last price back judged at that pri
   floorExpires(s);
   await s.autopilot.runOnce();
   const floor = saleAcceptFloorSats(20, 0);
-  const cover = minSizeCoveringSat(3000, 0, floor);
+  // The lane's floor with the room the upkeep writes over it (OFFER-10).
+  const cover = minSizeCoveringSat(3000, 0, smallestOrderPaysSat(floor, COVER_WRITE_MARGIN, saleFeeConfig().bps / 10_000));
+  assert.ok(cover > minSizeCoveringSat(3000, 0, floor), "above the bare floor's size");
   assert.deepEqual([offer.status, offer.feeRatePpm, offer.baseFeeSats], ["ENABLED", 3000, 0]);
   assert.ok(cover > before, `${fmt(cover)} vs ${fmt(before)}`);
   assert.equal(offer.minSats, cover, `before: ${fmt(before)} (the lane's floor ${fmt(floor)} sat)`);

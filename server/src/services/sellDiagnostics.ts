@@ -247,7 +247,7 @@ export function buildSellDiagnostics(input: DiagnosticsInput): SellDiagnostics {
   }
   const autos = [
     c.sellAutoReprice ? `auto-price (${c.sellPricingMode})` : null,
-    c.sellAutoSize ? "auto-size (standard lease and routing-fee promise, sane window)" : null,
+    c.sellAutoSize ? "auto-size (a lease buyers use, the routing-fee promise, a window that can be funded)" : null,
     c.sellAutoRelist ? "auto-relist" : null,
     c.sellAutoClose ? "auto-close after the lease" : null,
   ].filter(Boolean);

@@ -32,9 +32,12 @@ import {
   checkDraft,
   draftIsEmpty,
   draftStore,
+  OFFER_FLAGS,
+  offerManagedView,
   resetToBaseline,
   savedNum,
   switchOnConfirm,
+  toggleOfferManaged,
   type AdvancedSet,
   type Draft,
   type FlagKey,
@@ -583,7 +586,9 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
       paths: [...REB_NUM_FIELDS.filter((f) => f.key !== "rebalanceDailyBudgetSats").map((f) => f.key), ...REB_POLICY_FIELDS.map((f): NumPath => `rebalancePolicy.${f.key}`)],
     },
     channels: { paths: CHANNEL_NUM_FIELDS.map((f) => f.key) },
-    magma: { paths: SELL_NUM_FIELDS.map((f) => f.key), pricingMode: true },
+    // The offer's four switches are in this fold: they count, and Reset puts
+    // them back (ENG-4 — a mixed state showed nowhere but inside the fold).
+    magma: { paths: SELL_NUM_FIELDS.map((f) => f.key), flags: OFFER_FLAGS, pricingMode: true },
   };
   /** An area's Advanced section: remembered open or closed, its changes counted. */
   const advanced = (area: keyof typeof ADVANCED, children: ReactNode, forceOpen = false) => {
@@ -650,17 +655,9 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
   };
 
   const freeSat = magma?.sell.deployableCapitalSat ?? null;
-  /** The offer's four automations, as one choice. */
-  const OFFER_FLAGS: FlagKey[] = ["sellAutoReprice", "sellAutoSize", "sellAutoRelist", "sellAutoClose"];
-  const offerManaged = OFFER_FLAGS.every(flagShown);
-  const setOfferManaged = (on: boolean) => {
-    const flags = { ...draft.flags };
-    for (const key of OFFER_FLAGS) {
-      if (on === config[key]) delete flags[key];
-      else flags[key] = on;
-    }
-    setDraft({ ...draft, flags });
-  };
+  /** The offer's four automations, as one choice — shown as it is (all,
+   *  none, or some of them: autopilotForm.ts). */
+  const offerManaged = offerManagedView(flagShown);
 
   return (
     <div className="ap-page">
@@ -871,10 +868,20 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
           </p>
           <div className="ap-checks">
             <label className="check ap-check">
-              <input type="checkbox" checked={offerManaged} disabled={busy || writeOff} onChange={(e) => setOfferManaged(e.target.checked)} />
+              <input
+                type="checkbox"
+                checked={offerManaged.state === "all"}
+                aria-checked={offerManaged.state === "partly" ? "mixed" : offerManaged.state === "all"}
+                ref={(el) => {
+                  if (el) el.indeterminate = offerManaged.state === "partly";
+                }}
+                disabled={busy || writeOff}
+                onChange={() => setDraft(toggleOfferManaged(draft, config))}
+              />
               The autopilot manages my offer: price, size and listing, and closes a sold channel after its lease
               <InfoTip label="What managing the offer means" text={OFFER_AUTOMATION_HINT} />
             </label>
+            {offerManaged.text ? <p className="muted ap-hint ap-offer-partly">{offerManaged.text}</p> : null}
           </div>
           {advanced(
             "magma",
@@ -883,7 +890,9 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
                 Offer pricing
                 <InfoTip label="About offer pricing">
                   With auto-pricing on, your enabled offer is priced from what buyers actually paid for comparable leases, at the level
-                  below — never below your profit floor. (Price is not what gets a seller picked; it decides what a sale earns.)
+                  below — not below your profit floor, which is worked out for a typical order of your offer; with auto-size on, the smallest
+                  order the offer takes is kept large enough to pay for its channel as well. (Price is not what gets a seller picked; it
+                  decides what a sale earns.)
                 </InfoTip>
               </h3>
               <div className="mode-select">
@@ -905,10 +914,10 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
               </div>
               <h3 className="sub">Automation</h3>
               <div className="ap-checks">
-                {flagBox("sellAutoReprice", "Auto-price the enabled offer from what buyers actually paid (at the level above, floor-protected)")}
+                {flagBox("sellAutoReprice", "Auto-price the enabled offer from what buyers actually paid (at the level above, not below your profit floor for a typical order)")}
                 {flagBox(
                   "sellAutoSize",
-                  "Auto-size the offer: the standard 30-day lease, the routing-fee promise, and a window from the smallest channel that pays for itself up to what can be funded",
+                  "Auto-size the offer: a lease buyers use (30 days, or the 60, 90 or 180 days you set), the routing-fee promise, and a window from the smallest channel that pays for itself up to what can be funded",
                 )}
                 {flagBox("sellAutoRelist", "Auto-relist: list what is free, up to your capital to sell, and top up after a sale")}
                 {flagBox("sellAutoClose", "Auto-close channels after the lease ends (reclaim the capital on-chain)", {

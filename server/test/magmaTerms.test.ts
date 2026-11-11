@@ -109,7 +109,7 @@ test("with every offer-automation switch off, the autopilot changes none of an o
   api.autopilot.setConfig({ sellAutoSize: true });
   await api.autopilot.runOnce();
   assert.deepEqual([offer.feeRateCap, offer.baseFeeCap, offer.minBlockLength], ["2200", "1", 4320]);
-  assert.match((await checks()).find((c) => c.id === "automation")?.detail ?? "", /auto-size \(standard lease and routing-fee promise, sane window\)/);
+  assert.match((await checks()).find((c) => c.id === "automation")?.detail ?? "", /auto-size \(a lease buyers use, the routing-fee promise, a window that can be funded\)/);
 });
 
 test("a manual create or edit on Market → Sell sends the promise too, with the operator's lease", async (t) => {

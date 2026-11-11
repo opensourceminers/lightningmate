@@ -66,6 +66,18 @@ export function soldOpensKnowTheirFee(autopilot: Autopilot): void {
   };
 }
 
+/**
+ * LND gives an on-chain fee estimate: `satPerVbyte` for every confirmation
+ * target (250 sat/kw each). The bare fake LND gives none — and the autopilot
+ * lists no offer of its own while what a channel costs today isn't known
+ * (review of P2 of the 2026-11 programme, R2-6), so a test of an automatic
+ * listing gives the node one. 1 sat/vB: opening and closing a sold channel
+ * costs 175 + 150 sat.
+ */
+export function lndEstimatesFee(node: FakeLnd, satPerVbyte = 1): void {
+  node.override("wallet.estimateFee", (_a, cb) => cb(null, { sat_per_kw: String(Math.round(satPerVbyte * 250)) }));
+}
+
 /** A peer LND is connected to for gossip (no channel with it). A live LND
  *  keeps a few such peers at all times; with none at all, the channel stage
  *  takes this node to be offline and dials nobody. */

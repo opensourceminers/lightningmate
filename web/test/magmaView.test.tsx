@@ -440,7 +440,7 @@ test("Market → Sell's promise note and the seller explainer claim only what th
   // neither.
   const how = renderToStaticMarkup(<HowAmbossPicks usdOrderSat={null} />);
   assert.doesNotMatch(how, /keeps the offer well-formed/);
-  assert.match(how, /with auto-size on, it also gives the offers it manages the standard 30-day lease, a routing-fee promise/);
+  assert.match(how, /with auto-size on, it also gives the offers it manages a lease buyers use \(30 days unless you set 60, 90 or 180\), a routing-fee promise/);
   assert.match(how, /With selling on, LightningMate fulfils orders fast and safely and keeps every offer within what it can fund/);
 });
 

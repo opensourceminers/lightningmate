@@ -1,9 +1,9 @@
 /**
  * Every offer is priced for the lease it carries after the autopilot's next
- * write (magmaRecommend.ts pricingLease): the standard lease for a new offer
- * and, with auto-size, for every offer the autopilot manages; otherwise the
- * lease the offer keeps — a longer one buyers use, chosen on purpose (60, 90,
- * 180 days), is priced as such.
+ * write (magmaRecommend.ts pricingLease): the standard lease (4,320 blocks,
+ * 30 days) for a new offer; an offer keeps a longer lease buyers use, chosen
+ * on purpose (60, 90, 180 days), and is priced as such — with auto-size on
+ * too: the minimum lease is the operator's (review 2026-11-10, OFFER-5).
  *
  * Before (review P1b): the engine priced every offer for the standard 30 days.
  * A 90-day offer kept on purpose (auto-size off) was auto-priced at the 30-day
@@ -78,29 +78,39 @@ test("a 90-day offer priced too low is repriced to its 90-day price — never to
   assert.ok(Math.abs(effective(cheap) - 12_329) <= 2, `repriced to ${Math.round(effective(cheap))} ppm effective`);
 });
 
-test("with auto-size on, an offer the autopilot manages gets the standard lease — and, in the same write, the price for it; the operator's own 90-day offer keeps its lease and its 90-day price", async (t) => {
+test("with auto-size on the minimum lease stays the operator's: a 90-day offer the autopilot manages keeps its 90 days and its 90-day price — only a lease no order uses (5,000 blocks) gets the standard one and, in the same write, the price for it", async (t) => {
   quiet(t);
-  const { autopilot, magma } = pricedMarket(t, { sellAutoSize: true });
-  const managed = magma.addOffer({ ...WINDOW, feeRatePpm: 11_500, baseFeeSats: 852, minBlockLength: 12_960 });
-  const theirs = magma.addOffer({ ...WINDOW, feeRatePpm: 11_500, baseFeeSats: 852, minBlockLength: 12_960 });
-  autopilot.pauseOfferAutomation(theirs.id, "you edited this offer");
-  const rec = await autopilot.magmaReport();
-  const byId = (id: string) => rec.sell.recommendations.find((r) => r.offerId === id)!;
-  assert.equal(byId(managed.id).recommended.minBlockLength, 4320, "auto-size gives it the standard lease: priced for it");
-  assert.match(byId(managed.id).reasons.join(" "), /priced for a 4320-block \(30-day\) lease — the one auto-size gives this offer with its next write \(it promises 12960 blocks now\)/);
-  assert.equal(byId(theirs.id).recommended.minBlockLength, 12_960, "the operator's terms: its lease stays, priced as such");
-  await autopilot.runOnce();
-  assert.equal(managed.minBlockLength, 4320);
-  // 5% a year for 4,320 blocks is ~4,110 ppm per lease — at the size window
-  // auto-size gives it in the same write (the engine prices it for that one;
-  // its max is the deployable capital, the write's what one channel can fund
-  // after the open's own fee: a few ppm apart).
-  const eff = managed.feeRatePpm + (managed.baseFeeSats / Math.sqrt(managed.minSats * managed.maxSats)) * 1e6;
-  assert.ok(
-    Math.abs(eff - 4110) <= 5,
-    `the 30-day price with the 30-day lease: ${Math.round(eff)} (${managed.feeRatePpm} + ${managed.baseFeeSats}, ${managed.minSats}–${managed.maxSats}; ${Math.round(effective(managed))} at 1M–2M)`,
-  );
-  assert.deepEqual([theirs.feeRatePpm, theirs.minBlockLength], [11_500, 12_960], "not the autopilot's to change");
+  // Before (OFFER-5): auto-size gave every offer it managed "the standard
+  // lease" — a 90-day offer was rewritten to 30 days at the 30-day price.
+  for (const [lease, after, perLease] of [[12_960, 12_960, 12_329], [5_000, 4320, 4110]] as const) {
+    const { autopilot, magma } = pricedMarket(t, { sellAutoSize: true });
+    const managed = magma.addOffer({ ...WINDOW, feeRatePpm: 11_500, baseFeeSats: 852, minBlockLength: lease });
+    const theirs = magma.addOffer({ ...WINDOW, feeRatePpm: 11_500, baseFeeSats: 852, minBlockLength: 12_960 });
+    autopilot.pauseOfferAutomation(theirs.id, "you edited this offer");
+    const rec = await autopilot.magmaReport();
+    const byId = (id: string) => rec.sell.recommendations.find((r) => r.offerId === id)!;
+    assert.equal(byId(managed.id).recommended.minBlockLength, after, `${lease} blocks: priced for the lease it has after the next write`);
+    if (after !== lease) {
+      assert.match(byId(managed.id).reasons.join(" "), /priced for a 4320-block \(30-day\) lease — the one auto-size gives this offer with its next write \(it promises 5000 blocks now\)/);
+    } else {
+      assert.doesNotMatch(byId(managed.id).reasons.join(" "), /priced for a \d+-block/);
+    }
+    assert.equal(byId(theirs.id).recommended.minBlockLength, 12_960, "the operator's terms: its lease stays, priced as such");
+    await autopilot.runOnce();
+    assert.equal(managed.minBlockLength, after);
+    // 5% a year: ~4,110 ppm per 4,320-block lease, ~12,329 per 12,960 — at
+    // the size window auto-size gives it in the same write (the engine prices
+    // it for that one; its max is the deployable capital, the write's what one
+    // channel can fund after the open's own fee: a few ppm apart). An offer
+    // within the reprice threshold of it keeps the price it has.
+    const eff = managed.feeRatePpm + (managed.baseFeeSats / Math.sqrt(managed.minSats * managed.maxSats)) * 1e6;
+    assert.ok(
+      Math.abs(eff - perLease) <= perLease * 0.1,
+      `the ${after}-block price with the ${after}-block lease: ${Math.round(eff)} (${managed.feeRatePpm} + ${managed.baseFeeSats}, ${managed.minSats}–${managed.maxSats}; ${Math.round(effective(managed))} at 1M–2M)`,
+    );
+    if (after !== lease) assert.ok(Math.abs(eff - perLease) <= 5, `repriced in the lease's write: ${Math.round(eff)}`);
+    assert.deepEqual([theirs.feeRatePpm, theirs.minBlockLength], [11_500, 12_960], "not the autopilot's to change");
+  }
 });
 
 test("a lease the offer keeps that is longer than the price it was given: not repriced, and the sync status and diagnostics say why — a shorter one gets the longer standard lease's price", async (t) => {
@@ -160,20 +170,27 @@ test("a price goes only onto a lease it fits: the same one, or a slightly longer
   assert.equal(keptLeaseBlocks(4320, 8640), 8640);
 });
 
-test("when buyers mostly take 60-day leases (the standard is 8,640 blocks), a 30-day offer with auto-size off keeps its price — never the 60-day one on its 30 days", async (t) => {
+test("when buyers mostly take 60-day leases, the standard lease stays 30 days and the 60 days are shown as information: a 30-day offer is priced for its 30 days, and auto-size leaves its lease alone", async (t) => {
   quiet(t);
-  const s = sellerSetup(t, { chainBalance: 8_000_000, config: { sellAutoReprice: true, sellAutoSize: false, sellPricingMode: "balanced" } });
-  for (let i = 0; i < 8; i++) s.market.addOffer({ totalSats: 2_000_000, minSats: 1_000_000, maxSats: 2_000_000, feeRatePpm: 3000 + i * 300, baseFeeSats: 568, sellerScore: 50 });
-  __setHistoryForTests(
-    Array.from({ length: 30 }, (_, i) => ({ at: Date.now() - i * 86_400_000, sizeSat: 1_500_000, blocks: 8640, apr: 0.05, leasePpm: 8219, status: "FINISHED" })),
-  );
-  t.after(() => __setHistoryForTests([]));
-  const thirty = s.magma.addOffer({ ...WINDOW, feeRatePpm: 66, baseFeeSats: 852, minBlockLength: 4320 });
-  const rec = await s.autopilot.magmaReport();
-  assert.equal(rec.sell.standardLeaseBlocks, 8640);
-  assert.equal(rec.sell.recommendations.find((r) => r.offerId === thirty.id)?.recommended.minBlockLength, 8640, "a price button would set the 60-day standard");
-  await s.autopilot.runOnce();
-  assert.deepEqual([thirty.feeRatePpm, thirty.minBlockLength], [66, 4320]);
-  const entry = s.autopilot.offerSyncStatus().offers.find((e) => e.offerId === thirty.id);
-  assert.match(entry?.differences.join(" | ") ?? "", /not repriced: the market price is for a 8,640-block lease, and this offer promises 4,320 blocks — that price is for a much longer lease than its own/);
+  // Before (OFFER-5): the standard lease followed the sales — 8,640 blocks
+  // here. With auto-size off the 30-day offer was "not repriced: the market
+  // price is for a 8,640-block lease"; with auto-size on its lease was
+  // rewritten to 60 days, shutting out every order for 30.
+  for (const sellAutoSize of [false, true]) {
+    const s = sellerSetup(t, { chainBalance: 8_000_000, config: { sellAutoReprice: true, sellAutoSize, sellPricingMode: "balanced" } });
+    for (let i = 0; i < 8; i++) s.market.addOffer({ totalSats: 2_000_000, minSats: 1_000_000, maxSats: 2_000_000, feeRatePpm: 3000 + i * 300, baseFeeSats: 568, sellerScore: 50 });
+    __setHistoryForTests(
+      Array.from({ length: 30 }, (_, i) => ({ at: Date.now() - i * 86_400_000, sizeSat: 1_500_000, blocks: 8640, apr: 0.05, leasePpm: 8219, status: "FINISHED" })),
+    );
+    t.after(() => __setHistoryForTests([]));
+    const thirty = s.magma.addOffer({ ...WINDOW, feeRatePpm: 66, baseFeeSats: 852, minBlockLength: 4320 });
+    const rec = await s.autopilot.magmaReport();
+    assert.deepEqual([rec.sell.standardLeaseBlocks, rec.sell.popularLeaseBlocks], [4320, 8640], "the operator's standard; the market's most frequent lease beside it");
+    assert.equal(rec.sell.recommendations.find((r) => r.offerId === thirty.id)?.recommended.minBlockLength, 4320, "a price button keeps the 30 days");
+    await s.autopilot.runOnce();
+    assert.equal(thirty.minBlockLength, 4320, `auto-size ${sellAutoSize}: before, 8,640 with it on`);
+    // What those leases paid a year (5 %), for 30 days: ~4,110 ppm.
+    const eff = thirty.feeRatePpm + (thirty.baseFeeSats / Math.sqrt(thirty.minSats * thirty.maxSats)) * 1e6;
+    assert.ok(Math.abs(eff - 4110) <= 5, `auto-size ${sellAutoSize}: ${Math.round(eff)} ppm effective (${thirty.feeRatePpm} + ${thirty.baseFeeSats})`);
+  }
 });

@@ -149,13 +149,15 @@ test("a manual edit keeps its terms — no lease or promise change, no reprice �
   quiet(t);
   const { api, magma } = await sellingApi(t);
   const offer = magma.addOffer({ minSats: 1_000_000, maxSats: 2_000_000, totalSats: 2_000_000, minBlockLength: 4320 });
-  // The operator deliberately sells 90-day leases.
-  const edit = await api.request("POST", "/amboss/offer/update", { id: offer.id, ...TERMS, minBlockLength: 12_960 });
+  // The operator deliberately sets a lease of their own (5,000 blocks: one
+  // no order uses — a common longer one stays theirs even when the autopilot
+  // manages the offer, see magmaLeasePricing.test.ts).
+  const edit = await api.request("POST", "/amboss/offer/update", { id: offer.id, ...TERMS, minBlockLength: 5_000 });
   assert.equal(edit.status, 200);
   const writes = magma.count("UpdateOffer");
   await api.autopilot.runOnce();
   // Before: auto-size set it back to the popular lease at the next run.
-  assert.equal(offer.minBlockLength, 12_960);
+  assert.equal(offer.minBlockLength, 5_000);
   assert.equal(magma.count("UpdateOffer"), writes, "nothing written over the operator's terms");
   const listed = await api.request("GET", "/amboss/my-offers");
   assert.equal(listed.body.controls[offer.id]?.manual?.why, "you edited this offer");

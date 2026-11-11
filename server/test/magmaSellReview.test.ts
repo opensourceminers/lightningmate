@@ -29,7 +29,8 @@ import { BUYER, sellerSetup } from "./helpers/autopilot.js";
 import { IN_AN_HOUR, entryOnDisk, quiet } from "./helpers/lifecycle.js";
 import { internalError } from "./helpers/magma.js";
 import { __setHistoryForTests } from "../src/services/magmaHistory.js";
-import { minSizeCoveringSat, orderFeeSat, saleAcceptFloorSats } from "../src/services/magmaRecommend.js";
+import { COVER_KEEP_MARGIN, COVER_WRITE_MARGIN, minSizeCoveringSat, orderFeeSat, saleAcceptFloorSats, smallestOrderPaysSat } from "../src/services/magmaRecommend.js";
+import { saleFeeConfig } from "../src/services/serviceFee.js";
 import { offerPriceAlerts } from "../src/services/alerts.js";
 import { activeCap } from "../src/services/leaseCaps.js";
 import { SELLING_OFF_SKIP } from "../src/services/magmaDesk.js";
@@ -158,6 +159,32 @@ test("M1: when not even the largest order it can fund pays for its channel, the 
   assert.equal(control(s).costDisabledAt, undefined);
   const floor = await s.autopilot.saleFeeFloorSats();
   assert.ok(orderFeeSat(s.offer.feeRatePpm, s.offer.baseFeeSats, s.offer.minSats) >= floor);
+});
+
+test("R2-6: LND's fee estimate fails and the last rate it gave makes every order a loss — the offer still goes off the market (the lane turns orders down by that rate), and the reason says it is the last known rate, not today's", async (t) => {
+  quiet(t);
+  const s = liveSetup(t, { feeSatPerVb: 1, config: { sellMaxDeploySats: 600_000 } });
+  await s.autopilot.runOnce();
+  assert.equal(s.offer.status, "ENABLED");
+  // The last estimate LND gave was 25 sat/vB; then it stopped answering.
+  setFeeRate(s, 25);
+  await s.autopilot.saleFeeFloorSats();
+  s.node.override("wallet.estimateFee", (_a, cb) => (cb as (e: unknown) => void)([503, "UnexpectedEstimateFeeError"]));
+  (s.autopilot as unknown as { saleFloor: unknown }).saleFloor = null;
+  await s.autopilot.runOnce();
+  assert.equal(s.offer.status, "DISABLED", JSON.stringify(entry(s)?.differences));
+  // Before: "below cost at today's on-chain fee rate".
+  assert.match(entry(s)?.lastWrite?.reason ?? "", /^below cost at the last known on-chain fee rate \(LND gives no estimate right now\): .* taken off the market until the estimate is back and its orders pay for their channels$/);
+  assert.ok(
+    entry(s)?.differences.some((d) => d.startsWith("taken off the market by the autopilot below cost: at the last known on-chain fee rate")),
+    JSON.stringify(entry(s)?.differences),
+  );
+  // Without an estimate it stays off; with one that its orders cover, it is listed again.
+  await s.autopilot.runOnce();
+  assert.equal(s.offer.status, "DISABLED");
+  setFeeRate(s, 1);
+  await s.autopilot.runOnce();
+  assert.equal(s.offer.status, "ENABLED");
 });
 
 test("M1: an offer whose terms are the operator's (or with auto-size off) keeps its window — the sync record, an alert and Market → Sell say from which size orders are turned down", async (t) => {
@@ -480,11 +507,21 @@ test("M1: the min raise is the cover check's own — a pass with no market repor
   const before = s.offer.minSats;
   setFeeRate(s, 20);
   const floor = await s.autopilot.saleFeeFloorSats();
-  const cover = minSizeCoveringSat(s.offer.feeRatePpm, s.offer.baseFeeSats, floor);
+  // The lane's floor with room over it (OFFER-10): the room the upkeep writes
+  // needs an order larger than the 2M this node funds, so the smaller room a
+  // minimum is kept at is the one written.
+  const share = saleFeeConfig().bps / 10_000;
+  const size = (margin: number) => minSizeCoveringSat(s.offer.feeRatePpm, s.offer.baseFeeSats, smallestOrderPaysSat(floor, margin, share));
+  assert.ok(size(COVER_WRITE_MARGIN) > 2_000_000, `${size(COVER_WRITE_MARGIN)}`);
+  const cover = size(COVER_KEEP_MARGIN);
   assert.ok(cover > before, `${cover} vs ${before}`);
+  assert.ok(cover > minSizeCoveringSat(s.offer.feeRatePpm, s.offer.baseFeeSats, floor), "above the bare floor's size");
   await s.autopilot.offerCapitalNow(); // no report: no reshape, no reprice
   assert.equal(s.offer.minSats, cover);
-  assert.match(entry(s)?.lastWrite?.reason ?? "", /min channel raised to [\d,]+ sat: at today's fee rate a smaller order pays less than opening and closing its channel costs/);
+  assert.match(
+    entry(s)?.lastWrite?.reason ?? "",
+    /min channel raised to [\d,]+ sat: a smaller order pays less than [\d,]+ sat — opening and closing its channel costs [\d,]+ sat at today's fee rate, the rest is the minimum profit and room for on-chain fees to rise/,
+  );
 });
 
 test("texts: a free offer the autopilot took off the market, with auto-pricing off — the alert says to set its price, not that LightningMate lists it again", async (t) => {

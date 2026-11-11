@@ -103,7 +103,34 @@ test("an offer the autopilot prices gets the base comparable offers charge — a
   assert.equal((autopilot as unknown as { state: { offerBaseMoves?: Record<string, unknown> } }).state.offerBaseMoves?.[offer.id], undefined);
 });
 
-test("a base move never moves the price at √(min·max): a well-priced offer off the engine's exact price keeps its own, and a depleted one priced above it is not cheapened", async (t) => {
+test("while LND gives no fee estimate the base isn't split anew either: the recommendation is no base move and nothing is written — the base follows once the estimate is back (review of P2 of the 2026-11 programme, R2-6)", async (t) => {
+  quiet(t);
+  const s = pricedMarket(t);
+  const offer = s.magma.addOffer({ ...WINDOW, feeRatePpm: 4000, baseFeeSats: 0, feeRateCap: "2200", baseFeeCap: "1" });
+  const estimate = (kw: string | null) => {
+    s.node.override("wallet.estimateFee", (_a, cb) =>
+      kw === null ? (cb as (e: unknown) => void)([503, "UnexpectedEstimateFeeError"]) : (cb as (e: unknown, r: unknown) => void)(null, { sat_per_kw: kw }),
+    );
+    (s.autopilot as unknown as { saleFloor: unknown }).saleFloor = null;
+  };
+  // 1 sat/vB, known once; the offer's rate set to the engine's price at it.
+  estimate("250");
+  await s.autopilot.saleFeeFloorSats();
+  offer.feeRatePpm = (await recOf(s, offer.id)).recommended.effectiveFeePpm;
+  assert.equal((await recOf(s, offer.id)).baseOnly, true, "with the estimate: the base goes to the market's");
+  estimate(null);
+  const rec = await recOf(s, offer.id);
+  assert.equal((await s.autopilot.magmaReport()).sell.feeEstimateMissing, true);
+  assert.deepEqual([rec.shouldReprice, rec.baseOnly], [false, undefined], rec.reasons.join(" | "));
+  assert.ok(!rec.reasons.some((x) => x.startsWith("base fee to ")), rec.reasons.join(" | "));
+  await s.autopilot.runOnce();
+  assert.deepEqual([offer.baseFeeSats, s.magma.count("UpdateOffer")], [0, 0]);
+  estimate("250");
+  await s.autopilot.runOnce();
+  assert.equal(offer.baseFeeSats, 568);
+});
+
+test("a base move never moves the price at √(min·max): a well-priced offer off the engine's exact price keeps its own, and so does a sold-out one", async (t) => {
   quiet(t);
   const s = pricedMarket(t);
   const { autopilot, magma } = s;
@@ -111,7 +138,11 @@ test("a base move never moves the price at √(min·max): a well-priced offer of
   const sold = magma.addOffer({ ...WINDOW, feeRatePpm: 4000, baseFeeSats: 0, lockedSats: 1_500_000 }); // depleted: 0.5M of 2M left
   const target = (await recOf(s, near.id)).recommended.effectiveFeePpm;
   near.feeRatePpm = Math.round(target * 1.05); // within the reprice threshold: well priced
-  sold.feeRatePpm = Math.round(target * 1.3); // above the engine's price: a depleted offer is only ever raised
+  // Sold out (0.5M left, its smallest order is 1M) and within the threshold:
+  // held, as a well-priced one. (30 % above the engine's price it used to be
+  // "exhausted" too and stay there — now it is overpriced and lowered like any
+  // offer: review 2026-11-10, OFFER-6, magmaOfferMarket.test.ts.)
+  sold.feeRatePpm = Math.round(target * 1.07);
   assert.equal((await recOf(s, near.id)).state, "well_priced");
   assert.equal((await recOf(s, sold.id)).state, "exhausted");
   differedFor(s, near.id, 25);
@@ -343,29 +374,31 @@ test("base-fee clocks read back from a damaged state file are made safe — the 
 
 test("a market base too big for the price is cut to fit — written once: the next run's cut, a rounding remainder away, is no move", async (t) => {
   quiet(t);
-  // √(min·max) = 400k, priced at the profit floor at 1 sat/vB (2,063 ppm effective):
-  // the market's 5,000 sat (12,500 ppm there) is far more than the whole price —
-  // the cut stays beyond the tolerance of it, so each run cuts it again.
+  // √(min·max) = 400k, priced at the profit floor with its margin at 1 sat/vB
+  // (2,063 ppm effective, written 5 % above): the market's 5,000 sat (12,500
+  // ppm there) is far more than the whole price — the cut stays beyond the
+  // tolerance of it, so each run cuts it again. Leases sold just above the
+  // floor: under it the offer would be "floor above what buyers paid".
   const w: Window = { minSats: 200_000, maxSats: 800_000 };
   const s = pricedMarket(t, { window: w, bases: Array(8).fill(5000) });
   const { autopilot, magma, node } = s;
   node.override("wallet.estimateFee", (_a, cb) => (cb as (e: unknown, r: unknown) => void)(null, { sat_per_kw: "250" }));
-  __setHistoryForTests(Array.from({ length: 30 }, (_, i) => ({ at: Date.now() - i * 86_400_000, sizeSat: 400_000, blocks: 4320, apr: 0.01, leasePpm: 500, status: "FINISHED" })));
-  const offer = magma.addOffer({ ...w, totalSats: 800_000, minBlockLength: 4320, feeRatePpm: 2070, baseFeeSats: 0, feeRateCap: "2200", baseFeeCap: "1" });
+  __setHistoryForTests(Array.from({ length: 30 }, (_, i) => ({ at: Date.now() - i * 86_400_000, sizeSat: 400_000, blocks: 4320, apr: 0.0256, leasePpm: 2104, status: "FINISHED" })));
+  const offer = magma.addOffer({ ...w, totalSats: 800_000, minBlockLength: 4320, feeRatePpm: 2170, baseFeeSats: 0, feeRateCap: "2200", baseFeeCap: "1" });
   const target = await recOf(s, offer.id);
-  // The case: 2,070 ppm + 0 is well priced (the engine's price is ~2,063–2,071 ppm effective there).
+  // The case: 2,170 ppm + 0 is well priced (the engine's price is the floor with its margin, ~2,167 ppm effective there).
   assert.equal(target.state, "well_priced", `${target.recommended.effectiveFeePpm}`);
-  assert.ok(Math.abs(target.recommended.effectiveFeePpm - 2070) <= 10, `${target.recommended.effectiveFeePpm}`);
+  assert.ok(Math.abs(target.recommended.effectiveFeePpm - 2170) <= 10, `${target.recommended.effectiveFeePpm}`);
   differedFor(s, offer.id, 25);
   await autopilot.runOnce();
   assert.equal(magma.count("UpdateOffer"), 1);
-  assert.deepEqual([offer.feeRatePpm, offer.baseFeeSats], [3, 827], "cut to fit");
-  await autopilot.runOnce(); // 827 is still far from 5,000: the clock starts again, against 827
+  assert.deepEqual([offer.feeRatePpm, offer.baseFeeSats], [3, 867], "cut to fit");
+  await autopilot.runOnce(); // 867 is still far from 5,000: the clock starts again, against 867
   differedFor(s, offer.id, 25); // …and a day passes, past the 6 h after the move
   movedAgo(s, offer.id, 25);
   await autopilot.runOnce();
   await autopilot.runOnce();
-  assert.equal(magma.count("UpdateOffer"), 1, "before: a second write a day later, 3 + 827 → 1 + 828, for one sat");
+  assert.equal(magma.count("UpdateOffer"), 1, "before: a second write a day later, for one sat");
 });
 
 test("a base going down to the market's is refused where the smallest order would then pay less than opening and closing its channel costs today — the lane would turn it down", async (t) => {

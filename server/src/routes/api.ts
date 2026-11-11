@@ -190,6 +190,19 @@ const WRITE_DISABLED_MSG =
   "Writing is disabled. Set LM_ENABLE_WRITE=true and provide a write macaroon " +
   "(LND_WRITE_MACAROON / LND_WRITE_MACAROON_PATH, or admin.macaroon on Umbrel).";
 
+/**
+ * The same gate for what the app does on Amboss by hand (review 2026-11-10,
+ * ENG-1). Listing or creating an offer, changing its terms and ordering a
+ * channel touch no LND write — but what they start does: an order for a listed
+ * offer is accepted, opened or turned down by the order lane, which does not
+ * run without a write client (and a by-hand reject is refused too), and a
+ * bought channel's invoice is paid through LND. Without the gate a read-only
+ * install could list an offer whose orders then time out against the seller
+ * score, or place an order it can't pay.
+ */
+const ambossWriteDisabled = (what: string, cant = "answer the orders an offer draws"): string =>
+  `${what} needs write mode: without it LightningMate can't ${cant}. ${WRITE_DISABLED_MSG}`;
+
 /** A fee write met another under way (the fee lock): the autopilot's fee or
  *  max_htlc stage, the lease-promise check, or another apply — not "the
  *  autopilot is running", which a run's other stages no longer block. */
@@ -2172,6 +2185,11 @@ export function createApiRouter(
         res.status(400).json({ error: "no_key", message: "Connect Amboss in Settings first." });
         return;
       }
+      // An order is placed on Amboss here; paying it needs LND (ENG-1).
+      if (!writeLnd) {
+        res.status(403).json({ error: "write_disabled", message: ambossWriteDisabled("Ordering a channel", "pay for the order") });
+        return;
+      }
       const asked = bodyOf<BuyQuoteRequest>(req);
       const usdCents = Math.floor(Number(asked.usdCents));
       const wantsOffer = typeof asked.offerId === "string" && asked.offerId.trim().length > 0;
@@ -2616,15 +2634,44 @@ export function createApiRouter(
     "/amboss/offer",
     wrap(async (req, res) => {
       if (!needKey(res)) return;
-      const parsed = parseOfferTerms(bodyOf<OfferTermsRequest>(req), res);
+      if (!writeLnd) {
+        res.status(403).json({ error: "write_disabled", message: ambossWriteDisabled("Creating an offer") });
+        return;
+      }
+      const body = bodyOf<OfferTermsRequest>(req);
+      const parsed = parseOfferTerms(body, res);
       if (!parsed) return;
       // Every offer carries the routing-fee promise (D7) — kept by the fee
       // autopilot for each channel sold.
       const terms: OfferTerms = { ...parsed, ...autopilot.offerFeeCaps(), ...NO_EXTRA_TERMS };
       const write: OfferWrite = { at: new Date().toISOString(), by: "manual", action: "create", fields: ambossFields(terms), ok: false };
+      // Review 2026-11-10, WEB-1: a second offer only when the request says it
+      // is meant. Market → Sell showed "No offer yet" and its create form
+      // whenever the read of the node's offers had failed or was still under
+      // way, so a click created a second offer beside the one the autopilot
+      // keeps — two offers selling the same coins. The node's offers are read
+      // here, right before the create: a read that fails creates nothing (the
+      // page can't know either), and an offer that exists is named.
+      const { public_key } = await getWalletInfo({ lnd });
+      let mine: MyOffer[];
+      try {
+        mine = await withAmboss(() => getMyOffers(amboss.getKey(), public_key));
+      } catch (err) {
+        res.status(502).json({
+          error: "amboss_failed",
+          message: `No offer created: your offers on Amboss couldn't be read (${describeError(err)}), so it isn't known whether this node has one already. Try again.`,
+        });
+        return;
+      }
+      if (mine.length > 0 && body.another !== true) {
+        res.status(409).json({
+          error: "offer_exists",
+          message: `This node already has ${mine.length === 1 ? "an offer" : `${mine.length} offers`} on Amboss — reload Market → Sell to see ${mine.length === 1 ? "it" : "them"}. A second offer sells the same coins twice over; create one only if you mean to.`,
+        });
+        return;
+      }
       let offerId: string;
       try {
-        const { public_key } = await getWalletInfo({ lnd });
         offerId = await withAmboss(() => createOffer(amboss.getKey(), public_key, terms));
       } catch (err) {
         write.error = describeError(err);
@@ -2650,6 +2697,10 @@ export function createApiRouter(
       const id = typeof b.id === "string" ? b.id : "";
       if (!id) {
         res.status(400).json({ error: "bad_request", message: "Missing offer id." });
+        return;
+      }
+      if (!writeLnd) {
+        res.status(403).json({ error: "write_disabled", message: ambossWriteDisabled("Changing an offer") });
         return;
       }
       const parsed = parseOfferTerms(b, res);
@@ -2745,7 +2796,18 @@ export function createApiRouter(
         // when capital returns.
         // Never listed without a price: Amboss matches orders to an offer at
         // 0 ppm + 0 sat at 0 sats for the seller (2026-10-23).
-        const listing = want === "ENABLED" || (!want && offer.status === "DISABLED");
+        // (A bare toggle lists whatever isn't listed: an offer Amboss reports
+        // in a state other than DISABLED — ADMIN_DISABLED, one it names
+        // tomorrow — passed the gate below as "not a listing" and was sent to
+        // Amboss from a read-only install; review of P2 of the 2026-11
+        // programme, R2-7.)
+        const listing = want === "ENABLED" || (!want && offer.status !== "ENABLED");
+        // Listing an offer needs the order lane behind it (ENG-1); taking one
+        // off the market does not, and stays open on a read-only install.
+        if (listing && offer.status !== "ENABLED" && !writeLnd) {
+          res.status(403).json({ error: "write_disabled", message: ambossWriteDisabled("Listing an offer") });
+          return;
+        }
         if (listing && offer.status !== "ENABLED" && offer.feeRatePpm <= 0 && offer.baseFeeSats <= 0) {
           res.status(409).json({
             error: "no_price",

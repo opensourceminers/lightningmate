@@ -525,6 +525,7 @@ export const SUMMARY_LABEL: Record<MagmaV2Report["sell"]["state"], string> = {
   good_to_sell: "Priced to beat routing",
   sell_only_above_profit_floor: "Sell above floor only",
   market_too_cheap: "Market too cheap right now",
+  market_unknown: "Market unknown — no new offer, price held",
   insufficient_capital: "Not enough idle capital",
 };
 
@@ -627,9 +628,9 @@ export const PRICING_MODES: { id: AutopilotConfig["sellPricingMode"]; label: str
     label: "Auto",
     desc:
       "between the 25th and 75th percentile of what buyers actually paid: starts in the middle and steps up after each sale — it never steps down on its own, " +
-      "but it follows the market: when buyers pay less, your price comes down with it (never below your profit floor)",
+      "but it follows the market: when buyers pay less, your price comes down with it (not below your profit floor for a typical order)",
   },
-  { id: "fast", label: "Low", desc: "the low end of what buyers actually paid (their 25th percentile) — never below your profit floor" },
+  { id: "fast", label: "Low", desc: "the low end of what buyers actually paid (their 25th percentile) — not below your profit floor for a typical order" },
   { id: "balanced", label: "Median", desc: "the median of what buyers actually paid" },
   { id: "premium", label: "Premium", desc: "the top of what buyers paid (75th percentile)" },
 ];

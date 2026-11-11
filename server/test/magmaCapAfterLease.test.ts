@@ -11,7 +11,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { afterLeaseNote } from "../src/services/magmaDesk.js";
-import { BUYER, sellerSetup } from "./helpers/autopilot.js";
+import { BUYER, lndEstimatesFee, sellerSetup } from "./helpers/autopilot.js";
 import { entryOnDisk, feeEnv, quiet } from "./helpers/lifecycle.js";
 
 const OTHER = "03" + "cd".repeat(32);
@@ -116,6 +116,7 @@ test("no offer listed because the cap is used up by a sold channel still open af
   feeEnv(t);
   quiet(t);
   const s = sellerSetup(t, { config: { sellMaxDeploySats: 3_000_000, sellAutoReprice: true } });
+  lndEstimatesFee(s.node);
   s.node.peers.push(OTHER);
   s.node.channels.push({ id: "850000x7x0", partnerPublicKey: OTHER, capacity: 3_200_000, localBalance: 3_100_000, transactionId: TXID, transactionVout: 0 });
   s.magma.addSale({ buyerPubkey: OTHER, status: "CHANNEL_MONITORING_FINISHED", channelId: "850000x7x0", transactionId: `${TXID}:0`, sizeSats: 3_200_000 });

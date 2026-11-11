@@ -761,9 +761,14 @@ export interface OfferTermsRequest {
   feeRatePpm: number;
   baseFeeSats: number;
   minBlockLength: number;
+  /** POST /amboss/offer only: this node has an offer already and a further
+   *  one is meant. Without it the create is refused `offer_exists` (409) —
+   *  a page that couldn't read the offers must not create a second one. */
+  another?: boolean;
 }
 
-/** POST /amboss/offer/update: an offer of this node's, and its new terms. */
+/** POST /amboss/offer/update: an offer of this node's, and its new terms
+ *  (`another` belongs to the create alone: an update doesn't read it). */
 export interface OfferUpdateRequest extends OfferTermsRequest {
   id: string;
 }

@@ -56,6 +56,9 @@ export interface ClearingStats {
   medianSizeSat: number;
   /** Lease length the band is normalised to. */
   blocks: number;
+  /** These are the sales of EVERY size: the size band asked for had fewer
+   *  than MIN_CLEARING_SAMPLE in a year (clearingOrAll). */
+  allSizes?: boolean;
 }
 
 export interface DemandFit {
@@ -87,6 +90,28 @@ export const DEFAULT_LEASE_BLOCKS = 4320;
 const MAX_SANE_APR = 1.0; // 100%/yr
 const MIN_SANE_SIZE = 20_000;
 
+/**
+ * The statuses of a lease that was paid for and whose channel was opened:
+ * running, run to its end, ended early, or no longer watched by Amboss. They
+ * are the only ones Amboss's order history returned on the day this was
+ * checked (2,854 rows of a year: FINISHED 1,894, FINISHED_EARLY 657, ACTIVE
+ * 271, NOT_MONITORED 32 — each group's median rate within a point of the
+ * others'). A row with any other status is not a sale and is left out, so that
+ * a rejected or unpaid order — a price nobody paid — can never enter the
+ * clearing price, should Amboss start to return such rows (review 2026-11-10,
+ * OFFER-12: the status was stored and never looked at). A row that names no
+ * status is kept: the field going missing must not empty the history.
+ */
+export const SOLD_LEASE_STATUSES: ReadonlySet<string> = new Set(["ACTIVE", "FINISHED", "FINISHED_EARLY", "NOT_MONITORED"]);
+const isSale = (status: string | null | undefined): boolean => !status || SOLD_LEASE_STATUSES.has(status);
+
+/**
+ * The fewest sales a clearing price is read from (clearingFor). Below it the
+ * percentiles are a handful of orders: with one sale the 25th, 50th and 75th
+ * are that one sale.
+ */
+export const MIN_CLEARING_SAMPLE = 12;
+
 interface HistoryState {
   fetchedAt: number;
   from: string;
@@ -108,6 +133,8 @@ export function initMagmaHistory(dataDir: string): void {
   if (store) return;
   store = new JsonStore<HistoryState>(dataDir, "magma-history.json");
   state = store.read({ fetchedAt: 0, from: "", orders: [] });
+  // A history stored before only sales were kept (isSale).
+  state.orders = state.orders.filter((o) => isSale(o.status));
 }
 
 function mapOrder(r: RawMarketOrder): MarketOrder | null {
@@ -118,6 +145,7 @@ function mapOrder(r: RawMarketOrder): MarketOrder | null {
   if (!Number.isFinite(at) || !Number.isFinite(sizeSat) || !Number.isFinite(blocks)) return null;
   if (!Number.isFinite(apr) || apr <= 0 || apr > MAX_SANE_APR) return null;
   if (sizeSat < MIN_SANE_SIZE || blocks <= 0) return null;
+  if (!isSale(r.status)) return null;
   return {
     at,
     sizeSat,
@@ -196,17 +224,22 @@ export interface BandQuery {
  *
  * Widens the window (30d, then 90d, then 365d) until there are enough orders to
  * say anything, so a quiet fortnight cannot produce a confident wrong number.
+ * Every window needs MIN_CLEARING_SAMPLE sales, the widest one too: before,
+ * the 365-day window took whatever it found, and ONE sale in an offer's size
+ * band — 200 days old, at 0.2 % or at 90 % a year — was the 25th, 50th and
+ * 75th percentile at once and set the offer's whole price (review 2026-11-10,
+ * OFFER-3: written down to the bare profit floor, or up to the 50,000 ppm
+ * limit). Null with fewer: the caller then prices from the sales of every
+ * size (clearingOrAll), and says so.
  */
 export function clearingFor(q: BandQuery): ClearingStats | null {
   if (!state?.orders.length) return null;
   const blocks = q.blocks ?? DEFAULT_LEASE_BLOCKS;
   const windows = q.days ? [q.days] : [30, 90, 365];
-  const MIN_SAMPLE = 12;
 
   for (const days of windows) {
     const pool = inWindow(days).filter((o) => o.sizeSat >= q.minSizeSat && o.sizeSat <= q.maxSizeSat);
-    if (pool.length < MIN_SAMPLE && days !== windows[windows.length - 1]) continue;
-    if (!pool.length) return null;
+    if (pool.length < MIN_CLEARING_SAMPLE) continue;
 
     const aprs = pool.map((o) => o.apr).sort((a, b) => a - b);
     const sizes = pool.map((o) => o.sizeSat).sort((a, b) => a - b);
@@ -224,6 +257,21 @@ export function clearingFor(q: BandQuery): ClearingStats | null {
     };
   }
   return null;
+}
+
+/**
+ * What buyers paid for leases an offer of this size band could have served
+ * — or, when the band sold fewer than MIN_CLEARING_SAMPLE in a year, what
+ * they paid for leases of every size (`allSizes`): a rate a year differs far
+ * less between sizes than between a dozen sales and one. Null: no history, or
+ * fewer than the sample in the whole market — the caller falls back to the
+ * listed offers, or holds.
+ */
+export function clearingOrAll(q: BandQuery): ClearingStats | null {
+  const band = clearingFor(q);
+  if (band) return band;
+  const all = clearingFor({ ...q, minSizeSat: 0, maxSizeSat: Number.MAX_SAFE_INTEGER });
+  return all ? { ...all, allSizes: true } : null;
 }
 
 /**
@@ -288,25 +336,32 @@ export function popularLeaseBlocks(days = 90): number {
 }
 
 /**
- * The lease an offer should promise (D7): the standard length buyers ask for
- * most often — one of the lengths the market trades (4320 / 8640 / 12960 /
- * 25920 blocks), never shorter than 30 days. min_block_length is a MINIMUM
- * the seller commits to, so 4320 also serves the longer leases. Before, an
- * offer listed at 4032 blocks (an old default no order had used since 2022)
- * was never corrected: auto-size only ever SHORTENED a lease.
+ * The lease a new offer promises, and the one an offer with a lease no order
+ * uses is given: 30 days (4,320 blocks), fixed. min_block_length is a MINIMUM
+ * the seller commits to, so 4,320 serves the longer leases too — every sale
+ * of the last 90 days in the live history (638 of 30 days, 78 of 90, 25 of
+ * 180, 23 of 60) fits it.
+ *
+ * It used to follow the lease most sales carried (popularLeaseBlocks): had
+ * 60-day leases led for a quarter, auto-size would have rewritten every
+ * managed offer's MINIMUM to 8,640 blocks and shut out each 30-day buyer —
+ * the most frequent lease is not the best minimum (review 2026-11-10,
+ * OFFER-5; othervice's decision E4: the minimum lease is the operator's, the
+ * market's most frequent lease is shown as information only). An offer whose
+ * operator chose a longer common lease keeps it (keptLeaseBlocks).
  */
-export function standardLeaseBlocks(days = 90): number {
-  const popular = popularLeaseBlocks(days);
-  return COMMON_LEASE_BLOCKS.includes(popular) ? Math.max(DEFAULT_LEASE_BLOCKS, popular) : DEFAULT_LEASE_BLOCKS;
+export function standardLeaseBlocks(): number {
+  return DEFAULT_LEASE_BLOCKS;
 }
 
 /**
- * The lease an offer keeps when it is priced as it stands (and when a price
- * button on Market → Sell rewrites its terms): one buyers order, at least as
- * long as the standard — a longer minimum chosen on purpose (60, 90, 180
- * days) still serves its buyers. Anything else — the old 4,032-block default,
- * a shorter or an odd one — becomes the standard. The Sell tab's leaseToKeep
- * (web/src/magmaView.ts) is the same rule.
+ * The lease an offer keeps — when the autopilot's auto-size writes its terms,
+ * when it is priced as it stands, and when a price button on Market → Sell
+ * rewrites its terms: one buyers order, at least as long as the standard — a
+ * longer minimum chosen on purpose (60, 90, 180 days) still serves its
+ * buyers, and is the operator's choice (E4). Anything else — the old
+ * 4,032-block default, a shorter or an odd one — becomes the standard. The
+ * Sell tab's leaseToKeep (web/src/magmaView.ts) is the same rule.
  */
 export function keptLeaseBlocks(blocks: number, standard: number = standardLeaseBlocks()): number {
   return COMMON_LEASE_BLOCKS.includes(blocks) && blocks >= standard ? blocks : standard;

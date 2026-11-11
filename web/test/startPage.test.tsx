@@ -12,7 +12,18 @@ import { readFileSync } from "node:fs";
 import { todoItems } from "../src/todoView";
 import { activityTitle } from "../src/analyticsView";
 import { SETUP_GOALS, setupLines, setupPatch, setupProblem, withoutSelling, type SetupChoice } from "../src/setupView";
-import { advancedChanged, baselineConfig, EMPTY_DRAFT, resetToBaseline, type AdvancedSet, type Draft } from "../src/autopilotForm";
+import {
+  advancedChanged,
+  baselineConfig,
+  EMPTY_DRAFT,
+  OFFER_FLAGS,
+  offerManagedView,
+  resetToBaseline,
+  toggleOfferManaged,
+  type AdvancedSet,
+  type Draft,
+  type FlagKey,
+} from "../src/autopilotForm";
 import { buildPresets, matchesPreset, SELLING_KEYS } from "../src/presets";
 import { GLOSSARY } from "../src/components/SettingsPanel";
 import { priceHoldNote } from "../src/magmaView";
@@ -233,6 +244,59 @@ test("a strategy's own values aren't 'changed': Advanced measures against the st
   assert.match(panel, /buildPresets\(server\.defaults\)/, "built on the defaults, or the operator's own values would count as the strategy's");
 });
 
+test("ENG-4: 'The autopilot manages my offer' shows what is on — all, none or partly, with the parts named", () => {
+  const shownOf = (c: AutopilotConfig, d: Draft = EMPTY_DRAFT) => (k: FlagKey) => d.flags[k] ?? (c[k] as boolean);
+  // A factory install: it prices and sizes the offer, and the box said nothing was managed.
+  const factory = offerManagedView(shownOf(base));
+  assert.equal(factory.state, "partly");
+  assert.equal(
+    factory.text,
+    "Partly on: the autopilot sets the price and sizes the offer; it does not list again what is free or close a sold channel after its lease. " +
+      "Tick the box to hand it all four — each has its own switch under Advanced.",
+  );
+  const all = { ...base, sellAutoRelist: true, sellAutoClose: true } as AutopilotConfig;
+  const none = { ...base, sellAutoReprice: false, sellAutoSize: false } as AutopilotConfig;
+  assert.deepEqual(offerManagedView(shownOf(all)), { state: "all", text: null });
+  assert.deepEqual(offerManagedView(shownOf(none)), { state: "none", text: null });
+  assert.equal(offerManagedView(shownOf(none, { ...EMPTY_DRAFT, flags: { sellAutoClose: true } })).state, "partly", "an unsaved tick counts");
+
+  // Ticking hands over all four; only what was off is a change.
+  const ticked = toggleOfferManaged(EMPTY_DRAFT, base);
+  assert.deepEqual(ticked.flags, { sellAutoRelist: true, sellAutoClose: true });
+  assert.equal(offerManagedView(shownOf(base, ticked)).state, "all");
+  // Unticking that puts back what is saved — pricing and sizing stay on, nothing is left to save.
+  const unticked = toggleOfferManaged(ticked, base);
+  assert.deepEqual(unticked.flags, {});
+  assert.equal(offerManagedView(shownOf(base, unticked)).state, "partly");
+  // From a saved "all four", unticking takes all four away.
+  const off = toggleOfferManaged(EMPTY_DRAFT, all);
+  assert.deepEqual(off.flags, { sellAutoReprice: false, sellAutoSize: false, sellAutoRelist: false, sellAutoClose: false });
+  assert.equal(offerManagedView(shownOf(all, off)).state, "none");
+  assert.deepEqual(toggleOfferManaged(off, all).flags, {}, "and ticking again is the saved state");
+  // Other unsaved settings are left alone.
+  const other: Draft = { ...EMPTY_DRAFT, nums: { sellMaxDeploySats: "5000000" }, flags: { feeFloorAboveMax: true } };
+  const kept = toggleOfferManaged(other, base);
+  assert.deepEqual(kept.nums, other.nums);
+  assert.equal(kept.flags.feeFloorAboveMax, true);
+
+  // The four switches sit under Selling's Advanced: its count and its Reset cover them.
+  const magma: AdvancedSet = { paths: [], flags: OFFER_FLAGS };
+  const baseline = baselineConfig(base, null);
+  assert.equal(advancedChanged(magma, EMPTY_DRAFT, base, baseline), 0);
+  assert.equal(advancedChanged(magma, ticked, base, baseline), 2);
+  assert.equal(advancedChanged(magma, EMPTY_DRAFT, all, baseline), 2);
+  assert.deepEqual(resetToBaseline(magma, EMPTY_DRAFT, all, baseline).flags, { sellAutoRelist: false, sellAutoClose: false });
+  assert.deepEqual(resetToBaseline(magma, ticked, base, baseline).flags, {});
+
+  const panel = read("components/AutopilotPanel.tsx");
+  assert.match(panel, /magma: \{ paths: SELL_NUM_FIELDS\.map\(\(f\) => f\.key\), flags: OFFER_FLAGS, pricingMode: true \}/);
+  assert.match(panel, /checked=\{offerManaged\.state === "all"\}/);
+  assert.match(panel, /el\.indeterminate = offerManaged\.state === "partly"/);
+  assert.match(panel, /aria-checked=\{offerManaged\.state === "partly" \? "mixed" : offerManaged\.state === "all"\}/);
+  assert.match(panel, /onChange=\{\(\) => setDraft\(toggleOfferManaged\(draft, config\)\)\}/);
+  assert.match(panel, /\{offerManaged\.text \? <p className="muted ap-hint ap-offer-partly">\{offerManaged\.text\}<\/p> : null\}/);
+});
+
 test("every area's Advanced is a remembered fold that counts its changes", () => {
   const panel = read("components/AutopilotPanel.tsx");
   for (const area of ["fees", "rebalancing", "channels", "magma"]) assert.match(panel, new RegExp(`advanced\\(\\s*"${area}"`), area);
@@ -253,8 +317,9 @@ test("selling has one home for its settings: Market → Sell shows the offer and
   assert.match(sell, /settings under Autopilot → Selling/);
   assert.doesNotMatch(sell, /<Fold /, "price and figures in view, nothing to unfold");
   assert.doesNotMatch(sell, /v2-badge/);
-  // An edit under way, or no offer yet, shows its form.
-  assert.match(sell, /const formOpen = editingId !== null \|\| draft !== null \|\| showForm \|\| \(connected !== null && offers\.length === 0\)/);
+  // An edit under way shows its form; a new offer's form only for a list of
+  // offers that was read (marketSell.test.tsx renders the states).
+  assert.match(sell, /const formOpen = editingId !== null \|\| \(offersFresh && \(draft !== null \|\| showForm \|\| offers\.length === 0\)\)/);
   const panel = read("components/AutopilotPanel.tsx");
   assert.match(panel, /goTo\("market", "sell"\)/);
 });

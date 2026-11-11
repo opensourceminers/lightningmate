@@ -370,7 +370,10 @@ export const api = {
   ambossMyOrders: () => get<MyOrdersView>("/amboss/my-orders"),
   magmaRecommendations: () => get<MagmaV2Report>("/amboss/recommendations"),
   autopilotOutcomes: () => get<OutcomesReport>("/autopilot/outcomes"),
-  ambossCreateOffer: (p: OfferTermsRequest) => post<OfferCreateResult, OfferTermsRequest>("/amboss/offer", p),
+  /** `another`: this node has an offer and a second one is meant — without
+   *  it the server refuses the create while one exists. */
+  ambossCreateOffer: (p: OfferTermsRequest, another = false) =>
+    post<OfferCreateResult, OfferTermsRequest>("/amboss/offer", another ? { ...p, another: true } : p),
   ambossUpdateOffer: (id: string, p: OfferTermsRequest) =>
     post<OfferUpdateResult, OfferUpdateRequest>("/amboss/offer/update", { id, ...p }),
   /** Flip an offer — or, with `want`, put it in that state (read first,

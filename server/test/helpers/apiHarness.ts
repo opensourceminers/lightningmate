@@ -54,6 +54,9 @@ export interface ApiHarness {
   settings: SettingsStore;
   /** The shutdown gate for state-changing requests: close() = SIGTERM arrived. */
   requestGate: RequestGate;
+  /** Every route the API router has, as "POST /amboss/offer" — for a test
+   *  that must not miss one added later. */
+  routes: string[];
   baseUrl: string;
   request(
     method: string,
@@ -122,23 +125,28 @@ export async function startApi(
     lnd: { socket: "fake:10009", cert: "", macaroon: "" },
   };
   const requestGate = new RequestGate();
+  const apiRouter = createApiRouter(
+    node.lnd,
+    writeLnd,
+    config,
+    autopilot,
+    rebalanceLog,
+    settings,
+    overrides,
+    amboss,
+    backup,
+    earnings,
+    lsps1,
+    lnplus,
+    serviceFees,
+  );
+  type RouteLayer = { route?: { path: string; methods: Record<string, boolean> } };
+  const routes = (apiRouter.stack as RouteLayer[]).flatMap((layer) =>
+    layer.route ? Object.keys(layer.route.methods).map((m) => `${m.toUpperCase()} ${layer.route!.path}`) : [],
+  );
   const app = createHttpApp({
     requestGate,
-    apiRouter: createApiRouter(
-      node.lnd,
-      writeLnd,
-      config,
-      autopilot,
-      rebalanceLog,
-      settings,
-      overrides,
-      amboss,
-      backup,
-      earnings,
-      lsps1,
-      lnplus,
-      serviceFees,
-    ),
+    apiRouter,
     allowedHosts: [],
     authRequired: authRequired(),
   });
@@ -212,6 +220,7 @@ export async function startApi(
   return {
     dir,
     node,
+    routes,
     capital,
     autopilot,
     lsps1,

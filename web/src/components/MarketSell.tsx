@@ -28,7 +28,7 @@ import { sats, satsCompact } from "../format";
 import { ppmText } from "../nodeView";
 import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
-import { failedOfferWrite } from "../statusNotes";
+import { WRITE_MODE_HINT, failedOfferWrite } from "../statusNotes";
 import { EligibilityCard, HowAmbossPicks, OfferPromiseNote, SellDiagnosticsCard } from "./MagmaSellInfo";
 import { InfoTip } from "./InfoTip";
 import {
@@ -67,6 +67,7 @@ const SELL_STATE_LABEL: Record<MagmaSellOfferState, string> = {
   do_not_list_unprofitable: "unprofitable to list",
   do_not_list_uncompetitive: "floor above market",
   exhausted: "exhausted — relist",
+  market_unknown: "market unknown — price held",
   inactive: "inactive",
 };
 const SELL_STATE_CLASS: Record<MagmaSellOfferState, string> = {
@@ -77,9 +78,11 @@ const SELL_STATE_CLASS: Record<MagmaSellOfferState, string> = {
   do_not_list_unprofitable: "s-close",
   do_not_list_uncompetitive: "s-protect",
   exhausted: "s-cost",
+  market_unknown: "s-normal",
   inactive: "s-normal",
 };
 const asPct = (ppmPerYear: number) => `${(ppmPerYear / 10_000).toFixed(2)}%`;
+const NO_NEW_OFFER = "For a new offer — not possible until your offers are read from Amboss and write mode is on";
 
 export function MarketSell() {
   const ui = useUi();
@@ -91,7 +94,21 @@ export function MarketSell() {
   const [feeCaps, setFeeCaps] = useState<{ feeRateCapPpm: number; baseFeeCapSats: number } | null>(null);
   const [feeBps, setFeeBps] = useState(0);
   const [offers, setOffers] = useState<MyOffer[]>([]);
+  // Whether this node's offers were read at all, and why the last read
+  // failed. (Review 2026-11-10, WEB-1: a failed read — or one still under way
+  // — left the empty list it started with, which the page showed as "No offer
+  // yet — create one below" with the create form open. A click then listed a
+  // SECOND offer beside the one the autopilot keeps. Not read is not "none":
+  // the page says which it is, and offers the form only for a list it read.)
+  const [offersRead, setOffersRead] = useState(false);
+  const [offersError, setOffersError] = useState<string | null>(null);
+  /** The list is the one Amboss has now: a new offer may be created from it. */
+  const offersFresh = offersRead && offersError === null;
   const [cfg, setCfg] = useState<AutopilotConfig | null>(null);
+  /** Write mode (null: not known). Off: nothing here may list, create or
+   *  change an offer — the server refuses it (ENG-1) and the page says so. */
+  const [canWrite, setCanWrite] = useState<boolean | null>(null);
+  const writeOff = canWrite === false;
   const [draft, setDraft] = useState<OfferDraft | null>(null);
   /** The lease the draft's price was worked out for (a price button), or null. */
   const [pricedFor, setPricedFor] = useState<number | null>(null);
@@ -123,16 +140,27 @@ export function MarketSell() {
       .finally(() => setEligBusy(false));
   };
 
+  // Each load has a number, and only the latest one's answers are taken: an
+  // older offers read that answers late (two Retry clicks, a reload after a
+  // write while the first read is still under way) put its list over the
+  // newer one — an empty one made the page say "No offer yet" and open the
+  // New-offer form beside an offer that exists (review of P2 of the 2026-11
+  // programme, R2-8).
+  const loadSeq = useRef(0);
   const load = async () => {
+    const seq = ++loadSeq.current;
+    const latest = () => seq === loadSeq.current;
     let conn = false;
     try {
       const s = await api.ambossStatus();
+      if (!latest()) return;
       conn = s.connected;
       setConnected(s.connected);
       setKeyValid(s.keyValid);
       setKeyCheck(s.keyCheck);
       setFeeBps(s.saleFeeBps ?? 0);
     } catch (e) {
+      if (!latest()) return;
       setError(e instanceof Error ? e.message : String(e));
       setConnected(false);
       return;
@@ -144,19 +172,32 @@ export function MarketSell() {
     api.sellDiagnostics().then(setDiag).catch(() => setDiag(null));
     api
       .autopilotGet()
-      .then((s) => setCfg(s.config))
-      .catch(() => setCfg(null));
+      .then((s) => {
+        if (!latest()) return;
+        setCfg(s.config);
+        setCanWrite(s.canWrite);
+      })
+      .catch(() => {
+        if (latest()) setCfg(null);
+      });
     if (!conn) return;
-    // Best-effort — a flaky offers call (e.g. an expired key) shouldn't blank the tab.
+    // A flaky offers call (an expired key, Amboss down) doesn't blank the tab:
+    // the offers read before stay, marked as not refreshed — and a list never
+    // read is shown as not read, not as empty.
     api
       .ambossMyOffers()
       .then((r) => {
+        if (!latest()) return;
         setOffers(r.offers);
         setSync(r.sync);
         setControls(r.controls ?? {});
         setFeeCaps(r.feeCaps ?? null);
+        setOffersRead(true);
+        setOffersError(null);
       })
-      .catch(() => {});
+      .catch((e: unknown) => {
+        if (latest()) setOffersError(e instanceof Error ? e.message : String(e));
+      });
   };
 
   useEffect(() => {
@@ -213,7 +254,9 @@ export function MarketSell() {
   const applyPrice = (p: PricePoint, leaseBlocks: number, full = false) => {
     const mine = offers[0];
     if (mine) startEdit(mine, p, leaseBlocks, full);
-    else {
+    else if (offersFresh) {
+      // (Only for a list that was read and is empty: with the offers unread
+      // this would open a NEW offer's form beside one that may exist.)
       setPricedFor(leaseBlocks);
       setDraft({ ...form, feeRatePpm: p.feeRatePpm, baseFeeSats: p.baseFeeSat, minBlockLength: leaseBlocks });
     }
@@ -249,12 +292,26 @@ export function MarketSell() {
         const res = await api.ambossUpdateOffer(editing, d);
         ui.toast(res.verified === false ? "Amboss answered OK, but the offer reads back different — check it." : "Offer updated.", res.verified === false ? "error" : "success");
       } else {
-        await api.ambossCreateOffer(d);
+        // `another`: the second offer is meant — said in the dialog above.
+        // Without it the server refuses a create while an offer exists.
+        await api.ambossCreateOffer(d, another);
         ui.toast("Offer created.", "success");
+        // The list on the page is the one from before the create: until the
+        // reload's read answers it is not what Amboss has. Shown as being
+        // read — not as "No offer yet" with the New-offer form open and its
+        // button live beside the offer just made, which a second click sent
+        // a second create from (second review of P2 of the 2026-11
+        // programme, M2).
+        setOffersRead(false);
+        setOffersError(null);
       }
       setEditingId(null);
       setDraft(null);
       setPricedFor(null);
+      // "Create another offer" was a one-time ask: with the offer made the
+      // form closes, instead of standing open for a third (review of P2 of
+      // the 2026-11 programme, R2-12).
+      setShowForm(false);
       await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -356,9 +413,16 @@ export function MarketSell() {
   // The offer form only when it is wanted: editing, a price button pressed,
   // no offer yet, or "Create another offer" (it sat open under everything,
   // with a paragraph of fine print, on every visit).
-  const formOpen = editingId !== null || draft !== null || showForm || (connected !== null && offers.length === 0);
+  // A NEW offer's form only for a list of offers that was read: unread (the
+  // read failed, or is under way) there may be one already (WEB-1).
+  const formOpen = editingId !== null || (offersFresh && (draft !== null || showForm || offers.length === 0));
+  /** Why Save / Create / enable is disabled, or undefined. */
+  const writeOffTitle = writeOff ? `Not possible here — ${WRITE_MODE_HINT}` : undefined;
 
   const holdNote = r0 ? priceHoldNote(r0, mine, managedPrice) : null;
+  /** A price button with no offer to apply it to would open a new one's form
+   *  — not while the offers aren't read, or nothing may be created. */
+  const noNewOffer = !mine && (!offersFresh || writeOff);
 
   return (
     <div className="sell">
@@ -370,6 +434,12 @@ export function MarketSell() {
         <p className="banner error">
           Amboss rejects your API key (expired or revoked) — Magma selling <strong>does nothing</strong> (no offers managed, no
           orders fulfilled). Connect a fresh key in <strong>Settings</strong>.
+        </p>
+      ) : null}
+      {writeOff ? (
+        <p className="banner">
+          Creating, changing and listing an offer are <strong>disabled</strong> — {WRITE_MODE_HINT}. Without it LightningMate can't answer
+          the orders an offer draws, and an order left unanswered counts against your seller score. You can still disable an offer.
         </p>
       ) : null}
       {cfg?.sellEnabled && failedOfferWrite(sync) ? (
@@ -433,10 +503,26 @@ export function MarketSell() {
       <div className={`sell-grid ${rec && r0 ? "two" : ""}`}>
         <section className="panel sell-offers">
           <h2>{offers.length > 1 ? "Your offers" : "Your offer"}</h2>
-          {connected === null ? (
-            <p className="muted">Loading…</p>
+          {offersRead && offersError ? (
+            <p className="sug-warn offers-stale">
+              ⚠ Couldn't refresh your offers from Amboss ({offersError}) — shown as last read.{" "}
+              <button className="linklike" onClick={() => void load()}>
+                Retry
+              </button>
+            </p>
+          ) : null}
+          {connected === null || (!offersRead && !offersError) ? (
+            <p className="muted">Reading your offers from Amboss…</p>
+          ) : !offersRead ? (
+            <div className="banner error offers-unread">
+              Couldn't read your offers from Amboss: {offersError}. Whether this node has an offer isn't known, so none can be created
+              from here now.{" "}
+              <button className="linklike" onClick={() => void load()}>
+                Retry
+              </button>
+            </div>
           ) : offers.length === 0 ? (
-            <EmptyState icon="🏷️">No offer yet — create one below.</EmptyState>
+            <EmptyState icon="🏷️">{writeOff ? "No offer yet." : offersError ? "No offer when last read." : "No offer yet — create one below."}</EmptyState>
           ) : (
             offers.map((o) => {
               const active = o.status === "ENABLED";
@@ -482,9 +568,11 @@ export function MarketSell() {
                     </button>
                     <button
                       className="row-btn ghost"
-                      disabled={togglingId !== null || (!active && free)}
+                      disabled={togglingId !== null || (!active && (free || writeOff))}
                       title={
-                        !active && free
+                        !active && writeOff
+                          ? writeOffTitle
+                          : !active && free
                           ? autoPriced(o) && enginePriced(o)
                             ? freeOfferNote(controls[o.id], true, true)
                             : "Set a price first (edit): listed like this, buyers would get a channel for free"
@@ -534,7 +622,7 @@ export function MarketSell() {
                 ⚠ {turnedDownLine(e, !!controls[e.offerId]?.manual)}
               </p>
             ))}
-          {!formOpen && offers.length > 0 ? (
+          {!formOpen && offers.length > 0 && offersFresh && !writeOff ? (
             <button className="row-btn ghost add-offer" onClick={() => setShowForm(true)}>
               + Create another offer
             </button>
@@ -578,7 +666,9 @@ export function MarketSell() {
             <div className="magma-price-meta muted">
               {clearing
                 ? `buyers paid ${clearing.p25Ppm}–${clearing.p75Ppm} ppm (median ${clearing.medianPpm}) in ${clearing.count} sales of the last ${clearing.windowDays} days`
-                : `no sale history: priced against listed asks (median ${r0.market.median} ppm)`}
+                : r0.state === "market_unknown"
+                  ? "too few sales and too few comparable offers to know the market: the price is held"
+                  : `too few sales to price from: priced against comparable listed offers (median ${r0.market.median} ppm)`}
             </div>
             {(() => {
               const m = r0.market;
@@ -610,7 +700,7 @@ export function MarketSell() {
             <div className="magma-price-buttons">
               {(
                 [
-                  ["Low", r0.pricing.fast, "the 25th percentile of what buyers paid (never below your floor)"],
+                  ["Low", r0.pricing.fast, "the 25th percentile of what buyers paid (not below your profit floor for a typical order)"],
                   ["Median", r0.pricing.balanced, "the median of what buyers paid"],
                   ["High", r0.pricing.premium, "the 75th percentile of what buyers paid"],
                   ["Profit floor", r0.pricing.profitFloor, "the lowest price that still beats routing"],
@@ -619,8 +709,8 @@ export function MarketSell() {
                 <button
                   key={label}
                   className="row-btn"
-                  disabled={managedPrice}
-                  title={`${title} — for a ${leaseDays}-day lease`}
+                  disabled={managedPrice || noNewOffer}
+                  title={noNewOffer ? NO_NEW_OFFER : `${title} — for a ${leaseDays}-day lease`}
                   onClick={() => applyPrice(p, r0.recommended.minBlockLength)}
                 >
                   {label}
@@ -628,11 +718,13 @@ export function MarketSell() {
               ))}
               <button
                 className="row-btn primary"
-                disabled={managedPrice}
+                disabled={managedPrice || noNewOffer}
                 title={
                   mine
                     ? `The recommended price, the ${leaseDays}-day lease it is for and the engine's window (within what can be funded) — into your offer's edit form`
-                    : undefined
+                    : noNewOffer
+                      ? NO_NEW_OFFER
+                      : undefined
                 }
                 onClick={() => applyPrice(r0.recommended, r0.recommended.minBlockLength, true)}
               >
@@ -663,7 +755,7 @@ export function MarketSell() {
                     className={`sug-need-tag ${
                       summary.good
                         ? "need-balanced"
-                        : rec.sell.state === "insufficient_capital" || rec.sell.state === "market_too_cheap"
+                        : rec.sell.state === "insufficient_capital" || rec.sell.state === "market_too_cheap" || rec.sell.state === "market_unknown"
                           ? "need-need_inbound"
                           : ""
                     }`}
@@ -682,7 +774,8 @@ export function MarketSell() {
                     {r0.market.myRank ? ` · your rank #${r0.market.myRank} of ${r0.market.segmentCount}` : ""}
                   </span>
                   <span className="info-line">
-                    • {rec.sell.medianOrderSat ? `median real order ${satsCompact(rec.sell.medianOrderSat)} · ` : ""}standard lease {rec.sell.standardLeaseBlocks} blocks · ~
+                    • {rec.sell.medianOrderSat ? `median real order ${satsCompact(rec.sell.medianOrderSat)} · ` : ""}standard lease {rec.sell.standardLeaseBlocks} blocks
+                    {rec.sell.popularLeaseBlocks !== rec.sell.standardLeaseBlocks ? ` (most leases sold lately: ${rec.sell.popularLeaseBlocks} blocks)` : ""} · ~
                     {rec.sell.onchainOpenCostSat} sat to open on-chain
                     {rec.sell.projectedMonthlySat > 0 ? ` · ≈ ${sats(rec.sell.projectedMonthlySat)} sat/mo from your own sales of the last 30 days` : ""}
                     {rec.sell.pricingMode === "auto" ? ` · auto level ${Math.round(rec.sell.adaptiveLevel * 100)}%` : ""}
@@ -722,7 +815,7 @@ export function MarketSell() {
             ))}
           </div>
           <div className="apply-row">
-            <button className="primary-btn" disabled={busy} onClick={() => void submit()}>
+            <button className="primary-btn" disabled={busy || writeOff} title={writeOffTitle} onClick={() => void submit()}>
               {busy ? (editingId ? "Saving…" : "Creating…") : editingId ? "Save changes" : offers.length ? "Create another offer" : "Create offer"}
             </button>
             {editingId || draft || showForm ? (

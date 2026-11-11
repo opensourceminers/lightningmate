@@ -22,6 +22,7 @@ import {
   DEFAULT_LEASE_BLOCKS,
   clearingFor,
   initMagmaHistory,
+  keptLeaseBlocks,
   priceFitsLease,
   refreshMagmaHistory,
   standardLeaseBlocks,
@@ -61,9 +62,15 @@ import {
 } from "./openPlan.js";
 import type { LnPlusStore } from "./lnplusStore.js";
 import {
+  COVER_KEEP_MARGIN,
+  LISTED_MOVE_HOLD_MS,
+  COVER_RELAX_MARGIN,
   autoSizedWindow,
+  coveringMinSizeSat,
   getMagmaRecommendations,
   minSizeCoveringSat,
+  smallestOrderPaysSat,
+  standingMinimumStays,
   preferredBaseFeeSats,
   saleAcceptFloorSats,
   saleCostFloorSats,
@@ -620,10 +627,17 @@ interface PersistedState {
   /** Per offer: when the autopilot last moved its base fee (a verified
    *  write) — at most one move per BASE_FEE_MOVE_GAP_MS. */
   offerBaseMovedAt?: Record<string, string>;
+  /** The offer the autopilot created last, until a read of this node's
+   *  offers shows it (or OFFER_CREATED_WAIT_MS passed): while Amboss's list
+   *  is empty and does not show it yet, no second one is created. Before,
+   *  the only gate was "no offer in the list": a list one run behind the
+   *  create meant a second CreateOffer — the same capital listed twice
+   *  (second review of P2 of the 2026-11 programme, m4). */
+  offerCreated?: { id: string; at: string };
   /** The order lane's accept floor as LND's fee estimate last gave it, and
    *  when: while the estimate fails, the floor is this one (saleFeeFloor) —
    *  not the minimum relay fee's. */
-  lastSaleFloor?: { at: string; sats: number };
+  lastSaleFloor?: { at: string; sats: number; feePerVbyte?: number };
   /** Per area: its latest decision and why (decisionNote) — what it did, or
    *  why it did nothing (D16). */
   decisions?: Partial<Record<DecisionArea, AreaDecision>>;
@@ -977,6 +991,18 @@ const OFFER_DEPTH_MARGIN_SATS = 50_000;
 /** A size floor raised by the mempool stays up this long: fees hovering around
  *  a step moved it up and down all day (20 offer writes in 13 hours, 2026-11-05). */
 const OFFER_FLOOR_HOLD_MS = 6 * 3_600_000;
+/** How long an offer the autopilot created may be missing from Amboss's list
+ *  of this node's offers before another one is created (offerCreated). */
+const OFFER_CREATED_WAIT_MS = 6 * 3_600_000;
+
+/** Why the engine would not list the offer this wallet can fund (the state
+ *  of its "create" recommendation) — said where the autopilot lists none.
+ *  Any other state is an offer it would list. */
+const NOT_LISTED_WHY: Partial<Record<MagmaSellRecommendation["state"], string>> = {
+  do_not_list_uncompetitive: "at the channel size this wallet can fund, the price that pays for a lease is above what buyers pay for comparable leases",
+  do_not_list_unprofitable: "at the channel size this wallet can fund, even the recommended price barely beats routing — the capital is better kept routing",
+  market_unknown: "what the market pays isn't known — no sale history and too few comparable listed offers",
+};
 
 /** What an offer write did, in the Magma decision ("repriced offer 1a2b…"). */
 const OFFER_VERB: Partial<Record<SellActionKind, string>> = {
@@ -1237,10 +1263,11 @@ interface OfferCtx {
    *  (magmaRecommend.ts prices each offer for the lease it carries after the
    *  autopilot's next write). `why`: what the move is, when it isn't the
    *  market price moving (a base fee going to the market's). */
-  target: (off: MyOffer) => { fee: number; base: number; moved: boolean; lease: number; why?: string } | null;
+  target: (off: MyOffer) => { fee: number; base: number; moved: boolean; lease: number; listed: boolean; why?: string } | null;
   /** A sane size window (auto-size): null when the current one is fine. */
   reshape: (off: MyOffer) => { minSizeSats: number; maxSizeSats: number } | null;
-  /** The standard lease the offer should promise (auto-size), or null. */
+  /** The lease the offer should promise (auto-size): its own where buyers
+   *  use that one, else the standard — or null (its lease is left alone). */
   lease: (off: MyOffer) => number | null;
   /** The routing-fee promise (D7): every offer the autopilot creates carries
    *  it, and auto-size gives it to every offer it manages. */
@@ -1551,6 +1578,40 @@ export class Autopilot {
     const raised = this.offerFloorRaisedAt.get(id);
     return raised !== undefined && Date.now() - raised < OFFER_FLOOR_HOLD_MS;
   }
+  /** When an offer's price last followed LISTED offers (no sale history):
+   *  the next such step waits LISTED_MOVE_HOLD_MS. In memory: a restart at
+   *  worst lets one step come early. */
+  private readonly listedMoveAt = new Map<string, number>();
+  /** A listing-based step that was sent and not confirmed (the answer never
+   *  came, or the read-back failed): the price sent and when. An offer read
+   *  at exactly that price later took the step then — the hold counts from
+   *  the send; one read at another price did not, and the step is tried
+   *  again. Before, a step Amboss applied without answering started no hold
+   *  and the next run took a second one (second review of P2 of the 2026-11
+   *  programme, m2). */
+  private readonly listedMoveSent = new Map<string, { feeRatePpm: number; baseFeeSats: number; at: number }>();
+  /** Until when the next listing-based step of this offer's price waits;
+   *  null when it may be taken now. */
+  private listedMoveHeldUntil(off: Pick<MyOffer, "id" | "feeRatePpm" | "baseFeeSats">): number | null {
+    const sent = this.listedMoveSent.get(off.id);
+    if (sent && Date.now() - sent.at >= LISTED_MOVE_HOLD_MS) this.listedMoveSent.delete(off.id);
+    else if (sent && sent.feeRatePpm === off.feeRatePpm && sent.baseFeeSats === off.baseFeeSats) {
+      this.listedMoveSent.delete(off.id);
+      this.listedMoveAt.set(off.id, Math.max(sent.at, this.listedMoveAt.get(off.id) ?? 0));
+    }
+    const moved = this.listedMoveAt.get(off.id);
+    return moved !== undefined && Date.now() - moved < LISTED_MOVE_HOLD_MS ? moved + LISTED_MOVE_HOLD_MS : null;
+  }
+  /** A listing-based step was sent: confirmed, the hold starts now; not
+   *  confirmed, what was sent is kept for the next read (listedMoveSent). */
+  private noteListedMove(id: string, sent: { feeRatePpm: number; baseFeeSats: number }, confirmed: boolean): void {
+    if (confirmed) {
+      this.listedMoveAt.set(id, Date.now());
+      this.listedMoveSent.delete(id);
+    } else {
+      this.listedMoveSent.set(id, { feeRatePpm: sent.feeRatePpm, baseFeeSats: sent.baseFeeSats, at: Date.now() });
+    }
+  }
   private readonly maxHtlcBackoff = new Map<string, number>();
   /** The last max_htlc update applied per channel: one that didn't take is
    *  not resent every run (runMaxHtlcPass). */
@@ -1758,6 +1819,11 @@ export class Autopilot {
       !(typeof lastFloor?.at === "string" && Number.isFinite(Date.parse(lastFloor.at)) && typeof lastFloor.sats === "number" && Number.isFinite(lastFloor.sats) && lastFloor.sats > 0)
     ) {
       delete this.state.lastSaleFloor;
+    } else if (this.state.lastSaleFloor) {
+      // The fee rate it came from (the engine's costs while the estimate
+      // fails): a number above 0, or none.
+      const rate = (this.state.lastSaleFloor as { feePerVbyte?: unknown }).feePerVbyte;
+      if (!(typeof rate === "number" && Number.isFinite(rate) && rate > 0)) delete this.state.lastSaleFloor.feePerVbyte;
     }
     // Upgrading to the fee-change log: the fee changes still in the run
     // history move into it (once), so what was measurable stays measurable.
@@ -1922,10 +1988,12 @@ export class Autopilot {
     onchainReserveSat: number;
     offerFeeCaps: OfferFeeCaps;
     autoSizeLease: boolean;
+    autoRelist: boolean;
     operatorOfferIds: string[];
     heldFloorOfferIds: string[];
     windowsHeld: boolean;
     baseMoves: Record<string, { since?: string; offerBase?: number; movedAt?: string }>;
+    lastKnownFeePerVbyte: number | null;
   } {
     const c = this.state.config;
     return {
@@ -1936,11 +2004,11 @@ export class Autopilot {
       maxSellSizeSat: Math.max(0, Math.min(c.sellMaxChannelSats, c.sellMaxDeploySats)),
       onchainReserveSat: c.sellReserveSats,
       offerFeeCaps: this.offerFeeCaps(),
-      // Which lease each offer is priced for: the one it carries after the
-      // offer upkeep's next write. With auto-size (and selling)
-      // that is the standard lease for every offer whose terms aren't the
-      // operator's; otherwise the lease the offer keeps.
+      // Auto-size (and selling) manages every offer whose terms aren't the
+      // operator's: its size window, and a lease no order uses, are the
+      // upkeep's to write — the engine prices the offer for both.
       autoSizeLease: c.sellEnabled && c.sellAutoSize,
+      autoRelist: c.sellAutoRelist,
       operatorOfferIds: Object.entries(this.state.offerControl ?? {})
         .filter(([, control]) => !!control.manual)
         .map(([id]) => id),
@@ -1955,6 +2023,10 @@ export class Autopilot {
           return [id, { ...(m ? { since: m.since, offerBase: m.offerBase } : {}), ...(movedAt ? { movedAt } : {}) }];
         }),
       ),
+      // The on-chain fee rate LND last gave (saleFeeFloor): while its estimate
+      // fails, the engine costs a channel at this one — as the order lane's
+      // floor does — not at 1 sat/vB (review 2026-11-10, OFFER-13).
+      lastKnownFeePerVbyte: this.state.lastSaleFloor?.feePerVbyte ?? null,
     };
   }
 
@@ -4555,11 +4627,13 @@ export class Autopilot {
         base: r.recommended.baseFeeSat,
         moved: r.shouldReprice,
         lease: r.recommended.minBlockLength,
+        // Read from listed offers: no sale history to price from.
+        listed: !r.clearing,
         ...(why ? { why } : {}),
       };
     };
 
-    // Auto-size is offer-shape hygiene (D19): a standard lease and a sane
+    // Auto-size is offer-shape hygiene (D19): a lease buyers use and a sane
     // size window — not a lever that makes an offer fill (it isn't one below
     // Amboss's score/depth gate).
     //
@@ -4569,7 +4643,13 @@ export class Autopilot {
     // "not enough room" exits — and only ever moved a lease DOWN: the live
     // 4032-block offer (a length no order had used since 2022) was never
     // raised to the standard 4320.
-    ctx.lease = () => (cfg.sellAutoSize && !opts.capitalOnly ? standardLeaseBlocks() : null);
+    //
+    // Only a lease no order uses is corrected (keptLeaseBlocks): a longer one
+    // buyers take — 60, 90, 180 days — is the operator's choice and stays
+    // (review 2026-11-10, OFFER-5: every managed offer got "the standard
+    // lease", which followed the sales — 20 of 35 at 60 days, and the offer's
+    // minimum went to 60 days, shutting out the 15 buyers of 30).
+    ctx.lease = (off) => (cfg.sellAutoSize && !opts.capitalOnly ? keptLeaseBlocks(off.minBlockLength) : null);
 
     // The size window: from the smallest channel that still pays for itself
     // up to what can be funded. Null when the current one is fine, so we
@@ -4602,7 +4682,8 @@ export class Autopilot {
       // itself moves with the mempool, both ways (review 2026-10-25: at
       // 10 sat/vB the engine wanted 850k and the offer kept 250k). The engine
       // priced the offer for this same window (magmaRecommend buildSell).
-      return autoSizedWindow(off, wantMin, wantMax, this.offerFloorHeld(off.id));
+      // (Auto-relist off: never wider than what is still listed — OFFER-2.)
+      return autoSizedWindow(off, wantMin, wantMax, this.offerFloorHeld(off.id), cfg.sellAutoRelist ? null : off.availableSats);
     };
 
     const entries: OfferSyncEntry[] = [];
@@ -4641,6 +4722,11 @@ export class Autopilot {
     for (const id of Object.keys(this.state.offerBaseMovedAt ?? {})) {
       if (!offers.some((o) => o.id === id)) delete this.state.offerBaseMovedAt?.[id];
     }
+    // The offer created last: seen in the list, or missing for hours (deleted
+    // on amboss.tech, or never stored) — no longer waited for.
+    const made = this.state.offerCreated;
+    if (made && (offers.some((o) => o.id === made.id) || !(Date.now() - Date.parse(made.at) < OFFER_CREATED_WAIT_MS))) delete this.state.offerCreated;
+    const awaited = offers.length === 0 ? this.state.offerCreated : undefined;
 
     // Auto-list idle capital: no offer at all, leasing beats routing, and
     // auto-pricing on (listing means choosing a price, which only that switch
@@ -4649,17 +4735,67 @@ export class Autopilot {
     // for a node whose comparable offers don't sell — it would only park
     // capital and invite orders it may then have to turn down).
     const createRec = rec?.sell.recommendations.find((r) => r.mode === "create");
+    // (Not while LND gives no fee estimate: what a channel costs today isn't
+    // known, and a new offer's smallest order is sized by it — OFFER-13. Not
+    // with a last known rate to go by, and not without one: a first start, or
+    // an install from before the rate was kept, whose LND has given none yet,
+    // listed an offer costed at the engine's defaults — about 1 sat/vB
+    // (review of this package, R2-6).)
+    // And only an offer the engine itself would list: the summary speaks for
+    // the node's capital as a whole, the recommendation for the offer this
+    // wallet can fund (review of this package, R2-3: with 1.2M on chain the
+    // summary said "good to sell", the recommendation for that very offer
+    // "do not list — above what buyers paid", and it was listed).
     const canCreate =
-      !this.shuttingDown && cfg.sellAutoReprice && offers.length === 0 && rec?.sell.state === "good_to_sell" && !!createRec;
+      !this.shuttingDown &&
+      cfg.sellAutoReprice &&
+      offers.length === 0 &&
+      !awaited &&
+      rec?.sell.state === "good_to_sell" &&
+      rec.sell.onchainFeePerVbyte !== null &&
+      !!createRec &&
+      !NOT_LISTED_WHY[createRec.state];
     const realistic = canCreate ? await this.sellingRealistic() : null;
     let noOffer: { text: string; state: DecisionState } | null = null;
-    if (offers.length === 0) noOffer = this.whyNoOffer(rec, createRec !== undefined, realistic);
+    if (offers.length === 0) {
+      noOffer = awaited
+        ? {
+            text: `no further offer created: the one created at ${awaited.at.slice(11, 16)} UTC isn't in Amboss's list of your offers yet — looked at again next run`,
+            state: "waiting",
+          }
+        : this.whyNoOffer(rec, createRec, realistic);
+    }
     if (canCreate && rec && createRec && realistic?.ok) {
       const viable = rec.sell.minViableSizeSat ?? 1_000_000;
-      const minCh = Math.min(viable, ctx.maxOrder(viable));
+      let minCh = Math.min(viable, ctx.maxOrder(viable));
+      // The smallest order of a new offer pays for its channel, with the same
+      // room the upkeep keeps (coveringMinSizeSat). Before, the create path
+      // had no such check: an offer went up whose smallest order — or every
+      // order — the lane turned down, and the next run's upkeep raised its
+      // minimum or took it off the market again (review 2026-11-10, OFFER-8).
+      let uncovered: string | null = null;
+      const price = { feeRatePpm: createRec.recommended.feeRatePpm, baseFeeSats: createRec.recommended.baseFeeSat };
+      if (ctx.acceptFloorSat && minCh > 0) {
+        const share = saleFeeConfig().bps / 10_000;
+        const want = coveringMinSizeSat(price, ctx.acceptFloorSat, share, (x) => ctx.maxOrder(x) >= x && ctx.listable(x) >= x);
+        if (want) {
+          // A minimum written now gets the write margin's room (as near to
+          // it as the capital funds). The keep margin is for a minimum that
+          // already stands: measured against it here, a new offer went up
+          // whose smallest order paid ×1.17 over the lane's floor, and a fee
+          // estimate 18 % higher before the next run turned it down (review
+          // of this package, R2-1).
+          if (minCh < want.sizeSat) minCh = want.sizeSat;
+        } else if (minSizeCoveringSat(price.feeRatePpm, price.baseFeeSats, ctx.acceptFloorSat) > minCh) {
+          uncovered = `no offer listed: at the engine's price (${fmtSat(price.feeRatePpm)} ppm + ${fmtSat(price.baseFeeSats)} sat) no order that can be funded now (up to ${fmtSat(ctx.maxOrder(minCh))} sat) pays for opening and closing its channel at today's fee rate (${fmtSat(ctx.acceptFloorSat)} sat) — the order lane would turn every order down`;
+          minCh = 0;
+        }
+      }
       const maxCh = ctx.maxOrder(minCh);
       const listed = ctx.listable(minCh);
-      if (!(minCh > 0 && listed >= minCh && maxCh >= minCh)) {
+      if (uncovered) {
+        noOffer = { text: uncovered, state: "waiting" };
+      } else if (!(minCh > 0 && listed >= minCh && maxCh >= minCh)) {
         noOffer = {
           text:
             `no offer listed: only ${fmtSat(listed)} sat could be listed after the reserve, promised orders and the deploy cap — below the smallest channel worth selling (${fmtSat(viable)} sat)` +
@@ -4706,6 +4842,7 @@ export class Autopilot {
           } else {
             const id = await createOffer(key, pubkey, terms);
             write.ok = true;
+            this.state.offerCreated = { id, at: write.at };
             const created = await getMyOffer(key, id).catch(() => null);
             write.verified = created ? termsMatch(created, terms) : undefined;
             this.rememberPrice({ id, ...terms });
@@ -4767,7 +4904,7 @@ export class Autopilot {
    */
   private whyNoOffer(
     rec: MagmaV2Report | null,
-    canPrice: boolean,
+    createRec: MagmaSellRecommendation | undefined,
     realistic: { ok: boolean; why: string } | null,
   ): { text: string; state: DecisionState } | null {
     const cfg = this.state.config;
@@ -4785,7 +4922,15 @@ export class Autopilot {
     if (st !== "good_to_sell") {
       return { text: `no offer listed automatically: ${rec.sell.reasons[0] ?? "leasing doesn't beat routing at today's prices"}`, state: "idle" };
     }
-    if (!canPrice) return { text: "no offer listed: the engine has no price to list one at", state: "idle" };
+    if (rec.sell.onchainFeePerVbyte === null) {
+      return {
+        text: "no offer listed for now: LND gives no on-chain fee estimate, so what a channel costs today isn't known — one is listed once the estimate is back",
+        state: "waiting",
+      };
+    }
+    if (!createRec) return { text: "no offer listed: the engine has no price to list one at", state: "idle" };
+    const notListed = NOT_LISTED_WHY[createRec.state];
+    if (notListed) return { text: `no offer listed automatically: ${notListed}`, state: "idle" };
     if (realistic && !realistic.ok) return { text: `no offer listed automatically: ${realistic.why}`, state: "idle" };
     return null;
   }
@@ -4885,7 +5030,9 @@ export class Autopilot {
         : control.disabledByHandAt
         ? "disabled by you — the autopilot leaves it disabled; enable it on Market → Sell to list it again"
         : control.costDisabledAt
-        ? `taken off the market by the autopilot below cost: at today's on-chain fee rate not even its largest order pays for opening and closing its channel (${fmtSat(ctx.acceptFloorSat ?? 0)} sat) — the order lane would turn every order down; listed again (its terms first) once fees drop, or once there is capital for an order that pays for it${
+        ? `taken off the market by the autopilot below cost: at ${
+            ctx.acceptFloorLive ? "today's" : "the last known"
+          } on-chain fee rate opening and closing a channel costs ${fmtSat(ctx.acceptFloorSat ?? 0)} sat, and not even its largest order pays that with room to spare (${Math.round((COVER_KEEP_MARGIN - 1) * 100)} % over it) — the order lane would turn its orders down, or take them for next to nothing; listed again (its terms first) once fees are lower, or once there is capital for an order that pays for it${
             ctx.acceptFloorLive ? "" : " — on a fee rate LND's estimate gives: it isn't answering now"
           }`
         : control.autoDisabledAt
@@ -5008,7 +5155,7 @@ export class Autopilot {
     if (want.belowCost) {
       // Every order it could get would be turned down by the lane: off the
       // market until fees drop (disableBelowCost), not left inviting them.
-      const r = await this.disableBelowCost(key, off, want.belowCost, out);
+      const r = await this.disableBelowCost(key, off, want.belowCost, ctx.acceptFloorLive, out);
       control = this.offerControlOf(off.id); // its record now says why (disabledWhy)
       return this.syncEntry(r.offer, null, r.write ?? undefined, r.offer.status === "ENABLED" ? `below cost and not yet taken off the market: ${r.write?.error ?? "left for the next run"}` : disabledWhy(r.offer.status));
     }
@@ -5079,6 +5226,7 @@ export class Autopilot {
     // The cut memory follows what Amboss has: updated only when the write
     // landed (a failed one left the offer — and the old memory — as it was).
     if (ok) this.keepCut(off.id, want.cut);
+    if (want.listedMove) this.noteListedMove(off.id, want.fields, ok);
     if (ok) {
       console.log(`[autopilot] updated offer ${off.id}: ${changed.map((k) => `${k}=${write.fields[k]}`).join(", ")} (${write.reason})`);
     } else {
@@ -5093,6 +5241,13 @@ export class Autopilot {
    * one, its terms the autopilot's with auto-pricing on; else its own), the
    * smallest order that covers today's accept floor is one it can fund — with
    * auto-size its min goes up to it.
+   *
+   * "Covers" with room (COVER_KEEP_MARGIN, the margin a standing minimum is
+   * kept at): it went off the market when not even the bare floor could be
+   * covered, and comes back only once fees are clearly lower. Held against
+   * the bare floor both ways, a fee estimate moving 4 % around that point
+   * took the offer off the market and listed it again run after run (review
+   * of P2 of the 2026-11 programme, R2-9).
    */
   private coverableNow(off: MyOffer, ctx: OfferCtx, control: OfferControl): boolean {
     const floorSat = ctx.acceptFloorSat;
@@ -5105,7 +5260,7 @@ export class Autopilot {
       if ("waits" in lp) return false;
       price = lp;
     }
-    const cover = minSizeCoveringSat(price.feeRatePpm, price.baseFeeSats, floorSat);
+    const cover = minSizeCoveringSat(price.feeRatePpm, price.baseFeeSats, smallestOrderPaysSat(floorSat, COVER_KEEP_MARGIN, saleFeeConfig().bps / 10_000));
     if (!Number.isFinite(cover)) return false;
     return ctx.maxOrder(Math.max(cover, off.minSizeSats)) >= Math.max(cover, off.minSizeSats);
   }
@@ -5116,11 +5271,19 @@ export class Autopilot {
    * by it (costDisabledAt, capitalStatus) once its orders pay for their
    * channels. The intent is recorded first; an answer showing it listed takes
    * the record back.
+   *
+   * `live`: the floor is LND's estimate now. While the estimate fails the
+   * lane turns orders down by the last floor it gave, so the offer goes off
+   * the market by that floor too — orders the lane rejects cost seller score
+   * — and the reason says which rate it is: "today's" was untrue of a rate
+   * hours old (review of P2 of the 2026-11 programme, R2-6). It is listed
+   * again only on a real estimate (coverableNow).
    */
   private disableBelowCost(
     key: string,
     off: MyOffer,
     cost: { coverSat: number; floorSat: number },
+    live: boolean,
     out: AutopilotSell[],
   ): Promise<{ offer: MyOffer; write: OfferWrite | null }> {
     return this.withOffer(off.id, async () => {
@@ -5128,9 +5291,11 @@ export class Autopilot {
       if (!fresh || fresh.status !== "ENABLED") return { offer: fresh ?? off, write: null };
       if (this.stopWhy("sellEnabled")) return { offer: fresh, write: null };
       const reason =
-        `below cost at today's on-chain fee rate: ${
+        `below cost at ${live ? "today's on-chain fee rate" : "the last known on-chain fee rate (LND gives no estimate right now)"}: ${
           Number.isFinite(cost.coverSat) ? `only an order of ${fmtSat(cost.coverSat)} sat or more pays` : "no order pays"
-        } for opening and closing its channel (${fmtSat(cost.floorSat)} sat), and it can't fund one that big — every order would be turned down; taken off the market until fees drop`;
+        } for opening and closing its channel (${fmtSat(cost.floorSat)} sat), and it can't fund one that big — every order would be turned down; taken off the market until ${
+          live ? "fees drop" : "the estimate is back and its orders pay for their channels"
+        }`;
       const write: OfferWrite = { at: new Date().toISOString(), by: "autopilot", action: "disable", fields: { offer_id: off.id }, ok: false, reason };
       this.setOfferControl(off.id, { ...this.offerControlOf(off.id), costDisabledAt: write.at });
       this.persist();
@@ -5276,11 +5441,20 @@ export class Autopilot {
     off: MyOffer,
     ctx: OfferCtx,
     leaseBlocks: number,
-  ): { feeRatePpm: number; baseFeeSats: number } | { waits: "report" | "lease"; why: string } {
+  ): { feeRatePpm: number; baseFeeSats: number; listed?: boolean; heldUntil?: number } | { waits: "report" | "lease"; why: string } {
     const t = ctx.target(off);
     if (!t || listedForFree({ feeRatePpm: t.fee, baseFeeSats: t.base })) {
       return { waits: "report", why: "there is no market report for it this run — tried again next run" };
     }
+    // A price that follows listed offers (no sale history) moves one step
+    // every six hours, and being taken off the market and listed again is
+    // not a way round it: within the hold the offer comes back at the price
+    // it has — written under the same rule. Before, every relist was one
+    // more quarter step: 4,512 to 9,802 ppm in four dips of the wallet
+    // inside one hold (second review of P2 of the 2026-11 programme, m1).
+    const follows = t.listed && !t.why;
+    const heldUntil = follows && !listedForFree(off) && (t.fee !== off.feeRatePpm || t.base !== off.baseFeeSats) ? this.listedMoveHeldUntil(off) : null;
+    if (heldUntil !== null) return { feeRatePpm: off.feeRatePpm, baseFeeSats: off.baseFeeSats, heldUntil };
     if (!priceFitsLease(t.lease, leaseBlocks)) {
       return {
         waits: "lease",
@@ -5289,7 +5463,7 @@ export class Autopilot {
           "the offer keeps its lease) — set its price or its lease on Market → Sell, or turn on auto-size",
       };
     }
-    return { feeRatePpm: t.fee, baseFeeSats: t.base };
+    return { feeRatePpm: t.fee, baseFeeSats: t.base, listed: follows };
   }
 
   /**
@@ -5315,7 +5489,7 @@ export class Autopilot {
     | { offer: MyOffer; write?: OfferWrite; failed: string; wanted: OfferFields; waits?: "report" | "lease" }
   > {
     const manual = !!control.manual;
-    let listAt: { feeRatePpm: number; baseFeeSats: number } | undefined;
+    let listAt: { feeRatePpm: number; baseFeeSats: number; listed?: boolean; heldUntil?: number } | undefined;
     if (!manual && this.state.config.sellAutoReprice) {
       const price = this.listingPrice(off, ctx, ctx.lease(off) ?? off.minBlockLength);
       if ("waits" in price) {
@@ -5378,6 +5552,7 @@ export class Autopilot {
     }
     const ok = write.ok && write.verified === true;
     out.push({ orderId: off.id, action: want.kind, sizeSats: want.fields.maxSizeSats, ok, ...(ok ? {} : { error: write.error }) });
+    if (want.listedMove) this.noteListedMove(off.id, want.fields, ok);
     if (!ok || !done.read) {
       return {
         offer: done.read ?? off,
@@ -5575,7 +5750,7 @@ export class Autopilot {
      *  or the one a free offer gets back (upkeepOffer): applied before the
      *  size checks below, which judge the price it gets. `why`: the reason
      *  said for it (else "priced at the engine's …"). */
-    listAt?: { feeRatePpm: number; baseFeeSats: number; why?: string },
+    listAt?: { feeRatePpm: number; baseFeeSats: number; why?: string; listed?: boolean; heldUntil?: number },
   ): {
     fields: OfferFields;
     kind: SellActionKind;
@@ -5588,6 +5763,9 @@ export class Autopilot {
     /** Orders under this size are turned down as below cost (the operator's
      *  terms, or auto-size off: the window stays theirs — said, not changed). */
     turnedDownUnderSat: number | null;
+    /** The price follows LISTED offers in these terms (no sale history):
+     *  written, the next such step waits (listedMoveHeldUntil). */
+    listedMove: boolean;
   } {
     const cfg = this.state.config;
     const w = fieldsOf(off);
@@ -5595,22 +5773,48 @@ export class Autopilot {
     const notes: string[] = [];
     let kind: SellActionKind = "reprice";
     let repriced = false;
+    let listedMove = false;
+    const heldNote = (until: number) =>
+      `not repriced yet: there is no sale history to price from, and the price follows listed offers one step every ${Math.round(LISTED_MOVE_HOLD_MS / 3_600_000)} hours (a quarter at most) — the next one is due ${new Date(until).toISOString().slice(11, 16)} UTC`;
     const shape = manual ? null : ctx.reshape(off);
+    // Auto-relist off and less listed than the offer's own smallest order:
+    // nothing can be ordered from it, and nothing is listed again. Such an
+    // offer is left as it is until the operator lists more — no price that
+    // follows the market, no minimum raised a second time: the first raise
+    // above the listing changed the size the engine prices for, so the next
+    // run moved the price back down and the minimum up again, two writes for
+    // an offer that sells nothing (review of P2 of the 2026-11 programme,
+    // R2-5). A reshape that brings the window back within the listing ends it.
+    // Only the move that follows the market is held: a price of nothing, a
+    // price under the profit floor and the base fee's split are still put
+    // right — they leave the price at √(min·max) where it is or lift it once,
+    // and none of them comes back the run after.
+    const unorderable = !manual && !cfg.sellAutoRelist && off.availableSats < off.minSizeSats && !(shape && ctx.ordersPending === 0);
     if (!manual) {
       // The lease first: a price holds only for the lease it is for. The
       // engine prices each offer for the lease it carries after this write
-      // (magmaRecommend.ts) — the standard one with auto-size, else the one
-      // it keeps; a price meant for another lease goes on only where it
+      // (magmaRecommend.ts) — the one it keeps, or the standard one in place
+      // of a lease no order uses; a price meant for another lease goes on only where it
       // can't undercharge (priceFitsLease: the old 4,032-block offer takes
       // the 4,320-block price; a 5,000-block one never the 4,320 one).
       const lease = ctx.lease(off);
       const leaseAfter = lease ?? w.minBlockLength;
       const t = ctx.target(off);
-      if (t?.moved) {
+      if (t?.moved && unorderable && !t.why) {
+        notes.push(
+          `not repriced: less is listed (${fmtSat(off.availableSats)} sat) than its smallest order (${fmtSat(off.minSizeSats)} sat) and auto-relist is off — it sells nothing until you list more, and is priced again then`,
+        );
+      } else if (t?.moved && t.listed && !t.why && this.listedMoveHeldUntil(off) !== null) {
+        // Asks are prices nobody has to pay: followed a quarter at a time
+        // (the engine's cap), and one step every six hours — not one a run
+        // (review of P2 of the 2026-11 programme, R2-4).
+        notes.push(heldNote(this.listedMoveHeldUntil(off) as number));
+      } else if (t?.moved) {
         if (priceFitsLease(t.lease, leaseAfter)) {
           w.feeRatePpm = t.fee;
           w.baseFeeSats = t.base;
           repriced = true;
+          listedMove = t.listed && !t.why;
           const move = t.why ?? "market price moved";
           reasons.push(
             t.lease === leaseAfter
@@ -5629,8 +5833,12 @@ export class Autopilot {
         w.feeRatePpm = listAt.feeRatePpm;
         w.baseFeeSats = listAt.baseFeeSats;
         repriced = true;
+        // Listed again at a price read from listed offers: a step like any
+        // other, and the next one waits (listingPrice).
+        listedMove = !!listAt.listed;
         reasons.push(listAt.why ?? `priced at the engine's ${fmtSat(listAt.feeRatePpm)} ppm + ${fmtSat(listAt.baseFeeSats)} sat`);
       }
+      if (listAt?.heldUntil !== undefined && !notes.includes(heldNote(listAt.heldUntil))) notes.push(heldNote(listAt.heldUntil));
       if (shape && ctx.ordersPending > 0) {
         // What a pending order holds isn't sold yet: a wider window lists it a
         // second time, and the next order is turned down for capital.
@@ -5638,11 +5846,21 @@ export class Autopilot {
       } else if (shape) {
         w.minSizeSats = shape.minSizeSats;
         w.maxSizeSats = shape.maxSizeSats;
-        w.availableSats = Math.max(w.availableSats, shape.maxSizeSats);
+        // With auto-relist the listing follows the window's max. Without it
+        // what a sale took stays out: the window was sized within what is
+        // still listed (autoSizedWindow), and the listing is not touched
+        // (review 2026-11-10, OFFER-2: 1M left of a 3M offer was 2M for sale
+        // again as soon as the window moved — a fee move is enough — and the
+        // write named only the size window).
+        if (cfg.sellAutoRelist) w.availableSats = Math.max(w.availableSats, shape.maxSizeSats);
         kind = "resize";
-        reasons.push("size window set from the smallest channel that pays for itself up to what can be funded");
+        reasons.push(
+          cfg.sellAutoRelist
+            ? "size window set from the smallest channel that pays for itself up to what can be funded"
+            : "size window set from the smallest channel that pays for itself up to what can be funded and is still listed (auto-relist is off: what was sold is not listed again)",
+        );
       }
-      // Standard offer terms (D7, with auto-size): the lease buyers use, and
+      // Standard offer terms (D7, with auto-size): a lease buyers use, and
       // the routing-fee promise the fee autopilot keeps for every sold
       // channel. With every offer-automation switch off, an offer's terms are
       // the operator's — its promise too (one set on amboss.tech stays) — and
@@ -5650,7 +5868,7 @@ export class Autopilot {
       // with every switch off, while the diagnostics said "only the capital
       // limits apply".)
       if (lease !== null && lease !== w.minBlockLength) {
-        reasons.push(`lease set to the standard ${lease} blocks (was ${w.minBlockLength})`);
+        reasons.push(`lease set to the standard ${lease} blocks (was ${w.minBlockLength} — a length no order uses)`);
         w.minBlockLength = lease;
         if (kind === "reprice" && !repriced) kind = "terms";
       }
@@ -5665,30 +5883,79 @@ export class Autopilot {
     // 2026-10-25): at today's fee rate an order must pay at least opening and
     // closing its channel (the lane's accept floor, the same sum — rate × size
     // + base — the base fee's check uses). With auto-size, its terms the
-    // autopilot's, the min goes up to the smallest order that does; when not
-    // even the largest one it can fund does, it is taken off the market
-    // (belowCost, the upkeep). Otherwise the window stays the operator's, and
-    // the sync record says from which size orders are turned down.
+    // autopilot's, the min goes up to the smallest order that pays that with
+    // room over it and the minimum profit (coveringMinSizeSat: a fee estimate
+    // a little higher by the time an order comes must not make the lane turn
+    // the offer's own smallest order down; review 2026-11-10, OFFER-10 and
+    // OFFER-4) — as near to it as the capital funds; when not even the
+    // largest order it can fund pays the bare floor, it is taken off the
+    // market (belowCost, the upkeep). Otherwise the window stays the
+    // operator's, and the sync record says from which size orders are turned
+    // down.
     let belowCost: { coverSat: number; floorSat: number } | null = null;
     let turnedDownUnderSat: number | null = null;
     const floorSat = ctx.acceptFloorSat;
     if (floorSat && !listedForFree(w)) {
       const cover = minSizeCoveringSat(w.feeRatePpm, w.baseFeeSats, floorSat);
-      if (cover > w.minSizeSats) {
-        if (!manual && cfg.sellAutoSize) {
-          if (!Number.isFinite(cover) || ctx.maxOrder(cover) < cover) {
-            belowCost = { coverSat: cover, floorSat };
-          } else {
+      if (!manual && cfg.sellAutoSize) {
+        const share = saleFeeConfig().bps / 10_000;
+        // An order can be funded — and, with auto-relist off, is no larger
+        // than what the offer still lists (nothing is listed again for it).
+        const fundable = (x: number) => ctx.maxOrder(x) >= x;
+        const want = coveringMinSizeSat(w, floorSat, share, (x) => fundable(x) && (cfg.sellAutoRelist || x <= w.availableSats));
+        const keepSize = minSizeCoveringSat(w.feeRatePpm, w.baseFeeSats, smallestOrderPaysSat(floorSat, COVER_KEEP_MARGIN, share));
+        if (!want) {
+          if (unorderable) {
+            // Nothing can be ordered from it as it is: no order the lane
+            // would turn down, so no minimum to raise and nothing to take
+            // off the market.
+          } else if (cover > w.minSizeSats && Number.isFinite(cover) && fundable(cover)) {
+            // Auto-relist off and less listed than the smallest order that
+            // pays: the minimum goes there all the same — the offer sells
+            // nothing until more is listed, instead of orders the lane turns down.
             w.minSizeSats = cover;
             w.maxSizeSats = Math.max(w.maxSizeSats, cover);
             kind = "resize";
             reasons.push(
-              `min channel raised to ${fmtSat(cover)} sat: at today's fee rate a smaller order pays less than opening and closing its channel costs (${fmtSat(floorSat)} sat) — the order lane would turn it down`,
+              `min channel raised to ${fmtSat(cover)} sat: at today's fee rate a smaller order pays less than opening and closing its channel costs (${fmtSat(floorSat)} sat) — the order lane would turn it down. Less than that is still listed and auto-relist is off: the offer sells nothing until you list more`,
+            );
+          } else if (cover > w.minSizeSats) {
+            belowCost = { coverSat: cover, floorSat };
+          }
+        } else if (w.minSizeSats < (w.minSizeSats === off.minSizeSats ? Math.min(keepSize, want.sizeSat) : want.sizeSat)) {
+          // Two margins, so that a fee estimate moving by a little rewrites
+          // nothing: the minimum the offer HAS stands while its smallest
+          // order pays the keep margin; a minimum written now — this one, or
+          // the one the reshape above just set — gets the write margin's
+          // room. (Review of this package, R2-1: the keep margin was held
+          // against the reshaped minimum too, so a fresh one went out paying
+          // ×1.16 over the lane's floor and was rewritten on the next 2 %.)
+          //
+          // Where the reshape lowered it (it asks for the smallest channel
+          // worth selling, run after run, wherever that is well under the
+          // offer's), the minimum the offer has is put back as long as it
+          // pays the keep margin and no more than the relax margin: the
+          // estimate creeping down doesn't rewrite it either.
+          const relaxSize = minSizeCoveringSat(w.feeRatePpm, w.baseFeeSats, smallestOrderPaysSat(floorSat, COVER_RELAX_MARGIN, share));
+          const stays = off.minSizeSats > w.minSizeSats && standingMinimumStays(off.minSizeSats, want, relaxSize);
+          const to = stays ? off.minSizeSats : want.sizeSat;
+          w.minSizeSats = to;
+          w.maxSizeSats = Math.max(w.maxSizeSats, to);
+          // (A minimum that stays what the offer has is no change and gets no
+          // line. One the reshape took down comes out lower than the offer's:
+          // the line said "raised to" for a move from 3.89M to 3.42M.)
+          if (to !== off.minSizeSats) {
+            const moved = to > off.minSizeSats ? "raised to" : "lowered to";
+            kind = "resize";
+            reasons.push(
+              want.level === "margin"
+                ? `min channel ${moved} ${fmtSat(to)} sat: a smaller order pays less than ${fmtSat(want.paysSat)} sat — opening and closing its channel costs ${fmtSat(floorSat)} sat at today's fee rate, the rest is the minimum profit and room for on-chain fees to rise before the order lane turns the smallest order down`
+                : `min channel ${moved} ${fmtSat(to)} sat: at today's fee rate a smaller order pays less than opening and closing its channel costs (${fmtSat(floorSat)} sat) — the order lane would turn it down (no room over that: a larger smallest order can't be funded)`,
             );
           }
-        } else {
-          turnedDownUnderSat = Number.isFinite(cover) ? cover : w.maxSizeSats + 1;
         }
+      } else if (cover > w.minSizeSats) {
+        turnedDownUnderSat = Number.isFinite(cover) ? cover : w.maxSizeSats + 1;
       }
     }
     // What an earlier capital cut took goes back in — up to what it was, and
@@ -5749,8 +6016,9 @@ export class Autopilot {
     const wantListed = w.availableSats;
     w.maxSizeSats = Math.min(w.maxSizeSats, fundableMax);
     // Down to the step below — never under the largest order it takes, nor over
-    // what can be funded: a listing under its max sells nothing bigger, and
-    // the engine reads it as "exhausted".
+    // what can be funded: a listing under its max sells nothing bigger (the
+    // engine calls an offer "exhausted" only once less is listed than its
+    // smallest order).
     if (w.availableSats > listable) w.availableSats = depthManaged ? Math.min(listable, Math.max(depth, w.maxSizeSats)) : listable;
     if (depthManaged && walletLimited) {
       // Up by less than the margin, at the wallet's limit, isn't worth a write:
@@ -5785,7 +6053,7 @@ export class Autopilot {
       if (earlier.max) cut.max = cut.max ? { wish: Math.max(cut.max.wish, earlier.max.wish), set: cut.max.set } : earlier.max;
       if (earlier.listed) cut.listed = cut.listed ? { cutSats: cut.listed.cutSats + earlier.listed.cutSats, setTotal: cut.listed.setTotal } : earlier.listed;
     }
-    return { fields: w, kind, reasons, notes, cut: cut.max || cut.listed ? cut : null, belowCost, turnedDownUnderSat };
+    return { fields: w, kind, reasons, notes, cut: cut.max || cut.listed ? cut : null, belowCost, turnedDownUnderSat, listedMove };
   }
 
   /** The memory of an earlier capital cut on this offer — only the parts
@@ -6466,7 +6734,7 @@ export class Autopilot {
       const at = Date.now();
       const sats = saleAcceptFloorSats(oc.feePerVbyte, share);
       this.saleFloor = { at, sats };
-      this.state.lastSaleFloor = { at: new Date(at).toISOString(), sats };
+      this.state.lastSaleFloor = { at: new Date(at).toISOString(), sats, feePerVbyte: oc.feePerVbyte };
       this.saleFloorSeen = { live: true, at };
       return { sats, live: true, at };
     }
@@ -6594,6 +6862,7 @@ export class Autopilot {
       const read = await this.writeTerms(key, off.id, terms, write, fresh);
       const priced = write.ok && write.verified === true;
       out.push({ orderId: off.id, action: "reprice", sizeSats: terms.maxSizeSats, ok: priced, ...(priced ? {} : { error: write.error }) });
+      if (want.listedMove) this.noteListedMove(off.id, want.fields, priced);
       if (!priced || this.stopWhy("sellEnabled")) return null;
       // Listed meanwhile (a click, amboss.tech): the toggle would turn it off.
       if (read?.status === "ENABLED") {

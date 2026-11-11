@@ -20,7 +20,7 @@ import { SELLING_OFF_SKIP } from "../src/services/magmaDesk.js";
 import { executeRebalance } from "../src/services/rebalance.js";
 import { runMaxHtlcPass } from "../src/services/maxHtlc.js";
 import type { RebalanceRecommendation } from "../src/services/rebalanceRecommend.js";
-import { BUYER, autopilotWith, paidRebalance, plannedFeeChange, plannedRebalance, sellerSetup, suggestion } from "./helpers/autopilot.js";
+import { BUYER, autopilotWith, lndEstimatesFee, paidRebalance, plannedFeeChange, plannedRebalance, sellerSetup, suggestion } from "./helpers/autopilot.js";
 import { feeNode, type FeeChannel } from "./helpers/feeNode.js";
 import type { FakeMarket } from "./helpers/market.js";
 import { SALE_DEFAULTS } from "./helpers/magma.js";
@@ -299,6 +299,7 @@ function fillMarket(market: FakeMarket, fills: (score: number) => number): void 
 test("Magma: a pause while the selling check is read — no offer is created", async (t) => {
   quiet(t);
   const s = sellerSetup(t, { chainBalance: 20_000_000, config: { sellAutoReprice: true } });
+  lndEstimatesFee(s.node);
   fillMarket(s.market, () => 30);
   // The selling check (Amboss's public book) is the last read before the
   // create: the operator pauses while it is under way.
@@ -496,6 +497,7 @@ test("the order lane: a pause while its accept waits for the on-chain mutex — 
 test("Magma: a pause while this node's key is read for the create — the last read before it — no offer is created", async (t) => {
   quiet(t);
   const s = sellerSetup(t, { chainBalance: 20_000_000, config: { sellAutoReprice: true } });
+  lndEstimatesFee(s.node);
   fillMarket(s.market, () => 30);
   // After the selling check (Amboss's public book), the create reads only
   // this node's key from LND: the pause lands during that read.

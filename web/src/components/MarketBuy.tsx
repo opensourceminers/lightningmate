@@ -9,6 +9,7 @@ import { EmptyState } from "./Skeleton";
 import { useUi } from "./Overlay";
 import { buyConfirmMessage } from "../magmaView";
 import { InfoTip } from "./InfoTip";
+import { WRITE_MODE_HINT } from "../statusNotes";
 
 const fmt = (n: number): string => Math.round(n).toLocaleString("en-US");
 
@@ -29,6 +30,10 @@ export function MarketBuy() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [connected, setConnected] = useState(false);
+  /** Write mode (null: not known). Off: an order can't be paid for, so none
+   *  is placed — the server refuses the quote (review 2026-11-10, ENG-1). */
+  const [canWrite, setCanWrite] = useState<boolean | null>(null);
+  const writeOff = canWrite === false;
   const [sizeText, setSizeText] = useState("2000000");
   const [usd, setUsd] = useState(10);
   const [isPrivate, setIsPrivate] = useState(false);
@@ -59,6 +64,10 @@ export function MarketBuy() {
 
   useEffect(() => {
     void load();
+    api
+      .autopilotGet()
+      .then((s) => setCanWrite(s.canWrite))
+      .catch(() => setCanWrite(null));
   }, []);
 
   // Poll the order until the channel opens or it fails (Amboss is the truth).
@@ -179,13 +188,19 @@ export function MarketBuy() {
                 </button>
               </div>
             ) : null}
-            <button className="primary-btn" disabled={busy || (!pick && usd < 5)} onClick={() => void buy()}>
+            <button className="primary-btn" disabled={busy || writeOff || (!pick && usd < 5)} title={writeOff ? `Not possible here — ${WRITE_MODE_HINT}` : undefined} onClick={() => void buy()}>
               {busy ? "Working…" : "Buy inbound"}
             </button>
             <span className="open-warn">⚠ real on-chain channel</span>
           </>
         ) : null}
       </div>
+      {connected && writeOff ? (
+        <p className="banner">
+          Buying is <strong>disabled</strong> — {WRITE_MODE_HINT}. Without it an order placed on Amboss couldn't be paid for. You can
+          still browse and rank the offers.
+        </p>
+      ) : null}
       {buyError ? <p className="banner error">{buyError}</p> : null}
 
       {orderId ? (
@@ -270,13 +285,15 @@ export function MarketBuy() {
                     <td>
                       <button
                         className="row-btn"
-                        disabled={busy || !connected || o.eligible === false}
+                        disabled={busy || !connected || writeOff || o.eligible === false}
                         title={
                           !connected
                             ? "Connect Amboss in Settings first"
-                            : o.eligible === false
-                              ? "This seller doesn't sell to a node like yours"
-                              : "Buy from this seller specifically, at the size above"
+                            : writeOff
+                              ? `Not possible here — ${WRITE_MODE_HINT}`
+                              : o.eligible === false
+                                ? "This seller doesn't sell to a node like yours"
+                                : "Buy from this seller specifically, at the size above"
                         }
                         onClick={() => setPick(pick?.offerId === o.offerId ? null : o)}
                       >

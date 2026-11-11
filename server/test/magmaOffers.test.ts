@@ -141,7 +141,8 @@ test("manual offer writes: a refused update is an error status, a create returns
   assert.equal(updated.body.verified, true);
   assert.equal(offer.feeRatePpm, 2971);
 
-  const created = await api.request("POST", "/amboss/offer", terms);
+  // (A further offer beside the one above, and meant: `another` — WEB-1.)
+  const created = await api.request("POST", "/amboss/offer", { ...terms, another: true });
   assert.equal(created.status, 200);
   assert.ok(magma.offers.has(created.body.offerId));
   const input = magma.calls.find((c) => c.op === "CreateOffer")?.variables.input as Record<string, unknown>;

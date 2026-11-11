@@ -839,12 +839,18 @@ the same number, at the price it is written with. With auto-size, and terms that
 autopilot's, the min channel goes up to the smallest order that pays for its channel (and at
 least the engine's own minimum); when not even the largest order the offer can fund does,
 the offer is taken off the market ("below cost at today's on-chain fee rate") and listed
-again — its terms written and checked first — once fees drop, or once there is capital for an
-order that pays for its channel. While LND's fee estimate fails, the floor is the last one it
+again — its terms written and checked first — once fees are lower by a margin (its order has
+to pay 12 % over the cost — or the cost plus the minimum profit where that is more: held against the bare cost both ways, a fee estimate moving a few
+percent took the offer off the market and listed it again run after run), or once there is
+capital for an order that pays for its channel. While LND's fee estimate fails, the floor is the last one it
 gave (kept across restarts) — never the minimum relay fee's; past 6 h the lane says so with each
 order it turns down, and an offer taken off the market below cost is listed again only on a
 real estimate. An offer listed for free gets its price back judged the same way, at that
-price. An offer whose window is the
+price. With no sale history to price from, a price follows listed offers a quarter at a time,
+one step every 6 hours — also when the offer is taken off the market and listed again in
+between, and when Amboss applied a step without answering. An offer the autopilot created
+that Amboss's list does not show yet is not created a second time (it is waited for up to
+6 hours). An offer whose window is the
 operator's (or with auto-size off) keeps it: an alert and Market → Sell say from which size
 its orders are turned down. A listed offer under its profit floor is raised before anything
 else (its floor rounded up), whatever the market or the routing comparison says. While an

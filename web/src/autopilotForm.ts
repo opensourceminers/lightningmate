@@ -112,6 +112,61 @@ export function resetToBaseline(set: AdvancedSet, draft: Draft, config: Autopilo
   return { ...draft, nums, flags, pricingMode };
 }
 
+/** The offer's four automations ("The autopilot manages my offer"). */
+export const OFFER_FLAGS = ["sellAutoReprice", "sellAutoSize", "sellAutoRelist", "sellAutoClose"] as const satisfies readonly FlagKey[];
+
+/** What each of them does, as "the autopilot …" and as "it does not …". */
+const OFFER_PART: Record<(typeof OFFER_FLAGS)[number], { does: string; doesNot: string }> = {
+  sellAutoReprice: { does: "sets the price", doesNot: "set the price" },
+  sellAutoSize: { does: "sizes the offer", doesNot: "size the offer" },
+  sellAutoRelist: { does: "lists again what is free", doesNot: "list again what is free" },
+  sellAutoClose: { does: "closes a sold channel after its lease", doesNot: "close a sold channel after its lease" },
+};
+
+/**
+ * "The autopilot manages my offer", as it is — all four automations, none, or
+ * some of them. (Review 2026-11-10, ENG-4: the box was ticked only with all
+ * four on. A factory install has two on and two off, so the box stood empty
+ * while the autopilot priced and sized the offer — an operator read "it does
+ * not touch my offer" and had a by-hand price overwritten at the next run.)
+ * `text` names the parts when it is some of them.
+ */
+export function offerManagedView(shown: (key: FlagKey) => boolean): { state: "all" | "none" | "partly"; text: string | null } {
+  const on = OFFER_FLAGS.filter((k) => shown(k));
+  if (on.length === OFFER_FLAGS.length) return { state: "all", text: null };
+  if (on.length === 0) return { state: "none", text: null };
+  const off = OFFER_FLAGS.filter((k) => !shown(k));
+  return {
+    state: "partly",
+    text:
+      `Partly on: the autopilot ${on.map((k) => OFFER_PART[k].does).join(" and ")}; ` +
+      `it does not ${off.map((k) => OFFER_PART[k].doesNot).join(" or ")}. ` +
+      "Tick the box to hand it all four — each has its own switch under Advanced.",
+  };
+}
+
+/**
+ * A click on that box. Ticking hands the autopilot all four. Unticking takes
+ * all four away only from a saved state that had all four: with fewer saved
+ * (the factory's two, or none) it puts back what is saved — the click undoes
+ * the tick and switches off nothing the box did not switch on. (It used to
+ * set all four off: tick, untick, save — and the pricing and sizing that were
+ * on were off.)
+ */
+export function toggleOfferManaged(draft: Draft, config: AutopilotConfig): Draft {
+  const flags = { ...draft.flags };
+  const shownAll = OFFER_FLAGS.every((k) => draft.flags[k] ?? config[k]);
+  const savedAll = OFFER_FLAGS.every((k) => config[k]);
+  for (const key of OFFER_FLAGS) {
+    if (!shownAll) {
+      if (config[key]) delete flags[key];
+      else flags[key] = true;
+    } else if (savedAll) flags[key] = false;
+    else delete flags[key];
+  }
+  return { ...draft, flags };
+}
+
 export function boundsFor(bounds: AutopilotBounds | undefined, path: NumPath): NumberBounds | undefined {
   const [section, key] = path.split(".") as [string, string | undefined];
   if (key === undefined) return bounds?.config[section as NumKey];
