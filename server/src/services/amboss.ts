@@ -208,7 +208,7 @@ export async function ambossGql<T>(
   const timeoutMs = deadlineMs ?? (/^\s*mutation\b/.test(query) ? HTTP_TIMEOUTS.ambossMutationMs : HTTP_TIMEOUTS.ambossQueryMs);
   // A key that can't go into a header as it is never goes out — and is
   // never quoted (SEC-7).
-  if (apiKey && !isAmbossKeyShaped(apiKey)) throw new AmbossError("auth", "the Amboss API key is not one line of printable characters — connect it again");
+  if (apiKey && !isAmbossKeyShaped(apiKey)) throw new AmbossError("auth", "the Amboss key is not one line of printable characters — connect it again");
   let res: TimedResponse;
   try {
     res = await httpRequest(

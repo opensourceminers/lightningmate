@@ -38,5 +38,5 @@ export function destinationLine(d: PrivacyInfo["destinations"][number]): string 
 /** Why LN+ lookups leave from this server's IP (null when they go through
  *  Tor): the app has no Tor proxy. */
 export function lnplusDirectNote(s: { viaTor: boolean }): string | null {
-  return s.viaTor ? null : "LN+ lookups leave from this server's IP address (no Tor proxy — see Settings → Privacy).";
+  return s.viaTor ? null : "LN+ lookups leave from this server's IP address (no Tor proxy).";
 }

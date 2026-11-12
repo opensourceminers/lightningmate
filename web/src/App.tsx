@@ -79,7 +79,7 @@ export function App() {
       <header className="topbar">
         <span className="brand">
           <BrandMark />
-          Lightning Mate
+          <span className="brand-name">Lightning Mate</span>
           <span className="brand-sub">Lightning node manager</span>
         </span>
         <div className="topbar-right">
@@ -92,6 +92,7 @@ export function App() {
             onClick={() => navigate("settings")}
           >
             <TabIcon id="settings" />
+            <span className="gear-word">Settings</span>
           </button>
           <LogoutButton />
           <span
@@ -168,7 +169,9 @@ export function App() {
         {tab === "wallet" ? <WalletPanel price={price.data} /> : null}
         {tab === "analytics" ? <AnalyticsPanel key={subKey} initialSub={pendingSub} /> : null}
         {tab === "autopilot" ? <AutopilotPanel key={subKey} initialSub={pendingSub} /> : null}
-        {tab === "settings" ? <SettingsPanel onChange={price.refresh} version={version} /> : null}
+        {/* Keyed like the others: a link to one of its sections (Amboss,
+            Privacy, LSP mode) opens it there, also when Settings is open. */}
+        {tab === "settings" ? <SettingsPanel key={subKey} onChange={price.refresh} version={version} initialSection={pendingSub} /> : null}
       </div>
 
       <Footer version={version} />

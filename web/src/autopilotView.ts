@@ -289,9 +289,13 @@ export function runFailures(r: Pick<NonNullable<DashboardData["autopilot"]["last
  * failed read "nothing needed changing"). Areas in error or blocked are said
  * too (a compact D16).
  */
-export function autopilotDigest(a: DashboardData["autopilot"], nowMs = Date.now()): { key: string; text: string; warn?: boolean; sub?: string }[] {
-  const items: { key: string; text: string; warn?: boolean; sub?: string }[] = [];
-  if (a.pausedAt) items.push({ key: "ap-paused", text: `All automation paused ${ago(a.pausedAt, nowMs)} — ${pausedText(a.lspModeOn)}` });
+export function autopilotDigest(a: DashboardData["autopilot"], nowMs = Date.now()): DigestItem[] {
+  const items: DigestItem[] = [];
+  if (a.pausedAt) {
+    items.push({ key: "ap-paused", text: `All automation paused ${ago(a.pausedAt, nowMs)} — ${pausedText(a.lspModeOn)}` });
+    // What isn't paused leads to where it is switched off (review of P10, F7).
+    if (a.lspModeOn) items.push({ key: "ap-lsp", text: "LSP mode is still on — switch it off in Settings to stop wallet orders too", tab: "settings", sub: "lsp" });
+  }
   // Every automation of the autopilot's, Advertise routable size (the
   // max_htlc pass) included: on alone, its runs and failures are news too.
   const anyOn = a.fees || a.rebalance || a.channel || a.sell || a.maxHtlc;
@@ -319,11 +323,24 @@ export function autopilotDigest(a: DashboardData["autopilot"], nowMs = Date.now(
   // Only areas that are switched on: one that is off has nothing to fail at
   // (on a read-only node every area reads "blocked: write mode is off").
   const on: Partial<Record<DecisionArea, boolean>> = { fees: a.fees, rebalance: a.rebalance, channels: a.channel, magma: a.sell, maxHtlc: a.maxHtlc };
-  for (const [area, s] of Object.entries(a.status ?? {}) as [DecisionArea, { state: string; text: string }][]) {
+  for (const [area, s] of Object.entries(a.status ?? {}) as [DecisionArea, { state: string; text: string; needs?: string }][]) {
     if (!on[area] || (s.state !== "error" && s.state !== "blocked")) continue;
-    items.push({ key: `ap-${area}`, text: `${AREA_LABEL[area]} ${s.state === "error" ? "failed" : "blocked"}: ${s.text}`, warn: true, sub: AREA_SUB[area] });
+    const text = `${AREA_LABEL[area]} ${s.state === "error" ? "failed" : "blocked"}: ${s.text}`;
+    // What it needs is the Amboss key: the item leads to the Amboss card (SET-4).
+    if (s.needs === "amboss_key") items.push({ key: `ap-${area}`, text, warn: true, tab: "settings", sub: "amboss" });
+    else items.push({ key: `ap-${area}`, text, warn: true, sub: AREA_SUB[area] });
   }
   return items;
+}
+
+/** One line of the autopilot's digest; `tab`: where it leads, when not the
+ *  Autopilot tab. */
+export interface DigestItem {
+  key: string;
+  text: string;
+  warn?: boolean;
+  tab?: string;
+  sub?: string;
 }
 
 /** The Overview tile's foot: when the last run was, and what it did —

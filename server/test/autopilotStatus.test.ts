@@ -165,7 +165,8 @@ test("Magma: no offer and auto-pricing off says why none is listed; no Amboss ke
   amboss.clear();
   const blocked = autopilot.getState().status.magma;
   assert.equal(blocked.state, "blocked");
-  assert.match(blocked.text, /^no Amboss API key — connect one in Settings/);
+  assert.match(blocked.text, /^no Amboss key — connect it in Settings → Amboss/);
+  assert.equal(blocked.needs, "amboss_key", "a page can lead to the Amboss card");
   assert.equal((blocked.last as AreaDecision | undefined)?.text, m.text, "what it last decided stays at hand");
 });
 
@@ -570,7 +571,8 @@ test("a key Amboss rejects is 'blocked' for selling — whatever the lane last d
   amboss.markInvalid();
   const m = autopilot.getState().status.magma;
   assert.equal(m.state, "blocked");
-  assert.match(m.text, /^Amboss rejects your API key \(expired or revoked\) — connect a fresh one in Settings/);
+  assert.match(m.text, /^Amboss rejects your key \(expired or revoked\) — connect a fresh one in Settings → Amboss/);
+  assert.equal(m.needs, "amboss_key");
 });
 
 test("'Resume' with write mode off switches nothing on — the pause just ends", async (t) => {

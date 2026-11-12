@@ -1,4 +1,5 @@
 import { Fragment, useEffect, useState } from "react";
+import { SettingsLink } from "./SettingsLink";
 import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import { pageHidden } from "../usePolledData";
@@ -153,7 +154,7 @@ export function MarketBuy() {
           <>Pick an offer and a size — or let Amboss pick a seller for a dollar amount. You confirm the exact fee before paying.</>
         ) : (
           <>
-            Browsing is open to everyone. To buy, add your Amboss API key in <strong>Settings</strong>.
+            Browsing is open to everyone. To buy, <SettingsLink section="amboss">connect your Amboss key</SettingsLink>.
           </>
         )}
       </div>
@@ -288,7 +289,7 @@ export function MarketBuy() {
                         disabled={busy || !connected || writeOff || o.eligible === false}
                         title={
                           !connected
-                            ? "Connect Amboss in Settings first"
+                            ? "Connect your Amboss key first (Settings → Amboss)"
                             : writeOff
                               ? `Not possible here — ${WRITE_MODE_HINT}`
                               : o.eligible === false

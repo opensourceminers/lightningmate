@@ -59,7 +59,7 @@ test("Settings no longer calls the price lookup 'the only outbound request', has
   assert.doesNotMatch(settings, /torRoute|TOR_ROUTES|Everything via Tor|Lookups via Tor/, "every lookup goes through Tor: nothing to choose");
   const lnplus = readFileSync(new URL("../src/components/LnPlusPanel.tsx", import.meta.url), "utf8");
   assert.match(lnplus, /if \(!statusLoaded \|\| off\) return;/);
-  assert.match(lnplus, /LN\+ lookups are switched off \(Settings → Privacy\): nothing is asked of lightningnetwork\.plus/);
+  assert.match(lnplus, /LN\+ lookups are switched off \(<SettingsLink section="privacy">Settings → Privacy<\/SettingsLink>\): nothing is asked of\s+lightningnetwork\.plus/);
 });
 
 // Review 2 of P4: the security policy still promised "Nothing else leaves
@@ -71,11 +71,11 @@ test("SECURITY.md says what the Privacy card says: LN+ on by default with the no
   assert.doesNotMatch(flat, /Nothing else leaves your node/);
   assert.doesNotMatch(flat, /Minimal outbound traffic/);
   assert.match(flat, /LN\+ \(lightningnetwork\.plus\)\*\*: .*this node's own public key\. LN\+ lookups are \*\*on by default\*\*; switch them off under Settings → Privacy \("LN\+ lookups"\)/);
-  assert.match(flat, /\*\*Amboss\*\*: public Magma market data from api\.amboss\.space .*\*\*with or without an Amboss API key\*\*/);
+  assert.match(flat, /\*\*Amboss\*\*: public Magma market data from api\.amboss\.space .*\*\*with or without an Amboss key\*\*/);
   assert.match(flat, /\*\*mempool\.space\*\*: the BTC price, only while a fiat currency is chosen/);
   assert.match(flat, /service-fee lightning address\*\*: an LNURL-pay lookup/);
   assert.match(flat, /`TOR_PROXY_IP` \/ `TOR_PROXY_PORT`/);
-  assert.match(flat, /\*\*With the proxy\*\* \(every Umbrel install\), every one of them goes through Tor: LN\+, the price lookup, Amboss's public market data \(this node's own seller score included\), the Amboss calls made with your API key and the LNURL lookup\. None leaves from your home IP address, and none needs a port opened on your router\./);
+  assert.match(flat, /\*\*With the proxy\*\* \(every Umbrel install\), every one of them goes through Tor: LN\+, the price lookup, Amboss's public market data \(this node's own seller score included\), the Amboss calls made with your Amboss key and the LNURL lookup\. None leaves from your home IP address, and none needs a port opened on your router\./);
   assert.match(flat, /No setting routes them around Tor/);
   assert.match(flat, /by the autopilot's runs, the Market pages and the Overview's lease benchmark — and never carries the key/);
   assert.match(flat, /\*\*Without the proxy\*\* \(outside Umbrel\), every one of them leaves from this server's internet connection, which is your home IP address/);
@@ -96,7 +96,7 @@ test("the server's failure notes name no route setting: there is none", () => {
 // With every lookup through Tor, only a missing proxy sends them direct.
 test("the LN+ panel says why its lookups go direct: the app has no Tor proxy", () => {
   assert.equal(lnplusDirectNote({ viaTor: true }), null);
-  assert.equal(lnplusDirectNote({ viaTor: false }), "LN+ lookups leave from this server's IP address (no Tor proxy — see Settings → Privacy).");
+  assert.equal(lnplusDirectNote({ viaTor: false }), "LN+ lookups leave from this server's IP address (no Tor proxy).");
   const panel = readFileSync(new URL("../src/components/LnPlusPanel.tsx", import.meta.url), "utf8");
   assert.match(panel, /\{lnplusDirectNote\(status\)\}/);
   assert.doesNotMatch(panel, /no Tor proxy — see Settings/);
@@ -124,7 +124,7 @@ test("SEC-1/SEC-9 in Settings: a faulty proxy setting is an error banner, the ro
   const src = readFileSync(new URL("../src/components/SettingsPanel.tsx", import.meta.url), "utf8");
   assert.match(src, /privacy\.torProxyFault \? \(\n\s+<p className="banner error">\{privacySummary\(privacy\)\}<\/p>/);
   assert.match(src, /Route in force since the app started: \{privacy\.route\}\./);
-  assert.match(src, /\{authRequired \? \(\n\s+<>\n\s+<h3 className="sub">Sessions<\/h3>/);
+  assert.match(src, /\{authRequired \? \(\n\s+<>\n\s+<h3 className="sub set-target" id="set-sessions" tabIndex=\{-1\}>\s+Sessions\s+<\/h3>/);
   assert.match(src, /await api\.authRevokeAll\(\);\n\s+api\.logout\(\);/, "the server ends them, then this page signs out");
   const client = readFileSync(new URL("../src/api.ts", import.meta.url), "utf8");
   assert.match(client, /authRevokeAll: \(\) => post<AuthRevokeResult>\("\/auth\/revoke", \{\}\)/);

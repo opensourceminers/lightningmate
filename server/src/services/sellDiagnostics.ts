@@ -213,9 +213,9 @@ export function buildSellDiagnostics(input: DiagnosticsInput): SellDiagnostics {
   );
 
   if (!input.key.connected) {
-    add({ id: "key", status: "problem", label: "Amboss key", detail: "No key connected — offers and orders can't be managed.", fix: { tab: "settings", label: "Connect Amboss" } });
+    add({ id: "key", status: "problem", label: "Amboss key", detail: "No key connected — offers and orders can't be managed.", fix: { tab: "settings", sub: "amboss", label: "Connect Amboss" } });
   } else if (input.key.valid === false) {
-    add({ id: "key", status: "problem", label: "Amboss key", detail: "Amboss rejects the key (expired or revoked).", fix: { tab: "settings", label: "Connect a fresh key" } });
+    add({ id: "key", status: "problem", label: "Amboss key", detail: "Amboss rejects the key (expired or revoked).", fix: { tab: "settings", sub: "amboss", label: "Connect a fresh key" } });
   } else if (input.key.check === "unreachable") {
     add({ id: "key", status: "unknown", label: "Amboss key", detail: `Amboss can't be reached right now${input.key.lastError ? ` (${input.key.lastError})` : ""} — the last verdict stands.` });
   } else {

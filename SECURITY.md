@@ -21,7 +21,7 @@ security@opensourceminers.de (please don't open a public issue first).
   - **Amboss**: public Magma market data from api.amboss.space and
     magma.amboss.tech (offers, recent sales, the dollar rate, and this node's
     public seller score, so its public key too). This is read **with or
-    without an Amboss API key** — by the autopilot's runs, the Market pages
+    without an Amboss key** — by the autopilot's runs, the Market pages
     and the Overview's lease benchmark — and never carries the key. With a
     key, the app also reads and manages your offers, orders and purchases
     (magma.amboss.tech for everything that acts). Those calls carry the key
@@ -37,8 +37,8 @@ security@opensourceminers.de (please don't open a public issue first).
   (`TOR_PROXY_IP` / `TOR_PROXY_PORT`):
   - **With the proxy** (every Umbrel install), every one of them goes through
     Tor: LN+, the price lookup, Amboss's public market data (this node's own
-    seller score included), the Amboss calls made with your API key and the
-    LNURL lookup. None leaves from your home IP address, and none needs a port
+    seller score included), the Amboss calls made with your Amboss key and
+    the LNURL lookup. None leaves from your home IP address, and none needs a port
     opened on your router. No setting routes them around Tor (up to 0.8.4 one
     did, and the Amboss calls made with the key and the LNURL lookup went
     direct by default). A lookup never falls back to a direct connection:
@@ -264,7 +264,7 @@ file that is missing while its backup or a damaged copy is still there (a
 recovery cut short by a crash or a full disk); only a first start, with
 neither, begins from defaults without an alert. Each loss is alerted once:
 finding it again because the disk is still full adds no second alert, but a
-file lost again after it was saved is a new alert. The Amboss API key is the
+file lost again after it was saved is a new alert. The Amboss key is the
 exception to keeping old versions: when it is replaced or removed
 (Disconnect), no copy of the old key stays on disk — no `.bak`, no damaged
 copy (they are deleted before the new key is written, so not even a power cut

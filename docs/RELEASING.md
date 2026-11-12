@@ -128,7 +128,7 @@ home-screen widget, which the official one doesn't).
 
    Without them LightningMate has no Tor proxy on Umbrel: every request — LN+
    reputations (this node's key included), the BTC price, node lookups,
-   Amboss with and without the API key, the fee lookup — goes out directly
+   Amboss with and without the Amboss key, the fee lookup — goes out directly
    from the home connection; the start's log line and Settings → Privacy say
    so (and name a faulty value as one). With them, every one goes through
    Tor.

@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
+import { goTo } from "../nav";
 import { api } from "../api";
 import { boundsFor } from "../autopilotForm";
 import { allAutomationOff } from "../autopilotView";
 import { satsCompact } from "../format";
-import { SETUP_GOALS, setupLines, setupPatch, setupProblem, withoutSelling, type SetupChoice, type SetupGoal } from "../setupView";
+import { SETUP_GOALS, setupDestination, setupLines, setupPatch, setupProblem, withoutSelling, type SetupChoice, type SetupGoal } from "../setupView";
 import type { AutopilotState } from "../types";
 import { useUi } from "./Overlay";
 import { turnSellingOn } from "./SellingSwitch";
@@ -109,9 +110,14 @@ export function SetupWizard({ onChanged }: { onChanged?: () => void }) {
         sellingYes
           ? "The autopilot is on, selling too. Every setting is under the Autopilot tab."
           : choice.goal === "selling"
-            ? "The autopilot is on; selling stays off until you switch it on under Autopilot → Selling."
+            ? keyNow
+              ? "The autopilot is on; selling stays off until you switch it on under Autopilot → Selling."
+              : "The autopilot is on. Connect your Amboss key here, then switch selling on under Autopilot → Selling."
             : "The autopilot is on. Every setting is under the Autopilot tab.",
       );
+      // Selling wanted, no key yet: straight to the steps that connect it.
+      const dest = setupDestination(choice.goal, keyNow);
+      if (dest) goTo(dest.tab, dest.section);
     } catch (e) {
       const why = e instanceof Error ? e.message : String(e);
       setError(keySaved ? `${why} Your Amboss key is saved; nothing else changed.` : `${why} Nothing was changed.`);
@@ -176,11 +182,11 @@ export function SetupWizard({ onChanged }: { onChanged?: () => void }) {
             {choice.goal === "selling" && !hasKey ? (
               <label className="policy-field setup-key">
                 <span>
-                  Amboss API key, from{" "}
+                  Amboss key, from{" "}
                   <a href="https://account.amboss.tech/settings/api-keys" target="_blank" rel="noreferrer">
                     account.amboss.tech
                   </a>{" "}
-                  (optional now, needed to sell)
+                  (optional now, needed to sell — no key yet? After the start, Settings shows you how, step by step)
                 </span>
                 <input type="password" value={keyInput} autoComplete="off" onChange={(e) => setKeyInput(e.target.value)} />
               </label>

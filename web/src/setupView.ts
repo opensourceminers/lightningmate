@@ -33,6 +33,13 @@ export interface SetupChoice {
 const LARGEST_ORDER_SATS = 5_000_000;
 
 /** The answer without selling's settings: selling declined, or no key yet. */
+/** Where the first start ends: Settings at Amboss when selling was chosen
+ *  and no key is connected yet — the steps that connect it (review
+ *  2026-11-10, SET-4); else where it was. */
+export function setupDestination(goal: SetupGoal, keyConnected: boolean): { tab: "settings"; section: "amboss" } | null {
+  return goal === "selling" && !keyConnected ? { tab: "settings", section: "amboss" } : null;
+}
+
 export function withoutSelling(patch: AutopilotConfigPatch): AutopilotConfigPatch {
   return Object.fromEntries(Object.entries(patch).filter(([k]) => !k.startsWith("sell"))) as AutopilotConfigPatch;
 }
@@ -73,7 +80,7 @@ export function setupLines(c: SetupChoice, config: Pick<AutopilotConfig, "policy
     lines.push(
       hasKey
         ? `Selling: ${c.sellEverything ? "everything free" : `at most ${satsCompact(c.sellCapSats)} sat`} is listed once you confirm in the next step. The autopilot manages your offer: price, size and listing, and it closes a sold channel after its lease, for an on-chain fee.`
-        : "Selling: off for now. Connect an Amboss key in Settings, then switch it on under Autopilot → Selling.",
+        : "Selling: off for now. After the start, Settings opens at Amboss: connect your key there (three steps), then switch selling on under Autopilot → Selling.",
     );
   }
   return lines;

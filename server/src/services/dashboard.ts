@@ -125,7 +125,7 @@ export interface DashboardData {
      *  rather than "nothing new starts on its own" (review of P7). */
     lspModeOn: boolean;
     /** Per area: the last decision, or off / blocked (D16, compact). */
-    status: Partial<Record<DecisionArea, { state: AreaStatus["state"]; text: string; at: string | null }>>;
+    status: Partial<Record<DecisionArea, { state: AreaStatus["state"]; text: string; at: string | null; needs?: AreaStatus["needs"] }>>;
     /** Magma orders the lane turned down in the last two days (not dismissed). */
     magmaRefusals: number;
     magmaRefusalReason: string | null;
@@ -180,7 +180,7 @@ interface AutopilotState {
   /** autopilot.ts getState().lastActionAt (null: none on record). */
   lastActionAt?: string | null;
   paused?: { at: string } | null;
-  status?: Partial<Record<DecisionArea, Pick<AreaStatus, "state" | "text" | "at">>>;
+  status?: Partial<Record<DecisionArea, Pick<AreaStatus, "state" | "text" | "at" | "needs">>>;
   history?: unknown[];
 }
 
@@ -335,7 +335,7 @@ export function buildDashboard(
       intervalMinutes: autopilot.config.intervalMinutes,
       pausedAt: autopilot.paused?.at ?? null,
       lspModeOn: extra.lspModeOn ?? false,
-      status: Object.fromEntries(Object.entries(autopilot.status ?? {}).map(([k, v]) => [k, { state: v.state, text: v.text, at: v.at }])),
+      status: Object.fromEntries(Object.entries(autopilot.status ?? {}).map(([k, v]) => [k, { state: v.state, text: v.text, at: v.at, ...(v.needs ? { needs: v.needs } : {}) }])),
       magmaRefusals: extra.magmaRefusals.length,
       magmaRefusalReason: extra.magmaRefusals[0]?.reason ?? null,
     },

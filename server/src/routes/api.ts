@@ -2020,13 +2020,13 @@ export function createApiRouter(
           // The public book (eligibility, the Overview's lease benchmark, buy
           // offers) asks for this node's own seller score — by its public
           // key — with or without an Amboss key: a public lookup (review of P4).
-          what: "Magma offers, recent sales and the dollar rate — your own node's public seller score included (by its public key), read without your API key",
+          what: "Magma offers, recent sales and the dollar rate — your own node's public seller score included (by its public key), read without your Amboss key",
           active: true,
           viaTor: viaTor(),
         },
         {
           service: "Amboss account (magma.amboss.tech)",
-          what: "with your API key: your offers, orders and purchases — tied to your Amboss account",
+          what: "with your Amboss key: your offers, orders and purchases — tied to your Amboss account",
           active: amboss.hasKey(),
           viaTor: viaTor(),
         },
@@ -2512,7 +2512,7 @@ export function createApiRouter(
     const { apiKey: given } = bodyOf<AmbossKeyRequest>(req);
     const apiKey = typeof given === "string" ? given.trim() : "";
     if (!apiKey) {
-      res.status(400).json({ error: "missing_key", message: "Missing API key." });
+      res.status(400).json({ error: "missing_key", message: "Paste your Amboss key first." });
       return;
     }
     // Printable ASCII of a key's length, before any use (SEC-7): a key with
@@ -2522,13 +2522,13 @@ export function createApiRouter(
     if (!isAmbossKeyShaped(apiKey)) {
       res.status(400).json({
         error: "invalid_key",
-        message: `That doesn't look like an Amboss API key: it must be one line of letters, digits and symbols (${AMBOSS_KEY_MAX} characters at most), without spaces. Copy it again from Amboss.`,
+        message: `That doesn't look like an Amboss key: it must be one line of letters, digits and symbols (${AMBOSS_KEY_MAX} characters at most), without spaces. Copy it again from Amboss.`,
       });
       return;
     }
     const { verdict, error } = await checkKey(apiKey);
     if (verdict === false) {
-      res.status(400).json({ error: "invalid_key", message: "Amboss rejected this API key." });
+      res.status(400).json({ error: "invalid_key", message: "Amboss rejected this key. Make a fresh one at account.amboss.tech → Settings → API keys and paste it again." });
       return;
     }
     if (verdict === null) {
@@ -2589,7 +2589,7 @@ export function createApiRouter(
     "/amboss/buy/quote",
     wrap(async (req, res) => {
       if (!amboss.hasKey()) {
-        res.status(400).json({ error: "no_key", message: "Connect Amboss in Settings first." });
+        res.status(400).json({ error: "no_key", message: "Connect your Amboss key first (Settings → Amboss)." });
         return;
       }
       // An order is placed on Amboss here; paying it needs LND (ENG-1).
@@ -2837,7 +2837,7 @@ export function createApiRouter(
     "/amboss/order",
     wrap(async (req, res) => {
       if (!amboss.hasKey()) {
-        res.status(400).json({ error: "no_key", message: "Connect Amboss in Settings first." });
+        res.status(400).json({ error: "no_key", message: "Connect your Amboss key first (Settings → Amboss)." });
         return;
       }
       const { id: asked } = queryOf<OrderQuery>(req);
@@ -2860,7 +2860,7 @@ export function createApiRouter(
   // ── Magma selling (offers + orders, on the Magma API) ───────────────────────
   const needKey = (res: Response): boolean => {
     if (amboss.hasKey()) return true;
-    res.status(400).json({ error: "no_key", message: "Connect Amboss in Settings first." });
+    res.status(400).json({ error: "no_key", message: "Connect your Amboss key first (Settings → Amboss)." });
     return false;
   };
 

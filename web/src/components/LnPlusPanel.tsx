@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { SettingsLink } from "./SettingsLink";
 import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import type { LnPlusPoolNode, LnPlusStatus, LnPlusSwap, LnPlusSwapsResponse } from "../types";
@@ -240,11 +241,13 @@ export function LnPlusPanel() {
 
       {off ? (
         <div className="dryrun-banner">
-          LN+ lookups are switched off (Settings → Privacy): nothing is asked of lightningnetwork.plus. Peer picking uses the
-          reputations already cached.
+          LN+ lookups are switched off (<SettingsLink section="privacy">Settings → Privacy</SettingsLink>): nothing is asked of
+          lightningnetwork.plus. Peer picking uses the reputations already cached.
         </div>
       ) : status && lnplusDirectNote(status) ? (
-        <p className="muted pad">{lnplusDirectNote(status)}</p>
+        <p className="muted pad">
+          {lnplusDirectNote(status)} <SettingsLink section="privacy">Open Settings → Privacy</SettingsLink>
+        </p>
       ) : null}
 
       <p className="muted pad">

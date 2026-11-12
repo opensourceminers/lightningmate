@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
+import { SettingsLink } from "./SettingsLink";
 import { api } from "../api";
 import { useDialogFocus } from "../a11y";
 import { copyText } from "../clipboard";
@@ -474,7 +475,15 @@ function NodePanel({ target, onClose }: { target: NodeTarget; onClose: () => voi
                 ) : null}
                 {pub && !lnp && pub.lnplusState === "unavailable" ? <p className="muted small">LN+ couldn&apos;t be asked right now.</p> : null}
                 {pubError || pub?.recordState === "unavailable" ? <p className="muted small">The public record couldn't be read right now.</p> : null}
-                {pub?.recordState === "off" ? <p className="muted small">Public record lookups are off (Settings → Privacy).</p> : null}
+                {pub?.recordState === "off" ? (
+                  <p className="muted small">
+                    Public record lookups are off (
+                    <SettingsLink section="privacy" onGo={onClose}>
+                      Settings → Privacy
+                    </SettingsLink>
+                    ).
+                  </p>
+                ) : null}
               </section>
             ) : null}
 

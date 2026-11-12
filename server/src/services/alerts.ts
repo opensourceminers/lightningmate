@@ -8,6 +8,9 @@ import type { MagmaOverduePayment, MagmaRefund, MagmaRefusal, MagmaUnpaidChannel
 export interface Alert {
   level: "warn" | "info";
   message: string;
+  /** Where the app deals with it: a button beside the alert (review
+   *  2026-11-10, SET-4 — "in Settings" leads there). */
+  link?: { tab: string; sub?: string; label: string };
   /** Set on alerts the operator acknowledges (dismisses) explicitly; derived
    *  node alerts have none and disappear on their own. */
   id?: string;
@@ -32,7 +35,7 @@ export const DEAD_CAPITAL = {
 const RESET_CONSEQUENCE: Record<string, string> = {
   "autopilot.json": "All automation is OFF and settings are back to defaults until you set them again.",
   "lsps1-orders.json": "LSP orders that were in progress can no longer be tracked — check them in LND.",
-  "amboss.json": "Reconnect your Amboss key in Settings.",
+  "amboss.json": "Connect your Amboss key again (Settings → Amboss).",
   "overrides.json": "Per-channel fee overrides (incl. exclusions) are gone — re-check them on the Channels tab.",
   "settings.json": "Check your Settings (LSP mode, currency, LN+ lookups).",
   "channel-uptime.json": "How long each channel's peer has been offline is counted again from now — no channel counts as long offline until it has been for 72 hours.",
@@ -104,6 +107,7 @@ export function stateAlerts(dataDir: string): Alert[] {
     level: "warn" as const,
     message: incidentMessage(i),
     id: `state:${i.id}`,
+    ...(i.file === "amboss.json" && i.kind === "reset" ? { link: { tab: "settings", sub: "amboss", label: "Connect Amboss" } } : {}),
   }));
 }
 

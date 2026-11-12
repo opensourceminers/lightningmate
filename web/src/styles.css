@@ -67,6 +67,10 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
   font-size: 19px; font-weight: 700; letter-spacing: 0.2px;
   display: inline-flex; align-items: center; gap: 9px;
 }
+.brand svg { flex: none; }
+.brand-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The narrowest phones: the mark alone, the name would be cut (the gear and the buttons need the room). */
+@media (max-width: 360px) { .brand-name { display: none; } }
 .brand-sub {
   margin-left: 10px; padding-left: 11px; font-size: 12px; font-weight: 500;
   color: var(--muted); border-left: 1px solid var(--line);
@@ -204,7 +208,7 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 .pnl-net-fiat { font-size: 13px; color: var(--muted); margin-top: 2px; font-variant-numeric: tabular-nums; }
 
 /* Segmented control (settings) */
-.seg { display: inline-flex; gap: 2px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 3px; }
+.seg { display: inline-flex; flex-wrap: wrap; max-width: 100%; gap: 2px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px; padding: 3px; }
 .seg-btn {
   background: transparent; color: var(--muted); border: none; cursor: pointer;
   padding: 6px 15px; font-size: 13px; font-weight: 600; border-radius: 999px; transition: all var(--t);
@@ -367,7 +371,7 @@ code { font-family: ui-monospace, "SF Mono", "SFMono-Regular", Menlo, Consolas, 
 
 /* Sparkline */
 .spark { display: block; }
-.spark-flat { display: inline-block; height: 1px; background: var(--line); vertical-align: middle; }
+.spark-flat { display: inline-block; max-width: 100%; height: 1px; background: var(--line); vertical-align: middle; }
 .spark-col { width: 92px; }
 
 /* Liquidity map */
@@ -1665,15 +1669,48 @@ button:focus-visible, [role="button"]:focus-visible {
 .node-search-name { display: inline-flex; flex-wrap: wrap; gap: 6px; align-items: center; overflow-wrap: anywhere; }
 
 
-/* Settings: a gear in the top bar, not a tab among the things you work with. */
+/* Settings: in the top bar, not a tab among the things you work with — a
+   gear with its word, plain to see (on a phone the gear alone, 40 px). */
 .gear {
-  display: inline-flex; align-items: center; justify-content: center; width: 34px; height: 34px; padding: 0;
-  color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: var(--radius-xs); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px; height: 34px; padding: 0 12px;
+  font: inherit; font-size: 13px; font-weight: 600; color: var(--text); background: transparent;
+  border: 1px solid var(--line); border-radius: var(--radius-xs); cursor: pointer; white-space: nowrap;
   transition: color var(--t), border-color var(--t);
 }
 .gear:hover, .gear.active { color: var(--accent); border-color: var(--accent); }
 .gear:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
-.gear svg { width: 17px; height: 17px; margin: 0; }
+.gear svg { width: 17px; height: 17px; margin: 0; flex: none; }
+@media (max-width: 760px) {
+  .gear { width: 40px; height: 40px; padding: 0; flex: none; }
+  .gear-word { display: none; }
+}
+/* A banner that says what is missing and has the button for it. */
+.connect-banner { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.connect-banner > span { flex: 1 1 220px; }
+
+/* Connecting Amboss: three numbered steps, each with what it needs right there. */
+.amboss-connect { margin-bottom: 20px; }
+.amboss-connect a, #set-sign a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.connect-steps { list-style: none; counter-reset: step; margin: 12px 0 0; padding: 0; display: grid; gap: 12px; }
+.connect-steps > li {
+  counter-increment: step; position: relative; padding: 12px 14px 12px 46px;
+  background: var(--panel-2); border: 1px solid var(--line-soft); border-radius: var(--radius-xs); overflow-wrap: anywhere;
+}
+.connect-steps > li::before {
+  content: counter(step); position: absolute; left: 12px; top: 11px; width: 24px; height: 24px; border-radius: 50%;
+  display: grid; place-items: center; font-size: 12px; font-weight: 700; color: #1a1205; background: var(--accent);
+}
+.connect-steps > li .sig-input, .connect-steps > li .amboss-row { margin-top: 10px; }
+.connect-steps > li > span.muted { display: inline; }
+.connect-steps .amboss-key { min-width: 0; flex: 1 1 160px; }
+@media (max-width: 760px) { .connect-steps > li { padding: 12px 12px 12px 42px; } .connect-steps > li::before { left: 10px; } }
+
+/* A section a link opened: marked for a moment. */
+.set-target { scroll-margin-top: 16px; }
+.set-target:focus { outline: none; }
+.set-target:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.set-target.flash { animation: setFlash 1.6s ease; }
+@keyframes setFlash { 0%, 40% { box-shadow: 0 0 0 2px var(--accent); } 100% { box-shadow: 0 0 0 2px transparent; } }
 
 /* The start page: what needs you. */
 .todo { padding-top: 14px; padding-bottom: 14px; }

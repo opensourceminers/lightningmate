@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { ConnectAmbossButton } from "./SettingsLink";
 import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import { sharedMagmaReport } from "../magmaReport";
@@ -238,8 +239,9 @@ export function MarketOrders() {
         <div className="panel-head">
           <h2>Orders</h2>
         </div>
-        <div className="dryrun-banner">
-          Connect your Amboss API key in <strong>Settings</strong> to see orders.
+        <div className="dryrun-banner connect-banner">
+          <span>To see orders, connect your Amboss key — three steps, all in Settings.</span>
+          <ConnectAmbossButton />
         </div>
         {ordersInFlight > 0 ? (
           <p className="banner error">

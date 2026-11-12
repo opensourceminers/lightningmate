@@ -422,7 +422,7 @@ test("SECURITY.md names every destination the Privacy card lists — and the car
     if (hosts.length === 0) assert.ok(security.toLowerCase().includes(d.service.replace(/^the /, "").toLowerCase()), `SECURITY.md names ${d.service}`);
   }
   const amboss = destinations.find((d) => d.service.startsWith("Amboss public"));
-  assert.match(amboss?.what ?? "", /your own node's public seller score included \(by its public key\), read without your API key/);
+  assert.match(amboss?.what ?? "", /your own node's public seller score included \(by its public key\), read without your Amboss key/);
   // Every trigger of the own-key lookup is named — the Overview's lease
   // benchmark too (review of P4: it was missing).
   assert.match(security, /by the autopilot's runs, the Market pages and the Overview's lease benchmark/);

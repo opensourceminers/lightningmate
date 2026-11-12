@@ -57,7 +57,7 @@ test("on a Tor-only node the card says how few wallets can order — and propose
 
 test("the Settings card: experimental, the reach note shown, Tor-only — no clearnet field, buyers get the .onion; the old nudge and the get_info-only counter gone", () => {
   const settings = readFileSync(new URL("../src/components/SettingsPanel.tsx", import.meta.url), "utf8");
-  assert.match(settings, /<h3 className="sub">LSP mode \(experimental\)<\/h3>/);
+  assert.match(settings, /<h3 className="sub set-target" id="set-lsp" tabIndex=\{-1\}>\s+LSP mode \(experimental\)\s+<\/h3>/);
   assert.doesNotMatch(settings, /LSP mode \(beta\)/);
   assert.doesNotMatch(settings, /reach more wallets/);
   assert.doesNotMatch(settings, /get_info served/);

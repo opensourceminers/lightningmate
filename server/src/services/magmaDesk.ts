@@ -4773,7 +4773,7 @@ export class MagmaDesk {
 
   private guard(): DeskResult | null {
     if (!this.deps.writeLnd) return { ok: false, code: "read_only", message: "Enable write mode to fulfil orders." };
-    if (!this.deps.amboss.hasKey()) return { ok: false, code: "no_key", message: "Connect Amboss in Settings first." };
+    if (!this.deps.amboss.hasKey()) return { ok: false, code: "no_key", message: "Connect your Amboss key first (Settings → Amboss)." };
     if (this.stopping) return { ok: false, code: "shutting_down", message: "LightningMate is shutting down." };
     return null;
   }

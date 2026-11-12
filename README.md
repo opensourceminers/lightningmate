@@ -41,7 +41,9 @@ will do.
   and no channel is opened that costs more in on-chain fees than the order brings (an
   order an older version accepted, whose payment is already settled here, excepted). On
   Umbrel a 1 % service fee applies to completed sales; the app shows it before
-  you sell.
+  you sell. Buying and selling need your Amboss key: Settings → Amboss walks you
+  through it — log in at Amboss with your node (the message is signed right there),
+  make a key, paste it.
 - **Wallet:** Lightning and on-chain, to receive, send and pay invoices.
 - **Analytics:** a routing report, what each channel earns, and how fee changes
   worked out.

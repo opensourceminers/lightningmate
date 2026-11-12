@@ -178,7 +178,7 @@ test("the first start says what it will do, with the strategy's figures, before 
   assert.match(lines[2], /keeping 100\.0k sat on chain and paying at most 20 sat\/vB/);
   assert.match(lines[2], /Until this node has routing history that fee limit is the only check, no payback/, "a new node has no yield to pay back from");
   assert.equal(setupLines(choice({ openChannels: false }), base, false)[2], "New channels: only when you open them, under Channels → To open.");
-  assert.equal(setupLines(choice({ goal: "selling" }), base, false)[3], "Selling: off for now. Connect an Amboss key in Settings, then switch it on under Autopilot → Selling.");
+  assert.equal(setupLines(choice({ goal: "selling" }), base, false)[3], "Selling: off for now. After the start, Settings opens at Amboss: connect your key there (three steps), then switch selling on under Autopilot → Selling.");
   const selling = setupLines(choice({ goal: "selling", sellEverything: true }), base, true)[3];
   assert.match(selling, /^Selling: everything free is listed once you confirm/);
   assert.match(selling, /closes a sold channel after its lease, for an on-chain fee/, "what it switches on, said");
@@ -418,4 +418,16 @@ test("a phone hides table columns, never what a decision rests on: each stays in
   const css = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8");
   assert.match(css, /\.sm-only, \.sm-row \{ display: none; \}/);
   assert.match(css, /\.sm-only \{ display: block;/);
+});
+
+test("SET-4: selling blocked for want of the Amboss key — the start page's line leads to Settings → Amboss, not to the Autopilot tab", () => {
+  const status = { magma: { state: "blocked", text: "no Amboss key — connect it in Settings → Amboss: no offer is kept and no order is taken", needs: "amboss_key", at: null } };
+  const { todo } = todoItems(dash({}, { sell: true, status } as never), [channel({})], NOW);
+  const line = todo.find((i) => i.key === "ap-magma");
+  assert.ok(line, JSON.stringify(todo));
+  assert.equal(line.text, "Selling blocked: no Amboss key — connect it in Settings → Amboss: no offer is kept and no order is taken");
+  assert.deepEqual([line.tab, line.sub], ["settings", "amboss"]);
+  // Blocked for another reason: the Autopilot's Selling, as before.
+  const other = todoItems(dash({}, { sell: true, status: { magma: { state: "blocked", text: "write mode is off", at: null } } } as never), [channel({})], NOW).todo.find((i) => i.key === "ap-magma");
+  assert.deepEqual([other?.tab, other?.sub], ["autopilot", "magma"]);
 });

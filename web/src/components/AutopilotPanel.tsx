@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { ConnectAmbossButton, SettingsLink } from "./SettingsLink";
 import { Fold } from "./Fold";
 import { NodeLink } from "./NodeLink";
 import { api } from "../api";
@@ -196,6 +197,8 @@ export function StatusLine({ area, status }: { area: DecisionArea; status: AreaS
       <span className="ap-status-text">{v.text}</span>
       {v.when ? <span className="ap-status-when">{v.when}</span> : null}
       {v.lastError ? <span className="ap-status-err">{v.lastError}</span> : null}
+      {/* What it needs is the Amboss key: the way there, right here (SET-4). */}
+      {status?.needs === "amboss_key" ? <ConnectAmbossButton small /> : null}
     </div>
   );
 }
@@ -663,6 +666,8 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
           </span>
         </button>
         <InfoTip text={a.help} label={`About ${a.title}`} />
+        {/* (Open, the row's status line below has the button: one is enough.) */}
+        {config[a.field] && !isOpen && status?.[a.area]?.needs === "amboss_key" ? <ConnectAmbossButton small /> : null}
         {writeOff && config[a.field] ? <RunState on blocked="write mode is off — nothing can run" /> : null}
         <span className="ap-area-caret" aria-hidden="true">{isOpen ? "▾" : "▸"}</span>
       </div>
@@ -710,6 +715,11 @@ export function AutopilotPanel({ initialSub }: { initialSub?: string }) {
           <div className="ap-paused">
             ⏸ All automation paused {timeAgo(paused.at)} — {pausedText(lspModeOn)}. Magma orders already taken on are still
             carried to their end.{" "}
+            {lspModeOn ? (
+              <>
+                <SettingsLink section="lsp">LSP mode in Settings</SettingsLink>{" "}
+              </>
+            ) : null}
             <button className="primary-btn" disabled={busy || writeOff} onClick={() => void resume()}>
               Resume
             </button>

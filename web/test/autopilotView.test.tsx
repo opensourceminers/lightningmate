@@ -260,8 +260,11 @@ test("the digest pairs the last run's time with THAT run's counts, counts failur
   const did = autopilotDigest(ap({ lastActionAt: iso(3), lastRun: { applied: 3, attempted: 3, failed: 0, feeChanges: 2, rebalances: 1, sells: 0, opens: 0, maxHtlc: 0, errors: [] } }), NOW);
   assert.deepEqual(did.map((i) => i.text), ["Autopilot 3m ago: 2 fees adjusted · 1 rebalance — next run in ~27 min"]);
   // An area that is blocked or failing is on the Overview too.
-  const blocked = autopilotDigest(ap({ sell: true, status: { magma: { state: "blocked", text: "no Amboss API key — connect one in Settings", at: null } } }), NOW);
-  assert.ok(blocked.some((i) => i.text === "Selling blocked: no Amboss API key — connect one in Settings" && i.warn && i.sub === "magma"));
+  const blocked = autopilotDigest(ap({ sell: true, status: { magma: { state: "blocked", text: "write mode is off", at: null } } }), NOW);
+  assert.ok(blocked.some((i) => i.text === "Selling blocked: write mode is off" && i.warn && i.sub === "magma" && i.tab === undefined));
+  // Blocked for want of the Amboss key: the line leads to Settings → Amboss (SET-4).
+  const noKey = autopilotDigest(ap({ sell: true, status: { magma: { state: "blocked", text: "no Amboss key — connect it in Settings → Amboss", needs: "amboss_key", at: null } } }), NOW);
+  assert.ok(noKey.some((i) => i.text === "Selling blocked: no Amboss key — connect it in Settings → Amboss" && i.tab === "settings" && i.sub === "amboss"));
   // Paused: said first — without promising more than the pause does.
   assert.equal(autopilotDigest(ap({ fees: false, pausedAt: iso(120) }), NOW)[0].text, "All automation paused 2h ago — nothing new starts on its own");
   // An area that is off is never listed as blocked (a read-only node).
@@ -291,6 +294,10 @@ test("LSP mode is not part of the pause: with it on, the dialog, the banner, the
     autopilotDigest(ap({ fees: false, pausedAt: iso(120), lspModeOn: true }), NOW)[0].text,
     "All automation paused 2h ago — the autopilot starts nothing new, but LSP mode (Settings) is still on: it keeps answering wallet orders and opening their channels",
   );
+  // …and a line that leads to where LSP mode is switched off (review of P10, F7).
+  const lspLine = autopilotDigest(ap({ fees: false, pausedAt: iso(120), lspModeOn: true }), NOW)[1];
+  assert.deepEqual([lspLine?.key, lspLine?.tab, lspLine?.sub], ["ap-lsp", "settings", "lsp"]);
+  assert.ok(!autopilotDigest(ap({ fees: false, pausedAt: iso(120), lspModeOn: false }), NOW).some((i) => i.key === "ap-lsp"));
   // Beside the button, and the note once paused: selling stays off on Resume.
   assert.equal(pauseHint(), "every automation off at once — Resume brings back what was on, selling excepted");
   assert.equal(pauseHint(true), "every autopilot automation off at once (LSP mode, in Settings, stays on) — Resume brings back what was on, selling excepted");

@@ -28,7 +28,7 @@ export function AmbossKeyStatus(props: {
   // Next to a button that removes the key (none is offered while Amboss is
   // merely unreachable).
   const inFlight =
-    ordersInFlight > 0 && keyCheck !== "unreachable" ? (
+    ordersInFlight > 0 && (keyCheck !== "unreachable" || keyValid === false) ? (
       <p className="sug-warn">
         ⚠ {ordersInFlight === 1 ? "1 Magma order is" : `${ordersInFlight} Magma orders are`} in flight. Removing the
         key stops LightningMate from opening, reporting and settling {ordersInFlight === 1 ? "it" : "them"} — it would
@@ -62,6 +62,7 @@ function KeyState(props: {
   if (keyCheck === "unreachable") {
     // The reason without the "Amboss unreachable:" the row already says.
     const why = lastError?.replace(/^Amboss unreachable:\s*/, "") ?? "";
+    const Why = why ? `${why.charAt(0).toUpperCase()}${why.slice(1)} — ` : "";
     return (
       <>
         <div className="amboss-row">
@@ -71,11 +72,24 @@ function KeyState(props: {
           <button className="reset" disabled={busy} onClick={onRecheck}>
             {busy ? "…" : "Re-check"}
           </button>
+          {/* Rejected at the last check: removal stays a choice (review of P10, F3). */}
+          {keyValid === false ? (
+            <button className="reset" disabled={busy} onClick={onRemove}>
+              Remove key
+            </button>
+          ) : null}
         </div>
-        <p className="muted">
-          {why ? `${why.charAt(0).toUpperCase()}${why.slice(1)} — y` : "Y"}our key stays connected
-          {keyValid === true ? " (valid at the last check)" : ""}; buying and selling resume once Amboss answers.
-        </p>
+        {keyValid === false ? (
+          <p className="banner error">
+            {Why}Amboss rejected your key at the last check (expired or revoked): buying and <strong>selling on Magma do
+            nothing</strong> until a fresh key is connected below.
+          </p>
+        ) : (
+          <p className="muted">
+            {Why ? `${Why}y` : "Y"}our key stays connected
+            {keyValid === true ? " (valid at the last check)" : ""}; buying and selling resume once Amboss answers.
+          </p>
+        )}
       </>
     );
   }
@@ -95,11 +109,8 @@ function KeyState(props: {
         </div>
         <p className="banner error">
           Amboss refuses your stored key (expired or revoked), so buying and <strong>selling on Magma do
-          nothing</strong> — no offers are managed and no orders are fulfilled. Get a fresh key at{" "}
-          <a href="https://account.amboss.tech/settings/api-keys" target="_blank" rel="noreferrer">
-            account.amboss.tech
-          </a>
-          , remove the old one here and connect the new one.
+          nothing</strong> — no offers are managed and no orders are fulfilled. Make a fresh key at Amboss and connect it
+          below: it replaces the rejected one.
         </p>
       </>
     );

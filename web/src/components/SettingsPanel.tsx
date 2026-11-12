@@ -2,18 +2,18 @@ import { Fragment, useEffect, useState } from "react";
 import { COPY_FAILED, copyText } from "../clipboard";
 import { api } from "../api";
 import { pageHidden } from "../usePolledData";
-import type { AmbossKeyCheck, AppSettings, FiatCurrency, LspStatus, PrivacyInfo } from "../types";
+import type { AppSettings, FiatCurrency, LspStatus, PrivacyInfo } from "../types";
 import { LSP_LIMITS_NOTE, lspBuyerGuide, lspIgnoredLine, lspReachText, lspRecoveryLine } from "../lspView";
 import { destinationLine, privacySummary } from "../privacyView";
 import { BackupCard } from "./BackupCard";
 import { Fold } from "./Fold";
-import { AmbossKeyStatus } from "./AmbossKeyStatus";
+import { AmbossConnect, type AmbossCardState } from "./AmbossConnect";
+import { SignMessage } from "./SignMessage";
 import { LspActivity } from "./LspActivity";
 import { Switch, RunState } from "./Switch";
 import { useUi } from "./Overlay";
 import { satsCompact, timeAgo } from "../format";
 import { formatVersion } from "../version";
-import { removeKeyMessage } from "../statusNotes";
 
 const CURRENCIES: { value: FiatCurrency; label: string }[] = [
   { value: "off", label: "Off" },
@@ -37,22 +37,40 @@ export const GLOSSARY: [string, string][] = [
   ["On-chain", "Your normal bitcoin wallet on this node, as opposed to the coins in channels."],
 ];
 
-export function SettingsPanel({ onChange, version }: { onChange: () => void; version?: string }) {
+/** The sections a link can open Settings at (`goTo("settings", section)`). */
+export type SettingsSection = "amboss" | "sign" | "privacy" | "sessions" | "lsp";
+
+export function SettingsPanel({ onChange, version, initialSection }: { onChange: () => void; version?: string; initialSection?: string }) {
   const [diagError, setDiagError] = useState<string | null>(null);
   const ui = useUi();
   const [settings, setSettings] = useState<AppSettings | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Amboss / Magma connection
-  const [ambossConnected, setAmbossConnected] = useState<boolean | null>(null);
-  const [keyValid, setKeyValid] = useState<boolean | null | undefined>(undefined);
-  const [keyCheck, setKeyCheck] = useState<AmbossKeyCheck>("unknown");
-  const [keyCheckError, setKeyCheckError] = useState<string | null>(null);
-  const [ordersInFlight, setOrdersInFlight] = useState(0);
-  const [keyInput, setKeyInput] = useState("");
-  const [ambossBusy, setAmbossBusy] = useState(false);
-  const [ambossError, setAmbossError] = useState<string | null>(null);
+  const [canWrite, setCanWrite] = useState<boolean | null>(null);
+  // Write mode read (or its read failed): what the signing parts show is
+  // settled.
+  const [writeKnown, setWriteKnown] = useState(false);
+  // The Amboss card: read yet, and its steps (with their own signing box) open?
+  const [amboss, setAmboss] = useState<AmbossCardState>({ ready: false, steps: false });
+  // Opened from a link ("Connect Amboss", "Settings → Privacy"): at that
+  // section, marked for a moment, the keyboard's focus there (review
+  // 2026-11-10, SET-4). Once the parts above it have read what they show —
+  // before, the Amboss card grew after the scroll and pushed Privacy and LSP
+  // mode off the screen (review of P10, F1).
+  const [scrolled, setScrolled] = useState(false);
+  useEffect(() => {
+    if (!initialSection || scrolled || !amboss.ready || !writeKnown) return;
+    setScrolled(true);
+    const el = typeof document !== "undefined" && typeof document.getElementById === "function" ? document.getElementById(`set-${initialSection}`) : null;
+    if (!el) return;
+    const still = typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    el.scrollIntoView?.({ behavior: still ? "auto" : "smooth", block: "start" });
+    el.focus?.({ preventScroll: true });
+    el.classList?.add("flash");
+    const t = setTimeout(() => el.classList?.remove("flash"), 1700);
+    return () => clearTimeout(t);
+  }, [amboss.ready, writeKnown]);
 
   // Where the app's own lookups go (Privacy).
   const [privacy, setPrivacy] = useState<PrivacyInfo | null>(null);
@@ -81,82 +99,13 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
       .then((s) => setAuthRequired(s.authRequired))
       .catch(() => undefined);
     api.getSettings().then(setSettings).catch((e) => setError(e instanceof Error ? e.message : String(e)));
+    // Write mode: what signing can do, said before the click (SET-3).
     api
-      .ambossStatus()
-      .then((s) => {
-        setAmbossConnected(s.connected);
-        setKeyValid(s.keyValid);
-        setKeyCheck(s.keyCheck);
-        setKeyCheckError(s.lastError);
-        setOrdersInFlight(s.ordersInFlight ?? 0);
-      })
-      .catch(() => setAmbossConnected(false));
+      .autopilotGet()
+      .then((a) => setCanWrite(a.canWrite))
+      .catch(() => setCanWrite(null))
+      .finally(() => setWriteKnown(true));
   }, []);
-
-  // "Re-check": ask Amboss about the stored key now. Never deletes it.
-  const recheckAmboss = async () => {
-    setAmbossBusy(true);
-    setAmbossError(null);
-    try {
-      const s = await api.ambossKeyCheck();
-      setKeyValid(s.keyValid);
-      setKeyCheck(s.keyCheck);
-      setKeyCheckError(s.lastError);
-      setOrdersInFlight(s.ordersInFlight ?? 0);
-    } catch (e) {
-      setAmbossError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setAmbossBusy(false);
-    }
-  };
-
-  const connectAmboss = async () => {
-    if (!keyInput.trim() || ambossBusy) return;
-    setAmbossBusy(true);
-    setAmbossError(null);
-    try {
-      await api.ambossConnect(keyInput.trim());
-      setAmbossConnected(true);
-      setKeyValid(true);
-      setKeyCheck("valid");
-      setKeyInput("");
-    } catch (e) {
-      setAmbossError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setAmbossBusy(false);
-    }
-  };
-
-  // Removing the key is never a single click: it is confirmed, and the
-  // confirmation says what happens to Magma orders still in flight (fetched
-  // fresh — the count on screen may be minutes old).
-  const disconnectAmboss = async () => {
-    let inFlight = ordersInFlight;
-    try {
-      inFlight = (await api.ambossStatus()).ordersInFlight ?? inFlight;
-      setOrdersInFlight(inFlight);
-    } catch {
-      // keep the last known count
-    }
-    const ok = await ui.confirm({
-      title: inFlight > 0 ? "Remove the Amboss key? Orders are in flight" : "Remove the Amboss key?",
-      message: removeKeyMessage(inFlight),
-      confirmLabel: "Remove key",
-      danger: true,
-    });
-    if (!ok) return;
-    setAmbossBusy(true);
-    setAmbossError(null);
-    try {
-      await api.ambossDisconnect();
-      setAmbossConnected(false);
-      setKeyValid(undefined);
-    } catch (e) {
-      setAmbossError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setAmbossBusy(false);
-    }
-  };
 
   const choose = async (fiatCurrency: FiatCurrency) => {
     setBusy(true);
@@ -247,43 +196,32 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
     setTimeout(() => setGuideCopied(false), 1500);
   };
 
-  // Sign a message with the node (e.g. Amboss's "Login with Node" challenge)
-  const [signInput, setSignInput] = useState("");
-  const [signature, setSignature] = useState("");
-  const [signing, setSigning] = useState(false);
-  const [signError, setSignError] = useState<string | null>(null);
-  const [sigCopied, setSigCopied] = useState(false);
-
-  const doSign = async () => {
-    if (!signInput.trim() || signing) return;
-    setSigning(true);
-    setSignError(null);
-    setSignature("");
-    try {
-      setSignature((await api.signMessage(signInput.trim())).signature);
-    } catch (e) {
-      setSignError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSigning(false);
-    }
-  };
-
-  const copySig = async () => {
-    if (!(await copyText(signature))) {
-      ui.toast(COPY_FAILED, "error");
-      return;
-    }
-    setSigCopied(true);
-    setTimeout(() => setSigCopied(false), 1500);
-  };
-
   return (
     <>
     <section className="panel">
       <div className="panel-head"><h2>Settings</h2></div>
 
       {/* Each section shows its switches and its state; what explains them
-          is one click away (2026-10-24: the page ran to 815 words). */}
+          is one click away (2026-10-24: the page ran to 815 words). Amboss
+          first: what most people come here for (SET-2). */}
+      <div id="set-amboss" className="set-target" tabIndex={-1}>
+        <h3 className="sub">Amboss — needed to sell and buy channels on Magma</h3>
+        <AmbossConnect canWrite={canWrite} onState={setAmboss} />
+      </div>
+
+      <div id="set-sign" className="set-target" tabIndex={-1}>
+        <h3 className="sub">Sign a message with your node</h3>
+        {amboss.steps ? (
+          // One signing box at a time: step 1 above has it (review of P10, F5).
+          <p className="muted">For Amboss&apos;s login, step 1 above signs right there; for any other challenge too.</p>
+        ) : (
+          <>
+            <p className="muted">For Amboss&apos;s “Login with Node” — again whenever you log in there — or any other challenge.</p>
+            <SignMessage canWrite={canWrite} placeholder="Message to sign (e.g. Amboss's amboss-… challenge)" />
+          </>
+        )}
+      </div>
+
       <h3 className="sub">Fiat currency</h3>
       <div className="seg">
         {CURRENCIES.map((c) => (
@@ -300,7 +238,9 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
 
       {error ? <p className="banner error">{error}</p> : null}
 
-      <h3 className="sub">Privacy</h3>
+      <h3 className="sub set-target" id="set-privacy" tabIndex={-1}>
+        Privacy
+      </h3>
       {privacy ? (
         <>
           {/* Without a proxy every lookup leaves from the home IP: a warning. */}
@@ -345,7 +285,9 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
 
       {authRequired ? (
         <>
-          <h3 className="sub">Sessions</h3>
+          <h3 className="sub set-target" id="set-sessions" tabIndex={-1}>
+            Sessions
+          </h3>
           <div className="amboss-row">
             <span className="muted">A sign-in lasts 12 hours on each device. Sign out everywhere ends every one at once — this one too.</span>
             <button className="row-btn" disabled={busy} onClick={() => void signOutEverywhere()}>
@@ -355,74 +297,9 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
         </>
       ) : null}
 
-      <h3 className="sub">Amboss Magma</h3>
-      {ambossConnected === null ? (
-        <p className="muted">Checking…</p>
-      ) : ambossConnected ? (
-        <AmbossKeyStatus
-          keyValid={keyValid}
-          keyCheck={keyCheck}
-          lastError={keyCheckError}
-          busy={ambossBusy}
-          onRecheck={() => void recheckAmboss()}
-          onRemove={() => void disconnectAmboss()}
-          ordersInFlight={ordersInFlight}
-        />
-      ) : (
-        <>
-          <p className="muted">
-            Buying and selling on Magma (Market tab) need an Amboss API key — get one at{" "}
-            <a href="https://account.amboss.tech/settings/api-keys" target="_blank" rel="noreferrer">
-              account.amboss.tech
-            </a>
-            . It’s stored only on your node.
-          </p>
-          <div className="amboss-row">
-            <input
-              type="password"
-              className="unlock-input amboss-key"
-              value={keyInput}
-              placeholder="Amboss API key"
-              onChange={(e) => setKeyInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") void connectAmboss();
-              }}
-            />
-            <button className="primary-btn" disabled={!keyInput.trim() || ambossBusy} onClick={() => void connectAmboss()}>
-              {ambossBusy ? "Connecting…" : "Connect"}
-            </button>
-          </div>
-        </>
-      )}
-      {ambossError ? <p className="banner error">{ambossError}</p> : null}
-      <details className="set-more">
-        <summary>Sign a message</summary>
-        <p className="muted">
-          With your node’s key — for Amboss’ <strong>“Login with Node”</strong> challenge (<code>amboss-…</code>):
-          paste it, sign, and copy the signature back to Amboss. Needs write mode (admin macaroon).
-        </p>
-        <textarea
-          className="unlock-input sig-input"
-          rows={2}
-          value={signInput}
-          placeholder="Message to sign (e.g. the amboss-… challenge)"
-          onChange={(e) => setSignInput(e.target.value)}
-        />
-        <div className="amboss-row">
-          <button className="primary-btn" disabled={!signInput.trim() || signing} onClick={() => void doSign()}>
-            {signing ? "Signing…" : "Sign with node"}
-          </button>
-        </div>
-        {signature ? (
-          <div className="challenge-row" style={{ marginTop: 10 }}>
-            <code className="challenge">{signature}</code>
-            <button className="reset" onClick={copySig}>{sigCopied ? "copied" : "copy"}</button>
-          </div>
-        ) : null}
-        {signError ? <p className="banner error">{signError}</p> : null}
-      </details>
-
-      <h3 className="sub">LSP mode (experimental)</h3>
+      <h3 className="sub set-target" id="set-lsp" tabIndex={-1}>
+        LSP mode (experimental)
+      </h3>
       <div className="amboss-row">
         <Switch
           checked={settings?.lspModeEnabled ?? false}

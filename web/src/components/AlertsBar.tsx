@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { goTo } from "../nav";
 import { api } from "../api";
 import { usePolledData } from "../usePolledData";
 
@@ -32,6 +33,11 @@ export function AlertsBar() {
       {alerts.map((a, i) => (
         <span key={a.id ?? i} className={`alert ${a.level}`}>
           {a.level === "warn" ? "⚠" : "ℹ"} {a.message}
+          {a.link ? (
+            <button className="alert-dismiss" onClick={() => goTo(a.link!.tab, a.link!.sub)}>
+              {a.link.label}
+            </button>
+          ) : null}
           {a.id ? (
             <button
               className="alert-dismiss"

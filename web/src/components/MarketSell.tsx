@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { ConnectAmbossButton, SettingsLink } from "./SettingsLink";
 import { copyText } from "../clipboard";
 import { goTo } from "../nav";
 import { api } from "../api";
@@ -389,7 +390,10 @@ export function MarketSell() {
         <div className="panel-head">
           <h2>Sell liquidity</h2>
         </div>
-        <div className="dryrun-banner">Connect your Amboss API key in <strong>Settings</strong> to create offers.</div>
+        <div className="dryrun-banner connect-banner">
+          <span>To create offers, connect your Amboss key — three steps, all in Settings.</span>
+          <ConnectAmbossButton />
+        </div>
         <EligibilityCard e={elig} busy={eligBusy} onRefresh={() => loadEligibility(true)} />
         <HowAmbossPicks usdOrderSat={elig?.usdOrders?.minOrderSat ?? null} usdAtOwnPriceSat={elig?.usdOrders?.atOwnPriceSat ?? null} feeTiers={elig?.feeTiers ?? null} feeBps={feeBps} />
       </section>
@@ -432,8 +436,8 @@ export function MarketSell() {
         </p>
       ) : keyValid === false ? (
         <p className="banner error">
-          Amboss rejects your API key (expired or revoked) — Magma selling <strong>does nothing</strong> (no offers managed, no
-          orders fulfilled). Connect a fresh key in <strong>Settings</strong>.
+          Amboss rejects your key (expired or revoked) — Magma selling <strong>does nothing</strong> (no offers managed, no
+          orders fulfilled). <SettingsLink section="amboss">Connect a fresh key</SettingsLink>.
         </p>
       ) : null}
       {writeOff ? (

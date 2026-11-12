@@ -120,7 +120,7 @@ export function repeatsNote(repeats: number | undefined, since: string | null): 
  */
 export function removeKeyMessage(ordersInFlight: number): string {
   const base =
-    "Remove the Amboss API key from this node? Buying and selling on Magma stop until you connect a key again.";
+    "Remove the Amboss key from this node? Buying and selling on Magma stop until you connect a key again.";
   if (ordersInFlight <= 0) return base;
   const orders = ordersInFlight === 1 ? "1 Magma order is" : `${ordersInFlight} Magma orders are`;
   return (

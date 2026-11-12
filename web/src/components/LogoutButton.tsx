@@ -15,8 +15,8 @@ export function LogoutButton() {
   if (!show) return null;
 
   return (
-    <button className="refresh" title="Sign out of Lightning Mate" onClick={() => api.logout()}>
-      ⏻ sign out
+    <button className="refresh" title="Sign out of Lightning Mate" aria-label="Sign out" onClick={() => api.logout()}>
+      ⏻<span className="refresh-word"> sign out</span>
     </button>
   );
 }

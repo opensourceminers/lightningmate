@@ -1,7 +1,7 @@
 import type { ChannelView, DashboardData } from "./types";
 import { satsCompact } from "./format";
 import { offlineLabel } from "./closeView";
-import { autopilotDigest } from "./autopilotView";
+import { autopilotDigest, type DigestItem } from "./autopilotView";
 import { refusalDigest } from "./magmaView";
 import { noForwardsIn7d } from "./analyticsView";
 
@@ -26,8 +26,8 @@ const NAMED_OFFLINE = 3;
 
 /** Lines with the same trouble become one: on a read-only node all four areas
  *  report the same "write mode is off". */
-function foldSameTrouble(items: { key: string; text: string; warn?: boolean; sub?: string }[]): { key: string; text: string; warn?: boolean; sub?: string }[] {
-  const out: { key: string; text: string; warn?: boolean; sub?: string }[] = [];
+function foldSameTrouble(items: DigestItem[]): DigestItem[] {
+  const out: DigestItem[] = [];
   const groups = new Map<string, { index: number; labels: string[]; verb: string; why: string }>();
   for (const it of items) {
     const m = it.key.startsWith("ap-") ? /^(.*?) (blocked|failed): (.*)$/.exec(it.text) : null;
@@ -74,7 +74,7 @@ export function todoItems(d: DashboardData, channels: readonly ChannelView[] | n
   for (const it of digest) {
     if (it.key === "ap" && !it.warn) footnote = it.text;
     else if (it.key === "ap-last") footnote = footnote ? `${footnote} · ${it.text}` : it.text;
-    else todo.push({ key: it.key, text: it.text, warn: it.warn ?? true, tab: "autopilot", sub: it.sub });
+    else todo.push({ key: it.key, text: it.text, warn: it.warn ?? true, tab: it.tab ?? "autopilot", sub: it.sub });
   }
 
   if (noForwardsIn7d(d)) {

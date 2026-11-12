@@ -140,3 +140,11 @@ test("each offer is held against the lease its price is for: a 90-day offer kept
   assert.match(oddTerms, /not applied: that price is for a 4,320-block lease, and with auto-size off this offer keeps its 5,000 blocks/);
   assert.match(oddTerms, /Auto-size is off: the autopilot leaves the lease and the fee promise as they are/);
 });
+
+test("SET-4: no key, or a key Amboss rejects — the check's fix opens Settings at the Amboss card", async (t) => {
+  quiet(t);
+  const { api } = await setup(t);
+  api.amboss.clear();
+  const none = check((await api.request("GET", "/amboss/sell-diagnostics")).body, "key") as { fix?: unknown };
+  assert.deepEqual(none.fix, { tab: "settings", sub: "amboss", label: "Connect Amboss" });
+});

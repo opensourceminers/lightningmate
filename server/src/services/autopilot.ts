@@ -919,12 +919,18 @@ export interface AreaDecision {
   lastError?: { at: string; text: string };
 }
 
+/** Selling without an Amboss key, as its status says it. */
+export const NO_AMBOSS_KEY_TEXT = "no Amboss key — connect it in Settings → Amboss: no offer is kept and no order is taken";
+
 /** What the UI shows for an area: its last decision — or that it is off, or
  *  blocked right now (write mode off, no Amboss key), whatever it last did. */
 export interface AreaStatus {
   /** "not_run": switched on, and no decision made yet. */
   state: DecisionState | "off" | "not_run";
   text: string;
+  /** What the operator must do for it, where a page can lead there:
+   *  "amboss_key" — connect (or replace) the Amboss key (SET-4). */
+  needs?: "amboss_key";
   /** null: no decision yet (never run since it was switched on). */
   at: string | null;
   since?: string;
@@ -4865,7 +4871,7 @@ export class Autopilot {
     const cfg = this.state.config;
     if (!cfg.sellEnabled || this.shuttingDown) return [];
     if (!this.amboss.hasKey()) {
-      this.decisionNote("magma", "no Amboss API key — connect one in Settings: no offer is kept and no order is taken", "blocked");
+      this.decisionNote("magma", NO_AMBOSS_KEY_TEXT, "blocked");
       return [];
     }
     const key = this.amboss.getKey();
@@ -6965,12 +6971,13 @@ export class Autopilot {
       }
       if (area === "magma") {
         if (!this.amboss.hasKey()) {
-          return { state: "blocked", text: "no Amboss API key — connect one in Settings: no offer is kept and no order is taken", at: null, ...(d ? { last: d } : {}) };
+          return { state: "blocked", text: NO_AMBOSS_KEY_TEXT, needs: "amboss_key", at: null, ...(d ? { last: d } : {}) };
         }
         if (this.amboss.getValidity() === false) {
           return {
             state: "blocked",
-            text: "Amboss rejects your API key (expired or revoked) — connect a fresh one in Settings; orders in flight are still carried to their end",
+            text: "Amboss rejects your key (expired or revoked) — connect a fresh one in Settings → Amboss; orders in flight are still carried to their end",
+            needs: "amboss_key",
             at: null,
             ...(d ? { last: d } : {}),
           };

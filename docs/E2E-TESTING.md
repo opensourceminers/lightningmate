@@ -129,7 +129,7 @@ them): the test suite's fake LND holds that case (`rebalanceRouteLimit.test.ts`)
 - **Seller (node A)**: LightningMate in write mode — with the admin macaroon
   or the least-privilege one SECURITY.md lists, which needs `peers:read`
   (Autopilot → Selling must not show "blocked … lacks peers:read") — an Amboss
-  API key of account X with node A on it (Settings → Amboss: "valid"),
+  Amboss key of account X with node A on it (Settings → Amboss: "valid"),
   on-chain coins of at least the test channel size plus the on-chain reserve
   and the funding fee.
 - **Buyer (node B)**: another node, on another Amboss account Y, that can pay
