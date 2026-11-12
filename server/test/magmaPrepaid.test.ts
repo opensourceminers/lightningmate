@@ -19,8 +19,8 @@
 // channel alone and tells the operator.
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { AWAITING_AMBOSS_PAYMENT, BUYER_DIALS, NOT_OUR_ACCEPT_WAIT, OPENING_GRACE_MS, PAYMENT_OVERDUE_MS } from "../src/services/magmaDesk.js";
-import { magmaOverduePaymentAlerts, magmaRefundAlerts, magmaUnpaidChannelAlerts } from "../src/services/alerts.js";
+import { ACCEPT_REFUSED_WAIT, AWAITING_AMBOSS_PAYMENT, BUYER_DIALS, CANCEL_MARGIN_BLOCKS, CHANNEL_OUT_WAIT, NOT_OUR_ACCEPT_WAIT, OPENING_GRACE_MS, PAYMENT_OVERDUE_MS } from "../src/services/magmaDesk.js";
+import { magmaChannelNotShownAlerts, magmaOpenYoursAlerts, magmaOverduePaymentAlerts, magmaRefundAlerts, magmaUnpaidChannelAlerts } from "../src/services/alerts.js";
 import { HTTP_TIMEOUTS } from "../src/services/http.js";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
 import { chanNumber } from "./helpers/feeNode.js";
@@ -84,6 +84,8 @@ test("the buyer paid Amboss up front: the lane opens the channel with our invoic
   assert.equal(s.magma.sales.get(sale.id)?.transactionId, e?.fundingOutpoint, "Amboss has the outpoint");
   assert.equal(s.node.invoices.get(hash)?.state, "OPEN", "still unpaid: Amboss pays after the confirmation");
   assert.equal(events(s, sale.id).filter((w) => w === HOLDS).length, 1, "the record says why it opens unpaid");
+  // Not "… — opening the channel" any more: Market → Orders shows it on hover.
+  assert.equal(e?.decision?.reason, CHANNEL_OUT_WAIT);
   assert.equal(s.capital.reservedSat(), 0, "the coins are in the channel, no longer promised");
   // Passes while the channel confirms: nothing more happens.
   for (let i = 0; i < 3; i++) await s.autopilot.pollSellOrders();
@@ -250,6 +252,58 @@ test("a channel of the order's size to the buyer that was there when the order w
   assert.ok(!events(s, sale.id).some((w) => /opened outside LightningMate/.test(w)));
 });
 
+test("a channel of another size opened by hand to the buyer is not the order's, and the record says so once: the lane opens the order's own when fees allow", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  estimate(s, 400);
+  const txid = "a1".repeat(32);
+  s.node.pending.push({ partnerPublicKey: BUYER, capacity: 2_100_000, transactionId: txid, transactionVout: 0 });
+  for (let i = 0; i < 3; i++) await s.autopilot.pollSellOrders();
+  assert.equal(opens(s).length, 0);
+  const said = events(s, sale.id).filter((w) => w.includes(`${txid}:0`));
+  assert.deepEqual(said, [
+    `a 2,100,000 sat channel to the buyer (${txid}:0) was opened outside LightningMate — not the order's 2,000,000 sat, so it is not taken as the order's: Amboss takes only a channel of the order's size, and the order gets its own`,
+  ]);
+  estimate(s, 1);
+  await s.autopilot.pollSellOrders();
+  assert.equal(opens(s).length, 1);
+  assert.notEqual(entryOnDisk(s.dir, sale.id)?.fundingOutpoint, `${txid}:0`);
+  assert.equal(events(s, sale.id).filter((w) => w.includes(`${txid}:0`)).length, 1, "said once");
+});
+
+for (const [age, height, taken] of [
+  ["new since the order: taken as the order's", 860_000, true],
+  ["older than the order: not the order's, and the lane opens the order's own", 850_000, false],
+] as const) {
+  test(`a record that does not say which channels the buyer had at the accept, and a channel of the order's size to the buyer being opened: neither taken nor another opened while it is pending — once confirmed, its height decides (${age})`, async (t) => {
+    const { s, sale } = await prepaidOrder(t);
+    // As a record from before the accept noted the buyer's channels.
+    s.desk.journal.get(sale.id)!.preExistingAtAccept = undefined;
+    const txid = "b2".repeat(32);
+    s.node.pending.push({ partnerPublicKey: BUYER, capacity: 2_000_000, transactionId: txid, transactionVout: 0 });
+    for (let i = 0; i < 2; i++) await s.autopilot.pollSellOrders();
+    assert.equal(opens(s).length, 0, "no second channel beside one that may be the order's");
+    let e = entryOnDisk(s.dir, sale.id);
+    assert.equal(e?.phase, "accepted");
+    assert.equal(e?.fundingOutpoint, undefined, "and it is not taken while nothing tells its age");
+    assert.equal(events(s, sale.id).filter((w) => w.startsWith(`a channel of the order's size to the buyer is being opened outside LightningMate (${txid}:0)`)).length, 1);
+    const clicked = await s.desk.open(sale.id);
+    assert.equal(clicked.ok, false);
+    assert.equal(opens(s).length, 0, "a click opens none beside it either");
+    // Confirmed: its height says when it was funded.
+    s.node.pending.splice(0, s.node.pending.length);
+    s.node.channels.push({ id: `${height}x7x0`, partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 2_000_000, transactionId: txid, transactionVout: 0 });
+    await s.autopilot.pollSellOrders();
+    e = entryOnDisk(s.dir, sale.id);
+    if (taken) {
+      assert.equal(opens(s).length, 0);
+      assert.equal(e?.fundingOutpoint, `${txid}:0`);
+    } else {
+      assert.equal(opens(s).length, 1);
+      assert.notEqual(e?.fundingOutpoint, `${txid}:0`);
+    }
+  });
+}
+
 // ── LANE-12: a channel opened by hand ──────────────────────────────────────
 
 test("the operator opened the channel with another tool and reported it on Amboss's website while the lane waited for lower fees: the channel — still unconfirmed in LND — is taken as the order's, nothing is opened or reported, and Amboss's payment is settled for it", async (t) => {
@@ -259,7 +313,7 @@ test("the operator opened the channel with another tool and reported it on Ambos
   assert.equal(opens(s).length, 0);
   assert.match(
     entryOnDisk(s.dir, sale.id)?.lastError ?? "",
-    /^on-chain fees are 400 sat\/vB: opening the channel would cost about 70,000 sat, more than the 12,221 sat this sale earns; Amboss holds the buyer's payment, so the channel is opened whatever the fee from \d{4}-\d\d-\d\d \d\d:\d\d UTC — waiting for lower fees \(“Open channel” on Market → Orders opens it anyway\) — will try again$/,
+    /^on-chain fees are 400 sat\/vB: opening the channel would cost about 70,000 sat, more than the 12,221 sat this sale earns; Amboss holds the buyer's payment\. If the open still costs more at \d{4}-\d\d-\d\d \d\d:\d\d UTC, the order is ended then and Amboss refunds the buyer — waiting for lower fees \(“Open channel” opens it only once it costs no more than the order brings\) — will try again$/,
   );
   // By hand: a channel LND shows as opening, and its transaction on Amboss.
   const txid = "cd".repeat(32);
@@ -307,7 +361,7 @@ test("the operator opened the channel with another tool and has not reported it:
 
 // ── LANE-9: the accept that timed out ──────────────────────────────────────
 
-test("an accept that timed out twice and was applied on the third try without an answer: Amboss showing the order waiting for its channel is the confirmation — one invoice, no further accept, said once, and the channel is opened", async (t) => {
+test("an accept that timed out three times — the third applied by Amboss, its answer lost: Amboss showing the order waiting for its channel is the confirmation — one invoice, no further accept, said once, and the channel is opened", async (t) => {
   feeEnv(t);
   quiet(t);
   const saved = HTTP_TIMEOUTS.ambossAcceptMs;
@@ -320,7 +374,12 @@ test("an accept that timed out twice and was applied on the third try without an
   const sale = s.magma.addSale({ buyerPubkey: BUYER, timeout: new Date(Date.now() + 6 * HOUR).toISOString() });
   s.magma.buyerPaidAmboss(sale.id);
   s.magma.behave.AcceptOrder = (n) => (n < 2 ? "hang" : "apply-then-hang");
+  const t1 = performance.now();
   for (let i = 0; i < 3; i++) await s.autopilot.pollSellOrders();
+  // Each accept waits its own deadline (90 s live, 60 ms here) — not the
+  // usual 25 s of a mutation: three passes would take over a minute.
+  assert.ok(performance.now() - t1 < 15_000, `${Math.round(performance.now() - t1)} ms`);
+  assert.equal(saved, 90_000, "the accept waits 90 s for Amboss's answer");
   assert.equal(s.magma.count("AcceptOrder"), 3);
   assert.equal(s.magma.sales.get(sale.id)?.status, "WAITING_FOR_CHANNEL_OPEN");
   let e = entryOnDisk(s.dir, sale.id);
@@ -370,6 +429,45 @@ test("an invoice of ours that no accept of ours carried to Amboss is not opened 
   assert.equal(opens(s).length, 1);
 });
 
+test("Amboss answers this node's accept with an error and then shows the order accepted — by another accept, made elsewhere with another invoice: the lane opens nothing by itself for it, says why, and the operator's click opens", async (t) => {
+  feeEnv(t);
+  quiet(t);
+  const s = sellerSetup(t);
+  s.node.peers.push(BUYER);
+  s.magma.behave.AcceptOrder = "refuse";
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepting");
+  assert.ok(entryOnDisk(s.dir, sale.id)?.acceptSentAt, "the accept went out");
+  // Accepted on Amboss's website meanwhile; the buyer paid Amboss.
+  s.magma.sales.get(sale.id)!.status = "WAITING_FOR_CHANNEL_OPEN";
+  for (let i = 0; i < 3; i++) await s.autopilot.pollSellOrders();
+  assert.equal(opens(s).length, 0, "before: opened, and waited for a payment to an invoice Amboss may not have");
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "accepted");
+  assert.equal(e?.acceptSentAt, undefined);
+  assert.equal(e?.decision?.reason, ACCEPT_REFUSED_WAIT);
+  assert.equal(events(s, sale.id).filter((w) => w === ACCEPT_REFUSED_WAIT).length, 1, "said once");
+  assert.ok(!events(s, sale.id).includes(HOLDS));
+  assert.equal(s.desk.opensItself(sale.id), false);
+  assert.ok(
+    events(s, sale.id).some((w) => /^Amboss shows the order accepted, after it answered this node's accept with an error \(.*Invoice amount does not match the order.*\)$/.test(w)),
+    "the record names the refusal it follows",
+  );
+  // …and an alert tells the operator, with the order's last moment to open
+  // (review of P1c, m6: nothing did).
+  const [alert, ...more] = magmaOpenYoursAlerts(s.desk);
+  assert.deepEqual(more, []);
+  assert.equal(
+    alert?.message,
+    `A 2,000,000 sat Magma order waits for you to open its channel: ${ACCEPT_REFUSED_WAIT}. Its last moment to open is ${minuteOf(invoiceMade(s, sale.id) + 42 * HOUR)} UTC. “Open channel” on Market → Orders opens it, while that costs no more than the order brings.`,
+  );
+  const clicked = await s.desk.open(sale.id);
+  assert.equal(clicked.ok, true, JSON.stringify(clicked));
+  assert.equal(opens(s).length, 1);
+  assert.deepEqual(magmaOpenYoursAlerts(s.desk), [], "gone once the channel is out");
+});
+
 // ── the open that cannot be made, and its fee ──────────────────────────────
 
 test("the buyer's node cannot be reached for as long as an open would still be in time: tried until six hours before Amboss's deadline, then the order ends — our invoice cancelled, the coins free, and the operator told that Amboss refunds the buyer", async (t) => {
@@ -405,26 +503,263 @@ test("the buyer's node cannot be reached for as long as an open would still be i
   assert.match(alert?.message ?? "", /Nothing was paid to this node; Amboss refunds the buyer and may count the order against your seller score\./);
 });
 
-test("on-chain fees above what the sale earns: the unpaid order's open waits for lower fees, and from twelve hours before Amboss's deadline the channel is opened whatever the fee, at LND's three-block estimate", async (t) => {
+test("on-chain fees above what the sale earns: the unpaid order's open waits for lower fees, and in the six hours before its last moment to open it is priced at LND's three-block estimate — no dearer than the order brings, opened (before: opened whatever the fee)", async (t) => {
   const { s, sale } = await prepaidOrder(t);
-  estimate(s, 400, 520);
+  estimate(s, 400, 60);
   const t0 = Date.now();
   await s.autopilot.pollSellOrders();
   assert.deepEqual(openRates(s), []);
-  assert.match(entryOnDisk(s.dir, sale.id)?.lastError ?? "", /^on-chain fees are 400 sat\/vB: .*; Amboss holds the buyer's payment, so the channel is opened whatever the fee from /);
-  // Just before the forced open: still waiting.
+  assert.match(entryOnDisk(s.dir, sale.id)?.lastError ?? "", /^on-chain fees are 400 sat\/vB: .*; Amboss holds the buyer's payment\. If the open still costs more at .*, the order is ended then and Amboss refunds the buyer/);
+  // Just before the moment: still waiting.
   t.mock.timers.enable({ apis: ["Date"], now: t0 + PREPAID_CHANNEL_WINDOW_MS - 12 * HOUR - 10 * 60_000 });
   await s.autopilot.pollSellOrders();
   assert.deepEqual(openRates(s), []);
-  // From six hours before the last moment to open: whatever the fee — a
-  // sale this node accepted is to complete.
+  // At it: LND's estimate for about three blocks, 60 sat/vB — 10,500 sat
+  // against the 12,221 the order brings: opened.
   t.mock.timers.setTime(t0 + PREPAID_CHANNEL_WINDOW_MS - 12 * HOUR + 60_000);
   await s.autopilot.pollSellOrders();
-  assert.deepEqual(openRates(s), [520], "LND's estimate for about three blocks: it is the confirmation that counts now");
+  assert.deepEqual(openRates(s), [60], "LND's estimate for about three blocks: it is the confirmation that counts now");
   const e = entryOnDisk(s.dir, sale.id);
   assert.equal(e?.phase, "reported");
-  assert.ok(events(s, sale.id).includes("open started at 520 sat/vB"));
+  assert.ok(events(s, sale.id).includes("open started at 60 sat/vB"));
 });
+
+for (const [when, at] of [
+  ["a pass in its last minutes", PREPAID_CHANNEL_WINDOW_MS - 6 * HOUR - 5 * 60_000],
+  ["the first pass after it (the app was down)", PREPAID_CHANNEL_WINDOW_MS - 6 * HOUR + 60_000],
+] as const) test(`dearer than the order brings all through its last six hours: no open, and at its last moment to open — ${when} — the order is ended — our invoice cancelled, the coins free — and the alert says why with both numbers (othervice's ceiling, 2026-11-12; before: opened at 520 sat/vB, 91,000 sat for a sale of 12,221)`, async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  estimate(s, 400, 520);
+  const t0 = Date.now();
+  await s.autopilot.pollSellOrders();
+  // Six hours before its last moment to open: priced to confirm fast — and
+  // still dearer: it waits on, and says until when (Amboss refunds the buyer
+  // at its own deadline either way: ended now, six hours in which fees could
+  // fall were lost — review of P1c, M2).
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + PREPAID_CHANNEL_WINDOW_MS - 12 * HOUR + 60_000 });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted");
+  assert.match(
+    entryOnDisk(s.dir, sale.id)?.lastError ?? "",
+    new RegExp(`^on-chain fees are 520 sat/vB: .*If the open still costs more at ${minuteOf(invoiceMade(s, sale.id) + PREPAID_CHANNEL_WINDOW_MS - 6 * HOUR)} UTC, the order is ended then`),
+  );
+  t.mock.timers.setTime(t0 + at);
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRates(s), [], "nothing opened");
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "cancelled");
+  assert.equal(s.node.invoices.get(hash)?.state, "CANCELED");
+  assert.match(
+    e?.reason ?? "",
+    at < PREPAID_CHANNEL_WINDOW_MS - 6 * HOUR
+      ? /^on-chain fees are 520 sat\/vB: opening the channel would cost about 91,000 sat, more than the 12,221 sat this sale earns — ended at its last moment to open instead of opened: no channel is opened that costs more than the order brings$/
+      : // (Last looked at six hours before, the app down since: said so.)
+        /^on-chain fees are 520 sat\/vB: opening the channel would cost about 91,000 sat, more than the 12,221 sat this sale earns, when last looked at \(\d{4}-\d\d-\d\d \d\d:\d\d UTC\) — ended once its last moment to open had passed, not opened: no channel is opened that costs more than the order brings$/,
+  );
+  const [alert] = s.desk.refunds();
+  assert.deepEqual([alert?.orderId, alert?.heldBy], [sale.id, "amboss"]);
+  assert.match(alert?.reason ?? "", /91,000 sat, more than the 12,221 sat/);
+  assert.equal(s.autopilot.capital.reservedSat(), 0, "the coins are free");
+});
+
+test("with no fee estimate at all to the last nothing is opened blind: at its last moment to open the order is ended and the record says the fee could not be estimated", async (t) => {
+  // (openFeeUnknown: the bare fake LND gives no estimate, and the setup does
+  // not stand in its rate of 1 sat/vB.)
+  const { s, sale, hash } = await prepaidOrder(t, { openFeeUnknown: true });
+  const t0 = Date.now();
+  await s.autopilot.pollSellOrders();
+  assert.match(entryOnDisk(s.dir, sale.id)?.lastError ?? "", /^LND gives no on-chain fee estimate, so what opening the channel would cost is unknown; Amboss holds/);
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + PREPAID_CHANNEL_WINDOW_MS - 12 * HOUR + 60_000 });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted", "it waits on for an estimate");
+  t.mock.timers.setTime(t0 + PREPAID_CHANNEL_WINDOW_MS - 6 * HOUR + 60_000);
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRates(s), []);
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "cancelled");
+  assert.equal(s.node.invoices.get(hash)?.state, "CANCELED");
+  assert.match(e?.reason ?? "", /^LND gives no on-chain fee estimate, so what opening the channel would cost is unknown, when last looked at \(.* UTC\) — ended once its last moment to open had passed, not opened/);
+});
+
+test("a click on such an order gets the same answer with both numbers, and the order goes on waiting", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  estimate(s, 400, 520);
+  await s.autopilot.pollSellOrders();
+  const res = await s.desk.open(sale.id);
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.match(
+    res.message ?? "",
+    /^not opened: on-chain fees are 400 sat\/vB: opening the channel would cost about 70,000 sat, more than the 12,221 sat this sale earns — LightningMate opens no channel that costs more than the order brings; if the open still costs more at \d{4}-\d\d-\d\d \d\d:\d\d UTC, the order is ended then and Amboss refunds the buyer$/,
+  );
+  assert.deepEqual(openRates(s), []);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted");
+  assert.equal(s.node.invoices.get(hash)?.state, "OPEN");
+});
+
+// ── review of P1b, R10: the window with an odd `timeout` ─────────────────────
+
+/** A moment as the record names it (minutes, UTC). */
+const minuteOf = (ms: number) => new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+/** When our invoice for the order was made (its expiry less its 49 hours). */
+const invoiceMade = (s: Setup, id: string) => Date.parse(entryOnDisk(s.dir, id)?.invoice?.expiresAt ?? "") - 49 * HOUR;
+/** The moment the wait reason says the order is ended at, should the open still cost more. */
+const decidedAt = (s: Setup, id: string) => /If the open still costs more at (\d{4}-\d\d-\d\d \d\d:\d\d) UTC/.exec(entryOnDisk(s.dir, id)?.lastError ?? "")?.[1];
+
+for (const [what, timeoutAfter, decidedAfter] of [
+  ["Amboss's 48 hours (the live case): its last moment to open 42 hours after our invoice", 48 * HOUR, 42 * HOUR],
+  ["no `timeout`: Amboss's 48 hours are counted from our invoice — 42 hours, not the invoice's own 49 less 6", null, 42 * HOUR],
+  ["a `timeout` from before our invoice is none: the 48 hours count", -HOUR, 42 * HOUR],
+  ["a `timeout` after our invoice's end: the invoice's end is the limit — 49 hours less 6", 60 * HOUR, 43 * HOUR],
+] as const) {
+  test(`the window of an order Amboss holds the payment for, with ${what}`, async (t) => {
+    const { s, sale } = await prepaidOrder(t);
+    estimate(s, 400);
+    const made = invoiceMade(s, sale.id);
+    s.magma.sales.get(sale.id)!.timeout = timeoutAfter === null ? null : new Date(made + timeoutAfter).toISOString();
+    await s.autopilot.pollSellOrders();
+    assert.equal(decidedAt(s, sale.id), minuteOf(made + decidedAfter), entryOnDisk(s.dir, sale.id)?.lastError);
+    assert.deepEqual(openRates(s), []);
+  });
+}
+
+test("a short `timeout` halves the margin: Amboss gives 10 hours, so the open may be started until 5 hours after our invoice, not 4 — and it is decided at once", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  estimate(s, 400);
+  const made = invoiceMade(s, sale.id);
+  s.magma.sales.get(sale.id)!.timeout = new Date(made + 10 * HOUR).toISOString();
+  // Four and a half hours in, fees are low again: still in time to open.
+  t.mock.timers.enable({ apis: ["Date"], now: made + 4.5 * HOUR });
+  estimate(s, 10, 20);
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRates(s), [20], "opened, at the three-block estimate: the order is past its forcing moment");
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
+});
+
+test("a `timeout` half an hour away and fees above what the sale earns: its last moment to open is 15 minutes after our invoice — waited for to then, and the order ended, not opened", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  const made = invoiceMade(s, sale.id);
+  s.magma.sales.get(sale.id)!.timeout = new Date(made + 30 * 60_000).toISOString();
+  estimate(s, 400);
+  t.mock.timers.enable({ apis: ["Date"], now: made + 60_000 });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted");
+  t.mock.timers.setTime(made + 6 * 60_000);
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRates(s), []);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "cancelled");
+  assert.match(entryOnDisk(s.dir, sale.id)?.reason ?? "", /— ended at its last moment to open instead of opened/);
+  assert.equal(s.node.invoices.get(hash)?.state, "CANCELED");
+});
+
+// ── review of P1b, R9: the operator's order in the last six hours ────────────
+
+/** An order the operator accepted with selling switched off; Amboss holds
+ *  the buyer's payment, and the lane leaves the open to them. */
+async function operatorsOrder(t: TestContext) {
+  feeEnv(t);
+  quiet(t);
+  const s = sellerSetup(t, { config: { sellEnabled: false } });
+  s.node.peers.push(BUYER);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  s.magma.buyerPaidAmboss(sale.id);
+  await s.autopilot.pollSellOrders();
+  const accepted = await s.autopilot.magma.accept(sale.id);
+  assert.equal(accepted.ok, true, JSON.stringify(accepted));
+  await s.autopilot.pollSellOrders();
+  const payBy = Date.parse(s.magma.sales.get(sale.id)!.timeout ?? "");
+  return { s, sale, payBy, hash: acceptedInvoice(s.magma.sales.get(sale.id)!).id };
+}
+
+test("the operator's order says by when to open it, and “Open channel” in the last six hours before Amboss's deadline says that the order is ended and why — before, “no time left” ended it without a word of it", async (t) => {
+  const { s, sale, payBy, hash } = await operatorsOrder(t);
+  assert.equal(
+    entryOnDisk(s.dir, sale.id)?.decision?.reason,
+    `Amboss holds the buyer's payment — waiting for you to open the channel by ${minuteOf(payBy - 6 * HOUR)} UTC: Amboss ends the order unless its channel is there by ${minuteOf(payBy)} UTC, and a channel opened later could not get its confirmations in time`,
+  );
+  t.mock.timers.enable({ apis: ["Date"], now: payBy - 5 * HOUR });
+  estimate(s, 10, 20);
+  const clicked = await s.autopilot.magma.open(sale.id);
+  assert.equal(clicked.ok, false);
+  assert.equal(
+    clicked.message,
+    `no time left to open the channel: Amboss ends the order unless its channel is there by ${minuteOf(payBy)} UTC, and a channel opened after ${minuteOf(payBy - 6 * HOUR)} UTC could not get its confirmations in time — the order is ended here, and Amboss refunds the buyer`,
+  );
+  assert.deepEqual(openRates(s), []);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "cancelled");
+  assert.equal(s.node.invoices.get(hash)?.state, "CANCELED");
+});
+
+test("…and with no click by then the lane ends it at its last moment to open, as the click would: the coins free, our invoice cancelled, the refund told — and the alert to open it goes (review of P1c round 2, N-3)", async (t) => {
+  const { s, sale, payBy, hash } = await operatorsOrder(t);
+  t.mock.timers.enable({ apis: ["Date"], now: payBy - 6 * HOUR - 60_000 });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted", "a minute before it: still the operator's");
+  assert.equal(magmaOpenYoursAlerts(s.desk).length, 1);
+  t.mock.timers.setTime(payBy - 6 * HOUR + 60_000);
+  await s.autopilot.pollSellOrders();
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "cancelled");
+  assert.equal(
+    e?.reason,
+    `the channel was not opened by its last moment to open (${minuteOf(payBy - 6 * HOUR)} UTC): Amboss ends the order unless its channel is there by ${minuteOf(payBy)} UTC, and a channel opened later could not get its confirmations in time`,
+  );
+  assert.equal(s.node.invoices.get(hash)?.state, "CANCELED");
+  assert.equal(s.capital.reservedSat(), 0);
+  assert.deepEqual(openRates(s), []);
+  assert.deepEqual(magmaOpenYoursAlerts(s.desk), [], "an ended order waits for no open");
+  assert.equal(magmaRefundAlerts(s.desk).length, 1);
+});
+
+test("…and just before those six hours the click opens it, at the three-block estimate", async (t) => {
+  const { s, sale, payBy } = await operatorsOrder(t);
+  t.mock.timers.enable({ apis: ["Date"], now: payBy - 6 * HOUR - 5 * 60_000 });
+  estimate(s, 10, 20);
+  const clicked = await s.autopilot.magma.open(sale.id);
+  assert.equal(clicked.ok, true, JSON.stringify(clicked));
+  assert.deepEqual(openRates(s), [20]);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
+});
+
+test("a click on the operator's order above what it brings is refused with both numbers and says until when it can be opened — not that the lane ends it", async (t) => {
+  const { s, sale, payBy } = await operatorsOrder(t);
+  estimate(s, 400);
+  const clicked = await s.autopilot.magma.open(sale.id);
+  assert.equal(clicked.ok, false);
+  assert.equal(
+    clicked.message,
+    `not opened: on-chain fees are 400 sat/vB: opening the channel would cost about 70,000 sat, more than the 12,221 sat this sale earns — LightningMate opens no channel that costs more than the order brings; “Open channel” can open it until ${minuteOf(payBy - 6 * HOUR)} UTC — after that the order is ended and Amboss refunds the buyer`,
+  );
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted");
+});
+
+test("a click on the lane's order in its last six hours, above what it brings: refused, and the answer says when the order is ended should it still cost more", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  estimate(s, 400);
+  const made = invoiceMade(s, sale.id);
+  t.mock.timers.enable({ apis: ["Date"], now: made + 37 * HOUR });
+  const clicked = await s.autopilot.magma.open(sale.id);
+  assert.equal(clicked.ok, false);
+  assert.match(clicked.message ?? "", new RegExp(`costs more than the order brings; if the open still costs more at ${minuteOf(made + 42 * HOUR)} UTC, the order is ended then and Amboss refunds the buyer$`));
+  assert.deepEqual(openRates(s), []);
+});
+
+// Review of P1c, m2.
+for (const [usual, opened] of [
+  [60, [69]],
+  [69, [69]],
+  [70, []],
+] as const) {
+  test(`in its last six hours the three-block rate is dearer than the order brings and LND's usual estimate is ${usual} sat/vB: ${opened.length ? "opened at the highest rate the order pays for (69 sat/vB, 12,075 sat of its 12,221)" : "that is above what the order pays for — it waits"}`, async (t) => {
+    const { s } = await prepaidOrder(t);
+    estimate(s, 400);
+    const t0 = Date.now();
+    await s.autopilot.pollSellOrders();
+    t.mock.timers.enable({ apis: ["Date"], now: t0 + PREPAID_CHANNEL_WINDOW_MS - 12 * HOUR + 60_000 });
+    estimate(s, usual, 80);
+    await s.autopilot.pollSellOrders();
+    assert.deepEqual(openRates(s), opened);
+  });
+}
 
 test("an invoice of ours that is for another amount than the order earns is not opened for", async (t) => {
   const { s, sale, hash } = await prepaidOrder(t);
@@ -470,6 +805,22 @@ test("a payment is claimed only for a channel LND shows: Amboss reports the chan
   assert.equal(salesOnDisk(s.dir).length, 0);
 });
 
+test("the payment is here and its claim is held up: the operator is not told that Amboss has not paid — the order's record says what holds the claim up", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  await s.autopilot.pollSellOrders();
+  s.node.pending.splice(0);
+  s.magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  const t0 = Date.now();
+  await s.autopilot.pollSellOrders();
+  assert.ok(entryOnDisk(s.dir, sale.id)?.unpaidSince, "confirmed, and nothing paid yet");
+  s.node.payHoldInvoice(hash);
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + PAYMENT_OVERDUE_MS + HOUR });
+  for (let i = 0; i < 2; i++) await s.autopilot.pollSellOrders();
+  assert.match(entryOnDisk(s.dir, sale.id)?.lastError ?? "", /but LND shows no channel .* — the payment is not claimed/);
+  assert.deepEqual(s.desk.paymentsOverdue(), [], "Amboss has paid: the payment is held here");
+  assert.deepEqual(magmaOverduePaymentAlerts(s.desk), []);
+});
+
 // ── Amboss ends the order after our open ───────────────────────────────────
 
 test("Amboss turns the channel down after our open (INVALID_CHANNEL_OPENING): our invoice is cancelled so nothing can be paid for it later, the channel is left alone, and the operator is told it is theirs to close or keep", async (t) => {
@@ -488,8 +839,11 @@ test("Amboss turns the channel down after our open (INVALID_CHANNEL_OPENING): ou
   assert.equal(s.capital.reservedSat(), 0);
   const [alert] = magmaUnpaidChannelAlerts(s.desk);
   assert.equal(alert?.id, `magma:${sale.id}`);
-  assert.match(alert?.message ?? "", /^A 2,000,000 sat Magma order ended without payment after its channel was opened: Amboss ended the order: INVALID_CHANNEL_OPENING/);
-  assert.match(alert?.message ?? "", new RegExp(`The channel ${outpoint} stays open and is yours: close it to take the capital back, or keep it for routing\\.$`));
+  assert.equal(
+    alert?.message,
+    `A 2,000,000 sat Magma order ended without payment after its channel was opened: Amboss ended the order: INVALID_CHANNEL_OPENING. The channel ${outpoint} stays open and is yours: close it to take the capital back, or keep it for routing.`,
+    "the channel named once",
+  );
   assert.deepEqual(magmaRefundAlerts(s.desk), [], "one alert for the order, and the one that names the channel");
   assert.equal(salesOnDisk(s.dir).length, 0);
 });
@@ -521,7 +875,7 @@ test("selling switched off, the operator accepted by hand and Amboss holds the b
   assert.equal(accepted.ok, true, JSON.stringify(accepted));
   for (let i = 0; i < 2; i++) await s.autopilot.pollSellOrders();
   assert.equal(opens(s).length, 0, "the operator's order: their open");
-  assert.equal(entryOnDisk(s.dir, sale.id)?.decision?.reason, "Amboss holds the buyer's payment — waiting for you to open the channel");
+  assert.match(entryOnDisk(s.dir, sale.id)?.decision?.reason ?? "", /^Amboss holds the buyer's payment — waiting for you to open the channel by .* UTC: Amboss ends the order unless its channel is there by .* UTC, and a channel opened later could not get its confirmations in time$/);
   const clicked = await s.autopilot.magma.open(sale.id);
   assert.equal(clicked.ok, true, JSON.stringify(clicked));
   assert.equal(opens(s).length, 1);
@@ -953,7 +1307,12 @@ test("the channel Amboss names for a confirmed order is closed by now and on the
   for (let i = 0; i < 2; i++) await s.autopilot.pollSellOrders();
   const e = entryOnDisk(s.dir, second.id);
   assert.deepEqual([e?.phase, e?.fundingOutpoint], ["accepted", undefined]);
-  assert.match(e?.lastError ?? "", /^Amboss reports VALID_CHANNEL_OPENING, but .* — the payment is not claimed; check /);
+  // Said as it is: the channel is there, closed, on the other sale's record
+  // — before, "LND shows no channel of this node to the buyer".
+  assert.equal(
+    e?.lastError,
+    `Amboss reports VALID_CHANNEL_OPENING, but the channel Amboss names for this order (${outpoint}) is on record here as another sale's — the payment is not claimed; check both orders on Amboss`,
+  );
   assert.equal(entryOnDisk(s.dir, sale.id)?.fundingOutpoint, outpoint, "the earlier sale keeps its channel");
   assert.equal(s.node.invoices.get(hash)?.state, "ACCEPTED", "held, not claimed");
   assert.deepEqual([s.node.callsTo("invoices.settleInvoice").length, salesOnDisk(s.dir).length, opens(s).length], [0, 0, 1]);
@@ -1000,6 +1359,49 @@ test("Amboss has a funding transaction for an order still waiting for its channe
   assert.ok(!events(s, sale.id).some((w) => /^not opened: Amboss shows the order as/.test(w)));
   assert.equal(s.magma.count("AddTransaction"), 0);
   assert.ok(s.capital.reservedSat() > 0, "its coins stay promised");
+});
+
+test("…the operator is told at once, and at the order's last moment to open it is ended like any other: our invoice cancelled, the coins free, the buyer refunded — before, it stayed accepted, its coins reserved, until Amboss ended it", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  const named = `${"97".repeat(32)}:0`;
+  s.magma.sales.get(sale.id)!.transactionId = named;
+  const t0 = Date.now();
+  await s.autopilot.pollSellOrders();
+  const [alert, ...more] = magmaChannelNotShownAlerts(s.desk);
+  assert.deepEqual(more, []);
+  assert.match(
+    alert?.message ?? "",
+    new RegExp(
+      `^A 2,000,000 sat Magma order: Amboss already has a funding transaction for this order \\(${named}\\) that LND does not show as a channel of this node to the buyer — nothing is opened; check the order\\. ` +
+        "Unless the channel shows up, the order is ended at \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC, its last moment to open, and Amboss refunds the buyer\\. See Market → Orders for the order\\.$",
+    ),
+  );
+  // Still in time: it waits.
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + PREPAID_CHANNEL_WINDOW_MS - 6 * HOUR - 60_000 });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted");
+  t.mock.timers.setTime(t0 + PREPAID_CHANNEL_WINDOW_MS - 6 * HOUR + 60_000);
+  await s.autopilot.pollSellOrders();
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "cancelled");
+  assert.equal(e?.reason, `Amboss already has a funding transaction for this order (${named}) that LND does not show as a channel of this node to the buyer — nothing is opened — ended at its last moment to open`);
+  assert.equal(s.node.invoices.get(hash)?.state, "CANCELED");
+  assert.equal(s.capital.reservedSat(), 0);
+  assert.equal(opens(s).length, 0);
+  assert.deepEqual(magmaChannelNotShownAlerts(s.desk), [], "the order ended: the refund's alert says what happened");
+  assert.equal(magmaRefundAlerts(s.desk).length, 1);
+});
+
+test("Amboss stops naming the transaction LND does not show: the alert goes, and the order is opened for as any other", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  s.magma.sales.get(sale.id)!.transactionId = `${"96".repeat(32)}:0`;
+  await s.autopilot.pollSellOrders();
+  assert.equal(magmaChannelNotShownAlerts(s.desk).length, 1);
+  s.magma.sales.get(sale.id)!.transactionId = null;
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(magmaChannelNotShownAlerts(s.desk), []);
+  assert.equal(opens(s).length, 1);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.channelNotShown, undefined);
 });
 
 for (const [what, change, said, after] of [
@@ -1261,4 +1663,375 @@ test("the buyer's node refuses the channel of an order Amboss holds the payment 
   assert.equal(s.node.invoices.get(hash)?.state, "CANCELED");
   assert.equal(s.capital.reservedSat(), 0);
   assert.equal(opens(s).length, 2);
+});
+
+// ── review of P1b, R16: smaller behaviours, each held by a test ─────────────
+
+test("Amboss confirms a channel that is closed by now, opened here for the order: it was delivered — the payment is claimed and the sale booked", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  await s.autopilot.pollSellOrders();
+  const outpoint = entryOnDisk(s.dir, sale.id)?.fundingOutpoint;
+  assert.ok(outpoint);
+  s.node.pending.splice(0);
+  s.node.override("default.closedChannels", (_a, cb) => cb(null, { channels: [closedChannel(outpoint.split(":")[0], { channel_point: outpoint })] }));
+  s.magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  s.magma.ambossPays(sale.id, s.node);
+  for (let i = 0; i < 2; i++) await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "settled");
+  assert.equal(s.node.invoices.get(hash)?.state, "SETTLED");
+  assert.equal(salesOnDisk(s.dir).length, 1);
+});
+
+test("Amboss confirmed the channel and our invoice is cancelled before its time, unpaid: the order ends at once, unbooked, and the record says the invoice was cancelled — not that it expired", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  await s.autopilot.pollSellOrders();
+  const outpoint = entryOnDisk(s.dir, sale.id)?.fundingOutpoint;
+  s.magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.decision?.reason, AWAITING_AMBOSS_PAYMENT);
+  s.node.expireHoldInvoice(hash);
+  await s.autopilot.pollSellOrders();
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.deepEqual([e?.phase, e?.unbooked], ["settled", true]);
+  assert.equal(
+    e?.reason,
+    `Amboss reports VALID_CHANNEL_OPENING, but our invoice was cancelled unpaid — not booked as a sale: this node received nothing for it; its channel ${outpoint} keeps the lease's promises`,
+  );
+  assert.equal(salesOnDisk(s.dir).length, 0);
+});
+
+test("an order Amboss ends after it confirmed the channel and before it paid is not said to be waiting for Amboss's payment", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  await s.autopilot.pollSellOrders();
+  s.magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  const t0 = Date.now();
+  await s.autopilot.pollSellOrders();
+  assert.ok(entryOnDisk(s.dir, sale.id)?.unpaidSince);
+  s.magma.setStatus(sale.id, "ADMIN_CLOSED");
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "cancelled");
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + PAYMENT_OVERDUE_MS + HOUR });
+  assert.deepEqual(s.desk.paymentsOverdue(), []);
+});
+
+test("“channel open, not paid” is told for a week and then no more", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  await s.autopilot.pollSellOrders();
+  s.magma.setStatus(sale.id, "INVALID_CHANNEL_OPENING");
+  const t0 = Date.now();
+  await s.autopilot.pollSellOrders();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + 7 * 24 * HOUR - 60_000 });
+  assert.equal(magmaUnpaidChannelAlerts(s.desk).length, 1);
+  t.mock.timers.setTime(t0 + 7 * 24 * HOUR + 60_000);
+  assert.deepEqual(magmaUnpaidChannelAlerts(s.desk), []);
+});
+
+test("a part of the fee arriving on our invoice after the open is not taken for Amboss's payment", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
+  s.node.payHoldInvoice(hash, { mtokens: "1000000" });
+  for (let i = 0; i < 2; i++) await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.heldAt, undefined);
+  assert.ok(!events(s, sale.id).some((w) => w.startsWith("Amboss's payment arrived")));
+});
+
+// While Amboss cannot be reached the pass runs on LND alone (maintainFromLnd).
+
+test("Amboss unreachable, the channel out and our invoice cancelled unpaid: nothing ends while Amboss can't be asked — what Amboss says of the order decides", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  await s.autopilot.pollSellOrders();
+  s.magma.readBehaviour = "throw";
+  s.node.expireHoldInvoice(hash);
+  for (let i = 0; i < 2; i++) await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
+});
+
+test("Amboss unreachable, the channel out and our invoice past its time unpaid: nothing ends while Amboss can't be asked", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  await s.autopilot.pollSellOrders();
+  s.magma.readBehaviour = "throw";
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse(entryOnDisk(s.dir, sale.id)?.invoice?.expiresAt ?? "") + 60_000 });
+  for (let i = 0; i < 2; i++) await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
+});
+
+test("Amboss unreachable and its payment arrives after the open with little time left on the HTLC: it is noted, and released before it expires in the same pass", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  await s.autopilot.pollSellOrders();
+  s.magma.readBehaviour = "throw";
+  s.node.payHoldInvoice(hash, { expiryHeight: s.node.blockHeight + CANCEL_MARGIN_BLOCKS });
+  await s.autopilot.pollSellOrders();
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.ok(events(s, sale.id).includes("Amboss's payment arrived (12345 sat) — held until Amboss confirms the channel"), events(s, sale.id).join(" | "));
+  assert.equal(e?.heldUntilHeight, s.node.blockHeight + CANCEL_MARGIN_BLOCKS, "the HTLC's height is on the record");
+  assert.equal(e?.phase, "cancelled");
+  assert.equal(e?.reason, "the held payment was about to expire before Amboss confirmed the channel");
+  assert.equal(s.node.invoices.get(hash)?.state, "CANCELED");
+});
+
+test("an open interrupted before LND was asked, of an order Amboss holds the payment for: after the restart it goes back to waiting for its channel — not to a held payment it never had — and is opened", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  const reached = crashAt(s.desk, "lndOpen", "before");
+  void s.autopilot.pollSellOrders();
+  await until(reached, "the open");
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "opening");
+  const t0 = Date.now();
+  const again = s.restart();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + OPENING_GRACE_MS + 60_000 });
+  await again.pollSellOrders();
+  assert.ok(events(s, sale.id).includes("no channel appeared for the interrupted open — it never happened"));
+  await again.pollSellOrders();
+  assert.equal(opens(s).length, 1);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
+});
+
+test("a payment held and never claimed for want of a channel LND shows, then let go by LND near its expiry: the record says it was here and why it was not claimed — not “our invoice expired unpaid”", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  await s.autopilot.pollSellOrders();
+  const outpoint = entryOnDisk(s.dir, sale.id)?.fundingOutpoint;
+  s.node.pending.splice(0);
+  s.magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  s.node.payHoldInvoice(hash);
+  await s.autopilot.pollSellOrders();
+  assert.ok(events(s, sale.id).includes("Amboss's payment arrived (12345 sat) — held; claimed once nothing holds the claim up (the order's error says what does)"));
+  s.node.expireHoldInvoice(hash);
+  await s.autopilot.pollSellOrders();
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "cancelled");
+  assert.equal(e?.reason, `the held payment went back when LND let it go near its expiry, never claimed: Amboss reports VALID_CHANNEL_OPENING, but LND shows no channel ${outpoint}`);
+  assert.equal(salesOnDisk(s.dir).length, 0);
+});
+
+// ── tests the mutation check of P1c asked for ───────────────────────────────
+
+test("at the forcing moment LND gives no three-block estimate but its usual one: the open is priced at the usual one — not ended for want of an estimate", async (t) => {
+  const { s, sale } = await prepaidOrder(t, { openFeeUnknown: true });
+  estimate(s, 400);
+  const t0 = Date.now();
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRates(s), [], "waits while fees are high");
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + PREPAID_CHANNEL_WINDOW_MS - 12 * HOUR + 60_000 });
+  s.node.override("wallet.estimateFee", (a, cb) => (Number(a.conf_target) === 3 ? cb([503, "UnexpectedEstimateFeeError"]) : cb(null, { sat_per_kw: String(10 * 250) })));
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRates(s), [10]);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
+});
+
+test("a record that does not say which channels the buyer had at the accept, and a same-size channel that appears while the buyer is dialed for the open: nothing is opened beside it — the look under the lock", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  s.desk.journal.get(sale.id)!.preExistingAtAccept = undefined;
+  const txid = "b3".repeat(32);
+  duringDial(s, () => {
+    if (!s.node.pending.length) s.node.pending.push({ partnerPublicKey: BUYER, capacity: 2_000_000, transactionId: txid, transactionVout: 0 });
+  });
+  await s.autopilot.pollSellOrders();
+  assert.equal(opens(s).length, 0);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.fundingOutpoint, undefined);
+  assert.ok(events(s, sale.id).some((w) => w.startsWith(`a channel of the order's size to the buyer is being opened outside LightningMate (${txid}:0)`)));
+});
+
+test("Amboss's payment arrives while Amboss cannot be reached, after it confirmed the channel: once Amboss can be asked again nobody is told it has not paid", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  await s.autopilot.pollSellOrders();
+  s.magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  s.node.pending.splice(0);
+  const t0 = Date.now();
+  await s.autopilot.pollSellOrders();
+  assert.ok(entryOnDisk(s.dir, sale.id)?.unpaidSince);
+  s.magma.readBehaviour = "throw";
+  s.node.payHoldInvoice(hash);
+  await s.autopilot.pollSellOrders();
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.ok(e?.heldAt && e.unpaidSince, "held, noted on LND alone; the wait Amboss's word started is still on record");
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + PAYMENT_OVERDUE_MS + HOUR });
+  assert.deepEqual(s.desk.paymentsOverdue(), []);
+});
+
+test("a part of the fee arrives after Amboss confirmed the channel: no “Amboss has not paid” — the record says how much is held", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  await s.autopilot.pollSellOrders();
+  s.magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  const t0 = Date.now();
+  await s.autopilot.pollSellOrders();
+  assert.ok(entryOnDisk(s.dir, sale.id)?.unpaidSince);
+  s.node.payHoldInvoice(hash, { mtokens: "1000000" });
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + PAYMENT_OVERDUE_MS + HOUR });
+  await s.autopilot.pollSellOrders();
+  assert.match(entryOnDisk(s.dir, sale.id)?.lastError ?? "", /^Amboss reports VALID_CHANNEL_OPENING, but our invoice holds 1000 sat of the 12345 sat this order earns — not settled; check the order$/);
+  assert.deepEqual(s.desk.paymentsOverdue(), []);
+});
+
+test("Amboss stops naming the transaction LND does not show while fees are high: the alert goes at once, before anything is opened", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  estimate(s, 400);
+  s.magma.sales.get(sale.id)!.transactionId = `${"95".repeat(32)}:0`;
+  await s.autopilot.pollSellOrders();
+  assert.equal(magmaChannelNotShownAlerts(s.desk).length, 1);
+  s.magma.sales.get(sale.id)!.transactionId = null;
+  await s.autopilot.pollSellOrders();
+  assert.equal(opens(s).length, 0);
+  assert.deepEqual(magmaChannelNotShownAlerts(s.desk), []);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.channelNotShown, undefined);
+});
+
+test("the operator's click open of an order Amboss holds the payment for, interrupted before LND was asked: after the restart the order waits for their click again as such — not as a payment held by our invoice", async (t) => {
+  const { s, sale } = await operatorsOrder(t);
+  const reached = crashAt(s.desk, "lndOpen", "before");
+  void s.desk.open(sale.id);
+  await until(reached, "the open");
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "opening");
+  const t0 = Date.now();
+  const again = s.restart();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + OPENING_GRACE_MS + 60_000 });
+  await again.pollSellOrders();
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "accepted");
+  assert.match(e?.decision?.reason ?? "", /^Amboss holds the buyer's payment — waiting for you to open the channel/);
+  assert.equal(opens(s).length, 0);
+});
+
+// ── tests the review of P1c asked for ───────────────────────────────────────
+
+test("the operator's order: the alert names it once, with the reason that already says by when", async (t) => {
+  const { s, sale, payBy } = await operatorsOrder(t);
+  const [alert, ...more] = magmaOpenYoursAlerts(s.desk);
+  assert.deepEqual(more, []);
+  assert.equal(
+    alert?.message,
+    `A 2,000,000 sat Magma order waits for you to open its channel: Amboss holds the buyer's payment — waiting for you to open the channel by ${minuteOf(payBy - 6 * HOUR)} UTC: Amboss ends the order unless its channel is there by ${minuteOf(payBy)} UTC, and a channel opened later could not get its confirmations in time. “Open channel” on Market → Orders opens it, while that costs no more than the order brings.`,
+  );
+  assert.ok(sale);
+});
+
+test("new channels to the buyer of another size: only one this node opened and no other sale has is noted — not one the buyer opened, nor another sale's", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  estimate(s, 400);
+  const mine = "c1".repeat(32);
+  const buyers = "c2".repeat(32);
+  const anothers = "c3".repeat(32);
+  s.node.pending.push(
+    { partnerPublicKey: BUYER, capacity: 2_100_000, transactionId: mine, transactionVout: 0 },
+    { partnerPublicKey: BUYER, capacity: 3_000_000, transactionId: buyers, transactionVout: 0, partnerInitiated: true },
+    { partnerPublicKey: BUYER, capacity: 2_500_000, transactionId: anothers, transactionVout: 0, memo: "magma:another-order" },
+  );
+  await s.autopilot.pollSellOrders();
+  const said = events(s, sale.id).filter((w) => / sat channel to the buyer \(/.test(w));
+  assert.equal(said.length, 1, said.join(" | "));
+  assert.ok(said[0]!.includes(`${mine}:0`));
+});
+
+test("a record that does not list the buyer's channels at the accept: a confirmed channel of another size older than the order is not noted, a new one is", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  estimate(s, 400);
+  s.desk.journal.get(sale.id)!.preExistingAtAccept = undefined;
+  const old = "d1".repeat(32);
+  const fresh = "d2".repeat(32);
+  s.node.channels.push(
+    { id: "850000x3x0", partnerPublicKey: BUYER, capacity: 2_100_000, localBalance: 2_100_000, transactionId: old, transactionVout: 0 },
+    { id: "860000x3x0", partnerPublicKey: BUYER, capacity: 2_200_000, localBalance: 2_200_000, transactionId: fresh, transactionVout: 0 },
+  );
+  await s.autopilot.pollSellOrders();
+  const said = events(s, sale.id).filter((w) => / sat channel to the buyer \(/.test(w));
+  assert.equal(said.length, 1, said.join(" | "));
+  assert.ok(said[0]!.includes(`${fresh}:0`));
+});
+
+test("a click on an order whose payment our invoice holds, past Amboss's deadline for the open: the answer says the order is ended and the payment goes back", async (t) => {
+  feeEnv(t);
+  quiet(t);
+  const s = sellerSetup(t, { config: { sellEnabled: false } });
+  s.node.peers.push(BUYER);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  await s.autopilot.pollSellOrders();
+  assert.equal((await s.autopilot.magma.accept(sale.id)).ok, true);
+  const hash = s.magma.buyerPays(sale.id, s.node);
+  await s.autopilot.pollSellOrders();
+  const heldAt = Date.parse(entryOnDisk(s.dir, sale.id)?.heldAt ?? "");
+  assert.ok(Number.isFinite(heldAt), "held");
+  s.magma.sales.get(sale.id)!.timeout = new Date(heldAt + 60_000).toISOString();
+  t.mock.timers.enable({ apis: ["Date"], now: heldAt + 2 * 60_000 });
+  const clicked = await s.autopilot.magma.open(sale.id);
+  assert.equal(clicked.ok, false);
+  assert.equal(clicked.message, "no time left to open the channel — the order is ended here, and the buyer's payment goes back");
+  assert.equal(s.node.invoices.get(hash)?.state, "CANCELED");
+});
+
+test("Amboss names a transaction LND does not show, and then LND shows it: taken, and the alert goes", async (t) => {
+  const { s, sale } = await prepaidOrder(t);
+  const txid = "94".repeat(32);
+  s.magma.sales.get(sale.id)!.transactionId = `${txid}:0`;
+  await s.autopilot.pollSellOrders();
+  assert.equal(magmaChannelNotShownAlerts(s.desk).length, 1);
+  s.node.pending.push({ partnerPublicKey: BUYER, capacity: 2_000_000, transactionId: txid, transactionVout: 0 });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.fundingOutpoint, `${txid}:0`);
+  assert.deepEqual(magmaChannelNotShownAlerts(s.desk), []);
+  assert.equal(opens(s).length, 0);
+});
+
+test("Amboss names a transaction LND does not show, and then reports it confirmed: no end is promised any more — the alert goes, the record says what holds the payment up", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  const named = `${"93".repeat(32)}:0`;
+  s.magma.sales.get(sale.id)!.transactionId = named;
+  await s.autopilot.pollSellOrders();
+  assert.equal(magmaChannelNotShownAlerts(s.desk).length, 1);
+  s.magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
+  s.node.payHoldInvoice(hash);
+  await s.autopilot.pollSellOrders();
+  assert.deepEqual(magmaChannelNotShownAlerts(s.desk), []);
+  assert.match(entryOnDisk(s.dir, sale.id)?.lastError ?? "", /^Amboss reports VALID_CHANNEL_OPENING, but LND shows no channel of this node to the buyer for what Amboss names/);
+});
+
+test("an open retried in the last six hours — cheap when the buyer was away, dearer than the order brings when the buyer is back: waited for to its last moment to open, then ended with both numbers", async (t) => {
+  const { s, sale, hash } = await prepaidOrder(t);
+  s.node.peers.splice(s.node.peers.indexOf(BUYER), 1);
+  s.node.override("default.connectPeer", (_a, cb) => cb({ details: "dial tcp: i/o timeout" }));
+  const made = invoiceMade(s, sale.id);
+  t.mock.timers.enable({ apis: ["Date"], now: made + 36 * HOUR + 60_000 });
+  estimate(s, 10, 20);
+  await s.autopilot.pollSellOrders();
+  assert.equal(opens(s).length, 0, "the buyer is away");
+  assert.match(entryOnDisk(s.dir, sale.id)?.lastError ?? "", / — will try again$/);
+  // Back, and fees are up.
+  s.node.peers.push(BUYER);
+  s.node.override("default.connectPeer", (_a, cb) => cb(null, {}));
+  estimate(s, 400, 520);
+  t.mock.timers.setTime(made + 38 * HOUR);
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted", "waits: hours are left");
+  t.mock.timers.setTime(made + 42 * HOUR - 5 * 60_000);
+  await s.autopilot.pollSellOrders();
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.phase, "cancelled");
+  assert.match(e?.reason ?? "", /^on-chain fees are 520 sat\/vB: opening the channel would cost about 91,000 sat, more than the 12,221 sat this sale earns — ended at its last moment to open instead of opened/);
+  assert.equal(s.node.invoices.get(hash)?.state, "CANCELED");
+  assert.equal(opens(s).length, 0);
+});
+
+test("an order whose accept Amboss refused and then showed accepted: Amboss moving its deadline moves the moment the alert names, said once on the record; past it the lane ends the order and the refund is told (review of P1c round 2, N-3, t3)", async (t) => {
+  feeEnv(t);
+  quiet(t);
+  const s = sellerSetup(t);
+  s.node.peers.push(BUYER);
+  s.magma.behave.AcceptOrder = "refuse";
+  const sale = s.magma.addSale({ buyerPubkey: BUYER });
+  await s.autopilot.pollSellOrders();
+  s.magma.sales.get(sale.id)!.status = "WAITING_FOR_CHANNEL_OPEN";
+  await s.autopilot.pollSellOrders();
+  const made = invoiceMade(s, sale.id);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.decision?.until, new Date(made + 42 * HOUR).toISOString());
+  // Amboss names a deadline of its own: 40 hours.
+  s.magma.sales.get(sale.id)!.timeout = new Date(made + 40 * HOUR).toISOString();
+  await s.autopilot.pollSellOrders();
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.decision?.until, new Date(made + 34 * HOUR).toISOString());
+  assert.equal(events(s, sale.id).filter((w) => w === ACCEPT_REFUSED_WAIT).length, 1, "said once");
+  assert.match(magmaOpenYoursAlerts(s.desk)[0]?.message ?? "", new RegExp(`Its last moment to open is ${minuteOf(made + 34 * HOUR)} UTC\\.`));
+  t.mock.timers.enable({ apis: ["Date"], now: made + 34 * HOUR + 60_000 });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "cancelled");
+  assert.deepEqual(magmaOpenYoursAlerts(s.desk), []);
+  assert.equal(magmaRefundAlerts(s.desk).length, 1, "Amboss may hold the buyer's payment for it: the end is told");
+  assert.equal(opens(s).length, 0);
 });

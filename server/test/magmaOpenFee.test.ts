@@ -50,7 +50,7 @@ async function paidOrder(t: TestContext, opts: Parameters<typeof sellerSetup>[1]
 }
 
 const WHY_400 = "on-chain fees are 400 sat/vB: opening the channel would cost about 70,000 sat, more than the 2,411 sat this sale earns";
-const WAIT_400 = `${WHY_400} — waiting for lower fees (“Open channel” on Market → Orders opens it anyway)`;
+const WAIT_400 = `${WHY_400} — waiting for lower fees (“Open channel” opens it only once it costs no more than the order brings)`;
 
 test("fees rose between the accept and the payment: the lane's open waits while it would cost more than the sale earns, and goes out at a stated rate once it doesn't — before, at whatever LND picked", async (t) => {
   const { s, sale, hash } = await paidOrder(t);
@@ -173,18 +173,28 @@ test("an order that ended before the buyer paid is no refund: nothing to tell", 
   assert.equal(s.desk.acknowledgeRefusal(sale.id), false);
 });
 
-test("the operator's “Open channel” click opens whatever the fee — at the stated rate", async (t) => {
-  const { s, sale } = await paidOrder(t);
+test("the operator's “Open channel” click opens under the same ceiling: dearer than the order brings, it is refused with both numbers and the order goes on waiting; once it costs no more, it opens at the stated rate — before, it opened whatever the fee (othervice, 2026-11-12)", async (t) => {
+  const { s, sale, hash } = await paidOrder(t);
   estimate(s, 400);
   await s.autopilot.pollSellOrders();
   assert.deepEqual(openRates(s), []);
+  const refused = await s.desk.open(sale.id);
+  assert.equal(refused.ok, false, JSON.stringify(refused));
+  assert.match(
+    refused.message ?? "",
+    /^not opened: on-chain fees are 400 sat\/vB: opening the channel would cost about 70,000 sat, more than the 2,411 sat this sale earns — LightningMate opens no channel that costs more than the order brings; it waits for lower fees while the held payment has time$/,
+  );
+  assert.deepEqual(openRates(s), [], "nothing opened");
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "held", "the order goes on waiting");
+  assert.equal(s.node.invoices.get(hash)?.state, "ACCEPTED", "the payment is still held");
+  estimate(s, 13);
   const res = await s.desk.open(sale.id);
   assert.equal(res.ok, true, JSON.stringify(res));
-  assert.deepEqual(openRates(s), [400]);
+  assert.deepEqual(openRates(s), [13]);
   assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported");
 });
 
-test("LND gives no fee estimate: the lane does not open at a cost it doesn't know — it waits, and says so; the click opens as before, at the rate LND picks", async (t) => {
+test("LND gives no fee estimate: the lane does not open at a cost it doesn't know — it waits, and says so; a click opens nothing blind either", async (t) => {
   const { s, sale, hash } = await paidOrder(t, { openFeeUnknown: true });
   noEstimate(s);
   await s.autopilot.pollSellOrders();
@@ -197,9 +207,11 @@ test("LND gives no fee estimate: the lane does not open at a cost it doesn't kno
   assert.match(s.autopilot.getState().magmaLane.error ?? "", /^1 paid order waits for an on-chain fee estimate \(LND gives no on-chain fee estimate/);
   // …and so does the run history: before, no test told the two lines apart.
   assert.deepEqual(historyErrors(s, sale.id), ["a sold channel waits for an on-chain fee estimate — trying again"]);
+  // Before: the click opened at the rate LND picked (othervice's ceiling, 2026-11-12).
   const res = await s.desk.open(sale.id);
-  assert.equal(res.ok, true, JSON.stringify(res));
-  assert.deepEqual(openRates(s), [undefined]);
+  assert.equal(res.ok, false, JSON.stringify(res));
+  assert.match(res.message ?? "", /^not opened: LND gives no on-chain fee estimate, so what opening the channel would cost is unknown — LightningMate opens no channel that costs more than the order brings/);
+  assert.deepEqual(openRates(s), []);
 });
 
 test("no estimate for as long as the payment can be held: the buyer is refunded, and the record says an estimate was waited for", async (t) => {

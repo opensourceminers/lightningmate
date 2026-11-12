@@ -98,9 +98,10 @@ export const CHANNEL_MAX_FEE_HINT =
   "The most the autopilot pays to open a channel of its own, and the most it asks to close a sold channel after its lease at (if " +
   "the buyer's node insists on more, LND may finish that close above it). A channel sold on " +
   "Magma is not held to it — its buyer has paid: it opens at LND's regular fee rate while that costs no more than the sale " +
-  "earns. Above that the order waits for lower fees (Market → Orders says so, and “Open channel” there opens it anyway). If " +
-  "fees stay there, an order whose payment Amboss holds is opened whatever the fee in its last hours, so the sale is not lost; " +
-  "one whose payment this node holds waits until that payment runs out — then the buyer is refunded and an alert tells you.";
+  "earns. Above that the order waits for lower fees (Market → Orders says so; “Open channel” there opens it only once it costs " +
+  "no more). No open costs more than the order brings: if fees stay there, an order whose payment Amboss holds is ended at " +
+  "its last moment to open (six hours before Amboss's deadline), and one whose payment this node holds once that payment " +
+  "runs out — the buyer is refunded and an alert tells you, with both numbers.";
 const CHANNEL_NUM_FIELDS: { key: NumKey; label: string; hint?: string }[] = [
   { key: "channelSizeSats", label: "Channel size (sat, 0=auto)" },
   { key: "channelReserveSats", label: "Keep on-chain reserve (sat)" },

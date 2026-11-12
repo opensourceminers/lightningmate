@@ -880,7 +880,8 @@ paid outside a HODL invoice (an older version's plain invoice, settled on paymen
 could go back: it is tried for 38 hours after the payment was found. It waits for lower on-chain fees
 (or a fee estimate) like a held order, but its wait ends in the open, not in a refund: 6 hours before
 those 38 run out (or before a deadline of Amboss's) the channel is opened whatever the fee, with the
-6 hours left to reach a buyer who is offline just then. If its channel cannot be
+6 hours left to reach a buyer who is offline just then — the one open allowed to cost more than the
+order brings, as its payment cannot go back: an alert then names what it cost against what it brought. If its channel cannot be
 opened in that time (or before a deadline of Amboss's), the order ends with the buyer's payment kept:
 an alert says so until it is dismissed, and "Open channel" on Market → Orders takes the order up again
 for as long as Amboss lists it as waiting for its channel — otherwise the buyer is owed the payment,
@@ -891,8 +892,12 @@ the funding transaction (175 vB) at that rate costs no more than the order's fee
 above that, or while LND gives no estimate, the paid order waits (checked every pass, said once on its
 record, the lane's status "1 paid order waits for lower on-chain fees", or "… waits for an on-chain
 fee estimate"), for as long as the held
-payment allows an open — then the buyer is refunded. "Open channel" on Market → Orders opens it
-whatever the fee. Every paid order refunded with no channel opened raises an alert (48 h, or until
+payment allows an open — then the buyer is refunded. **No open costs more than the order brings**
+(decided 2026-11-12): "Open channel" on Market → Orders opens under the same limit — dearer, or with no
+estimate, the click is refused with both numbers and the order goes on waiting. The one exception is an
+order an older version accepted with a plain invoice, whose payment settled here and cannot go back:
+it is opened after its wait whatever the fee, and an alert says what the open cost against what the
+order brought (with no estimate at all LND picks the rate, and the alert can't name the cost). Every paid order refunded with no channel opened raises an alert (48 h, or until
 dismissed): Amboss may count it against the seller. Before, the open named no rate: LND picked one
 hours after the accept floor was checked, and nothing looked at it. **Amboss pays after the channel is
 confirmed** (seen on the first live sale, 2026-11-11: the buyer had paid Amboss, and the order went
@@ -908,17 +913,33 @@ with no funding transaction named), the order's record must show no open under w
 no channel of this node to the buyer with the order's size that was not there at the accept (the
 buyer's channels of that moment are kept on the order's record). One that is there is taken as the
 order's ("a channel to the buyer was opened outside LightningMate — taken as this order's") — also
-one opened and reported by hand that has no confirmation yet. **One channel is never two orders'**:
+one opened and reported by hand that has no confirmation yet. A channel to the buyer of another size
+is not the order's (Amboss takes only the order's size): the record says so once, and the order gets
+its own. For an order whose record does not list the buyer's channels at the accept (one from before
+that was kept, or one accepted outside LightningMate), a same-size channel still being opened is
+neither taken nor opened beside until it is confirmed and its height shows whether it is new. Where
+Amboss names a funding transaction LND does not show as this order's, nothing is opened beside it, an
+alert says so, and at the order's last moment to open the order is ended like any other. **One channel is never two orders'**:
 when the buyer has another open order here, that order is read from Amboss first, and a channel
 Amboss names for it is left to it — while such an order cannot be read, nothing is taken or opened
-for this one. The time such an unpaid order has is
-Amboss's `timeout` for the channel (48 hours after the invoice was made) less 6 hours for the channel
-to get its confirmations: until then a failed open is tried again and high on-chain fees are waited
-out as above; in the 6 hours before it the channel is opened whatever the fee, at LND's 3-block
-estimate. After it the invoice is cancelled, the coins are free again and an alert says so (Amboss
-refunds the buyer, and may count the order against the seller). An order Amboss shows accepted that no
-accept of LightningMate's reached is not opened by the lane — Amboss may hold another invoice for it —
-and waits for "Open channel". **Amboss's word alone is never income**: an order
+for this one. The time such an unpaid order has runs to
+Amboss's `timeout` for the channel (seen live: 48 hours after the invoice was made; never past the
+invoice's own end, and with no usable `timeout` — none, not a date, or earlier than the invoice — 48
+hours after the invoice), less 6 hours for the channel to get its confirmations (half the time there
+is, when Amboss gives less than 12 hours): its last moment to open. Up to then a failed open is tried
+again and high on-chain fees are waited out as above; in its last 6 hours the open is priced at LND's
+3-block estimate — or, where that is dearer than the order brings, at the highest rate the order pays
+for, if that is no less than LND's usual estimate. Still dearer, or with no estimate at all, at the
+last moment to open, the order is ended instead of opened — the invoice cancelled, the coins free, an
+alert with both numbers (or that the cost could not be estimated). Amboss refunds the buyer when it ends the order at its own deadline, and may
+count it against the seller: the Magma API's seller `reject` is documented for orders awaiting
+approval, and LightningMate never sends it for one Amboss approved — so ending the order earlier would
+refund nobody sooner. An order the lane leaves to the operator says by when to open it, and an alert
+names it: "Open channel" opens it up to its last moment to open, under the same ceiling; after that the
+lane ends it (as a click would, saying why) and the refund is told. An order Amboss shows accepted that no accept sent from LightningMate (and not
+refused) carried is not opened by the lane — Amboss may hold another invoice for it — and waits for
+"Open channel"; nor is one Amboss shows accepted after it answered this node's accept with an error
+(that accept may not be the one Amboss took). **Amboss's word alone is never income**: an order
 Amboss reports confirmed is settled, booked and charged the service fee only when this node's own
 invoice holds at least the order's fee and a channel is on the order's record that LND shows (open,
 still opening, or closed since). An order with no channel on its record takes the one Amboss names —
@@ -929,10 +950,12 @@ settles nothing. An invoice
 still unpaid at that moment is the normal case, not an error: the order waits for Amboss's payment
 ("channel confirmed — waiting for Amboss's payment", said once on its record) until the invoice runs
 out, 49 hours after it was made; a payment that arrives is settled as ever. After 6 hours of waiting an
-alert names the order. Only when the invoice has expired unpaid does the order end here, unbooked — its
+alert names the order (not one whose payment is here and whose claim is held up: its record says why).
+Only when the invoice has expired, or was cancelled, unpaid does the order end here, unbooked — its
 coins free again, or, where a channel was opened for it, kept as a completed sale that is not booked,
-so the lease's promises go on binding that channel, with an alert until it is dismissed (for a while
-the order ended after one hour, its invoice cancelled before Amboss could pay it). Where Amboss turns
+so the lease's promises go on binding that channel, with an alert for a week or until it is dismissed
+(for a while the order ended after one hour, its invoice cancelled before Amboss could pay it). A
+payment that was here and never claimed, let go by LND near its expiry, ends the order with that said. Where Amboss turns
 the channel down after the open or ends the order, the invoice is cancelled, the channel stays open
 and an alert says so: it is this node's to keep or close. While an order is pending no offer's window or listing moves up. Before 0.8.7 a dial gave up after 1.5 s, so nearly every
 buyer not already connected was turned down within seconds

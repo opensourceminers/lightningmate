@@ -330,3 +330,27 @@ test("GET /dashboard: the routing yield is on this node's side of its OPEN chann
   assert.equal(res.body.totalCapacitySats, 10_000_000);
   assert.equal(res.body.ownCapitalSats, 3_500_000, "1M + 2.5M of local balance in the open channels");
 });
+
+// Review of P1b, R8: the order lane's alerts reach the operator only through
+// the alerts route — each list it reads, held by a test (removing one of the
+// lines survived the whole suite). What each alert says is tested with its
+// list (magmaPrepaid, magmaLegacy); here: that the route serves it.
+test("the alerts route serves each of the order lane's lists: a channel opened and not paid, a payment Amboss has not made yet, an open dearer than the order brought, a channel Amboss names that LND does not show, and an order that waits for your open", async (t) => {
+  quiet(t);
+  const { api } = await dashApi(t);
+  const desk = api.autopilot.magma;
+  const at = new Date().toISOString();
+  const outpoint = `${"a1".repeat(32)}:0`;
+  desk.unpaidChannels = () => [{ orderId: "o-unpaid", sizeSats: 2_000_000, outpoint, reason: "Amboss ended the order: INVALID_CHANNEL_OPENING", at, delivered: false }];
+  desk.paymentsOverdue = () => [{ orderId: "o-overdue", sizeSats: 1_000_000, feeSats: 12_345, since: at, until: null }];
+  desk.opensAboveEarnings = () => [{ orderId: "o-dear", sizeSats: 3_000_000, feeRate: 400, costSats: 70_000, earnsSats: 2_400, at }];
+  desk.channelsNotShown = () => [{ orderId: "o-unknown", sizeSats: 4_000_000, what: "Amboss already has a funding transaction for this order (x) that LND does not show", since: at, endsAt: null }];
+  desk.waitingForYourOpen = () => [{ orderId: "o-yours", sizeSats: 5_000_000, reason: "payment held — waiting for you to open the channel", until: null }];
+  const alerts = (await api.request("GET", "/alerts")).body as { id?: string; message: string }[];
+  const said = (re: RegExp) => assert.ok(alerts.some((a) => re.test(a.message)), `${re} in ${JSON.stringify(alerts.map((a) => a.message))}`);
+  said(/^A 2,000,000 sat Magma order ended without payment after its channel was opened: /);
+  said(/^Amboss confirmed the channel of a 1,000,000 sat Magma order on .* but has not paid its 12,345 sat to this node yet\./);
+  said(/^The channel of a 3,000,000 sat Magma order was opened at 400 sat\/vB, about 70,000 sat — more than the 2,400 sat the order brought\./);
+  said(/^A 4,000,000 sat Magma order: Amboss already has a funding transaction for this order \(x\) that LND does not show\. See Market → Orders for the order\.$/);
+  said(/^A 5,000,000 sat Magma order waits for you to open its channel: payment held — waiting for you to open the channel\. “Open channel” on Market → Orders opens it, while that costs no more than the order brings\.$/);
+});

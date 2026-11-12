@@ -73,9 +73,13 @@ it shows, in order:
   confirmation is claimed and the sale booked once. (The buyer node stands in for Amboss as the
   payer.)
 - **A channel opened by hand while the lane waits**: with fees above what the sale earns the
-  unpaid order waits and says from when it is opened whatever the fee; a channel the operator
+  unpaid order waits and says when it is ended if the open still costs more; a channel the operator
   then opens with another tool is taken as the order's and reported to Amboss, and with fees back
   to normal no second one is opened; its payment is claimed and the sale booked once.
+- **The ceiling**: an order whose buyer paid Amboss, at its last moment to open (Amboss's deadline
+  minutes away) with fees at 400 sat/vB — the open would cost 70,000 sat for a sale that earns
+  60,000: the order is ended instead of opened, our invoice cancelled, nothing opened or spent,
+  nothing kept reserved for it, and the refund's alert names both numbers.
 
 No service fee is set in that run, so "what the sale earns" is the order's whole fee there.
 

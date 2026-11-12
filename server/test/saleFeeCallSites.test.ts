@@ -22,7 +22,7 @@ import { FakeLnd } from "./helpers/fakeLnd.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
 import { mockLnurlPayServer } from "./helpers/lnurl.js";
 import { FakeMagma } from "./helpers/magma.js";
-import { BUYER, sellerSetup } from "./helpers/autopilot.js";
+import { BUYER, lndEstimatesFee, sellerSetup } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { makeTempDir, type AfterHook } from "./helpers/tmp.js";
 import { withEnv } from "./helpers/env.js";
@@ -187,6 +187,8 @@ test("the manual 'open channel' route answers without waiting for a fee; the sal
   mockLnurlPayServer(http, { address: ADDRESS });
   const node = new FakeLnd({ chainBalance: 20_000_000 });
   node.payOutcome = "hang";
+  // A click opens no channel whose cost LND can't estimate (the ceiling).
+  lndEstimatesFee(node);
   const api = await startApi(t, { node });
   magma.sellerPubkey = api.node.publicKey; // this node's sales and offers
   api.amboss.setKey("test-key");
@@ -214,6 +216,7 @@ test("the manual 'open channel' route books no sale and owes no fee while Amboss
   const magma = new FakeMagma(http, t);
   magma.behave.AddTransaction = "false";
   const node = new FakeLnd({ chainBalance: 20_000_000 });
+  lndEstimatesFee(node);
   const api = await startApi(t, { node });
   magma.sellerPubkey = api.node.publicKey; // this node's sales and offers
   api.amboss.setKey("test-key");

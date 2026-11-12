@@ -152,10 +152,14 @@ export function magmaRefundAlerts(desk: {
  *  (MagmaDesk.unpaidChannels), until dismissed: this node's coins are in a
  *  channel nothing was earned for. */
 export function magmaUnpaidChannelAlerts(desk: { unpaidChannels(): Pick<MagmaUnpaidChannel, "orderId" | "sizeSats" | "outpoint" | "reason" | "delivered">[] }): Alert[] {
+  // The reason's own word about the channel goes: the alert says it, once
+  // (review of P1b, R17 — it named the channel twice).
+  const without = (reason: string, outpoint: string) =>
+    reason.replace(` — the channel ${outpoint} stays open; close it if you don't want it`, "").replace(`; its channel ${outpoint} keeps the lease's promises`, "");
   return desk.unpaidChannels().map((c) => ({
     level: "warn" as const,
     message:
-      `A ${Math.round(c.sizeSats).toLocaleString("en-US")} sat Magma order ended without payment after its channel was opened: ${c.reason}. ` +
+      `A ${Math.round(c.sizeSats).toLocaleString("en-US")} sat Magma order ended without payment after its channel was opened: ${without(c.reason, c.outpoint)}. ` +
       (c.delivered
         ? `Amboss counts the channel ${c.outpoint} as delivered, so it stays bound to what the order promised: ask Amboss about the payment for order ${c.orderId}.`
         : `The channel ${c.outpoint} stays open and is yours: close it to take the capital back, or keep it for routing.`),
@@ -188,6 +192,52 @@ export function magmaKeptPaymentAlerts(desk: { paymentsKept(): Pick<MagmaRefund,
       `The buyer's ${Math.round(r.feeSats).toLocaleString("en-US")} sat are settled here and do not go back by themselves: ` +
       `“Open channel” on Market → Orders tries again while Amboss still lists the order as waiting for its channel; otherwise the buyer is owed the payment.`,
     id: `magma:${r.orderId}`,
+  }));
+}
+
+/** An old order paid by a settled plain invoice whose channel was opened at
+ *  an on-chain fee above what it brought (MagmaDesk.opensAboveEarnings):
+ *  both numbers, until dismissed (othervice's ceiling, 2026-11-12 — the one
+ *  order it can't end, as its payment can't go back). */
+export function magmaOpenAboveEarningsAlerts(desk: {
+  opensAboveEarnings(): { orderId: string; sizeSats: number; feeRate: number; costSats: number; earnsSats: number }[];
+}): Alert[] {
+  const sat = (n: number) => Math.round(n).toLocaleString("en-US");
+  return desk.opensAboveEarnings().map((o) => ({
+    level: "warn" as const,
+    message:
+      `The channel of a ${sat(o.sizeSats)} sat Magma order was opened at ${sat(o.feeRate)} sat/vB, about ${sat(o.costSats)} sat — more than the ${sat(o.earnsSats)} sat the order brought. ` +
+      "It was paid by an invoice that had already settled here (an order accepted by an older version), so the payment could not go back and the channel was owed. See Market → Orders for the order.",
+    id: `magma:${o.orderId}`,
+  }));
+}
+
+/** Magma orders for which Amboss names a channel LND does not show as theirs
+ *  (MagmaDesk.channelsNotShown): nothing is opened beside it, and the order
+ *  is ended at its last moment to open unless the channel shows up. Derived:
+ *  gone once it does, or the order ends. */
+export function magmaChannelNotShownAlerts(desk: { channelsNotShown(): { orderId: string; sizeSats: number; what: string; endsAt: string | null }[] }): Alert[] {
+  const utc = (iso: string): string => `${iso.slice(0, 16).replace("T", " ")} UTC`;
+  return desk.channelsNotShown().map((o) => ({
+    level: "warn" as const,
+    message:
+      `A ${Math.round(o.sizeSats).toLocaleString("en-US")} sat Magma order: ${o.what}. ` +
+      (o.endsAt ? `Unless the channel shows up, the order is ended at ${utc(o.endsAt)}, its last moment to open, and Amboss refunds the buyer. ` : "") +
+      "See Market → Orders for the order.",
+  }));
+}
+
+/** Magma orders the lane leaves for the operator to open
+ *  (MagmaDesk.waitingForYourOpen), with their last moment to open. Derived:
+ *  gone once the channel is out or the order ends. */
+export function magmaOpenYoursAlerts(desk: { waitingForYourOpen(): { orderId: string; sizeSats: number; reason: string; until: string | null }[] }): Alert[] {
+  const utc = (iso: string): string => `${iso.slice(0, 16).replace("T", " ")} UTC`;
+  return desk.waitingForYourOpen().map((o) => ({
+    level: "warn" as const,
+    message:
+      `A ${Math.round(o.sizeSats).toLocaleString("en-US")} sat Magma order waits for you to open its channel: ${o.reason}. ` +
+      (o.until && !o.reason.includes(utc(o.until)) ? `Its last moment to open is ${utc(o.until)}. ` : "") +
+      "“Open channel” on Market → Orders opens it, while that costs no more than the order brings.",
   }));
 }
 

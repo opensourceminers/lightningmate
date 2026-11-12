@@ -7,7 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { magmaKeptPaymentAlerts, stateAlerts } from "../src/services/alerts.js";
+import { magmaKeptPaymentAlerts, stateAlerts, magmaOpenAboveEarningsAlerts } from "../src/services/alerts.js";
 import { LEGACY_FEE_WAIT_RESERVE_MS, LEGACY_OPEN_RETRY_MS, NO_PAYMENT_WAIT } from "../src/services/magmaDesk.js";
 import { BUYER, sellerSetup } from "./helpers/autopilot.js";
 import {
@@ -508,6 +508,68 @@ test("…and with fees that stay high it is opened anyway, six hours before the 
   assert.equal(e?.paymentKeptAt, undefined);
   assert.deepEqual(magmaKeptPaymentAlerts(s.desk), []);
   assert.equal(s.autopilot.getState().magmaLane.ok, true);
+  // Opened above what it brought — the one order the ceiling can't end (its
+  // payment can't go back): the record and an alert say so with both
+  // numbers, and the alert can be dismissed (othervice, 2026-11-12).
+  assert.deepEqual(e?.openAboveEarnings && [e.openAboveEarnings.feeRate, e.openAboveEarnings.costSats, e.openAboveEarnings.earnsSats], [400, 70_000, 2_411]);
+  const [alert, ...more] = magmaOpenAboveEarningsAlerts(s.desk);
+  assert.deepEqual(more, []);
+  assert.match(alert?.message ?? "", /^The channel of a 2,000,000 sat Magma order was opened at 400 sat\/vB, about 70,000 sat — more than the 2,411 sat the order brought\./);
+  // (Dismissed by its id on Market's alerts.)
+  assert.equal(alert?.id, `magma:${sale.id}`);
+  assert.equal(s.desk.acknowledgeRefusal(sale.id), true);
+  assert.deepEqual(magmaOpenAboveEarningsAlerts(s.desk), []);
+});
+
+test("…that alert is told for a week, not dismissed, and then no more", async (t) => {
+  const { s, sale } = settledLegacyOrder(t);
+  s.node.peers.push(BUYER);
+  estimate(s, 400);
+  await s.autopilot.pollSellOrders();
+  const t0 = Date.parse(entryOnDisk(s.dir, sale.id)?.heldAt ?? "");
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + FEE_WAIT_MS });
+  await s.autopilot.pollSellOrders();
+  assert.equal(magmaOpenAboveEarningsAlerts(s.desk).length, 1);
+  t.mock.timers.setTime(t0 + FEE_WAIT_MS + 7 * 24 * 3_600_000 - 60_000);
+  assert.equal(magmaOpenAboveEarningsAlerts(s.desk).length, 1);
+  t.mock.timers.setTime(t0 + FEE_WAIT_MS + 7 * 24 * 3_600_000 + 60_000);
+  assert.deepEqual(magmaOpenAboveEarningsAlerts(s.desk), []);
+});
+
+test("…and one whose open never goes out (the buyer's node away) is not said to have been opened above what it brought (review of P1c, m1)", async (t) => {
+  const { s, sale } = settledLegacyOrder(t);
+  s.node.peers.push(BUYER);
+  estimate(s, 400);
+  await s.autopilot.pollSellOrders();
+  const t0 = Date.parse(entryOnDisk(s.dir, sale.id)?.heldAt ?? "");
+  buyerOffline(s.desk);
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + FEE_WAIT_MS });
+  for (let i = 0; i < 3; i++) await s.autopilot.pollSellOrders();
+  assert.deepEqual(openRatesOf(s), []);
+  const e = entryOnDisk(s.dir, sale.id);
+  assert.equal(e?.openAboveEarnings, undefined);
+  assert.ok(!e?.events.some((x) => /^opened at /.test(x.what)), "nothing on the record says it was opened");
+  assert.deepEqual(magmaOpenAboveEarningsAlerts(s.desk), []);
+});
+
+test("an order with no payment of ours (accepted with another tool): a click is under the ceiling like any other — refused with both numbers, nothing opened, and no alert that a settled payment was opened for (review of P1c, M3)", async (t) => {
+  feeEnv(t);
+  quiet(t);
+  const s = sellerSetup(t);
+  s.node.peers.push(BUYER);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, sizeSats: 2_000_000, status: "WAITING_FOR_CHANNEL_OPEN", paymentStatus: "SUCCESSFUL_PAYMENT" });
+  await s.autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(s.dir, sale.id)?.decision?.reason, NO_PAYMENT_WAIT);
+  estimate(s, 400);
+  const res = await s.autopilot.magma.open(sale.id);
+  assert.equal(res.ok, false);
+  assert.equal(
+    res.message,
+    "not opened: on-chain fees are 400 sat/vB: opening the channel would cost about 70,000 sat, more than the 12,221 sat this sale earns — LightningMate opens no channel that costs more than the order brings",
+  );
+  assert.deepEqual(openRatesOf(s), [], "before: opened at 400 sat/vB");
+  assert.equal(entryOnDisk(s.dir, sale.id)?.openAboveEarnings, undefined);
+  assert.deepEqual(magmaOpenAboveEarningsAlerts(s.desk), []);
 });
 
 test("…with no fee estimate from LND it waits for one the same way, and is opened at the rate LND picks when the wait is over", async (t) => {
@@ -749,3 +811,63 @@ test("an order with no payment of ours on record that ends with no channel raise
   const res = await s.desk.open(sale.id);
   assert.deepEqual([res.ok, res.code], [false, "bad_status"]);
 });
+
+// ── review of P1c, round 2 ─────────────────────────────────────────────────
+
+test("a click past Amboss's deadline on an order whose payment is settled here: the answer says the payment stays — not that it goes back (N-1)", async (t) => {
+  const { s, sale } = settledLegacyOrder(t);
+  s.node.peers.push(BUYER);
+  estimate(s, 400);
+  await s.autopilot.pollSellOrders();
+  const heldAt = Date.parse(entryOnDisk(s.dir, sale.id)?.heldAt ?? "");
+  s.magma.sales.get(sale.id)!.timeout = new Date(heldAt + 2 * 3_600_000).toISOString();
+  t.mock.timers.enable({ apis: ["Date"], now: heldAt + 3 * 3_600_000 });
+  const res = await s.autopilot.magma.open(sale.id);
+  assert.equal(res.ok, false);
+  assert.equal(res.message, "no time left to open the channel — the order is ended here; the buyer's payment is settled here and does not go back by itself (see the alert)");
+  assert.equal(magmaKeptPaymentAlerts(s.desk).length, 1, "the alert it points to");
+});
+
+test("…and on an order with no payment of ours: nothing of the buyer's is held here (N-1)", async (t) => {
+  feeEnv(t);
+  quiet(t);
+  const s = sellerSetup(t);
+  s.node.peers.push(BUYER);
+  const sale = s.magma.addSale({ buyerPubkey: BUYER, sizeSats: 2_000_000, status: "WAITING_FOR_CHANNEL_OPEN", paymentStatus: "SUCCESSFUL_PAYMENT" });
+  await s.autopilot.pollSellOrders();
+  const heldAt = Date.parse(entryOnDisk(s.dir, sale.id)?.heldAt ?? "");
+  assert.ok(Number.isFinite(heldAt));
+  s.magma.sales.get(sale.id)!.timeout = new Date(heldAt + 3_600_000).toISOString();
+  t.mock.timers.enable({ apis: ["Date"], now: heldAt + 2 * 3_600_000 });
+  const res = await s.autopilot.magma.open(sale.id);
+  assert.equal(res.ok, false);
+  assert.equal(res.message, "no time left to open the channel — the order is ended here; no payment of the buyer's is held here");
+});
+
+for (const [when, lost] of [
+  ["LND's answer is lost (the stream dropped) and the channel shows up on a later pass", "later"],
+  ["LND answers with an error after the funding went out, and the channel is there at once", "at once"],
+] as const) {
+  test(`a legacy order opened by a click above what it brought, ${when}: the open's cost against what the order brought is still put on record and told (N-2)`, async (t) => {
+    const { s, sale } = settledLegacyOrder(t);
+    s.node.peers.push(BUYER);
+    estimate(s, 400);
+    await s.autopilot.pollSellOrders();
+    const txid = "e1".repeat(32);
+    const desk = s.desk as unknown as { lndOpen: (p: unknown) => Promise<unknown> };
+    desk.lndOpen = async () => {
+      if (lost === "at once") s.node.pending.push({ partnerPublicKey: BUYER, capacity: 2_000_000, transactionId: txid, transactionVout: 0 });
+      return { ok: false, error: "FailedToOpenChannel: Connection dropped" };
+    };
+    await s.autopilot.magma.open(sale.id);
+    if (lost === "later") {
+      assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "opening");
+      s.node.pending.push({ partnerPublicKey: BUYER, capacity: 2_000_000, transactionId: txid, transactionVout: 0 });
+      await s.autopilot.pollSellOrders();
+    }
+    const e = entryOnDisk(s.dir, sale.id);
+    assert.equal(e?.fundingOutpoint, `${txid}:0`);
+    assert.deepEqual(e?.openAboveEarnings && [e.openAboveEarnings.feeRate, e.openAboveEarnings.costSats, e.openAboveEarnings.earnsSats], [400, 70_000, 2_411]);
+    assert.equal(magmaOpenAboveEarningsAlerts(s.desk).length, 1);
+  });
+}

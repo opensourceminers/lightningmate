@@ -41,6 +41,7 @@ import {
   SOLD_CLOSE_MIN_LOCAL_SHARE,
   SOLD_KEEP_BAR_TEXT,
   UNPAID_OPEN_RESERVE_MS,
+  AMBOSS_OPEN_WINDOW_MS,
 } from "../src/services/magmaDesk.js";
 import { ANSWERS_KEPT } from "../src/services/magmaJournal.js";
 import { MAGMA_LEASE_MARGIN_BLOCKS } from "../src/services/leaseCaps.js";
@@ -529,12 +530,17 @@ test("the docs say how long an order Amboss reports confirmed waits for its paym
   assert.equal(HODL_EXPIRY_MS, 49 * 3_600_000, "“49 hours after it was made”");
   assert.equal(PAYMENT_OVERDUE_MS, 6 * 3_600_000, "“After 6 hours of waiting an alert names the order”");
   assert.equal(UNPAID_OPEN_RESERVE_MS, 6 * 3_600_000, "“less 6 hours for the channel to get its confirmations”");
-  assert.equal(LEGACY_FEE_WAIT_RESERVE_MS, 6 * 3_600_000, "“in the 6 hours before it the channel is opened whatever the fee”");
+  assert.equal(LEGACY_FEE_WAIT_RESERVE_MS, 6 * 3_600_000, "“in its last 6 hours the open is priced at LND's 3-block estimate”");
   assert.equal(URGENT_OPEN_CONF_TARGET, 3, "“at LND's 3-block estimate”");
   assert.match(flat, /the order waits for Amboss's payment \("channel confirmed — waiting for Amboss's payment", said once on its record\) until the invoice runs out, 49 hours after it was made/);
-  assert.match(flat, /After 6 hours of waiting an alert names the order\. Only when the invoice has expired unpaid does the order end here, unbooked/);
-  assert.match(flat, /Amboss's `timeout` for the channel \(48 hours after the invoice was made\) less 6 hours for the channel to get its confirmations/);
-  assert.match(flat, /in the 6 hours before it the channel is opened whatever the fee, at LND's 3-block estimate/);
+  assert.equal(AMBOSS_OPEN_WINDOW_MS, 48 * 3_600_000, "“with no usable `timeout` … 48 hours after the invoice”");
+  assert.equal(PAYMENT_OVERDUE_MS, 6 * 3_600_000);
+  assert.match(flat, /After 6 hours of waiting an alert names the order \(not one whose payment is here and whose claim is held up: its record says why\)\. Only when the invoice has expired, or was cancelled, unpaid does the order end here, unbooked/);
+  assert.match(flat, /Amboss's `timeout` for the channel \(seen live: 48 hours after the invoice was made; never past the invoice's own end, and with no usable `timeout` — none, not a date, or earlier than the invoice — 48 hours after the invoice\), less 6 hours for the channel to get its confirmations \(half the time there is, when Amboss gives less than 12 hours\): its last moment to open/);
+  assert.match(flat, /Up to then a failed open is tried again and high on-chain fees are waited out as above; in its last 6 hours the open is priced at LND's 3-block estimate — or, where that is dearer than the order brings, at the highest rate the order pays for, if that is no less than LND's usual estimate\. Still dearer, or with no estimate at all, at the last moment to open, the order is ended instead of opened/);
+  assert.match(flat, /"Open channel" opens it up to its last moment to open, under the same ceiling; after that the lane ends it \(as a click would, saying why\) and the refund is told/);
+  assert.doesNotMatch(flat, /up to an hour before Amboss's deadline/);
+  assert.match(flat, /\*\*No open costs more than the order brings\*\*/);
   assert.doesNotMatch(flat, /looked at again for an hour/);
 });
 

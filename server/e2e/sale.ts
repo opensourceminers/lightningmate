@@ -451,10 +451,12 @@ wallet.estimateFee = (_args, cb) => cb(null, { sat_per_kw: String(400 * 250) });
 await desk.tick();
 await desk.tick();
 check(
-  "with fees above what the sale earns the unpaid order waits for lower fees, and says from when it is opened whatever the fee",
+  "with fees above what the sale earns the unpaid order waits for lower fees, and says when it is ended should the open still cost more",
   byHand.status === "WAITING_FOR_CHANNEL_OPEN" &&
     (await openingToBuyer()).length === 0 &&
-    /^on-chain fees are 400 sat\/vB: .*Amboss holds the buyer's payment, so the channel is opened whatever the fee from /.test(onDisk(byHand.id)?.lastError ?? ""),
+    /^on-chain fees are 400 sat\/vB: opening the channel would cost about 70,000 sat, more than the 60,000 sat this sale earns; Amboss holds the buyer's payment\. If the open still costs more at .* UTC, the order is ended then and Amboss refunds the buyer/.test(
+      onDisk(byHand.id)?.lastError ?? "",
+    ),
   (onDisk(byHand.id)?.lastError ?? journalPhase(byHand.id)).slice(0, 260),
 );
 // The operator opens the channel with another tool, at a fee of their choice.
@@ -490,6 +492,46 @@ check(
   "its payment is claimed and the sale booked, once",
   "is_confirmed" in handDone && handDone.is_confirmed === true && bookedFor(byHand.id) === 1 && journalPhase(byHand.id) === "settled",
   `${JSON.stringify(handDone).slice(0, 80)}; ${bookedFor(byHand.id)} booking(s), journal ${journalPhase(byHand.id)}`,
+);
+
+// ── the ceiling: an open dearer than the order brings ends the order ───────
+// At the last moment to open fees are still 400 sat/vB: the order is ended
+// instead of opened, our invoice cancelled, Amboss refunds the buyer. (Regtest
+// has no clock to wait 42 hours by: Amboss's deadline is set 15 minutes out,
+// which halves the window — its last moment to open is minutes away, inside
+// the ten minutes no open is begun in. The wait through a 48-hour window is
+// in magmaPrepaid.test.ts.)
+const dear = order();
+magma.buyerPaidAmboss(dear.id);
+await desk.tick();
+const dearHash = parsePaymentRequest(dear.paymentRequest ?? "").id;
+check("the last order is accepted, our invoice unpaid", dear.status === "WAITING_FOR_CHANNEL_OPEN" && unpaid(await getInvoice({ lnd: seller, id: dearHash })), `${dear.status}, journal ${journalPhase(dear.id)}`);
+dear.timeout = new Date(Date.now() + 15 * 60_000).toISOString();
+wallet.estimateFee = (_args, cb) => cb(null, { sat_per_kw: String(400 * 250) });
+const dearChainBefore = (await getChainBalance({ lnd: seller })).chain_balance;
+await desk.tick();
+await desk.tick();
+wallet.estimateFee = realEstimate;
+const dearEntry = onDisk(dear.id);
+check(
+  "at its last moment to open, with the open dearer than the sale earns, the order is ended instead of opened",
+  dearEntry?.phase === "cancelled" &&
+    /^on-chain fees are 400 sat\/vB: opening the channel would cost about 70,000 sat, more than the 60,000 sat this sale earns — ended at its last moment to open instead of opened/.test(dearEntry?.reason ?? ""),
+  `${dearEntry?.phase}: ${(dearEntry?.reason ?? dearEntry?.lastError ?? "").slice(0, 240)}`,
+);
+check("its invoice is cancelled", (await getInvoice({ lnd: seller, id: dearHash })).is_canceled === true, JSON.stringify(await getInvoice({ lnd: seller, id: dearHash })).slice(0, 120));
+await desk.tick();
+// (An earlier order still waiting for its buyer's payment keeps its own.)
+const dearReserved = () => capital.pending().filter((r) => r.key === `magma:${dear.id}`).length;
+check(
+  "nothing is opened to the buyer, no coins spent, nothing kept reserved for the order",
+  (await openingToBuyer()).length === 0 && (await getChainBalance({ lnd: seller })).chain_balance === dearChainBefore && dearReserved() === 0,
+  `${(await openingToBuyer()).length} opening, ${dearReserved()} reservation(s) of the order`,
+);
+check(
+  "the refund is named, with both numbers",
+  desk.refunds().some((r) => r.orderId === dear.id && /70,000 sat, more than the 60,000 sat/.test(r.reason ?? "")),
+  JSON.stringify(desk.refunds().filter((r) => r.orderId === dear.id)).slice(0, 200),
 );
 
 // ── done ───────────────────────────────────────────────────────────────────

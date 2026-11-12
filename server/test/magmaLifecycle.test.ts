@@ -245,6 +245,7 @@ test("Amboss reports the channel confirmed, our invoice unpaid, and the channel 
   const [alert] = magmaUnpaidChannelAlerts(s.autopilot.magma);
   assert.equal(alert?.id, `magma:${sale.id}`);
   assert.match(alert?.message ?? "", new RegExp(`^A 2,000,000 sat Magma order ended without payment after its channel was opened: .*Amboss counts the channel ${txid}:0 as delivered, so it stays bound to what the order promised: ask Amboss about the payment for order ${sale.id}\\.$`));
+  assert.equal((alert?.message ?? "").split(`${txid}:0`).length - 1, 1, "the channel named once");
   assert.equal(s.autopilot.magma.acknowledgeRefusal(sale.id), true);
   assert.deepEqual(magmaUnpaidChannelAlerts(s.autopilot.magma), []);
   assert.deepEqual(magmaUnpaidChannelAlerts(s.restart().magma), [], "dismissed for good");

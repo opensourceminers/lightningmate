@@ -36,8 +36,10 @@ will do.
   *Pause all* stops everything at once, and every setting is under *Advanced*.
 - **Market (Amboss Magma):** buy inbound liquidity, or sell your own.
   Selling is off by default, and Amboss decides which seller gets an order. The buyer
-  pays Amboss, and Amboss pays your node's hold invoice once the channel is confirmed;
-  the payment is claimed only then. On
+  pays either your node's hold invoice before the open, or Amboss, which then pays that
+  invoice once the channel is confirmed; either way the payment is claimed only then,
+  and no channel is opened that costs more in on-chain fees than the order brings (an
+  order an older version accepted, whose payment is already settled here, excepted). On
   Umbrel a 1 % service fee applies to completed sales; the app shows it before
   you sell.
 - **Wallet:** Lightning and on-chain, to receive, send and pay invoices.

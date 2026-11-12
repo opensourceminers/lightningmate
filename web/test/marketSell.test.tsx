@@ -323,3 +323,150 @@ test("ENG-1: Market → Buy with write mode off — buying is disabled and says 
   assert.notEqual(propsOf(button(on.c, "Buy inbound")!).disabled, true);
   on.root.unmount();
 });
+
+// ── review of P2, C3/C4/C10: the price buttons with no offer to apply to ─────
+
+const point = (feeRatePpm: number) => ({ feeRatePpm, baseFeeSat: 284, effectiveFeePpm: feeRatePpm + 142 });
+/** An engine report with one recommendation for a new offer (enough for the page). */
+const REPORT = {
+  nodeNeedReason: null,
+  analytics: { filledOrdersAllTime: 0, mySellerScore: 0, netProfitSat: 0 },
+  sell: {
+    state: "good_to_sell",
+    reasons: ["the market is trading"],
+    warnings: [],
+    standardLeaseBlocks: 4320,
+    popularLeaseBlocks: 4320,
+    effectiveMaxOrderSat: 5_000_000,
+    adjustedRoutingPpmPerYear: 1000,
+    medianOrderSat: 1_000_000,
+    onchainOpenCostSat: 1750,
+    projectedMonthlySat: 0,
+    pricingMode: "balanced",
+    adaptiveLevel: 0.5,
+    pendingSellerOrders: 0,
+    pendingSellerOpens: 0,
+    recommendations: [
+      {
+        offerId: null,
+        mode: "create",
+        state: "good_to_sell",
+        shouldReprice: false,
+        current: null,
+        recommended: { ...point(4110), minBlockLength: 4320, feeRateCapPpm: 2200, baseFeeCapSats: 1 },
+        pricing: { fast: point(3500), balanced: point(4110), premium: point(4600), profitFloor: point(3000) },
+        economics: { beatsRouting: true, leaseApy: 0.05, netLeaseProfitSat: 3000, profitFloorEffectivePpm: 3000 },
+        market: { median: 4110, myRank: null, segmentCount: 10, sizeBand: "1M–2M" },
+        clearing: null,
+        reasons: [],
+        warnings: [],
+      },
+    ],
+  },
+};
+const priceButtons = (c: El) => all(c).filter((n) => n.nodeName === "BUTTON" && /^(Low|Median|High|Profit floor)$/.test(n.textContent.trim()));
+
+for (const [what, setup] of [
+  ["the offers could not be read", () => {
+    mockCommon();
+    a.ambossMyOffers = fail("Amboss did not answer (502)");
+  }],
+  ["write mode is off and there is no offer", () => {
+    mockCommon(false);
+    a.ambossMyOffers = read([]);
+  }],
+] as const) {
+  test(`a price button with no offer to apply it to is disabled and says why while ${what}`, async () => {
+    setup();
+    a.magmaRecommendations = async () => REPORT;
+    const { c, root } = await mount();
+    const btns = priceButtons(c);
+    assert.equal(btns.length, 4, c.textContent.slice(0, 300));
+    for (const b of btns) {
+      assert.equal(propsOf(b).disabled, true, b.textContent);
+      assert.equal(propsOf(b).title, "For a new offer — not possible until your offers are read from Amboss and write mode is on");
+    }
+    root.unmount();
+  });
+}
+
+test("a price button pressed while the offers are unread fills no form — and when Retry finds the offer, no form for a second one opens by itself", async () => {
+  mockCommon();
+  a.ambossMyOffers = fail("Amboss did not answer (502)");
+  a.magmaRecommendations = async () => REPORT;
+  const { c, root } = await mount();
+  // (Disabled; pressed anyway — a click that comes in before the render.)
+  propsOf(priceButtons(c).find((b) => b.textContent.trim() === "Median")!).onClick({ stopPropagation() {} });
+  await settle();
+  assert.doesNotMatch(c.textContent, /New offer/);
+  a.ambossMyOffers = read([OFFER]);
+  await click(button(c, "Retry"), "Retry");
+  assert.match(c.textContent, /4,000 ppm/);
+  assert.doesNotMatch(c.textContent, /New offer|another offer —/, "before: the price it was pressed with opened a second offer's form");
+  assert.ok(button(c, "+ Create another offer"), "the form stays closed");
+  root.unmount();
+});
+
+// ── review of P2, C13 and C17: write mode not known, and the row buttons ─────
+
+test("write mode not known (the settings read failed): Market → Sell says nothing of write mode and does not disable the create for it — the server is the gate", async () => {
+  mockCommon();
+  a.autopilotGet = fail("settings unreadable");
+  a.ambossMyOffers = read([]);
+  const { c, root } = await mount();
+  assert.match(c.textContent, /No offer yet — create one below\./);
+  assert.doesNotMatch(c.textContent, /write mode is off/);
+  assert.notEqual(propsOf(button(c, "Create offer")!).disabled, true);
+  root.unmount();
+});
+
+const BUY_OFFER = {
+  offerId: "sell-1",
+  sellerPubkey: "03".padEnd(66, "b"),
+  sellerScore: 50,
+  minSizeSats: 1_000_000,
+  maxSizeSats: 5_000_000,
+  availableSats: 5_000_000,
+  feeRatePpm: 3000,
+  baseFeeSats: 284,
+  feeRateCapPpm: 2200,
+  leaseBlocks: 4320,
+  leaseDays: 30,
+  sizeSats: 2_000_000,
+  fits: true,
+  sellerFeeSats: 6284,
+  ambossFeeSats: 300,
+  totalFeeSats: 6584,
+  costPpmPerYear: 40_000,
+  conditions: [],
+  eligible: true,
+};
+const mockBuy = (canWrite: boolean | "unknown") => {
+  a.ambossStatus = async () => ({ connected: true, keyValid: true, keyCheck: "valid", lastError: null, saleFeeBps: 100, ordersInFlight: 0 });
+  a.ambossBuyOffers = async () => ({ offers: [BUY_OFFER], inboundSatsPerUsd: null, satsPerUsd: null });
+  a.ambossPurchases = async () => [];
+  a.autopilotGet = canWrite === "unknown" ? fail("settings unreadable") : async () => ({ config: {}, canWrite });
+};
+
+test("Market → Buy with write mode off: an offer's Pick button is disabled and says why", async () => {
+  mockBuy(false);
+  const { c, root } = await mount(MarketBuy);
+  const pick = button(c, "Pick");
+  assert.ok(pick, c.textContent.slice(0, 300));
+  assert.equal(propsOf(pick).disabled, true);
+  assert.match(String(propsOf(pick).title), /^Not possible here — write mode is off/);
+  root.unmount();
+  mockBuy(true);
+  const on = await mount(MarketBuy);
+  assert.notEqual(propsOf(button(on.c, "Pick")!).disabled, true);
+  on.root.unmount();
+});
+
+test("Market → Buy with write mode not known: no write-mode banner, nothing disabled for it", async () => {
+  mockBuy("unknown");
+  const { c, root } = await mount(MarketBuy);
+  assert.doesNotMatch(c.textContent, /Buying is disabled/);
+  assert.notEqual(propsOf(button(c, "Buy inbound")!).disabled, true);
+  assert.notEqual(propsOf(button(c, "Pick")!).disabled, true);
+  root.unmount();
+});

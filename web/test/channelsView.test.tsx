@@ -144,8 +144,9 @@ test("the channel autopilot: its fee cap is a setting, how it decides is said un
   assert.match(CHANNEL_MAX_FEE_HINT, /A channel sold on Magma is not held to it/);
   assert.match(CHANNEL_MAX_FEE_HINT, /while that costs no more than the sale earns/);
   assert.match(CHANNEL_MAX_FEE_HINT, /the buyer is refunded and an alert tells you/);
-  // LANE-9: the sale whose payment Amboss holds is not lost to high fees.
-  assert.match(CHANNEL_MAX_FEE_HINT, /an order whose payment Amboss holds is opened whatever the fee in its last hours, so the sale is not lost/);
+  // The ceiling (othervice, 2026-11-12): no open costs more than the order brings.
+  assert.match(CHANNEL_MAX_FEE_HINT, /No open costs more than the order brings: if fees stay there, an order whose payment Amboss holds is ended at its last moment to open \(six hours before Amboss's deadline\)/);
+  assert.doesNotMatch(CHANNEL_MAX_FEE_HINT, /opens it anyway|whatever the fee/);
   // Its last decision, with its state (D16): the status line at the top of the sub-tab.
   assert.match(panel, /<StatusLine area="channels" status=\{status\?\.channels\} \/>/);
   assert.match(CHANNEL_OPEN_HINT, /paid back within a year/);

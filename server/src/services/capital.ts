@@ -477,7 +477,7 @@ export interface PeerChannel {
 export const saleTag = (source: string, orderId: string): string => `${source}:${orderId}`;
 
 /** A description that names a sale's order (saleTag). */
-const SALE_TAG = /^(lsps1|magma):\S+$/;
+export const SALE_TAG = /^(lsps1|magma):\S+$/;
 
 /** Every channel to `pubkey` that LND knows: open, or pending open. */
 export async function channelsWith(lnd: AuthenticatedLnd, pubkey: string): Promise<PeerChannel[]> {

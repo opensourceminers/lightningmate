@@ -103,7 +103,9 @@ const MIN_SANE_SIZE = 20_000;
  * status is kept: the field going missing must not empty the history.
  */
 export const SOLD_LEASE_STATUSES: ReadonlySet<string> = new Set(["ACTIVE", "FINISHED", "FINISHED_EARLY", "NOT_MONITORED"]);
-const isSale = (status: string | null | undefined): boolean => !status || SOLD_LEASE_STATUSES.has(status);
+/** (In any case: a status Amboss spelt otherwise one day dropped a sale
+ *  from the clearing price without a word — review of P2, n4.) */
+const isSale = (status: string | null | undefined): boolean => !status || SOLD_LEASE_STATUSES.has(status.toUpperCase());
 
 /**
  * The fewest sales a clearing price is read from (clearingFor). Below it the

@@ -932,7 +932,12 @@ export async function getMagmaRecommendations(
     // (autoSizedWindow — the upkeep's reshape writes the same), not for the
     // one it has: the representative size, and with it the profit floor,
     // moves with it.
-    const sized = offer && autoLease(offer) && !cfg.windowsHeld ? autoSizedWindow(offer, sellWindow.min, sellWindow.max, cfg.heldFloorOfferIds.includes(offer.id), cfg.autoRelist ? null : offer.availableSats) : null;
+    // (A floor held while LND's estimate is missing too, as the upkeep holds
+    // it: priced for the window it will really write — review of P2, n5.)
+    const sized =
+      offer && autoLease(offer) && !cfg.windowsHeld
+        ? autoSizedWindow(offer, sellWindow.min, sellWindow.max, cfg.heldFloorOfferIds.includes(offer.id) || feeEstimateMissing, cfg.autoRelist ? null : offer.availableSats)
+        : null;
     const minSize = sized?.minSizeSats ?? offer?.minSizeSats ?? sellWindow.min;
     const maxSize = sized?.maxSizeSats ?? offer?.maxSizeSats ?? sellWindow.max;
     // Priced for the lease the offer carries after the next write: a 90-day

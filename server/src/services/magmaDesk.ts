@@ -38,7 +38,7 @@ import {
   type FoundInvoice,
   type HodlStatus,
 } from "./hodl.js";
-import { channelsWith, findOpenedChannel, saleTag, spendableOnchain, type CapitalLedger } from "./capital.js";
+import { channelsWith, findOpenedChannel, SALE_TAG, saleTag, spendableOnchain, type CapitalLedger } from "./capital.js";
 import {
   MissingPermission,
   closeChannelByOutpoint,
@@ -115,8 +115,10 @@ import { OPEN_TX_VBYTES } from "./nodeEconomics.js";
  * `timeout` (our invoice's time plus 48 hours, as seen live); no open is
  * started in the last UNPAID_OPEN_RESERVE_MS before that, which the channel
  * needs for its confirmations; an open that waits for lower on-chain fees
- * (LANE-4) is made whatever the fee from LEGACY_FEE_WAIT_RESERVE_MS before
- * that last moment; and an open that fails is tried again until then, after
+ * (LANE-4) is priced to confirm fast from LEGACY_FEE_WAIT_RESERVE_MS before
+ * that last moment, opened when it costs no more than the order brings, and
+ * the order ended at that last moment when it still costs more (othervice,
+ * 2026-11-12); and an open that fails is tried again until then, after
  * which the invoice is cancelled, the reservation freed and the operator told
  * (refunds). After Amboss confirmed the channel the payment is waited for
  * until our invoice runs out, with an alert once it has lasted
@@ -236,8 +238,9 @@ export const OPEN_RETRY_WINDOW_MS = 30 * 60_000;
 export const LEGACY_OPEN_RETRY_MS = 38 * 3_600_000;
 /** How long before such an order's last moment to open (those 38 hours, or a
  *  deadline of Amboss's) its wait for lower on-chain fees ends: from then on
- *  the channel is opened whatever the fee — nothing can go back to the buyer
- *  — with these hours left to reach a buyer who is offline just then
+ *  the channel is opened whatever the fee — nothing can go back to the buyer;
+ *  the one open allowed above what the order brings, and told
+ *  (openAboveEarnings) — with these hours left to reach a buyer who is offline just then
  *  (openFeeFor; othervice's decision of 2026-11-10: rather wait for lower
  *  fees than open at once at any fee). */
 export const LEGACY_FEE_WAIT_RESERVE_MS = 6 * 3_600_000;
@@ -274,6 +277,11 @@ export const NO_PAYMENT_WAIT =
 export const NOT_OUR_ACCEPT_WAIT =
   "Amboss shows this order accepted, but no accept of LightningMate's reached it (accepted outside LightningMate?) — " +
   "LightningMate opens no channel by itself for an invoice Amboss may not have: waiting for you to open the channel";
+/** …and for one Amboss shows accepted after it answered this node's accept
+ *  with an error (noteAccepted): maybe by that accept, maybe elsewhere. */
+export const ACCEPT_REFUSED_WAIT =
+  "Amboss shows this order accepted after it answered LightningMate's accept with an error — maybe by that accept, maybe outside LightningMate with another invoice; " +
+  "LightningMate opens no channel by itself for an invoice Amboss may not have: waiting for you to open the channel";
 /** How long after Amboss confirmed an order's channel its payment may be
  *  outstanding before the operator is told (paymentsOverdue). Amboss pays the
  *  seller after the confirmation (way A in the file comment): the wait itself
@@ -285,12 +293,22 @@ export const PAYMENT_OVERDUE_MS = 6 * 3_600_000;
 /** What an order says while Amboss has confirmed its channel and Amboss's
  *  payment to our invoice is still to come (settle). */
 export const AWAITING_AMBOSS_PAYMENT = "channel confirmed — waiting for Amboss's payment (Amboss pays after the confirmation)";
+/** What an order says once its channel is out and Amboss has yet to confirm
+ *  it (recordFunding). */
+export const CHANNEL_OUT_WAIT = "channel opened — waiting for Amboss to confirm it";
 /** …and, before the open, an order Amboss took the buyer's payment for. */
 export const AMBOSS_HOLDS_PAYMENT = "Amboss holds the buyer's payment";
 /** How much of the time an unpaid-invoice order has for its channel is kept
  *  back for the channel's three confirmations and Amboss's check: at most
  *  this long, and never more than half the time there is (unpaidOpenWindow). */
 export const UNPAID_OPEN_RESERVE_MS = 6 * 3_600_000;
+/** How long Amboss gives an order it holds the buyer's payment for to get
+ *  its channel, from our invoice's making (seen live: its `timeout`, our
+ *  invoice's time plus 48 hours) — the window's end when the order names no
+ *  usable `timeout` (unpaidOpenWindow). */
+export const AMBOSS_OPEN_WINDOW_MS = 48 * 3_600_000;
+/** A moment as the order's record and the operator's answers name it. */
+const utc = (at: number): string => `${new Date(at).toISOString().slice(0, 16).replace("T", " ")} UTC`;
 /** No invoice of ours held or settled this order's payment (book, fulfil). */
 const noPaymentOfOurs = (entry: MagmaJournalEntry): boolean => !entry.invoice && !entry.paidInvoiceId;
 /** Way A: the order was accepted with an invoice of ours that nothing has
@@ -307,7 +325,32 @@ const OPEN_FEE_UNKNOWN = "a sold channel waits for an on-chain fee estimate — 
  *  record and in the lane's status (openFeeFor) — taken off again where the
  *  wait has ended (cannotOpen): `lower` fees, or an estimate at all. */
 const OPEN_ANYWAY = "“Open channel” on Market → Orders opens it anyway";
-const feeWaitTail = (lower: boolean): string => ` — waiting for ${lower ? "lower fees" : "one"} (${OPEN_ANYWAY})`;
+/** …for an order whose payment can still go back to the buyer: no open,
+ *  by the lane or a click, costs more than the order brings (othervice,
+ *  2026-11-12). */
+const OPEN_AT_PRICE = "“Open channel” opens it only once it costs no more than the order brings";
+const feeWaitTail = (lower: boolean, anyway = false): string => ` — waiting for ${lower ? "lower fees" : "one"} (${anyway ? OPEN_ANYWAY : OPEN_AT_PRICE})`;
+/** The tail a wait's text ends with, if it is one (either kind). */
+const feeWaitOf = (text: string): { lower: boolean; tail: string } | null => {
+  for (const lower of [true, false]) for (const anyway of [false, true]) {
+    const tail = feeWaitTail(lower, anyway);
+    if (text.endsWith(tail)) return { lower, tail };
+  }
+  return null;
+};
+/** Why an order Amboss holds the payment for ends at its last moment to
+ *  open when its open still costs more than the order brings, or its cost
+ *  can't be estimated (othervice's ceiling, 2026-11-12): `numbers` is
+ *  openFeeFor's — the rate, the cost and what the order earns. */
+const ceilingEnd = (numbers: string, lastLookedAt?: string): string =>
+  lastLookedAt
+    ? `${numbers}, when last looked at (${lastLookedAt.slice(0, 16).replace("T", " ")} UTC) — ended once its last moment to open had passed, not opened: no channel is opened that costs more than the order brings`
+    : `${numbers} — ended at its last moment to open instead of opened: no channel is opened that costs more than the order brings`;
+/** …the numbers of the fee wait an order's record ends with, if it does. */
+const ceilingWaitOf = (entry: MagmaJournalEntry): string | null => {
+  const last = entry.lastError?.replace(/ — will try again$/, "") ?? "";
+  return feeWaitOf(last) !== null && last.includes(`; ${AMBOSS_HOLDS_PAYMENT}. If the open still costs more at `) ? last.split("; ")[0]! : null;
+};
 /** What kept an order's channel from being opened all the while it was
  *  tried, if anything did (a buyer away, coins unconfirmed, fees above what
  *  the sale earns): the order's record ends with it — a wait for fees
@@ -315,10 +358,10 @@ const feeWaitTail = (lower: boolean): string => ` — waiting for ${lower ? "low
 const lastTried = (entry: MagmaJournalEntry): string => {
   const last = entry.lastError && / — will try again$/.test(entry.lastError) ? entry.lastError.replace(/ — will try again$/, "") : null;
   if (last === null) return "";
-  const waited = [true, false].find((lower) => last.endsWith(feeWaitTail(lower)));
-  return waited === undefined
+  const waited = feeWaitOf(last);
+  return waited === null
     ? ` — last tried: ${last}`
-    : ` — it waited for ${waited ? "lower fees" : "a fee estimate"} until then: ${last.slice(0, -feeWaitTail(waited).length)}`;
+    : ` — it waited for ${waited.lower ? "lower fees" : "a fee estimate"} until then: ${last.slice(0, -waited.tail.length)}`;
 };
 /** A dial ends this long before the order's deadline (dialBudgetFor). */
 const DIAL_DEADLINE_SLACK_MS = 30_000;
@@ -860,7 +903,7 @@ const buyersAwayText = (away: string[]): string =>
  *  of them, for LND to give a fee estimate at all. */
 const feesHighText = (waiting: string[]): string =>
   `${waiting.length === 1 ? "1 paid order waits" : `${waiting.length} paid orders wait`} for ` +
-  `${waiting[0].endsWith(feeWaitTail(false)) ? "an on-chain fee estimate" : "lower on-chain fees"} (${waiting[0]})`;
+  `${feeWaitOf(waiting[0])?.lower === false ? "an on-chain fee estimate" : "lower on-chain fees"} (${waiting[0]})`;
 
 /** Orders a pass left alone: a given-up pass still waits on a step of theirs. */
 const stuckText = (ids: string[]): string =>
@@ -1104,7 +1147,7 @@ export class MagmaDesk {
       .filter(
         (e) =>
           e.phase === "cancelled" &&
-          (!!e.heldAt || !!e.ambossHoldsAt) &&
+          (!!e.heldAt || !!e.ambossHoldsAt || e.acceptRefusedThenAccepted !== undefined) &&
           !!e.cancelledAt &&
           !e.fundingOutpoint &&
           !e.alertAckAt &&
@@ -1153,12 +1196,15 @@ export class MagmaDesk {
    * after the confirmation, so the wait itself is normal — the order goes on
    * waiting until our invoice runs out either way (settle); this only tells
    * the operator once it has lasted. Derived: gone when the payment arrives
-   * or the order ends.
+   * or the order ends — and not said of a payment that is here, held by our
+   * invoice, while its claim waits on something else (a channel LND does not
+   * show: settleBlocked): Amboss has paid, and the order's own record says
+   * what holds the claim up (review of P1b, R13).
    */
   paymentsOverdue(nowMs = Date.now()): MagmaOverduePayment[] {
     return this.journal
       .all()
-      .filter((e) => !TERMINAL_PHASES.has(e.phase) && !!e.unpaidSince && nowMs - Date.parse(e.unpaidSince) >= PAYMENT_OVERDUE_MS)
+      .filter((e) => !TERMINAL_PHASES.has(e.phase) && !!e.unpaidSince && !e.heldAt && nowMs - Date.parse(e.unpaidSince) >= PAYMENT_OVERDUE_MS)
       .map((e) => ({ orderId: e.orderId, sizeSats: e.sizeSats, feeSats: feeSatsOf(e), since: e.unpaidSince!, until: e.invoice?.expiresAt ?? null }));
   }
 
@@ -1185,6 +1231,38 @@ export class MagmaDesk {
       }));
   }
 
+  /** Orders that wait for the operator to open their channel
+   *  (waitForYourOpen), with the reason and the last moment to open. Derived:
+   *  gone once the channel is out or the order ends. */
+  waitingForYourOpen(): { orderId: string; sizeSats: number; reason: string; until: string | null }[] {
+    return this.journal
+      .all()
+      .filter((e) => OPENABLE.has(e.phase) && !e.fundingOutpoint && e.decision?.action === "wait" && /waiting for you to open the channel/.test(e.decision.reason))
+      .map((e) => ({ orderId: e.orderId, sizeSats: e.sizeSats, reason: e.decision!.reason, until: e.decision!.until ?? null }));
+  }
+
+  /** Orders for which Amboss names a funding transaction or channel that
+   *  LND does not show as theirs, while nothing is opened beside it — until
+   *  the channel shows up, Amboss names none, or the order ends (at its last
+   *  moment to open at the latest: fulfil). Derived. */
+  channelsNotShown(): { orderId: string; sizeSats: number; what: string; since: string; endsAt: string | null }[] {
+    return this.journal
+      .all()
+      .filter((e) => !TERMINAL_PHASES.has(e.phase) && !e.fundingOutpoint && !!e.channelNotShown)
+      .map((e) => ({ orderId: e.orderId, sizeSats: e.sizeSats, ...e.channelNotShown!, since: e.channelNotShown!.at }));
+  }
+
+  /** Orders paid by a plain invoice that settled here (an older version's)
+   *  whose channel was opened at an on-chain fee above what they brought —
+   *  the one case the ceiling does not end an order in, since the payment
+   *  cannot go back (openAboveEarnings) — for a week, until dismissed. */
+  opensAboveEarnings(nowMs = Date.now()): { orderId: string; sizeSats: number; feeRate: number; costSats: number; earnsSats: number; at: string }[] {
+    return this.journal
+      .all()
+      .filter((e) => !!e.openAboveEarnings && !e.alertAckAt && nowMs - Date.parse(e.openAboveEarnings.at) <= 7 * 24 * 3_600_000)
+      .map((e) => ({ orderId: e.orderId, sizeSats: e.sizeSats, ...(e.openAboveEarnings as NonNullable<MagmaJournalEntry["openAboveEarnings"]>) }));
+  }
+
   /** The operator read the alert about a turned-down order, about a paid
    *  one that ended with no channel (refunds), about one whose payment was
    *  kept (paymentsKept), or about a channel nobody paid for
@@ -1196,6 +1274,7 @@ export class MagmaDesk {
       e.phase === "rejected" ||
       (e.phase === "cancelled" && (!!e.heldAt || !!e.ambossHoldsAt || !!e.fundingOutpoint)) ||
       (e.phase === "failed" && !!e.paymentKeptAt) ||
+      !!e.openAboveEarnings ||
       (e.phase === "settled" && e.unbooked === true && !!e.invoice && !!e.fundingOutpoint);
     if (!alerted) return false;
     e.alertAckAt = now();
@@ -2989,23 +3068,52 @@ export class MagmaDesk {
     // Never a second channel (LANE-10): one that is there already — on
     // Amboss's order, or in LND, opened outside LightningMate since the
     // accept — is this order's (channelAlreadyThere), and reported below.
-    if (OPENABLE.has(entry.phase) && !(await this.channelAlreadyThere(entry, order))) {
-      if (!how.auto && !how.manual) {
-        const reason = entry.phase === "held" ? "payment held — waiting for you to open the channel" : `${AMBOSS_HOLDS_PAYMENT} — waiting for you to open the channel`;
-        if (entry.decision?.reason !== reason) {
-          entry.decision = { at: now(), action: "wait", reason };
-          this.journal.note(entry);
+    const there = OPENABLE.has(entry.phase) ? await this.channelAlreadyThere(entry, order) : true;
+    // One Amboss names and LND does not show as this order's: nothing is
+    // opened beside it, and at the order's last moment to open the order is
+    // ended like any other — our invoice cancelled, the coins free, the
+    // buyer refunded (review of P1b, R15: before, it stayed "accepted", its
+    // invoice open and its coins reserved, until Amboss ended it).
+    if (there && OPENABLE.has(entry.phase) && !entry.fundingOutpoint && entry.channelNotShown) {
+      const deadline = this.lastOpenAt(entry, order);
+      if (deadline !== null && deadline <= Date.now()) {
+        out.push(...(await this.release(entry, `${entry.channelNotShown.what.replace(/; check (both orders on Amboss|the order)$/, "")} — ended at its last moment to open`)));
+        return out;
+      }
+    }
+    if (OPENABLE.has(entry.phase) && !there) {
+      // An order left to the operator, past its last moment to open: ended
+      // here, as their click would end it — the coins free, our invoice
+      // cancelled, the refund told (review of P1c round 2, N-3: it kept its
+      // coins and our invoice until Amboss ended it, and its alert still said
+      // "Open channel" opens it).
+      if (!how.manual && !this.opensItself(entry.orderId)) {
+        const window = this.unpaidOpenWindow(entry, order);
+        if (window && Date.now() >= window.openBy) {
+          out.push(
+            ...(await this.release(
+              entry,
+              `the channel was not opened by its last moment to open (${utc(window.openBy)}): Amboss ends the order unless its channel is there by ${utc(window.payBy)}, and a channel opened later could not get its confirmations in time`,
+            )),
+          );
+          return out;
         }
+      }
+      if (!how.auto && !how.manual) {
+        // (With the moment to do it by, where there is one: review of P1b, R9.)
+        const window = this.unpaidOpenWindow(entry, order);
+        const reason =
+          entry.phase === "held"
+            ? "payment held — waiting for you to open the channel"
+            : `${AMBOSS_HOLDS_PAYMENT} — waiting for you to open the channel` +
+              (window ? ` by ${utc(window.openBy)}: Amboss ends the order unless its channel is there by ${utc(window.payBy)}, and a channel opened later could not get its confirmations in time` : "");
+        this.waitForYourOpen(entry, order, reason);
         return out;
       }
       // An invoice of ours that no accept of ours carried to Amboss is one
       // Amboss does not have: nothing would ever pay it. The operator's.
       if (!how.manual && opensUnpaid(entry) && !entry.acceptSentAt) {
-        if (entry.decision?.reason !== NOT_OUR_ACCEPT_WAIT) {
-          entry.decision = { at: now(), action: "wait", reason: NOT_OUR_ACCEPT_WAIT };
-          this.journal.event(entry, NOT_OUR_ACCEPT_WAIT);
-          this.journal.note(entry);
-        }
+        this.waitForYourOpen(entry, order, entry.acceptRefusedThenAccepted !== undefined ? ACCEPT_REFUSED_WAIT : NOT_OUR_ACCEPT_WAIT, true);
         return out;
       }
       // Review 2026-11-10, LANE-5: an order found with no record here and no
@@ -3017,11 +3125,7 @@ export class MagmaDesk {
       // was accepted elsewhere never got one (acceptedElsewhere). Now it
       // waits for the operator, who knows where its payment went.
       if (!how.manual && noPaymentOfOurs(entry)) {
-        if (entry.decision?.reason !== NO_PAYMENT_WAIT) {
-          entry.decision = { at: now(), action: "wait", reason: NO_PAYMENT_WAIT };
-          this.journal.event(entry, NO_PAYMENT_WAIT);
-          this.journal.note(entry);
-        }
+        this.waitForYourOpen(entry, order, NO_PAYMENT_WAIT, true);
         return out;
       }
       if (opensUnpaid(entry) && entry.decision?.action !== "wait") {
@@ -3043,6 +3147,19 @@ export class MagmaDesk {
     return out;
   }
 
+  /** An order the lane leaves for the operator to open: its decision says
+   *  why, with its last moment to open (`until`; review of P1c, m6: nothing
+   *  told the operator of such an order, nor by when). `event`: the reason
+   *  also goes on the order's record, once. */
+  private waitForYourOpen(entry: MagmaJournalEntry, order: SaleOrder, reason: string, event = false): void {
+    const last = this.lastOpenAt(entry, order);
+    const until = last === null ? null : new Date(last).toISOString();
+    if (entry.decision?.reason === reason && (entry.decision.until ?? null) === until) return;
+    if (event && entry.decision?.reason !== reason) this.journal.event(entry, reason);
+    entry.decision = { at: now(), action: "wait", reason, until };
+    this.journal.note(entry);
+  }
+
   /**
    * Amboss shows an order past approval whose accept this node sent without
    * hearing back ("accepting"): the accept arrived. Said once — the stale
@@ -3053,7 +3170,18 @@ export class MagmaDesk {
    * the accept as confirmed.
    */
   private noteAccepted(entry: MagmaJournalEntry, order: SaleOrder): void {
-    if (entry.phase === "accepting" && PAST_APPROVAL.has(order.status)) this.toPhase(entry, "accepted", "Amboss shows the order accepted");
+    if (entry.phase !== "accepting" || !PAST_APPROVAL.has(order.status)) return;
+    // Amboss answered the last accept sent from here with an error, and no
+    // other went out since: the accept Amboss shows may be another one, made
+    // elsewhere with another invoice — Amboss would never pay ours. Not this
+    // node's accept, then (NOT_OUR_ACCEPT_WAIT): before, the lane opened by
+    // itself and waited for a payment to an invoice Amboss may not have.
+    const refused = entry.acceptRefused;
+    if (refused !== undefined) {
+      entry.acceptSentAt = undefined;
+      entry.acceptRefusedThenAccepted = refused;
+    }
+    this.toPhase(entry, "accepted", refused !== undefined ? `Amboss shows the order accepted, after it answered this node's accept with an error (${refused})` : "Amboss shows the order accepted");
   }
 
   /**
@@ -3087,11 +3215,17 @@ export class MagmaDesk {
       }
       return true;
     }
+    // Amboss no longer names one: nothing stands against an open any more.
+    if (entry.channelNotShown) {
+      entry.channelNotShown = undefined;
+      this.journal.note(entry);
+    }
     if (!(await this.foreignChannelFor(entry, order))) return false;
     return this.deps.capital.mutex.run("magma adopt", async () => {
       if (!OPENABLE.has(entry.phase)) return true; // someone else got here first
       const found = await this.foreignChannelFor(entry, order);
-      if (found) this.takeForeignChannel(entry, found);
+      if (found?.take) this.takeForeignChannel(entry, found.outpoint);
+      else if (found) this.noteUnjudged(entry, found.outpoint);
       return found !== null;
     });
   }
@@ -3131,8 +3265,19 @@ export class MagmaDesk {
    * nor opening a second one beside it is safe. The order's pass ends there
    * with nothing changed — the error is on its record, and the next pass
    * looks again.
+   *
+   * `take: false`: a channel of the order's size still being opened, for a
+   * record from before the buyer's channels were noted at the accept (or of
+   * an order accepted elsewhere): with no height yet, nothing tells whether
+   * it is new since the order — it may be an older open to the same buyer.
+   * It is neither taken nor is another opened beside it until it is
+   * confirmed and its height decides (review of P1b, R20).
+   *
+   * With nothing to take, a new channel to the buyer of another size is
+   * said once on the order's record (review of P1b, R12): Amboss takes only
+   * the order's size, so it is not the order's, and the order gets its own.
    */
-  private async foreignChannelFor(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<string | null> {
+  private async foreignChannelFor(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<{ outpoint: string; take: boolean } | null> {
     let notBeforeHeight: number | undefined;
     if (!entry.preExistingAtAccept) {
       const height = (await getWalletInfo({ lnd: this.deps.readLnd })).current_block_height;
@@ -3150,11 +3295,53 @@ export class MagmaDesk {
         ...(notBeforeHeight !== undefined ? { notBeforeHeight } : {}),
         tag: saleTag("magma", entry.orderId),
       });
-      if (!found) return null;
+      if (!found) {
+        await this.noteOtherSizes(entry, exclude, notBeforeHeight);
+        return null;
+      }
       siblings ??= await this.siblingOrders(entry, found.outpoint);
-      if (!(await this.namedForAnother(siblings, entry.buyerPubkey, found.outpoint))) return found.outpoint;
+      if (!(await this.namedForAnother(siblings, entry.buyerPubkey, found.outpoint))) {
+        return { outpoint: found.outpoint, take: notBeforeHeight === undefined || found.fundedHeight !== null };
+      }
       exclude.push(found.outpoint);
     }
+  }
+
+  /** foreignChannelFor's channel of unknown age, said once on the record. */
+  private noteUnjudged(entry: MagmaJournalEntry, outpoint: string): string {
+    const what =
+      `a channel of the order's size to the buyer is being opened outside LightningMate (${outpoint}), and this order's record does not say which channels the buyer had at the accept: ` +
+      "it is neither taken as the order's nor is another opened beside it until it is confirmed and its height shows whether it is new";
+    if (!entry.events.some((e) => e.what === what)) {
+      this.journal.event(entry, what);
+      this.journal.note(entry);
+    }
+    return what;
+  }
+
+  /** foreignChannelFor: a new channel of this node to the buyer, of another
+   *  size than the order's, said once per channel. */
+  private async noteOtherSizes(entry: MagmaJournalEntry, exclude: string[], notBeforeHeight: number | undefined): Promise<void> {
+    const skip = new Set(exclude);
+    const tag = saleTag("magma", entry.orderId);
+    const others = (await channelsWith(this.deps.readLnd, entry.buyerPubkey)).filter(
+      (c) =>
+        c.ours &&
+        c.capacity !== entry.sizeSats &&
+        !skip.has(c.outpoint) &&
+        !(SALE_TAG.test(c.description) && c.description !== tag) &&
+        (notBeforeHeight === undefined || (c.fundedHeight !== null && c.fundedHeight >= notBeforeHeight)),
+    );
+    let noted = false;
+    for (const c of others) {
+      if (entry.events.some((e) => e.what.includes(c.outpoint))) continue;
+      this.journal.event(
+        entry,
+        `a ${c.capacity.toLocaleString("en-US")} sat channel to the buyer (${c.outpoint}) was opened outside LightningMate — not the order's ${entry.sizeSats.toLocaleString("en-US")} sat, so it is not taken as the order's: Amboss takes only a channel of the order's size, and the order gets its own`,
+      );
+      noted = true;
+    }
+    if (noted) this.journal.note(entry);
   }
 
   /**
@@ -3216,7 +3403,7 @@ export class MagmaDesk {
    * capital; the intent is saved before the open and the outpoint right
    * after. The open names its on-chain fee rate, and the lane's own open
    * waits while that would cost more than the sale earns (openFeeFor);
-   * `byHand`: the operator's click, which opens whatever the fee.
+   * `byHand`: the operator's click, under the same ceiling (openFeeFor).
    */
   private async openFor(entry: MagmaJournalEntry, order: SaleOrderDetail, pass?: LanePass | null, byHand = false): Promise<MagmaSellAction[]> {
     const base = { orderId: entry.orderId, action: "open" as const, sizeSats: entry.sizeSats };
@@ -3225,14 +3412,24 @@ export class MagmaDesk {
     // Before the dial: a buyer is not dialed (up to a minute and a half over
     // Tor) for an open that waits for its fee anyway.
     const fee = await this.openFeeFor(entry, order, byHand);
+    // The click on an order whose open would cost more than it brings (or
+    // whose cost LND can't estimate): not opened, and the answer names both
+    // numbers; the order goes on waiting (othervice's ceiling, 2026-11-12).
+    if (fee.refuse) return [{ ...base, ok: false, error: fee.refuse }];
     if (fee.wait) {
-      // No time left to wait in (a deadline of Amboss's for the open, minutes
-      // away): the payment goes back, and the reason says what was waited
-      // for — not "waiting", and not an open that "failed": none was tried.
+      // No time left to wait in (the last moment to open, minutes away): the
+      // payment goes back, and the reason says what was waited for — not
+      // "waiting", and not an open that "failed": none was tried. Dearer than
+      // the order brings, or no estimate, to the last: the order is ended,
+      // not opened (the ceiling) — our invoice cancelled (a held payment goes
+      // back to the buyer at once; one Amboss holds, Amboss refunds when it
+      // ends the order), the coins free, and the alert of an order ended
+      // with no channel says why, with both numbers.
       if (!this.timeLeftToOpen(entry, order)) {
-        return [{ ...base, ok: false, error: fee.wait.why }, ...(await this.release(entry, `the channel could not be opened in time: ${fee.wait.why}`))];
+        const why = fee.wait.numbers && this.unpaidOpenWindow(entry, order) ? ceilingEnd(fee.wait.numbers) : `the channel could not be opened in time: ${fee.wait.why}`;
+        return [{ ...base, ok: false, error: why }, ...(await this.release(entry, why))];
       }
-      const text = fee.wait.why + feeWaitTail(fee.wait.lower);
+      const text = fee.wait.why + feeWaitTail(fee.wait.lower, fee.wait.anyway);
       const failed = await this.openFailed(entry, order, text, true);
       if (!OPENABLE.has(phaseOf(entry))) return failed;
       if (pass) pass.feesHigh.push(text);
@@ -3302,10 +3499,11 @@ export class MagmaDesk {
       // channel to the buyer that is new since the accept and nobody's is
       // this order's — nothing is opened beside it (channelAlreadyThere).
       const there = await this.foreignChannelFor(entry, order);
-      if (there) {
-        this.takeForeignChannel(entry, there);
+      if (there?.take) {
+        this.takeForeignChannel(entry, there.outpoint);
         return [];
       }
+      if (there) return [{ ...base, ok: false, error: this.noteUnjudged(entry, there.outpoint) }];
       const lacking = await this.capitalFor(entry.sizeSats, { caps: false, exceptKey: `magma:${entry.orderId}` });
       if (lacking) return this.openFailed(entry, order, lacking.reason);
       const preExisting = (await channelsWith(this.deps.readLnd, entry.buyerPubkey)).map((c) => c.outpoint);
@@ -3314,7 +3512,7 @@ export class MagmaDesk {
       // invoice holds the payment), or "accepted" (Amboss holds it).
       const from = phaseOf(entry) === "accepted" ? "accepted" : "held";
       entry.phase = "opening";
-      entry.opening = { startedAt: now(), preExisting, from };
+      entry.opening = { startedAt: now(), preExisting, from, ...(fee.above ? { above: fee.above } : {}) };
       entry.openAttempts += 1;
       this.journal.event(entry, fee.feeRate ? `open started at ${fee.feeRate} sat/vB` : "open started");
       try {
@@ -3342,12 +3540,14 @@ export class MagmaDesk {
         ...(fee.feeRate ? { feeRate: fee.feeRate } : {}),
       });
       if (res.ok && res.transactionId) {
+        this.noteOpenAboveEarnings(entry, fee.above);
         this.recordFunding(entry, `${res.transactionId}:${res.transactionVout ?? 0}`);
         return [{ ...base, ok: true, transactionId: res.transactionId }];
       }
       // An error after the broadcast must not lead to a second open.
       const opened = await this.findOurOpen(entry).catch(() => null);
       if (opened) {
+        this.noteOpenAboveEarnings(entry, fee.above);
         this.recordFunding(entry, opened);
         return [{ ...base, ok: true, transactionId: opened.split(":")[0] }];
       }
@@ -3403,11 +3603,12 @@ export class MagmaDesk {
    * the buyer is refunded and the operator told (refunds). With no estimate
    * from LND the cost is unknown, and the lane waits the same way.
    *
-   * The operator's click (`byHand`) is their decision: it opens at the
-   * estimate whatever the sale earns — and without an estimate as before,
-   * at the rate LND picks. Not the "Max on-chain fee for opens" setting: an
-   * order accepted and paid for is owed its channel while the sale covers
-   * it, at 30 sat/vB too.
+   * The operator's click (`byHand`) opens under the same ceiling: an open
+   * that costs more than the order brings, or whose cost LND can't
+   * estimate, is refused with both numbers, and the order goes on waiting
+   * (othervice, 2026-11-12). Not the "Max on-chain fee for opens" setting:
+   * an order accepted and paid for is owed its channel while the sale
+   * covers it, at 30 sat/vB too.
    *
    * An order whose payment is not held — one accepted by an older version
    * with a plain invoice, which settled when the buyer paid — waits too,
@@ -3423,22 +3624,43 @@ export class MagmaDesk {
    * fee: at 400 sat/vB about 70,000 sat for a sale that earned 2,400.
    * othervice's decision of 2026-11-10: rather wait for lower fees.)
    *
+   * Its open above what the order brought is put on the record and told
+   * (openAboveEarnings): that payment cannot go back.
+   *
    * An order Amboss holds the buyer's payment for (opened before our invoice
-   * is paid: fulfil) waits the same way, and its wait ends in the open too —
-   * a sale this node accepted is to complete (othervice, 2026-11-11), and
-   * letting it run out counts against the seller. From
-   * LEGACY_FEE_WAIT_RESERVE_MS before its last moment to open
-   * (unpaidOpenWindow) it is opened whatever the fee, at LND's estimate for
-   * a confirmation within about three blocks: Amboss pays only once the
-   * channel is confirmed, so from there on it is the confirmation that
-   * counts. (The cost of that has no ceiling of its own; the sale's fee does
-   * not bound it.)
+   * is paid: fulfil) waits the same way, up to its last moment to open
+   * (unpaidOpenWindow: openBy). From LEGACY_FEE_WAIT_RESERVE_MS before that
+   * moment (forceFrom) it is priced at LND's estimate for a confirmation
+   * within about three blocks (Amboss pays only once the channel is
+   * confirmed) — or, where that is dearer than the order brings, at the
+   * highest rate the order pays for, as long as that is no less than LND's
+   * usual estimate. No dearer than the order brings, it is opened; dearer,
+   * or with no estimate at all, to the last moment to open, the order is
+   * ended then (cannotOpen, or openFor in its last minutes: ceilingEnd) —
+   * our invoice cancelled, the coins free, an alert with both numbers, and
+   * Amboss ends the order and refunds the buyer at its own deadline. (Until
+   * 2026-11-12 it was opened whatever the fee from forceFrom: a sale this
+   * node accepted was to complete; othervice then set the ceiling: "wenn die
+   * Gebühren für das Öffnen mehr kosten als die Bestellung einbringt, soll
+   * die Order canceled werden". The Magma schema's `seller.reject` is
+   * documented and used here for orders awaiting approval only; no call of
+   * it on an order Amboss approved was ever made, so it is ended by not
+   * opening and cancelling our invoice, as an order that ran out of time.
+   * Amboss refunds the buyer at its deadline either way — so the order is
+   * ended at its last moment to open, not at forceFrom: ended there, six
+   * hours in which fees could fall were given up for nobody's gain — review
+   * of P1c, M2.)
    */
   private async openFeeFor(
     entry: MagmaJournalEntry,
     order: SaleOrder,
     byHand: boolean,
-  ): Promise<{ feeRate?: number; wait?: { why: string; lower: boolean } }> {
+  ): Promise<{
+    feeRate?: number;
+    wait?: { why: string; lower: boolean; anyway?: boolean; numbers?: string };
+    refuse?: string;
+    above?: NonNullable<MagmaJournalEntry["openAboveEarnings"]>;
+  }> {
     if (!this.deps.soldChannelOpen) return {};
     const window = this.unpaidOpenWindow(entry, order);
     const forced = window !== null && Date.now() >= window.forceFrom;
@@ -3447,31 +3669,90 @@ export class MagmaDesk {
     // (No estimate for the short target: the usual one is better than none.)
     if (forced && !usable(terms)) terms = await this.deps.soldChannelOpen().catch(() => null);
     const rate = terms && terms.feeRate !== null && terms.feeRate > 0 ? terms.feeRate : null;
-    const anyway = rate !== null ? { feeRate: rate } : {};
-    if (byHand || forced) return anyway;
-    // Nothing held: once the wait is over, the channel is opened whatever it costs.
-    const settledUntil = entry.invoice ? null : this.feeWaitEndFor(entry, order);
-    if (settledUntil !== null && settledUntil <= Date.now()) return anyway;
-    const utc = (at: number): string => `${new Date(at).toISOString().slice(0, 16).replace("T", " ")} UTC`;
-    const then =
-      window !== null
-        ? `; ${AMBOSS_HOLDS_PAYMENT}, so the channel is opened whatever the fee from ${utc(window.forceFrom)}`
-        : settledUntil === null
-          ? ""
-          : `; the buyer's payment is settled here, so the channel is opened whatever the fee from ${utc(settledUntil)}`;
-    if (!terms || rate === null) {
-      return { wait: { why: `LND gives no on-chain fee estimate, so what opening the channel would cost is unknown${then}`, lower: false } };
-    }
-    const earns = Math.floor(feeSatsOf(entry) * (1 - terms.serviceFeeRate));
-    const cost = rate * OPEN_TX_VBYTES;
-    if (cost <= earns) return { feeRate: rate };
     const sat = (n: number) => n.toLocaleString("en-US");
-    return {
-      wait: {
-        why: `on-chain fees are ${sat(rate)} sat/vB: opening the channel would cost about ${sat(cost)} sat, more than the ${sat(earns)} sat this sale earns${then}`,
-        lower: true,
-      },
-    };
+    // What the order brings this node (the figure E2's wait already used):
+    // its fee less the service fee's share; and what the open would cost.
+    const earns = terms ? Math.floor(feeSatsOf(entry) * (1 - terms.serviceFeeRate)) : null;
+    const cost = rate !== null ? rate * OPEN_TX_VBYTES : null;
+    const numbers =
+      rate === null || cost === null || earns === null
+        ? "LND gives no on-chain fee estimate, so what opening the channel would cost is unknown"
+        : `on-chain fees are ${sat(rate)} sat/vB: opening the channel would cost about ${sat(cost)} sat, more than the ${sat(earns)} sat this sale earns`;
+    const cheapEnough = cost !== null && earns !== null && cost <= earns;
+
+    // Paid by a plain invoice that settled here (an older version's order):
+    // the payment cannot go back, so the wait ends in the open — at the rate
+    // there is, whatever it costs — and an open above what the order brought
+    // is put on its record for the operator's alert once it went out
+    // (openFor: openAboveEarnings). Only that order: one with no payment of
+    // ours at all (accepted with another tool) is under the ceiling like any
+    // other — a click on one opened at 400 sat/vB, and its alert said its
+    // payment was settled here (review of P1c, M3).
+    if (!entry.invoice && entry.paidInvoiceId) {
+      const settledUntil = this.feeWaitEndFor(entry, order);
+      if (byHand || settledUntil <= Date.now()) {
+        if (rate === null) return {};
+        return !cheapEnough && cost !== null && earns !== null ? { feeRate: rate, above: { at: now(), feeRate: rate, costSats: cost, earnsSats: earns } } : { feeRate: rate };
+      }
+      if (cheapEnough) return { feeRate: rate as number };
+      return {
+        wait: {
+          why: `${numbers}; the buyer's payment is settled here, so the channel is opened whatever the fee from ${utc(settledUntil)}`,
+          lower: rate !== null,
+          anyway: true,
+        },
+      };
+    }
+
+    // Every other order: no open — the lane's, forced or not, a retried one,
+    // or a click — pays more in on-chain fee than the order brings (othervice,
+    // 2026-11-12: "wenn die Gebühren für das Öffnen mehr kosten als die
+    // Bestellung einbringt, soll die Order canceled werden"). Before, the
+    // forced open of an order Amboss holds the payment for, and every click,
+    // opened whatever the fee: at 900 sat/vB about 157,500 sat for a sale
+    // that earned 12,345.
+    if (cheapEnough) return { feeRate: rate as number };
+    // In the hours before the last moment to open, the three-block rate
+    // dearer than the order brings: the highest rate the order pays for,
+    // where that is no less than LND's usual estimate — it confirms in good
+    // time with hours to go (review of P1c, m2: an order whose usual rate
+    // paid was ended).
+    if (forced && earns !== null) {
+      const most = Math.floor(earns / OPEN_TX_VBYTES);
+      const usual = await this.deps.soldChannelOpen().catch(() => null);
+      if (usual && usual.feeRate !== null && usual.feeRate > 0 && most >= usual.feeRate) return { feeRate: most };
+    }
+    if (byHand) {
+      // What comes next, said as it is: the lane's own order is tried until
+      // its last moment to open and ended then; one the lane leaves to the
+      // operator is theirs to open until then; one with no payment of ours
+      // is theirs altogether.
+      const next = noPaymentOfOurs(entry)
+        ? ""
+        : window === null
+          ? `; it waits for ${rate === null ? "a fee estimate" : "lower fees"} while the held payment has time`
+          : !this.opensItself(entry.orderId)
+            ? `; “Open channel” can open it until ${utc(window.openBy)} — after that the order is ended and Amboss refunds the buyer`
+            : `; if the open still costs more at ${utc(window.openBy)}, the order is ended then and Amboss refunds the buyer`;
+      return { refuse: `not opened: ${numbers} — LightningMate opens no channel that costs more than the order brings${next}` };
+    }
+    const then = window !== null ? `; ${AMBOSS_HOLDS_PAYMENT}. If the open still costs more at ${utc(window.openBy)}, the order is ended then and Amboss refunds the buyer` : "";
+    return { wait: { why: `${numbers}${then}`, lower: rate !== null, numbers } };
+  }
+
+  /** A legacy order's open that went out above what the order brought
+   *  (openFeeFor's `above`): on its record for the alert, saved with the
+   *  funding outpoint. Only once it went out — before, it was written before
+   *  the dial and the capital check, and an order never opened was alerted
+   *  as "opened at 400 sat/vB" (review of P1c, m1). */
+  private noteOpenAboveEarnings(entry: MagmaJournalEntry, above: NonNullable<MagmaJournalEntry["openAboveEarnings"]> | undefined): void {
+    if (!above) return;
+    const sat = (n: number) => n.toLocaleString("en-US");
+    entry.openAboveEarnings = { ...above, at: now() };
+    this.journal.event(
+      entry,
+      `opened at ${sat(above.feeRate)} sat/vB, about ${sat(above.costSats)} sat — more than the ${sat(above.earnsSats)} sat the order brought: its payment is settled here and cannot go back`,
+    );
   }
 
   /** When the wait for lower fees of an order paid outside a HODL invoice
@@ -3503,12 +3784,19 @@ export class MagmaDesk {
     const unpaid = opensUnpaid(entry);
     // Past the open deadline, first attempt or not: Amboss has ended the order
     // or is about to, and a channel opened now would be a free one (a dial can
-    // take a minute and a half, and this runs again after it).
+    // take a minute and a half, and this runs again after it). The answer —
+    // a click's too — says that the order is ended, and why (review of P1b,
+    // R9: it said "no time left" and ended the order without a word of it).
     const deadline = this.lastOpenAt(entry, order);
     if ((deadline !== null && deadline <= Date.now()) || (entry.openAttempts > 0 && !this.timeLeftToOpen(entry, order))) {
+      // (Waited for lower fees to the last: the ceiling's end, both numbers —
+      // said as last looked at when that was a while ago: the app down
+      // across the last moment, say. Review of P1c round 2, t1.)
+      const ceiling = unpaid ? ceilingWaitOf(entry) : null;
+      const stale = entry.lastErrorAt && Date.now() - Date.parse(entry.lastErrorAt) > OPEN_RETRY_MIN_TIME_LEFT_MS ? entry.lastErrorAt : undefined;
       return [
-        { ...base, ok: false, error: "no time left to open the channel" },
-        ...(await this.release(entry, `the channel could not be opened in time${unpaid ? lastTried(entry) : ""}`)),
+        { ...base, ok: false, error: this.noTimeLeft(entry, order) },
+        ...(await this.release(entry, ceiling !== null ? ceilingEnd(ceiling, stale) : `the channel could not be opened in time${unpaid ? lastTried(entry) : ""}`)),
       ];
     }
     if (!entry.invoice) return null; // paid by a plain invoice (before the journal): nothing held
@@ -3569,13 +3857,15 @@ export class MagmaDesk {
    *  - `payBy`: when Amboss ends the order unless the channel is there —
    *    its `timeout` (seen live: our invoice's time plus 48 hours), read as
    *    openDeadline reads it, and never after our invoice's own expiry. With
-   *    no deadline from Amboss, that expiry.
+   *    no usable deadline from Amboss, AMBOSS_OPEN_WINDOW_MS after our
+   *    invoice was made (the 48 hours Amboss gave live — not the invoice's
+   *    49: review of P1b, R10).
    *  - `openBy`: the last moment an open is started. UNPAID_OPEN_RESERVE_MS
    *    before `payBy`: the channel needs three confirmations before Amboss
    *    takes it, and a channel opened later would likely be one nobody pays
    *    for. (Never more than half the time there is, should Amboss give a
    *    short one.)
-   *  - `forceFrom`: from when the open no longer waits for lower fees
+   *  - `forceFrom`: from when the open is priced to confirm fast
    *    (openFeeFor) — LEGACY_FEE_WAIT_RESERVE_MS before `openBy`, hours in
    *    which a buyer who is offline just then can still be reached.
    *
@@ -3587,9 +3877,26 @@ export class MagmaDesk {
     const invoiceEnd = Date.parse(entry.invoice.expiresAt);
     const made = invoiceEnd - HODL_EXPIRY_MS;
     const amboss = this.openDeadline(entry, order);
-    const payBy = amboss !== null && amboss > made ? Math.min(amboss, invoiceEnd) : invoiceEnd;
+    const payBy = amboss !== null && amboss > made ? Math.min(amboss, invoiceEnd) : made + AMBOSS_OPEN_WINDOW_MS;
     const openBy = payBy - Math.min(UNPAID_OPEN_RESERVE_MS, Math.max(0, (payBy - made) / 2));
     return { payBy, openBy, forceFrom: openBy - LEGACY_FEE_WAIT_RESERVE_MS };
+  }
+
+  /** cannotOpen's answer when the last moment to open has passed: that the
+   *  order is ended here, and — for one Amboss holds the payment for — by
+   *  when Amboss wanted its channel. */
+  private noTimeLeft(entry: MagmaJournalEntry, order: SaleOrder): string {
+    const window = this.unpaidOpenWindow(entry, order);
+    if (window) {
+      return `no time left to open the channel: Amboss ends the order unless its channel is there by ${utc(window.payBy)}, and a channel opened after ${utc(window.openBy)} could not get its confirmations in time — the order is ended here, and Amboss refunds the buyer`;
+    }
+    // (What becomes of the buyer's payment, as it is: review of P1c round 2,
+    // N-1 — "goes back" was said of a payment settled here, and of none.)
+    return entry.invoice
+      ? "no time left to open the channel — the order is ended here, and the buyer's payment goes back"
+      : entry.paidInvoiceId
+        ? "no time left to open the channel — the order is ended here; the buyer's payment is settled here and does not go back by itself (see the alert)"
+        : "no time left to open the channel — the order is ended here; no payment of the buyer's is held here";
   }
 
   /** The last moment an open may be started, as far as there is one: for an
@@ -3669,8 +3976,14 @@ export class MagmaDesk {
     this.openRefused.delete(entry.orderId);
     entry.phase = "funded";
     entry.fundingOutpoint = outpoint;
+    entry.channelNotShown = undefined;
     entry.fundedAt = now();
     entry.lastError = undefined;
+    // What the order waited for before the open ("… — opening the channel",
+    // "waiting for you to open the channel") no longer holds: Market →
+    // Orders showed it on hover on orders long reported and settled (review
+    // of P1b, R19). What it waits for now: settle says so once confirmed.
+    if (entry.decision?.action === "wait") entry.decision = { at: now(), action: "wait", reason: CHANNEL_OUT_WAIT };
     this.journal.event(entry, `funded ${outpoint}`);
     try {
       this.journal.commit(entry);
@@ -3731,6 +4044,9 @@ export class MagmaDesk {
       const found = await this.findOurOpen(entry);
       if (found) {
         this.journal.event(entry, "the interrupted open's channel was found in LND");
+        // (A legacy open above what it brought, whose answer was lost: said
+        // now — review of P1c round 2, N-2.)
+        this.noteOpenAboveEarnings(entry, entry.opening?.above);
         this.recordFunding(entry, found);
         return;
       }
@@ -3794,6 +4110,14 @@ export class MagmaDesk {
    *  held payment, then book the sale and enqueue its service fee — once. */
   private async settle(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<MagmaSellAction[]> {
     const base = { orderId: entry.orderId, action: "settle" as const, sizeSats: entry.sizeSats };
+    // Amboss confirmed a channel: the order is no longer ended at its last
+    // moment to open for one LND does not show — what holds its payment up
+    // is said by settleBlocked from here (review of P1c, m4: the alert kept
+    // promising an end that never came).
+    if (entry.channelNotShown) {
+      entry.channelNotShown = undefined;
+      this.journal.note(entry);
+    }
     if (entry.phase === "opening") await this.reconcileOpening(entry);
     // Opened outside LightningMate (by hand with another tool, say): the
     // channel Amboss names, as LND shows it — so the lease's routing-fee
@@ -3828,14 +4152,25 @@ export class MagmaDesk {
     }
     if (entry.invoice && st) {
       if (st.state === "held") {
+        // Amboss's payment is here: no longer "waiting for its payment"
+        // (paymentsOverdue), whether or not it can be claimed yet.
+        if (entry.unpaidSince) {
+          entry.unpaidSince = undefined;
+          this.journal.note(entry);
+        }
         // …and only in full, for a channel on the order's record that LND
         // shows (settleBlocked; review of P1b, R2: an order with no channel
         // on record was settled and booked on Amboss's word).
         const blocked = await this.settleBlocked(entry, order, st, reported);
         if (blocked) {
+          // The payment is here (in full: notePayment) and on the record, so
+          // that its end says so — not "our invoice expired unpaid".
+          entry.claimHeldUp = blocked;
+          this.notePayment(entry, st, "held; claimed once nothing holds the claim up (the order's error says what does)");
           if (entry.lastError !== blocked) this.noteError(entry, blocked);
           return [{ ...base, ok: false, error: blocked }];
         }
+        entry.claimHeldUp = undefined;
         this.notePayment(entry, st);
         try {
           await this.lndSettle(entry.invoice.secret);
@@ -3847,7 +4182,9 @@ export class MagmaDesk {
           }
         }
       } else if (st.state === "canceled" && entry.heldAt) {
-        entry.reason = "the held payment was released before Amboss confirmed the channel (LND cancels held payments near expiry)";
+        entry.reason = entry.claimHeldUp
+          ? `the held payment went back when LND let it go near its expiry, never claimed: ${entry.claimHeldUp.replace(/ — the payment is not claimed; check .*$|; check the order$/, "")}`
+          : "the held payment was released before Amboss confirmed the channel (LND cancels held payments near expiry)";
         entry.cancelledAt = now();
         this.toPhase(entry, "cancelled", entry.reason);
         return [{ orderId: entry.orderId, action: "cancel", sizeSats: entry.sizeSats, ok: true, error: entry.reason }];
@@ -3954,20 +4291,21 @@ export class MagmaDesk {
         if (found) outpoint = `${found.transaction_id}:${found.transaction_vout}`;
         else if (named.length) anothers = true;
       }
-      // …or closed by now.
+      // …or closed by now — and, closed on another sale's record, said as
+      // such (the record said "LND shows no channel" of a channel it shows).
       if (!outpoint) {
-        const gone = (await getClosedChannels({ lnd: this.deps.readLnd })).channels.find(
+        const named = (await getClosedChannels({ lnd: this.deps.readLnd })).channels.filter(
           (c) =>
             c.partner_public_key === entry.buyerPubkey &&
             c.is_partner_initiated === false &&
             !c.is_funding_cancel &&
-            !claimed.has(`${c.transaction_id}:${c.transaction_vout}`) &&
             ((!!txid && c.transaction_id === txid && sameOutput(vout, c.transaction_vout)) || (!!channelId && c.id === channelId)),
         );
+        const gone = named.find((c) => !claimed.has(`${c.transaction_id}:${c.transaction_vout}`));
         if (gone) {
           outpoint = `${gone.transaction_id}:${gone.transaction_vout}`;
           closed = true;
-        }
+        } else if (named.length) anothers = true;
       }
     } catch {
       return "unanswered";
@@ -4008,6 +4346,14 @@ export class MagmaDesk {
         ? `Amboss names ${named} for this order, a channel on record here as another sale's — nothing is opened for this order; check both orders on Amboss`
         : `Amboss already has a funding transaction for this order (${named}) that LND does not show as a channel of this node to the buyer — ` +
           "nothing is opened; check the order";
+    // …and the operator told (channelsNotShown), up to the order's last
+    // moment to open, when it is ended like any other (fulfil).
+    const last = this.lastOpenAt(entry, order);
+    const endsAt = last === null ? null : new Date(last).toISOString();
+    if (entry.channelNotShown?.what !== error || entry.channelNotShown.endsAt !== endsAt) {
+      entry.channelNotShown = { at: entry.channelNotShown?.what === error ? entry.channelNotShown.at : now(), what: error, endsAt };
+      if (entry.lastError === error) this.journal.note(entry);
+    }
     if (entry.lastError !== error) this.noteError(entry, error);
     return false;
   }
@@ -4054,11 +4400,11 @@ export class MagmaDesk {
    *  Amboss pays after the open): on the record, once. The phase stays — the
    *  channel is reported, and the payment is claimed when Amboss confirms it
    *  (settle). Saved by the caller's next write. */
-  private notePayment(entry: MagmaJournalEntry, st: HodlStatus): void {
+  private notePayment(entry: MagmaJournalEntry, st: HodlStatus, held = "held until Amboss confirms the channel"): void {
     if (st.heldUntilHeight !== null) entry.heldUntilHeight = st.heldUntilHeight;
     if (entry.heldAt || st.state !== "held" || st.heldMtokens < BigInt(entry.feeMsat || "0")) return;
     entry.heldAt = now();
-    this.journal.event(entry, `Amboss's payment arrived (${feeSatsOf(entry)} sat) — held until Amboss confirms the channel`);
+    this.journal.event(entry, `Amboss's payment arrived (${feeSatsOf(entry)} sat) — ${held}`);
     this.journal.note(entry);
   }
 
@@ -4110,8 +4456,11 @@ export class MagmaDesk {
     entry.unpaidSince = undefined;
     entry.lastError = undefined;
     entry.lastErrorAt = undefined;
+    // (Expired, or cancelled before its time — by LND, or by hand: review of
+    // P1b, R18. It said "expired" of both.)
+    const ended = invoice && Date.parse(invoice.expiresAt) > Date.now() ? "was cancelled unpaid" : "expired unpaid";
     if (entry.fundingOutpoint) {
-      const what = `Amboss reports ${order.status}, but our invoice expired unpaid — not booked as a sale: this node received nothing for it; its channel ${entry.fundingOutpoint} keeps the lease's promises`;
+      const what = `Amboss reports ${order.status}, but our invoice ${ended} — not booked as a sale: this node received nothing for it; its channel ${entry.fundingOutpoint} keeps the lease's promises`;
       entry.unbooked = true;
       entry.bookedAt = now();
       entry.settledAt = now();
@@ -4120,7 +4469,7 @@ export class MagmaDesk {
       console.warn(`[magma] order ${entry.orderId}: ${what}`);
       return [{ orderId: entry.orderId, action: "settle", sizeSats: entry.sizeSats, ok: true, error: what, transactionId: entry.fundingOutpoint.split(":")[0] }];
     }
-    const reason = `Amboss reports ${order.status}, but our invoice expired unpaid — nothing to settle, nothing booked`;
+    const reason = `Amboss reports ${order.status}, but our invoice ${ended} — nothing to settle, nothing booked`;
     entry.cancelledAt = now();
     entry.reason = reason;
     this.toPhase(entry, "cancelled", `cancelled: ${reason}`);

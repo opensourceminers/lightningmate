@@ -102,6 +102,14 @@ const recOf = async (s: S, id: string) => {
   const rep = await s.autopilot.magmaReport();
   return { rep, r: rep.sell.recommendations.find((x) => x.offerId === id)! };
 };
+/** When an offer's price last followed listed offers, as the autopilot keeps it (state offerListedMovedAt). */
+const listedMoved = (s: S) => {
+  const state = (s.autopilot as unknown as { state: { offerListedMovedAt?: Record<string, string> } }).state;
+  return {
+    get: (id: string) => (state.offerListedMovedAt?.[id] ? Date.parse(state.offerListedMovedAt[id]!) : undefined),
+    set: (id: string, at: number) => void (state.offerListedMovedAt = { ...(state.offerListedMovedAt ?? {}), [id]: new Date(at).toISOString() }),
+  };
+};
 const history = (t: { after(fn: () => void): void }, orders: ReturnType<typeof sale>[]) => {
   __setHistoryForTests(orders);
   t.after(() => __setHistoryForTests([]));
@@ -237,6 +245,21 @@ test("OFFER-7: no sale history and three comparable listings — three 1-block l
   assert.equal(s.magma.count("UpdateOffer"), 0);
 });
 
+// Review of P2, R5: the lease alone keeps a listing out — the one above has
+// listings no score would let in either.
+test("OFFER-7: no sale history — three 1-block listings of sellers with a score are not comparable either: the market is 'unknown' and the price stays", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t, { chainBalance: 20_000_000, config: SELLER_CFG });
+  asks(s, () => 4000, 3);
+  asks(s, () => 3000, 3, { minBlockLength: 1 });
+  const offer = s.magma.addOffer(OFFER);
+  const { r } = await recOf(s, offer.id);
+  assert.equal(r.state, "market_unknown");
+  assert.equal(r.recommended.feeRatePpm, 4110);
+  await s.autopilot.runOnce();
+  assert.equal(s.magma.count("UpdateOffer"), 0);
+});
+
 test("OFFER-7: no sale history — five made-up listings at 1 ppm do not pull the price down", async (t) => {
   quiet(t);
   const s = sellerSetup(t, { chainBalance: 20_000_000, config: SELLER_CFG });
@@ -288,13 +311,30 @@ test("OFFER-7: no sale history, eight comparable listings far above the offer �
     /^not repriced yet: there is no sale history to price from, and the price follows listed offers one step every 6 hours \(a quarter at most\) — the next one is due \d\d:\d\d UTC$/,
   );
   // Six hours on: the next step, a quarter again.
-  const movedAt = (s.autopilot as unknown as { listedMoveAt: Map<string, number> }).listedMoveAt;
+  const movedAt = listedMoved(s);
   movedAt.set(offer.id, Date.now() - LISTED_MOVE_HOLD_MS - 1000);
   await s.autopilot.runOnce();
   const second = eff();
   assert.ok(second > first && second <= first * 1.25 + 1, `and again: ${Math.round(first)} -> ${Math.round(second)}`);
   await s.autopilot.runOnce();
   assert.equal(eff(), second, "and the hold starts anew");
+});
+
+// Review of P2, n1: the hold is on disk, and goes with the offer.
+test("R2-4: the six-hour hold outlasts a restart, and an offer deleted since leaves nothing of it behind", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t, { chainBalance: 20_000_000, config: SELLER_CFG });
+  asks(s, (i) => 9000 + i * 100);
+  const offer = s.magma.addOffer(OFFER);
+  await s.autopilot.runOnce();
+  assert.equal(s.magma.count("UpdateOffer"), 1, "one listing-based step");
+  const again = s.restart();
+  await again.runOnce();
+  assert.equal(s.magma.count("UpdateOffer"), 1, "before: in memory, the restart let the next step come at once");
+  s.magma.offers.delete(offer.id);
+  await again.runOnce();
+  const state = (again as unknown as { state: { offerListedMovedAt?: Record<string, string> } }).state;
+  assert.deepEqual(state.offerListedMovedAt, {});
 });
 
 test("R2-4: the six-hour hold is for a price read from listings only — with sale history a price that moved follows at once, also right after a listing-based step", async (t) => {
@@ -304,7 +344,7 @@ test("R2-4: the six-hour hold is for a price read from listings only — with sa
   const offer = s.magma.addOffer(OFFER);
   await s.autopilot.runOnce();
   assert.equal(s.magma.count("UpdateOffer"), 1, "one listing-based step");
-  const movedAt = (s.autopilot as unknown as { listedMoveAt: Map<string, number> }).listedMoveAt;
+  const movedAt = listedMoved(s);
   const stepAt = movedAt.get(offer.id);
   assert.ok(stepAt, "which starts the hold");
   movedAt.set(offer.id, stepAt - 1000);
@@ -355,7 +395,7 @@ test("R2-4: an offer taken off the market while the wallet is empty and listed a
     assert.equal(effective(offer), first, `dip ${dip}: at the price it had`);
   }
   // Six hours after the step the relist takes the next one, and that one holds too.
-  const movedAt = (s.autopilot as unknown as { listedMoveAt: Map<string, number> }).listedMoveAt;
+  const movedAt = listedMoved(s);
   movedAt.set(offer.id, Date.now() - LISTED_MOVE_HOLD_MS - 1000);
   s.node.chainBalance = 0;
   await s.autopilot.runOnce();
@@ -589,6 +629,38 @@ test("R2-5: auto-relist off and less left than any order that pays for its chann
   assert.ok(offer.minSats <= offer.totalSats - offer.lockedSats, `its smallest order (${offer.minSats}) fits what is listed`);
 });
 
+// Review of P2, S7 and S8: the two other conditions of that hold, one by one.
+test("R2-5's offer, and on-chain fees fall so far that a reshape brings its smallest order back within what is listed: repriced and resized in that same run, with no “not repriced” note", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t, { chainBalance: 20_000_000, config: { ...SELLER_CFG, sellAutoSize: true, sellAutoRelist: false } });
+  market(t, s);
+  await feeRate(s, 2500);
+  const offer = s.magma.addOffer({ ...OFFER, totalSats: 2_300_000, lockedSats: 2_000_000 });
+  await s.autopilot.runOnce();
+  assert.deepEqual([s.magma.count("UpdateOffer"), offer.minSats], [1, 540_000]);
+  const priced = [offer.feeRatePpm, offer.baseFeeSats];
+  // Hours later (a raised minimum is held for six), fees have fallen.
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() + 7 * 3_600_000 });
+  await feeRate(s, 250);
+  await s.autopilot.runOnce();
+  assert.equal(s.magma.count("UpdateOffer"), 2, `written in the run the fees fell: ${JSON.stringify([offer.minSats, offer.maxSats, s.autopilot.offerSyncStatus().offers[0]?.differences])}`);
+  assert.ok(offer.minSats <= 300_000, `its smallest order (${offer.minSats}) fits the 300,000 sat listed`);
+  assert.notDeepEqual([offer.feeRatePpm, offer.baseFeeSats], priced, "and priced");
+  assert.ok(!(s.autopilot.offerSyncStatus().offers[0]!.differences ?? []).some((d) => /^not repriced/.test(d)), JSON.stringify(s.autopilot.offerSyncStatus().offers[0]!.differences));
+});
+
+test("R2-5's scene with auto-relist on (auto-size off): less listed than the smallest order is no hold — the price follows the market in the first run, with no note that auto-relist is off", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t, { chainBalance: 20_000_000, config: { ...SELLER_CFG, sellAutoSize: false, sellAutoRelist: true } });
+  market(t, s);
+  await feeRate(s, 250);
+  // Priced well above what buyers pay (4,110 ppm): the engine takes it down.
+  const offer = s.magma.addOffer({ ...OFFER, feeRatePpm: 6000, minSats: 540_000, totalSats: 2_300_000, lockedSats: 2_000_000 });
+  await s.autopilot.runOnce();
+  assert.ok(offer.feeRatePpm < 6000, `repriced in the first run: ${offer.feeRatePpm} ppm — ${JSON.stringify(s.autopilot.offerSyncStatus().offers[0]!.differences)}`);
+  assert.ok(!(s.autopilot.offerSyncStatus().offers[0]!.differences ?? []).some((d) => /auto-relist is off/.test(d)), JSON.stringify(s.autopilot.offerSyncStatus().offers[0]!.differences));
+});
+
 // ── OFFER-8: the offer the autopilot creates is one the lane accepts ─────────
 
 for (const autoSize of [false, true]) {
@@ -651,6 +723,35 @@ const market = (t: { after(fn: () => void): void }, s: S, apr = 0.05, askExtra: 
   history(t, Array.from({ length: 30 }, (_, i) => sale(i, 1_000_000, apr)));
   asks(s, (i) => 3000 + i * 300, 8, askExtra);
 };
+
+// Review of P2, R25: the report reads what buyers pay as the price does.
+test("the report names what leases clear at for every size when the offer's own band sold too few — as its price is read", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t, { chainBalance: 20_000_000, config: SELLER_CFG });
+  // 30 sales of 1M; the offer's band (5M–10M) sold none.
+  market(t, s);
+  await feeRate(s, 2500);
+  s.magma.addOffer({ ...OFFER, minSats: 5_000_000, maxSats: 10_000_000, totalSats: 10_000_000 });
+  const rep = await s.autopilot.magmaReport();
+  assert.equal(rep.sell.clearing?.allSizes, true, JSON.stringify(rep.sell.clearing));
+  assert.equal(rep.sell.clearing?.medianPpm, 4110);
+  assert.ok(rep.sell.reasons.some((x) => /leases of every size clear around 4110 ppm for 30 days/.test(x)), JSON.stringify(rep.sell.reasons));
+});
+
+// Review of P2, R19: the one move an uncompetitive offer gets.
+test("an offer whose floor is above what buyers pay is not listed anew — but one listed far above that floor is lowered to it", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t, { chainBalance: 20_000_000, config: SELLER_CFG });
+  market(t, s);
+  await feeRate(s, 12_500); // 50 sat/vB: a 1M channel's floor is far above the 4,110 ppm buyers pay
+  const offer = s.magma.addOffer({ ...OFFER, minSats: 1_000_000, maxSats: 1_000_000, feeRatePpm: 40_000 });
+  const { r } = await recOf(s, offer.id);
+  assert.equal(r.state, "do_not_list_uncompetitive");
+  assert.equal(r.shouldReprice, true);
+  assert.equal(r.repriceDirection, "down");
+  assert.ok(r.recommended.feeRatePpm < 40_000, `${r.recommended.feeRatePpm} ppm`);
+  assert.ok(r.reasons.some((x) => /^its price \(.* ppm effective\) is well above the floor it needs now — lowered to \d+$/.test(x)), JSON.stringify(r.reasons));
+});
 
 test("R2-1: a small wallet — the offer the autopilot creates still gives its smallest order the write margin's room, and a fee estimate 2 % higher rewrites nothing", async (t) => {
   quiet(t);
@@ -904,6 +1005,26 @@ test("OFFER-12: an order Amboss returns as rejected, cancelled or unpaid is not 
 });
 
 // ── OFFER-13: with no fee estimate, the engine and the lane use one cost ─────
+
+// Review of P2, n5.
+test("OFFER-13: LND gives no fee estimate — auto-size does not take an offer's minimum down on the last known rate; once the estimate is back it does", async (t) => {
+  quiet(t);
+  const s = sellerSetup(t, { chainBalance: 20_000_000, config: SIZED_CFG });
+  market(t, s);
+  await feeRate(s, 2500); // 10 sat/vB, known once
+  s.node.override("wallet.estimateFee", (_a: unknown, cb: unknown) => (cb as (e: unknown) => void)([503, "UnexpectedEstimateFeeError"]));
+  (s.autopilot as unknown as { saleFloor: unknown }).saleFloor = null;
+  const offer = s.magma.addOffer({ ...WIDE_OFFER, minSats: 3_000_000 });
+  for (let i = 0; i < 2; i++) await s.autopilot.runOnce();
+  assert.equal(offer.minSats, 3_000_000, JSON.stringify(s.autopilot.offerSyncStatus().offers[0]?.lastWrite));
+  // …and the engine prices the window the offer keeps, not the lower one.
+  const { r } = await recOf(s, offer.id);
+  const kept = Math.sqrt(offer.minSats * offer.maxSats);
+  assert.ok(Math.abs(r.recommended.sizeSat - kept) <= kept * 0.01, `priced at ${r.recommended.sizeSat} sat, the kept window's ${Math.round(kept)}`);
+  await feeRate(s, 2500);
+  await s.autopilot.runOnce();
+  assert.ok(offer.minSats < 3_000_000, `lowered once the estimate is back: ${offer.minSats}`);
+});
 
 test("OFFER-13: LND gives no fee estimate — a channel is costed at the last known rate as the lane does, the report says so, and no price is written and no offer created until it is back", async (t) => {
   quiet(t);

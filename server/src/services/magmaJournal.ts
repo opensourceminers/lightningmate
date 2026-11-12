@@ -96,6 +96,21 @@ export interface MagmaJournalEntry {
    *  still awaiting approval takes it as a refusal (MagmaDesk.resumeAccept).
    *  Gone once the accept is released or confirmed. */
   acceptRefused?: string;
+  /** What Amboss answered this node's last accept with — an error — when the
+   *  order showed accepted after it with no other accept sent from here:
+   *  maybe applied despite the answer, maybe accepted elsewhere with another
+   *  invoice. The accept does not count as this node's (acceptSentAt is
+   *  cleared): the lane opens nothing by itself for it (review of P1b, R14). */
+  acceptRefusedThenAccepted?: string;
+  /** Amboss names a funding transaction or channel for the order that LND
+   *  does not show as this order's (takeReportedChannel): what the record
+   *  says, since when, and the order's last moment to open, when it is
+   *  ended unless the channel shows up (review of P1b, R15). */
+  channelNotShown?: { at: string; what: string; endsAt: string | null };
+  /** What held up the claim of a payment our invoice holds after Amboss
+   *  confirmed the channel (settleBlocked) — so that, should LND let the
+   *  payment go, the record says it was here and why it was not claimed. */
+  claimHeldUp?: string;
   /** The buyer's channels with this node (open and pending outpoints) when
    *  the order was accepted. A channel to the buyer that is not among them
    *  and belongs to no other sale is this order's — opened by hand or with
@@ -127,6 +142,10 @@ export interface MagmaJournalEntry {
      *  never to have happened: "held", or "accepted" for an order whose
      *  payment Amboss holds (absent on older records: "held"). */
     from?: "accepted" | "held";
+    /** A legacy order's open above what it brought (openFeeFor): put on
+     *  the record once the channel is found, should LND's answer have been
+     *  lost (reconcileOpening). */
+    above?: { at: string; feeRate: number; costSats: number; earnsSats: number };
   };
   fundingOutpoint?: string;
   fundedAt?: string;
@@ -156,7 +175,15 @@ export interface MagmaJournalEntry {
   /** The lane's latest decision about this order, with its reason. `kind`
    *  "parts": a skip because its fee parts aren't an offer price — the
    *  order is the operator's to decide (MagmaDesk.partsLeftToYou). */
-  decision?: { at: string; action: string; reason: string; kind?: "parts" };
+  decision?: {
+    at: string;
+    action: string;
+    reason: string;
+    kind?: "parts";
+    /** A wait for the operator's open: the order's last moment to open,
+     *  where it has one (MagmaDesk.waitingForYourOpen names it). */
+    until?: string | null;
+  };
   lastStatus?: string;
   lastStatusAt?: string;
   /** Amboss's deadline for the current phase, as last seen. */
@@ -187,6 +214,12 @@ export interface MagmaJournalEntry {
    *  payment is settled here and nothing gives it back — the operator's to
    *  put right (MagmaDesk.paymentsKept; “Open channel” tries again). */
   paymentKeptAt?: string;
+  /** An order paid by a plain invoice that already settled here (an older
+   *  version's) whose channel was opened at an on-chain fee above what the
+   *  order brought: the payment cannot be given back, so the channel is
+   *  opened all the same, and the operator is told with both numbers
+   *  (othervice's ceiling of 2026-11-12 holds for every other order). */
+  openAboveEarnings?: { at: string; feeRate: number; costSats: number; earnsSats: number };
   /** The operator dismissed the alert about this order being turned down. */
   alertAckAt?: string;
   /** Lease over and channel closed by the autopilot (sellAutoClose). */
