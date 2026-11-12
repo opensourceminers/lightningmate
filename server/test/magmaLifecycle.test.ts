@@ -1,8 +1,13 @@
 /**
  * Magma selling end to end, on the Magma API (fake) and a fake LND: the order
- * lane accepts with a HODL invoice, opens only once the buyer's payment is
- * held, reports the funding outpoint, settles only when Amboss confirms the
- * channel — and every failure releases the held payment instead.
+ * lane accepts with a HODL invoice, opens once Amboss waits for the channel
+ * (never while it waits for the buyer's payment), reports the funding
+ * outpoint, settles only when Amboss confirms the channel and the invoice
+ * holds the payment — and every failure releases a held payment instead.
+ * These tests run the sale the way Amboss's docs put it, with the buyer
+ * paying our invoice before the open; the sale whose buyer paid Amboss up
+ * front, and whose invoice is paid only after the channel is confirmed, is
+ * in magmaPrepaid.
  *
  * Before: orders were accepted with a REGULAR invoice (the buyer's payment
  * settled before any channel existed), a lost add_transaction answer led to a
@@ -18,7 +23,8 @@ import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { MagmaJournalEntry } from "../src/services/magmaJournal.js";
-import { UNPAID_CONFIRMED_WAIT_MS } from "../src/services/magmaDesk.js";
+import { AWAITING_AMBOSS_PAYMENT, HODL_EXPIRY_MS, PAYMENT_OVERDUE_MS } from "../src/services/magmaDesk.js";
+import { magmaOverduePaymentAlerts, magmaUnpaidChannelAlerts } from "../src/services/alerts.js";
 import { activeCap } from "../src/services/leaseCaps.js";
 import { JsonStore, storeIncidents } from "../src/store.js";
 import { FakeLnd, paymentHashOf } from "./helpers/fakeLnd.js";
@@ -131,14 +137,14 @@ test("INVALID_CHANNEL_OPENING: the HODL invoice is cancelled, no fee, no sale", 
   assert.equal(fees.entries().length, 0);
 });
 
-test("Amboss reporting the channel confirmed is never income on its own: an invoice of ours that holds no payment is not settled, booked or charged — said once on the order's record, and after an hour the order ends, unbooked", async (t) => {
+test("Amboss reporting the channel confirmed is never income on its own: an invoice of ours that holds no payment is not settled, booked or charged — the order waits for the payment, said once, until the invoice runs out; then it ends, unbooked", async (t) => {
   feeEnv(t);
   quiet(t);
   const { autopilot, node, magma, dir, earnings, fees, capital } = sellerSetup(t);
   const sale = magma.addSale({ buyerPubkey: BUYER });
   await autopilot.pollSellOrders();
   const hash = acceptedInvoice(magma.sales.get(sale.id)!).id;
-  // The buyer never paid — yet Amboss reports the channel valid.
+  // Nothing was paid to our invoice — yet Amboss reports the channel valid.
   magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
   for (let i = 0; i < 4; i++) await autopilot.pollSellOrders();
   let e = entryOnDisk(dir, sale.id);
@@ -146,38 +152,45 @@ test("Amboss reporting the channel confirmed is never income on its own: an invo
   // 12,345 sat sale and charged the 1% — for a payment never received.
   assert.notEqual(e?.phase, "settled");
   assert.equal(e?.phase, "accepted");
-  const unpaid = "Amboss reports VALID_CHANNEL_OPENING, but our invoice is unpaid — nothing to settle (looked at again for an hour, then the order ends here, unbooked)";
-  assert.equal(e?.lastError, unpaid);
-  // Review 2026-11-10, LANE-8: before, the same line was written to the
-  // order's record on every pass (every 45 seconds), for as long as Amboss
-  // listed the order.
-  assert.equal(e?.events.filter((ev) => ev.what === unpaid).length, 1, "said once, not on each of the four passes");
+  // Review 2026-11-10, LANE-11: Amboss pays the seller after it confirmed the
+  // channel, so this is how a sale stands for a while — no error. (Since
+  // LANE-8 it read "…our invoice is unpaid — nothing to settle (looked at
+  // again for an hour, then the order ends here, unbooked)", and the lane's
+  // status said the same.)
+  assert.equal(e?.lastError, undefined);
+  assert.equal(e?.decision?.reason, AWAITING_AMBOSS_PAYMENT);
+  const waiting = "Amboss confirmed the channel (VALID_CHANNEL_OPENING) — waiting for its payment to our invoice";
+  // LANE-8: before, a line was written to the order's record on every pass
+  // (every 45 seconds), for as long as Amboss listed the order.
+  assert.equal(e?.events.filter((ev) => ev.what === waiting).length, 1, "said once, not on each of the four passes");
   assert.equal(node.callsTo("invoices.settleInvoice").length, 0);
   assert.equal(node.invoices.get(hash)?.state, "OPEN");
-  // The operator is told where orders are looked at: the lane's status.
   const lane = autopilot.getState().magmaLane;
-  assert.deepEqual([lane.ok, lane.retrying], [false, true]);
-  assert.equal(
-    lane.error,
-    `1 order is reported confirmed by Amboss while our invoice is unpaid (${sale.id}) — nothing is settled or booked; looked at again for an hour, then the order ends here, unbooked`,
-  );
+  assert.deepEqual([lane.ok, lane.error], [true, null], "a payment that is still to come is no problem of the lane's");
   assert.ok(capital.reservedSat() > 0, "its coins stay reserved while it is looked at");
-  // A minute short of the hour: still looked at.
+  assert.deepEqual(magmaOverduePaymentAlerts(autopilot.magma), [], "and no alert yet");
+  // Hours later: still waiting (LANE-8 ended the order after one hour — the
+  // invoice cancelled, so that Amboss could no longer pay it). The operator
+  // is told that it lasts.
   const t0 = Date.now();
-  t.mock.timers.enable({ apis: ["Date"], now: t0 + UNPAID_CONFIRMED_WAIT_MS - 60_000 });
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + PAYMENT_OVERDUE_MS + 60_000 });
   await autopilot.pollSellOrders();
   assert.equal(entryOnDisk(dir, sale.id)?.phase, "accepted");
-  // The hour is over: before, the order never ended and its coins stayed
-  // reserved.
-  t.mock.timers.setTime(t0 + UNPAID_CONFIRMED_WAIT_MS + 60_000);
+  assert.equal(node.invoices.get(hash)?.state, "OPEN");
+  const [overdue] = magmaOverduePaymentAlerts(autopilot.magma);
+  assert.match(overdue?.message ?? "", /^Amboss confirmed the channel of a 2,000,000 sat Magma order on \d{4}-\d\d-\d\d \d\d:\d\d UTC, but has not paid its 12,345 sat to this node yet\. LightningMate keeps waiting until /);
+  // The invoice has run out: now the order ends — before LANE-8 it never
+  // did, and its coins stayed reserved.
+  t.mock.timers.setTime(t0 + HODL_EXPIRY_MS + 60_000);
   await autopilot.pollSellOrders();
   e = entryOnDisk(dir, sale.id);
   assert.equal(e?.phase, "cancelled");
-  assert.equal(e?.reason, "Amboss reports VALID_CHANNEL_OPENING, but our invoice stayed unpaid for an hour — nothing to settle, nothing booked");
+  assert.equal(e?.reason, "Amboss reports VALID_CHANNEL_OPENING, but our invoice expired unpaid — nothing to settle, nothing booked");
   assert.equal(e?.lastError, undefined);
   assert.equal(node.invoices.get(hash)?.state, "CANCELED", "no payment can land on it later, with nothing left to open for it");
   assert.equal(capital.reservedSat(), 0, "its coins are free again");
   assert.equal(autopilot.getState().magmaLane.ok, true);
+  assert.deepEqual(magmaOverduePaymentAlerts(autopilot.magma), []);
   // And it stays ended: nothing more on its record, pass after pass.
   const events = e?.events.length;
   await autopilot.pollSellOrders();
@@ -189,7 +202,7 @@ test("Amboss reporting the channel confirmed is never income on its own: an invo
   assert.equal(feesOnDisk(dir).length, 0);
 });
 
-test("Amboss reports the channel confirmed, our invoice unpaid, and the channel is one opened outside LightningMate: after the hour the order is kept as a completed sale that is not booked — its channel keeps the lease's promises", async (t) => {
+test("Amboss reports the channel confirmed, our invoice unpaid, and the channel is one opened outside LightningMate: once the invoice has run out the order is kept as a completed sale that is not booked — its channel keeps the lease's promises, and the operator is told", async (t) => {
   feeEnv(t);
   quiet(t);
   const s = sellerSetup(t);
@@ -204,15 +217,22 @@ test("Amboss reports the channel confirmed, our invoice unpaid, and the channel 
   amboss.channelId = channelId;
   s.magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
   await s.autopilot.pollSellOrders();
-  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "accepted");
+  let e = entryOnDisk(s.dir, sale.id);
+  // The channel is on record at once, and with it the order's coins are no
+  // longer reserved a second time.
+  assert.deepEqual([e?.phase, e?.fundingOutpoint], ["reported", `${txid}:0`]);
+  assert.equal(s.capital.reservedSat(), 0);
   const t0 = Date.now();
-  t.mock.timers.enable({ apis: ["Date"], now: t0 + UNPAID_CONFIRMED_WAIT_MS + 60_000 });
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + 2 * 3_600_000 });
   await s.autopilot.pollSellOrders();
-  const e = entryOnDisk(s.dir, sale.id);
+  assert.equal(entryOnDisk(s.dir, sale.id)?.phase, "reported", "an hour is not the end: the payment may still come");
+  t.mock.timers.setTime(t0 + HODL_EXPIRY_MS + 60_000);
+  await s.autopilot.pollSellOrders();
+  e = entryOnDisk(s.dir, sale.id);
   assert.deepEqual([e?.phase, e?.unbooked, e?.fundingOutpoint], ["settled", true, `${txid}:0`]);
   assert.equal(
     e?.reason,
-    `Amboss reports VALID_CHANNEL_OPENING, but our invoice stayed unpaid for an hour — not booked as a sale: this node received nothing for it; its channel ${txid}:0 keeps the lease's promises`,
+    `Amboss reports VALID_CHANNEL_OPENING, but our invoice expired unpaid — not booked as a sale: this node received nothing for it; its channel ${txid}:0 keeps the lease's promises`,
   );
   assert.equal(s.node.invoices.get(hash)?.state, "CANCELED");
   assert.equal(s.node.callsTo("invoices.settleInvoice").length, 0);
@@ -221,9 +241,16 @@ test("Amboss reports the channel confirmed, our invoice unpaid, and the channel 
   assert.notEqual(activeCap(s.capital.leaseCaps(), { outpoint: `${txid}:0`, channelId }, s.node.blockHeight), null, "the 2,200 ppm promise binds the channel");
   assert.equal(s.capital.soldLeases().some((l) => l.orderId === sale.id), true, "and the rebalancer leaves it alone");
   assert.equal(s.capital.reservedSat(), 0);
+  // The operator is told until they dismiss it: a channel nothing was paid for.
+  const [alert] = magmaUnpaidChannelAlerts(s.autopilot.magma);
+  assert.equal(alert?.id, `magma:${sale.id}`);
+  assert.match(alert?.message ?? "", new RegExp(`^A 2,000,000 sat Magma order ended without payment after its channel was opened: .*Amboss counts the channel ${txid}:0 as delivered, so it stays bound to what the order promised: ask Amboss about the payment for order ${sale.id}\\.$`));
+  assert.equal(s.autopilot.magma.acknowledgeRefusal(sale.id), true);
+  assert.deepEqual(magmaUnpaidChannelAlerts(s.autopilot.magma), []);
+  assert.deepEqual(magmaUnpaidChannelAlerts(s.restart().magma), [], "dismissed for good");
 });
 
-test("Amboss reports the channel confirmed before our invoice holds the payment, and the payment arrives within the hour: settled, booked and charged as ever", async (t) => {
+test("Amboss reports the channel confirmed before our invoice holds the payment, and the payment arrives two hours later: settled, booked and charged as ever", async (t) => {
   feeEnv(t);
   quiet(t);
   const { autopilot, node, magma, dir } = sellerSetup(t);
@@ -232,25 +259,29 @@ test("Amboss reports the channel confirmed before our invoice holds the payment,
   magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
   await autopilot.pollSellOrders();
   assert.ok(entryOnDisk(dir, sale.id)?.unpaidSince, "looked at again from now");
+  // Two hours on, nothing has come: the order still waits (LANE-11 — after
+  // LANE-8 it had ended after one, its invoice cancelled).
+  const t0 = Date.now();
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + 2 * 3_600_000 });
+  await autopilot.pollSellOrders();
+  assert.equal(entryOnDisk(dir, sale.id)?.phase, "accepted");
   const hash = magma.buyerPays(sale.id, node);
   magma.setStatus(sale.id, "VALID_CHANNEL_OPENING"); // (the fake's payment moved the order on)
-  const t0 = Date.now();
-  t.mock.timers.enable({ apis: ["Date"], now: t0 + 30 * 60_000 });
   await autopilot.pollSellOrders();
   let e = entryOnDisk(dir, sale.id);
   assert.equal(node.invoices.get(hash)?.state, "SETTLED");
   assert.deepEqual([e?.phase, e?.unbooked, e?.unpaidSince], ["settled", undefined, undefined]);
   assert.equal(salesOnDisk(dir).length, 1);
   assert.equal(feesOnDisk(dir).length, 1);
-  // Long after the hour: it stays a booked sale.
-  t.mock.timers.setTime(t0 + 3 * UNPAID_CONFIRMED_WAIT_MS);
+  // Long after: it stays a booked sale.
+  t.mock.timers.setTime(t0 + HODL_EXPIRY_MS + 3_600_000);
   await autopilot.pollSellOrders();
   e = entryOnDisk(dir, sale.id);
   assert.equal(e?.phase, "settled");
   assert.equal(salesOnDisk(dir).length, 1);
 });
 
-test("the hour is over and the payment arrives as the unpaid invoice is being cancelled — LND refuses the cancel: the order is not ended, and the next pass settles and books it", async (t) => {
+test("the invoice has run out and the payment arrives as the unpaid invoice is being cancelled — LND refuses the cancel: the order is not ended, and the next pass settles and books it", async (t) => {
   // Review of the package (LANE-8): no test held the "paid after all" branch.
   feeEnv(t);
   quiet(t);
@@ -269,7 +300,7 @@ test("the hour is over and the payment arrives as the unpaid invoice is being ca
     cb({ code: 9, details: "invoice already accepted" });
   });
   const t0 = Date.now();
-  t.mock.timers.enable({ apis: ["Date"], now: t0 + UNPAID_CONFIRMED_WAIT_MS + 60_000 });
+  t.mock.timers.enable({ apis: ["Date"], now: t0 + HODL_EXPIRY_MS + 60_000 });
   await autopilot.pollSellOrders();
   let e = entryOnDisk(dir, sale.id);
   assert.equal(cancels, 1);

@@ -28,6 +28,11 @@ export const SHUTDOWN_FLUSH_RESERVE_MS = 8_000;
  * a 45 s mutation deadline: a slow add_transaction could be cut off with its
  * outcome unknown.) Every such step is also written to the order journal
  * before it is sent, so even a SIGKILL leaves a record to reconcile from.
+ *
+ * The one call that may outlast the wait is the Magma accept
+ * (HTTP_TIMEOUTS.ambossAcceptMs, 90 s — Amboss was seen to take that long):
+ * a stop does not wait it out. Its mark is on disk before it is sent, and the
+ * next start reads the order from Amboss before it sends anything again.
  */
 export const SHUTDOWN_WAIT_MS = SHUTDOWN_GRACE_MS - SHUTDOWN_FLUSH_RESERVE_MS;
 

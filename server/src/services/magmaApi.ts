@@ -19,6 +19,7 @@
  */
 
 import { AmbossError, MAGMA_URL, ambossGql, collectPages } from "./amboss.js";
+import { HTTP_TIMEOUTS } from "./http.js";
 
 // ── amounts ───────────────────────────────────────────────────────────────────
 
@@ -569,14 +570,18 @@ export const ACCEPT_MUTATION = `mutation AcceptOrder($input: SellerAcceptOrdersI
   market { order { seller { accept(input: $input) { success } } } }
 }`;
 
-/** Accept a sale with the BOLT11 HODL invoice the buyer will pay (Amboss:
- *  for `fees.seller`, expiring in at least 48 hours). */
+/** Accept a sale with the BOLT11 HODL invoice for what the seller earns
+ *  (Amboss: for `fees.seller`, expiring in at least 48 hours). Who pays it:
+ *  Amboss, once the channel is confirmed, when the buyer paid Amboss as the
+ *  order was placed — or the buyer, right after the accept. The call has a
+ *  longer deadline than other mutations (HTTP_TIMEOUTS.ambossAcceptMs). */
 export async function acceptSale(apiKey: string, orderId: string, paymentRequest: string): Promise<boolean> {
   const data = await ambossGql<{ market: { order: { seller: { accept: { success: boolean } } } } }>(
     MAGMA_URL,
     ACCEPT_MUTATION,
     apiKey,
     { input: { order_id: orderId, payment_request: paymentRequest } },
+    HTTP_TIMEOUTS.ambossAcceptMs,
   );
   return data.market.order.seller.accept.success === true;
 }

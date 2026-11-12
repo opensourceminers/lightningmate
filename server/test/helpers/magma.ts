@@ -7,6 +7,10 @@ import type { AfterHook } from "./tmp.js";
 
 export const MAGMA_API = "https://magma.amboss.tech/graphql";
 
+/** How long Amboss gives the seller to open the channel of an order the buyer
+ *  paid it for: 48 hours from the accept's invoice (seen 2026-11-11). */
+export const PREPAID_CHANNEL_WINDOW_MS = 48 * 3_600_000;
+
 /**
  * A fake Amboss Magma API (magma.amboss.tech) for the seller side: your sales,
  * your offers, accept / add_transaction / reject, offer create / update /
@@ -16,10 +20,21 @@ export const MAGMA_API = "https://magma.amboss.tech/graphql";
  * variables actually sent); a mismatch is answered like the real API would
  * (a GraphQL validation error) and fails the test in the after-hook.
  *
- * Orders move like Amboss moves them: accept → WAITING_FOR_BUYER_PAYMENT;
- * `buyerPays(id, node)` pays the HODL invoice we sent (held in the fake LND)
- * → WAITING_FOR_CHANNEL_OPEN; add_transaction → SELLER_SENT_TRANSACTION;
- * `setStatus(id, "VALID_CHANNEL_OPENING")` → the channel is confirmed.
+ * Orders move like Amboss moves them, in one of two ways.
+ *
+ * The buyer pays our invoice first (Amboss's documentation): accept →
+ * WAITING_FOR_BUYER_PAYMENT; `buyerPays(id, node)` pays the HODL invoice we
+ * sent (held in the fake LND) → WAITING_FOR_CHANNEL_OPEN; add_transaction →
+ * SELLER_SENT_TRANSACTION; `setStatus(id, "VALID_CHANNEL_OPENING")` → the
+ * channel is confirmed.
+ *
+ * The buyer has paid Amboss up front (what the live API does, seen
+ * 2026-11-11): `buyerPaidAmboss(id)` before the accept; accept → straight to
+ * WAITING_FOR_CHANNEL_OPEN with our invoice UNPAID and `timeout` 48 hours on;
+ * add_transaction → SELLER_SENT_TRANSACTION; `setStatus(id,
+ * "VALID_CHANNEL_OPENING")`; only then `ambossPays(id, node)` pays our
+ * invoice.
+ *
  * Each mutation's outcome can be scripted (`behave`).
  */
 
@@ -47,6 +62,10 @@ export interface FakeSale {
   promises: { minBlockLength: number; feeRateCap: string; baseFeeCap: string };
   /** What we sent: the HODL invoice (accept), the outpoint (add_transaction). */
   paymentRequest?: string;
+  /** The buyer has paid Amboss, not us: the accept moves the order straight
+   *  to WAITING_FOR_CHANNEL_OPEN, and Amboss pays our invoice only after it
+   *  confirmed the channel (`buyerPaidAmboss`, `ambossPays`). */
+  prepaid?: boolean;
 }
 
 export interface FakeOfferState {
@@ -276,6 +295,28 @@ export class FakeMagma {
     return hash;
   }
 
+  /** The buyer pays Amboss up front (the live API's way): from the accept
+   *  on the order waits for its channel, with our invoice unpaid. */
+  buyerPaidAmboss(id: string): void {
+    const s = this.sales.get(id);
+    if (!s) throw new Error(`no sale ${id}`);
+    if (s.status !== "WAITING_FOR_SELLER_APPROVAL") throw new Error(`order ${id} is past its approval (${s.status})`);
+    s.prepaid = true;
+  }
+
+  /** Amboss pays the HODL invoice we accepted with — which it does only once
+   *  it has confirmed the channel. Returns the invoice's payment hash. */
+  ambossPays(id: string, node: FakeLnd): string {
+    const s = this.sales.get(id);
+    if (!s?.paymentRequest) throw new Error(`order ${id} was not accepted with an invoice`);
+    if (s.status !== "VALID_CHANNEL_OPENING" && s.status !== "CHANNEL_MONITORING_FINISHED")
+      throw new Error(`Amboss pays the seller only after it confirmed the channel (order ${id} is ${s.status})`);
+    const hash = parsePaymentRequest(s.paymentRequest).id;
+    node.payHoldInvoice(hash);
+    s.paymentStatus = "SUCCESSFUL_PAYMENT";
+    return hash;
+  }
+
   /** How many times an operation was called. */
   count(op: string): number {
     return this.counts.get(op) ?? 0;
@@ -365,6 +406,14 @@ export class FakeMagma {
             const s = this.sales.get(String(input.order_id));
             if (!s || s.status !== "WAITING_FOR_SELLER_APPROVAL") return false;
             s.paymentRequest = String(input.payment_request);
+            if (s.prepaid) {
+              // Seen live: no stop at WAITING_FOR_BUYER_PAYMENT, nothing paid
+              // to us, and the deadline for the channel 48 hours after the
+              // invoice was made.
+              s.status = "WAITING_FOR_CHANNEL_OPEN";
+              s.timeout = new Date(Date.now() + PREPAID_CHANNEL_WINDOW_MS).toISOString();
+              return true;
+            }
             s.status = "WAITING_FOR_BUYER_PAYMENT";
             if (this.timeoutAfterAccept === "cleared") s.timeout = null;
             return true;

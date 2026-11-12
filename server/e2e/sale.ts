@@ -6,6 +6,12 @@
  * as a node with tor.active does. Only Amboss is the test suite's fake (every
  * request checked against the saved Magma schema): what the live API answers can
  * only be seen on a live order (docs/E2E-TESTING.md, section A).
+ *
+ * The first sale runs the way Amboss's docs put it — the buyer pays our hold
+ * invoice before the channel is opened. The last two run the way a live sale
+ * did (2026-11-11): the buyer has paid Amboss, the channel is opened with our
+ * invoice unpaid, and the payment comes only after Amboss confirmed the
+ * channel — the buyer node stands in for Amboss as the payer.
  */
 import { execSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -32,7 +38,7 @@ import { CapitalLedger } from "../src/services/capital.js";
 import { AmbossStore } from "../src/services/ambossStore.js";
 import { EarningsLog } from "../src/services/earningsLog.js";
 import { fundingHeight } from "../src/services/leaseCaps.js";
-import { OPEN_MIN_BLOCKS_LEFT } from "../src/services/magmaDesk.js";
+import { AWAITING_AMBOSS_PAYMENT, OPEN_MIN_BLOCKS_LEFT } from "../src/services/magmaDesk.js";
 import type { MagmaJournalEntry } from "../src/services/magmaJournal.js";
 import { OverridesStore } from "../src/services/overrides.js";
 import { RebalanceLog } from "../src/services/rebalanceLog.js";
@@ -378,6 +384,113 @@ const next = magma.addSale({
 });
 await desk.tick();
 check("the next order is accepted as ever", next.status === "WAITING_FOR_BUYER_PAYMENT", `${next.status}; ${(onDisk(next.id)?.reason ?? "").slice(0, 120)}`);
+
+// ── the buyer paid Amboss: the channel is opened before our invoice is paid ──
+const order = () =>
+  magma.addSale({
+    buyerPubkey: buyerKey,
+    sizeSats: SIZE,
+    feeSeller: "60000",
+    timeout: new Date(Date.now() + 2 * 3_600_000).toISOString(),
+    sockets: [`127.0.0.1:${NODES.buyer.p2p}`],
+  });
+/** The seller's channels to the buyer that are still being opened. */
+const openingToBuyer = async () => (await getPendingChannels({ lnd: seller })).pending_channels.filter((c) => c.partner_public_key === buyerKey && c.is_opening);
+const unpaid = (i: { is_held?: boolean; is_confirmed: boolean; is_canceled?: boolean }) => !i.is_held && !i.is_confirmed && !i.is_canceled;
+const bookedFor = (id: string) => earnings.recent().filter((e) => e.orderId === id).length;
+
+const prepaid = order();
+magma.buyerPaidAmboss(prepaid.id);
+await desk.tick();
+const prepaidHash = parsePaymentRequest(prepaid.paymentRequest ?? "").id;
+check(
+  "an order whose buyer paid Amboss is accepted and waits for its channel, our invoice unpaid",
+  prepaid.status === "WAITING_FOR_CHANNEL_OPEN" && journalPhase(prepaid.id) === "accepted" && unpaid(await getInvoice({ lnd: seller, id: prepaidHash })),
+  `${prepaid.status}, journal ${journalPhase(prepaid.id)}`,
+);
+await desk.tick();
+const prepaidPending = await until("the unpaid order's channel pending", async () => (await openingToBuyer())[0]);
+check(
+  "the lane opens its channel with nothing held by our invoice",
+  prepaidPending.capacity === SIZE && unpaid(await getInvoice({ lnd: seller, id: prepaidHash })),
+  `${prepaidPending.capacity} sat, ${prepaidPending.transaction_id.slice(0, 12)}…; ${(onDisk(prepaid.id)?.events.map((e) => e.what).join(" | ") ?? "").slice(0, 260)}`,
+);
+await until("the unpaid order's funding reported to Amboss", async () => {
+  await desk.tick();
+  return !!prepaid.transactionId;
+}, 30_000).catch(() => null);
+check("its funding transaction is reported to Amboss", (prepaid.transactionId ?? "").startsWith(prepaidPending.transaction_id), prepaid.transactionId ?? `status ${prepaid.status}`);
+mine(3);
+const prepaidChannel = await until("the unpaid order's channel active", async () => (await getChannels({ lnd: seller })).channels.find((c) => c.transaction_id === prepaidPending.transaction_id && c.is_active));
+mine(6);
+prepaid.status = "VALID_CHANNEL_OPENING";
+prepaid.channelId = prepaidChannel.id;
+await desk.tick();
+await desk.tick();
+check(
+  "Amboss confirms the channel before it has paid: nothing is claimed, the order waits for Amboss's payment",
+  unpaid(await getInvoice({ lnd: seller, id: prepaidHash })) && journalPhase(prepaid.id) === "reported" && onDisk(prepaid.id)?.decision?.reason === AWAITING_AMBOSS_PAYMENT && bookedFor(prepaid.id) === 0,
+  `${journalPhase(prepaid.id)}: ${onDisk(prepaid.id)?.decision?.reason ?? onDisk(prepaid.id)?.lastError ?? ""}`.slice(0, 200),
+);
+const latePay = pay({ lnd: buyer, request: prepaid.paymentRequest ?? "", max_fee: 1_000 });
+await until("the payment after the confirmation settled", async () => {
+  await desk.tick();
+  return (await getInvoice({ lnd: seller, id: prepaidHash })).is_confirmed;
+}, 60_000).catch(() => null);
+const lateDone = await latePay.catch((err: unknown) => ({ failed: JSON.stringify(err).slice(0, 120) }));
+check("the payment that arrives after the confirmation is claimed", "is_confirmed" in lateDone && lateDone.is_confirmed === true, JSON.stringify(lateDone).slice(0, 120));
+check("the sale is booked, once", bookedFor(prepaid.id) === 1 && journalPhase(prepaid.id) === "settled", `${bookedFor(prepaid.id)} booking(s), journal ${journalPhase(prepaid.id)}`);
+
+// ── a channel opened by hand while the lane waits: taken, never a second ───
+const byHand = order();
+magma.buyerPaidAmboss(byHand.id);
+await desk.tick();
+const byHandHash = parsePaymentRequest(byHand.paymentRequest ?? "").id;
+// Fees above what the sale earns: the lane waits for lower ones.
+wallet.estimateFee = (_args, cb) => cb(null, { sat_per_kw: String(400 * 250) });
+await desk.tick();
+await desk.tick();
+check(
+  "with fees above what the sale earns the unpaid order waits for lower fees, and says from when it is opened whatever the fee",
+  byHand.status === "WAITING_FOR_CHANNEL_OPEN" &&
+    (await openingToBuyer()).length === 0 &&
+    /^on-chain fees are 400 sat\/vB: .*Amboss holds the buyer's payment, so the channel is opened whatever the fee from /.test(onDisk(byHand.id)?.lastError ?? ""),
+  (onDisk(byHand.id)?.lastError ?? journalPhase(byHand.id)).slice(0, 260),
+);
+// The operator opens the channel with another tool, at a fee of their choice.
+await addPeer({ lnd: seller, public_key: buyerKey, socket: `127.0.0.1:${NODES.buyer.p2p}` }).catch(() => null);
+const hand = await openChannel({ lnd: seller, partner_public_key: buyerKey, local_tokens: SIZE, chain_fee_tokens_per_vbyte: 2 });
+const handOutpoint = `${hand.transaction_id}:${hand.transaction_vout}`;
+await until("the hand-opened channel pending", async () => (await openingToBuyer()).some((c) => c.transaction_id === hand.transaction_id));
+wallet.estimateFee = realEstimate;
+await until("the hand-opened channel reported to Amboss", async () => {
+  await desk.tick();
+  return !!byHand.transactionId;
+}, 30_000).catch(() => null);
+await desk.tick();
+const nowOpening = await openingToBuyer();
+check(
+  "the channel opened by hand is taken as the order's — with fees back to normal the lane opens no second one",
+  nowOpening.length === 1 && nowOpening[0].transaction_id === hand.transaction_id && onDisk(byHand.id)?.fundingOutpoint === handOutpoint,
+  `${nowOpening.length} opening, journal ${journalPhase(byHand.id)} ${onDisk(byHand.id)?.fundingOutpoint?.slice(0, 14) ?? "no outpoint"}…; ${(onDisk(byHand.id)?.events.map((e) => e.what).slice(-3).join(" | ") ?? "").slice(0, 260)}`,
+);
+check("and it is the one reported to Amboss", (byHand.transactionId ?? "").startsWith(hand.transaction_id), byHand.transactionId ?? `status ${byHand.status}`);
+mine(3);
+const handChannel = await until("the hand-opened channel active", async () => (await getChannels({ lnd: seller })).channels.find((c) => c.transaction_id === hand.transaction_id && c.is_active));
+mine(6);
+byHand.status = "VALID_CHANNEL_OPENING";
+byHand.channelId = handChannel.id;
+const handPay = pay({ lnd: buyer, request: byHand.paymentRequest ?? "", max_fee: 1_000 });
+await until("the hand-opened order's payment settled", async () => {
+  await desk.tick();
+  return (await getInvoice({ lnd: seller, id: byHandHash })).is_confirmed;
+}, 60_000).catch(() => null);
+const handDone = await handPay.catch((err: unknown) => ({ failed: JSON.stringify(err).slice(0, 120) }));
+check(
+  "its payment is claimed and the sale booked, once",
+  "is_confirmed" in handDone && handDone.is_confirmed === true && bookedFor(byHand.id) === 1 && journalPhase(byHand.id) === "settled",
+  `${JSON.stringify(handDone).slice(0, 80)}; ${bookedFor(byHand.id)} booking(s), journal ${journalPhase(byHand.id)}`,
+);
 
 // ── done ───────────────────────────────────────────────────────────────────
 autopilot.shutdown();

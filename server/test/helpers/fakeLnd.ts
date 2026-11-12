@@ -234,6 +234,10 @@ export class FakeLnd {
         getInfo: (_a, cb) => cb(null, this.infoRpc()),
         listChannels: (_a, cb) => cb(null, { channels: this.channels.map((c, i) => this.channelRpc(c, i)) }),
         pendingChannels: (_a, cb) => cb(null, this.pendingRpc()),
+        // No closed channels unless a test overrides it (the Magma lane asks,
+        // before it claims a payment, where a channel on an order's record
+        // went that is neither open nor pending).
+        closedChannels: (_a, cb) => cb(null, { channels: [] }),
         walletBalance: (_a, cb) =>
           cb(null, {
             confirmed_balance: String(this.chainBalance),

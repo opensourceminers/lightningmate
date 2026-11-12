@@ -740,20 +740,27 @@ test("a manual accept the wallet can't fund is refused (409): no invoice, no acc
 
 // ── what the guards are for, pinned ───────────────────────────────────────────
 
-test("the deploy cap counts an accepted order once — as promised — while Amboss lists it unpaid or waiting for its channel", async (t) => {
+test("the deploy cap counts an accepted order once while Amboss lists it unpaid or waiting for its channel — as promised, or as deployed once its channel is opened", async (t) => {
   quiet(t);
   for (const status of ["WAITING_FOR_BUYER_PAYMENT", "WAITING_FOR_CHANNEL_OPEN"] as const) {
     const { autopilot, magma, capital } = sellerSetup(t, { config: { sellMaxDeploySats: 5_000_000 } });
     const a = magma.addSale({ buyerPubkey: BUYER, sizeSats: 2_000_000 });
     await autopilot.pollSellOrders();
-    // (WAITING_FOR_CHANNEL_OPEN: Amboss shows it paid; our invoice holds
-    // nothing yet — the order is still promised, not funded.)
+    // (WAITING_FOR_CHANNEL_OPEN with our invoice unpaid: Amboss holds the
+    // buyer's payment and pays us after the channel is confirmed, so the
+    // lane opens A's channel on this pass — review 2026-11-10, LANE-10.)
     magma.setStatus(a.id, status);
     (autopilot.magma as unknown as { deployed: { at: number } }).deployed.at = 0; // the listing's 30 s cache ran out
     const b = magma.addSale({ buyerPubkey: OTHER_BUYER, sizeSats: 2_500_000 });
     await autopilot.pollSellOrders();
-    assert.equal(capital.reservedSat(), 4_500_000, `${status}: both promised`);
-    assert.equal(capital.deployedSat(), 0, `${status}: Amboss lists A, but it is promised here already — not counted twice`);
+    if (status === "WAITING_FOR_BUYER_PAYMENT") {
+      assert.equal(capital.reservedSat(), 4_500_000, `${status}: both promised`);
+      assert.equal(capital.deployedSat(), 0, `${status}: Amboss lists A, but it is promised here already — not counted twice`);
+    } else {
+      assert.equal(magma.sales.get(a.id)?.status, "SELLER_SENT_TRANSACTION", `${status}: A's channel is opened and reported`);
+      assert.equal(capital.reservedSat(), 2_500_000, `${status}: only B is still promised`);
+      assert.equal(capital.deployedSat(), 2_000_000, `${status}: A is deployed — counted once, not as promised too`);
+    }
     assert.equal(magma.sales.get(b.id)?.status, "WAITING_FOR_BUYER_PAYMENT", `${status}: 2M promised + 2.5M fits the 5M cap`);
   }
 });

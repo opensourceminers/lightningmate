@@ -327,7 +327,7 @@ test("'Open channel' on an accepted order whose invoice LND has cancelled (the b
   // Orders tab said "Channel opening" for an order it had just ended.
   assert.equal(res.ok, false);
   assert.equal(res.code, "bad_status");
-  assert.match(res.message, /^No channel opened: the order is cancelled here \(the invoice expired or was cancelled before the buyer paid\)\.$/);
+  assert.match(res.message, /^No channel opened: the order is cancelled here \(the invoice expired or was cancelled before it was paid\)\.$/);
   assert.equal(node.callsTo("default.openChannel").length, 0);
   assert.equal(entryOnDisk(dir, sale.id)?.phase, "cancelled");
 });

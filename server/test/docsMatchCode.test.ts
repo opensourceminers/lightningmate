@@ -29,20 +29,22 @@ import {
   CANCEL_MARGIN_BLOCKS,
   CLOSE_ASKED_RETRY_MS,
   HODL_CLTV_DELTA,
+  HODL_EXPIRY_MS,
   LEGACY_FEE_WAIT_RESERVE_MS,
   LEGACY_OPEN_RETRY_MS,
   MANUAL_ACCEPT_SKIP,
   NO_PAYMENT_WAIT,
   OPEN_MIN_BLOCKS_LEFT,
   OPEN_RETRY_MIN_TIME_LEFT_MS,
+  PAYMENT_OVERDUE_MS,
   OPEN_RETRY_WINDOW_MS,
   SOLD_CLOSE_MIN_LOCAL_SHARE,
   SOLD_KEEP_BAR_TEXT,
-  UNPAID_CONFIRMED_WAIT_MS,
+  UNPAID_OPEN_RESERVE_MS,
 } from "../src/services/magmaDesk.js";
 import { ANSWERS_KEPT } from "../src/services/magmaJournal.js";
 import { MAGMA_LEASE_MARGIN_BLOCKS } from "../src/services/leaseCaps.js";
-import { SOLD_CHANNEL_KEEP_PPM_YEAR } from "../src/services/autopilot.js";
+import { SOLD_CHANNEL_KEEP_PPM_YEAR, URGENT_OPEN_CONF_TARGET } from "../src/services/autopilot.js";
 import { OPEN_TX_VBYTES } from "../src/services/nodeEconomics.js";
 import { autopilotWith } from "./helpers/autopilot.js";
 import { quiet } from "./helpers/lifecycle.js";
@@ -521,9 +523,17 @@ test("the docs and the Auto-close hint say when a sold channel is closed at its 
   assert.doesNotMatch(hint.slice(0, hint.indexOf("\n\n")), /never above/);
 });
 
-test("the docs say how long an order Amboss reports confirmed is looked at while our invoice is unpaid", () => {
-  // Review 2026-11-10, LANE-8.
+test("the docs say how long an order Amboss reports confirmed waits for its payment, and when an unpaid order's channel is opened", () => {
+  // Review 2026-11-10, LANE-8 and LANE-9..13 (Amboss pays after the channel is confirmed).
   const flat = strategy.replace(/\s+/g, " ");
-  assert.equal(UNPAID_CONFIRMED_WAIT_MS, 3_600_000, "“an hour”");
-  assert.match(flat, /While that invoice is unpaid the order is looked at again for an hour .* then the invoice is cancelled and the order ends here, unbooked/);
+  assert.equal(HODL_EXPIRY_MS, 49 * 3_600_000, "“49 hours after it was made”");
+  assert.equal(PAYMENT_OVERDUE_MS, 6 * 3_600_000, "“After 6 hours of waiting an alert names the order”");
+  assert.equal(UNPAID_OPEN_RESERVE_MS, 6 * 3_600_000, "“less 6 hours for the channel to get its confirmations”");
+  assert.equal(LEGACY_FEE_WAIT_RESERVE_MS, 6 * 3_600_000, "“in the 6 hours before it the channel is opened whatever the fee”");
+  assert.equal(URGENT_OPEN_CONF_TARGET, 3, "“at LND's 3-block estimate”");
+  assert.match(flat, /the order waits for Amboss's payment \("channel confirmed — waiting for Amboss's payment", said once on its record\) until the invoice runs out, 49 hours after it was made/);
+  assert.match(flat, /After 6 hours of waiting an alert names the order\. Only when the invoice has expired unpaid does the order end here, unbooked/);
+  assert.match(flat, /Amboss's `timeout` for the channel \(48 hours after the invoice was made\) less 6 hours for the channel to get its confirmations/);
+  assert.match(flat, /in the 6 hours before it the channel is opened whatever the fee, at LND's 3-block estimate/);
+  assert.doesNotMatch(flat, /looked at again for an hour/);
 });

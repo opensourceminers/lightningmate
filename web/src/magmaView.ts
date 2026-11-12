@@ -161,7 +161,9 @@ const BUY_STATUS: Record<string, string> = {
  *  sale says who opens its channel: the order lane (`opensItself`, from the
  *  server — with selling on, or an order the lane accepted
  *  itself), or you (review of P7: "waiting for you to open the channel"
- *  showed while the lane was opening it). */
+ *  showed while the lane was opening it). "Paid" is the buyer's payment:
+ *  to Amboss as a rule, which pays this node once the channel is confirmed
+ *  — the order's own line says where the payment is. */
 export function orderStatusLabel(status: string, side: "SELL" | "BUY" | string, opensItself = false): string {
   if (side !== "BUY" && status === "WAITING_FOR_CHANNEL_OPEN" && opensItself) return "Paid — the autopilot opens the channel";
   const words = (side === "BUY" ? BUY_STATUS[status] : undefined) ?? SELL_STATUS[status];
@@ -171,13 +173,16 @@ export function orderStatusLabel(status: string, side: "SELL" | "BUY" | string, 
   return plain.charAt(0).toUpperCase() + plain.slice(1);
 }
 
-/** The toast after an order is accepted by hand: who opens its channel
- *  once the buyer has paid — the order lane (Selling on), or
- *  you ("Open channel"). */
+/** The toast after an order is accepted by hand: who opens its channel —
+ *  the order lane (Selling on), or you ("Open channel") — and when: once
+ *  Amboss shows the buyer's payment. That is right after the accept when
+ *  the buyer paid Amboss as the order was placed, which is how a sale on
+ *  Magma usually runs (review 2026-11-10, LANE-9: "once the buyer has
+ *  paid" read as a payment still to come, to this node). */
 export function acceptedToast(opensItself: boolean): string {
   return opensItself
-    ? "Order accepted — while selling is on, the autopilot opens the channel once the buyer has paid."
-    : "Order accepted — open the channel once the buyer has paid.";
+    ? "Order accepted — while selling is on, the autopilot opens the channel as soon as Amboss shows the buyer's payment."
+    : "Order accepted — open the channel as soon as the order says “Paid”: usually right away.";
 }
 
 /** A click's answer when the order already is what it asked for (the API's

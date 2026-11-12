@@ -1136,6 +1136,9 @@ export function givenUp(): string | null {
 
 /** The Magma order lane's cadence (D4): independent of the main run. */
 export const ORDER_LANE_INTERVAL_MS = 45_000;
+/** The confirmation target of a sold channel's open whose time is running
+ *  out (soldChannelOpen): about three blocks. */
+export const URGENT_OPEN_CONF_TARGET = 3;
 /** How often the order lane reads the listed offers to catch one priced below
  *  what the autopilot set, or listed for free (guardOfferPrices). */
 export const OFFER_GUARD_INTERVAL_MS = 2 * 60_000;
@@ -1755,7 +1758,7 @@ export class Autopilot {
       saleFloorSats: () => this.saleFeeFloorSats(),
       saleFloorNote: () => this.saleFloorNote(),
       soldChannelClose: () => this.soldChannelClose(),
-      soldChannelOpen: () => this.soldChannelOpen(),
+      soldChannelOpen: (urgent) => this.soldChannelOpen(urgent),
       offerPrices: () => this.knownOfferPrices(),
       initialRoutingFee: () => this.initialRoutingFee(),
     });
@@ -4093,12 +4096,18 @@ export class Autopilot {
    * (saleFeeFloor), as a whole rate (openFeeRateOf); null when LND gives
    * none — and the service fee's share of a sale's fee. Not the economy rate
    * of a routing open (openFeeRate): a sold channel has to confirm while the
-   * buyer's payment is held.
+   * buyer's payment is held. `urgent`: the estimate for about three blocks
+   * (URGENT_OPEN_CONF_TARGET) — for the open that is made whatever the fee
+   * because its time is running out.
    */
-  async soldChannelOpen(): Promise<{ feeRate: number | null; serviceFeeRate: number }> {
+  async soldChannelOpen(urgent = false): Promise<{ feeRate: number | null; serviceFeeRate: number }> {
     let feeRate: number | null = null;
     try {
-      const { tokens_per_vbyte } = await getChainFeeRate({ lnd: this.readLnd });
+      // `urgent`: an order whose time to open is running out (its buyer paid
+      // Amboss, and Amboss pays us only for a channel confirmed in time) —
+      // LND's estimate for about three blocks, not the default six: a cheap
+      // funding transaction sent at the last moment may not get there.
+      const { tokens_per_vbyte } = await getChainFeeRate({ lnd: this.readLnd, ...(urgent ? { confirmation_target: URGENT_OPEN_CONF_TARGET } : {}) });
       if (Number.isFinite(tokens_per_vbyte) && tokens_per_vbyte > 0) feeRate = openFeeRateOf(tokens_per_vbyte);
     } catch {
       feeRate = null;

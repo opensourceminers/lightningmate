@@ -13,14 +13,24 @@ import { MAGMA_LEASE_MARGIN_BLOCKS, leaseCapFrom, type LeaseCap, type SoldLease 
  * poll opened a second channel for the same order. Now:
  *
  *   seen → accepting (preimage saved, then invoice, then accept) → accepted
- *        → held (the buyer's payment is held by our HODL invoice)
+ *        → held (the buyer's payment is held by our HODL invoice — only when
+ *          the buyer pays that invoice before the channel: see below)
  *        → opening (open started — written before the open)
  *        → funded (funding outpoint — written right after the open)
  *        → reported (Amboss took the funding transaction)
  *        → settled (Amboss confirmed the channel; payment claimed, sale booked)
- *   or, at any point: cancelled (held payment released — buyer refunded),
- *                     rejected (we declined the order), failed (ended without
- *                     anything of ours left to release).
+ *   or, at any point: cancelled (our invoice cancelled — a payment it held
+ *                     goes back), rejected (we declined the order), failed
+ *                     (ended without anything of ours left to release).
+ *
+ * Where the buyer's money is (the first live sale, 2026-11-11): a buyer on
+ * Magma pays AMBOSS when the order is placed, and Amboss pays our HODL
+ * invoice only once the channel has its confirmations. Such an order goes
+ * accepted → opening → funded → reported with our invoice still unpaid
+ * (`ambossHoldsAt` says so), the payment arrives in "funded"/"reported"
+ * (`heldAt`, `heldUntilHeight`), and it never passes through "held". The
+ * other way, in Amboss's documentation — the buyer pays our invoice right
+ * after the accept — goes accepted → held → opening as before.
  *
  * An entry with a funding outpoint is never opened again; an "opening" entry
  * without one is first reconciled with LND (magmaDesk.ts).
@@ -86,6 +96,20 @@ export interface MagmaJournalEntry {
    *  still awaiting approval takes it as a refusal (MagmaDesk.resumeAccept).
    *  Gone once the accept is released or confirmed. */
   acceptRefused?: string;
+  /** The buyer's channels with this node (open and pending outpoints) when
+   *  the order was accepted. A channel to the buyer that is not among them
+   *  and belongs to no other sale is this order's — opened by hand or with
+   *  another tool while the order waited — and no second one is opened for
+   *  it (MagmaDesk.channelAlreadyThere). Absent on records from before it
+   *  was kept. */
+  preExistingAtAccept?: string[];
+  /** When the lane first found the order waiting for its channel with our
+   *  invoice still unpaid: the buyer paid Amboss when the order was placed,
+   *  and Amboss pays our invoice after the channel is confirmed. The channel
+   *  is opened without a payment held here (MagmaDesk.fulfil). */
+  ambossHoldsAt?: string;
+  /** When our invoice came to hold the payment — before the open (the phase
+   *  is then "held"), or after it, in "funded"/"reported". */
   heldAt?: string;
   /** Lowest CLTV expiry height of the held HTLCs (cancel before it). */
   heldUntilHeight?: number | null;
@@ -95,7 +119,15 @@ export interface MagmaJournalEntry {
    *  is the error of an open whose outcome LND left open (a dropped stream,
    *  a timeout): the entry waits in "opening" until LND shows the channel or
    *  has had ample time to. */
-  opening?: { startedAt: string; preExisting: string[]; unclear?: string };
+  opening?: {
+    startedAt: string;
+    preExisting: string[];
+    unclear?: string;
+    /** The phase the open started from, and goes back to if it turns out
+     *  never to have happened: "held", or "accepted" for an order whose
+     *  payment Amboss holds (absent on older records: "held"). */
+    from?: "accepted" | "held";
+  };
   fundingOutpoint?: string;
   fundedAt?: string;
   reportAttempts: number;
@@ -161,8 +193,10 @@ export interface MagmaJournalEntry {
   closedAt?: string;
   closeTxid?: string;
   /** Since when Amboss has reported this order's channel confirmed while the
-   *  invoice of ours it was accepted with is unpaid (MagmaDesk.settle;
-   *  review 2026-11-10, LANE-8). */
+   *  invoice of ours it was accepted with is unpaid (MagmaDesk.settle): the
+   *  normal wait of an order whose buyer paid Amboss — Amboss pays after the
+   *  confirmation — and, when it goes on for long, an alert
+   *  (MagmaDesk.paymentsOverdue). */
   unpaidSince?: string;
   /** A lease-end close the buyer's node refused for its fee in the first
    *  round: the shutdown is out and LND goes on with it — not a failure, and

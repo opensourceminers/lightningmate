@@ -3,7 +3,7 @@ import { getChannelsView } from "./channels.js";
 import { getNodeSummary } from "./node.js";
 import { storeIncidents, type StoreIncident } from "../store.js";
 import type { ServiceFeeLedger } from "./serviceFee.js";
-import type { MagmaRefund, MagmaRefusal } from "./magmaDesk.js";
+import type { MagmaOverduePayment, MagmaRefund, MagmaRefusal, MagmaUnpaidChannel } from "./magmaDesk.js";
 
 export interface Alert {
   level: "warn" | "info";
@@ -117,14 +117,50 @@ export function magmaRefusalAlerts(desk: { refusals(): Pick<MagmaRefusal, "order
 
 /** Paid Magma orders whose payment went back to the buyer with no channel
  *  opened (MagmaDesk.refunds), until dismissed: a sale lost after the buyer
- *  had paid, and on Amboss an order the seller did not fulfil. */
-export function magmaRefundAlerts(desk: { refunds(): Pick<MagmaRefund, "orderId" | "sizeSats" | "feeSats" | "reason">[] }): Alert[] {
+ *  had paid, and on Amboss an order the seller did not fulfil. One whose
+ *  payment Amboss held (`heldBy`) never had anything of the buyer's here:
+ *  Amboss gives it back. */
+export function magmaRefundAlerts(desk: {
+  refunds(): (Pick<MagmaRefund, "orderId" | "sizeSats" | "feeSats" | "reason"> & Partial<Pick<MagmaRefund, "heldBy">>)[];
+}): Alert[] {
   return desk.refunds().map((r) => ({
     level: "warn" as const,
     message:
-      `A paid ${Math.round(r.sizeSats).toLocaleString("en-US")} sat Magma order was refunded and no channel opened: ${r.reason}. ` +
-      `The buyer has their ${Math.round(r.feeSats).toLocaleString("en-US")} sat back; Amboss may count the order against your seller score. See Market → Orders for the order.`,
+      r.heldBy === "amboss"
+        ? `A ${Math.round(r.sizeSats).toLocaleString("en-US")} sat Magma order Amboss had taken the buyer's payment for ended with no channel opened: ${r.reason}. ` +
+          "Nothing was paid to this node; Amboss refunds the buyer and may count the order against your seller score. See Market → Orders for the order."
+        : `A paid ${Math.round(r.sizeSats).toLocaleString("en-US")} sat Magma order was refunded and no channel opened: ${r.reason}. ` +
+          `The buyer has their ${Math.round(r.feeSats).toLocaleString("en-US")} sat back; Amboss may count the order against your seller score. See Market → Orders for the order.`,
     id: `magma:${r.orderId}`,
+  }));
+}
+
+/** Magma orders that ended without payment after their channel was opened
+ *  (MagmaDesk.unpaidChannels), until dismissed: this node's coins are in a
+ *  channel nothing was earned for. */
+export function magmaUnpaidChannelAlerts(desk: { unpaidChannels(): Pick<MagmaUnpaidChannel, "orderId" | "sizeSats" | "outpoint" | "reason" | "delivered">[] }): Alert[] {
+  return desk.unpaidChannels().map((c) => ({
+    level: "warn" as const,
+    message:
+      `A ${Math.round(c.sizeSats).toLocaleString("en-US")} sat Magma order ended without payment after its channel was opened: ${c.reason}. ` +
+      (c.delivered
+        ? `Amboss counts the channel ${c.outpoint} as delivered, so it stays bound to what the order promised: ask Amboss about the payment for order ${c.orderId}.`
+        : `The channel ${c.outpoint} stays open and is yours: close it to take the capital back, or keep it for routing.`),
+    id: `magma:${c.orderId}`,
+  }));
+}
+
+/** Magma orders whose channel Amboss confirmed a good while ago and has not
+ *  paid for yet (MagmaDesk.paymentsOverdue). Derived: gone once the payment
+ *  arrives or the order ends. */
+export function magmaOverduePaymentAlerts(desk: { paymentsOverdue(): Pick<MagmaOverduePayment, "orderId" | "sizeSats" | "feeSats" | "since" | "until">[] }): Alert[] {
+  const utc = (iso: string): string => `${iso.slice(0, 16).replace("T", " ")} UTC`;
+  return desk.paymentsOverdue().map((p) => ({
+    level: "warn" as const,
+    message:
+      `Amboss confirmed the channel of a ${Math.round(p.sizeSats).toLocaleString("en-US")} sat Magma order on ${utc(p.since)}, ` +
+      `but has not paid its ${Math.round(p.feeSats).toLocaleString("en-US")} sat to this node yet. ` +
+      `LightningMate keeps waiting${p.until ? ` until ${utc(p.until)}` : ""}; if nothing arrives, ask Amboss about order ${p.orderId}. See Market → Orders for the order.`,
   }));
 }
 

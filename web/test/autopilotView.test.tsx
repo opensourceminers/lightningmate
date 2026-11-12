@@ -798,8 +798,9 @@ test("a paid sale says who opens its channel — the autopilot, or you — and s
   assert.equal(orderStatusLabel("WAITING_FOR_CHANNEL_OPEN", "SELL"), "Paid — waiting for you to open the channel");
   // A purchase is the seller's to open, whatever the flag.
   assert.equal(orderStatusLabel("WAITING_FOR_CHANNEL_OPEN", "BUY", true), "Paid — waiting for the seller to open the channel");
-  assert.equal(acceptedToast(true), "Order accepted — while selling is on, the autopilot opens the channel once the buyer has paid.");
-  assert.equal(acceptedToast(false), "Order accepted — open the channel once the buyer has paid.");
+  // LANE-9: the buyer has usually paid Amboss already — no payment "to come".
+  assert.equal(acceptedToast(true), "Order accepted — while selling is on, the autopilot opens the channel as soon as Amboss shows the buyer's payment.");
+  assert.equal(acceptedToast(false), "Order accepted — open the channel as soon as the order says “Paid”: usually right away.");
   const orders = readFileSync(new URL("../src/components/MarketOrders.tsx", import.meta.url), "utf8");
   assert.match(orders, /ui\.toast\(deskDoneToast\(r, acceptedToast\(r\.opensItself === true\)\), "success"\)/);
 });

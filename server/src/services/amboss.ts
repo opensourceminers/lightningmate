@@ -188,7 +188,8 @@ async function graphqlErrorIn(res: TimedResponse): Promise<GraphqlError | null> 
 /**
  * One GraphQL request to Amboss. Every call is deadline-bound (http.ts): a
  * stalled Amboss must not hold anything hostage. Mutations get their own
- * deadline (see HTTP_TIMEOUTS for why it must stay inside the shutdown wait).
+ * deadline (see HTTP_TIMEOUTS for why it must stay inside the shutdown wait);
+ * `deadlineMs` names another one for a single call — the Magma accept's.
  * Throws AmbossError.
  */
 export async function ambossGql<T>(
@@ -196,8 +197,9 @@ export async function ambossGql<T>(
   query: string,
   apiKey?: string,
   variables?: Record<string, unknown>,
+  deadlineMs?: number,
 ): Promise<T> {
-  const timeoutMs = /^\s*mutation\b/.test(query) ? HTTP_TIMEOUTS.ambossMutationMs : HTTP_TIMEOUTS.ambossQueryMs;
+  const timeoutMs = deadlineMs ?? (/^\s*mutation\b/.test(query) ? HTTP_TIMEOUTS.ambossMutationMs : HTTP_TIMEOUTS.ambossQueryMs);
   let res: TimedResponse;
   try {
     res = await httpRequest(

@@ -60,8 +60,8 @@ export interface AutopilotSeams {
  */
 export function soldOpensKnowTheirFee(autopilot: Autopilot): void {
   const real = autopilot.soldChannelOpen.bind(autopilot);
-  autopilot.soldChannelOpen = async () => {
-    const terms = await real();
+  autopilot.soldChannelOpen = async (urgent?: boolean) => {
+    const terms = await real(urgent);
     return terms.feeRate === null ? { ...terms, feeRate: 1 } : terms;
   };
 }

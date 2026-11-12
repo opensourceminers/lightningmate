@@ -23,6 +23,17 @@ export const HTTP_TIMEOUTS = {
    *  the Magma order journal re-reads the order from Amboss on the next pass
    *  and acts on what actually happened. */
   ambossMutationMs: 25_000,
+  /** The Magma accept alone gets longer still, and is the one call that may
+   *  outlast the shutdown wait. On the first live sale (2026-11-11) Amboss
+   *  took more than 25 s over the accept ten times in a row — each a
+   *  timeout here, each sent again 45 s later — before one answered; the
+   *  order had its channel to open 20 minutes late. What makes the longer
+   *  wait safe at a stop: the accept's mark (`acceptSentAt`) is on disk
+   *  before it goes out, and after a restart the lane reads the order from
+   *  Amboss before anything else — it sends the accept again only while the
+   *  order still awaits approval, with the same invoice, and takes an accept
+   *  Amboss applied as accepted (MagmaDesk.resumeAccept). */
+  ambossAcceptMs: 90_000,
   lnplusMs: 10_000,
   /** Through Tor a new circuit to an onion service can take several seconds. */
   priceMs: 20_000,

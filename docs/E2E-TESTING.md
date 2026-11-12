@@ -6,7 +6,8 @@ Amboss account. `server/e2e/` adds real LND nodes on regtest (next section). Two
 **not been run end to end yet**:
 
 - **A. Selling on Amboss Magma** — the seller API on `magma.amboss.tech`, the
-  hold invoice Amboss's buyer pays, and Amboss's confirmation of the channel.
+  hold invoice (which Amboss pays once the channel is confirmed, or the buyer
+  right after the accept), and Amboss's confirmation of the channel.
 - **B. An LSPS1 buy from ZEUS's embedded node over Tor** — LightningMate's LSP
   mode as the one wallet known to order over peer messages sees it.
 
@@ -48,8 +49,8 @@ says PASS or FAIL; the exit code says whether all passed.
 the node's own block count (some 4,500 blocks; the three LND nodes follow in steps of 400). What
 it shows, in order:
 
-- **A whole sale**: an unreachable buyer is waited for, not turned down; accept, held payment,
-  the open at a stated fee rate — the funding transaction is read back from the mempool and pays
+- **A whole sale, the buyer paying our invoice first**: an unreachable buyer is waited for, not
+  turned down; accept, held payment, the open at a stated fee rate — the funding transaction is read back from the mempool and pays
   that rate —, the report to Amboss, settle, the sale booked once.
 - **The lease's end**: with Amboss listing the lease as over while the node's own count says it
   still runs, nothing is closed; one block before the end the channel is still open; at the end
@@ -63,6 +64,16 @@ it shows, in order:
   hold invoice and its size reserved; near the approval deadline it is rejected rather than left
   to time out, the accept not sent again, the invoice cancelled and the size free; the next order
   is accepted as ever.
+- **A whole sale, the buyer having paid Amboss** (how a live sale ran): the accept leads straight
+  to "waiting for the channel" with our invoice unpaid; the lane opens the channel with nothing
+  held and reports it; when Amboss confirms the channel before it has paid, nothing is claimed
+  and the order says it waits for Amboss's payment; the payment that arrives after the
+  confirmation is claimed and the sale booked once. (The buyer node stands in for Amboss as the
+  payer.)
+- **A channel opened by hand while the lane waits**: with fees above what the sale earns the
+  unpaid order waits and says from when it is opened whatever the fee; a channel the operator
+  then opens with another tool is taken as the order's and reported to Amboss, and with fees back
+  to normal no second one is opened; its payment is claimed and the sale booked once.
 
 No service fee is set in that run, so "what the sale earns" is the order's whole fee there.
 
@@ -105,7 +116,7 @@ No service fee is set in that run, so "what the sale earns" is the order's whole
    the caps and the capital) — or accept it by hand. The journal goes
    `seen → accepting → accepted`.
 6. **Check the invoice amount — the one live point not yet verified.**
-   Before B pays, read the order on Amboss (`fees.seller`, `fees.fixed`,
+   Before anything is paid to A, read the order on Amboss (`fees.seller`, `fees.fixed`,
    `fees.variable`) and the invoice in LND
    (`lncli listinvoices --pending_only` — memo `Magma order <id>`; its
    `value_msat`, `state OPEN`, expiry about 49 h, `cltv_expiry 288`).
@@ -123,12 +134,23 @@ No service fee is set in that run, so "what the sale earns" is the order's whole
    the first real sale, so the fallback is checked against what Amboss
    really sends.
 
-**4. Payment held (B pays)**
+**4. Where the buyer's payment is**
 
-7. B pays the invoice Amboss presents. On A: `lncli lookupinvoice <hash>` shows
-   `ACCEPTED` (held, not settled); the journal `held`; Amboss
-   `WAITING_FOR_CHANNEL_OPEN`. The coins for the channel stay reserved
-   (Wallet: "promised to buyers").
+7. Read the order's status right after the accept: it shows which of two ways
+   the sale runs.
+   - **`WAITING_FOR_CHANNEL_OPEN`, A's invoice still `OPEN`** — how the first
+     live sale ran (2026-11-11). B paid Amboss when placing the order, and
+     Amboss pays A's invoice only after it confirmed the channel. The journal
+     stays `accepted` and says "Amboss holds the buyer's payment: it waits
+     for the channel, and pays our invoice once the channel is confirmed".
+     Nothing is held on A.
+   - **`WAITING_FOR_BUYER_PAYMENT`** — the way Amboss's documentation puts
+     it. B pays the invoice Amboss presents. On A:
+     `lncli lookupinvoice <hash>` shows `ACCEPTED` (held, not settled); the
+     journal `held`; Amboss `WAITING_FOR_CHANNEL_OPEN`.
+
+   Either way the coins for the channel stay reserved (Wallet: "promised to
+   buyers"). Note which way it was.
 
 **5. Channel open and report (node A)**
 
@@ -145,14 +167,24 @@ No service fee is set in that run, so "what the sale earns" is the order's whole
    lane waits instead ("on-chain fees are N sat/vB: opening the channel would
    cost about …"): on regtest LND's estimate is bitcoind's fallback (about
    25 sat/vB, 4,375 sat an open), so the test order must pay more than that,
-   or use "Open channel".
+   or use "Open channel". An order whose payment Amboss holds is opened
+   with A's invoice unpaid — what is at risk is the open's on-chain fee, the
+   channel and its coins stay A's — and, should fees stay too high, whatever
+   the fee in the last hours before Amboss's deadline (the wait says from
+   when); one whose payment A holds is refunded instead.
 9. The channel shows in Channels with its lease tag.
 
 **6. Confirmation and settle**
 
-10. After the confirmations Amboss asks for, the order turns
-    `VALID_CHANNEL_OPENING`; within a lane pass the invoice is **settled**
-    (`SETTLED` in LND), the journal `settled`.
+10. After the confirmations Amboss asks for (three, by its own words), the
+    order turns `VALID_CHANNEL_OPENING`. With the payment held on A, the
+    invoice is **settled** within a lane pass (`SETTLED` in LND), the journal
+    `settled`. With the payment held by Amboss, A's invoice is still unpaid
+    then: the order says "channel confirmed — waiting for Amboss's payment
+    (Amboss pays after the confirmation)" and nothing is claimed; once
+    Amboss's payment arrives (`ACCEPTED` in LND) the next lane pass settles
+    it. **Note how long Amboss takes to pay — not yet measured.** An alert
+    tells the operator when it has taken more than six hours.
 11. Booked once: Analytics / P&L shows the lease income of this sale once; the
     1 % service fee is in the fee ledger once (`GET /api/service-fees`) and
     paid in the background.
@@ -170,11 +202,17 @@ No service fee is set in that run, so "what the sale earns" is the order's whole
   place an order. The paused lane neither accepts nor rejects it: it stays
   "Waiting for you to accept" on Market → Orders, nothing is promised — accept
   or reject it yourself before its deadline.
-- **Restart mid-order**: restart the app between the accept and the payment,
-  and again between the payment and the open. No second invoice, no second
+- **Restart mid-order**: restart the app between the accept and the open,
+  and again right after the open. No second invoice, no second
   channel; the order carries on.
-- **Buyer never pays**: the invoice expires unpaid (about 49 h), the order
-  ends `BUYER_FAILED_TO_PAY`, the reserved coins are free again.
+- **Open by hand**: with selling on, open the order's channel yourself (the
+  order's size, to the buyer) before the lane does — or report one on
+  Amboss's site. The lane takes that channel as the order's ("opened
+  outside LightningMate" in the order's history), reports it if Amboss does
+  not have it yet, and opens no second one.
+- **Buyer never pays** (only where the buyer pays A's invoice): the invoice
+  expires unpaid (about 49 h), the order ends `BUYER_FAILED_TO_PAY`, the
+  reserved coins are free again.
 
 Record for each: the order id, the statuses Amboss showed, the journal
 phases, the LND invoice states, and anything unexpected.
