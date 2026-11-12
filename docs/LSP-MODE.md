@@ -35,7 +35,7 @@
 
 | Piece | Source |
 |---|---|
-| Pricing (fee = fixed + ppm × size, duration-scaled) | `magmaRecommend` profit floor + **fill telemetry** (price to what sells) |
+| Pricing (the market's rate a year for the lease's length, never below the profit floor: routing opportunity + open and close cost + 500 sat, net of the service fee; a channel whose floor is above the 50,000 ppm price cap is refused, not sold below cost) | `magmaRecommend` profit floor + **fill telemetry** (price to what sells) |
 | Capital guards (the effective on-chain reserve, the coins promised to orders not opened yet, the shared deploy cap, the per-channel limit) | the capital ledger and the one on-chain mutex in `capital.ts`, shared with the Magma order lane (`magmaDesk.ts`) and the channel autopilot |
 | Channel opening | `channelOps.connectForOpen` (dial, outside the on-chain mutex) + `channelOps.fundChannel` (the open, inside it) |
 | Earnings/P&L recording | `earningsLog` (new `via: "lsps1"`) |
@@ -58,7 +58,7 @@
 1. **P1 — skeleton (read-only):** LSPS0 transport + `lsps1.get_info` from live
    pricing. No orders yet. Verifiable with a ZEUS wallet pointing at the node.
    ✅ **Built 2026-07-03** (`server/src/services/lsps1.ts`, Settings card "LSP
-   mode (beta)", `GET /api/lsp/status`). Offer limits come from chain balance
+   mode (experimental)", `GET /api/lsp/status`). Offer limits come from chain balance
    minus the shared Magma sell reserve, capped by `sellMaxChannelSats`;
    `create_order`/`get_order` answer `-32601` until P2.
 2. **P2 — orders:** `create_order` + HODL invoice + open on payment +
@@ -129,7 +129,7 @@
   disclosed like the Magma fee (fee-note in the card, env-driven, never hidden).
 - ~~Default pricing mode~~ **Decided (P2):** same engine level as Magma (the
   autopilot's configured mode + adaptive level), duration-scaled, profit-floored.
-- Beta gating: community store only at first? (decide at release time)
+- Release gating: experimental, off by default — community store only at first? (decide at release time)
 
 ## Reach — how buyers find a LightningMate LSP (P4)
 
@@ -179,9 +179,41 @@ Wallet compatibility (package P5 of the 2026-10 review):
 - Leases up to 13,140 blocks (ZEUS's "3 months" preset; 6 and 12 months are
   refused with a message naming the range).
 - A buyer offline after paying is waited for (bLIP-51: the LSP MUST wait for
-  the peer connection) until the held payment's HTLC nears its expiry — the
-  invoice asks for a 144-block CLTV — and the open follows the buyer's next
-  message at once. Only then is the payment refunded.
+  the peer connection) for **six hours at most** after the payment arrived —
+  or less, should the held payment's HTLC near its expiry first (the invoice
+  asks for a 144-block CLTV) — and the open follows the buyer's next message
+  at once. Then the payment is refunded. While it waits the order's size is
+  reserved in the capital Magma selling and the channel autopilot share; the
+  six hours keep a buyer that pays and stays away from holding it for a day.
+- The funding fee rate is read when the channel is opened, not when it was
+  paid. Should opening and closing the channel then cost more than the order
+  brings, the open waits for lower fees (inside the same six hours) and the
+  order says so; after them the buyer is refunded.
+- An open LND does not finish within two minutes (the buyer's node not
+  answering open_channel) gives the on-chain mutex back, and the buyer is
+  disconnected (LND drops a peer's pending reservations when it goes). LND's
+  own answer is still waited for: a channel it funds after all is the
+  order's, its payment claimed — or, should the order have ended meanwhile,
+  on the order's record with an alert that the buyer has it unpaid. Until
+  that answer (30 minutes at most) nothing else is opened for the order, and
+  the open counts against the deploy cap; it is never refunded while LND may
+  still fund it.
+- Switching LSP mode off withdraws the quotes handed out and not paid: their
+  invoices are cancelled — an order being made at that moment too, and, at a
+  start with the mode off, quotes left from before. A payment already held
+  is still served.
+- A buyer's unpaid quotes count only against its own further quotes — never
+  against another buyer's. Should two buyers be quoted the same coins and
+  both pay, the second open finds them gone and is refunded. At the cap of
+  ten open orders, an unpaid quote that has stood ten minutes gives way to
+  a new buyer's order (its invoice cancelled, its order says why). That
+  keeps fewer than ten free pubkeys from holding the cap; ten that renew
+  each quote the moment it turns ten minutes old still can.
+- A `token` is refused with error 102: this LSP issues none (an empty one is
+  none).
+- With write mode off (LM_ENABLE_WRITE) the app can neither open nor refund
+  an order paid before: the start says so, in the log and on the LSP card;
+  LND returns each payment itself near its HTLC's expiry.
 - Pricing never runs in the request path while a price is cached (ZEUS gives
   `create_order` 7 s); the first order after a start waits at most 4 s for
   the market, then quotes the local profit floor.
@@ -200,7 +232,9 @@ Wallet compatibility (package P5 of the 2026-10 review):
 
 - **Refund correctness** (HODL settle/cancel) is fund-adjacent — needs the most
   careful review + restart-recovery tests.
-- Order spam / DoS → rate limit per pubkey (30 messages a minute), cap open
+- Order spam / DoS → rate limit per pubkey (30 answered messages a minute — the
+  window slides, so a wallet polling faster is answered 30 times a minute, never
+  shut out), cap open
   orders (2 per buyer, 10 in all), and pace new ones: each is a hold invoice
   in LND and a turn of the on-chain mutex every Magma accept and open waits
   on, so a buyer gets at most one replaced quote a minute and six orders an

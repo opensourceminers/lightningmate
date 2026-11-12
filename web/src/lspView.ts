@@ -52,6 +52,14 @@ export function lspReachText(uris: readonly string[]): string {
 const shortMethod = (m: string): string => m.replace(/^lsps\d\./, "");
 
 /** "get_info 3 · create_order 1" — requests answered, per method. */
+/** What LSP mode holds a buyer to, on the Settings card — the limits
+ *  docs/LSP-MODE.md names (review 2026-11-10, LSP-12: neither the card nor
+ *  the doc said how long a paid order keeps capital reserved, or what
+ *  switching off does to quotes already handed out). */
+export const LSP_LIMITS_NOTE =
+  "A buyer who pays and stays offline keeps that channel's size reserved for six hours at most, then is refunded; " +
+  "switching LSP mode off withdraws the quotes not paid yet (a payment already held is still served).";
+
 export function lspServedLine(s: Pick<LspStatus, "requests">): string {
   const served = s.requests.filter((r) => r.served > 0 && r.method !== "other");
   return served.length ? served.map((r) => `${shortMethod(r.method)} ${r.served}`).join(" · ") : "none yet";
@@ -115,7 +123,12 @@ export function lspRecoveryLine(s: Pick<LspStatus, "recovery">): string | null {
 export function lspOrderLabel(o: LspOrder): string {
   if (o.orderState === "COMPLETED") return "Completed";
   if (o.orderState === "FAILED") {
-    if (o.superseded) return "Replaced by a newer order";
+    // (Another buyer's order took its place at the LSP's limit — the error
+    // says so; paid in that moment, its payment went back.)
+    if (o.superseded) {
+      if (!o.error?.startsWith("withdrawn unpaid")) return "Replaced by a newer order";
+      return o.paymentState === "REFUNDED" ? "Withdrawn · this LSP was full · refunded" : "Withdrawn · this LSP was full";
+    }
     // Its payment is still held: the refund comes, but hasn't yet.
     if (o.refundPending) return "Failed · refund pending";
     // The channel was opened, the payment never claimed: given away.

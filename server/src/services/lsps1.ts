@@ -4,6 +4,7 @@ import {
   getInvoice,
   getWalletInfo,
   removeExternalSocket,
+  removePeer,
   sendMessageToPeer,
   subscribeToInvoice,
   subscribeToPeerMessages,
@@ -25,7 +26,7 @@ import { JsonStore, recordStoreIncident } from "../store.js";
 import type { SettingsStore } from "./settings.js";
 import type { EarningsLog } from "./earningsLog.js";
 import { getMagmaRecommendations, MAGMA_V2_DEFAULTS } from "./magmaRecommend.js";
-import { onchainCosts } from "./nodeEconomics.js";
+import { CLOSE_TX_VBYTES, OPEN_TX_VBYTES, onchainCosts } from "./nodeEconomics.js";
 import { saleFeeConfig, type ServiceFeeLedger } from "./serviceFee.js";
 import { checkPeerListing, couldNotConnect, ensureConnected, fundChannel, isPendingChannelsLimit, isPreBroadcastRefusal, opensBlocked } from "./channelOps.js";
 import { INVOICE_NOT_FOUND, HODL_CANCEL_MARGIN_BLOCKS, cancelHodl, createHodl, heldUntilHeightOf, newHodlSecret, settleHodl } from "./hodl.js";
@@ -41,6 +42,8 @@ import {
   type Reservation,
 } from "./capital.js";
 import { leaseCapFrom, type LeaseCap, type OfferFeeCaps, type SoldLease } from "./leaseCaps.js";
+import { outboundRouting } from "./http.js";
+import { socksResolve } from "./torProxy.js";
 
 /**
  * LSP mode — LSPS1 (bLIP-51) channel selling over LSPS0 (bLIP-50) transport.
@@ -126,6 +129,23 @@ const ORDERS_PER_PEER_PER_HOUR = 6;
  *  create_order's first look use them: read at most this often. The check
  *  that decides an order reads LND afresh, inside the on-chain mutex. */
 const CHAIN_READS_FRESH_MS = 30_000;
+/** How long the open of a sold channel may take inside the on-chain mutex
+ *  (LND's whole negotiation with the buyer: open_channel, accept_channel,
+ *  the funding). Past it the mutex is given back and the open is an unclear
+ *  one: its "opening" mark stays, and the channel is looked for in LND
+ *  before anything else (reconcileOpening) — no refund, no second open.
+ *  Before, a buyer that paid, stayed connected and never answered
+ *  open_channel held the mutex every Magma accept and every autopilot open
+ *  waits on until LND gave up (about ten minutes), six times an hour
+ *  (review 2026-11-10, LSP-3). A normal open over Tor takes seconds. */
+export const OPEN_CALL_TIMEOUT_MS = 120_000;
+/** How long an order waits for LND's answer to an open that ran past its time
+ *  limit before the open is judged by what LND shows (reconcileOpening) —
+ *  the buyer is disconnected at the time limit, so LND drops the open's
+ *  reservation long before this. */
+const LATE_OPEN_MAX_MS = 30 * 60_000;
+/** The funding rate's read before an open, at most (openOnce). */
+const FEE_READ_TIMEOUT_MS = 10_000;
 /** A paid order whose buyer is offline looks for it again this often; the
  *  buyer's next LSPS message (a wallet asking get_order) wakes it at once. */
 const OPEN_RETRY_DELAY_MS = 60_000;
@@ -139,10 +159,17 @@ const HODL_CLTV_DELTA = 144;
  *  margin at which the payment is released anyway, plus the open and the
  *  settle right after it. Below it the buyer is refunded instead. */
 const OPEN_MIN_BLOCKS_LEFT = HODL_CANCEL_MARGIN_BLOCKS + 6;
-/** When LND names no expiry height for the held payment: how long after it
- *  was first seen held an open may still be tried — inside the smallest CLTV
- *  a stock LND gives an invoice (80 blocks, ~13 h), minus the margin. */
-const HELD_FALLBACK_MS = 6 * 3_600_000;
+/** How long after a payment was first seen held an open may still be tried
+ *  — whatever its HTLC's height would allow. A paid order reserves its size
+ *  in the capital Magma selling and the channel autopilot share; a buyer
+ *  that pays and stays offline held all of it until the HTLC neared its
+ *  expiry — about 19 hours with the invoice's 144 blocks, longer with a
+ *  larger final CLTV the payer chose — free, and renewable by ordering
+ *  again (review 2026-11-10, LSP-1). Six hours: long enough for a phone
+ *  wallet that went to the background after paying to come back, and
+ *  inside the smallest CLTV a stock LND gives an invoice (80 blocks, about
+ *  13 h) — also the limit where LND names no expiry height. */
+export const HELD_WAIT_MS = 6 * 3_600_000;
 /** Restart recovery: an order LND can't answer for yet (still starting up,
  *  unlocking) is looked at again — after 30 s, doubling to 5 min. */
 const RECOVERY_RETRY_MIN_MS = 30_000;
@@ -203,6 +230,9 @@ const CLIENTS_KEPT = 10;
 const peerText = (v: unknown, max = 40): string => String(v ?? "").replace(/[^\w .+:/-]/g, "?").slice(0, max);
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** A wait that keeps no process alive (a fee wait's: the loop sees
+ *  `stopping` after it — round 2, N-n2). */
+const pause = (ms: number) => new Promise<void>((r) => setTimeout(r, ms).unref());
 /** After a restart mid-open (or an open whose outcome LND left unclear): how
  *  long LND gets to show the channel before we conclude the open never
  *  happened (same as Magma, magmaDesk.ts). */
@@ -456,6 +486,8 @@ export class Lsps1Service {
   private pricingRefresh: Promise<PricingContext> | undefined;
   /** Retry pacing — instance fields so tests can shrink the waits. */
   private openRetryDelayMs = OPEN_RETRY_DELAY_MS;
+  private openCallTimeoutMs = OPEN_CALL_TIMEOUT_MS;
+  private feeReadTimeoutMs = FEE_READ_TIMEOUT_MS;
   private settleRetryBaseMs = 2_000;
   private recoveryRetryMinMs = RECOVERY_RETRY_MIN_MS;
   private recoveryRetryMs = RECOVERY_RETRY_MIN_MS;
@@ -494,6 +526,14 @@ export class Lsps1Service {
   private stopping = false;
   /** "Look again for the interrupted open" timers — cleared by stop(). */
   private readonly resumeTimers = new Set<NodeJS.Timeout>();
+  /** Opens that ran past OPEN_CALL_TIMEOUT_MS: LND's answer still to come,
+   *  per order. While one is out, nothing opens for that order again
+   *  (reconcileOpening waits), and whatever LND answers is put on record
+   *  (lateOpenAnswered). */
+  private readonly lateOpens = new Map<string, Promise<void>>();
+  /** Orders whose buyer was disconnected for an open of an earlier process
+   *  (reconcileOpening). */
+  private readonly disconnectedFor = new Set<string>();
   /** The on-chain budget shared with Magma selling and the channel autopilot. */
   private readonly capital: CapitalLedger;
 
@@ -622,7 +662,10 @@ export class Lsps1Service {
       this.stopSub();
       // Withdraw only on a real on→off transition — a boot with the mode off
       // shouldn't touch (and needlessly re-gossip) the node announcement.
-      if (this.lastEnabled) void this.advertiseFeature(false);
+      if (this.lastEnabled) {
+        void this.advertiseFeature(false);
+        void this.withdrawQuotes();
+      }
     }
     this.lastEnabled = enabled;
   }
@@ -644,7 +687,7 @@ export class Lsps1Service {
       // (Without a write macaroon nothing was ever announced.)
       if (this.writeLnd) {
         const [host, port] = old.split(":");
-        const ip = /^\d+\.\d+\.\d+\.\d+$/.test(host) ? host : (await lookup(host, { family: 4 })).address;
+        const ip = /^\d+\.\d+\.\d+\.\d+$/.test(host) ? host : await this.resolveLegacyName(host);
         await this.lndRemoveSocket(`${ip}:${port}`);
         console.log(`[lsps1] withdrew the clearnet address ${ip}:${port} (${old}) from the node graph — LSP mode is Tor-only`);
       }
@@ -652,6 +695,64 @@ export class Lsps1Service {
       console.warn(`[lsps1] could not withdraw the clearnet address "${old}" (${lndErrorDetail(err)}) — LND drops it at its next restart`);
     } finally {
       this.settings.forgetLegacyClearnetAddress();
+    }
+  }
+
+  /** The address the old DDNS name stands for now — asked of the Tor proxy
+   *  where the app has one, so that no DNS lookup goes out beside Tor (with
+   *  a proxy, every request of the app goes through it; this one went to the
+   *  system's resolver). Without a proxy (outside Umbrel) the system's DNS,
+   *  as every request of the app goes direct there — and the log says so. */
+  private async resolveLegacyName(host: string): Promise<string> {
+    const proxy = outboundRouting().proxy;
+    if (proxy) return socksResolve(proxy, host);
+    console.log(`[lsps1] resolving ${host} through the system's DNS: this app has no Tor proxy`);
+    return (await lookup(host, { family: 4 })).address;
+  }
+
+  /** Switched off: the quotes handed out and not paid are withdrawn — their
+   *  invoices cancelled, the orders ended. Before, one stayed payable for its
+   *  hour after the switch-off, and paying it opened a channel the operator
+   *  had just said no more of (review 2026-11-10, LSP-6). A payment already
+   *  held when the switch goes off is still served (the order was bought).
+   *  One that lands between the look at the invoice and its cancel is
+   *  refunded by the cancel. Inside the on-chain mutex, where orders are
+   *  made: a create_order under way is made first and withdrawn here, or
+   *  sees the switch off itself (createOrder). */
+  private async withdrawQuotes(): Promise<void> {
+    if (!this.writeLnd) return;
+    await this.capital.mutex.run("lsps1 withdraw", async () => {
+      const quotes = this.orders.filter((o) => o.orderState === "CREATED" && o.paymentState === "EXPECT_PAYMENT" && !o.channel && !this.fulfilling.has(o.orderId));
+      for (const old of quotes) await this.withdrawQuote(old);
+    });
+  }
+
+  /** An order taken back out of the list before it was handed out. */
+  private dropOrder(order: Lsps1Order): void {
+    const at = this.orders.indexOf(order);
+    if (at >= 0) this.orders.splice(at, 1);
+  }
+
+  /** One unpaid quote withdrawn because LSP mode is off: its invoice
+   *  cancelled, the order ended. A payment held by then is served. */
+  private async withdrawQuote(old: Lsps1Order): Promise<void> {
+    this.fulfilling.add(old.orderId);
+    try {
+      const inv = await this.lndInvoice(old.invoiceId);
+      if (inv.is_held || inv.is_confirmed) return; // paid meanwhile: served below
+      if (!inv.is_canceled) await this.lndCancel(old.invoiceId);
+      // (The watch may have seen a payment land as the cancel went out:
+      // refunded by it.)
+      if (old.paymentState === "HOLD") old.paymentState = "REFUNDED";
+      old.orderState = "FAILED";
+      old.error = "LSP mode was switched off before this order was paid — its invoice is cancelled";
+      this.persistOrders();
+      console.log(`[lsps1] order ${old.orderId}: unpaid quote withdrawn — LSP mode is off`);
+    } catch (err) {
+      console.warn(`[lsps1] could not withdraw the unpaid quote ${old.orderId} (${lndErrorDetail(err)}) — it runs out within its hour`);
+    } finally {
+      this.fulfilling.delete(old.orderId);
+      if (old.orderState === "CREATED" && old.paymentState === "HOLD") void this.fulfill(old);
     }
   }
 
@@ -699,12 +800,19 @@ export class Lsps1Service {
       .map((o) => ({ key: `lsps1:${o.orderId}`, sats: o.lspBalanceSat, reserveSat: this.caps().reserveSats }));
   }
 
-  /** Unpaid quotes: LSPS1's own soft claims. They count against its NEW
-   *  quotes (so two buyers aren't quoted the same coins) and its own deploy
-   *  headroom — never against Magma or the open of a paid order. */
-  private unpaidQuotes(exceptOrderId?: string): Reservation[] {
+  /** Unpaid quotes: LSPS1's own soft claims — never counted against Magma
+   *  or the open of a paid order. `peer`: only that buyer's own count against
+   *  its new quote (it isn't quoted the same coins twice). Another buyer's
+   *  unpaid quote does not: quotes cost nothing, and counted against
+   *  everyone, one peer's two 1M quotes nobody meant to pay turned every
+   *  other buyer away for their hour at the default 2M budget, renewably
+   *  (review 2026-11-10, LSP-2). Two buyers quoted the same coins and both
+   *  paying: the second open finds the capital gone (the fresh check inside
+   *  the on-chain mutex, fundableFor) and is refunded. Without `peer` (the
+   *  operator's status card): every quote. */
+  private unpaidQuotes(exceptOrderId?: string, peer?: string): Reservation[] {
     return this.orders
-      .filter((o) => o.orderState === "CREATED" && o.paymentState === "EXPECT_PAYMENT" && !o.channel && o.orderId !== exceptOrderId)
+      .filter((o) => o.orderState === "CREATED" && o.paymentState === "EXPECT_PAYMENT" && !o.channel && o.orderId !== exceptOrderId && (peer === undefined || o.peer === peer))
       .map((o) => ({ key: `lsps1:${o.orderId}`, sats: o.lspBalanceSat, reserveSat: this.caps().reserveSats }));
   }
 
@@ -714,20 +822,25 @@ export class Lsps1Service {
     const now = Date.now();
     // A channel opened but not yet settled counts too: it is no longer a
     // reservation (the funding transaction is out), but the capital is sold.
+    // So does a channel the buyer has without paying (channelUnpaid): the
+    // coins are out all the same (review of P9 round 2, N-4: it counted
+    // against no cap, and the full cap could be sold beside it).
     return this.orders
       .filter(
-        (o) => o.orderState !== "FAILED" && o.channel && new Date(o.channel.expiresAt).getTime() > now,
+        (o) =>
+          (o.orderState !== "FAILED" || o.error?.startsWith("the channel was opened, but") === true) && o.channel && new Date(o.channel.expiresAt).getTime() > now,
       )
       .reduce((s, o) => s + o.lspBalanceSat, 0);
   }
 
   /** Deploy-cap headroom for a NEW order: cap minus everything sold and still
    *  leased (Magma and LSPS1), minus every promised order of both demand
-   *  sources, minus this service's own unpaid quotes (so two of its buyers
-   *  can't oversell the cap together; MAX_PENDING_* keeps that abuse-bounded).
+   *  sources, minus the buyer's own unpaid quotes (it isn't quoted the same
+   *  coins twice). Other buyers' unpaid quotes don't count (LSP-2): should
+   *  several pay beyond the cap, the open finds it reached and refunds.
    *  `exceptOrderId`: a quote the new order replaces (supersede). */
-  private deployHeadroomSat(exceptOrderId?: string): number {
-    const unpaid = this.unpaidQuotes(exceptOrderId).reduce((s, r) => s + r.sats, 0);
+  private deployHeadroomSat(exceptOrderId: string | undefined, peer: string): number {
+    const unpaid = this.unpaidQuotes(exceptOrderId, peer).reduce((s, r) => s + r.sats, 0);
     return Math.max(0, this.caps().maxDeploySats - this.capital.deployedSat() - this.capital.reservedSat() - unpaid);
   }
 
@@ -892,19 +1005,27 @@ export class Lsps1Service {
     }
   }
 
-  /** Sliding one-minute window per pubkey; map bounded so peers can't grow it. */
+  /** The per-peer budget (a sliding one-minute window per pubkey; the map is
+   *  bounded, so peers can't grow it): RATE_LIMIT_PER_MINUTE messages answered in any
+   *  minute. Only an answered message is counted and kept: before, refused
+   *  ones were too — the list grew with a flood, and a peer sending steadily
+   *  above the budget (a wallet polling get_order every second, say) was
+   *  never answered again, as its own refused messages kept the window full
+   *  (review 2026-11-10, LSP-9). Now the window slides: such a peer is
+   *  answered 30 times a minute. */
   private allowPeer(pubkey: string): boolean {
     const now = Date.now();
     const cutoff = now - 60_000;
     const hits = (this.rateWindow.get(pubkey) ?? []).filter((t) => t > cutoff);
-    hits.push(now);
+    const allowed = hits.length < RATE_LIMIT_PER_MINUTE;
+    if (allowed) hits.push(now);
     this.rateWindow.set(pubkey, hits);
     if (this.rateWindow.size > RATE_LIMIT_MAX_PEERS) {
       for (const [key, times] of this.rateWindow) {
         if (!times.some((t) => t > cutoff)) this.rateWindow.delete(key);
       }
     }
-    return hits.length <= RATE_LIMIT_PER_MINUTE;
+    return allowed;
   }
 
   // ── JSON-RPC dispatch ────────────────────────────────────────────────────────
@@ -955,7 +1076,7 @@ export class Lsps1Service {
         return rpcResult(rid, { protocols: [1] });
       case "lsps1.get_info": {
         try {
-          const info = await this.getInfo();
+          const info = await this.getInfo(peer);
           // A wallet asks get_info before it orders: the price is ready by then.
           void this.refreshPricing({ ifStale: true }).catch(() => undefined);
           return rpcResult(rid, info);
@@ -1079,6 +1200,9 @@ export class Lsps1Service {
   private lndConnect(pubkey: string) {
     return ensureConnected(this.writeLnd!, pubkey, []);
   }
+  private lndDisconnect(pubkey: string) {
+    return removePeer({ lnd: this.writeLnd!, public_key: pubkey });
+  }
   private lndFeeRate(confirmationTarget: number) {
     return getChainFeeRate({ lnd: this.writeLnd!, confirmation_target: confirmationTarget });
   }
@@ -1101,10 +1225,10 @@ export class Lsps1Service {
    * quote always read LND afresh, outside the mutex — one read per request a
    * spamming peer sent.
    */
-  private async quotableSat(fresh = false, exceptOrderId?: string): Promise<number> {
+  private async quotableSat(fresh = false, exceptOrderId?: string, peer?: string): Promise<number> {
     if (!this.writeLnd) return 0;
     const reads = await this.chainReads(fresh);
-    return spendableWith(reads, this.capital, this.caps().reserveSats, { extra: this.unpaidQuotes(exceptOrderId) }).spendableSat;
+    return spendableWith(reads, this.capital, this.caps().reserveSats, { extra: this.unpaidQuotes(exceptOrderId, peer) }).spendableSat;
   }
 
   /** LND's balance and reserve inputs: from the cache unless `fresh`. A
@@ -1136,8 +1260,8 @@ export class Lsps1Service {
     return sp.spendableSat;
   }
 
-  private async offerView(exceptOrderId?: string) {
-    const deployable = await this.quotableSat(false, exceptOrderId);
+  private async offerView(exceptOrderId?: string, peer?: string) {
+    const deployable = await this.quotableSat(false, exceptOrderId, peer);
     // Never advertise more than we could actually fund, capped by the shared
     // Magma sell cap; clamped up to min so the min ≤ max spec constraint holds
     // even when the wallet is empty. The clamp vouches for nothing:
@@ -1157,8 +1281,10 @@ export class Lsps1Service {
   }
 
   /** bLIP-51 `lsps1.get_info` result — sat amounts are strings per spec. */
-  private async getInfo(): Promise<Record<string, unknown>> {
-    const offer = await this.offerView();
+  private async getInfo(peer: string): Promise<Record<string, unknown>> {
+    // (What this buyer can order: another buyer's unpaid quotes don't
+    // shrink it — LSP-2.)
+    const offer = await this.offerView(undefined, peer);
     const min = String(LSPS1_LIMITS.minChannelSat);
     const max = String(offer.maxChannelSat);
     return {
@@ -1275,7 +1401,7 @@ export class Lsps1Service {
   /** Price an order: market level scaled to the requested duration, never below
    *  the profit floor (routing opportunity + on-chain costs + min net profit,
    *  all net of the service fee) — the same economics Magma selling uses. */
-  private async quote(sizeSat: number, durationBlocks: number): Promise<{ feeTotalSat: number; effectivePpm: number }> {
+  private async quote(sizeSat: number, durationBlocks: number): Promise<{ feeTotalSat: number; effectivePpm: number } | { refuse: string }> {
     const ctx = await this.pricingContext();
     const years = durationBlocks / BLOCKS_PER_YEAR;
     const costPpm = ((ctx.openCostSat + ctx.closeCostSat) / sizeSat) * 1_000_000;
@@ -1285,6 +1411,16 @@ export class Lsps1Service {
         (sizeSat * (1 - ctx.serviceFeeRate))) *
       1_000_000;
     const floor = Math.max(floorRouting, floorMinProfit, MAGMA_V2_DEFAULTS.minFeeRatePpm);
+    // The cap is a price this LSP never asks; the floor is what the channel
+    // costs. A floor above the cap is a channel not sold — not one sold below
+    // its own open and close (review 2026-11-10, LSP-4: at 300 sat/vB a 1M
+    // channel was quoted 50,000 sat while opening and closing it cost
+    // 97,500).
+    if (floor > MAGMA_V2_DEFAULTS.maxFeeRatePpm) {
+      return {
+        refuse: `the least this LSP can sell a ${sizeSat} sat channel for (opening and closing it, and what it must earn) is above the most it ever asks for one right now — usually high on-chain fees; try a larger channel, or later`,
+      };
+    }
     const market = ctx.marketPpmPerYear != null ? ctx.marketPpmPerYear * years : 0;
     const effectivePpm = Math.min(Math.max(floor, market), MAGMA_V2_DEFAULTS.maxFeeRatePpm);
     return { feeTotalSat: Math.ceil((sizeSat * effectivePpm) / 1_000_000), effectivePpm: Math.round(effectivePpm) };
@@ -1325,6 +1461,12 @@ export class Lsps1Service {
     if (typeof p.announce_channel !== "boolean") return invalid("announce_channel", "must be a boolean");
     const token = p.token === undefined ? "" : p.token;
     if (typeof token !== "string" || token.length > 512) return invalid("token", "must be a short string");
+    // bLIP-51: "LSP MUST validate the `token` field and return a `102` error
+    // if the token is invalid." This LSP issues no tokens, so any one given
+    // is unrecognised — before, it was accepted, stored and echoed (review
+    // 2026-11-10, LSP-10). An empty one is none (ZEUS sends "").
+    // (data carries the words for people, as every answer of this LSP does.)
+    if (token !== "") return rpcError(rid, 102, "Unrecognized or stale token", { message: "this LSP issues no tokens — order without one" });
     if (p.refund_onchain_address !== undefined && typeof p.refund_onchain_address !== "string") {
       return invalid("refund_onchain_address", "must be a string");
     }
@@ -1369,7 +1511,7 @@ export class Lsps1Service {
     // Options must match what lsps1.get_info advertises (error 100 otherwise)
     // — from LND's balance as last read (≤ 30 s), against the promises as
     // they stand; the quote being replaced doesn't count against it.
-    const offer = await this.offerView(early.replace?.orderId);
+    const offer = await this.offerView(early.replace?.orderId, peer);
     if (clientBalanceSat !== 0) return mismatch("client_balance_sat", "a client balance is not supported (max 0)");
     if (lspBalanceSat < offer.minChannelSat) {
       return mismatch("lsp_balance_sat", `below min_initial_lsp_balance_sat (${offer.minChannelSat})`);
@@ -1409,7 +1551,7 @@ export class Lsps1Service {
     // Aggregate deploy cap (shared with Magma selling): reject up front rather
     // than refunding a paid order later.
     const atCap = () => refused("this LSP is at its capital deployment cap — try again later");
-    if (lspBalanceSat > this.deployHeadroomSat(early.replace?.orderId)) return atCap();
+    if (lspBalanceSat > this.deployHeadroomSat(early.replace?.orderId, peer)) return atCap();
     // The coins, as last read: get_info's maximum is clamped up to the 1M
     // minimum (min ≤ max), so with less than that to spend the size checks
     // above let every 1M request through. Without this look, each one took
@@ -1432,7 +1574,9 @@ export class Lsps1Service {
     if (lspBalanceSat > offer.deployableSat) return noCapital(offer.deployableSat);
 
     // Pricing may ask Amboss for the market — never while holding the mutex.
-    const { feeTotalSat } = await this.quote(lspBalanceSat, expiryBlocks);
+    const priced = await this.quote(lspBalanceSat, expiryBlocks);
+    if ("refuse" in priced) return refused(priced.refuse);
+    const { feeTotalSat } = priced;
     // The routing-fee promise of this sale, locked now (leaseCaps.ts).
     const caps = this.pricingMode().offerFeeCaps ?? null;
 
@@ -1456,14 +1600,18 @@ export class Lsps1Service {
       const slot = this.orderSlot(peer);
       if ("refuse" in slot) return refused(slot.refuse);
       const replace = slot.replace;
-      if (lspBalanceSat > this.deployHeadroomSat(replace?.orderId)) return atCap();
-      const spendable = await this.quotableSat(true, replace?.orderId);
+      if (lspBalanceSat > this.deployHeadroomSat(replace?.orderId, peer)) return atCap();
+      const spendable = await this.quotableSat(true, replace?.orderId, peer);
       if (lspBalanceSat > spendable) return noCapital(spendable);
 
       const orderId = randomUUID();
       // Only now, with the new order sure to be made, the quote it replaces
       // is cancelled. One paid meanwhile stays — and opens.
-      const replaced = replace ? await this.supersede(replace, orderId) : "replaced";
+      const replaced = replace ? await this.supersede(replace, orderId, peer) : "replaced";
+      // (Another buyer's quote, at the total cap: paid meanwhile or not to be
+      // cancelled, it stands — and this buyer is told the LSP is full.)
+      const theirs = replace !== undefined && replace.peer !== peer;
+      if (replaced !== "replaced" && theirs) return refused("this LSP has too many open orders right now — try again later");
       if (replaced === "paid") return refused("your earlier order was just paid — its channel is being opened; wait for it before ordering again");
       if (replaced === "unclear") return refused("this LSP could not cancel your earlier unpaid order right now — try again in a minute");
 
@@ -1472,13 +1620,6 @@ export class Lsps1Service {
       // instead — the buyer's payment automatically bounces back.
       const { id: invoiceId, secret } = newHodlSecret();
       const expiresAt = new Date(Date.now() + ORDER_EXPIRY_MS).toISOString();
-      const inv = await this.lndCreateHodl(
-        invoiceId,
-        feeTotalSat,
-        `LSPS1 ${orderId}: ${lspBalanceSat} sat channel for ${expiryBlocks} blocks`,
-        expiresAt,
-      );
-
       const order: Lsps1Order = {
         orderId,
         peer,
@@ -1494,7 +1635,7 @@ export class Lsps1Service {
         paymentState: "EXPECT_PAYMENT",
         feeTotalSat,
         orderTotalSat: feeTotalSat, // + client_balance (always 0)
-        invoice: inv.request,
+        invoice: "",
         invoiceId,
         invoiceSecret: secret,
         invoiceExpiresAt: expiresAt,
@@ -1502,8 +1643,42 @@ export class Lsps1Service {
         serviceFeePaidSat: 0,
         ...(caps ? { feeRateCapPpm: caps.feeRateCapPpm, baseFeeCapSats: caps.baseFeeCapSats } : {}),
       };
+      // The preimage is on disk BEFORE the invoice exists (hodl.ts rule 1),
+      // and a save that fails refuses the order: before, the invoice was
+      // made first and the save only logged — after a restart nobody knew
+      // the order, a payment to it stayed held until LND let it go (about a
+      // day), and get_order answered 101 (review 2026-11-10, LSP-8).
       this.orders.unshift(order); // counts against the next quote at once (unpaidQuotes)
+      try {
+        this.trimOrders();
+        this.ordersStore.writeOrThrow(this.orders);
+      } catch (err) {
+        this.dropOrder(order);
+        const detail = `LSP order ${orderId}: the order could not be saved (${err instanceof Error ? err.message : String(err)}) — no invoice was made, the buyer was asked to try again`;
+        // (writeOrThrow has put the failed save on the alerts.)
+        console.error(`[lsps1] CRITICAL ${detail}`);
+        return rpcError(rid, -32603, "Internal error", { message: "this LSP could not record the order — try again shortly" });
+      }
+      let inv: { request: string };
+      try {
+        inv = await this.lndCreateHodl(invoiceId, feeTotalSat, `LSPS1 ${orderId}: ${lspBalanceSat} sat channel for ${expiryBlocks} blocks`, expiresAt);
+      } catch (err) {
+        // No invoice: no order (nothing can be paid to it).
+        this.dropOrder(order);
+        this.persistOrders();
+        throw err;
+      }
+      order.invoice = inv.request;
       this.persistOrders();
+      // Switched off while this order was being made: withdrawn at once —
+      // nothing is handed out with the mode off (review of P9, m-3).
+      if (!this.settings.get().lspModeEnabled) {
+        await this.withdrawQuote(order);
+        // (Its invoice was never handed out; should the cancel have failed it
+        // is followed, and recovery ends it — round 2, N-n6.)
+        if (order.orderState === "CREATED") this.watchInvoice(order);
+        return refused("LSP mode was switched off — this LSP takes no orders now");
+      }
       this.watchInvoice(order);
       console.log(`[lsps1] order ${orderId}: ${lspBalanceSat} sat / ${expiryBlocks} blocks → ${feeTotalSat} sat fee`);
       return rpcResult(rid, this.orderPayload(order));
@@ -1546,7 +1721,24 @@ export class Lsps1Service {
       if (ages.some((a) => a < REQUOTE_MIN_GAP_MS)) return { refuse: "you asked for a new quote a moment ago — pay it or try again in a minute" };
       return { replace };
     }
-    if (pending.length >= MAX_PENDING_TOTAL) return { refuse: "this LSP has too many open orders right now — try again later" };
+    if (pending.length >= MAX_PENDING_TOTAL) {
+      // At the total cap, an unpaid quote of any buyer that has stood for
+      // SAME_QUOTE_MS gives way to the new order (supersede cancels its
+      // invoice): five free pubkeys with two quotes each turned every other
+      // buyer away for the quotes' hour, renewably (review of P9, M-2). A
+      // buyer that means to pay does so within minutes. What this bounds:
+      // five pubkeys, or any number fewer than ten, can't keep the cap full —
+      // at their pace (six orders an hour each) some of their quotes turn
+      // ten minutes old. Ten pubkeys renewing each quote the moment it does
+      // can (60 orders an hour); a shorter stand would let a real buyer's
+      // quote be withdrawn sooner — othervice's trade-off (round 2, N-3).
+      // The cap's bound on LND's hold invoices stays.
+      const stale = pending
+        .filter((o) => o.paymentState === "EXPECT_PAYMENT" && !o.channel && !this.fulfilling.has(o.orderId) && nowMs - Date.parse(o.createdAt) >= SAME_QUOTE_MS)
+        .reduce<Lsps1Order | undefined>((oldest, o) => (!oldest || Date.parse(o.createdAt) <= Date.parse(oldest.createdAt) ? o : oldest), undefined);
+      if (!stale) return { refuse: "this LSP has too many open orders right now — try again later" };
+      return { replace: stale };
+    }
     return {};
   }
 
@@ -1560,7 +1752,9 @@ export class Lsps1Service {
   private sameQuote(peer: string, terms: OrderTerms, nowMs = Date.now()): Lsps1Order | null {
     // The list is newest first: on equal times the earlier entry is newer.
     const newest = this.orders
-      .filter((o) => o.peer === peer && o.orderState === "CREATED" && o.paymentState === "EXPECT_PAYMENT" && !o.channel && !o.supersededBy)
+      // (Not one whose invoice is still being made — saved first, it has
+      // none yet: review of P9, m-2.)
+      .filter((o) => o.peer === peer && o.orderState === "CREATED" && o.paymentState === "EXPECT_PAYMENT" && !o.channel && !o.supersededBy && o.invoice !== "")
       .reduce<Lsps1Order | undefined>((n, o) => (!n || Date.parse(o.createdAt) > Date.parse(n.createdAt) ? o : n), undefined);
     if (!newest || this.fulfilling.has(newest.orderId)) return null;
     const age = nowMs - Date.parse(newest.createdAt);
@@ -1587,7 +1781,7 @@ export class Lsps1Service {
    * whose payment this then cancels. Once LND has cancelled the invoice, a
    * payment that arrived meanwhile has gone back to the buyer.
    */
-  private async supersede(old: Lsps1Order, byOrderId: string): Promise<"replaced" | "paid" | "unclear"> {
+  private async supersede(old: Lsps1Order, byOrderId: string, byPeer: string): Promise<"replaced" | "paid" | "unclear"> {
     // Read afresh after every await: the invoice watch may move the order on.
     const now = () => ({ order: old.orderState as Lsps1OrderState, payment: old.paymentState as Lsps1PaymentState });
     if (now().order !== "CREATED") return "replaced"; // ended meanwhile: nothing left to replace
@@ -1599,12 +1793,18 @@ export class Lsps1Service {
       if (!inv.is_canceled) await this.lndCancel(old.invoiceId);
       // The invoice watch may have marked it failed as the cancel landed
       // ("expired unpaid"): the record says what really ended it.
-      if (now().payment === "HOLD") old.paymentState = "REFUNDED";
+      const paidInTheMoment = now().payment === "HOLD";
+      if (paidInTheMoment) old.paymentState = "REFUNDED";
       old.orderState = "FAILED";
       old.supersededBy = byOrderId;
-      old.error = "replaced by a newer order of the same buyer before it was paid";
+      const mine = byPeer === old.peer;
+      old.error =
+        (mine
+          ? "replaced by a newer order of the same buyer before it was paid"
+          : "withdrawn unpaid: this LSP was at its limit of open orders, and another buyer's order took the place of this quote, unpaid for ten minutes") +
+        (paidInTheMoment ? " — its payment arrived as it was withdrawn and went back" : "");
       this.persistOrders();
-      console.log(`[lsps1] order ${old.orderId}: unpaid, replaced by the buyer's new order ${byOrderId}`);
+      console.log(`[lsps1] order ${old.orderId}: unpaid, ${mine ? "replaced by the buyer's new order" : "withdrawn for another buyer's order"} ${byOrderId}`);
       return "replaced";
     } catch (err) {
       console.warn(`[lsps1] could not replace order ${old.orderId}: ${lndErrorDetail(err)}`);
@@ -1761,14 +1961,6 @@ export class Lsps1Service {
         }
       }
 
-      // Honor funding_confirms_within_blocks via the chain fee estimator.
-      let feeRate: number | undefined;
-      try {
-        feeRate = (await this.lndFeeRate(order.fundingConfirmsWithinBlocks)).tokens_per_vbyte;
-      } catch {
-        feeRate = undefined; // let LND pick
-      }
-
       // The buyer must be connected as a peer: it reached us over BOLT8, but a
       // phone wallet may go offline right after paying, and there is no
       // address to dial it at. bLIP-51: the LSP MUST wait for the peer
@@ -1777,8 +1969,12 @@ export class Lsps1Service {
       // the buyer sends anything. (Before: ten tries a minute apart, then a
       // refund — while the payment could have stayed held for hours.)
       let lastError = "open not attempted";
+      let feeWaiting = false;
       for (let attempt = 0; ; attempt++) {
-        if (attempt > 0) await this.waitForPeer(order.peer, this.openRetryDelayMs);
+        // (A wait for lower fees is not woken by the buyer's messages — a
+        // wallet polling get_order would start a full attempt 30 times a
+        // minute for hours: review of P9, n-7.)
+        if (attempt > 0) await (feeWaiting ? pause(this.openRetryDelayMs) : this.waitForPeer(order.peer, this.openRetryDelayMs));
         // Shutting down: leave the payment held. Restart recovery resumes this
         // order from its saved state — far better than being killed mid-open.
         if (this.stopping) return;
@@ -1788,7 +1984,10 @@ export class Lsps1Service {
           break;
         }
         if (hold.kind === "late") {
-          lastError = hold.why;
+          // (With what stood in the way the last time the buyer was there:
+          // fees above what the order brings say so with their numbers. An
+          // offline buyer is said by the reason itself.)
+          lastError = lastError === "open not attempted" || order.waitingForBuyerSince ? hold.why : `${hold.why} — last tried: ${lastError}`;
           break;
         }
         // LND didn't answer the lookup: no open on a payment it can't vouch
@@ -1802,6 +2001,7 @@ export class Lsps1Service {
         // macaroon and restarts, so the order ends at once — refunded, with
         // that reason (below) — never read as a buyer that is offline.
         if (!(await this.lndConnect(order.peer))) {
+          feeWaiting = false; // (its next message is the one to wake on)
           lastError = couldNotConnect(order.peer);
           this.noteWaitingForBuyer(order, true);
           continue; // the buyer may reconnect — wait for it
@@ -1812,7 +2012,7 @@ export class Lsps1Service {
         // for this attempt, never across the retry wait above.
         let step: Awaited<ReturnType<Lsps1Service["openOnce"]>>;
         try {
-          step = await this.capital.mutex.run("lsps1 open", () => this.openOnce(order, feeRate));
+          step = await this.capital.mutex.run("lsps1 open", () => this.openOnce(order));
         } catch (err) {
           // LND didn't answer a read before the open (the balance, the
           // buyer's channels): nothing was sent — try again in a while.
@@ -1832,8 +2032,16 @@ export class Lsps1Service {
           return;
         }
         lastError = step.error;
-        // Only a connect problem (or the buyer's pending-channel limit) is
-        // worth waiting out; anything else is final.
+        // A wait for lower fees: on the order's record, so the Orders tab
+        // says why its channel waits (cleared once it is open).
+        feeWaiting = !!step.feeWait;
+        if (step.feeWait && order.error !== step.error) {
+          order.error = step.error;
+          this.persistOrders();
+        }
+        // Only a connect problem, the buyer's pending-channel limit or fees
+        // above what the order brings are worth waiting out; anything else
+        // is final.
         if (!step.retry) break;
       }
       await this.failAndRefund(order, lastError);
@@ -1857,7 +2065,7 @@ export class Lsps1Service {
    * HTLC itself shortly before that, and an open the payment can't outlive
    * gives the channel away). The expiry height is LND's, recorded with the
    * order; with none known, or no height to compare it with, the deadline is
-   * HELD_FALLBACK_MS after the payment was first seen held — by the clock, so
+   * HELD_WAIT_MS after the payment was first seen held — by the clock, so
    * an LND that stops answering ends the wait too.
    */
   private async holdLeft(
@@ -1877,6 +2085,12 @@ export class Lsps1Service {
     this.noteHeld(order, until);
     if (`${order.heldAt}|${order.heldUntilHeight}` !== before) this.persistOrders();
     const waited = order.waitingForBuyerSince ? "the buyer did not come back online before" : "no open was possible before";
+    // By the clock first, whatever the height allows (LSP-1): the capital
+    // the order reserves is shared, and no buyer holds it for longer.
+    const heldAt = Date.parse(order.heldAt ?? "");
+    if (Number.isFinite(heldAt) && Date.now() - heldAt > HELD_WAIT_MS) {
+      return { kind: "late", why: `${waited} its held payment was released ${Math.round(HELD_WAIT_MS / 3_600_000)} h after it was paid — no paid order keeps this node's capital reserved for longer` };
+    }
     if (order.heldUntilHeight) {
       const height = await this.lndHeight().catch(() => null);
       if (height !== null) {
@@ -1884,12 +2098,7 @@ export class Lsps1Service {
         if (left < OPEN_MIN_BLOCKS_LEFT) {
           return { kind: "late", why: `${waited} its held payment had to be released (${Math.max(0, left)} blocks left, ${OPEN_MIN_BLOCKS_LEFT} needed for the open)` };
         }
-        return held ? { kind: "ok" } : { kind: "unknown" };
       }
-    }
-    const heldAt = Date.parse(order.heldAt ?? "");
-    if (Number.isFinite(heldAt) && Date.now() - heldAt > HELD_FALLBACK_MS) {
-      return { kind: "late", why: `${waited} its held payment had to be released (${Math.round(HELD_FALLBACK_MS / 3_600_000)} h after it was paid)` };
     }
     return held ? { kind: "ok" } : { kind: "unknown" };
   }
@@ -1935,10 +2144,10 @@ export class Lsps1Service {
   /** One open attempt, inside the on-chain mutex: check capital with a fresh
    *  balance, record the intent, open, record the outpoint. `done` with the
    *  channel on the order: the caller settles, once the mutex is released. */
-  private async openOnce(
-    order: Lsps1Order,
-    feeRate: number | undefined,
-  ): Promise<{ done: true } | { done: false; error: string; retry: boolean; unclear?: boolean }> {
+  private async openOnce(order: Lsps1Order): Promise<{ done: true } | { done: false; error: string; retry: boolean; unclear?: boolean; feeWait?: boolean }> {
+    // A channel on record already (a late open's, recorded while this one
+    // waited for the mutex): never a second (review of P9 round 2, N-1).
+    if (order.channel) return { done: true };
     // Only an order still under way with its payment held is opened. It may
     // have ended while this open waited for the mutex — its quote replaced
     // (supersede cancels it in here), its payment released, the order
@@ -1955,14 +2164,54 @@ export class Lsps1Service {
       return { done: false, error: "insufficient on-chain capital at open time", retry: false };
     }
     // Deploy cap re-check at open time — catches a cap the user LOWERED
-    // after this order was created (create-time already serialized siblings).
-    if (this.capital.deployedSat() + order.lspBalanceSat > this.caps().maxDeploySats) {
+    // after this order was created, and paid orders of several buyers who
+    // were quoted beside each other (LSP-2). An open of another order that
+    // is still with LND (its outpoint not on record: unclear, or past its
+    // time limit) counts as deployed: LND may fund it yet (review of P9, m-1:
+    // 4M went out against a 2M cap).
+    const opening = this.orders
+      .filter((o) => o.orderId !== order.orderId && (o.orderState === "CREATED" || this.lateOpens.has(o.orderId)) && !!o.opening && !o.channel)
+      .reduce((s, o) => s + o.lspBalanceSat, 0);
+    if (this.capital.deployedSat() + opening + order.lspBalanceSat > this.caps().maxDeploySats) {
       return { done: false, error: "capital deployment cap reached", retry: false };
     }
     // The per-channel limit likewise: lowered below this order's size since
     // it was quoted, the channel is not sold — the payment goes back.
     if (order.lspBalanceSat > this.caps().maxChannelSats) {
       return { done: false, error: `the per-channel limit (${this.caps().maxChannelSats} sat) is below this order's ${order.lspBalanceSat} sat`, retry: false };
+    }
+    // The funding rate for funding_confirms_within_blocks, read now — right
+    // before the open, not when the payment arrived: a buyer that pays and
+    // goes offline comes back hours later, and the open went out at the rate
+    // of then (review 2026-11-10, LSP-5: paid at 4 sat/vB, opened at 4 with
+    // 80 asked). And the price is checked against it: should opening and
+    // closing the channel now cost more than the order brings, it is not
+    // opened — the open waits for lower fees while the held payment has time
+    // (HELD_WAIT_MS at most), then the buyer is refunded. No estimate: LND
+    // picks the rate, as before.
+    // (Inside the on-chain mutex: an estimator that hangs gives no rate
+    // after FEE_READ_TIMEOUT_MS, and LND picks one, as before.)
+    let feeRate: number | undefined;
+    try {
+      let timer: NodeJS.Timeout | undefined;
+      feeRate = await Promise.race([
+        this.lndFeeRate(order.fundingConfirmsWithinBlocks).then((r) => r.tokens_per_vbyte),
+        new Promise<undefined>((resolve) => (timer = setTimeout(() => resolve(undefined), this.feeReadTimeoutMs))),
+      ]).finally(() => clearTimeout(timer));
+    } catch {
+      feeRate = undefined;
+    }
+    if (feeRate !== undefined && feeRate > 0) {
+      const costSat = Math.ceil(feeRate * OPEN_TX_VBYTES) + Math.ceil(feeRate * CLOSE_TX_VBYTES);
+      const bringsSat = Math.floor(order.feeTotalSat * (1 - saleFeeConfig().bps / 10_000));
+      if (costSat > bringsSat) {
+        return {
+          done: false,
+          error: `on-chain fees rose since the quote: at ${feeRate} sat/vB opening and closing this channel would cost about ${costSat} sat, more than the ${bringsSat} sat the order brings — waiting for lower fees`,
+          retry: true,
+          feeWait: true,
+        };
+      }
     }
     const preExisting = (await channelsWith(this.writeLnd!, order.peer)).map((c) => c.outpoint);
     // Check again: the reads above waited on LND, and a shutdown that began
@@ -1988,7 +2237,40 @@ export class Lsps1Service {
     }
     this.opensInFlight += 1;
     try {
-      const res = await this.lndOpen(order, feeRate);
+      let timer: NodeJS.Timeout | undefined;
+      let timedOut = false;
+      const opening = this.lndOpen(order, feeRate);
+      const res = await Promise.race([
+        opening,
+        new Promise<{ ok: false; error: string }>((resolve) => {
+          timer = setTimeout(() => {
+            timedOut = true;
+            resolve({ ok: false, error: `LND did not finish the open within ${Math.round(this.openCallTimeoutMs / 1000)} s (the buyer's node may not be answering)` });
+          }, this.openCallTimeoutMs);
+        }),
+      ]).finally(() => clearTimeout(timer));
+      if (timedOut) {
+        // The mutex goes back, but LND's open goes on: its answer is kept and
+        // put on record whenever it comes — a channel LND funds after all is
+        // this order's, or (the order ended meanwhile) a channel nobody paid
+        // for, said loudly. And nothing opens for this order again while it
+        // is out. (Review of P9, M-1: abandoned, an open LND finished later
+        // was a second channel for one order, or one on a refunded order, on
+        // no record.) The buyer is disconnected too: LND drops a peer's
+        // pending reservations when the peer goes, so a node that answers
+        // open_channel slowly on purpose can't have it funded late.
+        const late: Promise<void> = opening
+          .then((answer) => this.lateOpenAnswered(order, answer))
+          .catch((err) => console.warn(`[lsps1] order ${order.orderId}: the late open's answer could not be put on record (${lndErrorDetail(err)})`))
+          .finally(() => {
+            // (Only its own entry: a later open of the order may have one.)
+            if (this.lateOpens.get(order.orderId) === late) this.lateOpens.delete(order.orderId);
+          });
+        this.lateOpens.set(order.orderId, late);
+        void this.lndDisconnect(order.peer).catch((err) =>
+          console.warn(`[lsps1] order ${order.orderId}: could not disconnect the buyer after the open's time limit (${lndErrorDetail(err)}) — LND may still fund it; its answer is waited for`),
+        );
+      }
       if (res.ok && res.transactionId) {
         this.recordChannel(order, `${res.transactionId}:${res.transactionVout ?? 0}`);
         return { done: true };
@@ -2051,6 +2333,18 @@ export class Lsps1Service {
    *  findOurOpen itself). */
   private async reconcileOpening(order: Lsps1Order): Promise<"found" | "wait" | "none"> {
     return this.capital.mutex.run("lsps1 reconcile", async () => {
+      // Recorded meanwhile (a late open's answer, lateOpenAnswered): found —
+      // the look below leaves the order's own channel out and would answer
+      // "none" (review of P9 round 2, N-1: a second open followed).
+      if (order.channel) return "found";
+      // An open of an earlier process (a restart while it was out): the
+      // buyer is disconnected once, so that LND drops a reservation a slow
+      // buyer may still hold and nothing is funded after the grace below
+      // (round 2, N-5).
+      if (order.opening && !this.lateOpens.has(order.orderId) && !this.disconnectedFor.has(order.orderId)) {
+        this.disconnectedFor.add(order.orderId);
+        void this.lndDisconnect(order.peer).catch((err) => console.warn(`[lsps1] order ${order.orderId}: could not disconnect the buyer (${lndErrorDetail(err)})`));
+      }
       // LND not answering is no answer: look again later. (Before, a failed
       // lookup read as "no channel" — once the grace was over, a second open
       // followed for an order whose channel may well exist: say, right after
@@ -2067,10 +2361,71 @@ export class Lsps1Service {
       }
       const startedAt = order.opening ? Date.parse(order.opening.startedAt) : 0;
       if (Date.now() - startedAt < OPENING_GRACE_MS) return "wait";
+      // An open that ran past its time limit is still with LND: its own
+      // answer decides (lateOpenAnswered), not the grace (M-1).
+      if (this.lateOpens.has(order.orderId) && Date.now() - startedAt < LATE_OPEN_MAX_MS) return "wait";
       if (order.opening?.unclear) order.unclearOpens = (order.unclearOpens ?? 0) + 1;
       order.opening = undefined;
       this.persistOrders();
       return "none";
+    });
+  }
+
+  /** LND's answer to an open that ran past its time limit (openOnce). A
+   *  channel it funded is put on record under the on-chain mutex: the
+   *  order's, and its payment claimed, while the order still stands; on an
+   *  order that has ended meanwhile (its payment released), a channel the
+   *  buyer has without paying — said loudly. A failure needs nothing here:
+   *  reconcileOpening judges by what LND shows. */
+  private async lateOpenAnswered(order: Lsps1Order, res: { ok: boolean; transactionId?: string; transactionVout?: number; error?: string }): Promise<void> {
+    if (!res.ok || !res.transactionId) {
+      // LND said the open is gone before any funding (the buyer disconnected,
+      // a refused reservation): the order need not sit out the grace — the
+      // next look at LND decides (round 2, N-n5: an honest slow buyer waited
+      // ten minutes a try).
+      if (res.error && isPreBroadcastRefusal(res.error) && order.opening && !order.channel) {
+        order.opening = { ...order.opening, startedAt: new Date(Date.now() - OPENING_GRACE_MS).toISOString() };
+        this.persistOrders();
+      }
+      return;
+    }
+    const outpoint = `${res.transactionId}:${res.transactionVout ?? 0}`;
+    const settle = await this.capital.mutex.run("lsps1 late open", async () => {
+      if (order.channel?.fundingOutpoint === outpoint) return false; // found meanwhile by its tag
+      if (order.channel) {
+        // (Not reached while the late open blocks a second one; said all the same.)
+        const detail = `LSP order ${order.orderId}: LND funded a second channel (${outpoint}) for it after its open ran past its time limit — the buyer has it without paying.`;
+        console.error(`[lsps1] CRITICAL ${detail}`);
+        recordStoreIncident(this.dataDir, { file: "lsps1-orders.json", kind: "unpaid_channel", detail });
+        return false;
+      }
+      this.recordChannel(order, outpoint);
+      if (order.orderState === "CREATED") return true;
+      this.channelUnpaid(order, "its payment was released before LND finished the open that had run past its time limit");
+      return false;
+    });
+    console.log(`[lsps1] order ${order.orderId}: LND finished the open that ran past its time limit (${outpoint})`);
+    // (Through fulfill: one claim at a time per order — a resumed fulfill
+    // that finds the channel on record claims it otherwise.)
+    if (settle) void this.fulfill(order);
+  }
+
+  /** An order that ended, or whose payment is gone, with an open's mark on
+   *  record: the channel that open may have funded, looked for by its tag
+   *  under the on-chain mutex (the rule of reconcileOpening). Found: on the
+   *  order's record, and the buyer has it without paying — said. The mark
+   *  goes either way. True when found. */
+  private async findLateChannel(order: Lsps1Order, why: string): Promise<boolean> {
+    return this.capital.mutex.run("lsps1 late channel", async () => {
+      const found = await this.findOurOpen(order);
+      if (!found) {
+        order.opening = undefined;
+        this.persistOrders();
+        return false;
+      }
+      this.recordChannel(order, found);
+      this.channelUnpaid(order, why);
+      return true;
     });
   }
 
@@ -2128,6 +2483,17 @@ export class Lsps1Service {
    */
   private async settleAndRecord(order: Lsps1Order): Promise<void> {
     if (!this.writeLnd) return;
+    // Filed as failed while its open was with LND (the invoice cancelled
+    // meanwhile — from outside, or by a very slow open): the channel is out
+    // and nothing can be claimed for it. Said loudly (review 2026-11-10,
+    // LSP-7: it returned without a word, the order reading "payment
+    // refunded").
+    // (Not twice: an order channelUnpaid has ended carries its words — no
+    // path settles such an order again today; this keeps it so.)
+    if (order.orderState === "FAILED" && order.channel && !order.error?.startsWith("the channel was opened, but")) {
+      this.channelUnpaid(order, "its payment was released while the channel was being opened");
+      return;
+    }
     let settled = false;
     let detail = "";
     for (let attempt = 0; attempt < 5 && !settled; attempt++) {
@@ -2253,7 +2619,21 @@ export class Lsps1Service {
    * Resolves once the pass is done, the opens it started included.
    */
   private async recoverOrders(): Promise<void> {
-    if (!this.writeLnd || this.stopping) return;
+    if (!this.writeLnd) {
+      // Write mode off (LM_ENABLE_WRITE) with orders paid before it went
+      // off: nothing here can open, settle or refund them — said at start,
+      // in the log and on the LSP card (review 2026-11-10, LSP-11: they sat
+      // held until LND let the payment go, unmentioned).
+      const held = this.orders.filter((o) => o.orderState === "CREATED" && (o.paymentState === "HOLD" || !!o.channel));
+      if (held.length > 0) {
+        this.lastError =
+          `write mode is off: ${held.length} paid LSP order${held.length === 1 ? "" : "s"} can be neither opened nor refunded here — ` +
+          "LND returns each payment itself near its HTLC's expiry (where a channel is already open, its payment is then lost); turn write mode on to have them finished";
+        console.warn(`[lsps1] ${this.lastError} (${held.map((o) => o.orderId).join(", ")})`);
+      }
+      return;
+    }
+    if (this.stopping) return;
     if (this.recovering) {
       this.recoverAgain = true; // asked again meanwhile: one more pass after this one
       return;
@@ -2299,7 +2679,7 @@ export class Lsps1Service {
    *  only ever starts an open — it never settles); or CREATED and followed
    *  by nothing here. One being opened or settled right now is left alone. */
   private needsRecovery(o: Lsps1Order): boolean {
-    if (o.orderState === "FAILED") return refundPending(o);
+    if (o.orderState === "FAILED") return refundPending(o) || (!!o.opening && !o.channel);
     if (o.orderState !== "CREATED" || this.fulfilling.has(o.orderId)) return false;
     return unclaimed(o) || !this.invoiceSubs.has(o.invoiceId);
   }
@@ -2350,6 +2730,10 @@ export class Lsps1Service {
    */
   private async recoverOne(order: Lsps1Order): Promise<{ open: Promise<void> } | "unwatched" | null> {
     if (order.orderState === "FAILED") {
+      // Ended while an open of its was out (its "opening" mark on disk): the
+      // channel that open may have funded is looked for by its tag, once —
+      // found, it is on record and said loudly (review of P9, M-1).
+      if (order.opening && !order.channel) await this.findLateChannel(order, "its order had ended before the channel was found");
       await this.releaseHeld(order);
       return null;
     }
@@ -2408,13 +2792,27 @@ export class Lsps1Service {
       return null;
     }
     if (inv.is_canceled || new Date(order.invoiceExpiresAt).getTime() < Date.now()) {
+      // An open was under way when the process stopped (its "opening" mark
+      // is on disk), and LND has released the payment since: the channel it
+      // may have funded is looked for first. Found, it is on the order's
+      // record and said loudly — the buyer has it without paying (review
+      // 2026-11-10, LSP-7: filed "expired across restart", the channel
+      // untracked, nobody told).
+      if (order.opening && (await this.findLateChannel(order, "LND released the buyer's held payment while the app was down, before the interrupted open's channel was found"))) return null;
       if (order.paymentState === "HOLD") order.paymentState = "REFUNDED";
       order.orderState = "FAILED";
       order.error ??= "expired across restart";
       this.persistOrders();
       return null;
     }
-    // Still awaiting payment.
+    // Still awaiting payment — unless LSP mode is off by now (a start with it
+    // off): a quote handed out before is withdrawn, as at a switch-off.
+    if (!this.settings.get().lspModeEnabled && !inv.is_held && !inv.is_confirmed) {
+      await this.withdrawQuote(order);
+      // (Not withdrawn — LND refused the cancel, or it was paid just now:
+      // followed as ever, so a payment to it is served — round 2, N-2.)
+      if (order.orderState !== "CREATED") return null;
+    }
     return this.watchInvoice(order) === false ? "unwatched" : null;
   }
 

@@ -18,6 +18,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { LspActivity } from "../src/components/LspActivity";
 import {
   isTorOnly,
+  LSP_LIMITS_NOTE,
   lspBlockedLine,
   lspBuyerGuide,
   lspIgnoredLine,
@@ -203,4 +204,25 @@ test("listening while new orders are turned away for want of peers:read: the car
   // Listening, nothing blocked: no banner (an old error of the service is
   // not shown while it listens).
   assert.doesNotMatch(card({ lastError: "Connection dropped" }), /banner error/);
+});
+
+// Review 2026-11-10, LSP-12: the card names the limits the doc names.
+test("the LSP card says how long a paid order of an offline buyer keeps capital reserved, and what switching off does to unpaid quotes", () => {
+  const settings = readFileSync(new URL("../src/components/SettingsPanel.tsx", import.meta.url), "utf8");
+  assert.match(settings, /<p className="muted">\{LSP_LIMITS_NOTE\}<\/p>/, "on the card while LSP mode is on");
+  // Write mode off with paid orders: the warning shows with the switch off too (review of P9, m-4).
+  assert.match(settings, /\{lsp && !lsp\.canWrite && lsp\.lastError && !settings\?\.lspModeEnabled \? <p className="banner error">\{lsp\.lastError\}<\/p> : null\}/);
+  assert.equal(
+    LSP_LIMITS_NOTE,
+    "A buyer who pays and stays offline keeps that channel's size reserved for six hours at most, then is refunded; switching LSP mode off withdraws the quotes not paid yet (a payment already held is still served).",
+  );
+});
+
+// Review of P9, round 2 (N-n4): a quote withdrawn for another buyer's order
+// at the LSP's limit is not "replaced by a newer order" of its own buyer.
+test("an order withdrawn at the LSP's limit for another buyer's says so — and that its payment went back when it was paid in that moment", () => {
+  const base = { orderId: "x", peer: "02aa", createdAt: "", sizeSat: 1_000_000, feeSat: 1, channelExpiryBlocks: 4320, invoiceExpiresAt: "", orderState: "FAILED", superseded: true } as unknown as Parameters<typeof lspOrderLabel>[0];
+  assert.equal(lspOrderLabel({ ...base, paymentState: "EXPECT_PAYMENT", error: "replaced by a newer order of the same buyer before it was paid" }), "Replaced by a newer order");
+  assert.equal(lspOrderLabel({ ...base, paymentState: "EXPECT_PAYMENT", error: "withdrawn unpaid: this LSP was at its limit of open orders, …" }), "Withdrawn · this LSP was full");
+  assert.equal(lspOrderLabel({ ...base, paymentState: "REFUNDED", error: "withdrawn unpaid: … — its payment arrived as it was withdrawn and went back" }), "Withdrawn · this LSP was full · refunded");
 });

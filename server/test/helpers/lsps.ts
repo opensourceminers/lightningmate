@@ -38,6 +38,10 @@ export interface LspSeams {
   /** Live invoice watches, by payment hash. */
   invoiceSubs: Map<string, unknown>;
   openRetryDelayMs: number;
+  /** How long one open may take inside the on-chain mutex. */
+  openCallTimeoutMs: number;
+  /** How long the funding rate's read before an open may take. */
+  feeReadTimeoutMs: number;
   settleRetryBaseMs: number;
   recoveryRetryMinMs: number;
   recoveryRetryMs: number;

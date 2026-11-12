@@ -109,6 +109,59 @@ export function socksConnect(proxy: SocksProxy, host: string, port: number, sign
   });
 }
 
+/**
+ * A host name resolved by the Tor proxy — Tor's SOCKS extension RESOLVE
+ * (command 0xF0; tor's socks-extensions.txt): the name goes to the proxy,
+ * the proxy asks the Tor network, and no DNS lookup leaves this host. The
+ * IPv4 address, or a rejection with the proxy's words. For the one name the
+ * app ever looks up on its own (the DDNS name LSP mode once announced —
+ * lsps1.ts withdrawLegacyClearnet); every request goes by name otherwise.
+ */
+export function socksResolve(proxy: SocksProxy, host: string, timeoutMs = 30_000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const name = Buffer.from(host, "utf8");
+    if (name.length === 0 || name.length > 255) {
+      reject(new Error(`invalid host name for the Tor proxy: ${host}`));
+      return;
+    }
+    const socket = net.connect({ host: proxy.host, port: proxy.port });
+    let stage: "greeting" | "resolve" = "greeting";
+    let buf = Buffer.alloc(0);
+    const timer = setTimeout(() => fail(new Error(`the Tor proxy did not resolve ${host} within ${Math.round(timeoutMs / 1000)} s`)), timeoutMs);
+    const done = () => {
+      clearTimeout(timer);
+      socket.removeAllListeners("data");
+      socket.removeAllListeners("close");
+      socket.destroy();
+    };
+    const fail = (err: Error) => {
+      done();
+      reject(err);
+    };
+    socket.on("error", (err) => fail(new Error(`Tor proxy ${proxy.host}:${proxy.port} unreachable: ${err.message}`)));
+    socket.on("close", () => fail(new Error("the Tor proxy closed the connection")));
+    socket.on("data", (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (stage === "greeting") {
+        if (buf.length < 2) return;
+        if (buf[0] !== 0x05 || buf[1] !== 0x00) return fail(new Error("the Tor proxy refused: no acceptable authentication method"));
+        buf = buf.subarray(2);
+        stage = "resolve";
+        socket.write(Buffer.concat([Buffer.from([0x05, 0xf0, 0x00, 0x03, name.length]), name, Buffer.from([0, 0])]));
+      }
+      if (buf.length < 4) return;
+      if (buf[0] !== 0x05) return fail(new Error("the Tor proxy answered something other than SOCKS5"));
+      if (buf[1] !== 0x00) return fail(new Error(`the Tor proxy could not resolve ${host}: ${REPLY[buf[1]] ?? `error ${buf[1]}`}`));
+      if (buf[3] !== 0x01) return fail(new Error(`the Tor proxy answered no IPv4 address for ${host}`));
+      if (buf.length < 10) return;
+      const ip = `${buf[4]}.${buf[5]}.${buf[6]}.${buf[7]}`;
+      done();
+      resolve(ip);
+    });
+    socket.once("connect", () => socket.write(Buffer.from([0x05, 0x01, 0x00])));
+  });
+}
+
 /** What a response through the proxy carries (the body read in full). */
 export interface ProxiedResponse {
   status: number;

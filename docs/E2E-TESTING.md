@@ -41,6 +41,8 @@ server/e2e/regtest.sh up
 node --import tsx e2e/nodePanel.ts  # a node's details through the app's routes: open by hand, fee mode, close
 server/e2e/regtest.sh up
 node --import tsx e2e/refill.ts     # refills: a route under its fee limit, invoices of failed tries, one peer over two channels
+server/e2e/regtest.sh up
+node --import tsx e2e/lsps.ts       # LSP mode: a buyer's node orders a channel over LSPS1 (part B's money path)
 server/e2e/regtest.sh down
 ```
 
@@ -82,6 +84,17 @@ it shows, in order:
   nothing kept reserved for it, and the refund's alert names both numbers.
 
 No service fee is set in that run, so "what the sale earns" is the order's whole fee there.
+
+`lsps.ts` (a few minutes) plays part B's buyer with the `buyer` node: it speaks LSPS0 to the
+seller over BOLT8 custom messages (type 37913), as ZEUS's embedded node does, and pays through
+the hub. It checks: get_info and a quote; a token refused with error 102 and a lease too long with
+100; a paid order's channel opened to the buyer with the order's outpoint, its payment claimed
+once the funding is out, booked once; a buyer that pays and goes offline waited for, its payment
+held; back online with fees above what the order brings, not opened and the order says why; once
+fees are down, opened at the rate of then; a buyer that stays away refunded six hours after its
+payment (its payment comes back, the capital is free); an unpaid quote withdrawn when LSP mode is
+switched off (its invoice cancelled in LND); and at 400 sat/vB a channel refused rather than quoted
+below its cost. What only ZEUS shows — its screens, its Tor round trips, its polling — stays part B.
 
 `refill.ts` (a few minutes; it mines two weeks of blocks so the hub's channel may give
 liquidity) builds the cycle seller → hub → buyer → seller with two channels between seller and
@@ -292,8 +305,10 @@ phases, the LND invoice states, and anything unexpected.
   the order failed.
 - **Buyer offline after paying**: pay, then close ZEUS before the open.
   Node A waits (`waitingForBuyerSince`) and opens as soon as ZEUS is back —
-  or refunds the payment when the held HTLC nears its expiry (the invoice asks
-  for a 144-block CLTV).
+  or refunds the payment six hours after it was paid (sooner, should the held
+  HTLC near its expiry first; the invoice asks for a 144-block CLTV).
+- **Polling**: count ZEUS's `get_order` requests a minute while it waits — the
+  LSP answers 30 a minute per peer.
 - **Too long a lease**: ask for 6 months — refused with a message that names
   the range ZEUS shows.
 

@@ -348,6 +348,9 @@ async function lspSetup(t: TestContext, chainBalance: number) {
   api.amboss.setKey("test-key");
   soldOpensKnowTheirFee(api.autopilot);
   api.autopilot.setConfig({ sellEnabled: true, sellMaxDeploySats: 50_000_000, sellMaxChannelSats: 10_000_000 });
+  // LSP mode on (no listener needed: orders are made directly) — with it
+  // off, an order made meanwhile is withdrawn at once.
+  api.settings.set({ lspModeEnabled: true });
   const lsp = api.lsps1 as unknown as LspCreate;
   lsp.quote = async () => ({ feeTotalSat: 20_000, effectivePpm: 5_000 }); // pricing is not under test
   lsp.watchInvoice = () => undefined;
@@ -375,17 +378,22 @@ test("create_order is refused when the coins are promised elsewhere — get_info
   assert.equal(node.callsTo("default.openChannel").length, 1, "the paid Magma order opens");
 });
 
-test("an unpaid LSPS1 quote never stands in the way of a Magma accept or a paid Magma open — but LSPS1's own next quote counts it", async (t) => {
+test("an unpaid LSPS1 quote never stands in the way of a Magma accept or a paid Magma open — but its buyer's own next quote counts it (another buyer's does not: LSP-2)", async (t) => {
   quiet(t);
   const { api, node, magma, lsp } = await lspSetup(t, 3_000_000);
   api.autopilot.setConfig({ sellMaxDeploySats: 3_000_000 });
   const quote = await lsp.createOrder(1, "02" + "ef".repeat(32), { ...ORDER_PARAMS, lsp_balance_sat: "1500000" });
   assert.ok(quote.result?.order_id, JSON.stringify(quote));
-  // Its own second quote: the first one's coins are spoken for (LSPS1-internal)
-  // — refused, as above the maximum get_info now advertises.
-  const second = await lsp.createOrder(2, "02" + "ee".repeat(32), { ...ORDER_PARAMS, lsp_balance_sat: "1500000" });
-  assert.ok(second.error, "two buyers aren't quoted the same coins");
-  assert.equal(lsp.orders.length, 1);
+  // The same buyer's second quote: the first one's coins are spoken for —
+  // refused, as above the maximum get_info advertises to it.
+  const second = await lsp.createOrder(2, "02" + "ef".repeat(32), { ...ORDER_PARAMS, lsp_balance_sat: "1600000" });
+  assert.ok(second.error, "one buyer isn't quoted the same coins twice");
+  // Another buyer is quoted: an unpaid quote of one peer turns no other away
+  // (review 2026-11-10, LSP-2); should both pay, the second open finds the
+  // coins gone and is refunded.
+  const other = await lsp.createOrder(3, "02" + "ee".repeat(32), { ...ORDER_PARAMS, lsp_balance_sat: "1500000" });
+  assert.ok(other.result?.order_id, JSON.stringify(other));
+  assert.equal(lsp.orders.length, 2);
   assert.equal(api.capital.reservedSat(), 0, "an unpaid quote is no promise anyone else must honour");
 
   // Before, the unpaid quote counted in the shared ledger: 1.5M quoted + 2M

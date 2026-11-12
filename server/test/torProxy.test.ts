@@ -28,7 +28,8 @@ import { join } from "node:path";
 import { HttpTimeoutError, httpRequest, mempoolBase, setOutboundRouting, torVia, viaTor } from "../src/services/http.js";
 import { ambossGql } from "../src/services/amboss.js";
 import { __resetEligibilityCache } from "../src/services/magmaEligibility.js";
-import { socksFetch, torProxyFromEnv } from "../src/services/torProxy.js";
+import { socksFetch, socksResolve, torProxyFromEnv } from "../src/services/torProxy.js";
+import { socksResolver } from "./helpers/socksResolver.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { makeTempDir } from "./helpers/tmp.js";
@@ -376,4 +377,14 @@ test("GET /lnplus/status: through Tor whenever there is a proxy — and whether 
   // An old client asking for "Direct" routes nothing around Tor.
   await api.request("POST", "/settings", { torRoute: "direct" });
   assert.deepEqual(await status(), [true, true]);
+});
+
+// Review 2026-11-10 (LSP mode): the one name the app looks up on its own —
+// the DDNS name LSP mode once announced — went to the system's resolver
+// beside the proxy. Tor's RESOLVE extension asks the Tor network instead.
+test("a name is resolved by the Tor proxy (RESOLVE): the name goes to the proxy, its IPv4 address comes back — and a refusal is said in the proxy's words", async (t) => {
+  const { proxy, asked } = await socksResolver(t, (name) => (name === "home.example.org" ? "203.0.113.9" : 4));
+  assert.equal(await socksResolve(proxy, "home.example.org"), "203.0.113.9");
+  await assert.rejects(socksResolve(proxy, "gone.example.org"), /the Tor proxy could not resolve gone\.example\.org: host unreachable/);
+  assert.deepEqual(asked, ["home.example.org", "gone.example.org"]);
 });

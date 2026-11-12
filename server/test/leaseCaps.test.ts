@@ -317,6 +317,7 @@ test("an LSPS1 order locks the same routing-fee promise as the node's Magma offe
   };
   lsp.quote = async () => ({ feeTotalSat: 20_000, effectivePpm: 5_000 });
   lsp.watchInvoice = () => undefined;
+  api.settings.set({ lspModeEnabled: true }); // (with it off, an order made is withdrawn at once)
   const res = await lsp.createOrder(1, "02" + "ef".repeat(32), {
     client_balance_sat: "0",
     required_channel_confirmations: 1,
@@ -427,6 +428,7 @@ test("an LSPS1 sale's promise outlives the order list's trim: 250 newer abandone
   };
   lsp.quote = async () => ({ feeTotalSat: 20_000, effectivePpm: 5_000 });
   lsp.watchInvoice = () => undefined;
+  api.settings.set({ lspModeEnabled: true }); // (with it off, an order made is withdrawn at once)
   // One more order arrives: the list is saved — and trimmed.
   const res = await lsp.createOrder(1, PEER(8), {
     client_balance_sat: "0",

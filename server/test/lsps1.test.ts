@@ -44,6 +44,8 @@ import { parsePaymentRequest } from "./helpers/bolt11.js";
 import { BUYER, lspNode, lspsWallet, zeusOrder, type LspNode } from "./helpers/lsps.js";
 import { feeEnv, quiet } from "./helpers/lifecycle.js";
 import { makeTempDir } from "./helpers/tmp.js";
+import { socksResolver } from "./helpers/socksResolver.js";
+import { setOutboundRouting } from "../src/services/http.js";
 import { until } from "./helpers/wait.js";
 
 const hashOf = (order: { payment: { bolt11: { invoice: string } } }): string => parsePaymentRequest(order.payment.bolt11.invoice).id;
@@ -374,10 +376,14 @@ test("the first look refuses only what the check that decides would: exactly the
   );
 });
 
-test("orders that cross are counted again inside the on-chain mutex: two buyers at once, each asking for a channel that fits alone but not beside the other — one is made, the other refused for the coins, or for the deploy cap", async (t) => {
+test("orders that cross are counted again inside the on-chain mutex: one buyer asking twice at once for a channel that fits alone but not beside the other — one is made, the other refused for the coins, or for the deploy cap", async (t) => {
   silence(t);
-  const buyers = [buyerN(36), buyerN(37)];
+  // (One buyer — one wallet, two requests: another buyer's unpaid quote
+  // counts against no one's, LSP-2.)
+  const buyers = [buyerN(36)];
   const outcome = (answers: any[]) => answers.map((a) => a.error?.data.message ?? "made").sort();
+  // Two requests that are not the same quote (1.5M and 1.6M).
+  const asks = [sized(5), sized(6)];
 
   // 3,000,000 on chain: 1,500,000 fits once (2,949,000 to spend), not twice
   // (1,448,000 left beside the first: its coins, a second funding fee).
@@ -385,11 +391,12 @@ test("orders that cross are counted again inside the on-chain mutex: two buyers 
   coins.svc.start();
   const coinTurns = orderTurns(coins);
   // Both pass the first look before either order is made.
-  const byCoins = await Promise.all(buyers.map((b) => lspsWallet(coins.node, b).call("lsps1.create_order", sized(5))));
-  assert.deepEqual(outcome(byCoins), [
-    "made",
-    "this LSP has no on-chain capital for a channel this size right now (1448000 sat available) — try a smaller channel or later",
-  ]);
+  const coinsWallet = lspsWallet(coins.node, buyers[0]!);
+  const byCoins = await Promise.all(asks.map((a) => coinsWallet.call("lsps1.create_order", a)));
+  // (Which of the two is made first decides what the other finds left.)
+  const [made, refusedFor] = outcome(byCoins);
+  assert.equal(made, "made");
+  assert.match(refusedFor ?? "", /^this LSP has no on-chain capital for a channel this size right now \(1[34]\d{5} sat available\) — try a smaller channel or later$/);
   assert.equal(coinTurns(), 2);
   assert.equal(coins.node.callsTo("invoices.addHoldInvoice").length, 1);
 
@@ -400,7 +407,8 @@ test("orders that cross are counted again inside the on-chain mutex: two buyers 
   });
   cap.svc.start();
   const capTurns = orderTurns(cap);
-  const byCap = await Promise.all(buyers.map((b) => lspsWallet(cap.node, b).call("lsps1.create_order", sized(5))));
+  const capWallet = lspsWallet(cap.node, buyers[0]!);
+  const byCap = await Promise.all(asks.map((a) => capWallet.call("lsps1.create_order", a)));
   assert.deepEqual(outcome(byCap), ["made", "this LSP is at its capital deployment cap — try again later"]);
   assert.equal(capTurns(), 2);
   assert.equal(cap.node.callsTo("invoices.addHoldInvoice").length, 1);
@@ -514,7 +522,7 @@ test("ZEUS asking again with the same terms gets the quote it already has — th
   assert.equal(view(lsp, fresh.order_id)?.paymentState, "HOLD", "the paid one stays");
 });
 
-test("asking again with one term changed is another request: announcing the channel, other confirmations, another funding target or another token gets a new order with that term — never the quote made for the old terms; a client balance is still refused", async (t) => {
+test("asking again with one term changed is another request: announcing the channel, other confirmations or another funding target gets a new order with that term — never the quote made for the old terms; a client balance and a token are still refused", async (t) => {
   silence(t);
   const lsp = lspNode(t);
   lsp.svc.start();
@@ -526,7 +534,6 @@ test("asking again with one term changed is another request: announcing the chan
     ["announce_channel", { announce_channel: true }],
     ["required_channel_confirmations", { required_channel_confirmations: 2 }],
     ["funding_confirms_within_blocks", { funding_confirms_within_blocks: 12 }],
-    ["token", { token: "spring" }],
   ];
   let terms = zeusOrder();
   let last = (await w.call("lsps1.create_order", terms)).result;
@@ -542,8 +549,8 @@ test("asking again with one term changed is another request: announcing the chan
     assert.equal(next.result[name], change[name], `${name}: the order has the term asked for`);
     last = next.result;
   }
-  assert.equal(lsp.node.callsTo("invoices.addHoldInvoice").length, 5);
-  assert.equal(lsp.seams.orders.filter((o) => o.supersededBy).length, 3, "at its cap, each one replaced the oldest quote");
+  assert.equal(lsp.node.callsTo("invoices.addHoldInvoice").length, 4);
+  assert.equal(lsp.seams.orders.filter((o) => o.supersededBy).length, 2, "at its cap, each one replaced the oldest quote");
 
   // A client balance is no term this LSP offers: option_mismatch, as before
   // — not the quote made without one.
@@ -554,8 +561,12 @@ test("asking again with one term changed is another request: announcing the chan
     [100, "client_balance_sat: a client balance is not supported (max 0)"],
     JSON.stringify(pushed.result?.order_id),
   );
-  assert.equal(lsp.node.callsTo("invoices.addHoldInvoice").length, 5);
-  assert.equal(lsp.seams.orders.filter((o) => o.supersededBy).length, 3, "nothing replaced for a refused request");
+  // …nor is a token this LSP never issued (bLIP-51: error 102).
+  age(lsp, 61_000);
+  const coupon = await w.call("lsps1.create_order", { ...terms, token: "spring" });
+  assert.deepEqual([coupon.error?.code, coupon.error?.message], [102, "Unrecognized or stale token"]);
+  assert.equal(lsp.node.callsTo("invoices.addHoldInvoice").length, 4);
+  assert.equal(lsp.seams.orders.filter((o) => o.supersededBy).length, 2, "nothing replaced for a refused request");
 });
 
 test("a quote being replaced is never handed out: asked for again while another request of its buyer replaces it, its invoice — about to be cancelled — is not the answer", async (t) => {
@@ -618,7 +629,7 @@ test("the same terms as a paid order — even one no open is under way for, as a
   const node = new FakeLnd({ chainBalance: 20_000_000, peers: [BUYER] });
   const paid = await storedOrder(node, { orderId: "paid-1", paid: true, sizeSat: 1_000_000, channelExpiryBlocks: 13_140 });
   writeFileSync(join(dir, "lsps1-orders.json"), JSON.stringify([paid]));
-  const lsp = lspNode(t, { dir, node, lspMode: false }); // not started: no recovery has picked it up
+  const lsp = lspNode(t, { dir, node }); // not started: no recovery has picked it up
   const create = (lsp.svc as unknown as { createOrder(rid: number, peer: string, p: Record<string, unknown>): Promise<{ result?: { order_id: string } }> }).createOrder.bind(lsp.svc);
   const res = await create(1, BUYER, zeusOrder());
   assert.ok(res.result?.order_id, JSON.stringify(res));
@@ -989,7 +1000,7 @@ test("a held payment whose HTLC expiry LND doesn't name is waited for at most 6 
   await lsp.seams.recoverOrders();
   const v = view(lsp, "held-long");
   assert.deepEqual([v?.orderState, v?.paymentState], ["FAILED", "REFUNDED"]);
-  assert.equal(v?.error, "the buyer did not come back online before its held payment had to be released (6 h after it was paid)");
+  assert.equal(v?.error, "the buyer did not come back online before its held payment was released 6 h after it was paid — no paid order keeps this node's capital reserved for longer");
   assert.equal(node.invoices.get(order.invoiceId)?.state, "CANCELED");
   // An open the payment might not outlive would give the channel away.
   assert.equal(dials, 0);
@@ -1033,7 +1044,8 @@ test("an unpaid order whose invoice LND can't follow yet is looked at again unti
     if (!ready) throw new Error("the invoices subserver is not ready");
     return follow(a);
   }) as never);
-  const lsp = lspNode(t, { dir, node, lspMode: false });
+  // (LSP mode on: with it off a quote found unpaid at start is withdrawn.)
+  const lsp = lspNode(t, { dir, node });
   lsp.seams.recoveryRetryMinMs = 20;
   lsp.seams.recoveryRetryMs = 20;
   await lsp.seams.recoverOrders();
@@ -1105,9 +1117,12 @@ test("restart recovery keeps trying until LND answers: a held order opens and se
   assert.equal(node.callsTo("default.openChannel").length, 1);
   assert.equal(lsp.capital.reservedSat(), 0, "its coins are no longer promised");
   assert.equal(lsp.svc.committedSat(), 0);
-  // The unpaid one is followed again: paying it now opens its channel too.
-  node.payHoldInvoice(unpaid.invoiceId);
-  await until(() => view(lsp, "unpaid-1")?.orderState === "COMPLETED", "the unpaid order, paid now, completes");
+  // The unpaid one is withdrawn: with LSP mode off, a quote handed out
+  // before is no longer payable (review of P9, m-3 — before, paying it now
+  // opened its channel with the mode off).
+  await until(() => view(lsp, "unpaid-1")?.orderState === "FAILED", "the unpaid quote withdrawn");
+  assert.equal(node.invoices.get(unpaid.invoiceId)?.state, "CANCELED");
+  assert.equal(view(lsp, "unpaid-1")?.error, "LSP mode was switched off before this order was paid — its invoice is cancelled");
   const done = await lsp.svc.status();
   assert.deepEqual([done.recovery.waiting, done.recovery.lastError, done.recovery.nextTryAt], [0, null, null]);
 });
@@ -1611,4 +1626,20 @@ test("a clearnet address 0.8.4 announced is withdrawn once at start and leaves t
   again.svc.start();
   await new Promise((r) => setTimeout(r, 50));
   assert.equal(addressUpdates().length, 1);
+});
+
+test("an old clearnet address given as a DDNS name is resolved by the Tor proxy before it is withdrawn — no DNS lookup goes out beside Tor", async (t) => {
+  quiet(t);
+  const { proxy, asked } = await socksResolver(t, () => "198.51.100.23");
+  setOutboundRouting({ proxy });
+  t.after(() => setOutboundRouting({ proxy: null }));
+  const dir = makeTempDir(t);
+  writeFileSync(join(dir, "settings.json"), JSON.stringify({ fiatCurrency: "off", lspModeEnabled: true, lspClearnetAddress: "home.example.invalid:9735" }));
+  const lsp = lspNode(t, { dir });
+  lsp.node.override("peers.updateNodeAnnouncement", (_a, cb) => cb?.(null, {}));
+  const addressUpdates = () => lsp.node.callsTo("peers.updateNodeAnnouncement").filter((a) => a.address_updates);
+  lsp.svc.start();
+  await until(() => addressUpdates().length > 0, "the old address is withdrawn");
+  assert.deepEqual(asked, ["home.example.invalid"], "the proxy was asked for the name");
+  assert.deepEqual(addressUpdates().map((a) => a.address_updates), [[{ action: 1, address: "198.51.100.23:9735" }]]);
 });

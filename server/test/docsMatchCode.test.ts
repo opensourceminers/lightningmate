@@ -377,8 +377,18 @@ function lightningPermissions(): Map<string, string[]> {
   };
   walk(methods);
   const out = new Map<string, string[]>();
+  // Where the library's own words are wrong, LND's: removePeer's file says
+  // "Requires `peers:remove` permission", but LND checks peers:write for
+  // DisconnectPeer (`lncli listpermissions` on LND 0.21.6:
+  // /lnrpc.Lightning/DisconnectPeer → peers write) — and "remove" is no
+  // action bakemacaroon would take.
+  const lnd: Record<string, string[]> = { removePeer: ["peers:write"] };
   for (const fn of used) {
     if (fn === "authenticatedLndGrpc") continue; // builds the client: no RPC of its own
+    if (lnd[fn]) {
+      out.set(fn, lnd[fn]);
+      continue;
+    }
     const file = modules.get(fn.replace(/([a-z0-9])([A-Z])/g, "$1_$2").toLowerCase());
     assert.ok(file, `${fn}: not found in the lightning library's methods`);
     const doc = /Requires\s+((?:`[a-z]+:[a-z]+`(?:,\s*|\s+and\s+)?)+)\s*permission/.exec(readFileSync(file, "utf8"));
@@ -578,4 +588,19 @@ test("the docs say when a fee that sells is kept, when a higher one is tried and
   assert.match(flat, /with it off no price test is offered and a raise applied by hand is not taken back/);
   assert.match(flat, /by more than max\(1 % of capacity, 50k sat\) and one of its sales/);
   assert.match(flat, /up to four times as much or more once in the 6 h/);
+});
+
+// Review 2026-11-10, LSP-1, LSP-3, LSP-9, LSP-12: what LSP mode holds a buyer
+// to, in the doc and in the code's own numbers.
+test("docs/LSP-MODE.md names LSP mode's limits in the code's numbers, and calls the mode experimental, never beta", async () => {
+  const { HELD_WAIT_MS, OPEN_CALL_TIMEOUT_MS } = await import("../src/services/lsps1.js");
+  const flat = read("docs/LSP-MODE.md").replace(/\s+/g, " ");
+  assert.equal(HELD_WAIT_MS, 6 * 3_600_000, "“for six hours at most”");
+  assert.match(flat, /for \*\*six hours at most\*\* after the payment arrived/);
+  assert.equal(OPEN_CALL_TIMEOUT_MS, 120_000, "“within two minutes”");
+  assert.match(flat, /An open LND does not finish within two minutes/);
+  assert.match(flat, /30 answered messages a minute/);
+  assert.match(flat, /Switching LSP mode off withdraws the quotes handed out and not paid/);
+  assert.match(flat, /A `token` is refused with error 102/);
+  assert.doesNotMatch(flat, /\bbeta\b/i);
 });

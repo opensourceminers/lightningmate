@@ -3,7 +3,7 @@ import { COPY_FAILED, copyText } from "../clipboard";
 import { api } from "../api";
 import { pageHidden } from "../usePolledData";
 import type { AmbossKeyCheck, AppSettings, FiatCurrency, LspStatus, PrivacyInfo } from "../types";
-import { lspBuyerGuide, lspIgnoredLine, lspReachText, lspRecoveryLine } from "../lspView";
+import { LSP_LIMITS_NOTE, lspBuyerGuide, lspIgnoredLine, lspReachText, lspRecoveryLine } from "../lspView";
 import { destinationLine, privacySummary } from "../privacyView";
 import { BackupCard } from "./BackupCard";
 import { Fold } from "./Fold";
@@ -399,6 +399,8 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
         {lsp && !lsp.canWrite ? <span className="muted">write mode is off — enable it to use LSP mode</span> : null}
       </div>
       {lspError ? <p className="banner error">{lspError}</p> : null}
+      {/* Write mode off with LSP orders paid before: said whatever the switch says (with it on, LspActivity says it). */}
+      {lsp && !lsp.canWrite && lsp.lastError && !settings?.lspModeEnabled ? <p className="banner error">{lsp.lastError}</p> : null}
       {settings?.lspModeEnabled ? null : (
         <p className="muted">Sell inbound channels directly to wallets that order over Lightning (LSPS1) — few wallets can, so expect few orders.</p>
       )}
@@ -419,6 +421,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
               · {satsCompact(lsp.offer.deployableSat)} sat deployable on-chain
             </p>
           ) : null}
+          <p className="muted">{LSP_LIMITS_NOTE}</p>
           {lsp.ordersPending + lsp.ordersCompleted + lsp.ordersFailed > 0 ? (
             <p className="muted">
               Orders: {lsp.ordersPending} pending · {lsp.ordersCompleted} completed
