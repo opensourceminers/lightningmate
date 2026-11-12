@@ -18,9 +18,10 @@
   "devDependencies": {
     "concurrently": "^9.2.5"
   },
-  "comment:overrides": "Patched transitive deps that the lightning library's own ranges would let through - as ranges, so a later fix is taken too: @grpc/grpc-js ^1.14.6 (GHSA-m9gg-hp2v-232j and GHSA-f596-whhp-79r4: fixed in 1.14.5; GHSA-5375-pq7m-f5r2 and GHSA-99f4-grh7-6pcq: fixed in 1.14.4), bn.js ^5.2.3 (GHSA-378v-28hj-76wf, an infinite loop: fixed in 5.2.3). Drop each once lightning's ranges exclude the vulnerable versions; CI runs npm audit on the production dependencies.",
+  "comment:overrides": "Patched transitive deps that the lightning library's own ranges would let through - as ranges, so a later fix is taken too: @grpc/grpc-js ^1.14.6 (GHSA-m9gg-hp2v-232j and GHSA-f596-whhp-79r4: fixed in 1.14.5; GHSA-5375-pq7m-f5r2 and GHSA-99f4-grh7-6pcq: fixed in 1.14.4), bn.js ^5.2.3 (GHSA-378v-28hj-76wf, an infinite loop: fixed in 5.2.3), bitcoinjs-lib ^6.1.10 (GHSA-8vv3-6qpc-gpw6, a forged transaction list passing the merkle root check: fixed in 6.1.8; lightning 10 pins 6.1.7, its fix is lightning 13). Drop each once lightning's ranges exclude the vulnerable versions; CI runs npm audit on the production dependencies.",
   "overrides": {
     "@grpc/grpc-js": "^1.14.6",
-    "bn.js": "^5.2.3"
+    "bn.js": "^5.2.3",
+    "bitcoinjs-lib": "^6.1.10"
   }
 }
