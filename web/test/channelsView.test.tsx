@@ -25,7 +25,7 @@ const estimate = (o: Partial<OpenEstimate> = {}): OpenEstimate => ({
   reserveSat: 61_000,
   promisedSat: 0,
   yieldPpmYear: 1_000,
-  yieldEvidence: { channels: 2, capacitySat: 4_000_000, forwards: 40, earnedSat: 330, forwardsRead: true },
+  yieldEvidence: { channels: 2, capacitySat: 4_000_000, offline: 0, forwards: 40, earnedSat: 330, forwardsRead: true },
   minYieldForwards: 10,
   minYieldEarnedSat: 1_000,
   openVbytes: 175,
@@ -48,7 +48,7 @@ test("the Open form says what an open costs at the chosen rate, what is left, an
   // Bigger than what can be spent.
   assert.match(openLines(6_000_000, 4, estimate({ promisedSat: 2_000_000 })).warn ?? "", /^Only 5,000,000 sat can be spent after the on-chain reserve \(61,000 sat\) and the 2,000,000 sat promised to buyers — not enough for 6,000,000\./);
   // No yield to go by: said — and why — not guessed.
-  const few = { channels: 1, capacitySat: 6_000_000, forwards: 3, earnedSat: 10, forwardsRead: true };
+  const few = { channels: 1, capacitySat: 6_000_000, offline: 0, forwards: 3, earnedSat: 10, forwardsRead: true };
   assert.equal(
     openLines(2_000_000, 4, estimate({ yieldPpmYear: null, yieldEvidence: few })).payback,
     "too little routing on month-old channels to estimate its payback (3 forwards, 10 sat in 30 days — it takes 10 forwards or 1,000 sat)",

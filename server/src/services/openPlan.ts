@@ -115,6 +115,9 @@ export interface OpenContext {
    *  measuredYield); null: nothing to measure a payback against (no such
    *  channel, or too little routing to tell). */
   yieldPpmYear: number | null;
+  /** What that yield stands on — for the words of a skip only (how many of
+   *  the channels counted are offline). */
+  yieldEvidence?: YieldEvidence | null;
   /** How far auto-size may rise to meet a peer's minimum (sat). */
   maxRaiseSat: number;
   peers: Readonly<Record<string, PeerOpenRecord>>;
@@ -136,11 +139,23 @@ export function openAndCloseCost(rate: number): number {
   return Math.ceil(rate * OPEN_TX_VBYTES) + Math.ceil(rate * CLOSE_TX_VBYTES);
 }
 
-/** The node's open channels with a month of history behind them. */
+/**
+ * The node's open channels with a month of history behind them — whether
+ * their peer is connected right now or not. Before, only the connected ones
+ * counted (review 2026-11-10, CHAN-1), and "what a sat in month-old channels
+ * earned" was wrong in two ways that both let an open through: the capital
+ * stuck in dead channels left the denominator, so the yield read higher than
+ * the node's (two of four 10M channels dead: 1,460 ppm/yr for a true 730, and
+ * the open the payback would have held back for ~21 months went out); and
+ * when the peer of the channel that earns was away for a moment — a restart,
+ * a new Tor circuit — its forwards left the count too, the yield read "too
+ * little routing to measure", and the open went out at the maximum fee rate
+ * with no payback check at all.
+ */
 export function monthOldChannels(channels: readonly ChannelView[], currentHeight: number): ChannelView[] {
   return channels.filter((c) => {
     const funded = fundingHeight(c.id);
-    return c.active && c.status === "open" && funded !== null && currentHeight - funded >= MONTH_BLOCKS;
+    return c.status === "open" && funded !== null && currentHeight - funded >= MONTH_BLOCKS;
   });
 }
 
@@ -150,11 +165,26 @@ export interface YieldEvidence {
   /** Month-old open channels, and their capacity (sat). */
   channels: number;
   capacitySat: number;
+  /** Of those channels, the ones whose peer is offline right now. They count
+   *  all the same: their capital is deployed here and earns nothing. */
+  offline: number;
   /** Forwards out through them, and what they earned (sat). */
   forwards: number;
   earnedSat: number;
-  /** False: LND's forwarding history couldn't be read (nothing is known). */
+  /** False: LND's forwarding history couldn't be read, or not all of it —
+   *  LND had more forwards than were read, and a part of the earnings would
+   *  pass for all of them (review 2026-11-10, CHAN-13). Nothing is known. */
   forwardsRead: boolean;
+}
+
+/** "2 of the 4 are offline and count all the same" — said wherever the yield
+ *  is quoted, so a figure that counts the dead channels reads as one that
+ *  does; "" with none offline. */
+export function offlineYieldWords(e: Pick<YieldEvidence, "channels" | "offline"> | null | undefined): string {
+  if (!e || e.offline <= 0) return "";
+  if (e.channels === 1) return "that one channel is offline and counts all the same";
+  if (e.offline >= e.channels) return `all ${fmt(e.channels)} are offline and count all the same`;
+  return `${fmt(e.offline)} of the ${fmt(e.channels)} ${e.offline === 1 ? "is offline and counts" : "are offline and count"} all the same`;
 }
 
 /**
@@ -173,11 +203,13 @@ export function measuredYield(e: YieldEvidence): number | null {
 
 /** Why the payback could not be checked, in words (measuredYield null). */
 export function unmeasuredYieldText(e: YieldEvidence): string {
-  if (!e.forwardsRead) return "this node's forwarding history couldn't be read, so what a channel earns here is unknown";
+  if (!e.forwardsRead) return "this node's forwarding history couldn't be read in full, so what a channel earns here is unknown";
   if (e.channels === 0) return "no channel is a month old yet, so what a channel earns here can't be measured";
+  const offline = offlineYieldWords(e);
   return (
     `too little routing to measure what a channel earns here (${fmt(e.forwards)} forward${e.forwards === 1 ? "" : "s"}, ` +
-    `${fmt(e.earnedSat)} sat through month-old channels in 30 days — it takes ${MIN_YIELD_FORWARDS} forwards or ${fmt(MIN_YIELD_EARNED_SAT)} sat)`
+    `${fmt(e.earnedSat)} sat through month-old channels in 30 days — it takes ${MIN_YIELD_FORWARDS} forwards or ${fmt(MIN_YIELD_EARNED_SAT)} sat` +
+    `${offline ? `; ${offline}` : ""})`
   );
 }
 
@@ -269,7 +301,8 @@ export function planOpen(
     const perYear = (size * ctx.yieldPpmYear) / 1_000_000;
     const months = perYear > 0 ? (cost / perYear) * 12 : Infinity;
     if (months > OPEN_PAYBACK_MONTHS) {
-      const measure = `${fmt(ctx.yieldPpmYear)} ppm/yr: what a sat in month-old channels earned, capacity-weighted`;
+      const offline = offlineYieldWords(ctx.yieldEvidence);
+      const measure = `${fmt(ctx.yieldPpmYear)} ppm/yr: what a sat in month-old channels earned, capacity-weighted${offline ? ` — ${offline}` : ""}`;
       return {
         skip: Number.isFinite(months)
           ? `opening and later closing it costs ~${fmt(cost)} sat at ${ctx.feeRate} sat/vB — ~${Math.round(months)} months ` +

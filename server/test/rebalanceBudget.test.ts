@@ -20,7 +20,7 @@ import { RebalanceLog, type RebalanceRecord } from "../src/services/rebalanceLog
 import type { RebalanceExecParams } from "../src/services/rebalance.js";
 import { AUTOPILOT_CONFIG_BOUNDS, sanitizePersistedConfig } from "../src/services/autopilotConfig.js";
 import { ConfigValidationError } from "../src/services/autopilot.js";
-import { autopilotWith, failedRebalance, paidRebalance, plannedFeeChange, plannedRebalance, type AutopilotSeams } from "./helpers/autopilot.js";
+import { autopilotWith, failedRebalance, manualRefillsUnchecked, paidRebalance, plannedFeeChange, plannedRebalance, type AutopilotSeams } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
 import { AMBOSS_API } from "./helpers/amboss.js";
@@ -146,6 +146,7 @@ test("a manual rebalance counts toward the same daily budget: capped at what is 
   t.mock.method(console, "log", () => undefined);
   installFetchMock(t).onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
   const api = await startApi(t, { node: new FakeLnd() });
+  manualRefillsUnchecked(api.autopilot); // the lock, budget and books are the test — the bare fake node has no such channels
   api.autopilot.setConfig({ rebalanceDailyBudgetSats: 200, rebalanceEnabled: true });
   const ap = api.autopilot as unknown as AutopilotSeams;
   const sent: RebalanceExecParams[] = [];
@@ -196,6 +197,7 @@ test("a manual refill never pays beside the autopilot's rebalance stage — nor 
   t.mock.method(console, "log", () => undefined);
   installFetchMock(t).onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
   const api = await startApi(t, { node: new FakeLnd() });
+  manualRefillsUnchecked(api.autopilot); // the lock, budget and books are the test — the bare fake node has no such channels
   api.autopilot.setConfig({ rebalanceEnabled: true, rebalanceDailyBudgetSats: 10_000 });
   const ap = api.autopilot as unknown as AutopilotSeams;
   ap.rebalanceReport = async () => ({ recommendations: [move("800005x1x0", 500, 10)] });
@@ -234,6 +236,7 @@ test("a manual refill never pays beside the autopilot's rebalance stage — nor 
 
 test("a manual refill holds only the refill lock: a main run meanwhile still applies fees — its own refills wait for the next run, and the decision says why", async (t) => {
   const { autopilot, seams } = autopilotWith(t, { enabled: true, rebalanceEnabled: true, rebalanceDailyBudgetSats: 10_000 });
+  manualRefillsUnchecked(autopilot); // the lock, budget and books are the test — the bare fake node has no such channels
   seams.feeReport = async () => ({ recommendations: [plannedFeeChange("800001x1x0", 500, 420)] });
   const applied: string[] = [];
   seams.feeApply = async (_w, items) => {
@@ -283,6 +286,7 @@ test("a manual refill into or out of a channel whose earlier payment may still l
     }),
   );
   const api = await startApi(t, { node: new FakeLnd(), dir });
+  manualRefillsUnchecked(api.autopilot); // the lock, budget and books are the test — the bare fake node has no such channels
   const ap = api.autopilot as unknown as AutopilotSeams;
   const sent: RebalanceExecParams[] = [];
   ap.rebalanceExec = async (_w, p) => {
@@ -334,6 +338,7 @@ test("the Rebalancing tab's plan comes with today's budget — the confirm dialo
 
 test("a manual refill whose route fails backs off that source → target pair, like the autopilot's own attempts", async (t) => {
   const { autopilot, seams } = autopilotWith(t, {});
+  manualRefillsUnchecked(autopilot); // the lock, budget and books are the test — the bare fake node has no such channels
   seams.rebalanceExec = async (_w, p) => ({ ...failedRebalance(p), failedSourceIds: [p.sourceId] });
   const res = await autopilot.rebalanceByHand({ targetId: "800001x1x0", sourceId: "800002x1x0", amountSats: 400_000, econRatio: 0.8 });
   assert.equal(res?.ok, false);

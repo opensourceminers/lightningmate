@@ -76,8 +76,13 @@ export function budgetBlocked(r: Pick<RebalanceRecommendation, "wouldRebalance" 
  * have routed out (what the tab says). The plan's time goes with it: the
  * server refuses the row once its target was refilled (or tried) after the
  * plan was made — the tab loads its plan once, and a stale row paid a
- * second refill into a target the autopilot had just refilled. Null: the
- * row has nothing to run.
+ * second refill into a target the autopilot had just refilled. The row's
+ * other sources go with it, as the autopilot's own refill has them (the next
+ * one is tried when no route pays from the first); the server checks every
+ * source against the plan's rules as they stand now and gives each the share
+ * it keeps — a row sent one source and no share, and a source that had
+ * routed out since the plan could be taken down to nothing. Null: the row
+ * has nothing to run.
  */
 export function manualRefillRequest(
   r: Pick<
@@ -91,7 +96,8 @@ export function manualRefillRequest(
     | "earningDemandSats"
     | "minNetProfitSats"
     | "estimatedRouteCostPpm"
-  >,
+  > &
+    Partial<Pick<RebalanceRecommendation, "sourceCandidates">>,
   /** The operator's econRatio (the plan's profitShare): the cost cap's
    *  fallback when the row has no max ppm. */
   econRatio = 0.8,
@@ -99,9 +105,11 @@ export function manualRefillRequest(
   planAt?: string,
 ): RebalanceExecRequest | null {
   if (!r.selectedSourceChannel || !r.recommendedAmount) return null;
+  const others = otherSources(r).map((c) => c.channelId);
   return {
     targetId: r.channelId,
     sourceId: r.selectedSourceChannel,
+    ...(others.length ? { otherSourceIds: others } : {}),
     amountSats: r.recommendedAmount,
     econRatio,
     ...(r.maxCostPpm != null ? { maxFeePpm: r.maxCostPpm } : {}),
@@ -116,14 +124,24 @@ export function manualRefillRequest(
   };
 }
 
+/** The row's sources after the one it runs from: those the plan did not
+ *  rule out, in its order — where the refill goes on when no route pays
+ *  from the first. */
+function otherSources(r: Pick<RebalanceRecommendation, "selectedSourceChannel"> & Partial<Pick<RebalanceRecommendation, "sourceCandidates">>) {
+  return (r.sourceCandidates ?? []).filter((c) => !c.rejected && c.channelId !== r.selectedSourceChannel);
+}
+
 /** A refused manual refill the tab answers by loading a fresh plan: the
- *  row's target was refilled (or tried) after the plan was made (409
- *  stale_plan). Null: any other error (shown as it is). */
+ *  row's target (or another channel of its peer) was refilled or tried
+ *  after the plan was made (409 stale_plan), or the plan's rules no longer
+ *  allow its channels — its source routed out since, say (409 not_allowed).
+ *  Null: any other error (shown as it is). */
 export function stalePlanRefusal(e: unknown): string | null {
   const err = e as { status?: unknown; body?: unknown; message?: unknown } | null;
   const body = err?.body as { error?: unknown; message?: unknown } | null | undefined;
-  if (err?.status !== 409 || body?.error !== "stale_plan") return null;
-  const why = typeof body.message === "string" && body.message ? body.message : "This channel was refilled (or tried) after this plan was made";
+  if (err?.status !== 409 || (body?.error !== "stale_plan" && body?.error !== "not_allowed")) return null;
+  const fallback = body.error === "stale_plan" ? "This channel was refilled (or tried) after this plan was made" : "This refill's channels changed after this plan was made";
+  const why = typeof body.message === "string" && body.message ? body.message : fallback;
   return `${why.replace(/: reload it$/, "")} — loading a fresh plan, nothing was sent.`;
 }
 
@@ -135,7 +153,8 @@ export function stalePlanRefusal(e: unknown): string | null {
  * an autopilot refill.
  */
 export function confirmRefillText(
-  r: Pick<RebalanceRecommendation, "recommendedAmount" | "alias" | "maxFeeSats" | "maxCostPpm" | "sourceCandidates" | "expectedRevenuePpm">,
+  r: Pick<RebalanceRecommendation, "recommendedAmount" | "alias" | "maxFeeSats" | "maxCostPpm" | "sourceCandidates" | "expectedRevenuePpm"> &
+    Partial<Pick<RebalanceRecommendation, "selectedSourceChannel">>,
   b: RebalanceBudget | null | undefined,
   /** Fee automation is on: only then does the fee engine hold the price. */
   feeAutomation = true,
@@ -153,9 +172,12 @@ export function confirmRefillText(
       ? ` The fee engine then keeps this channel's fee at ≥ ${r.expectedRevenuePpm} ppm — what the refill is valued at — until the refilled sats have routed out ` +
         "(at most 30 days, never above your Max ppm unless you let a refill's cost lift it, and released a week on if they barely move), as after an autopilot refill."
       : "";
+  const from = r.sourceCandidates[0]?.alias ?? "a source channel";
+  // Its other sources, tried in order when no route pays from the first.
+  const next = otherSources({ selectedSourceChannel: r.selectedSourceChannel ?? r.sourceCandidates[0]?.channelId ?? null, sourceCandidates: r.sourceCandidates }).map((c) => c.alias);
   return (
-    `Move ${satsCompact(amount)} into ${r.alias} from ${r.sourceCandidates[0]?.alias ?? "a source channel"} ` +
-    `(a smaller amount if no route takes that much), paying at most ${sats(pays)} sat in routing fees ` +
+    `Move ${satsCompact(amount)} into ${r.alias} from ${from} ` +
+    `(a smaller amount if no route takes that much${next.length ? `; from ${next.join(", then ")} if none pays from ${from}` : ""}), paying at most ${sats(pays)} sat in routing fees ` +
     `(${r.maxCostPpm ?? "—"} ppm at most, and no more than the refill is expected to earn above the minimum).${hold} ` +
     `${budget} It starts this channel's rebalance cooldown, but isn't held back by it. This sends a real payment.`
   );

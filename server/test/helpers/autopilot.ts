@@ -12,7 +12,7 @@ import { FakeMarket } from "./market.js";
 import type { FeeApplyItem, FeeApplyResult } from "../../src/services/fees.js";
 import type { FeeRecommendation, FeeRecReport } from "../../src/services/feeRecommend.js";
 import type { RebalanceExecOptions, RebalanceExecParams, RebalanceExecResult } from "../../src/services/rebalance.js";
-import type { RebalanceRecommendation, RebalanceRecReport } from "../../src/services/rebalanceRecommend.js";
+import type { ManualRefillRules, RebalanceRecommendation, RebalanceRecReport } from "../../src/services/rebalanceRecommend.js";
 import type { SuggestionV2, SuggestV2Report } from "../../src/services/suggestRecommend.js";
 import { FakeLnd } from "./fakeLnd.js";
 import { installFetchMock } from "./fetchMock.js";
@@ -41,6 +41,10 @@ export interface AutopilotSeams {
    *  shutdown check (a stub may ignore them — the books then record a
    *  payment left in flight when the stub returns it). */
   rebalanceExec: (writeLnd: unknown, p: RebalanceExecParams, opts?: RebalanceExecOptions) => Promise<RebalanceExecResult>;
+  /** What the plan's rules say, this minute, of a refill asked for by hand:
+   *  which of its sources may give, the share each keeps and the most it
+   *  gives (review 2026-11-10, REB-3). The real one runs the fee engine. */
+  refillRules: (targetId: string, sourceIds: string[]) => Promise<ManualRefillRules>;
   channelSuggestions: () => Promise<Pick<SuggestV2Report, "suggestions">>;
   /** The economy fee rate an automatic open pays (sat/vB) — LND's estimate;
    *  the fake LND has none unless a test gives it one (null: no open). */
@@ -48,6 +52,26 @@ export interface AutopilotSeams {
   /** The Magma stage — the one that always runs after the fee, rebalance and
    *  channel stages; a test replaces it to look at the disk mid-run. */
   runSell: () => Promise<unknown[]>;
+}
+
+/**
+ * A refill by hand is sent without the plan's rules being asked. The real
+ * check (review 2026-11-10, REB-3: rebalanceByHand asks, with one fee engine
+ * run, whether each source may give liquidity this minute) needs a node with
+ * those channels and their fees — a test of the refill lock, the budget or
+ * the books runs on a bare fake node with a stubbed executor and channel ids
+ * the node has never heard of, and says so with this: every source asked for
+ * is allowed, with no share to keep. No helper installs it by itself; the
+ * rules' own tests (rebalanceManualRules) run without it.
+ */
+export function manualRefillsUnchecked(autopilot: Autopilot): void {
+  (autopilot as unknown as AutopilotSeams).refillRules = async (targetId, sourceIds) => ({
+    targetAlias: targetId,
+    targetRefused: null,
+    peerChannels: [],
+    sources: sourceIds.map((id) => ({ id })),
+    refused: [],
+  });
 }
 
 /**

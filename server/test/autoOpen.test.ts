@@ -733,7 +733,7 @@ test("a peer that says the channel is too BIG is a refusal before anything is br
 
 test("the payback trusts the month-old channels' yield only with enough routing behind it — 10 forwards or 1,000 sat in 30 days; below that only the fee cap applies, and the note says so", async (t) => {
   // The boundary itself.
-  const ev = (forwards: number, earnedSat: number) => ({ channels: 1, capacitySat: 6_000_000, forwards, earnedSat, forwardsRead: true });
+  const ev = (forwards: number, earnedSat: number) => ({ channels: 1, capacitySat: 6_000_000, offline: 0, forwards, earnedSat, forwardsRead: true });
   assert.equal(measuredYield(ev(MIN_YIELD_FORWARDS - 1, MIN_YIELD_EARNED_SAT - 1)), null);
   assert.equal(measuredYield(ev(MIN_YIELD_FORWARDS, 10)), 20, "ten forwards: measured (~20 ppm/yr)");
   assert.equal(measuredYield(ev(1, MIN_YIELD_EARNED_SAT)), 2_028, "1,000 sat: measured");

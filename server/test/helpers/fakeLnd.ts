@@ -198,6 +198,10 @@ export class FakeLnd {
   payOutcome: PayOutcome | ((p: FakePayment) => PayOutcome) = "succeed";
   /** Routing fee charged on successful payments. */
   routingFeeMsat = 2_000;
+  /** The channel a payment back to this node arrives on — the last hop of
+   *  its route, which the peer chooses (a function decides per payment).
+   *  Unset: the one-hop route over 800000x1x0 of before. */
+  payArrivesOn: string | ((p: FakePayment) => string | undefined) | undefined = undefined;
   /** Next channel opens: succeed (pending channel) or fail with this LND status text. */
   openFailure: string | null = null;
   /** The next closes' stream ends in this error (LND's words). */
@@ -861,6 +865,16 @@ export class FakeLnd {
     const ns = String(BigInt(Date.now()) * 1_000_000n);
     const succeeded = p.status === "SUCCEEDED";
     const htlcStatus = p.status === "SUCCEEDED" ? "SUCCEEDED" : p.status === "FAILED" ? "FAILED" : "IN_FLIGHT";
+    const arrivesOn = typeof this.payArrivesOn === "function" ? this.payArrivesOn(p) : this.payArrivesOn;
+    const hop = (channelId: string, feeMsat: string) => ({
+      amt_to_forward_msat: String(p.tokens * 1000),
+      chan_capacity: "5000000",
+      chan_id: chanNumber(channelId),
+      expiry: this.blockHeight + 40,
+      fee_msat: feeMsat,
+      pub_key: p.destination,
+      tlv_payload: true,
+    });
     return {
       creation_date: String(nowSec()),
       creation_time_ns: ns,
@@ -874,17 +888,7 @@ export class FakeLnd {
           resolve_time_ns: p.status === "IN_FLIGHT" ? "0" : ns,
           status: htlcStatus,
           route: {
-            hops: [
-              {
-                amt_to_forward_msat: String(p.tokens * 1000),
-                chan_capacity: "5000000",
-                chan_id: chanNumber("800000x1x0"),
-                expiry: this.blockHeight + 40,
-                fee_msat: p.feeMsat,
-                pub_key: p.destination,
-                tlv_payload: true,
-              },
-            ],
+            hops: arrivesOn ? [hop("800000x1x0", p.feeMsat), hop(arrivesOn, "0")] : [hop("800000x1x0", p.feeMsat)],
             total_amt_msat: String(p.tokens * 1000 + Number(p.feeMsat)),
             total_fees_msat: p.feeMsat,
             total_time_lock: this.blockHeight + 40,

@@ -167,7 +167,7 @@ import {
 } from "../services/magmaApi.js";
 import type { DeskResult } from "../services/magmaDesk.js";
 import type { AmbossStore } from "../services/ambossStore.js";
-import { FeeItemError, RebalanceBudgetError, RefillInFlightError, StalePlanError, ambossFields, termsMatch, type Autopilot, type OfferWrite } from "../services/autopilot.js";
+import { FeeItemError, RebalanceBudgetError, RefillInFlightError, RefillNotAllowedError, StalePlanError, ambossFields, termsMatch, type Autopilot, type OfferWrite } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 import { BackupStore, exportScb, getBackupStatus } from "../services/backup.js";
 import type { EarningsLog } from "../services/earningsLog.js";
@@ -298,6 +298,9 @@ const MAX_CHANNEL_SATS = 1_000_000_000; // 10 BTC
 const MAX_FEE_PPM = 50_000; // 5%
 const MAX_BASE_MSAT = 10_000_000; // 10k sat
 const MAX_REBALANCE_SATS = 100_000_000; // 1 BTC
+/** The sources a manual refill may name beside its first (the plan lists
+ *  three per target). */
+const MAX_MANUAL_SOURCES = 8;
 const MAX_RECEIVE_SATS = 100_000_000; // 1 BTC per invoice
 const MAX_PAY_FEE_SATS = 2_000_000; // routing-fee budget cap
 const MAX_ONCHAIN_SEND_SATS = 1_000_000_000; // 10 BTC per send
@@ -1081,8 +1084,13 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { targetId, sourceId, amountSats, econRatio, maxFeePpm, maxFeeSats, gate, planAt, routeCostPpm } = bodyOf<RebalanceExecRequest>(req);
+      const { targetId, sourceId, otherSourceIds, amountSats, econRatio, maxFeePpm, maxFeeSats, gate, planAt, routeCostPpm } =
+        bodyOf<RebalanceExecRequest>(req);
       const amount = intIn(amountSats, 1000, MAX_REBALANCE_SATS);
+      // The row's other sources (the plan lists a few per target): tried in
+      // order after sourceId. The server checks each against the plan's rules.
+      const others: unknown = otherSourceIds;
+      const othersOk = others === undefined || (Array.isArray(others) && others.length <= MAX_MANUAL_SOURCES && others.every(isChannelId));
       // When the plan the row came from was made (the tab sends its
       // generatedAt): a target refilled since is refused as stale.
       const planOk = planAt === undefined || (typeof planAt === "string" && planAt.length <= 64 && Number.isFinite(Date.parse(planAt)));
@@ -1111,12 +1119,13 @@ export function createApiRouter(
         (maxFeeSats !== undefined && maxSats === null) ||
         (routeCostPpm !== undefined && routeCost === null) ||
         (g !== undefined && (g.revenuePpm === null || g.demandSats === null || g.minNetSats === null)) ||
-        !planOk
+        !planOk ||
+        !othersOk
       ) {
         res.status(400).json({
           error: "bad_request",
           message:
-            "valid targetId/sourceId, amountSats (1k–1 BTC), econRatio (0.05–1) and optional maxFeePpm, maxFeeSats (the most the refill may pay, sat), gate {revenuePpm, demandSats, minNetSats}, routeCostPpm (the plan's route cost) and planAt (when the plan was made, ISO time) required.",
+            `valid targetId/sourceId, amountSats (1k–1 BTC), econRatio (0.05–1) and optional otherSourceIds (up to ${MAX_MANUAL_SOURCES} channel ids), maxFeePpm, maxFeeSats (the most the refill may pay, sat), gate {revenuePpm, demandSats, minNetSats}, routeCostPpm (the plan's route cost) and planAt (when the plan was made, ISO time) required.`,
         });
         return;
       }
@@ -1131,6 +1140,8 @@ export function createApiRouter(
         done = await autopilot.rebalanceByHand({
           targetId,
           sourceId,
+          // (Ids only: the share each keeps is the server's to say — rebalanceByHand.)
+          ...(Array.isArray(others) && others.length ? { sources: [sourceId, ...(others as string[])].map((id) => ({ id })) } : {}),
           amountSats: amount,
           econRatio: ratio,
           ...(maxFee !== null && maxFee !== undefined ? { maxFeePpm: maxFee } : {}),
@@ -1143,7 +1154,20 @@ export function createApiRouter(
         if (err instanceof StalePlanError) {
           // Nothing was sent: the row was planned before its target's last
           // refill — the tab reloads its plan.
-          res.status(409).json({ error: "stale_plan", message: err.message, targetId: err.targetId, lastAt: err.lastAt, planAt: err.planAt });
+          res.status(409).json({
+            error: "stale_plan",
+            message: err.message,
+            targetId: err.targetId,
+            lastAt: err.lastAt,
+            planAt: err.planAt,
+            ...(err.peerChannelId ? { peerChannelId: err.peerChannelId } : {}),
+          });
+          return;
+        }
+        if (err instanceof RefillNotAllowedError) {
+          // Nothing was sent: the plan's rules, as they stand now, don't
+          // allow this refill's channels — the tab reloads its plan.
+          res.status(409).json({ error: "not_allowed", message: err.message, channelId: err.channelId });
           return;
         }
         if (err instanceof RebalanceBudgetError) {

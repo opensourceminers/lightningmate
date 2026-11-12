@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import { PAYMENT_CHECK, REBALANCE_MAX_TIMEOUT_BLOCKS, executeRebalance, pathfindingMs } from "../src/services/rebalance.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
-import { BUYER, autopilotWith, failedRebalance, paidRebalance, plannedRebalance, sellerSetup, type AutopilotSeams } from "./helpers/autopilot.js";
+import { BUYER, autopilotWith, failedRebalance, manualRefillsUnchecked, paidRebalance, plannedRebalance, sellerSetup, type AutopilotSeams } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
 import { AMBOSS_API } from "./helpers/amboss.js";
@@ -206,6 +206,7 @@ test("a manual rebalance still in flight is tracked: logged as it really ended (
   // A main run refreshes Amboss's public sale history in the background.
   installFetchMock(t).onGraphql(AMBOSS_API, "getMarketMetrics", () => ({ data: { getMarketMetrics: { order_details: [] } } }));
   const api = await startApi(t, { node: new FakeLnd() });
+  manualRefillsUnchecked(api.autopilot); // the lock, budget and books are the test — the bare fake node has no such channels
   const ap = api.autopilot as unknown as AutopilotSeams & {
     rebalancePaymentStatus: (id: string) => Promise<unknown>;
     checkInFlightRebalances(): Promise<void>;

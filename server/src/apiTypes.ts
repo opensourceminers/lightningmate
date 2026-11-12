@@ -355,9 +355,15 @@ export interface UnservedDemandReport {
   channels: UnservedDemandChannel[];
 }
 
-/** A refill by hand (POST /rebalance/execute): the executor's parameters
- *  (one source), and when the plan the row came from was made. */
+/** A refill by hand (POST /rebalance/execute): the executor's parameters,
+ *  the row's sources by id, and when the plan the row came from was made.
+ *  The server checks every source against the plan's rules as they stand
+ *  now and gives each the share it keeps (409 not_allowed when none may
+ *  give, or the target is never refilled). */
 export type RebalanceExecRequest = Omit<RebalanceExecParams, "sources"> & {
+  /** The row's other sources, in the plan's order: tried when no route pays
+   *  from `sourceId` (as the autopilot's own refill does). */
+  otherSourceIds?: string[];
   /** When the plan the row came from was made (its generatedAt): a target
    *  refilled — or tried — since then is refused (409 stale_plan). */
   planAt?: string;

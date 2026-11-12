@@ -54,6 +54,7 @@ import {
   magmaFillsPerYear,
   measuredYield,
   monthOldChannels,
+  offlineYieldWords,
   planOpen,
   unmeasuredYieldText,
   type OpenContext,
@@ -91,14 +92,29 @@ import {
   sellableSats,
   stepBackSellableMin,
   type CooldownInput,
+  type FeeEngineInputs,
   type FeeRecConfig,
   type FeeRecommendation,
 } from "./feeRecommend.js";
 import { FeeChangeLog, type FeeChangeRecord } from "./feeChangeLog.js";
 import { getAlias } from "./aliases.js";
-import { REBALANCE_HARD_TIMEOUT_MS, executeRebalance, type RebalanceExecOptions, type RebalanceExecParams, type RebalanceExecResult, type RefillHooks } from "./rebalance.js";
+import {
+  REBALANCE_HARD_TIMEOUT_MS,
+  executeRebalance,
+  landedOn,
+  type PaidPath,
+  type PeerChannelBefore,
+  type RebalanceExecOptions,
+  type RebalanceExecParams,
+  type RebalanceExecResult,
+  type RebalanceSource,
+  type RefillHooks,
+} from "./rebalance.js";
 import {
   getRebalanceRecommendations,
+  manualRefillRules,
+  type ManualRefillRules,
+  type RebalanceRecOptions,
   selectRebalanceRuns,
   type RebalanceRecConfig,
   type RebalanceRecReport,
@@ -191,9 +207,37 @@ export class StalePlanError extends Error {
     readonly lastAt: string,
     /** When the plan the request came from was made. */
     readonly planAt: string,
+    /** It was another channel of the target's peer that was refilled: a
+     *  refill reaches the peer over any of its channels (REB-2), so the row
+     *  describes a peer that is no longer as drained as it reads. */
+    readonly peerChannelId?: string,
   ) {
-    super("This channel was refilled (or tried) after this plan was made: reload it");
+    super(
+      peerChannelId
+        ? "Another channel of this channel's peer was refilled (or tried) after this plan was made: reload it"
+        : "This channel was refilled (or tried) after this plan was made: reload it",
+    );
     this.name = "StalePlanError";
+  }
+}
+
+/**
+ * A refill by hand the plan's rules do not allow now (manualRefillRules):
+ * refused before anything is sent — the API answers 409 and the Rebalancing
+ * tab reloads its plan. Its source may give nothing this minute (it routed
+ * out since the plan was made, was sold, is draining, belongs to the
+ * target's own peer …), or its target was bought on Magma and is still in
+ * its lease (review 2026-11-10, REB-3: nothing about the channels was
+ * checked, and a manual refill took a source at 15 % local down to 0.5 %).
+ */
+export class RefillNotAllowedError extends Error {
+  constructor(
+    /** The channel the rules refuse: the target, or the first source. */
+    readonly channelId: string,
+    message: string,
+  ) {
+    super(message);
+    this.name = "RefillNotAllowedError";
   }
 }
 
@@ -545,6 +589,10 @@ interface PendingRebalance {
    *  with it): the log record gets them once it lands. */
   targetSentBefore?: number;
   holdPpm?: number;
+  /** The target's peer's other channels with us as they stood before it:
+   *  the peer chooses which channel the payment arrives on, and the log
+   *  record follows the sats (landedOn). */
+  peerChannels?: PeerChannelBefore[];
 }
 
 interface PersistedState {
@@ -3206,9 +3254,11 @@ export class Autopilot {
   /** The sources a planned refill may pull from, in order: those whose route
    *  didn't fail the probe, not busy with a payment in flight, and whose pair
    *  with this target isn't backing off. */
-  private refillSources(r: RebalanceRecommendation, inFlight: Set<string>, cooldownMin: number): { id: string; keepRatio?: number }[] {
-    const listed = r.sourceCandidates?.length
-      ? r.sourceCandidates.filter((c) => !c.rejected).map((c) => ({ id: c.channelId, keepRatio: c.keepRatio }))
+  private refillSources(r: RebalanceRecommendation, inFlight: Set<string>, cooldownMin: number): RebalanceSource[] {
+    const listed: RebalanceSource[] = r.sourceCandidates?.length
+      ? // (Each gives no more than the plan found it can spare — its peer's
+        // channels together, less the plan's earlier moves: REB-2.)
+        r.sourceCandidates.filter((c) => !c.rejected).map((c) => ({ id: c.channelId, keepRatio: c.keepRatio, maxSats: c.spareSats }))
       : r.selectedSourceChannel
         ? [{ id: r.selectedSourceChannel }]
         : [];
@@ -3260,6 +3310,14 @@ export class Autopilot {
     // source: once its cooldown is over, a second rebalance of it could start
     // while the first may still land — moving twice what was planned.
     const inFlight = new Set((this.state.pendingRebalances ?? []).flatMap((p) => [p.targetId, ...(p.sourceId ? [p.sourceId] : [])]));
+    // A peer's channels wait together (review 2026-11-10, REB-2): a payment
+    // toward a peer may arrive on any of its channels with us, so one still
+    // in flight into a channel, or a refill of it within its cooldown, holds
+    // the peer's other channels back too. (Before, the refill that arrived on
+    // the other channel left the planned one drained, and it was refilled
+    // again one cooldown later.)
+    const inFlightInto = new Set((this.state.pendingRebalances ?? []).map((p) => p.targetId));
+    const withPeer = (r: RebalanceRecommendation) => [r.channelId, ...(r.peerChannels ?? [])];
     const report = await this.rebalanceReport();
     const profitable = report.recommendations.filter((r) => r.wouldRebalance && r.recommendedAmount);
     const waiting: string[] = [];
@@ -3269,8 +3327,16 @@ export class Autopilot {
         waiting.push(`${r.alias}: a payment into it is still in flight`);
         continue;
       }
+      if (withPeer(r).some((id) => inFlightInto.has(id))) {
+        waiting.push(`${r.alias}: a payment into its peer's other channel is still in flight`);
+        continue;
+      }
       if (!this.rebalanceCooldownOk(r.channelId, rebalanceCooldownMinutes)) {
         waiting.push(`${r.alias}: refilled or tried within its cooldown`);
+        continue;
+      }
+      if (!withPeer(r).every((id) => this.rebalanceCooldownOk(id, rebalanceCooldownMinutes))) {
+        waiting.push(`${r.alias}: its peer's other channel was refilled or tried within its cooldown`);
         continue;
       }
       const sources = this.refillSources(r, inFlight, rebalanceCooldownMinutes);
@@ -3312,8 +3378,15 @@ export class Autopilot {
       }
       // (A payment of this run left in flight takes its channels out too.)
       const sources = (sourcesOf.get(r) ?? []).filter((s) => !inFlight.has(s.id));
-      if (inFlight.has(r.channelId) || sources.length === 0) {
+      if (inFlight.has(r.channelId) || withPeer(r).some((id) => inFlightInto.has(id)) || sources.length === 0) {
         waiting.push(`${r.alias}: its channels are busy with a payment still in flight`);
+        continue;
+      }
+      // (A refill of this run into the peer's other channel started that
+      // channel's cooldown: the plan lists one refill per peer, and the stage
+      // sends no second one whatever the plan says.)
+      if (!(r.peerChannels ?? []).every((id) => this.rebalanceCooldownOk(id, rebalanceCooldownMinutes))) {
+        waiting.push(`${r.alias}: its peer's other channel was refilled or tried within its cooldown`);
         continue;
       }
       // (The books start the target's cooldown — refillBooks.)
@@ -3371,6 +3444,7 @@ export class Autopilot {
         // counts as spent (pendingRebalances), and the books are settled when
         // a later run learns how it ended.
         inFlight.add(res.targetId).add(res.sourceId);
+        inFlightInto.add(res.targetId);
         out.push({ alias: res.targetAlias, amountSats: res.amountSats, feeSats: null, costPpm: null, ok: false, inFlight: true, error: res.error });
         continue;
       }
@@ -3445,12 +3519,21 @@ export class Autopilot {
    *  profit gate — the autopilot's, or one run by hand from a recommended row
    *  (the gate went with it) — carries the price the gate valued it at: the
    *  fee engine holds it while the refilled sats are in the channel. One run
-   *  by hand without the gate chose its own price and sets no floor. */
+   *  by hand without the gate chose its own price and sets no floor.
+   *
+   *  The record follows the sats (review 2026-11-10, REB-2): a paid refill
+   *  that arrived on another channel of the target's peer (`res.landed`) is
+   *  that channel's — its id, its "sent" counter from before — so the fee
+   *  engine's refill lot and hold stand where the sats are, and the channel
+   *  it was planned for is kept beside it (plannedTargetId). */
   private rebalanceRecord(res: RebalanceExecResult, via: "autopilot" | "manual", holdPpm?: number | null): RebalanceRecord {
+    const landed = res.ok ? res.landed : undefined;
+    const sentBefore = landed ? landed.sentBefore : res.targetSentBefore;
     return {
       at: new Date().toISOString(),
       via,
-      targetId: res.targetId,
+      targetId: landed?.id ?? res.targetId,
+      ...(landed ? { plannedTargetId: res.targetId } : {}),
       targetAlias: res.targetAlias,
       sourceId: res.sourceId,
       sourceAlias: res.sourceAlias,
@@ -3461,7 +3544,7 @@ export class Autopilot {
       ok: res.ok,
       error: res.error,
       ...(res.paymentId ? { paymentId: res.paymentId } : {}),
-      ...(res.targetSentBefore !== undefined ? { targetSentBefore: res.targetSentBefore } : {}),
+      ...(sentBefore !== undefined ? { targetSentBefore: sentBefore } : {}),
       ...(res.ok && holdPpm != null ? { holdPpm } : {}),
     };
   }
@@ -3491,7 +3574,8 @@ export class Autopilot {
    * fee engine holds that price while the refilled sats are in the channel.
    * It is booked at no more than the target's fee as the executor read it
    * when the refill was sent (heldAt): in the write-ahead record and in the
-   * log record alike.
+   * log record alike — and, for a refill that arrived on another channel of
+   * the target's peer, at no more than that channel's fee.
    */
   private refillBooks(meta: { targetId: string; via: "autopilot" | "manual"; holdPpm?: number | null }) {
     const sent = new Map<string, PendingRebalance>();
@@ -3511,6 +3595,7 @@ export class Autopilot {
       maxFeeSats: number;
       targetSentBefore?: number;
       targetPpm?: number;
+      peerChannels?: PeerChannelBefore[];
     }): PendingRebalance => {
       const at = new Date().toISOString();
       const hold = heldAt(meta.holdPpm, p.targetPpm);
@@ -3527,6 +3612,7 @@ export class Autopilot {
         via: meta.via,
         ...(p.targetSentBefore !== undefined ? { targetSentBefore: p.targetSentBefore } : {}),
         ...(hold != null ? { holdPpm: hold } : {}),
+        ...(p.peerChannels?.length ? { peerChannels: p.peerChannels } : {}),
       };
     };
     const hooks: RefillHooks = {
@@ -3540,6 +3626,7 @@ export class Autopilot {
           maxFeeSats: a.maxFeeSats,
           targetSentBefore: a.targetSentBefore,
           targetPpm: a.targetPpm,
+          peerChannels: a.peerChannels,
         });
         (this.state.pendingRebalances ??= []).push(entry);
         try {
@@ -3593,6 +3680,7 @@ export class Autopilot {
                 maxFeeSats,
                 targetSentBefore: res.targetSentBefore,
                 targetPpm: res.targetPpm,
+                peerChannels: res.peerChannels,
               }),
             );
           }
@@ -3607,7 +3695,7 @@ export class Autopilot {
           // that ends after a restart.
           const entry = res.paymentId ? sent.get(res.paymentId) : undefined;
           this.rebalanceLog.append({
-            ...this.rebalanceRecord(res, meta.via, heldAt(meta.holdPpm, res.targetPpm)),
+            ...this.rebalanceRecord(res, meta.via, heldAt(meta.holdPpm, res.ok && res.landed ? res.landed.ppm : res.targetPpm)),
             ...(entry ? { startedAt: entry.at } : {}),
           });
           if (entry) this.dropPending(entry.id);
@@ -3672,7 +3760,7 @@ export class Autopilot {
         done.add(p);
         continue;
       }
-      let st: { state: "confirmed"; feeSats: number } | { state: "failed" | "pending" };
+      let st: { state: "confirmed"; feeSats: number; paths?: readonly PaidPath[] } | { state: "failed" | "pending" };
       try {
         st = await this.rebalancePaymentStatus(p.id);
       } catch {
@@ -3685,6 +3773,11 @@ export class Autopilot {
       if (givenUp() || this.rebalanceLog.hasPayment(p.id) || !(this.state.pendingRebalances ?? []).includes(p)) continue;
       const manual = p.via === "manual";
       const ok = st.state === "confirmed";
+      // Where it arrived: on the channel it was planned for, or on another
+      // one of that peer — then that one's record (rebalanceRecord).
+      const landed = st.state === "confirmed" ? landedOn(st.paths, p.targetId, p.peerChannels ?? []) : null;
+      const sentBefore = landed ? landed.sentBefore : p.targetSentBefore;
+      const hold = ok ? heldAt(p.holdPpm, landed ? landed.ppm : undefined) : null;
       if (p.sourceId) this.notePairs(p.targetId, { ok, sourceId: p.sourceId, failedSourceIds: ok ? [] : [p.sourceId] });
       // Written with the time it was sent: its fee belongs to that day's
       // budget (the maximum fee was charged there meanwhile).
@@ -3692,7 +3785,8 @@ export class Autopilot {
         at: new Date().toISOString(),
         startedAt: p.at,
         via: manual ? "manual" : "autopilot",
-        targetId: p.targetId,
+        targetId: landed?.id ?? p.targetId,
+        ...(landed ? { plannedTargetId: p.targetId } : {}),
         targetAlias: p.alias,
         sourceId: p.sourceId ?? "",
         sourceAlias: p.sourceAlias ?? "",
@@ -3703,10 +3797,10 @@ export class Autopilot {
         ok,
         error: ok ? undefined : "the payment that was still in flight failed",
         paymentId: p.id,
-        ...(p.targetSentBefore !== undefined ? { targetSentBefore: p.targetSentBefore } : {}),
+        ...(sentBefore !== undefined ? { targetSentBefore: sentBefore } : {}),
         // (Only a refill that passed the gate carries a hold — a manual one
         // run with it too; see refillBooks.)
-        ...(ok && p.holdPpm != null ? { holdPpm: p.holdPpm } : {}),
+        ...(hold != null ? { holdPpm: hold } : {}),
       });
       done.add(p);
       console.log(`[autopilot] in-flight rebalance ${p.id.slice(0, 12)}… ended ${st.state}${ok ? ` (fee ${(st as { feeSats: number }).feeSats} sat)` : ""}`);
@@ -3748,35 +3842,69 @@ export class Autopilot {
    * refused (StalePlanError): the row was planned for a channel that is no
    * longer the one it describes (review of P3: a stale row paid a second
    * refill into a target the autopilot had just refilled). A request
-   * without it (an API client of its own) is not checked.
+   * without it (an API client of its own) is not checked. The same holds
+   * for a refill of another channel of the target's peer since the plan —
+   * it reached that peer (REB-2).
+   *
+   * Its channels are checked against the plan's rules as they stand now
+   * (review 2026-11-10, REB-3 — refillRules): each source asked for must be
+   * one the plan would list this minute, and the executor gets it with the
+   * share it keeps and the most it gives, from those rules — whatever the
+   * request says of either. A source the rules refuse is left out; with none
+   * left, or a target bought on Magma in its lease, nothing is sent
+   * (RefillNotAllowedError). Before, the row's one source went out without
+   * its share, and a source that had routed down to 15 % local since the
+   * plan was taken to 0.5 %.
    */
   async rebalanceByHand(params: RebalanceExecParams & { planAt?: string }): Promise<RebalanceExecResult | null> {
     const writeLnd = this.writeLnd;
     if (!writeLnd) throw new Error("writing is disabled");
     if (this.refilling || this.shuttingDown) return null;
-    const busy = this.inFlightThrough([params.targetId, params.sourceId, ...(params.sources ?? []).map((s) => s.id)]);
+    const asked = [...new Set([params.sourceId, ...(params.sources ?? []).map((s) => s.id)])];
+    const busy = this.inFlightThrough([params.targetId, ...asked]);
     if (busy) throw new RefillInFlightError(busy.channelId, busy.payment);
     const { planAt, ...exec } = params;
-    // The target's last refill (or try): when it started — the cooldown
+    // A channel's last refill (or try): when it started — the cooldown
     // stamp — and when it ended, as booked. A plan made while one was under
     // way read the channel drained and is as stale as one made before it:
     // the start alone let it through (review of P4: a plan stamped between
     // an autopilot refill's start and its landing paid a second refill).
-    const lastAt = [this.state.perTargetLastRebalanced[params.targetId], this.rebalanceLog.lastInto(params.targetId)]
-      .filter((at): at is string => typeof at === "string" && Number.isFinite(Date.parse(at)))
-      .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
-    if (planAt !== undefined && lastAt !== undefined && Date.parse(lastAt) > Date.parse(planAt)) {
-      throw new StalePlanError(params.targetId, lastAt, planAt);
-    }
+    const refilledSince = (channelId: string): string | null => {
+      const lastAt = [this.state.perTargetLastRebalanced[channelId], this.rebalanceLog.lastInto(channelId)]
+        .filter((at): at is string => typeof at === "string" && Number.isFinite(Date.parse(at)))
+        .sort((a, b) => Date.parse(b) - Date.parse(a))[0];
+      return planAt !== undefined && lastAt !== undefined && Date.parse(lastAt) > Date.parse(planAt) ? lastAt : null;
+    };
+    const stale = refilledSince(params.targetId);
+    if (stale && planAt !== undefined) throw new StalePlanError(params.targetId, stale, planAt);
     const budget = this.rebalanceBudget();
     if (budget.leftSats !== null && budget.leftSats <= 0) throw new RebalanceBudgetError(budget);
     this.refilling = { by: "manual", since: Date.now(), givenUp: () => false };
     try {
+      // Under the lock: the rules are read from the node as it stands, and
+      // nothing else refills between that and the payment.
+      const rules = await this.refillRules(params.targetId, asked);
+      if (rules.targetRefused) {
+        throw new RefillNotAllowedError(params.targetId, `${rules.targetAlias} is never refilled: ${rules.targetRefused}`);
+      }
+      for (const id of rules.peerChannels) {
+        const at = refilledSince(id);
+        if (at && planAt !== undefined) throw new StalePlanError(params.targetId, at, planAt, id);
+      }
+      if (rules.sources.length === 0) {
+        const [first, ...more] = rules.refused;
+        throw new RefillNotAllowedError(
+          first?.id ?? params.sourceId,
+          more.length === 0
+            ? `${first?.alias ?? params.sourceId} can't give liquidity now: ${first?.why ?? "it is not an open channel"}`
+            : `None of this refill's sources can give liquidity now — ${rules.refused.map((r) => `${r.alias}: ${r.why}`).join("; ")}`,
+        );
+      }
       const maxFeeSats = Math.min(params.maxFeeSats ?? Infinity, budget.leftSats ?? Infinity);
       return await this.refillBooks({ targetId: params.targetId, via: "manual", holdPpm: params.gate?.revenuePpm ?? null }).settle((hooks) =>
         this.rebalanceExec(
           writeLnd,
-          { ...exec, ...(Number.isFinite(maxFeeSats) ? { maxFeeSats } : {}) },
+          { ...exec, sourceId: rules.sources[0].id, sources: rules.sources, ...(Number.isFinite(maxFeeSats) ? { maxFeeSats } : {}) },
           { ...hooks, shouldStop: () => this.shuttingDown },
         ),
       );
@@ -4053,6 +4181,7 @@ export class Autopilot {
       heldSat: hold.heldSat,
       feeRate: rate,
       yieldPpmYear: earning?.ppmYear ?? null,
+      yieldEvidence: earning?.evidence ?? null,
       maxRaiseSat: Math.floor((earning?.capitalSat ?? pre.chainSat) * MAX_CAPITAL_SHARE_PER_OPEN),
       peers: this.state.peerOpenFailures ?? {},
       connected,
@@ -4239,10 +4368,13 @@ export class Autopilot {
    * What a sat in this node's month-old channels earned (ppm/yr, the last
    * 30 days, capacity-weighted) — what a new channel's open and close must
    * pay back — with what that stands on, and the node's capital (on chain +
-   * its side of open channels). Yield null: no channel older than a month,
-   * or too little routing through them to tell (measuredYield) — then there
-   * is nothing to measure a payback against, and only the maximum fee rate
-   * applies (a node can always open its first channels).
+   * its side of open channels). Every open month-old channel counts, its peer
+   * connected or not (monthOldChannels, CHAN-1). Yield null: no channel older
+   * than a month, too little routing through them to tell (measuredYield), or
+   * a forwarding history LND handed over only in part (CHAN-13: a part of
+   * the earnings is not a measurement) — then there is nothing to measure a
+   * payback against, and only the maximum fee rate applies (a node can
+   * always open its first channels).
    *
    * (The Magma comparison, D10, quotes the same capacity-weighted figure
    * since 2026-10-25 — it asked what the MEDIAN month-old channel earned, 0
@@ -4262,9 +4394,10 @@ export class Autopilot {
       const evidence: YieldEvidence = {
         channels: aged.length,
         capacitySat: aged.reduce((s, c) => s + c.capacity, 0),
+        offline: aged.filter((c) => !c.active).length,
         forwards: aged.reduce((s, c) => s + (stats.get(c.id)?.forwardCount ?? 0), 0),
         earnedSat: aged.reduce((s, c) => s + (stats.get(c.id)?.feesEarnedSats ?? 0), 0),
-        forwardsRead: report !== null,
+        forwardsRead: report !== null && report.complete,
       };
       return { ppmYear: measuredYield(evidence), capitalSat, evidence };
     } catch {
@@ -6499,7 +6632,7 @@ export class Autopilot {
       text:
         `${fmtSat(heldSat)} sat held for Magma — what your offer can list (spendable, within your deploy cap): selling there is expected to earn more on it ` +
         `(~${leasePpmYear} ppm/yr: offers like yours fill ~${fills.perYear.toFixed(1)} times a year${ownLine}) than a routing channel ` +
-        `(~${routing} ppm/yr: what a sat of month-old channels here earned, capacity-weighted)`,
+        `(~${routing} ppm/yr: what a sat of month-old channels here earned, capacity-weighted${offlineYieldWords(ev) ? ` — ${offlineYieldWords(ev)}` : ""})`,
     });
   }
 
@@ -7595,8 +7728,18 @@ export class Autopilot {
    *  LSPS1 (never a source). The one place its inputs are built: the
    *  Rebalancing tab (rebalanceRecommendations) and the stage share it. */
   private async rebalanceReport(): Promise<Pick<RebalanceRecReport, "recommendations"> & Partial<RebalanceRecReport>> {
-    return getRebalanceRecommendations(
-      this.readLnd,
+    const [engine, opts] = await this.refillPlanInputs();
+    return getRebalanceRecommendations(this.readLnd, engine, opts);
+  }
+  /** What the plan's rules say this minute of a refill by hand — from the
+   *  plan's own inputs, without asking for a route (manualRefillRules). */
+  private async refillRules(targetId: string, sourceIds: string[]): Promise<ManualRefillRules> {
+    const [engine, opts] = await this.refillPlanInputs();
+    return manualRefillRules(this.readLnd, engine, opts, { targetId, sourceIds });
+  }
+  /** The refill plan's inputs: the fee engine's, and the leases. */
+  private async refillPlanInputs(): Promise<[FeeEngineInputs, RebalanceRecOptions]> {
+    return [
       {
         rebalanceRecords: this.rebalanceLog.successes(floorWindowStart()),
         cooldown: this.feeCooldown(),
@@ -7618,7 +7761,7 @@ export class Autopilot {
           .filter((p) => !!p.channelId)
           .map((p) => ({ channelId: p.channelId as string, leaseBlocks: p.leaseBlocks })),
       },
-    );
+    ];
   }
   private rebalanceExec(writeLnd: AuthenticatedLnd, params: RebalanceExecParams, opts: RebalanceExecOptions = {}) {
     return executeRebalance(this.readLnd, writeLnd, params, opts);
@@ -7626,10 +7769,11 @@ export class Autopilot {
   /** How a rebalance payment we stopped waiting for has ended. */
   private async rebalancePaymentStatus(
     id: string,
-  ): Promise<{ state: "confirmed"; feeSats: number } | { state: "failed" | "pending" }> {
+  ): Promise<{ state: "confirmed"; feeSats: number; paths?: readonly PaidPath[] } | { state: "failed" | "pending" }> {
     try {
       const p = await getPayment({ lnd: this.writeLnd ?? this.readLnd, id });
-      if (p.is_confirmed && p.payment) return { state: "confirmed", feeSats: p.payment.safe_fee ?? p.payment.fee };
+      // (Its paths say which channel it came back through — landedOn.)
+      if (p.is_confirmed && p.payment) return { state: "confirmed", feeSats: p.payment.safe_fee ?? p.payment.fee, paths: p.payment.paths };
       return { state: p.is_failed ? "failed" : "pending" };
     } catch (err) {
       // 404 SentPaymentNotFound: it never reached LND.

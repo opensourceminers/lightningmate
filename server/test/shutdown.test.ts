@@ -23,7 +23,7 @@ import { flushHtlcTelemetry, initHtlcTelemetry, recordForwardEvent, stopHtlcTele
 import type { RebalanceRecommendation } from "../src/services/rebalanceRecommend.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
 import { feeNode, type FeeChannel } from "./helpers/feeNode.js";
-import { BUYER, autopilotWith, paidRebalance, plannedRebalance, sellerSetup, suggestion } from "./helpers/autopilot.js";
+import { BUYER, autopilotWith, manualRefillsUnchecked, paidRebalance, plannedRebalance, sellerSetup, suggestion } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { makeTempDir, type AfterHook } from "./helpers/tmp.js";
 
@@ -288,6 +288,7 @@ test("the shutdown waits for an autopilot payment still in flight", async (t) =>
 
 test("the shutdown waits for a manual refill's payment still in flight too — it no longer holds the main run's lock", async (t) => {
   const { autopilot, seams } = autopilotWith(t, {});
+  manualRefillsUnchecked(autopilot); // the lock, budget and books are the test — the bare fake node has no such channels
   const { released, release } = heldUntilReleased(t);
   let paying = false;
   seams.rebalanceExec = async (_writeLnd, p) => {

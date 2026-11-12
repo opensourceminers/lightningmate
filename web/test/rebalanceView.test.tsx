@@ -167,6 +167,25 @@ test("'Run it' sends the row's fee caps and the profit gate — the cap the dial
   assert.doesNotMatch(tab, /econRatio: 0\.8/, "the operator's econRatio, not a constant");
 });
 
+// Review 2026-11-10, REB-3: the row's one source went alone and without the
+// share a source keeps — a source that had routed out since the plan was
+// taken down to nothing, and a run with no route from it stopped there.
+test("'Run it' names the row's other sources too — those the plan did not rule out, in its order; the shares they keep are the server's to set — and the dialog says where the refill goes on", () => {
+  const cand = (channelId: string, alias: string, o: object = {}) => ({ channelId, alias, localRatio: 0.9, spareSats: 1_000_000, keepRatio: 0.55, reason: "", ...o });
+  const row = recommended({
+    sourceCandidates: [cand("850000x2x0", "src"), cand("850000x3x0", "next"), cand("850000x4x0", "pricey", { rejected: true, rejectedReason: "no route within 320 ppm" }), cand("850000x5x0", "last")],
+  });
+  const request = manualRefillRequest(row, 0.7);
+  assert.equal(request?.sourceId, "850000x2x0");
+  assert.deepEqual(request?.otherSourceIds, ["850000x3x0", "850000x5x0"]);
+  assert.ok(request && !("sources" in request) && !("keepRatio" in request), "no share is sent: the server's rules set it");
+  assert.equal(manualRefillRequest(recommended(), 0.7)?.otherSourceIds, undefined, "one source: none named");
+  assert.match(
+    confirmRefillText(row, budget({ leftSats: 5_000 })),
+    /^Move 750.0k into router from src \(a smaller amount if no route takes that much; from next, then last if none pays from src\), paying at most 380 sat in routing fees/,
+  );
+});
+
 // Review of P7 (a P3 gap): a run whose planned size the cap no longer allows
 // (today's budget left shrank since the plan) tries the largest size that
 // fits at the plan's route cost before the halves — the server needs it.
@@ -181,6 +200,14 @@ test("a Run from the tab carries its plan's time: a row whose target was refille
   assert.equal(manualRefillRequest(recommended(), 0.8)?.planAt, undefined, "no plan time: none sent");
   const refused = { status: 409, body: { error: "stale_plan", message: "This channel was refilled (or tried) after this plan was made: reload it" } };
   assert.equal(stalePlanRefusal(refused), "This channel was refilled (or tried) after this plan was made — loading a fresh plan, nothing was sent.");
+  // So is a row whose channels the plan's rules no longer allow (409
+  // not_allowed): its source routed out since the plan was made.
+  const gone = { status: 409, body: { error: "not_allowed", message: "src can't give liquidity now: it holds 15% locally — a source holds 70% or more (20% above its 50% target)" } };
+  assert.equal(
+    stalePlanRefusal(gone),
+    "src can't give liquidity now: it holds 15% locally — a source holds 70% or more (20% above its 50% target) — loading a fresh plan, nothing was sent.",
+  );
+  assert.equal(stalePlanRefusal({ status: 409, body: { error: "not_allowed" } }), "This refill's channels changed after this plan was made — loading a fresh plan, nothing was sent.");
   // Any other refusal is shown as it is.
   assert.equal(stalePlanRefusal({ status: 409, body: { error: "busy" } }), null);
   assert.equal(stalePlanRefusal(new Error("boom")), null);

@@ -335,7 +335,7 @@ test("a source the planner probed without a passing route is not handed to the e
         selectedSourceChannel: "800002x1x0",
         // As planRebalances leaves them: the passing source first, then the
         // one probed before it (no route passed), then one not probed.
-        sourceCandidates: [cand("800002x1x0"), cand("800000x1x0", { rejected: true, rejectedReason: "cheapest route 900 ppm, max 320" }), cand("800003x1x0")],
+        sourceCandidates: [cand("800002x1x0"), cand("800000x1x0", { rejected: true, rejectedReason: "no route within 320 ppm — the one LND offers costs 900 ppm" }), cand("800003x1x0")],
       },
     ],
   });

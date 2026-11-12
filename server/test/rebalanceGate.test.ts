@@ -33,7 +33,7 @@ import { RebalanceLog, type RebalanceRecord } from "../src/services/rebalanceLog
 import type { ChannelView } from "../src/services/channels.js";
 import { chanNumber, feeNode, forwardsOut, withMarket, type FakeForward, type FeeChannel } from "./helpers/feeNode.js";
 import { INVOICE_FEATURE } from "./helpers/fakeLnd.js";
-import { autopilotWith, paidRebalance, plannedRebalance } from "./helpers/autopilot.js";
+import { autopilotWith, manualRefillsUnchecked, paidRebalance, plannedRebalance } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import type { RebalanceExecParams } from "../src/services/rebalance.js";
 
@@ -199,7 +199,7 @@ test("a source that was never tried — too little to spare, or no fee room at a
     ],
   });
   const { autopilot, seams } = autopilotWith(t, { rebalanceEnabled: true, rebalanceDailyBudgetSats: 10_000 }, {}, {}, node);
-  const cand = (channelId: string, keepRatio: number) => ({ channelId, alias: channelId, localRatio: 0.6, spareSats: 150_000, keepRatio, reason: "" });
+  const cand = (channelId: string, keepRatio: number, spareSats: number) => ({ channelId, alias: channelId, localRatio: 0.6, spareSats, keepRatio, reason: "" });
   seams.rebalanceReport = async () => ({
     recommendations: [
       {
@@ -209,9 +209,11 @@ test("a source that was never tried — too little to spare, or no fee room at a
         recommendedAmount: 750_000,
         selectedSourceChannel: "850000x4x0",
         sourceCandidates: [
-          cand("850000x4x0", 0.6), // 1.8M of 3M, keeping 60 %: nothing to spare
-          cand("850000x3x0", 0.55), // keeping 55 %: 150k, which earns 60 sat < the 100 sat minimum
-          cand("850000x2x0", 0.55), // 1.05M to spare
+          // (What the plan found each can spare is the most it gives — review
+          // 2026-11-10, REB-3; the first one's has gone since the plan.)
+          cand("850000x4x0", 0.6, 150_000), // 1.8M of 3M, keeping 60 %: nothing to spare
+          cand("850000x3x0", 0.55, 150_000), // keeping 55 %: 150k, which earns 60 sat < the 100 sat minimum
+          cand("850000x2x0", 0.55, 1_050_000), // 1.05M to spare
         ],
         estimatedRouteFeeSats: 20,
         expectedNetProfitSats: 100,
@@ -674,6 +676,7 @@ test("the autopilot hands the executor the plan's route cost — and the manual 
   assert.equal(got[0]?.routeCostPpm, 300);
   // By hand: through the API, validated, to the executor.
   const api = await startApi(t);
+  manualRefillsUnchecked(api.autopilot); // the lock, budget and books are the test — the bare fake node has no such channels
   const manual: RebalanceExecParams[] = [];
   (api.autopilot as unknown as { rebalanceExec: (w: unknown, p: RebalanceExecParams) => Promise<unknown> }).rebalanceExec = async (_w, p) => {
     manual.push(p);

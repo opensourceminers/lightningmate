@@ -4,7 +4,15 @@ export interface RebalanceRecord {
   /** When the record was written: when the rebalance ended. */
   at: string;
   via: "manual" | "autopilot";
+  /** The channel the sats arrived on. For a paid refill of a peer with
+   *  several channels that is the one LND's payment came back through — the
+   *  peer chooses it — which need not be the one it was planned for
+   *  (plannedTargetId). Everything that follows the sats reads this: the fee
+   *  engine's refill lots and hold, the outcomes, the costs per channel. */
   targetId: string;
+  /** The channel the refill was planned for, where the sats arrived on
+   *  another channel of its peer (review 2026-11-10, REB-2). */
+  plannedTargetId?: string;
   targetAlias: string;
   sourceId: string;
   sourceAlias: string;
@@ -266,12 +274,12 @@ export class RebalanceLog {
     return this.records.some((r) => r.paymentId === paymentId);
   }
 
-  /** When the latest refill into `targetId` — paid or failed — was booked
-   *  (it ended then), or null. */
+  /** When the latest refill into `targetId` — paid or failed, planned for
+   *  it or arrived on it — was booked (it ended then), or null. */
   lastInto(targetId: string): string | null {
     let latest: string | null = null;
     for (const r of this.records) {
-      if (r.targetId === targetId && (latest === null || Date.parse(r.at) > Date.parse(latest))) latest = r.at;
+      if ((r.targetId === targetId || r.plannedTargetId === targetId) && (latest === null || Date.parse(r.at) > Date.parse(latest))) latest = r.at;
     }
     return latest;
   }

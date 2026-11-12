@@ -124,8 +124,12 @@ export function RebalanceRecommendations() {
   const execute = async (r: RebalanceRecReport["recommendations"][number]) => {
     // The fee caps the dialog promises and the gate go with it (the server
     // caps it at what is left of today's budget as well).
-    // The plan's time goes with it: a row whose target was refilled since
-    // the plan was made is refused (409 stale_plan) and the plan reloaded.
+    // The plan's time goes with it: a row whose target (or another channel
+    // of its peer) was refilled since the plan was made is refused (409
+    // stale_plan) and the plan reloaded. So are the row's other sources: the
+    // server checks each against the plan's rules as they stand and gives it
+    // the share it keeps — a row none of whose sources may give any more is
+    // refused the same way (409 not_allowed).
     const request = manualRefillRequest(r, data?.config?.profitShare, data?.generatedAt);
     if (!request) return;
     const ok = await ui.confirm({

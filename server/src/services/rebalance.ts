@@ -1,4 +1,5 @@
 import {
+  cancelHodlInvoice,
   createInvoice,
   decodePaymentRequest,
   getFeeRates,
@@ -47,6 +48,14 @@ export const DEFAULT_REBALANCE_POLICY: RebalancePolicy = {
  * Fast cost estimate from the graph (no payment, no probe HTLCs). Optimistic —
  * the real cost and whether liquidity is actually there is only known when you
  * run the rebalance.
+ *
+ * The route LND returns is NOT the cheapest one: it is the one LND's own
+ * weighting prefers — fee, time lock and a penalty for a low chance of
+ * success — among the routes within the fee limit. A cheaper, longer route is
+ * returned only when the limit rules the preferred one out (review
+ * 2026-11-10, REB-1). So the limit is part of the question: `maxFeeSats` asks
+ * for a route within that many sats; without it the limit is `maxPpm` of the
+ * amount.
  */
 export async function estimateCost(
   lnd: AuthenticatedLnd,
@@ -55,9 +64,10 @@ export async function estimateCost(
   target: ChannelView,
   amountSats: number,
   maxPpm: number,
+  maxFeeSats?: number,
 ): Promise<{ costPpm: number | null; feeSats: number | null }> {
   try {
-    const maxFee = Math.ceil((amountSats * maxPpm) / 1_000_000);
+    const maxFee = maxFeeSats !== undefined ? Math.max(0, Math.floor(maxFeeSats)) : Math.ceil((amountSats * maxPpm) / 1_000_000);
     const { route } = await getRouteToDestination({
       lnd,
       destination: ownKey,
@@ -212,6 +222,28 @@ function waitAtMost<T>(work: Promise<T>, ms: number): Promise<T | typeof TIMED_O
   return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
 }
 
+/** How long the executor waits for LND to cancel a self-invoice (exported
+ *  for tests). */
+export const INVOICE_CANCEL = { waitMs: 3_000 };
+
+/**
+ * Cancel the self-invoice of an attempt that is over with no payment left
+ * that could settle it: one never sent, one LND refused outright, one LND
+ * reported failed. Before, each of them stayed open in LND until it expired —
+ * up to three sizes of three sources per target and cooldown, on a node whose
+ * refills find no route a growing pile in LND's invoice table (review
+ * 2026-11-10, refill minor). Best effort: LND's refusal, or no answer within
+ * INVOICE_CANCEL.waitMs, changes nothing of the refill — the invoice then
+ * expires as it did. Never called for a payment that may still land (in
+ * flight): LND would fail its HTLCs on arrival.
+ */
+async function dropInvoice(lnd: AuthenticatedLnd, id: string): Promise<void> {
+  await waitAtMost(
+    cancelHodlInvoice({ lnd, id }).catch(() => undefined),
+    INVOICE_CANCEL.waitMs,
+  );
+}
+
 // ── Executing a rebalance (writes) ────────────────────────────────────────────
 
 /** A channel to pull from, and the share of its balance to leave on our side. */
@@ -221,6 +253,11 @@ export interface RebalanceSource {
    *  move is capped at the source's spare balance, not sized by the target
    *  alone (review a2). Absent: anything it has. */
   keepRatio?: number;
+  /** Never take more than this from it (sat): what the plan found it can
+   *  spare — where its peer has several channels with us, what those hold
+   *  above their shares together (review 2026-11-10, REB-2), less what the
+   *  plan's earlier moves take. Absent: its spare above `keepRatio`. */
+  maxSats?: number;
 }
 
 export interface RebalanceExecParams {
@@ -280,6 +317,16 @@ export interface RebalanceExecResult {
   /** Sources that were tried and paid nothing (no route within the cap) —
    *  each pair backs off on its own. */
   failedSourceIds?: string[];
+  /** The target's peer's other channels with us, as read before the refill
+   *  (absent: it has none). */
+  peerChannels?: PeerChannelBefore[];
+  /** A paid refill that arrived on another channel of the target's peer:
+   *  that channel (review 2026-11-10, REB-2). A refill names the peer it
+   *  comes back through, never the channel — LND has no way to pin one — and
+   *  the peer alone chooses which of its channels with us carries it. The
+   *  books follow the sats: the log record, its "sent" counter and the fee
+   *  hold are that channel's. */
+  landed?: PeerChannelBefore;
   /** The refill stopped before its next attempt (opts.shouldStop): the
    *  process is shutting down, or the operator switched auto-rebalance off
    *  (or paused all automation) while it ran — a skip, not a failure: nothing
@@ -287,6 +334,52 @@ export interface RebalanceExecResult {
    *  failedSourceIds; the error says why it stopped. */
   stopped?: boolean;
 }
+
+/** Another channel of a refill target's peer, as read before the refill. */
+export interface PeerChannelBefore {
+  id: string;
+  /** Its lifetime "sent" counter (LND) before the refill. */
+  sentBefore: number;
+  /** Its outbound fee (ppm) as read for the refill (absent: LND didn't list it). */
+  ppm?: number;
+}
+
+/** A path of a paid payment as LND reports it (payViaPaymentDetails,
+ *  getPayment): its last hop is the channel it arrived on. */
+export interface PaidPath {
+  hops?: readonly { channel?: string; forward?: number }[];
+  tokens?: number;
+}
+
+/**
+ * The channel a paid refill arrived on, when that is not the target but
+ * another channel of its peer (`others`) — null when it came in over the
+ * target, or LND doesn't say. A payment split over several paths: the channel
+ * most of it arrived on (the target on a tie).
+ */
+export function landedOn(paths: readonly PaidPath[] | undefined, targetId: string, others: readonly PeerChannelBefore[]): PeerChannelBefore | null {
+  const arrived = new Map<string, number>();
+  for (const p of paths ?? []) {
+    const last = p.hops?.[p.hops.length - 1];
+    if (!last?.channel) continue;
+    arrived.set(last.channel, (arrived.get(last.channel) ?? 0) + (Number(last.forward) || Number(p.tokens) || 1));
+  }
+  let most = arrived.get(targetId) ?? 0;
+  let landed: PeerChannelBefore | null = null;
+  for (const o of others) {
+    const sats = arrived.get(o.id) ?? 0;
+    if (sats > most) {
+      most = sats;
+      landed = o;
+    }
+  }
+  return landed;
+}
+
+/** What the executor answers for a source that is a channel of the target's
+ *  own peer. */
+export const SAME_PEER_SOURCE =
+  "source and target are channels of the same peer — a move between them goes out to that peer and straight back: it pays a fee and buys no reach";
 
 /** One payment attempt of a refill, as it is about to be sent. */
 export interface RefillAttempt {
@@ -306,6 +399,9 @@ export interface RefillAttempt {
   /** The target's outbound fee (ppm) as read for this refill (absent: LND
    *  didn't list it) — the write-ahead record books no hold above it. */
   targetPpm?: number;
+  /** The target's peer's other channels with us (absent: none): the payment
+   *  may arrive on one of them. */
+  peerChannels?: PeerChannelBefore[];
 }
 
 /**
@@ -380,7 +476,11 @@ function describePayError(err: unknown, budgetPpm: number): string {
 
 /**
  * Execute one circular rebalance: pay a self-invoice out via a source channel
- * and back in via the target's peer. Every attempt's max_fee is the profit
+ * and back in via the target's peer — the peer, not the channel: where it has
+ * several channels with us, the result says which one the payment arrived on
+ * (`landed`), and a source that is one of them is never used (review
+ * 2026-11-10, REB-2: the executor refused only the target itself as its own
+ * source, and paid a loop out to the peer and straight back). Every attempt's max_fee is the profit
  * gate's own limit at that size (feeCapAt), so a refill can never pay more
  * than it is worth — and never more than `maxFeeSats` (the daily budget left)
  * — at any of the fallback sizes. If no route fits, nothing is paid. Each
@@ -451,7 +551,20 @@ export async function executeRebalance(
     .then((w) => w.current_block_height)
     .catch(() => null);
 
-  const withTarget = { ...base, budgetPpm: gatedBudget, targetSentBefore: target.totalSent, ...(targetPpm !== undefined ? { targetPpm } : {}) };
+  // The peer's other channels with us: the payment may arrive on any of them.
+  const peerChannels: PeerChannelBefore[] = channels
+    .filter((c) => c.peerPubkey === target.peerPubkey && c.id !== target.id && c.status === "open")
+    .map((c) => {
+      const ppm = rates.channels.find((r) => r.id === c.id)?.fee_rate;
+      return { id: c.id, sentBefore: c.totalSent, ...(ppm !== undefined ? { ppm } : {}) };
+    });
+  const withTarget = {
+    ...base,
+    budgetPpm: gatedBudget,
+    targetSentBefore: target.totalSent,
+    ...(targetPpm !== undefined ? { targetPpm } : {}),
+    ...(peerChannels.length ? { peerChannels } : {}),
+  };
   const failedSourceIds: string[] = [];
   let lastErr: unknown = null;
   let tried = false;
@@ -465,9 +578,16 @@ export async function executeRebalance(
       lastErr ??= new Error(`source ${spec.id} is not an open channel`);
       continue;
     }
-    // Never more than the source can spare above the share it keeps.
+    // Another channel of the target's own peer: nothing is sent from it (no
+    // attempt, so no back-off either — the planner never lists one).
+    if (source.peerPubkey === target.peerPubkey) {
+      lastErr ??= new Error(SAME_PEER_SOURCE);
+      continue;
+    }
+    // Never more than the source can spare above the share it keeps — nor
+    // than the plan found it can give.
     const settled = source.localBalance + source.remoteBalance;
-    const spare = source.localBalance - Math.round((spec.keepRatio ?? 0) * settled);
+    const spare = Math.min(source.localBalance - Math.round((spec.keepRatio ?? 0) * settled), spec.maxSats ?? Infinity);
     let triedHere = false;
     // A payment from this source was sent and failed (what a stop reports).
     let sentAndFailedHere = false;
@@ -485,9 +605,9 @@ export async function executeRebalance(
     // doesn't, then the halves.
     const planned = Math.min(params.amountSats, spare);
     for (const amount of adaptiveAmounts(planned, fitBelowPlanned(cap, planned, params.routeCostPpm))) {
-      const left = deadline - Date.now();
       const hardLimit = opts.hardTimeoutMs ?? REBALANCE_HARD_TIMEOUT_MS;
-      if (left < Math.min(MIN_ATTEMPT_LEFT_MS, hardLimit / 4)) {
+      const minLeft = Math.min(MIN_ATTEMPT_LEFT_MS, hardLimit / 4);
+      if (deadline - Date.now() < minLeft) {
         lastErr ??= new Error("rebalance time limit reached");
         break;
       }
@@ -499,17 +619,39 @@ export async function executeRebalance(
       }
       const halt = opts.shouldStop?.();
       if (halt) return stop(halt);
+      const triedBefore: { here: boolean; any: boolean } = { here: triedHere, any: tried };
       triedHere = true;
       tried = true;
+      // The self-invoice of this attempt, once LND has made it — and the
+      // payment, once it is handed to LND.
+      let made: string | null = null;
       let sent: string | null = null;
       const attemptedHere = { ...withTarget, sourceId: source.id, sourceAlias: source.peerAlias, amountSats: amount, failedSourceIds };
       try {
         const invoice = await createInvoice({ lnd: writeLnd, tokens: amount });
+        made = invoice.id;
         const decoded = await decodePaymentRequest({ lnd: readLnd, request: invoice.request });
         // Asked again right before it goes out: the signal may have come
-        // while the invoice was made (it stays unpaid and expires).
+        // while the invoice was made (which is cancelled: nothing pays it).
         const late = opts.shouldStop?.();
-        if (late) return stop(late);
+        if (late) {
+          await dropInvoice(writeLnd, invoice.id);
+          return stop(late);
+        }
+        // The time left is taken again here. Before, LND's pathfinding time
+        // and the wait for the payment ran for what was left BEFORE the
+        // invoice was made and decoded — past the hard limit by as long as
+        // those two LND calls took (review 2026-11-10, refill minor). With
+        // too little left by now nothing is sent: not an attempt of this
+        // source (it does not back off for LND's slow answer).
+        const left = deadline - Date.now();
+        if (left < minLeft) {
+          await dropInvoice(writeLnd, invoice.id);
+          triedHere = triedBefore.here;
+          tried = triedBefore.any;
+          lastErr ??= new Error("rebalance time limit reached");
+          break;
+        }
         // On the caller's books before it is sent (write-ahead). If it can't
         // be recorded, it is not sent — nor is anything else of this refill.
         try {
@@ -522,8 +664,10 @@ export async function executeRebalance(
             maxFeeSats,
             targetSentBefore: target.totalSent,
             ...(targetPpm !== undefined ? { targetPpm } : {}),
+            ...(peerChannels.length ? { peerChannels } : {}),
           });
         } catch (err) {
+          await dropInvoice(writeLnd, invoice.id);
           return {
             ...attemptedHere,
             error: `not sent: the payment couldn't be recorded before sending it (${err instanceof Error ? err.message : String(err)}) — nothing was paid`,
@@ -561,12 +705,14 @@ export async function executeRebalance(
         }
         opts.onEnd?.(invoice.id, "paid");
         const feeSats = paid.safe_fee ?? paid.fee;
+        const landed = landedOn(paid.paths, target.id, peerChannels);
         return {
           ...attemptedHere,
           ok: true,
           feeSats,
           costPpm: Math.round((feeSats / amount) * 1_000_000),
           paymentId: invoice.id,
+          ...(landed ? { landed } : {}),
         };
       } catch (err) {
         lastErr = err;
@@ -577,6 +723,7 @@ export async function executeRebalance(
         if (sent !== null && !paymentFailed(err) && (await paymentAbsent(writeLnd, sent))) {
           opts.onEnd?.(sent, "failed");
           failedSourceIds.push(spec.id);
+          await dropInvoice(writeLnd, sent);
           return { ...attemptedHere, error: `LND refused the payment (${describePayError(err, budgetPpm)}) — it has none by that id: nothing was sent` };
         }
         if (sent !== null && !paymentFailed(err)) {
@@ -594,6 +741,9 @@ export async function executeRebalance(
           opts.onEnd?.(sent, "failed");
           sentAndFailedHere = true;
         }
+        // Over with nothing left that could pay it — LND reported the payment
+        // failed, or it was never sent (the invoice couldn't be decoded).
+        if (made !== null) await dropInvoice(writeLnd, made);
       }
     }
     if (triedHere) failedSourceIds.push(spec.id);

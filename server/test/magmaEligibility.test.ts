@@ -494,7 +494,7 @@ test("D10: a sale that nets nothing at today's on-chain fees leaves nothing for 
   s.autopilot.openEconomics = async () => ({
     ppmYear: null,
     capitalSat: 20_000_000,
-    evidence: { channels: 0, capacitySat: 0, forwards: 0, earnedSat: 0, forwardsRead: true },
+    evidence: { channels: 0, capacitySat: 0, offline: 0, forwards: 0, earnedSat: 0, forwardsRead: true },
   });
   const forwardsBefore = s.node.callsTo("default.forwardingHistory").length;
   const run = await s.autopilot.runOnce();

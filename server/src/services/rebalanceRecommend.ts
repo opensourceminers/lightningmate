@@ -4,10 +4,12 @@ import { getOwnPubkey } from "./node.js";
 import {
   DEFAULT_REBALANCE_POLICY,
   MIN_REFILL_SATS,
+  SAME_PEER_SOURCE,
   adaptiveAmounts,
   estimateCost,
   feeCapAt,
   largestFittingRefill,
+  type RebalanceSource,
   type RefillFeeCap,
 } from "./rebalance.js";
 import {
@@ -72,7 +74,9 @@ export interface RebalanceRecConfig {
   maxSourcesPerTarget: number;
   /** Cap on how many candidates we actually probe a route for. */
   maxCandidates: number;
-  /** Generous ceiling for the probe so we can report cost even when too pricey. */
+  /** The fee limit of the second route question, asked only when LND has no
+   *  route within a size's own cap: generous, so that a price can be shown
+   *  even when it is too high. */
   probeCeilingPpm: number;
 }
 
@@ -242,6 +246,12 @@ export interface RebalanceRecommendation {
   amountToReachTargetLocalRatio: number;
   demandSizedAmount: number;
 
+  /** The peer's other active channels with us (absent: it has none). LND
+   *  reaches a peer over any of its channels and the peer chooses which one a
+   *  refill arrives on, so they share this channel's cooldown and its
+   *  in-flight guard (review 2026-11-10, REB-2). */
+  peerChannels?: string[];
+
   /** Sources to try, in order (the selected one first). */
   sourceCandidates: SourceCandidate[];
   selectedSourceChannel: string | null;
@@ -269,7 +279,8 @@ export interface RebalanceRecSummary {
  * channel, a different thing altogether.)
  */
 export interface RefillNote {
-  /** Median route cost of the refills probed now (ppm). */
+  /** Median route cost of the refills probed now (ppm): per drained channel
+   *  the route found within its cap, else the one LND would take. */
   routeTypicalPpm: number | null;
   /** Drained channels the fee engine is raising first. */
   feeFirstCount: number;
@@ -305,10 +316,36 @@ const pct = (n: number) => `${Math.round(n * 100)}%`;
 /** A channel that may give liquidity, and how much. */
 export interface SourceInfo {
   ch: ChannelView;
-  /** What it holds above its own share (target ratio + margin), sat. */
+  /** What it holds above its own share (target ratio + margin), sat — and no
+   *  more than its peer's channels with us hold above their shares together. */
   spareSats: number;
   keepRatio: number;
   grossFlow14d: number;
+  /** Its peer has several channels with us: how many, and what they hold
+   *  above their shares together (sat) — the most they give between them. */
+  peer?: { channels: number; spareSats: number };
+}
+
+/** A peer's channels with us, summed: what they hold, what they could
+ *  (settled), and what their target ratios (plus `margin`) ask for. */
+function peerTotals(mates: readonly ChannelView[], feeById: Map<string, FeeRecommendation>, margin = 0): { local: number; settled: number; wanted: number } {
+  let local = 0;
+  let settled = 0;
+  let wanted = 0;
+  for (const c of mates) {
+    const own = c.localBalance + c.remoteBalance;
+    local += c.localBalance;
+    settled += own;
+    wanted += Math.round(((feeById.get(c.id)?.metrics.targetLocalRatio ?? 0.5) + margin) * own);
+  }
+  return { local, settled, wanted };
+}
+
+/** The active channels by peer. */
+function channelsByPeer(active: readonly ChannelView[]): Map<string, ChannelView[]> {
+  const byPeer = new Map<string, ChannelView[]>();
+  for (const c of active) byPeer.set(c.peerPubkey, [...(byPeer.get(c.peerPubkey) ?? []), c]);
+  return byPeer;
 }
 
 /**
@@ -326,7 +363,12 @@ export interface SourceInfo {
  *    flag needs five channels; small nodes had none);
  *  - one protecting its liquidity or recovering a refill's cost.
  * Each gives at most its spare: its balance above its own target ratio plus
- * a margin.
+ * a margin — and, where its peer has more channels with us, no more than
+ * those hold above their shares together (review 2026-11-10, REB-2: LND
+ * reaches a peer over any of its channels, so the outbound toward a peer is
+ * their sum. A full channel next to an empty one of the same peer gave its
+ * whole spare away, the peer then read drained, and the node paid a second
+ * time to move liquidity back to it).
  */
 export function buildSourcePool(
   active: ChannelView[],
@@ -335,6 +377,27 @@ export function buildSourcePool(
   cfg: RebalanceRecConfig,
   ctx: { soldLeases: readonly SoldLease[]; currentBlock: number },
 ): SourceInfo[] {
+  return (
+    [...sourceVerdicts(active, feeById, overrides, cfg, ctx).values()]
+      .filter((v): v is SourceInfo => typeof v !== "string")
+      // the most to spare, then the most idle (best donors)
+      .sort((a, b) => b.spareSats - a.spareSats || a.grossFlow14d - b.grossFlow14d)
+  );
+}
+
+/**
+ * The pool's rules, channel by channel: what each active channel may give —
+ * or, in words, why it may give nothing. The pool is the ones that may
+ * (buildSourcePool); a refill by hand is told why its source may not
+ * (manualRefillRules).
+ */
+export function sourceVerdicts(
+  active: readonly ChannelView[],
+  feeById: Map<string, FeeRecommendation>,
+  overrides: OverrideMap,
+  cfg: RebalanceRecConfig,
+  ctx: { soldLeases: readonly SoldLease[]; currentBlock: number },
+): Map<string, SourceInfo | string> {
   const revenue = (c: ChannelView) => feeById.get(c.id)?.metrics.revenue30d ?? 0;
   const best = active.reduce<ChannelView | null>((top, c) => (revenue(c) > (top ? revenue(top) : 0) ? c : top), null);
   // By outpoint, or — for a sale only Amboss knows of — by the channel it names.
@@ -344,27 +407,38 @@ export function buildSourcePool(
         (l.fundingOutpoint === `${c.transactionId}:${c.transactionVout}` || (!!l.channelId && standardChannelId(l.channelId) === c.id)) &&
         leaseRunning(l, c.id, ctx.currentBlock),
     );
-  return active
-    .flatMap((c): SourceInfo[] => {
-      if (overrides[c.id]?.mode === "exclude") return [];
-      const fee = feeById.get(c.id);
-      if (!fee) return [];
-      const m = fee.metrics;
-      const target = m.targetLocalRatio ?? 0.5;
-      if (c.private) return [];
-      if (m.channelAgeDays == null || m.channelAgeDays < cfg.sourceMinAgeDays) return [];
-      if (sold(c)) return [];
-      if (c.localRatio < target + cfg.sourceExcessThreshold) return []; // not enough excess
-      if (fee.state === "protecting_liquidity" || fee.state === "recovering_cost") return [];
-      if (m.isTopEarner || c.id === best?.id) return [];
-      if (m.netDrain14d > 0) return []; // draining — leave it
-      const keepRatio = target + cfg.sourceKeepMargin;
-      const spareSats = c.localBalance - Math.round(keepRatio * (c.localBalance + c.remoteBalance));
-      if (spareSats < cfg.minRebalanceAmount) return [];
-      return [{ ch: c, spareSats, keepRatio, grossFlow14d: m.grossFlow14d }];
-    })
-    // the most to spare, then the most idle (best donors)
-    .sort((a, b) => b.spareSats - a.spareSats || a.grossFlow14d - b.grossFlow14d);
+  const byPeer = channelsByPeer(active);
+  const verdict = (c: ChannelView): SourceInfo | string => {
+    if (overrides[c.id]?.mode === "exclude") return "it is excluded from the autopilot";
+    const fee = feeById.get(c.id);
+    if (!fee) return "the fee engine has no figures for it";
+    const m = fee.metrics;
+    const target = m.targetLocalRatio ?? 0.5;
+    if (c.private) return "it is a private channel — nothing routes back through one";
+    if (m.channelAgeDays == null || m.channelAgeDays < cfg.sourceMinAgeDays) return `it is younger than ${cfg.sourceMinAgeDays} days`;
+    if (sold(c)) return "it was sold (Magma or LSP) and its lease is running — its balance is the buyer's inbound";
+    if (c.localRatio < target + cfg.sourceExcessThreshold) {
+      // not enough excess
+      return `it holds ${pct(c.localRatio)} locally — a source holds ${pct(target + cfg.sourceExcessThreshold)} or more (${pct(cfg.sourceExcessThreshold)} above its ${pct(target)} target)`;
+    }
+    if (fee.state === "protecting_liquidity") return "its fee is protecting its own liquidity";
+    if (fee.state === "recovering_cost") return "it is earning back a refill of its own";
+    if (m.isTopEarner || c.id === best?.id) return "it is one of the best earners";
+    if (m.netDrain14d > 0) return "it is draining — more routed out of it than in over 14 days"; // leave it
+    const keepRatio = target + cfg.sourceKeepMargin;
+    const own = c.localBalance - Math.round(keepRatio * (c.localBalance + c.remoteBalance));
+    const mates = byPeer.get(c.peerPubkey) ?? [c];
+    const together = mates.length > 1 ? peerTotals(mates, feeById, cfg.sourceKeepMargin) : null;
+    const shared = together ? together.local - together.wanted : own;
+    const spareSats = Math.min(own, shared);
+    if (spareSats < cfg.minRebalanceAmount) {
+      return shared < own
+        ? `its peer's ${mates.length} channels with us hold only ${k(clamp0(shared))} above their shares together`
+        : `it holds only ${k(clamp0(own))} above the ${pct(keepRatio)} it keeps`;
+    }
+    return { ch: c, spareSats, keepRatio, grossFlow14d: m.grossFlow14d, ...(together ? { peer: { channels: mates.length, spareSats: shared } } : {}) };
+  };
+  return new Map(active.map((c) => [c.id, verdict(c)]));
 }
 
 /** One channel's refill decision up to the source and route — pure
@@ -593,9 +667,20 @@ export function classify(ch: ChannelView, fee: FeeRecommendation | undefined, cf
   return rec;
 }
 
-/** A route's cost from `source` into `target` for `amountSats`, as the graph
- *  says (no payment). */
-export type RouteProbe = (source: ChannelView, target: ChannelView, amountSats: number) => Promise<{ costPpm: number | null; feeSats: number | null }>;
+/**
+ * A route's cost from `source` into `target` for `amountSats`, as the graph
+ * says (no payment): the route LND would take among those that cost at most
+ * `maxFeeSats` — without it, among those within the probe ceiling. Not the
+ * cheapest route there is: LND weighs the fee against the time lock and the
+ * chance of success, and returns a cheaper route only when the limit rules
+ * out the one it prefers (estimateCost).
+ */
+export type RouteProbe = (
+  source: ChannelView,
+  target: ChannelView,
+  amountSats: number,
+  maxFeeSats?: number,
+) => Promise<{ costPpm: number | null; feeSats: number | null }>;
 
 /** One amount's route and what the gate makes of it. */
 interface Probed {
@@ -621,6 +706,15 @@ interface Probed {
  * refill (its own rules, the refill's hold included) — and a route passes
  * only when its fee is within feeCapAt, the same cap the payment carries.
  *
+ * Each size is asked for under its own cap first — the most the gate lets a
+ * refill of that size cost — so that a route within it is found where LND
+ * has one. Only when there is none is LND asked under the probe ceiling,
+ * and that answer is a price to show, not "the cheapest route" (review
+ * 2026-11-10, REB-1: every size was asked under 3,000 ppm, LND answered with
+ * the route it prefers — 500 ppm on the live node — and a drained channel
+ * whose cap was 320 ppm read "cheapest route 500 ppm, too expensive" for
+ * months, while a route within its cap was never asked for and never tried).
+ *
  * The smaller sizes: the planned one's half and quarter — and, when the
  * planned size doesn't pass, first the largest size the cap allows at the
  * route cost probed for it (largestFittingRefill), probed and judged like the
@@ -644,8 +738,19 @@ async function probeSource(
     maxFeeSats: rec.maxCostSatsByPayback,
     earnings: { revenuePpm: value, demandSats: rec.earningDemandSats, minNetSats: cfg.minExpectedNetProfitSats },
   });
+  /** The cap of size `a` before a route is known: valued as a refill that
+   *  costs nothing would be (the fee paid can only lift the fee the engine
+   *  holds afterwards, never lower it — and the route found is judged by the
+   *  full formula below whatever this says). */
+  const capBefore = (a: number): number => {
+    const post = ctx ? feeAfterRefill(target, ctx, { amountSats: a, feeSats: 0, holdPpm: h0 }).aimPpm : h0;
+    return feeCapAt(capAt(Math.min(h0, post)), a);
+  };
   const probeAt = async (a: number): Promise<Probed | null> => {
-    const { costPpm, feeSats } = await probeRoute(source, target, a);
+    const within = capBefore(a);
+    let found = within >= 1 ? await probeRoute(source, target, a, within) : { costPpm: null, feeSats: null };
+    if (found.costPpm == null || found.feeSats == null) found = await probeRoute(source, target, a);
+    const { costPpm, feeSats } = found;
     if (costPpm == null || feeSats == null) return null;
     const postPpm = ctx ? feeAfterRefill(target, ctx, { amountSats: a, feeSats, holdPpm: h0 }).aimPpm : h0;
     const value = Math.min(h0, postPpm);
@@ -680,9 +785,10 @@ async function probeSource(
   return probes.sort((a, b) => b.amount - a.amount);
 }
 
-/** Why the cheapest route from a source didn't pass. */
+/** Why no route from a source passed: none was found within the cap of any
+ *  size, and `p` is the lowest-priced of the routes LND offered above it. */
 function rejection(p: Probed, rec: RebalanceRecommendation): string {
-  if (p.costPpm > p.maxCostPpm) return `cheapest route ${p.costPpm} ppm, max ${p.maxCostPpm}`;
+  if (p.costPpm > p.maxCostPpm) return `no route within ${p.maxCostPpm} ppm — the one LND offers costs ${p.costPpm} ppm`;
   if (rec.maxCostSatsByPayback != null && p.feeSats > rec.maxCostSatsByPayback) return `route fee ${p.feeSats} sat, payback limit ${rec.maxCostSatsByPayback} sat`;
   return `best net ${p.net} sat, below the ${rec.minNetProfitSats} sat minimum`;
 }
@@ -870,6 +976,18 @@ export function boughtAndLeased(channelId: string, bought: PlanInput["boughtLeas
  * source's spare shrinks by the moves planned from it before (a run's moves
  * no longer all drained one stale pick) — and routes are probed source by
  * source until one passes the gate.
+ *
+ * Where a peer has several channels with us, the peer is what is judged
+ * (review 2026-11-10, REB-2). LND forwards to a peer over any of its channels
+ * with enough balance, so the outbound a sender can use toward it is the sum
+ * over them, and the peer alone chooses which channel a payment back to us
+ * arrives on. So: a channel is drained only when its peer is — the channels'
+ * summed balance against their summed targets; its refill is no larger than
+ * what the peer lacks; a channel of the same peer is never its source (a
+ * paid move out to the peer and straight back); and one plan refills a peer
+ * once. Before, a channel at 15 % local was refilled for a fee while the
+ * same peer's other channel held 4M of outbound — from that very channel
+ * where it was the idle one.
  */
 export async function planRebalances(input: PlanInput, probeRoute: RouteProbe): Promise<Omit<RebalanceRecReport, "generatedAt" | "config">> {
   const { cfg, overrides } = input;
@@ -891,19 +1009,80 @@ export async function planRebalances(input: PlanInput, probeRoute: RouteProbe): 
     return rec;
   });
 
+  // The peer, not the channel, where it has more than one with us. (Private
+  // channels count: LND forwards over them as over any other.)
+  const byPeer = channelsByPeer(active);
+  for (const rec of recs) {
+    const mates = byPeer.get((chById.get(rec.channelId) as ChannelView).peerPubkey) ?? [];
+    if (mates.length < 2) continue;
+    rec.peerChannels = mates.filter((c) => c.id !== rec.channelId).map((c) => c.id);
+    if (rec.state === "not_needed" || rec.state === "close_candidate") continue;
+    const { local, settled, wanted } = peerTotals(mates, feeById);
+    const over = `over its ${mates.length} channels with us`;
+    if (settled > 0 && (wanted - local) / settled < cfg.targetDeficitThreshold) {
+      rec.state = "watching";
+      rec.wouldRebalance = false;
+      rec.recommendedAmount = null;
+      rec.blockedBy.push("peer has outbound in another channel");
+      rec.reasons.unshift(
+        `its peer is not drained: ${k(local)} of ${k(settled)} (${pct(local / settled)}) is local ${over} — payments reach the peer over any of them, so a refill here would buy outbound the node already has`,
+      );
+      continue;
+    }
+    const lacks = clamp0(wanted - local);
+    if (rec.recommendedAmount == null || lacks >= rec.recommendedAmount) continue;
+    if (lacks < cfg.minRebalanceAmount) {
+      rec.state = "watching";
+      rec.recommendedAmount = null;
+      rec.blockedBy.push("peer lacks too little");
+      rec.reasons.push(`its peer lacks only ${k(lacks)} ${over} — too small for an economical rebalance`);
+      continue;
+    }
+    rec.reasons.push(`sized to the ${k(lacks)} its peer lacks ${over} (this channel alone would take ${k(rec.recommendedAmount)})`);
+    rec.recommendedAmount = lacks;
+  }
+
   // What each target's refill could earn: the most valuable get the sources
   // (and the probes) first; possible demand breaks a tie.
   const worth = (r: RebalanceRecommendation) => (r.expectedRevenuePpm ?? 0) * Math.min(r.recommendedAmount ?? 0, r.earningDemandSats);
   const order = recs
     .filter((r) => r.state === "profitable_rebalance_candidate")
     .sort((a, b) => worth(b) - worth(a) || Number(b.inDemand) - Number(a.inDemand));
+  /** What the plan already takes from each source — and from each source's
+   *  peer: the channels of one peer give from one shared spare
+   *  (buildSourcePool). */
   const planned = new Map<string, number>();
+  const plannedOfPeer = new Map<string, number>();
+  /** Peers this plan refills, and through which channel. */
+  const refilled = new Map<string, string>();
   let probed = 0;
   for (const rec of order) {
     const target = chById.get(rec.channelId) as ChannelView;
-    const candidates = pool
-      .filter((s) => s.ch.id !== rec.channelId)
-      .map((s) => ({ s, spare: s.spareSats - (planned.get(s.ch.id) ?? 0) }))
+    // One refill per peer in a plan: the first one's sats may arrive on this
+    // channel, and both were sized to the same lack. (It asks for no route
+    // and takes none of the probes.)
+    const before = refilled.get(target.peerPubkey);
+    if (before) {
+      rec.state = "watching";
+      rec.recommendedAmount = null;
+      rec.blockedBy.push("one refill per peer");
+      rec.reasons.push(
+        `its peer's other channel ${before} is refilled in this plan — one refill per peer at a time: it reaches the peer over any of its channels, and the peer chooses which one it arrives on`,
+      );
+      continue;
+    }
+    // Never from a channel of the same peer: out to the peer and straight
+    // back pays a fee and moves nothing the node can use. (The pool holds
+    // none for a drained peer — its channels together are under their
+    // shares, buildSourcePool — so this is the rule spelled out; the
+    // executor refuses such a source whoever asks.)
+    const others = pool.filter((s) => s.ch.peerPubkey !== target.peerPubkey);
+    const candidates = others
+      .map((s) => {
+        const shared = s.peer ? s.peer.spareSats - (plannedOfPeer.get(s.ch.peerPubkey) ?? 0) : Infinity;
+        const spare = Math.min(s.spareSats - (planned.get(s.ch.id) ?? 0), shared);
+        return { s, spare, shared: spare === shared };
+      })
       .filter((x) => x.spare >= cfg.minRebalanceAmount)
       .sort((a, b) => b.spare - a.spare || a.s.grossFlow14d - b.s.grossFlow14d)
       .slice(0, Math.max(1, cfg.maxSourcesPerTarget));
@@ -911,9 +1090,9 @@ export async function planRebalances(input: PlanInput, probeRoute: RouteProbe): 
       rec.state = "unprofitable_skip";
       rec.blockedBy.push("no safe source channel");
       rec.reasons.push(
-        pool.length
+        others.length
           ? "no source channel has enough to spare — the others' spare balance is already planned for refills before this one"
-          : "no channel can give liquidity: a source must be ≥ 14 days old, public, not sold on Magma/LSP, not draining, not the best earner, with idle balance above its own share",
+          : "no channel can give liquidity: a source must be ≥ 14 days old, public, not sold on Magma/LSP, not draining, not the best earner, with idle balance above its own share — and its peer's channels together above theirs",
       );
       continue;
     }
@@ -922,13 +1101,15 @@ export async function planRebalances(input: PlanInput, probeRoute: RouteProbe): 
       continue;
     }
     probed += 1;
-    rec.sourceCandidates = candidates.map(({ s, spare }) => ({
+    rec.sourceCandidates = candidates.map(({ s, spare, shared }) => ({
       channelId: s.ch.id,
       alias: s.ch.peerAlias || s.ch.id,
       localRatio: s.ch.localRatio,
       spareSats: spare,
       keepRatio: s.keepRatio,
-      reason: `${pct(s.ch.localRatio)} local, ${k(spare)} to spare above its ${pct(s.keepRatio)} share, not draining`,
+      reason: shared
+        ? `${pct(s.ch.localRatio)} local, ${k(spare)} to spare — what its peer's ${s.peer?.channels} channels with us hold above their shares together, not draining`
+        : `${pct(s.ch.localRatio)} local, ${k(spare)} to spare above its ${pct(s.keepRatio)} share, not draining`,
     }));
     const ctx = input.contextOf(rec.channelId);
     let best: { p: Probed; i: number } | null = null;
@@ -940,7 +1121,8 @@ export async function planRebalances(input: PlanInput, probeRoute: RouteProbe): 
         cand.rejectedReason = "no route at any size within the probe ceiling";
         continue;
       }
-      // best passing route by net profit; otherwise the cheapest, for transparency
+      // best passing route by net profit; otherwise the lowest-priced of the
+      // routes LND offered above the cap, for transparency
       const passing = found.filter((p) => p.passes).sort((a, b) => b.net - a.net);
       if (passing.length) {
         best = { p: passing[0], i };
@@ -989,6 +1171,8 @@ export async function planRebalances(input: PlanInput, probeRoute: RouteProbe): 
           `net +${p.net} sat (pays at most ${p.maxFeeSats} sat) — ${after}`,
       );
       planned.set(source.id, (planned.get(source.id) ?? 0) + p.amount);
+      plannedOfPeer.set(source.peerPubkey, (plannedOfPeer.get(source.peerPubkey) ?? 0) + p.amount);
+      refilled.set(target.peerPubkey, rec.channelId);
       continue;
     }
     const tooPricey = p.costPpm > p.maxCostPpm || (rec.maxCostSatsByPayback != null && p.feeSats > rec.maxCostSatsByPayback);
@@ -997,7 +1181,9 @@ export async function planRebalances(input: PlanInput, probeRoute: RouteProbe): 
       rec.state = "route_found_too_expensive";
       rec.blockedBy.push("route above max cost / payback limit");
       rec.reasons.push(
-        `cheapest route ${p.costPpm} ppm (max ${p.maxCostPpm})` +
+        (p.costPpm > p.maxCostPpm
+          ? `no route found within its max of ${p.maxCostPpm} ppm — the route LND offers costs ${p.costPpm} ppm`
+          : `the route LND offers costs ${p.costPpm} ppm (${p.feeSats} sat) — more than the ${p.maxFeeSats} sat this refill may cost`) +
           (p.paybackDays != null ? `, payback ~${p.paybackDays}d (limit ${cfg.maxPaybackDays}d)` : "") +
           ` — too expensive even at smaller sizes${valued}`,
       );
@@ -1044,7 +1230,7 @@ export async function planRebalances(input: PlanInput, probeRoute: RouteProbe): 
   const drained = recs.filter((r) => r.state !== "not_needed").length;
   const note =
     routeTypicalPpm != null
-      ? `Refilling outbound by rebalancing costs ~${routeTypicalPpm} ppm right now (median of the routes probed). Raising the fee and letting flow refill a channel costs nothing — it is just slower.`
+      ? `The refill routes LND offers cost ~${routeTypicalPpm} ppm right now (the median over the drained channels: a route within a channel's limit where there is one, else the one LND would take — not the cheapest there is). Raising the fee and letting flow refill a channel costs nothing — it is just slower.`
       : drained > 0
         ? "No refill route probed right now — raising the fee and letting flow refill a channel costs nothing, it is just slower."
         : "Nothing needs a refill right now.";
@@ -1090,7 +1276,84 @@ export async function getRebalanceRecommendations(
       boughtLeases: opts.boughtLeases ?? [],
       feeAutomation: opts.feeAutomation !== false,
     },
-    (source, target, amount) => estimateCost(lnd, ownKey, source, target, amount, cfg.probeCeilingPpm),
+    (source, target, amount, maxFeeSats) => estimateCost(lnd, ownKey, source, target, amount, cfg.probeCeilingPpm, maxFeeSats),
   );
   return { generatedAt, config: cfg, feeAutomation: opts.feeAutomation !== false, ...plan };
+}
+
+/** What the plan's rules say, right now, of a refill somebody asks for by
+ *  hand (manualRefillRules). */
+export interface ManualRefillRules {
+  /** The target's peer alias (the channel id where LND knows no channel by it). */
+  targetAlias: string;
+  /** Why the target is never refilled (null: it may be). */
+  targetRefused: string | null;
+  /** The target's peer's other channels with us. */
+  peerChannels: string[];
+  /** The sources asked for that may give liquidity now, in the order asked:
+   *  each with the share it keeps and the most it gives. */
+  sources: RebalanceSource[];
+  /** The ones that may not, and why. */
+  refused: { id: string; alias: string; why: string }[];
+}
+
+/**
+ * A refill by hand against the plan's rules as they stand now (review
+ * 2026-11-10, REB-3): one fee engine run with the plan's own inputs and the
+ * source pool built from it — no route is asked for.
+ *
+ * Before, POST /rebalance/execute checked ids and amounts and nothing about
+ * the channels: the row's one source went to the executor without the share
+ * it keeps, and whatever the planner had ruled out (a source in a sold
+ * lease, private, young, draining; a target bought on Magma) was sent as
+ * asked. A row from a plan made at 10:00, its source at 80 % local then and
+ * routed down to 15 % by 10:40, took that source to 0.5 %.
+ *
+ * Now each source asked for must be one the pool would list this minute, and
+ * it gives no more than the pool says: it keeps its share, and gives at most
+ * what it — and its peer's channels with us together — hold above theirs.
+ * The one judgement that stays the operator's is the target's: a refill by
+ * hand may go into a channel the plan would not refill (not drained enough,
+ * excluded from the autopilot) — except one bought on Magma in its lease,
+ * whose low balance is what was bought.
+ */
+export async function manualRefillRules(
+  lnd: AuthenticatedLnd,
+  engine: FeeEngineInputs,
+  opts: RebalanceRecOptions,
+  asked: { targetId: string; sourceIds: readonly string[] },
+): Promise<ManualRefillRules> {
+  const cfg = { ...REBAL_REC_DEFAULTS, ...(opts.recOverrides ?? {}) };
+  const run = await runFeeEngine(lnd, engine);
+  const feeById = new Map(run.report.recommendations.map((r) => [r.channelId, r]));
+  const verdicts = sourceVerdicts(
+    run.channels.filter((c) => c.active),
+    feeById,
+    engine.channelOverrides ?? {},
+    cfg,
+    { soldLeases: opts.soldLeases ?? [], currentBlock: run.currentBlock },
+  );
+  const target = run.channels.find((c) => c.id === asked.targetId);
+  const rules: ManualRefillRules = {
+    targetAlias: target?.peerAlias || asked.targetId,
+    targetRefused: boughtAndLeased(asked.targetId, opts.boughtLeases, run.currentBlock)
+      ? "it was bought on Magma for its inbound and its lease is still running — its low local balance is what was bought"
+      : null,
+    peerChannels: target ? run.channels.filter((c) => c.peerPubkey === target.peerPubkey && c.id !== target.id).map((c) => c.id) : [],
+    sources: [],
+    refused: [],
+  };
+  for (const id of new Set(asked.sourceIds)) {
+    const ch = run.channels.find((c) => c.id === id);
+    const verdict = !ch
+      ? "it is not an open channel"
+      : target && ch.peerPubkey === target.peerPubkey
+        ? SAME_PEER_SOURCE
+        : !ch.active
+          ? "its peer is offline"
+          : (verdicts.get(id) ?? "the fee engine has no figures for it");
+    if (typeof verdict === "string") rules.refused.push({ id, alias: ch?.peerAlias || id, why: verdict });
+    else rules.sources.push({ id, keepRatio: verdict.keepRatio, maxSats: verdict.spareSats });
+  }
+  return rules;
 }

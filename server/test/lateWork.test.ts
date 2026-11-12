@@ -20,7 +20,7 @@ import { leasePromiseAlerts } from "../src/services/alerts.js";
 import type { LeaseCap } from "../src/services/leaseCaps.js";
 import type { FeeApplyItem, FeeApplyResult } from "../src/services/fees.js";
 import type { RebalanceRecReport } from "../src/services/rebalanceRecommend.js";
-import { autopilotWith, paidRebalance, plannedFeeChange, plannedRebalance, suggestion, type AutopilotSeams } from "./helpers/autopilot.js";
+import { autopilotWith, manualRefillsUnchecked, paidRebalance, plannedFeeChange, plannedRebalance, suggestion, type AutopilotSeams } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { FakeLnd } from "./helpers/fakeLnd.js";
 import { quiet, sleep, keepFileAlive } from "./helpers/lifecycle.js";
@@ -251,6 +251,7 @@ test("the rebalancing stage paying within its deadline is no alarm, however long
 test("a manual refill holding the refill lock: another one is refused saying so, and held 10 minutes GET /alerts says the lock is held, by whom — gone once it is free", async (t) => {
   t.mock.method(console, "log", () => undefined);
   const api = await startApi(t, { node: new FakeLnd() });
+  manualRefillsUnchecked(api.autopilot); // the lock, budget and books are the test — the bare fake node has no such channels
   api.autopilot.setConfig({ rebalanceDailyBudgetSats: 10_000 });
   const ap = api.autopilot as unknown as AutopilotSeams;
   let release!: () => void;

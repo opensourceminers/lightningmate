@@ -30,14 +30,23 @@ export function startingFeeText(f: StartingFee): string {
   return `it starts at ${sats(f.feeRatePpm)} ppm + ${sats(f.baseFeeMsat)} msat routing fee — the fee engine's new-channel fee, not LND's default`;
 }
 
+/** "2 of the 4 offline", where month-old channels the yield counts are
+ *  offline right now (they count all the same); "" with none. */
+function offlineCounted(est: OpenEstimate): string {
+  const e = est.yieldEvidence;
+  if (!e || !(e.offline > 0)) return "";
+  return e.channels === 1 ? "that one offline" : e.offline >= e.channels ? `all ${sats(e.channels)} offline` : `${sats(e.offline)} of the ${sats(e.channels)} offline`;
+}
+
 /** Why the payback can't be estimated, from what the yield stands on. */
 function unmeasured(est: OpenEstimate): string {
   const e = est.yieldEvidence;
   if (!e || !e.forwardsRead) return "this node's routing income couldn't be read — its payback can't be estimated";
   if (e.channels === 0) return "no channel is a month old yet — its payback can't be estimated";
+  const offline = offlineCounted(est);
   return (
     `too little routing on month-old channels to estimate its payback (${sats(e.forwards)} forward${e.forwards === 1 ? "" : "s"}, ` +
-    `${sats(e.earnedSat)} sat in 30 days — it takes ${est.minYieldForwards} forwards or ${sats(est.minYieldEarnedSat)} sat)`
+    `${sats(e.earnedSat)} sat in 30 days — it takes ${est.minYieldForwards} forwards or ${sats(est.minYieldEarnedSat)} sat${offline ? `; ${offline}, counted all the same` : ""})`
   );
 }
 
@@ -64,7 +73,7 @@ export function openLines(sizeSats: number, rate: number | null, est: OpenEstima
     const months = ((open + close) / perYear) * 12;
     payback =
       `the open and a later close (~${sats(open + close)} sat) pay back in ~${months < 1 ? "<1" : Math.round(months)} month${Math.round(months) === 1 ? "" : "s"} ` +
-      `at what a channel earns here (${sats(est.yieldPpmYear)} ppm/yr in month-old channels)`;
+      `at what a channel earns here (${sats(est.yieldPpmYear)} ppm/yr in month-old channels${offlineCounted(est) ? ` — ${offlineCounted(est)}, counted all the same` : ""})`;
     if (months > est.paybackMonths && !warn) {
       warn = `At ${rate} sat/vB this channel takes ~${Math.round(months)} months to earn back its open and close — more than the autopilot's ${est.paybackMonths}-month limit. A lower rate (it confirms slower) pays back sooner.`;
     }
