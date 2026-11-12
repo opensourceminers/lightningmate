@@ -194,6 +194,17 @@ export const OPENING_GRACE_MS = 10 * 60_000;
  *  own listing of the orders waiting on us leaves the order out — before an
  *  order with nothing of ours tied to it is dropped. */
 const MAX_REFUSALS = 3;
+/** Amboss names a funding transaction with its output ("txid:0") or without
+ *  one: without, any output of that transaction is meant. */
+const sameOutput = (named: string | undefined, index: string | number | undefined): boolean =>
+  named === undefined || Number(named) === Number(index);
+/** What a look for the channel Amboss names for an order came to
+ *  (adoptReportedChannel; review of P1b, R2): "taken" — LND shows it and it
+ *  is on the order's record now; "unnamed" — Amboss names no transaction and
+ *  no channel; "absent" — LND shows no channel of this node to the buyer for
+ *  what Amboss names; "another-sale" — LND shows it, and it is on another
+ *  sale's record; "unanswered" — LND did not answer, so nothing is known. */
+type ReportedChannel = "taken" | "unnamed" | "absent" | "another-sale" | "unanswered";
 /** How the note of a failed read of an order starts (unreadable,
  *  couldNotRead) — and that of a key Amboss refused while the lane worked on
  *  the order (advance). Each is stale once Amboss shows the order again, and
@@ -3063,7 +3074,9 @@ export class MagmaDesk {
    *    then reported to Amboss like one opened here. Taken under the on-chain
    *    mutex, as an interrupted open's channel is (reconcileOpening): another
    *    sale's open holds the mutex until its channel is on that sale's
-   *    record, so its channel is never met here unclaimed.
+   *    record, so its channel is never met here unclaimed. Never the channel
+   *    Amboss names for another order of the same buyer: that one is the
+   *    other order's (foreignChannelFor; review of P1b, R1).
    */
   private async channelAlreadyThere(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<boolean> {
     if (entry.fundingOutpoint) return true;
@@ -3091,6 +3104,33 @@ export class MagmaDesk {
    * placed (as adoptWithInvoices estimates the block). Only a channel of
    * exactly the order's size counts: any other is not what the buyer bought,
    * and Amboss would not take it for the order.
+   *
+   * And never the channel Amboss names for another order of this node to the
+   * same buyer (review of P1b, R1). Two orders of one buyer, one size, both
+   * accepted and waiting for lower fees; the operator opens one channel by
+   * hand and reports it on Amboss's website for one of them. Before, the
+   * order the lane walked first took that channel — whichever it was: the
+   * walk goes by deadline, not by which order Amboss has a transaction for —
+   * and reported it to Amboss a second time; the order it was opened for
+   * found its channel on another sale's record and was never opened for. One
+   * channel for two accepted orders: a sale lost, or — where Amboss takes the
+   * transaction for both — two payments for one channel. So, when LND shows
+   * such a channel, the other orders of this buyer that have no channel on
+   * their record are read from Amboss afresh (the pass's listing does not
+   * carry an order's transaction, and a click has no listing): a channel one
+   * of them names — by its funding transaction or its channel id — is left
+   * to that order, which takes it on its own turn (takeReportedChannel), and
+   * the look goes on to the next channel; with none left, this order is
+   * opened for like any other. The reads are made only when there is a
+   * channel to take, which is rare; they can fall inside the on-chain mutex
+   * (the second look of channelAlreadyThere and of openFor), for as long as
+   * one read of Amboss takes.
+   *
+   * An order of the buyer that cannot be read stops the look with an error
+   * (siblingOrders): the channel may be that order's, and neither taking it
+   * nor opening a second one beside it is safe. The order's pass ends there
+   * with nothing changed — the error is on its record, and the next pass
+   * looks again.
    */
   private async foreignChannelFor(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<string | null> {
     let notBeforeHeight: number | undefined;
@@ -3100,14 +3140,60 @@ export class MagmaDesk {
       const blocksSince = Number.isFinite(placed) ? Math.max(0, Math.ceil((Date.now() - placed) / 600_000)) : 0;
       notBeforeHeight = height - blocksSince - ORDER_HEIGHT_SLACK_BLOCKS - Math.ceil(blocksSince * ORDER_HEIGHT_SLACK_SHARE);
     }
-    const found = await findOpenedChannel(this.deps.readLnd, {
-      pubkey: entry.buyerPubkey,
-      capacity: entry.sizeSats,
-      exclude: [...(entry.preExistingAtAccept ?? []), ...this.deps.capital.claimedOutpoints()],
-      ...(notBeforeHeight !== undefined ? { notBeforeHeight } : {}),
-      tag: saleTag("magma", entry.orderId),
+    const exclude = [...(entry.preExistingAtAccept ?? []), ...this.deps.capital.claimedOutpoints()];
+    let siblings: SaleOrderDetail[] | undefined;
+    for (;;) {
+      const found = await findOpenedChannel(this.deps.readLnd, {
+        pubkey: entry.buyerPubkey,
+        capacity: entry.sizeSats,
+        exclude,
+        ...(notBeforeHeight !== undefined ? { notBeforeHeight } : {}),
+        tag: saleTag("magma", entry.orderId),
+      });
+      if (!found) return null;
+      siblings ??= await this.siblingOrders(entry, found.outpoint);
+      if (!(await this.namedForAnother(siblings, entry.buyerPubkey, found.outpoint))) return found.outpoint;
+      exclude.push(found.outpoint);
+    }
+  }
+
+  /**
+   * The other orders of this order's buyer that are not ended and have no
+   * channel on their record, as Amboss shows them now (foreignChannelFor;
+   * review of P1b, R1). Whatever their size and phase: the channel Amboss
+   * names for an order is taken as that order's without a look at its size
+   * (adoptReportedChannel). One that cannot be read is an error — see there.
+   */
+  private async siblingOrders(entry: MagmaJournalEntry, outpoint: string): Promise<SaleOrderDetail[]> {
+    const out: SaleOrderDetail[] = [];
+    for (const other of this.journal.open()) {
+      if (other.orderId === entry.orderId || other.buyerPubkey !== entry.buyerPubkey || other.fundingOutpoint) continue;
+      try {
+        out.push(await this.ambossSale(this.deps.amboss.getKey(), other.orderId));
+      } catch (err) {
+        throw new Error(
+          `a channel to the buyer was opened outside LightningMate (${outpoint}), and order ${other.orderId} of the same buyer could not be read from Amboss ` +
+            `(${msg(err)}) — it may be that order's: nothing is taken or opened for this order now; looked at again on the next pass`,
+        );
+      }
+    }
+    return out;
+  }
+
+  /** Does Amboss name the channel at `outpoint` for one of these orders — by
+   *  its funding transaction (with the output, where Amboss gives one), or by
+   *  the channel id LND shows for it once it is open? */
+  private async namedForAnother(orders: SaleOrderDetail[], buyerPubkey: string, outpoint: string): Promise<boolean> {
+    const [id, index] = outpoint.split(":");
+    const byTransaction = orders.some((o) => {
+      const [txid, vout] = String(o.transactionId ?? "").split(":");
+      return !!txid && txid === id && sameOutput(vout, index);
     });
-    return found?.outpoint ?? null;
+    if (byTransaction) return true;
+    const ids = new Set(orders.map((o) => standardChannelId(o.channelId)).filter((c): c is string => !!c));
+    if (!ids.size) return false;
+    const open = (await getChannels({ lnd: this.deps.readLnd, partner_public_key: buyerPubkey })).channels;
+    return open.some((c) => `${c.transaction_id}:${c.transaction_vout}` === outpoint && ids.has(c.id));
   }
 
   /** …taken as this order's (call it under the on-chain mutex). */
@@ -3280,7 +3366,18 @@ export class MagmaDesk {
       entry.phase = from;
       entry.opening = undefined;
       const failed = await this.openFailed(entry, order, error);
-      if (phaseOf(entry) === from && failed[0]?.error) this.openRefused.set(entry.orderId, { at: Date.now(), what: failed[0].error });
+      if (phaseOf(entry) === from) {
+        if (failed[0]?.error) this.openRefused.set(entry.orderId, { at: Date.now(), what: failed[0].error });
+        // Saved here too: the record on disk says "opening" since before LND
+        // was asked, and a refusal in the words of the one before it is not
+        // said again (openFailed) — nothing was saved then. The order was
+        // "accepted" here and "opening" on disk, and a restart would have
+        // waited OPENING_GRACE_MS for the channel of an open LND had refused,
+        // then written that "no channel appeared for the interrupted open".
+        // (Found by the test of the review of P1b, R7: an unpaid order's open
+        // that is refused, tried again and refused again.)
+        this.journal.note(entry);
+      }
       return failed;
     });
   }
@@ -3702,10 +3799,17 @@ export class MagmaDesk {
     // channel Amboss names, as LND shows it — so the lease's routing-fee
     // promise binds it and the rebalancer leaves it alone (review
     // 2026-10-25: such a sale was settled, booked and charged with neither).
-    if (!entry.fundingOutpoint) await this.adoptReportedChannel(entry, order);
-    // (Said once: an order whose payment is still to come is looked at on
-    // every pass.)
-    if (!entry.fundingOutpoint && !entry.unpaidSince) this.journal.event(entry, `Amboss reports ${order.status} but no funding outpoint is on record here`);
+    let reported: ReportedChannel = "taken";
+    if (!entry.fundingOutpoint) {
+      reported = await this.adoptReportedChannel(entry, order);
+      // LND did not answer the look: whether the order has a channel is not
+      // known on this pass. Nothing is settled, ended or said on such a pass;
+      // the next one looks again (review of P1b, R2: the failed look was read
+      // as "no channel", and the sale was settled without one — the channel
+      // opened by hand was then never tied to the sale, so neither the
+      // lease's promise nor the close protection knew it).
+      if (reported === "unanswered") return [];
+    }
     // A channel on record ends the order's reservation, paid or not: its
     // coins are in that channel (an order first seen here with its channel,
     // opened by hand, already confirmed).
@@ -3715,11 +3819,19 @@ export class MagmaDesk {
     }
     // Amboss's word alone is never income: only a payment our invoice holds
     // is claimed, booked and charged the service fee.
-    if (entry.invoice) {
-      const st = await this.lndHodlStatus(entry.invoice.id);
+    const st = entry.invoice ? await this.lndHodlStatus(entry.invoice.id) : undefined;
+    // (Said once: an order whose payment is still to come is looked at on
+    // every pass. Not said of a held payment: that one is not claimed without
+    // a channel, and settleBlocked says why — once, as the order's error.)
+    if (!entry.fundingOutpoint && !entry.unpaidSince && st?.state !== "held") {
+      this.journal.event(entry, `Amboss reports ${order.status} but no funding outpoint is on record here`);
+    }
+    if (entry.invoice && st) {
       if (st.state === "held") {
-        // …and only in full, for a channel LND shows (settleBlocked).
-        const blocked = await this.settleBlocked(entry, order, st);
+        // …and only in full, for a channel on the order's record that LND
+        // shows (settleBlocked; review of P1b, R2: an order with no channel
+        // on record was settled and booked on Amboss's word).
+        const blocked = await this.settleBlocked(entry, order, st, reported);
         if (blocked) {
           if (entry.lastError !== blocked) this.noteError(entry, blocked);
           return [{ ...base, ok: false, error: blocked }];
@@ -3797,40 +3909,78 @@ export class MagmaDesk {
    * transaction) Amboss names — or with its channel id — and tied to no other
    * sale. Only the outpoint is recorded: no "funded" time (its open was not
    * this node's, and the deploy share counts it from Amboss's listing).
+   *
+   * What the look came to is the answer (ReportedChannel; review of P1b, R2).
+   * Before, it had none: LND not answering looked the same as LND showing no
+   * such channel, and settle went on to claim the payment and book the sale
+   * with no channel on its record. And the channel is looked for among LND's
+   * closed channels too, as settleBlocked does for a channel on record: one
+   * opened by hand, reported, confirmed and closed before the lane saw the
+   * order confirmed was delivered — without this look its payment could
+   * never be claimed. Only a closed channel LND says this node opened, and
+   * not a funding that was cancelled before it became a channel.
    */
-  private async adoptReportedChannel(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<void> {
+  private async adoptReportedChannel(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<ReportedChannel> {
     const [txid, vout] = String(order.transactionId ?? "").split(":");
     const channelId = standardChannelId(order.channelId);
-    if (!txid && !channelId) return;
+    if (!txid && !channelId) return "unnamed";
     const claimed = new Set(this.deps.capital.claimedOutpoints());
     let outpoint: string | undefined;
+    let closed = false;
+    let anothers = false;
     try {
       // By its funding transaction: among the channels still opening too —
       // Amboss has the transaction from the moment it was reported, three
       // confirmations before the channel is open (LANE-12).
       if (txid) {
-        outpoint = (await channelsWith(this.deps.readLnd, entry.buyerPubkey)).find((c) => {
+        const shown = await channelsWith(this.deps.readLnd, entry.buyerPubkey);
+        outpoint = shown.find((c) => {
           const [id, index] = c.outpoint.split(":");
           return c.ours && !claimed.has(c.outpoint) && id === txid && (vout === undefined || Number(vout) === Number(index));
         })?.outpoint;
+        // The channel Amboss names is there — on another sale's record (the
+        // callers say that, rather than "LND does not show it").
+        anothers = shown.some((c) => {
+          const [id, index] = c.outpoint.split(":");
+          return c.ours && claimed.has(c.outpoint) && id === txid && sameOutput(vout, index);
+        });
       }
       // …or by the channel id Amboss names (an open channel has one).
       if (!outpoint && channelId) {
-        const found = (await getChannels({ lnd: this.deps.readLnd, partner_public_key: entry.buyerPubkey })).channels.find(
+        const named = (await getChannels({ lnd: this.deps.readLnd, partner_public_key: entry.buyerPubkey })).channels.filter(
+          (c) => c.partner_public_key === entry.buyerPubkey && !c.is_partner_initiated && c.id === channelId,
+        );
+        const found = named.find((c) => !claimed.has(`${c.transaction_id}:${c.transaction_vout}`));
+        if (found) outpoint = `${found.transaction_id}:${found.transaction_vout}`;
+        else if (named.length) anothers = true;
+      }
+      // …or closed by now.
+      if (!outpoint) {
+        const gone = (await getClosedChannels({ lnd: this.deps.readLnd })).channels.find(
           (c) =>
             c.partner_public_key === entry.buyerPubkey &&
-            !c.is_partner_initiated &&
+            c.is_partner_initiated === false &&
+            !c.is_funding_cancel &&
             !claimed.has(`${c.transaction_id}:${c.transaction_vout}`) &&
-            c.id === channelId,
+            ((!!txid && c.transaction_id === txid && sameOutput(vout, c.transaction_vout)) || (!!channelId && c.id === channelId)),
         );
-        if (found) outpoint = `${found.transaction_id}:${found.transaction_vout}`;
+        if (gone) {
+          outpoint = `${gone.transaction_id}:${gone.transaction_vout}`;
+          closed = true;
+        }
       }
     } catch {
-      return; // LND didn't answer: the caller says no outpoint is on record
+      return "unanswered";
     }
-    if (!outpoint) return;
+    if (!outpoint) return anothers ? "another-sale" : "absent";
     entry.fundingOutpoint = outpoint;
-    this.journal.event(entry, `its channel ${outpoint} was opened outside LightningMate — taken from Amboss and LND`);
+    this.journal.event(
+      entry,
+      closed
+        ? `its channel ${outpoint} was opened outside LightningMate and is closed by now — taken from Amboss and LND`
+        : `its channel ${outpoint} was opened outside LightningMate — taken from Amboss and LND`,
+    );
+    return "taken";
   }
 
   /**
@@ -3838,34 +3988,62 @@ export class MagmaDesk {
    * here (adoptReportedChannel). True when LND shows it and it is on record
    * now; otherwise the record says what is wrong — and still nothing is
    * opened: a second channel for an order Amboss already has one for would
-   * be paid for once.
+   * be paid for once. What is wrong is said as it is (review of P1b, R1 and
+   * R2): the channel Amboss names is on another sale's record — one channel
+   * named for two orders, which only the operator and Amboss can sort out —
+   * or LND shows no such channel of this node. When LND did not answer,
+   * nothing is said: the next pass looks again.
    */
   private async takeReportedChannel(entry: MagmaJournalEntry, order: SaleOrderDetail): Promise<boolean> {
-    if (!entry.fundingOutpoint) await this.adoptReportedChannel(entry, order);
+    let reported: ReportedChannel = "taken";
+    if (!entry.fundingOutpoint) reported = await this.adoptReportedChannel(entry, order);
     if (entry.fundingOutpoint) {
       this.openRefused.delete(entry.orderId);
       return true;
     }
+    if (reported === "unanswered") return false;
     const named = order.transactionId || order.channelId || order.status;
     const error =
-      `Amboss already has a funding transaction for this order (${named}) that LND does not show as a channel of this node to the buyer — ` +
-      "nothing is opened; check the order";
+      reported === "another-sale"
+        ? `Amboss names ${named} for this order, a channel on record here as another sale's — nothing is opened for this order; check both orders on Amboss`
+        : `Amboss already has a funding transaction for this order (${named}) that LND does not show as a channel of this node to the buyer — ` +
+          "nothing is opened; check the order";
     if (entry.lastError !== error) this.noteError(entry, error);
     return false;
   }
 
   /**
    * What stands against claiming a held payment, if anything (LANE-13): the
-   * invoice must hold the order's whole fee, and a channel on record must be
-   * one LND shows — open, still opening, or closed since (a channel that was
-   * there was delivered). Amboss's word alone claims nothing.
+   * invoice must hold the order's whole fee, a channel must be on the order's
+   * record, and it must be one LND shows — open, still opening, or closed
+   * since (a channel that was there was delivered). Amboss's word alone
+   * claims nothing.
+   *
+   * No channel on record (review of P1b, R2): `reported` is what the look
+   * for the channel Amboss names came to in this pass (adoptReportedChannel).
+   * Before, an order with no outpoint was settled and booked on Amboss's
+   * word and the held payment — for a transaction LND knows nothing of, or
+   * for a channel that is on another sale's record (one channel, two sales).
+   * The payment stays held, the record says why, and every pass looks again:
+   * a channel that shows up is taken and the payment claimed. One that never
+   * does is not claimed at all: LND lets a held payment go before it runs
+   * out, and the order then ends unbooked.
    */
-  private async settleBlocked(entry: MagmaJournalEntry, order: SaleOrderDetail, st: HodlStatus): Promise<string | null> {
+  private async settleBlocked(entry: MagmaJournalEntry, order: SaleOrderDetail, st: HodlStatus, reported: ReportedChannel): Promise<string | null> {
     if (st.heldMtokens < BigInt(entry.feeMsat || "0")) {
       return `Amboss reports ${order.status}, but our invoice holds ${st.heldMtokens / 1000n} sat of the ${feeSatsOf(entry)} sat this order earns — not settled; check the order`;
     }
     const outpoint = entry.fundingOutpoint;
-    if (!outpoint) return null;
+    if (!outpoint) {
+      const named = order.transactionId || order.channelId;
+      if (reported === "another-sale") {
+        return `Amboss reports ${order.status}, but the channel Amboss names for this order (${named}) is on record here as another sale's — the payment is not claimed; check both orders on Amboss`;
+      }
+      if (reported === "absent") {
+        return `Amboss reports ${order.status}, but LND shows no channel of this node to the buyer for what Amboss names (${named}) — the payment is not claimed; check the order`;
+      }
+      return `Amboss reports ${order.status}, but no channel is on record here for this order and Amboss names none — the payment is not claimed; check the order`;
+    }
     if ((await channelsWith(this.deps.readLnd, entry.buyerPubkey)).some((c) => c.outpoint === outpoint)) return null;
     const closed = (await getClosedChannels({ lnd: this.deps.readLnd })).channels;
     if (closed.some((c) => `${c.transaction_id}:${c.transaction_vout}` === outpoint)) return null;

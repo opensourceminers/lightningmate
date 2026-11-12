@@ -692,7 +692,10 @@ with no funding transaction named), the order's record must show no open under w
 no channel of this node to the buyer with the order's size that was not there at the accept (the
 buyer's channels of that moment are kept on the order's record). One that is there is taken as the
 order's ("a channel to the buyer was opened outside LightningMate — taken as this order's") — also
-one opened and reported by hand that has no confirmation yet. The time such an unpaid order has is
+one opened and reported by hand that has no confirmation yet. **One channel is never two orders'**:
+when the buyer has another open order here, that order is read from Amboss first, and a channel
+Amboss names for it is left to it — while such an order cannot be read, nothing is taken or opened
+for this one. The time such an unpaid order has is
 Amboss's `timeout` for the channel (48 hours after the invoice was made) less 6 hours for the channel
 to get its confirmations: until then a failed open is tried again and high on-chain fees are waited
 out as above; in the 6 hours before it the channel is opened whatever the fee, at LND's 3-block
@@ -701,7 +704,12 @@ refunds the buyer, and may count the order against the seller). An order Amboss 
 accept of LightningMate's reached is not opened by the lane — Amboss may hold another invoice for it —
 and waits for "Open channel". **Amboss's word alone is never income**: an order
 Amboss reports confirmed is settled, booked and charged the service fee only when this node's own
-invoice holds at least the order's fee and LND knows the channel on the order's record. An invoice
+invoice holds at least the order's fee and a channel is on the order's record that LND shows (open,
+still opening, or closed since). An order with no channel on its record takes the one Amboss names —
+when LND shows it as this node's channel to the buyer, also among the closed ones, and no other sale
+has it. Otherwise the payment stays held and unclaimed and the record says why (Amboss names no
+channel, LND shows none, or the channel is another sale's); a pass in which LND does not answer
+settles nothing. An invoice
 still unpaid at that moment is the normal case, not an error: the order waits for Amboss's payment
 ("channel confirmed — waiting for Amboss's payment", said once on its record) until the invoice runs
 out, 49 hours after it was made; a payment that arrives is settled as ever. After 6 hours of waiting an

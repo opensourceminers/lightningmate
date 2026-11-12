@@ -250,12 +250,27 @@ test("Amboss reports the channel confirmed, our invoice unpaid, and the channel 
   assert.deepEqual(magmaUnpaidChannelAlerts(s.restart().magma), [], "dismissed for good");
 });
 
+/** The order's channel, opened outside LightningMate and reported on Amboss:
+ *  LND shows it, Amboss names it. (Review of P1b, R2: the two tests below had
+ *  no channel at all, and so pinned that a payment is claimed and a sale
+ *  booked for an order with no channel on its record. What they are about —
+ *  a payment that comes late — is told with the order's channel there.) */
+function channelOpenedByHand(node: FakeLnd, amboss: { transactionId: string | null; channelId: string | null }): string {
+  const txid = "cd".repeat(32);
+  const channelId = `${node.blockHeight - 3}x7x0`;
+  node.channels.push({ id: channelId, partnerPublicKey: BUYER, capacity: 2_000_000, localBalance: 2_000_000, transactionId: txid, transactionVout: 0 });
+  amboss.transactionId = `${txid}:0`;
+  amboss.channelId = channelId;
+  return `${txid}:0`;
+}
+
 test("Amboss reports the channel confirmed before our invoice holds the payment, and the payment arrives two hours later: settled, booked and charged as ever", async (t) => {
   feeEnv(t);
   quiet(t);
   const { autopilot, node, magma, dir } = sellerSetup(t);
   const sale = magma.addSale({ buyerPubkey: BUYER });
   await autopilot.pollSellOrders();
+  const outpoint = channelOpenedByHand(node, magma.sales.get(sale.id)!);
   magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
   await autopilot.pollSellOrders();
   assert.ok(entryOnDisk(dir, sale.id)?.unpaidSince, "looked at again from now");
@@ -264,13 +279,13 @@ test("Amboss reports the channel confirmed before our invoice holds the payment,
   const t0 = Date.now();
   t.mock.timers.enable({ apis: ["Date"], now: t0 + 2 * 3_600_000 });
   await autopilot.pollSellOrders();
-  assert.equal(entryOnDisk(dir, sale.id)?.phase, "accepted");
+  assert.deepEqual([entryOnDisk(dir, sale.id)?.phase, entryOnDisk(dir, sale.id)?.fundingOutpoint], ["reported", outpoint]);
   const hash = magma.buyerPays(sale.id, node);
   magma.setStatus(sale.id, "VALID_CHANNEL_OPENING"); // (the fake's payment moved the order on)
   await autopilot.pollSellOrders();
   let e = entryOnDisk(dir, sale.id);
   assert.equal(node.invoices.get(hash)?.state, "SETTLED");
-  assert.deepEqual([e?.phase, e?.unbooked, e?.unpaidSince], ["settled", undefined, undefined]);
+  assert.deepEqual([e?.phase, e?.unbooked, e?.unpaidSince, e?.fundingOutpoint], ["settled", undefined, undefined, outpoint]);
   assert.equal(salesOnDisk(dir).length, 1);
   assert.equal(feesOnDisk(dir).length, 1);
   // Long after: it stays a booked sale.
@@ -289,6 +304,7 @@ test("the invoice has run out and the payment arrives as the unpaid invoice is b
   const sale = magma.addSale({ buyerPubkey: BUYER });
   await autopilot.pollSellOrders();
   const hash = acceptedInvoice(magma.sales.get(sale.id)!).id;
+  const outpoint = channelOpenedByHand(node, magma.sales.get(sale.id)!);
   magma.setStatus(sale.id, "VALID_CHANNEL_OPENING");
   await autopilot.pollSellOrders();
   assert.ok(entryOnDisk(dir, sale.id)?.unpaidSince);
@@ -304,12 +320,12 @@ test("the invoice has run out and the payment arrives as the unpaid invoice is b
   await autopilot.pollSellOrders();
   let e = entryOnDisk(dir, sale.id);
   assert.equal(cancels, 1);
-  assert.deepEqual([e?.phase, e?.unpaidSince, e?.cancelledAt], ["accepted", undefined, undefined], "not ended: the payment is held");
+  assert.deepEqual([e?.phase, e?.unpaidSince, e?.cancelledAt], ["reported", undefined, undefined], "not ended: the payment is held");
   assert.equal(salesOnDisk(dir).length, 0);
   await autopilot.pollSellOrders();
   e = entryOnDisk(dir, sale.id);
   assert.equal(node.invoices.get(hash)?.state, "SETTLED");
-  assert.deepEqual([e?.phase, e?.unbooked], ["settled", undefined]);
+  assert.deepEqual([e?.phase, e?.unbooked, e?.fundingOutpoint], ["settled", undefined, outpoint]);
   assert.equal(salesOnDisk(dir).length, 1, "booked as the sale it is");
   assert.equal(feesOnDisk(dir).length, 1);
   assert.equal(cancels, 1, "nothing cancelled after that");
