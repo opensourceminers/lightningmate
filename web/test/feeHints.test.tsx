@@ -31,6 +31,16 @@ test("both say that a fee that sells is kept, and that a higher one is tried whe
   const hint = source("components/AutopilotPanel.tsx");
   assert.match(hint, /A fee that sells is kept: " \+ "it is not lowered while the channel sells at it/);
   assert.match(hint, /higher is tried, and taken back if it earns less/);
+  // The memory of a failed test grows as the step-back's does; a raise made
+  // for a drain is judged too; "Apply" and Fee automation (the package's
+  // second review, Q1, Q2, Q7).
+  assert.match(hint, /not raised to for a week either " \+ "\(two weeks, four weeks when it fails again\)/);
+  assert.match(hint, /A raise the drain rules made/);
+  assert.match(hint, /with it off no price test is offered and a raise applied by hand is not taken back/);
+  assert.match(banner, /or would need over three months to sell the surplus/);
+  assert.match(banner, /A raise made for a drain \(not one toward a refill cost\) is checked the same way once the channel is balanced again/);
+  assert.match(hint, /is checked the same way at the end of its weeks/);
+  assert.match(banner, /with it off, no price test is offered and a raise you apply is not taken back/);
   // The ramp that acts before a channel is empty, and what paces it.
   assert.match(hint, /the demand and drain ramps 6 h/);
   assert.match(hint, /sells itself empty within three weeks — the drain ramp/);

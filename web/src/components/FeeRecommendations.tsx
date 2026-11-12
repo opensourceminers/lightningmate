@@ -159,13 +159,17 @@ export function FeeRecommendations() {
         goes up only when something says the channel drains, or a floor or your min needs it — never just back toward your
         balanced level — and an ordinary raise, or protecting a drained channel, only after a sale at the fee it charges now.
         A fee that sells is kept: it is not lowered while the channel sells at it, unless the channel holds more than its
-        target and takes in more than it sells — and where a channel sells every day, a slightly higher fee is tried and
-        taken back if it earns less. A raise nothing sold at for 48 h
+        target and takes in more than it sells, or would need over three months to sell the surplus — and where a channel
+        sells every day, a slightly higher fee is tried and taken back if it earns less. A raise made for a drain
+        (not one toward a refill cost) is checked the same way once the channel is balanced again, and taken back
+        if it earned less. A raise nothing sold at for 48 h
         while it had sats to sell steps back to the last fee that sold, and isn&apos;t
         raised back to that level for a week — longer each time it fails again. Only these move in one update: a step back, an idle channel dropping to the
         price that last won it flow or to what the market charges into its peer, a fee you pinned, a new
         channel&apos;s protected fee, a broken lease promise, and a fee outside your min/max (one below your min goes
-        to the min, and steps on from there). Apply them now, or let the autopilot manage them.
+        to the min, and steps on from there). Apply them now, or let the autopilot manage them: what you apply here is
+        judged like the autopilot&apos;s own moves, as long as Fee automation runs — with it off, no price test is offered
+        and a raise you apply is not taken back.
         </InfoTip>
       </p>
 

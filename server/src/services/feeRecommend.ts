@@ -177,6 +177,11 @@ export const DRAIN_RAMP_AHEAD_DAYS = 7;
 /** A stretch of time counts toward that rate with DRAIN_MIN_FORWARDS sales
  *  and this share of the channel's capacity net out in it. */
 export const DRAIN_RAMP_NET_SHARE = 0.05;
+/** …and only where the last 14 days show at least this share of what that
+ *  stretch says goes out (its rate times its days, 14 at most) net out too:
+ *  the sats a channel that routes both ways sold on some days and got back
+ *  on others are no drain. */
+export const DRAIN_RAMP_KEPT_SHARE = 0.5;
 /** Toward a KNOWN refill cost one move covers this share of the way, where
  *  that is more than the quarter of the fee — and never more than the fee
  *  itself: a move at most doubles it. */
@@ -598,6 +603,25 @@ export function salesOf(events: readonly ForwardEvent[], channelId: string, from
   return flow;
 }
 
+/** What `channelId` sold over the newest `ms` of `stretches` (newest
+ *  first, each [from, to)). */
+function salesOver(events: readonly ForwardEvent[], channelId: string, stretches: readonly [number, number][], ms: number): Flow {
+  const flow: Flow = { out: 0, inn: 0, revenue: 0, forwards: 0 };
+  let revenueMsat = 0;
+  let left = ms;
+  for (const [a, b] of stretches) {
+    if (left <= 0) break;
+    const f = salesOf(events, channelId, Math.max(a, b - left), b);
+    flow.out += f.out;
+    flow.inn += f.inn;
+    flow.forwards += f.forwards;
+    revenueMsat += Math.round(f.revenue * 1000);
+    left -= b - Math.max(a, b - left);
+  }
+  flow.revenue = revenueMsat / 1000;
+  return flow;
+}
+
 /** When `channelId` last sold in (fromMs, toMs) — -Infinity: never. */
 function lastSaleMs(events: readonly ForwardEvent[], channelId: string, fromMs: number, toMs: number): number {
   let last = -Infinity;
@@ -699,8 +723,8 @@ export function provenLevel(
 
 /** A fee change someone made by hand or a pin applied: never the autopilot's
  *  own trial of a higher price. */
-const madeByHand = (h: Pick<FeeChangeRecord, "via" | "why" | "pinned">): boolean =>
-  h.via === "manual" || h.pinned === true || /^pinned to /.test(h.why ?? "");
+const madeByHand = (h: { via?: FeeChangeRecord["via"]; why?: string; pinned?: boolean; engine?: boolean }): boolean =>
+  (h.via === "manual" && h.engine !== true) || h.pinned === true || /^pinned to /.test(h.why ?? "");
 
 /** The autopilot's climb to the current fee: its consecutive raises, each
  *  starting where the one before ended. */
@@ -715,7 +739,7 @@ export interface RaiseChain {
   startedAt: string;
 }
 
-type ChangeRow = Pick<FeeChangeRecord, "at" | "fromPpm" | "toPpm" | "via" | "why" | "pinned">;
+type ChangeRow = Pick<FeeChangeRecord, "at" | "fromPpm" | "toPpm" | "via" | "why" | "pinned" | "engine">;
 const sortedChanges = (history: readonly ChangeRow[], nowMs: number): (ChangeRow & { t: number })[] =>
   history
     .map((h) => ({ ...h, t: Date.parse(h.at) }))
@@ -820,6 +844,21 @@ export function flowAtFees(
  *  change was logged with). */
 const isPriceTest = (h: ChangeRow): boolean =>
   !madeByHand(h) && h.via !== "lease" && h.fromPpm !== null && h.fromPpm > 0 && h.toPpm > h.fromPpm && /^price test: /.test(h.why ?? "");
+/** A raise one of the drain rules made — the drain or demand ramp, the
+ *  velocity nudge, the balance curve under the target, the protect ramp, a
+ *  30-day drain's raise, the benchmark's nudge for a draining top earner
+ *  (the review's second round, N1: a buyer who emptied a channel had the
+ *  protect ramp raise it on the way, which ended the climb — the raises
+ *  around it were never set against the fee before the burst, and 200 ppm
+ *  stood for 38 days against buyers whose best price was 100): the autopilot's own,
+ *  made for the balance, not as a price test. Such a raise is judged on what
+ *  it earned too, as part of the climb it begins (climbAnchorOf), once the
+ *  drain it was made for is over (the package's second review, Q1: a burst of
+ *  400k on a balanced channel raised it 100 → 120 ppm; back at half local by
+ *  the third day, "a fee that sells is kept" held 120 for the remaining 55
+ *  days, and its buyers, who buy less the more it costs, paid a sixth less). */
+const isRuleRaise = (h: ChangeRow): boolean =>
+  !madeByHand(h) && h.via !== "lease" && h.fromPpm !== null && h.fromPpm > 0 && h.toPpm > h.fromPpm && /^(drain|demand|velocity|balance|protect|draining|benchmark): /.test(h.why ?? "");
 const isStepBack = (h: ChangeRow): boolean => !madeByHand(h) && h.fromPpm !== null && h.toPpm < h.fromPpm && /^step back: /.test(h.why ?? "");
 
 /** The price test that set the current fee, and the two stretches it is
@@ -865,6 +904,8 @@ export interface ClimbAnchor {
   startedAt: string;
   /** The price tests since, kept or taken back. */
   tests: number;
+  /** The raises of the drain rules in the climb (isRuleRaise). */
+  ruleRaises: number;
   /** The check at the climb's latest full week: what the channel sold in the
    *  `hours` it is judged on, of the `window` hours before that week ended
    *  (from `from`, ms), and in the `hours` before the climb began. Left out
@@ -875,6 +916,15 @@ export interface ClimbAnchor {
    *  try at 360). Null: no full week yet, or less than
    *  PROBE_JUDGE_AFTER_HOURS of either stretch are on record. */
   week: { n: number; hours: number; window: number; from: number; now: Flow; before: Flow } | null;
+  /** What went out net at the fee the climb began at over the hours the
+   *  week's check sets it against, without the last day before the climb
+   *  (sats), and how many hours that was. Where that rate is a drain, a
+   *  raise of the drain rules is not taken back by what it earned: the days
+   *  it is set against were the drain (the review's second round, N3). The
+   *  last day is left out: a burst that set the raise off is no drain the
+   *  fee before allowed. */
+  beforeNetOut: number;
+  beforeHours: number;
 }
 
 /**
@@ -904,23 +954,79 @@ export function climbAnchorOf(
 ): ClimbAnchor | null {
   const changes = sortedChanges(history, nowMs);
   const span = PROBE_JUDGE_AFTER_HOURS * 3_600_000;
+  /** The stretches at the fee before change `i`, newest first, from
+   *  `floorMs` on: the time it stood before the change, and before that the
+   *  time it stood before a climb that was taken back to it — the
+   *  climb's own hours left out (the package's second review, Q1: a drain
+   *  raise two days after a failed test's step-back had 48 h at the fee
+   *  before it on record, under the 72 h a check needs, and was never
+   *  judged; the same fee had stood for weeks before the test). */
+  const atFeeBefore = (i: number, floorMs: number): [number, number][] => {
+    const fee = changes[i].fromPpm;
+    const out: [number, number][] = [];
+    let end = changes[i].t;
+    let j = i - 1;
+    for (;;) {
+      const start = Math.max(floorMs, j >= 0 ? changes[j].t : floorMs);
+      if (end > start) out.push([start, end]);
+      if (j < 1 || changes[j].t <= floorMs) break;
+      const back = changes[j];
+      if (!isStepBack(back) || back.toPpm !== fee) break;
+      // The climb that step-back took back: price tests, drain-rule raises
+      // and step-backs, each from where the one before ended, back to the
+      // change that left this fee (the review's second round, N2: a drain
+      // raise 43 h after a drain climb was taken back had too few hours at
+      // the fee before it on record, and 120 ppm stood for 105 days).
+      let m = j - 1;
+      while (
+        m >= 0 &&
+        changes[m].t > floorMs &&
+        (isPriceTest(changes[m]) || isRuleRaise(changes[m]) || isStepBack(changes[m])) &&
+        changes[m].toPpm === changes[m + 1].fromPpm &&
+        !((isPriceTest(changes[m]) || isRuleRaise(changes[m])) && changes[m].fromPpm === fee)
+      )
+        m -= 1;
+      const left = changes[m];
+      if (!left || left.t <= floorMs || !(isPriceTest(left) || isRuleRaise(left)) || left.fromPpm !== fee || left.toPpm !== changes[m + 1].fromPpm) break;
+      end = left.t;
+      j = m - 1;
+    }
+    return out;
+  };
+  const total = (xs: [number, number][]): number => xs.reduce((s, [a, b]) => s + b - a, 0);
+  /** The stretches (newest first) without their newest `ms`. */
+  const cutTail = (xs: [number, number][], ms: number): [number, number][] => {
+    let left = ms;
+    const out: [number, number][] = [];
+    for (const [a, b] of xs) {
+      const cut = Math.min(left, b - a);
+      left -= cut;
+      if (b - cut > a) out.push([a, b - cut]);
+    }
+    return out;
+  };
+  const netOut = (f: Flow): number => f.out - f.inn;
   /** How long the fee before change `i` is on record. */
-  const stoodBefore = (i: number): number => changes[i].t - Math.max(fromMs, i > 0 ? changes[i - 1].t : fromMs);
+  const stoodBefore = (i: number): number => total(atFeeBefore(i, fromMs));
   let at = -1;
   let tests = 0;
   let walked = 0;
+  let rules = 0;
+  let walkedRules = 0;
   // The lowest fee since the change looked at.
   let low = currentPpm;
   for (let i = changes.length - 1; i >= 0; i--) {
     const h = changes[i];
     const next = changes[i + 1];
-    if ((!isPriceTest(h) && !isStepBack(h)) || h.toPpm !== (next ? next.fromPpm : currentPpm) || h.t <= fromMs) break;
+    if ((!isPriceTest(h) && !isRuleRaise(h) && !isStepBack(h)) || h.toPpm !== (next ? next.fromPpm : currentPpm) || h.t <= fromMs) break;
     low = Math.min(low, h.toPpm);
-    if (!isPriceTest(h)) continue;
-    walked += 1;
+    if (isStepBack(h)) continue;
+    if (isPriceTest(h)) walked += 1;
+    else walkedRules += 1;
     if (low > (h.fromPpm as number) && stoodBefore(i) >= span) {
       at = i;
       tests = walked;
+      rules = walkedRules;
     }
   }
   if (at < 0) return null;
@@ -931,7 +1037,8 @@ export function climbAnchorOf(
   const inForce = CLIMB_CHECK_HOURS * 3_600_000;
   // What is on record before the climb, at its fee, when the check's hours end.
   const readFrom = mark + inForce - (nowMs - fromMs);
-  const onRecord = first.t - Math.max(readFrom, at > 0 ? changes[at - 1].t : readFrom);
+  const beforeOnRecord = atFeeBefore(at, readFrom);
+  const onRecord = total(beforeOnRecord);
   const window = Math.floor(Math.min(CLIMB_WINDOW_DAYS * DAY_MS, n * week, onRecord) / 3_600_000);
   const from = mark - window * 3_600_000;
   // The climb's fees in those hours, each from its change to the next —
@@ -955,13 +1062,20 @@ export function climbAnchorOf(
   }
   now.revenue = revenueMsat / 1000;
   const hours = Math.floor(keptMs / 3_600_000);
+  const weekOn = n >= 1 && nowMs - mark <= inForce && hours >= PROBE_JUDGE_AFTER_HOURS;
+  const beforeDrain = (): { beforeNetOut: number; beforeHours: number } => {
+    const ms = weekOn ? Math.max(0, keptMs - DAY_MS) : 0;
+    return { beforeNetOut: ms > 0 ? netOut(salesOver(events, channelId, cutTail(beforeOnRecord, DAY_MS), ms)) : 0, beforeHours: Math.floor(ms / 3_600_000) };
+  };
   return {
     ppm: first.fromPpm as number,
     startedAt: first.at,
     tests,
+    ruleRaises: rules,
+    ...beforeDrain(),
     week:
-      n >= 1 && nowMs - mark <= inForce && hours >= PROBE_JUDGE_AFTER_HOURS
-        ? { n, hours, window, from, now, before: salesOf(events, channelId, first.t - keptMs, first.t) }
+      weekOn
+        ? { n, hours, window, from, now, before: salesOver(events, channelId, beforeOnRecord, keptMs) }
         : null,
   };
 }
@@ -1364,7 +1478,7 @@ export async function runFeeEngine(lnd: AuthenticatedLnd, inputs: FeeEngineInput
   const lastChangeOf = (id: string): BuildCtx["lastChange"] => {
     const last = [...(changesOf.get(id) ?? [])].sort((a, b) => b.at.localeCompare(a.at))[0];
     return last
-      ? { at: last.at, fromPpm: last.fromPpm, toPpm: last.toPpm, via: last.via, ...(last.why ? { why: last.why } : {}), ...(last.pinned ? { pinned: true } : {}) }
+      ? { at: last.at, fromPpm: last.fromPpm, toPpm: last.toPpm, via: last.via, ...(last.why ? { why: last.why } : {}), ...(last.pinned ? { pinned: true } : {}), ...(last.engine ? { engine: true } : {}) }
       : undefined;
   };
   // Each channel's own forwards, in and out (what sold is read a dozen ways
@@ -1545,7 +1659,7 @@ export interface BuildCtx {
   /** Its last fee change LightningMate made (the fee-change log): who made
    *  it (absent: the autopilot), its reason, whether it applied a pin — and
    *  its "from", null when that wasn't known. */
-  lastChange?: { at: string; fromPpm: number | null; toPpm: number; via?: FeeChangeRecord["via"]; why?: string; pinned?: boolean };
+  lastChange?: { at: string; fromPpm: number | null; toPpm: number; via?: FeeChangeRecord["via"]; why?: string; pinned?: boolean; engine?: boolean };
   currentBlock: number;
   records: RebalanceRecord[];
   bench: NodeBenchmarks;
@@ -1718,10 +1832,23 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const soldDays = Number.isFinite(stampMs) ? Math.min(windowDays, (ctx.nowMs - stampMs) / DAY_MS) : windowDays;
   const heldDays = Number.isFinite(changedMs) ? Math.min(windowDays, (ctx.nowMs - changedMs) / DAY_MS) : windowDays;
   let netOutPerDay = 0;
+  // What went out net in the flow window, against which each stretch is
+  // checked (the package's second review, random buyers: a 5M channel at
+  // half local that sold and took back ~200k a day had four days with 1M
+  // more out than in, and was "down to 10 % local in ~8 d" while its 14 days
+  // showed 250k net out — the drain ramp raised it 110 → 130 ppm, a raise
+  // nobody judged, and the hold kept it; buyers who bought less the more it
+  // cost then paid a fifth less than at the fee held flat). A stretch counts
+  // only where the 14 days keep at least DRAIN_RAMP_KEPT_SHARE of what it
+  // says goes out in as many of them as it covers.
+  const net14 = f14.out - f14.inn;
   const drainRate = (f: Flow | undefined, days: number): void => {
     if (!f || f.forwards < DRAIN_MIN_FORWARDS) return;
     const net = f.out - f.inn;
-    if (net >= DRAIN_RAMP_NET_SHARE * cap) netOutPerDay = Math.max(netOutPerDay, net / days);
+    if (net < DRAIN_RAMP_NET_SHARE * cap) return;
+    const rate = net / days;
+    if (net14 < DRAIN_RAMP_KEPT_SHARE * rate * Math.min(days, cfg.flowWindowDays)) return;
+    netOutPerDay = Math.max(netOutPerDay, rate);
   };
   drainRate(sold, Math.max(soldDays, DEMAND_RAMP_HOURS / 24));
   if (recent) {
@@ -1980,7 +2107,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // wasn't known (recorded as 0, it read as a raise from 0), nor while a pin
   // or an exclusion holds the fee.
   const lc = ctx.lastChange;
-  const byHand = !!lc && (lc.via === "manual" || lc.pinned === true || /^pinned to /.test(lc.why ?? ""));
+  const byHand = !!lc && madeByHand(lc);
   const manualNow = ctx.override?.mode === "exclude" || (ctx.override?.mode === "fixed" && Number.isFinite(ctx.override.fixedPpm));
   const raisedFrom = lc && !byHand && lc.fromPpm !== null && lc.fromPpm > 0 && lc.toPpm > lc.fromPpm && lc.toPpm === currentPpm ? lc.fromPpm : null;
   const raisedMs = lc && raisedFrom !== null ? Date.parse(lc.at) : NaN;
@@ -2031,7 +2158,13 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const soldAtLeast = salesKnown && !sellsAtFee && soldWeekAtLeast >= SELLS_HERE_SALES;
   const notYetKnown = salesKnown && !sellsAtFee && !soldAtLeast && soldHere >= 1 && soldWeek >= SELLS_HERE_SALES;
   const sellsHere = sellsAtFee || soldAtLeast || notYetKnown;
-  const onTrial = raisedFrom !== null && !manualNow && ctx.nowMs - raisedMs < RAISE_TRIAL_DAYS * DAY_MS;
+  // (A move of the engine's applied with "Apply" is on trial only where the
+  // autopilot's runs keep the channel's clock: without them it can never be
+  // stepped back, and the trial only held a raise nobody bought at for a
+  // week — the review's second round, N4.)
+  const clocked = ctx.cooldown?.sellableSince === undefined || Number.isFinite(Date.parse(ctx.cooldown.sellableSince[ch.id] ?? ""));
+  const trialHere = !lc?.engine || clocked;
+  const onTrial = raisedFrom !== null && !manualNow && trialHere && ctx.nowMs - raisedMs < RAISE_TRIAL_DAYS * DAY_MS;
   // …nor, for as long, the fee a step-back went back to: it is the fee that
   // sold before the raise, and its sales "since it was set" start at none
   // again — the curve took a 300 ppm that had sold 75 times in a month down a
@@ -2041,12 +2174,20 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const testedFrom =
     lc && !byHand && lc.fromPpm !== null && lc.toPpm < lc.fromPpm && lc.toPpm === currentPpm && /^step back: /.test(lc.why ?? "") ? lc.fromPpm : null;
   const testedMs = lc && testedFrom !== null ? Date.parse(lc.at) : NaN;
-  const backOnTrial = testedFrom !== null && !manualNow && ctx.nowMs - testedMs < RAISE_TRIAL_DAYS * DAY_MS;
+  const backOnTrial = testedFrom !== null && !manualNow && trialHere && ctx.nowMs - testedMs < RAISE_TRIAL_DAYS * DAY_MS;
   const overTarget = ch.localRatio - targetLocalRatio > cfg.deadband;
   const spareSats = Math.max(0, (ch.localRatio - targetLocalRatio) * cap);
   // (A context without the fee levels counts the days whole.)
   const atFee = ctx.atOrBelow ?? (recent ? { d7: { ...recent.d7, ms: 7 * DAY_MS }, d14: { ...recent.d14, ms: 14 * DAY_MS } } : undefined);
-  const takesInMore = !!atFee && atFee.d14.inn - atFee.d14.out > inflowTolerance && atFee.d7.inn > atFee.d7.out;
+  // More in than out by more than the tolerance and one of its sales: the
+  // first sale missing after a step-back is no inflow (the package's second
+  // review, Q4: two failed tries of 360 ppm, two days each without a sale,
+  // filled a channel to 70 % while its inflow went on; back at 330 its 14
+  // days showed 100k more in than out, the sale the step-back's first hours
+  // missed — it was lowered to 300 for it, and as a channel over its target
+  // never tried higher again: a tenth less for good).
+  const saleSize = atFee && atFee.d14.forwards > 0 ? atFee.d14.out / atFee.d14.forwards : 0;
+  const takesInMore = !!atFee && atFee.d14.inn - atFee.d14.out > inflowTolerance + saleSize && atFee.d7.inn > atFee.d7.out;
   const soldPerDay = recent ? recent.d14.out / 14 : 0;
   const slowSeller = !!recent && spareSats > soldPerDay * SPARE_SELL_DAYS;
   const spareToSell = overTarget && (takesInMore || slowSeller);
@@ -2249,15 +2390,38 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // "earned less" and took back the fee its buyers paid).
   const anchorSale = anchorWeek && anchorWeek.now.forwards > 0 ? anchorWeek.now.revenue / anchorWeek.now.forwards : 0;
   const anchorLess = !!anchorWeek && anchorJudged && anchorWeek.now.revenue + anchorSale < anchorWeek.before.revenue;
+  // A climb a drain rule began is taken back only once that drain is over:
+  // the channel is inside its target band again and no fast drain is
+  // measured. While it drains, the raise is what rations its sats, and
+  // earning less is its price.
+  const ruleClimb = !!anchor && anchor.ruleRaises > 0;
+  // (And the last 14 days show no drain: a channel whose raise slowed a real
+  // drain reached its band and was taken back at once, by what it earned
+  // against the days it drained at the old fee — then drained again and was
+  // raised again; the review's second round, N3. A burst the flow has
+  // brought back since leaves the 14 days even.)
+  // (Drained at the fee before: at what went out net a day then, the
+  // channel would be down to 10 % local within DRAIN_RAMP_WITHIN_DAYS from
+  // where it is — the drain ramp's own measure. A two-way channel's days of
+  // more out than in are no drain by it.)
+  const drainedBefore =
+    !!anchor && anchor.beforeHours > 0 && anchor.beforeNetOut > 0 && ((ch.localRatio - DEMAND_RAMP_LOCAL) * cap) / (anchor.beforeNetOut / (anchor.beforeHours / 24)) <= DRAIN_RAMP_WITHIN_DAYS;
+  const drainOver = ch.localRatio >= targetLocalRatio - cfg.deadband && !fastDrain && !drainedBefore;
+  const climbLabel = (a: ClimbAnchor): string => (a.ruleRaises > 0 ? "raised" : "price test");
   const spanOf = (hours: number): string => (hours % 24 === 0 ? `${hours / 24} d` : `${hours} h`);
   /** The hours a week's check is judged on, as its line names them. */
   const lastSpan = (w: { hours: number; window: number }): string =>
     w.hours < w.window ? `${spanOf(w.hours)} of its last ${spanOf(w.window)} (without a price test taken back or not yet judged)` : `its last ${spanOf(w.hours)}`;
+  if (anchor && anchorWeek && anchorLess && ruleClimb && !drainOver)
+    reasons.push(
+      `raised: at ${currentPpm} ppm, up from ${anchor.ppm} ppm ${since(Date.parse(anchor.startedAt), ctx.nowMs)} — it earned ${sat(anchorWeek.now.revenue)} sat in ${lastSpan(anchorWeek)} against ${sat(anchorWeek.before.revenue)} in the ${spanOf(anchorWeek.hours)} before, at ${anchor.ppm} ppm, less — kept while the channel drains (under its target band, selling itself empty, or drained at the fee before)`,
+    );
+  let climbKeptLine: string | null = null;
   if (anchor && anchorWeek && anchorJudged && !anchorLess)
     reasons.push(
-      `price test: at ${currentPpm} ppm, up from ${anchor.ppm} ppm ${since(Date.parse(anchor.startedAt), ctx.nowMs)} — it earned ${sat(anchorWeek.now.revenue)} sat in ${lastSpan(anchorWeek)} against ${sat(anchorWeek.before.revenue)} in the ${spanOf(anchorWeek.hours)} before, at ${anchor.ppm} ppm: kept${
+      (climbKeptLine = `${climbLabel(anchor)}: at ${currentPpm} ppm, up from ${anchor.ppm} ppm ${since(Date.parse(anchor.startedAt), ctx.nowMs)} — it earned ${sat(anchorWeek.now.revenue)} sat in ${lastSpan(anchorWeek)} against ${sat(anchorWeek.before.revenue)} in the ${spanOf(anchorWeek.hours)} before, at ${anchor.ppm} ppm: kept${
         anchorWeek.now.revenue < anchorWeek.before.revenue ? " (less by no more than one sale)" : ""
-      }`,
+      }`),
     );
   // A probe that was taken back is not made again for a while that grows
   // with each failure (7, 14, 28 days) — the step-back's record, kept apart
@@ -2276,7 +2440,15 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const weekSales = recent?.d7.forwards ?? 0;
   // (recent.d3: the PROBE_JUDGE_AFTER_HOURS before now.)
   const recentSold = recent?.d3.forwards ?? 0;
+  // A price test needs the autopilot's runs to be judged: the clock of when
+  // the channel had sats to sell, which only its scheduled fee stage keeps
+  // (none on record with fee automation off — "Apply" once a day tried
+  // 310 → 340 every few days, never took one back, and earned three tenths
+  // less than the autopilot; the package's second review, Q2). A context
+  // without the clocks at all (sellableSince undefined) is not the app's.
+  const watched = sellableSince === undefined || Number.isFinite(sellableSinceMs);
   if (
+    watched &&
     sellsAtFee &&
     weekSales >= PROBE_WEEK_SALES &&
     !overTarget &&
@@ -2523,6 +2695,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     anchor &&
     anchorWeek &&
     anchorLess &&
+    (!ruleClimb || drainOver) &&
     climbBackTo !== null &&
     climbBackTo < (kind === "step_back" ? target : currentPpm) &&
     !manualNow &&
@@ -2532,13 +2705,19 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     const span = spanOf(anchorWeek.hours);
     const started = since(Date.parse(anchor.startedAt), ctx.nowMs);
     const fact = `step back: ${
-      anchor.tests > 1 ? `raised ${anchor.ppm}→${currentPpm} ppm in ${anchor.tests} price tests since ${started}` : `tried ${anchor.ppm}→${currentPpm} ppm ${started}`
+      ruleClimb
+        ? `raised ${anchor.ppm}→${currentPpm} ppm by the drain rules ${started}${anchor.tests ? `, with ${anchor.tests} price test${anchor.tests > 1 ? "s" : ""} since` : ""}, the drain is over`
+        : anchor.tests > 1
+          ? `raised ${anchor.ppm}→${currentPpm} ppm in ${anchor.tests} price tests since ${started}`
+          : `tried ${anchor.ppm}→${currentPpm} ppm ${started}`
     }, and it earned less there, by more than one sale (${sat(anchorWeek.now.revenue)} sat in ${lastSpan(anchorWeek)} against ${sat(anchorWeek.before.revenue)} in the ${span} before, at ${anchor.ppm} ppm)`;
     const where =
       climbBackTo === anchor.ppm
-        ? anchor.tests > 1
-          ? "its fee before these tests"
-          : "its fee before the test"
+        ? ruleClimb
+          ? "its fee before that raise"
+          : anchor.tests > 1
+            ? "its fee before these tests"
+            : "its fee before the test"
         : climbBackTo === holdProfit
           ? "its profit floor, what its refills cost"
           : climbBackTo === holdNew
@@ -3157,6 +3336,9 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     dropLine(unsoldLine);
     dropLine(noFlowHoldLine);
   }
+  // ("…: kept" is not said over a fee that goes down: the package's second
+  // review, Q7 — it stood beside "lowering at most 30 ppm per move".)
+  if (targetPpm < currentPpm) dropLine(climbKeptLine);
   // (The step-back's memory: its hold, when the fee moved after all; its
   // cap, when a floor or the min took the fee past it.)
   if (backCapLine && (backCapAt <= currentPpm ? targetPpm !== currentPpm : targetPpm > backCapAt)) dropLine(backCapLine);

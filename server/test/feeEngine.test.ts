@@ -28,6 +28,7 @@ import {
   RAMP_STEPS,
   buildRecommendation,
   getFeeRecommendations,
+  runFeeEngine,
   type BuildCtx,
   type FeeChannel,
   type FeeRecConfig,
@@ -260,8 +261,12 @@ test("a raise needs a sale at the fee it raises from: the curve, a drain signal 
   assert.equal(buildRecommendation(chan({ localRatio: 0.05 }), ctx({ ppm: 80, ...drainedFlow })).targetPpm, 80 + RAMP_STEPS * STEP);
   // The policy's min lifts a fee below it…
   assert.equal(buildRecommendation(chan({ localRatio: 0.35 }), ctx({ ppm: 0, ...flows, soldSinceChange: NO_FLOW })).targetPpm, 25);
-  // …and a pin applies.
-  assert.equal(buildRecommendation(chan({ localRatio: 0.35 }), ctx({ ppm: 80, ...flows, soldSinceChange: NO_FLOW, override: { mode: "fixed", fixedPpm: 300 } })).targetPpm, 300);
+  // …and a pin applies — and the hold's line goes with the fee it did not
+  // hold (review FEE-8: "nothing sold at 80 ppm … not raised" stood over
+  // a move to 300).
+  const pinnedUp = buildRecommendation(chan({ localRatio: 0.35 }), ctx({ ppm: 80, ...flows, soldSinceChange: NO_FLOW, override: { mode: "fixed", fixedPpm: 300 } }));
+  assert.equal(pinnedUp.targetPpm, 300);
+  assert.ok(!pinnedUp.reasons.some((x) => /^hold: nothing sold at 80 ppm/.test(x)), pinnedUp.reasons.join(" | "));
 });
 
 test("the step-back: a raise nothing sold at for 48 h, with sats to sell, goes back to the last price that sold (or the fee before the raise) in one move — the anti-churn threshold doesn't veto it", () => {
@@ -695,6 +700,57 @@ test("what a channel sold since its fee was set reaches the engine (getFeeRecomm
     (r) => r.channelId === drainedId,
   )!;
   assert.deepEqual([withLog.metrics.provenLevel?.ppm, withLog.metrics.provenLevel?.sales], [230, 3]);
+});
+
+test("a log record that left the rate as it was — the base fee alone — is not the fee's last change: a raise nothing sold at is still stepped back after it (review FEE-12, the engine's half)", async () => {
+  const id = "850000x1x0";
+  const otherId = "850000x2x0";
+  const hour = 3_600_000;
+  const node = feeNode({
+    blockHeight: HEIGHT,
+    channels: [
+      { id, partnerPublicKey: "02" + "11".repeat(32), capacity: 2_000_000, localBalance: 1_000_000, transactionId: "aa".repeat(32), transactionVout: 0, feeRatePpm: 120, baseFeeMsat: 1000 },
+      { id: otherId, partnerPublicKey: "02" + "22".repeat(32), capacity: 2_000_000, localBalance: 1_000_000, transactionId: "bb".repeat(32), transactionVout: 0, feeRatePpm: 50, baseFeeMsat: 0 },
+    ],
+    // It sold at 80 ppm before the raise, nothing since.
+    forwards: [4, 5, 6, 7, 8, 9].map((d) => ({ at: Date.now() - d * 24 * hour, inId: otherId, outId: id, tokens: 50_000, feeMsat: 4_000 })),
+  });
+  const raisedAt = new Date(Date.now() - 72 * hour).toISOString();
+  const changes = [
+    { at: new Date(Date.now() - 24 * hour).toISOString(), channelId: id, alias: "p", fromPpm: 120, toPpm: 120, fromBaseMsat: 0, toBaseMsat: 1000, via: "manual" as const },
+    { at: raisedAt, channelId: id, alias: "p", fromPpm: 80, toPpm: 120, fromBaseMsat: 0, toBaseMsat: 0, via: "autopilot" as const, why: "velocity: steady outbound demand — small nudge up" },
+  ];
+  const stamp = { lastApplied: { [id]: raisedAt }, cooldownHours: 6 };
+  const run = await runFeeEngine(node.lnd, { rebalanceRecords: [], cooldown: stamp, channelOverrides: { [otherId]: { mode: "exclude" } }, signals: { demand: new Map(), market: new Map() }, feeHistory: changes });
+  assert.deepEqual(
+    [run.contextOf(id)?.lastChange?.fromPpm, run.contextOf(id)?.lastChange?.toPpm, run.contextOf(id)?.lastChange?.at],
+    [80, 120, raisedAt],
+    "the raise is the fee's last change, not the base-fee write",
+  );
+  const rec = run.report.recommendations.find((r) => r.channelId === id)!;
+  assert.equal(rec.targetPpm, 80, rec.reasons.join(" | "));
+  assert.match(rec.reasons.join(" | "), /^step back: /);
+});
+
+test("a price test applied with 'Apply' reaches the engine from the fee-change log as its own move (engine: true): nothing sold at it for 48 h and it is stepped back, and remembered as a test (the review's second round, N6)", async () => {
+  const id = "850000x1x0";
+  const otherId = "850000x2x0";
+  const hour = 3_600_000;
+  const node = feeNode({
+    blockHeight: HEIGHT,
+    channels: [
+      { id, partnerPublicKey: "02" + "11".repeat(32), capacity: 2_000_000, localBalance: 1_000_000, transactionId: "aa".repeat(32), transactionVout: 0, feeRatePpm: 90, baseFeeMsat: 0 },
+      { id: otherId, partnerPublicKey: "02" + "22".repeat(32), capacity: 2_000_000, localBalance: 1_000_000, transactionId: "bb".repeat(32), transactionVout: 0, feeRatePpm: 50, baseFeeMsat: 0 },
+    ],
+    forwards: [52, 60, 70, 80, 90, 100, 110, 120, 130, 140].map((h) => ({ at: Date.now() - h * hour, inId: otherId, outId: id, tokens: 50_000, feeMsat: 4_000 })),
+  });
+  const appliedAt = new Date(Date.now() - 50 * hour).toISOString();
+  const applied = { at: appliedAt, channelId: id, alias: "p", fromPpm: 80, toPpm: 90, fromBaseMsat: 0, toBaseMsat: 0, via: "manual" as const, engine: true, why: "price test: it sells at 80 ppm (10 sales since it was set 6 d ago, 10 in the last 7 days) and holds no more than its target — trying 90 ppm" };
+  const stamp = { lastApplied: { [id]: appliedAt }, cooldownHours: 6, sellableSince: { [id]: new Date(Date.now() - 300 * hour).toISOString() } };
+  const run = await runFeeEngine(node.lnd, { rebalanceRecords: [], cooldown: stamp, channelOverrides: { [otherId]: { mode: "exclude" } }, signals: { demand: new Map(), market: new Map() }, feeHistory: [applied] });
+  assert.equal(run.contextOf(id)?.lastChange?.engine, true);
+  const rec = run.report.recommendations.find((r) => r.channelId === id)!;
+  assert.deepEqual([rec.targetPpm, rec.stepBack, rec.probeBack], [80, true, true], rec.reasons.join(" | "));
 });
 
 // ── the market reference (public graph) ─────────────────────────────────────

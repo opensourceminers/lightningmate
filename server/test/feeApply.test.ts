@@ -179,6 +179,19 @@ test("manual Apply applies what the engine recommends — the base fee too — a
   assert.equal(after.recommendations.find((r: { channelId: string }) => r.channelId === "850000x1x0").wouldApply, false, "the row is done");
 });
 
+test("'Apply recommended' books the engine's moves as its own (engine: true, via manual) — a fee set by hand through POST /fees/apply does not carry it", async (t) => {
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 800_000 })] });
+  const api = await startApi(t, { node });
+  api.autopilot.setConfig({ enabled: true });
+  const res = await api.request("POST", "/fees/apply-recommended", {});
+  assert.equal(res.body.changes.length, 1);
+  const [applied] = api.autopilot.feeChanges();
+  assert.deepEqual([applied.via, applied.engine], ["manual", true]);
+  await api.request("POST", "/fees/apply", { items: [{ id: "850000x1x0", transactionId: TX(1), transactionVout: 0, feeRatePpm: 200, baseFeeMsat: 0 }] });
+  const [byHand] = api.autopilot.feeChanges();
+  assert.deepEqual([byHand.toPpm, byHand.via, byHand.engine], [200, "manual", undefined]);
+});
+
 test("a manual Apply stamps the cooldown: the autopilot's next run does not step the same channel again", async (t) => {
   // Idle at 40% local: the engine lowers it once a day.
   const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 800_000 })] });
@@ -703,6 +716,55 @@ test("one channel's max_htlc changes at most once in 6 h — a near-empty channe
   assert.equal(node.policyRequests.length, 4);
 });
 
+test("a channel that swings by four times and more with every run is lowered at once each time, but raised at once only once in 6 h — 150k ↔ 30k spendable flipped 131,072 ↔ 32,768 with every run, 48 updates a day (the package's second review, Q5)", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-01T00:00:00Z") });
+  const RESERVE = 10_000;
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: RESERVE + 150_000 })] });
+  const lastChanged = new Map<string, number>();
+  const lastUrgentRaise = new Map<string, number>();
+  const pass = async (spendable: number) => {
+    node.channels[0].localBalance = RESERVE + spendable;
+    return (await runMaxHtlcPass(node.lnd, node.lnd, new Map(), { lastChanged, lastUrgentRaise })).map((m) => [m.fromSat, m.toSat, m.ok]);
+  };
+  assert.deepEqual(await pass(150_000), [[1_980_000, 131_072, true]]);
+  const writes: unknown[][] = [];
+  for (let i = 0; i < 12; i++) {
+    t.mock.timers.tick(HOUR / 2);
+    writes.push(...(await pass(i % 2 === 0 ? 30_000 : 150_000)));
+  }
+  // In the 6 h: down, up once (the refill is advertised), down again — then held low.
+  assert.deepEqual(writes, [
+    [131_072, 16_384, true],
+    [16_384, 131_072, true],
+    [131_072, 16_384, true],
+  ]);
+  // Once the interval is over, a raise goes through again.
+  t.mock.timers.tick(6 * HOUR);
+  assert.deepEqual(await pass(150_000), [[16_384, 131_072, true]]);
+});
+
+test("the record of a raise past the interval lasts 6 h, not for good: an urgent raise 6 h after the last one goes at once, though the size was changed within the hour", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-01T00:00:00Z") });
+  const RESERVE = 10_000;
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: RESERVE + 150_000 })] });
+  const lastChanged = new Map<string, number>();
+  const lastUrgentRaise = new Map<string, number>();
+  const pass = async (spendable: number) => {
+    node.channels[0].localBalance = RESERVE + spendable;
+    return (await runMaxHtlcPass(node.lnd, node.lnd, new Map(), { lastChanged, lastUrgentRaise })).map((m) => [m.fromSat, m.toSat]);
+  };
+  assert.deepEqual(await pass(150_000), [[1_980_000, 131_072]]);
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(30_000), [[131_072, 16_384]]);
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(150_000), [[16_384, 131_072]], "the urgent raise of these 6 h");
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(30_000), [[131_072, 16_384]]);
+  // 6 h 15 min after the urgent raise, 5 h 45 min after the last change: a raise goes at once again.
+  t.mock.timers.tick(5.75 * HOUR);
+  assert.deepEqual(await pass(150_000), [[16_384, 131_072]]);
+});
+
 test("a channel that was emptied and is filled again advertises its size at once: 524,288 → 8,192 → 524,288 within the hour (review of the fee package, R4 — before: held at 8,192 for six hours with 600,000 sat to sell)", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-01T00:00:00Z") });
   const RESERVE = 10_000;
@@ -759,6 +821,19 @@ test("the autopilot keeps the six hours across its runs: the size it wrote in on
   const next = await autopilot.runOnce();
   assert.deepEqual(next.maxHtlc ?? [], []);
   assert.equal(node.policyRequests.length, 1);
+  // So does the record of a raise by four times or more: emptied, refilled
+  // (advertised at once), emptied and refilled again — the second refill
+  // waits for the interval.
+  const sizes: number[][] = [];
+  for (const spendable of [9_000, 80_000, 9_000, 80_000]) {
+    node.channels[0].localBalance = RESERVE + spendable;
+    sizes.push(...((await autopilot.runOnce()).maxHtlc ?? []).map((m) => [m.fromSat ?? 0, m.toSat]));
+  }
+  assert.deepEqual(sizes, [
+    [65_536, 8_192],
+    [8_192, 65_536],
+    [65_536, 8_192],
+  ]);
 });
 
 test("a write that leaves the rate as it was — the base fee alone — does not restamp the fee's 'set at' time: what sold since the fee was set and the raise wait keep counting from the change of price (review FEE-12)", async (t) => {
@@ -834,4 +909,42 @@ test("a fee LND has that the books don't — a write taken right before the proc
   t.mock.timers.tick(24 * HOUR);
   const later = await autopilot.runOnce();
   assert.deepEqual(later.changes.map((c) => [c.id, c.fromPpm, c.ok]), [["850000x1x0", 240, true]]);
+});
+
+test("an inbound discount with a base part only (-1,000 msat, no rate) is named again by every write too — a fee write that left it out would wipe it on an LND that resets what is not named", async () => {
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 1_500_000, inboundBaseMsat: -1_000, inboundRatePpm: 0 })] });
+  const results = await applyFees(node.lnd, node.lnd, [{ id: "850000x1x0", transactionId: TX(1), transactionVout: 0, feeRatePpm: 250, baseFeeMsat: 0 }]);
+  assert.deepEqual(results.map((r) => r.ok), [true]);
+  const moved = await runMaxHtlcPass(node.lnd, node.lnd, new Map());
+  assert.deepEqual(moved.map((m) => [m.id, m.ok]), [["850000x1x0", true]]);
+  assert.deepEqual(node.policyRequests.map(inboundNamed), [{ base: -1_000, rate: 0 }, { base: -1_000, rate: 0 }]);
+  assert.deepEqual(node.inboundOf("850000x1x0"), { base: -1_000, rate: 0 });
+});
+
+test("a manual Apply first puts on record a fee LND has that the books don't, as the scheduled run does: the engine does not step it a second time from the old stamp", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  // Idle at 40% local: lowered once a day.
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 800_000 })] });
+  const { autopilot, saved } = autopilotOn(t, node, { enabled: true });
+  const first = await autopilot.runOnce();
+  assert.deepEqual(first.changes.map((c) => [c.id, c.fromPpm, c.toPpm, c.ok]), [["850000x1x0", 300, 270, true]]);
+  // A day later LND takes 270 → 240 and the books never hear of it.
+  t.mock.timers.tick(24 * HOUR);
+  const lost = await applyFees(node.lnd, node.lnd, [{ id: "850000x1x0", transactionId: TX(1), transactionVout: 0, feeRatePpm: 240, baseFeeMsat: 0 }]);
+  assert.deepEqual(lost.map((r) => r.ok), [true]);
+  t.mock.timers.tick(HOUR / 2);
+  const nowIso = new Date().toISOString();
+  // The operator presses "Apply recommended": without the look first the
+  // stamp said "set 24.5 h ago" and 240 → 210 went out at once.
+  const applied = await autopilot.applyRecommended();
+  assert.deepEqual(applied, [], "no second step");
+  assert.equal(node.feeOf("850000x1x0")?.ppm, 240);
+  assert.equal(saved().perChannelLastApplied["850000x1x0"], nowIso);
+  assert.deepEqual(
+    autopilot.feeChanges().map((c) => [c.fromPpm, c.toPpm, c.via, c.why]),
+    [
+      [270, 240, "manual", "found at this fee — set outside the app, or by it right before a restart"],
+      [300, 270, "autopilot", autopilot.feeChanges()[1].why],
+    ],
+  );
 });

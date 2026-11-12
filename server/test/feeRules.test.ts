@@ -102,6 +102,12 @@ test("how far down an idle channel goes follows its balance: to Min ppm with sat
     const near = buildRecommendation(chan({ localRatio: local }), ctx({ ppm: 100 }));
     assert.deepEqual([near.targetPpm, near.wouldApply], [80, true], why(near));
   }
+  // Inside the deadband over its target (53 % against 50 %, the band 5 %) it
+  // has no sats to spare: the balanced level, then one step a week — not
+  // toward Min ppm at the ratchet's 30 a day.
+  const inBand = buildRecommendation(chan({ localRatio: 0.53 }), ctx({ ppm: 80 }));
+  assert.deepEqual([inBand.targetPpm, inBand.wouldApply], [70, true], why(inBand));
+  assert.match(inBand.reasons[0], /^no flow: nothing routed here recently — it holds no more than its target, so below the balanced level \(80 ppm\) it is lowered one step a week only/);
   // Under its target, at the level or below it: it stays — neither discounted nor raised.
   for (const ppm of [80, 60]) {
     const under = buildRecommendation(chan({ localRatio: 0.3 }), ctx({ ppm }));
@@ -152,6 +158,10 @@ test("a price with evidence behind it is taken at once whatever the balance: the
   // Below the balanced level too: the market's 40 against a level of 80.
   const cheapMarket = buildRecommendation(under, ctx({ ppm: 80, market: market(40) }));
   assert.deepEqual([cheapMarket.targetPpm, cheapMarket.wouldApply], [40, true], why(cheapMarket));
+  // And the price that last won routing back, below the balanced level, on a
+  // channel under its target: taken, not held at the level.
+  const cheapAnchor = buildRecommendation(under, ctx({ ppm: 80, flowAnchor: 50 }));
+  assert.deepEqual([cheapAnchor.targetPpm, cheapAnchor.wouldApply], [50, true], why(cheapAnchor));
   const drained = buildRecommendation(chan({ capacity: 5_000_000, localRatio: 0.07 }), ctx({ ppm: 340, market: market(150) }));
   assert.deepEqual([drained.targetPpm, drained.wouldApply], [140, true], why(drained));
   assert.match(drained.reasons[0], /^no flow: other nodes charge ~150 ppm into this peer — dropping to 140 ppm instead of stepping down blind/);
@@ -338,6 +348,16 @@ test("after a step-back the next climb goes at most to the middle of the stretch
   assert.equal(at(340).reasons[0], "hold: stepped back from 350 ppm 24 h ago — not raised back to it before 2026-10-27");
   // A record from before the fee it went back to was kept: the last price below the one that failed, as before.
   assert.equal(at(240, steppedBack({ toPpm: undefined })).targetPpm, 260);
+  // A fee at the price that failed or above it (set by hand since, or lifted
+  // by a floor) is not held by the memory: the memory bounds the way back up,
+  // not a fee that is past it already.
+  const past = (ppm: number) =>
+    buildRecommendation(chan({ localRatio: 0.05 }), ctx({ ppm, ...selling, soldSinceChange: soldThrice, cooldown: steppedBack(), cfg: cfgOf({ protectPpm: 600 }) }));
+  for (const [ppm, to] of [[350, 430], [400, 500]]) {
+    const r = past(ppm);
+    assert.equal(r.targetPpm, to, why(r));
+    assert.ok(!r.reasons.some((x) => /stepped back from 350 ppm/.test(x)), why(r));
+  }
 });
 
 test("a raise the step-back's memory bounds is judged against the aim behind the memory, not the short way to its bound (a fee that sold 20 times sat at 350 for the memory's seven days: the middle, 390, was 'a change below threshold')", () => {
@@ -491,6 +511,13 @@ test("its sales don't hold the fee of a channel with sats to spare and no buyers
   assert.equal(turned.targetPpm, 300, why(turned));
   const even = full({ recent: week(2, { inn14: 240_000, out14: 200_000, inn7: 150_000 }) });
   assert.equal(even.targetPpm, 300, why(even));
+  // 80k more in than out over 14 days in sales of 50k: over the tolerance
+  // (50k), but not by one sale — the sale a step-back's first hours missed
+  // is no inflow (the package's second review, Q4).
+  const lag = full({ recent: week(2, { inn14: 280_000, out14: 200_000, inn7: 300_000 }) });
+  assert.equal(lag.targetPpm, 300, why(lag));
+  const more = full({ recent: week(2, { inn14: 310_000, out14: 200_000, inn7: 300_000 }) });
+  assert.equal(more.targetPpm, 270, why(more));
 
   // The days of a higher fee — a price test's — say nothing about this one:
   // 600k in and 200k out in 14 days, but even over the 9.5 of them at 300 ppm
@@ -590,6 +617,13 @@ test("price test: a channel that sells every day at its fee, at its target, is t
   assert.deepEqual(at80.blockedByGuards, []);
   assert.equal(at80.reasons[0], TEST_WHY);
   assert.equal(rule({}, { ppm: 300, ...sells }).targetPpm, 330);
+  // Only where the autopilot's runs watch the channel (its clock of sats to
+  // sell): with fee automation off "Apply" could not judge a test, so none is
+  // offered (the package's second review, Q2).
+  const unwatched = rule({}, { ppm: 80, ...sells, cooldown: { ...lastChange(240), sellableSince: {} } });
+  assert.equal(unwatched.targetPpm, 80, why(unwatched));
+  assert.ok(!unwatched.reasons.some((x) => /^price test: /.test(x)), why(unwatched));
+  assert.equal(rule({}, { ppm: 80, ...sells, cooldown: { ...lastChange(240), sellableSince: { [ID]: hoursAgo(300) } } }).targetPpm, 90);
   // Never past Max ppm (nor said to be), a lease promise or the fee a rule's step-back remembers.
   const nearMax = rule({}, { ppm: 950, ...sells });
   assert.equal(nearMax.targetPpm, 1000, why(nearMax));
@@ -748,6 +782,29 @@ test("a price test nothing sold at is taken back after 48 h like any raise — a
   assert.deepEqual([promised.targetPpm, promised.stepBack, promised.probeBack], [70, undefined, undefined], why(promised));
 });
 
+test("a price test applied with 'Apply' on the Fees tab is still the engine's: nothing sold at it in 48 h and it goes back, it earned less in its first 72 h and it goes back, both remembered as a failed test — a fee set by hand stays the operator's (the package's second review, Q2)", () => {
+  const applied = { at: hoursAgo(50), fromPpm: 80, toPpm: 90, via: "manual" as const, engine: true, why: TEST_WHY };
+  const none = testedFor(50, 0, { lastChange: applied });
+  assert.deepEqual([none.targetPpm, none.stepBack, none.probeBack], [80, true, true], why(none));
+  assert.match(none.reasons[0], /^step back: tried 80→90 ppm 2 d ago and nothing sold at it since/);
+  const less = testedFor(80, 30, { lastChange: { ...applied, at: hoursAgo(80) } });
+  assert.deepEqual([less.targetPpm, less.stepBack, less.probeBack], [80, true, true], why(less));
+  assert.match(less.reasons[0], /^step back: tried 80→90 ppm 3 d ago and it earned less in its first 72 h/);
+  // With Fee automation off (no clock of the channel's sats on record) an
+  // applied raise is not held on trial: nothing could take it back, and the
+  // trial only kept a fee nobody bought at for a week (the review's second
+  // round, N4). The balance curve lowers it as it would any fee.
+  const trialed = (sellableSince: Record<string, string>) =>
+    rule({}, { ppm: 90, soldSinceChange: NO_FLOW, recent: week(0), lastChange: { ...applied, at: hoursAgo(20), why: "velocity: steady outbound demand — small nudge up" }, cooldown: { ...lastChange(20), sellableSince } });
+  assert.equal(trialed({ [ID]: hoursAgo(500) }).targetPpm, 90, why(trialed({ [ID]: hoursAgo(500) })));
+  assert.ok(trialed({}).targetPpm < 90, why(trialed({})));
+  // Set by hand (POST /fees/apply): no step-back (the balance curve may
+  // still move it, as it moves any fee that does not sell).
+  const byHand = testedFor(50, 0, { lastChange: { ...applied, engine: undefined } });
+  assert.ok(!byHand.reasons.some((x) => /^step back: /.test(x)), why(byHand));
+  assert.equal(byHand.stepBack, undefined);
+});
+
 /**
  * At 110 ppm after two price tests, 90 → 100 → 110: the first 171 h ago, the
  * second 90 h ago and kept on its first 72 h. The climb's first week ended
@@ -767,12 +824,81 @@ const climbed = (now: number, before: number, o: Partial<BuildCtx> & { ppm?: num
         ppm: 90,
         startedAt: hoursAgo(171),
         tests: 2,
+        ruleRaises: 0,
+        beforeNetOut: 0,
+        beforeHours: 0,
         week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(1_000_000, 0, 20, now), before: flow(1_100_000, 0, 22, before) },
       },
       cooldown: { ...lastChange(90), sellableSince: { [ID]: hoursAgo(500) } },
       ...o,
     },
   );
+
+test("a climb a drain rule began is checked the same way once the drain is over: inside its target band and not selling itself empty, a raise that earned less goes back to the fee before it — while the channel is still under its band it is kept, and the line says why (the package's second review, Q1)", () => {
+  const ruled = () =>
+    climbed(60, 70, {
+      climbAnchor: { ppm: 90, startedAt: hoursAgo(171), tests: 1, ruleRaises: 1, beforeNetOut: 0, beforeHours: 0, week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(1_000_000, 0, 20, 60), before: flow(1_100_000, 0, 22, 70) } },
+    });
+  const over = ruled();
+  assert.deepEqual([over.targetPpm, over.wouldApply, over.stepBack, over.probeBack], [90, true, true, true], why(over));
+  assert.equal(
+    over.reasons[0],
+    "step back: raised 90→110 ppm by the drain rules 7 d ago, with 1 price test since, the drain is over, and it earned less there, by more than one sale (60 sat in its last 7 d against 70 in the 7 d before, at 90 ppm) — back to 90 ppm, its fee before that raise",
+  );
+  // Under its band (40 % against 50 %, the band 5 %): the raise rations what is left.
+  const under = rule(
+    { localRatio: 0.4 },
+    {
+      ppm: 110,
+      soldSinceChange: flow(500_000, 0, 10, 55),
+      recent: week(7, { n3: 6 }),
+      lastChange: { at: hoursAgo(171), fromPpm: 90, toPpm: 110, via: "autopilot", why: "drain: it sells ~300k a day net at 90 ppm" },
+      climbAnchor: { ppm: 90, startedAt: hoursAgo(171), tests: 0, ruleRaises: 1, beforeNetOut: 0, beforeHours: 0, week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(1_000_000, 0, 20, 60), before: flow(1_100_000, 0, 22, 70) } },
+      cooldown: { ...lastChange(171), sellableSince: { [ID]: hoursAgo(500) } },
+    },
+  );
+  assert.ok(under.targetPpm >= 110, why(under));
+  assert.equal(under.stepBack, undefined, why(under));
+  // At half local, but selling itself empty again (600k net in the 3.75
+  // days since the fee was set, 35 % net out over 14 days): kept as well.
+  const emptying = climbed(60, 70, {
+    f14: flow(700_000, 0, 28, 77),
+    soldSinceChange: flow(600_000, 0, 12, 66),
+    climbAnchor: { ppm: 90, startedAt: hoursAgo(171), tests: 1, ruleRaises: 1, beforeNetOut: 0, beforeHours: 0, week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(1_000_000, 0, 20, 60), before: flow(1_100_000, 0, 22, 70) } },
+  });
+  assert.equal(emptying.stepBack, undefined, why(emptying));
+  // And where the days it is set against were a drain at the fee before
+  // (150k net out of the 2M channel, without the last day before the raise):
+  // those days were never what that fee earns while balanced (the review's
+  // second round, N3).
+  const drainedBefore = climbed(60, 70, {
+    climbAnchor: { ppm: 90, startedAt: hoursAgo(171), tests: 1, ruleRaises: 1, beforeNetOut: 600_000, beforeHours: 144, week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(1_000_000, 0, 20, 60), before: flow(1_100_000, 0, 22, 70) } },
+  });
+  assert.equal(drainedBefore.stepBack, undefined, why(drainedBefore));
+  // (600k net out in 6 days: 100k a day, 10 % local in 8 days from half of
+  // 2M. 150k in those days — 25k a day, 32 days — is a two-way channel's
+  // days of more out than in: taken back.)
+  const twoWayBefore = climbed(60, 70, {
+    climbAnchor: { ppm: 90, startedAt: hoursAgo(171), tests: 1, ruleRaises: 1, beforeNetOut: 150_000, beforeHours: 144, week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(1_000_000, 0, 20, 60), before: flow(1_100_000, 0, 22, 70) } },
+  });
+  assert.equal(twoWayBefore.stepBack, true, why(twoWayBefore));
+  assert.ok(drainedBefore.reasons.some((x) => /less — kept while the channel drains/.test(x)), why(drainedBefore));
+  // A climb of price tests alone is taken back whatever the days before were.
+  const testsOnly = climbed(60, 70, {
+    climbAnchor: { ppm: 90, startedAt: hoursAgo(171), tests: 2, ruleRaises: 0, beforeNetOut: 600_000, beforeHours: 144, week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(1_000_000, 0, 20, 60), before: flow(1_100_000, 0, 22, 70) } },
+  });
+  assert.equal(testsOnly.stepBack, true, why(testsOnly));
+  // As much or more: the climb is kept, and its line names it a raise, not a price test.
+  const keptRule = climbed(80, 70, { climbAnchor: { ppm: 90, startedAt: hoursAgo(171), tests: 1, ruleRaises: 1, beforeNetOut: 0, beforeHours: 0, week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(1_000_000, 0, 20, 80), before: flow(1_100_000, 0, 22, 70) } } });
+  assert.ok(keptRule.reasons.some((x) => x.startsWith("raised: at 110 ppm, up from 90 ppm 7 d ago — it earned 80 sat in its last 7 d against 70 in the 7 d before, at 90 ppm: kept")), why(keptRule));
+  assert.ok(emptying.reasons.some((x) => /less — kept while the channel drains/.test(x)), why(emptying));
+  assert.ok(
+    under.reasons.includes(
+      "raised: at 110 ppm, up from 90 ppm 7 d ago — it earned 60 sat in its last 7 d against 70 in the 7 d before, at 90 ppm, less — kept while the channel drains (under its target band, selling itself empty, or drained at the fee before)",
+    ),
+    why(under),
+  );
+});
 
 test("a climb of price tests is checked against the fee it began at, at the end of each of its weeks: it earned less in its last days than in as many before the climb, and all of it goes back — each test was kept on three days' sales, and buyers who buy a sixth less at each tenth more left 1,500 to 2,000 sat in 120 days where the fee it began at earned 2,400", () => {
   const less = climbed(60, 70);
@@ -790,9 +916,13 @@ test("a climb of price tests is checked against the fee it began at, at the end 
     const line = `price test: at 110 ppm, up from 90 ppm 7 d ago — it earned ${now} sat in its last 7 d against 70 in the 7 d before, at 90 ppm: kept${now < 70 ? " (less by no more than one sale)" : ""}`;
     assert.ok(kept.reasons.includes(line), why(kept));
   }
+  // "kept" is not said over a fee that goes down after all (a pin here).
+  const pinnedDown = climbed(80, 70, { override: { mode: "fixed", fixedPpm: 90 } });
+  assert.equal(pinnedDown.targetPpm, 90, why(pinnedDown));
+  assert.ok(!pinnedDown.reasons.some((x) => /: kept/.test(x)), why(pinnedDown));
   assert.deepEqual([climbed(66, 70).targetPpm, climbed(66, 70).stepBack], [90, true]);
   // The second week's check reads 14 days, one cut short what is on record.
-  const anchor = { ppm: 90, startedAt: hoursAgo(339), tests: 2 };
+  const anchor = { ppm: 90, startedAt: hoursAgo(339), tests: 2, ruleRaises: 0, beforeNetOut: 0, beforeHours: 0 };
   const stretch = (n: number, hours: number) => ({ n, hours, window: hours, from: NOW - (hours + 3) * HOUR, now: flow(1_000_000, 0, 20, 120), before: flow(1_100_000, 0, 22, 140) });
   assert.match(climbed(0, 0, { climbAnchor: { ...anchor, week: stretch(2, 336) } }).reasons[0], /in 2 price tests since 14 d ago, and it earned less there, by more than one sale \(120 sat in its last 14 d against 140 in the 14 d before, at 90 ppm\)/);
   assert.match(climbed(0, 0, { climbAnchor: { ...anchor, week: stretch(2, 100) } }).reasons[0], /\(120 sat in its last 100 h against 140 in the 100 h before, at 90 ppm\)/);
@@ -806,7 +936,7 @@ test("a climb of price tests is checked against the fee it began at, at the end 
     ppm: 100,
     lastChange: { at: hoursAgo(171), fromPpm: 90, toPpm: 100, via: "autopilot", why: "price test: it sells at 90 ppm" },
     priceTest: { fromPpm: 90, at: hoursAgo(171), before: flow(500_000, 0, 10, 45), first: flow(500_000, 0, 10, 50) },
-    climbAnchor: { ppm: 90, startedAt: hoursAgo(171), tests: 1, week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(1_000_000, 0, 20, 60), before: flow(1_100_000, 0, 22, 70) } },
+    climbAnchor: { ppm: 90, startedAt: hoursAgo(171), tests: 1, ruleRaises: 0, beforeNetOut: 0, beforeHours: 0, week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(1_000_000, 0, 20, 60), before: flow(1_100_000, 0, 22, 70) } },
     cooldown: { ...lastChange(171), sellableSince: { [ID]: hoursAgo(500) } },
   });
   assert.equal(once.targetPpm, 90, why(once));
@@ -839,7 +969,7 @@ test("a climb of price tests is checked against the fee it began at, at the end 
   assert.deepEqual([refused.targetPpm, refused.stepBack], [110, undefined], why(refused));
   const excluded = climbed(60, 70, { override: { mode: "exclude" } });
   assert.deepEqual([excluded.targetPpm, excluded.stepBack], [110, undefined], why(excluded));
-  const lower = climbed(60, 70, { climbAnchor: { ppm: 110, startedAt: hoursAgo(171), tests: 2, week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(1_000_000, 0, 20, 60), before: flow(1_100_000, 0, 22, 70) } } });
+  const lower = climbed(60, 70, { climbAnchor: { ppm: 110, startedAt: hoursAgo(171), tests: 2, ruleRaises: 0, beforeNetOut: 0, beforeHours: 0, week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(1_000_000, 0, 20, 60), before: flow(1_100_000, 0, 22, 70) } } });
   assert.equal(lower.stepBack, undefined, why(lower));
   assert.ok(!lower.reasons.some((x) => /earned less there/.test(x)), why(lower));
 });
@@ -875,6 +1005,12 @@ test("a price test that was taken back is not repeated for a week (two weeks, fo
   // …as it is by the memory of a raise that failed.
   const bound = rule({ localRatio: 0.05 }, { ...sells, cooldown: { ...lastChange(240), stepBacks: { [ID]: { fromPpm: 90, toPpm: 80, at: hoursAgo(24) } } } });
   assert.equal(bound.targetPpm, 80, why(bound));
+  // A channel that sells itself empty is raised past it too: the drain ramp
+  // (80 → 100, past the 90 that failed a day ago) prices the sats it has
+  // left, whatever a test said about a balanced channel.
+  const draining = buildRecommendation(chan(), ctx({ f14: flow(700_000, 0, 28, 56), f30: flow(900_000, 750_000, 40, 72), ppm: 80, soldSinceChange: flow(150_000, 0, 3, 12), cooldown: { ...lastChange(12), probeBacks: { [ID]: { fromPpm: 90, toPpm: 80, at: hoursAgo(24), count: 1 } } } }));
+  assert.equal(draining.targetPpm, 100, why(draining));
+  assert.match(draining.reasons[0], /^drain: /);
 });
 
 // ── FEE-3: a fast drain is priced ahead ─────────────────────────────────────
@@ -930,6 +1066,48 @@ test("the drain is measured at the fee in force: since it was set, and over the 
   const noStamp = drains({}, { ppm: 80, soldSinceChange: flow(900_000, 750_000, 40, 72), recent: lastDays(2, 6, 12, 14) });
   assert.equal(noStamp.targetPpm, 100, why(noStamp));
   assert.match(noStamp.reasons[0], /^drain: it sells ~100k a day net at 80 ppm — at that rate it is down to 10% local in ~8 d \(40 sales in 30 d\)/);
+});
+
+test("what sold before the fee was set does not drive the drain ramp through the last day either, and sales in the first minutes after a change are read over six hours at least, not as a day's rate many times higher", () => {
+  // Fee set 12 h ago, one sale since; four sales (200k) in the last day, most
+  // of them at the fee before: the day is not this fee's.
+  const dayOld = drains({}, { ppm: 80, soldSinceChange: flow(40_000, 0, 1, 3), recent: lastDays(4, 12, 12, 14), cooldown: lastChange(12) });
+  assert.equal(dayOld.targetPpm, 80, why(dayOld));
+  assert.ok(noDrainLine(dayOld), why(dayOld));
+  // The cooldown's stamp says when the fee was set, where the log's last
+  // record is older (a fee found set outside the app is stamped when found,
+  // review FEE-10): 12 h, not the 100 h since the record.
+  const found = drains({}, { ppm: 80, soldSinceChange: flow(40_000, 0, 1, 3), recent: lastDays(4, 12, 12, 14), cooldown: lastChange(12), lastChange: { at: hoursAgo(100), fromPpm: 60, toPpm: 80, via: "autopilot" } });
+  assert.ok(noDrainLine(found), why(found));
+  // Three sales of 50k in the 20 minutes since the fee was set: 150k over the
+  // six hours is 600k a day — not 150k in 20 minutes, 10.8M a day.
+  const minutes = drains({}, { ppm: 80, soldSinceChange: threeSales, cooldown: lastChange(1 / 3) });
+  assert.ok(
+    minutes.reasons.some((x) => x.startsWith("drain: it sells ~600k a day net at 80 ppm — at that rate it is down to 10% local in about a day")),
+    why(minutes),
+  );
+});
+
+test("sats a channel that routes both ways sold on some days and got back on others are no drain: four days with 1M more out than in, and 250k net out in the 14 days, do not ramp a 5M channel at half local (random buyers: raised 110 → 130 ppm, held, a fifth less earned than at the fee held flat)", () => {
+  const big = chan({ capacity: 5_000_000, localRatio: 0.48 });
+  const at = (net14: number) =>
+    buildRecommendation(
+      big,
+      ctx({ ppm: 110, f14: flow(3_250_000, 3_250_000 - net14, 70, 357), f30: flow(6_500_000, 6_250_000, 140, 715), soldSinceChange: flow(1_850_000, 850_000, 17, 203), cooldown: lastChange(96) }),
+    );
+  const twoWay = at(250_000);
+  assert.ok(noDrainLine(twoWay), why(twoWay));
+  assert.ok(twoWay.targetPpm <= 110, why(twoWay));
+  // Where the 14 days keep half of it (500k of the stretch's 1M), it is a drain.
+  const kept = at(500_000);
+  assert.match(kept.reasons[0], /^drain: it sells ~250k a day net at 110 ppm — at that rate it is down to 10% local in ~8 d/, why(kept));
+  assert.equal(kept.targetPpm, 130, why(kept));
+});
+
+test("a drain measured since the fee was set more than two weeks ago is held against 14 days of net outflow, not its whole stretch: 50k a day net for 30 days is a drain the 14 days keep", () => {
+  // 1.5M net out in the 30 days at 80 ppm; 700k of it in the last 14.
+  const steady = drains({}, { ppm: 80, f14: flow(700_000, 0, 28, 56), soldSinceChange: flow(1_500_000, 0, 60, 120), cooldown: lastChange(30 * 24) });
+  assert.match(steady.reasons[0], /^drain: it sells ~50k a day net at 80 ppm/, why(steady));
 });
 
 test("no drain ramp on thin evidence: under three sales or 5 % of the capacity net out in a stretch, what came in taken off; two weeks that are even; more than three weeks from drained; where raising lost revenue before", () => {
@@ -1110,10 +1288,13 @@ test("the climb of price tests the current fee belongs to: the fee before the ea
     ppm: 90,
     startedAt: hoursAgo(171),
     tests: 2,
+    ruleRaises: 0,
+    beforeNetOut: 200_000,
+    beforeHours: 144,
     week: { n: 1, hours: 168, window: 168, from: NOW - 171 * HOUR, now: flow(200_000, 0, 2, 21), before: flow(200_000, 0, 2, 18) },
   });
   // No check before the first week is over, nor from 48 h after its end until the next.
-  assert.deepEqual(climbAnchorOf(events, ID, two(167), 110, FROM, NOW), { ppm: 90, startedAt: hoursAgo(167), tests: 2, week: null });
+  assert.deepEqual(climbAnchorOf(events, ID, two(167), 110, FROM, NOW), { ppm: 90, startedAt: hoursAgo(167), tests: 2, ruleRaises: 0, beforeNetOut: 0, beforeHours: 0, week: null });
   assert.equal(climbAnchorOf(events, ID, two(168 + 48), 110, FROM, NOW)?.week?.n, 1);
   assert.equal(climbAnchorOf(events, ID, two(168 + 49), 110, FROM, NOW)?.week, null);
   // The stretches: 14 days after the second week; 7 again after the third (a
@@ -1130,11 +1311,11 @@ test("the climb of price tests the current fee belongs to: the fee before the ea
   // The fee before the climb stood 100 h before it: the stretches are 100 h…
   assert.deepEqual(climbAnchorOf(events, ID, [change(271, 120, 90), ...two(171)], 110, FROM, NOW)?.week?.hours, 100);
   // …and under 72 h it is not what a climb is checked against: the climb is the next test's.
-  assert.deepEqual(climbAnchorOf(events, ID, [change(231, 120, 90), ...two(171)], 110, FROM, NOW), { ppm: 100, startedAt: hoursAgo(90), tests: 1, week: null });
+  assert.deepEqual(climbAnchorOf(events, ID, [change(231, 120, 90), ...two(171)], 110, FROM, NOW), { ppm: 100, startedAt: hoursAgo(90), tests: 1, ruleRaises: 0, beforeNetOut: 0, beforeHours: 0, week: null });
 
   // A test taken back to a fee above the climb's start is part of it…
   const withBack = [change(400, 90, 100, TESTED), change(300, 100, 110, TESTED), change(250, 110, 100, WENT_BACK), change(171, 100, 110, TESTED)];
-  assert.deepEqual(climbAnchorOf(events, ID, withBack, 110, FROM, NOW), { ppm: 90, startedAt: hoursAgo(400), tests: 3, week: null });
+  assert.deepEqual(climbAnchorOf(events, ID, withBack, 110, FROM, NOW), { ppm: 90, startedAt: hoursAgo(400), tests: 3, ruleRaises: 0, beforeNetOut: 0, beforeHours: 0, week: null });
   // The hours of a test that was taken back are no part of the week's check
   // (nothing sells at a fee above what buyers pay — that is not what the fee
   // below it earns), nor those of a test not yet judged when the week ended;
@@ -1149,15 +1330,61 @@ test("the climb of price tests the current fee belongs to: the fee before the ea
   // …one taken back to the start ends it: the next test begins a new climb.
   const fromStart = [change(400, 90, 100, TESTED), change(300, 100, 90, WENT_BACK), change(171, 90, 100, TESTED)];
   const again = climbAnchorOf(events, ID, fromStart, 100, FROM, NOW);
-  assert.deepEqual([again?.ppm, again?.startedAt, again?.tests, again?.week?.hours], [90, hoursAgo(171), 1, 129]);
-  // A raise a rule made, a change by hand and a gap in the log end the climb as well.
-  assert.equal(climbAnchorOf(events, ID, [change(400, 90, 100, TESTED), change(171, 100, 110, { why: "balance: low local ratio" })], 110, FROM, NOW), null);
+  // Its check reads the fee it began at over the 129 h after the step-back
+  // and, the test taken back left out, the hours before that test: 168 h,
+  // as many as the climb has stood (the package's second review, Q1).
+  assert.deepEqual([again?.ppm, again?.startedAt, again?.tests, again?.week?.hours], [90, hoursAgo(171), 1, 168]);
+  // A raise one of the drain rules made is part of the climb, and counted
+  // apart (the package's second review, Q1: it was never judged, and the
+  // hold kept it for good)…
+  assert.deepEqual(climbAnchorOf(events, ID, [change(400, 90, 100, TESTED), change(171, 100, 110, { why: "balance: low local ratio" })], 110, FROM, NOW), {
+    ppm: 90,
+    startedAt: hoursAgo(400),
+    tests: 1,
+    ruleRaises: 1,
+    beforeNetOut: 0,
+    beforeHours: 0,
+    week: null,
+  });
+  // …and a raise toward a refill cost, a change by hand and a gap in the log end it.
+  assert.equal(climbAnchorOf(events, ID, [change(400, 90, 100, TESTED), change(171, 100, 110, { why: "replacement: refilling costs 120 ppm" })], 110, FROM, NOW), null);
   assert.equal(climbAnchorOf(events, ID, [change(400, 80, 90, TESTED), change(300, 90, 100, { ...TESTED, via: "manual" }), change(171, 100, 110, TESTED)], 110, FROM, NOW)?.ppm, 100);
   assert.equal(climbAnchorOf(events, ID, [change(400, 80, 90, TESTED), change(171, 100, 110, TESTED)], 110, FROM, NOW)?.ppm, 100);
   // None: no change, a last change that did not end at the fee LND has, a test older than the forwards read.
   assert.equal(climbAnchorOf(events, ID, [], 110, FROM, NOW), null);
   assert.equal(climbAnchorOf(events, ID, two(171), 120, FROM, NOW), null);
   assert.equal(climbAnchorOf(events, ID, [change(171, 90, 100, TESTED)], 100, NOW - 100 * HOUR, NOW), null);
+});
+
+test("the fee a climb began at is read across a climb taken back to it — a test's, or the drain rules' — its hours left out and what sold in them too, not across one that began at another fee; a demand ramp's raise is part of a climb (the review's second round, N2, N6)", () => {
+  const FROM = NOW - 30 * DAY;
+  const events = [fwd(400), fwd(350, 100_000, 9_000), fwd(300, 100_000, 9_000), fwd(200, 100_000, 9_000), fwd(150, 100_000, 10_000), fwd(50, 100_000, 11_000), fwd(2)];
+  // A test from 90 taken back to it: its 100 h (one sale at 350 h) are not read; the 168 h before the climb are the 129 h after the
+  // step-back (the sale at 200 h) and the 39 h before the test (none).
+  const fromStart = [change(400, 90, 100, TESTED), change(300, 100, 90, WENT_BACK), change(171, 90, 100, TESTED)];
+  const w = climbAnchorOf(events, ID, fromStart, 100, FROM, NOW)?.week;
+  assert.deepEqual([w?.hours, w?.before.forwards, w?.before.revenue], [168, 1, 9]);
+  // The same across a raise of the drain rules that was taken back.
+  const drainBack = [change(400, 90, 100, { why: "drain: it sells ~300k a day net at 90 ppm" }), change(300, 100, 90, { why: "step back: raised 90→100 ppm by the drain rules 4 d ago, the drain is over, and it earned less there" }), change(171, 90, 100, TESTED)];
+  assert.equal(climbAnchorOf(events, ID, drainBack, 100, FROM, NOW)?.week?.hours, 168);
+  // A climb that began at another fee (80) and was taken back only to 90 is
+  // still the climb from 80: it is checked against 80, never against a 90
+  // that stood 129 h.
+  const elsewhere = [change(400, 80, 100, TESTED), change(300, 100, 90, WENT_BACK), change(171, 90, 100, TESTED)];
+  assert.deepEqual([climbAnchorOf(events, ID, elsewhere, 100, FROM, NOW)?.ppm, climbAnchorOf(events, ID, elsewhere, 100, FROM, NOW)?.tests], [80, 2]);
+  // What went out net at the fee before, for "it drained there": the
+  // week's stretch without its last day — a burst of 1M an hour before the
+  // climb began is what set it off, not a drain the fee before allowed.
+  const burst = [...events, fwd(172, 1_000_000, 90_000)];
+  const before = climbAnchorOf(burst, ID, fromStart, 100, FROM, NOW);
+  assert.deepEqual([before?.beforeNetOut, before?.beforeHours], [100_000, 144]);
+  // A change by hand before the step-back's climb ends the reading there:
+  // the fee before it was another (120), not 90 — 129 h.
+  const byHand = [change(400, 120, 100, { via: "manual" }), change(300, 100, 90, WENT_BACK), change(171, 90, 100, TESTED)];
+  assert.equal(climbAnchorOf(events, ID, byHand, 100, FROM, NOW)?.week?.hours, 129);
+  // The demand ramp's raise of a drained channel begins a climb.
+  const demand = climbAnchorOf(events, ID, [change(171, 90, 110, { why: "demand: drained (5% local) and sold 3 times at 90 ppm since it was set" })], 110, FROM, NOW);
+  assert.deepEqual([demand?.ppm, demand?.ruleRaises, demand?.tests], [90, 1, 0]);
 });
 
 test("with the forwarding history incomplete the holds for a fee that sells cannot speak — the run says so in a line of its own, and the fee is still lowered", () => {

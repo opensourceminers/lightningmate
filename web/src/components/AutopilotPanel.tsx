@@ -151,14 +151,20 @@ export const FEE_MOVE_HINT =
   "fee it charges now — protecting a drained channel too (there an HTLC it had to refuse counts as well). A fee that sells is kept: " +
   "it is not lowered while the channel sells at it, unless the channel holds more than its target and takes in more than it sells " +
   "or would need over three months to sell the surplus; where a channel sells every day and holds no more than its target, a fee " +
-  "one step (or a tenth) higher is tried, and taken back if it earns less — the price that earned less is then not raised to for a week either, unless the channel drains. A raise nothing sold at for 48 h while the channel had " +
+  "one step (or a tenth) higher is tried, and taken back if it earns less — the price that earned less is then not raised to for a week either " +
+  "(two weeks, four weeks when it fails again), unless the channel drains. A raise the drain rules made — the drain, demand and protect ramps, the " +
+  "balance curve, the velocity nudge — is checked the same way at the end of its weeks, once the channel is back in its target band, " +
+  "no longer sells itself empty and did not drain at the fee before: what it earned against as many days before it, taken back if " +
+  "less by more than one sale (a raise toward a refill cost is not). A raise nothing sold at for 48 h while the channel had " +
   "sats to sell goes back to the last fee that sold — and isn’t raised back to that level for a week, two weeks the second time in " +
   "a row, four the third. " +
   "In one update only: a step back, an idle channel dropping to the price that last won it flow or to the market’s price into its " +
   "peer, a pinned fee, a new channel’s protected fee, a broken lease promise, and a fee outside Min/Max ppm (a fee below Min goes to " +
   "Min first, then steps). An idle channel steps down to Min ppm only where it holds more than its target: at its target it steps " +
   "to Neutral ppm and from there one step a week, and under its target it is not stepped down below Neutral ppm (the drop to the price that last won it flow, or to the market’s, is made there too). “Min change” only skips " +
-  "fees already that close to where the engine is heading — never an idle channel’s step or jump down, nor a fee brought into Min/Max.";
+  "fees already that close to where the engine is heading — never an idle channel’s step or jump down, nor a fee brought into Min/Max. " +
+  "“Apply” on the Fees tab applies the engine’s own moves, which the engine then judges as its own; the step-back and the judgement " +
+  "need Fee automation’s runs (they keep the clocks), so with it off no price test is offered and a raise applied by hand is not taken back.";
 const SELL_NUM_FIELDS: { key: NumKey; label: string; hint?: string }[] = [{ key: "sellMaxChannelSats", label: "Max channel size / order (sat)" }];
 /** Fields on the Limits, labelled there (validation messages name them). */
 const LIMIT_LABELS = { sellMaxDeploySats: "Capital to sell (sat)", sellReserveSats: "Keep on chain (sat)" } as const;

@@ -52,12 +52,16 @@ for (const [name, chunk] of [
 
   // (Before: 1,691 sat — the climb to 330 was taken back whole for the dead
   // days of the try at 360. A flat 300 ppm earns 3,600 sat in these 60 days:
-  // each try nobody buys at costs two days' sales, three of them here.)
+  // each try nobody buys at costs two days' sales, three of them here. The
+  // first run makes no price test — no clock of the channel's sats to sell
+  // is on record yet (the package's second review, Q2) — so the tests come
+  // an hour later, and with two sales a day the fourth try falls on day 58:
+  // its two days without a sale end the run, 3,333 sat where it was 3,390.)
   test(`buyers who pay up to 330 ppm, ${name}, from 300 ppm: 330 is found and kept — 360 is tried, taken back after two days without a sale, and tried again later each time`, async (t) => {
     const r = await simulate(t, capped(330, 200_000, chunk * 2, 300, 60));
     report(`K2 cap 330, ${name}`, "buyers pay up to 330 ppm, 200k a day, start 300 ppm", r, 10);
     assert.ok(staysAt(r, 330, 360, 16, 4), told(r, 10));
-    assert.ok(r.changes.length <= 9 && r.revenueSats >= 3_350, told(r, 10));
+    assert.ok(r.changes.length <= 9 && r.revenueSats >= 3_300, told(r, 10));
   });
 }
 

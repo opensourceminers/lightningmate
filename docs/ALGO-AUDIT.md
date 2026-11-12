@@ -101,3 +101,10 @@ Konsistent mit: Fee-Engine hob Fees auf nachfrage-starken Kanälen an (velocity 
 # Anhang: Detail-Audits pro Subsystem
 
 (Volltext der fünf Subsystem-Audits — Fees, Rebalancing, Magma, Learning/Ökonomie, Kapital/Orchestrierung — mit `file:line`-Referenzen und gerankten Fixes. Siehe Chat-Verlauf der Audit-Session; die Kernpunkte sind oben synthetisiert.)
+
+### Stand 2026-11 (zweite Prüfung der Fee-Regeln)
+- Eine Anhebung der Drain-Regeln (Drain-, Demand- und Protect-Rampe, Velocity, Balance-Kurve unter dem Ziel, 30-Tage-Drain, Benchmark) gehört zum Anstieg, den sie beginnt, und wird wie ein Preistest geprüft, sobald der Drain vorbei ist (Kanal wieder im Zielband, kein schneller Abfluss, und die Vergleichstage beim alten Preis waren kein Drain (ihr Nettoabfluss hätte den Kanal nicht binnen 21 Tagen auf 10 % gebracht)): Hat sie in ihrer Woche um mehr als einen Verkauf weniger eingebracht als die Fee davor, geht sie zurück und wird wie ein gescheiterter Test gemerkt. Vorher hielt „eine Fee, die verkauft, bleibt" sie für immer: Ein Käufer, der 400k aus einem ausgeglichenen Kanal nahm, ließ dessen Fee 20 % höher stehen, die übrigen Käufer zahlten ein Sechstel weniger.
+- Die Drain-Rampe zählt eine Strecke nur, wenn die letzten 14 Tage mindestens die Hälfte ihres Abflusses behalten haben: Ein Kanal, der in beide Richtungen routet, verkauft an manchen Tagen nur und bekommt die Sats an anderen zurück.
+- „Apply" auf dem Fees-Tab bucht die Schritte der Engine als ihre eigenen (`engine: true`): Probezeit, Step-back und Urteil gelten — solange die Fee-Automatik läuft, deren Läufe die Uhren führen. Ohne sie wird kein Preistest angeboten.
+- „Nimmt mehr auf, als er verkauft" braucht einen Überschuss über Toleranz plus einen Verkauf; der erste fehlende Verkauf nach einem Step-back ist kein Zufluss.
+- max_htlc: Eine Absenkung auf ein Viertel geht immer sofort, eine Anhebung auf das Vierfache nur einmal in 6 h.

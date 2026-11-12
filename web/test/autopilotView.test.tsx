@@ -444,6 +444,9 @@ test("the settings draft checks the rules across fields the server checks: min â
   assert.deepEqual(high.errors, ["Protect ppm (1200) must not be above Max ppm (1000)"]);
   assert.equal(high.fieldErrors["policy.protectPpm"], high.errors[0]);
   assert.deepEqual(checkDraft(draft({ nums: { "policy.maxPpm": "200", "policy.protectPpm": "150" } }), c, bounds, labels).errors, []);
+  // Protect ppm equal to Max ppm is allowed: it is the highest it may be.
+  assert.deepEqual(checkDraft(draft({ nums: { "policy.maxPpm": "200", "policy.protectPpm": "200" } }), c, bounds, labels).errors, []);
+  assert.deepEqual(checkDraft(draft({ nums: { "policy.protectPpm": "1000" } }), c, bounds, labels).errors, []);
   assert.deepEqual(checkDraft(draft({ nums: { channelSizeSats: "15000" } }), c, bounds, labels).errors, ["Channel size: 0 (auto) or at least 20,000 sat"]);
   assert.deepEqual(checkDraft(draft({ nums: { channelSizeSats: "0" } }), config({ channelSizeSats: 2_000_000 }), bounds, labels).patch, { channelSizeSats: 0 });
 });

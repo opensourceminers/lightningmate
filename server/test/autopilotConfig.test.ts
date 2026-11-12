@@ -455,6 +455,9 @@ test("upgrading keeps what the engine did with an inverted fee range, a sub-mini
   assert.equal(validateAutopilotPatch({ policy: { maxPpm: 250 } }, over.config).ok, true);
   // Lowering both in one save is fine; Protect below Min is no floor, and no error.
   assert.equal(validateAutopilotPatch({ policy: { maxPpm: 200, protectPpm: 150 } }, DEFAULT_CONFIG).ok, true);
+  // Protect ppm equal to Max ppm is the highest it may be, not above it.
+  assert.equal(validateAutopilotPatch({ policy: { maxPpm: 200, protectPpm: 200 } }, DEFAULT_CONFIG).ok, true);
+  assert.equal(validateAutopilotPatch({ policy: { protectPpm: 1000 } }, DEFAULT_CONFIG).ok, true);
   assert.equal(validateAutopilotPatch({ policy: { minPpm: 400, neutralPpm: 500 } }, DEFAULT_CONFIG).ok, true);
   assert.ok(!sanitizePersistedConfig({ policy: { protectPpm: 350 } }).repairs.some((r) => r.startsWith("policy.protectPpm")));
 

@@ -36,6 +36,13 @@ export interface FeeChangeRecord {
   /** It applied a pin (an override "fixed"): the operator's fee, as one set
    *  by hand is — the step-back never takes it back. */
   pinned?: boolean;
+  /** A move of the fee engine's own that the operator applied by hand
+   *  ("Apply" on the Fees tab, `via: "manual"`): the engine judges it as its
+   *  own — a raise is on trial, taken back when nothing sells at it or a
+   *  price test earned less — where a fee set by hand is the operator's
+   *  (the package's second review, Q2: an applied price test was never
+   *  judged, and a channel under its target went 310 ↔ 340 every four days). */
+  engine?: boolean;
 }
 
 const FILE = "fee-changes.json";

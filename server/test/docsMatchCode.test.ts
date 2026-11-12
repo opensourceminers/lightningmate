@@ -564,4 +564,12 @@ test("the docs say when a fee that sells is kept, when a higher one is tried and
   assert.match(flat, /A test that was taken back is not repeated for 7 days — 14, then 28 when tests fail in a row at the same level/);
   assert.match(flat, /advertised size changes \*\*at most once in 6 h\*\*/);
   assert.doesNotMatch(flat, /never on a fee set by hand/);
+  // The package's second review (Q1, Q2, Q4, Q5, random buyers).
+  assert.equal(fee.DRAIN_RAMP_KEPT_SHARE, 0.5, "“at least half of what the stretch says goes out”");
+  assert.match(flat, /and at least half of what the stretch says goes out in as many of them as it covers/);
+  assert.match(flat, /A \*\*raise the drain rules made\*\* — the drain and demand ramps, the velocity nudge, the balance curve under the target, the protect ramp, a 30-day drain's raise, the benchmark's nudge for a draining top earner — is part of the climb it begins/);
+  assert.match(flat, /\*\*once the drain is over\*\*: the channel is inside its target band again, no fast drain is measured, and the days the climb is set against were no drain either/);
+  assert.match(flat, /with it off no price test is offered and a raise applied by hand is not taken back/);
+  assert.match(flat, /by more than max\(1 % of capacity, 50k sat\) and one of its sales/);
+  assert.match(flat, /up to four times as much or more once in the 6 h/);
 });

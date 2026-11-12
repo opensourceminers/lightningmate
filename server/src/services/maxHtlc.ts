@@ -66,7 +66,10 @@ const RAISE_HEADROOM = 1.1;
  *  retried — and recorded as applied — every 30-minute run). */
 export const MAX_HTLC_BACKOFF_MS = 6 * 3_600_000;
 /** The least time between two max_htlc changes on one channel (four a day
- *  at most), a change by URGENT_CHANGE or more — either way — excepted. */
+ *  at most), a change by URGENT_CHANGE or more excepted: a lowering always,
+ *  a raise once in the interval (the package's second review, Q5: a channel
+ *  that swung between 150k and 30k spendable flipped 131,072 ↔ 32,768 with
+ *  every run, 48 updates a day). */
 export const MAX_HTLC_MIN_INTERVAL_MS = 6 * 3_600_000;
 /** Two buckets: the channel can forward a quarter of what it advertises, or
  *  four times as much. */
@@ -117,8 +120,9 @@ export function decideMaxHtlc(
  *
  * `excluded`: the channels the operator took out of fee automation — not
  * read, not written. `lastChanged`: when each channel's max_htlc was last
- * changed by a pass (kept by the caller), for the pacing above; kept in
- * memory only — after a restart one change may come early.
+ * changed by a pass (kept by the caller), for the pacing above, and
+ * `lastUrgentRaise` when a raise last went through it; kept in memory
+ * only — after a restart one change may come early.
  */
 export async function runMaxHtlcPass(
   readLnd: AuthenticatedLnd,
@@ -131,14 +135,17 @@ export async function runMaxHtlcPass(
     lastWrites?: Map<string, { fromSat: number | null; toSat: number }>;
     excluded?: ReadonlySet<string>;
     lastChanged?: Map<string, number>;
+    lastUrgentRaise?: Map<string, number>;
   } = {},
 ): Promise<MaxHtlcChange[]> {
   const lastWrites = opts.lastWrites ?? new Map<string, { fromSat: number | null; toSat: number }>();
   const lastChanged = opts.lastChanged ?? new Map<string, number>();
+  const lastUrgentRaise = opts.lastUrgentRaise ?? new Map<string, number>();
   const [{ channels }, mine] = await Promise.all([getChannels({ lnd: readLnd }), getOwnPubkey(readLnd)]);
   const out: MaxHtlcChange[] = [];
   const now = Date.now();
   for (const [id, at] of lastChanged) if (now - at >= MAX_HTLC_MIN_INTERVAL_MS) lastChanged.delete(id);
+  for (const [id, at] of lastUrgentRaise) if (now - at >= MAX_HTLC_MIN_INTERVAL_MS) lastUrgentRaise.delete(id);
 
   for (const c of channels.filter((ch) => ch.is_active && !opts.excluded?.has(ch.id))) {
     const refusedAt = backoff.get(c.id);
@@ -187,10 +194,14 @@ export async function runMaxHtlcPass(
     } else if (last) lastWrites.delete(c.id);
     if (!change) continue;
     // Changed within the interval: it waits — unless the channel can forward
-    // a quarter or less of what it advertises, or four times as much or more.
+    // a quarter or less of what it advertises (lowered at once, always), or
+    // four times as much or more (raised at once, once in the interval: a
+    // refilled channel is advertised at its size, a channel that swings
+    // with every payment is not rewritten with every run).
     // (A size the channel doesn't say — none in its policy — is no measure.)
-    const urgent = !!currentMaxSat && (toSat * URGENT_CHANGE <= currentMaxSat || toSat >= currentMaxSat * URGENT_CHANGE);
-    if (lastChanged.has(c.id) && !urgent) continue;
+    const urgentLower = !!currentMaxSat && toSat * URGENT_CHANGE <= currentMaxSat;
+    const urgentRaise = !!currentMaxSat && toSat >= currentMaxSat * URGENT_CHANGE && !lastUrgentRaise.has(c.id);
+    if (lastChanged.has(c.id) && !urgentLower && !urgentRaise) continue;
     if (opts.shouldStop?.()) break;
 
     try {
@@ -220,6 +231,7 @@ export async function runMaxHtlcPass(
       }
       backoff.delete(c.id);
       lastWrites.set(c.id, { fromSat: currentMaxSat, toSat });
+      if (lastChanged.has(c.id) && currentMaxSat !== null && toSat > currentMaxSat) lastUrgentRaise.set(c.id, now);
       lastChanged.set(c.id, now);
       out.push({
         id: c.id,

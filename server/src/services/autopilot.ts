@@ -1704,6 +1704,9 @@ export class Autopilot {
    *  size is changed at most once in MAX_HTLC_MIN_INTERVAL_MS (runMaxHtlcPass).
    *  In memory: a restart at worst lets one change come early. */
   private readonly maxHtlcLastChanged = new Map<string, number>();
+  /** When a raise of each channel's max_htlc last went through the 6 h
+   *  interval (maxHtlc.ts, an urgent raise once in it). */
+  private readonly maxHtlcLastUrgentRaise = new Map<string, number>();
   /** Every applied fee change (D15) — what fee outcomes and the elasticity
    *  learner measure; never the run history. */
   readonly feeLog: FeeChangeLog;
@@ -2858,7 +2861,7 @@ export class Autopilot {
     writeLnd: AuthenticatedLnd,
     writes: FeeWrite[],
     via: NonNullable<AutopilotChange["via"]>,
-    opts: { quietRepeats?: boolean; shouldStop?: () => boolean } = {},
+    opts: { quietRepeats?: boolean; shouldStop?: () => boolean; engine?: boolean } = {},
   ): Promise<{ changes: AutopilotChange[]; notSent: number }> {
     if (writes.length === 0) return { changes: [], notSent: 0 };
     const byId = new Map(writes.map((w) => [w.id, w]));
@@ -2920,6 +2923,8 @@ export class Autopilot {
             toBaseMsat: toBaseMsat ?? null,
             via,
             ...(w?.pinned ? { pinned: true } : {}),
+            // ("Apply recommended": the engine's move, the operator's click.)
+            ...(opts.engine && via === "manual" ? { engine: true } : {}),
             ...(why || res.clampedBy ? { why: [why, res.clampedBy].filter(Boolean).join("; ") } : {}),
           },
         ]);
@@ -3088,7 +3093,7 @@ export class Autopilot {
           const eligible = report.recommendations.filter(
             (r) => r.wouldApply && r.transactionId !== null && r.transactionVout !== null && (!wanted || wanted.has(r.channelId)),
           );
-          const { changes } = await this.writeFees(writeLnd, eligible.map((r) => recommendationWrite(r)), "manual");
+          const { changes } = await this.writeFees(writeLnd, eligible.map((r) => recommendationWrite(r)), "manual", { engine: true });
           if (changes.length) this.recordRun({ changes });
           return changes;
         }),
@@ -7595,6 +7600,7 @@ export class Autopilot {
             shouldStop: () => (halted.why = this.stopWhy("maxHtlcEnabled")) !== null,
             lastWrites: this.maxHtlcLastWrites,
             lastChanged: this.maxHtlcLastChanged,
+            lastUrgentRaise: this.maxHtlcLastUrgentRaise,
             // "Exclude" means the channel is left alone — its advertised size
             // too, not only its fee (review FEE-5).
             excluded: new Set(

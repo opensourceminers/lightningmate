@@ -165,7 +165,8 @@ channel holds, a fee the autopilot raised to — what sells at it decides, and t
 takes it back, not the curve — and the fee any step back went back to. It does not cover a
 channel with **spare to sell**: one that holds more than its target (beyond the deadband) and
 either takes in more than it sells (14-day inflow above its outflow by more than max(1 % of
-capacity, 50k sat), and more in than out in the last 7 days — counted over the days the fee
+capacity, 50k sat) and one of its sales — the first sale a step back's hours missed is no
+inflow — and more in than out in the last 7 days — counted over the days the fee
 stood at this one or lower: on the days of a price test it sold less because of the test),
 or would need more than 90 days at its selling rate of the last 14 days to sell what it holds
 above its target. There the fee comes down as before (`spare: it sells at N ppm, but holds
@@ -204,7 +205,27 @@ ended, are left out of both stretches (a climb from 300 to the 330 ppm buyers pa
 back whole for the two dead days of the try at 360). Less by more than one sale, and the fee
 goes back to where the climb began, in one move (`step back: raised A→B ppm by price tests
 since … and it earned less there, by more than one sale`); otherwise the line says what it
-earned against what (`price test: at B ppm, up from A ppm … : kept`).
+earned against what (`price test: at B ppm, up from A ppm … : kept`). What the fee
+before the climb earned is read over the hours it stood before the climb, and, where a climb
+from it — price tests, raises of the drain rules — was taken back to it before, over the hours
+it stood before that climb as well (the climb's own hours left out).
+
+A **raise the drain rules made** — the drain and demand ramps, the velocity nudge, the
+balance curve under the target, the protect ramp, a 30-day drain's raise, the benchmark's
+nudge for a draining top earner — is part of the climb it begins and is checked the same way,
+at the end of its weeks, **once the drain is over**: the channel is inside its target band
+again, no fast drain is measured, and the days the climb is set against were no drain either
+— at what went out net a day in them at the fee before (the last day before the climb left
+out: a burst that set the raise off is no drain the fee before allowed), the channel would not
+be down to 10 % local within 21 days from where it is. Less by more than one sale, and it goes back
+to the fee before it (`step back: raised A→B ppm by the drain rules … the drain is over, and it
+earned less there`), remembered as a failed test; while the channel still drains it is kept,
+and the line says so (`raised: at B ppm … less — kept while the channel drains`). Before, such
+a raise was kept for good by the hold once the channel was balanced again: one buyer who took
+400k from a balanced channel left its fee 20 % higher, and its other buyers paid a sixth
+less. A raise toward a refill cost and the floors are not part of a climb: they end it. With Fee
+automation off, a move applied with "Apply" is not held on trial either (nothing could take it
+back).
 
 A test that was taken back is not repeated for 7 days — 14, then 28 when tests fail in a row
 at the same level (`price test: N ppm was tried and taken back … — no higher fee is tried
@@ -260,8 +281,12 @@ The 48 h count from the raise, or from when the channel last got
 sats to sell if that is later: the fee stage notes each run since when every channel has had
 something to sell without a break (a channel drained in between starts again — before, its
 raise was stepped back on the first run its liquidity came back; two looks further apart than
-three run intervals, at least 6 h, start every clock again). A raise set by hand (a manual
-apply or a pin) is never stepped back, nor one whose earlier fee wasn't known (a manual apply
+three run intervals, at least 6 h, start every clock again). A fee set by hand (`POST /fees/apply`
+or a pin) is never stepped back; a move of the engine's own applied with **"Apply"** on the
+Fees tab is the engine's (`engine: true` on its record) and is judged like any other — as
+long as Fee automation runs: the step back and the judgements need the clocks its runs keep,
+so with it off no price test is offered and a raise applied by hand is not taken back. Nor is
+a raise stepped back whose earlier fee wasn't known (a manual apply
 that couldn't read LND's fee is on record with an unknown "from" — it read as a raise from 0).
 For 7 days after a step-back, the fee it stepped back from is not raised to again — a raise
 stops on the grid step below it ("guard: stepped back from …"), the profit floor, a new
@@ -407,8 +432,9 @@ idle).
    sold since the fee was set (over 6 h at least) and the last 1, 3, 7 and 14 days where the
    fee has stood that long — sales at an older, lower fee say nothing about this one; each
    stretch counts with ≥ 3 forwards and ≥ 5 % of capacity net out (what came in is taken
-   off), and none unless the last 14 days show 5 % net out too: a channel that routes both
-   ways has days on which it only sells. Not where a measured elasticity below 1 says higher
+   off), and none unless the last 14 days show 5 % net out too, and at least half of what the
+   stretch says goes out in as many of them as it covers: a channel that routes both ways has
+   days on which it only sells, and gets the sats back on others. Not where a measured elasticity below 1 says higher
    fees cost flow here. Such a channel counts as draining for the replacement cost as well.
 
 8. **Bounded moves:** the target moves toward the aim by the steps above. **A drained channel
@@ -569,9 +595,10 @@ too (review 2026-11-10, FEE-5: with the pass on, an excluded channel got eight p
 in three days; a pinned channel is still managed — the pin is its fee, not its size). And a
 channel's advertised size changes **at most once in 6 h** (FEE-6: a near-empty channel in use
 flipped between two sizes with every run, a channel update each) — except a change of two
-buckets or more, either way, which is made at once: down to a quarter or less, since senders
-would fail on what it advertises, and up to four times as much or more, since a channel just
-refilled would advertise a tiny size for six hours. Within the 6 h the size can be off by one
+buckets or more, which is made at once: down to a quarter or less, always, since senders
+would fail on what it advertises, and up to four times as much or more once in the 6 h, since a
+channel just refilled would advertise a tiny size for six hours (one that swings by that much
+with every run is not rewritten with every run: 48 updates a day before). Within the 6 h the size can be off by one
 bucket.
 
 ---
