@@ -143,6 +143,16 @@ export function leaseRefusal(e: unknown): string | null {
   return typeof body.message === "string" ? body.message : "This channel is inside its lease.";
 }
 
+/** A close refused because one of the same kind is already under way (409
+ *  close_in_flight): said as that, not as a failed close (independent review
+ *  of P5, R1-19). Null for any other error. */
+export function closeUnderWay(e: unknown): string | null {
+  const err = e as { status?: unknown; body?: unknown } | null;
+  const body = err?.body as { error?: unknown; message?: unknown } | null | undefined;
+  if (err?.status !== 409 || body?.error !== "close_in_flight") return null;
+  return typeof body.message === "string" ? body.message : "A close of this channel is already under way.";
+}
+
 /** The lease a 409 lease_active refusal named (null: any other error, or a
  *  refusal without one). The server may know a lease the dialog was not
  *  given — Amboss's listing changed since the table loaded, say — and the

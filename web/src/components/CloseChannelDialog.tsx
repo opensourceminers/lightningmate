@@ -4,8 +4,10 @@ import { useDialogFocus } from "../a11y";
 import type { FeeEstimates } from "../types";
 import { satsCompact } from "../format";
 import { fastRateHint } from "../onchainView";
+import { rateFarAbove } from "../statusNotes";
 import {
   closeButtons,
+  closeUnderWay,
   dialogLease,
   forceCloseConsequences,
   leaseBreakWarning,
@@ -90,6 +92,11 @@ export function CloseChannelDialog({
   const [error, setError] = useState<string | null>(null);
   /** The close went out and LND goes on with it: nothing left to press. */
   const [underWay, setUnderWay] = useState<string | null>(null);
+  /** The server asked again: this rate is far above the next block's
+   *  (CHAN-2). The button closes at it only after this was read; another
+   *  rate asks nothing of it. */
+  const [rateAsk, setRateAsk] = useState<{ rate: number; message: string } | null>(null);
+  const rateAsked = rateAsk !== null && rateAsk.rate === rate;
   const offline = !channel.active;
   // Focus into the dialog, Tab kept inside it, Esc cancels — not while a
   // close is being sent (a11y).
@@ -112,7 +119,7 @@ export function CloseChannelDialog({
       .catch(() => {});
   }, []);
 
-  const doClose = async (force: boolean) => {
+  const doClose = async (force: boolean, rateConfirmed = false) => {
     setBusy(force ? "force" : "coop");
     setError(null);
     try {
@@ -122,6 +129,7 @@ export function CloseChannelDialog({
         force,
         force ? undefined : rate,
         leaseWarning !== null && breakLease,
+        !force && rateConfirmed ? ["fee_rate_high"] : undefined,
       );
       if (r.ok) {
         toast(`Closing channel — ${r.transactionId?.slice(0, 12)}…`, "success");
@@ -134,6 +142,14 @@ export function CloseChannelDialog({
       }
       setError(`Close failed: ${r.error}`);
     } catch (e) {
+      // A rate far above the next block's: said, and the button asks for
+      // the yes.
+      const high = rateFarAbove(e);
+      if (high) {
+        setRateAsk({ rate, message: high });
+        setBusy(null);
+        return;
+      }
       // A lease the server knows and this dialog didn't: shown now, with its
       // "close it anyway" box — the next try can confirm breaking it.
       const named = refusedLease(e);
@@ -142,7 +158,7 @@ export function CloseChannelDialog({
         setBreakLease(false);
         setStep("close");
       }
-      setError(leaseRefusal(e) ?? `Close failed: ${e instanceof Error ? e.message : String(e)}`);
+      setError(leaseRefusal(e) ?? closeUnderWay(e) ?? `Close failed: ${e instanceof Error ? e.message : String(e)}`);
     }
     setBusy(null);
   };
@@ -268,12 +284,14 @@ export function CloseChannelDialog({
                   </span>
                 </label>
 
+                {rateAsked ? <p className="modal-msg warn">{rateAsk.message} Close at this rate anyway?</p> : null}
+
                 <div className="modal-actions">
                   <button className="reset" onClick={onCancel} disabled={busy !== null}>
                     Cancel
                   </button>
-                  <button className="primary-btn" disabled={!can.coop} onClick={() => void doClose(false)}>
-                    {busy === "coop" ? "Closing…" : `Close · ${rate || "?"} sat/vB`}
+                  <button className="primary-btn" disabled={!can.coop} onClick={() => void doClose(false, rateAsked)}>
+                    {busy === "coop" ? "Closing…" : rateAsked ? `Close anyway · ${rate} sat/vB` : `Close · ${rate || "?"} sat/vB`}
                   </button>
                 </div>
               </>

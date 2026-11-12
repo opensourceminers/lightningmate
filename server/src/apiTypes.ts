@@ -212,7 +212,12 @@ export type PayResult = LndPayResult & { error?: string };
 export type OnchainState = WalletState & { budget: SendBudget | null };
 
 /** POST /onchain/send: sent, or why not (an error LND gave is a result). */
-export type OnchainSendResult = SendResult & { error?: string };
+export type OnchainSendResult = SendResult & {
+  error?: string;
+  /** LND did not answer in time: the send may still go out (`error` says
+   *  where to look). */
+  unknown?: boolean;
+};
 
 /** GET /rebalance/recommendations: the autopilot's own plan, with today's
  *  fee budget and the refills still in flight. */
@@ -323,6 +328,11 @@ export interface NodePublicInfo {
 export interface PrivacyInfo {
   /** Umbrel's Tor proxy (host:port), or null: everything goes direct. */
   torProxy: string | null;
+  /** A proxy setting given and unusable, in words (null: none, or fine):
+   *  then everything goes direct until it is fixed. */
+  torProxyFault: string | null;
+  /** The route in force, in one line (as the start's log says it). */
+  route: string;
   lnplusLookups: boolean;
   nodeLookups: boolean;
   destinations: { service: string; what: string; active: boolean; viaTor: boolean }[];
@@ -506,6 +516,11 @@ export interface AuthUnlockResult {
   token: string;
 }
 
+/** POST /auth/revoke: every session ended (this one too). */
+export interface AuthRevokeResult {
+  ok: true;
+}
+
 /** POST /alerts/ack: the alert is dismissed (an unknown one answers 404). */
 export interface AlertAckResult {
   ok: true;
@@ -651,6 +666,9 @@ export interface ChannelCloseRequest {
   isForce: boolean;
   feeRate?: number;
   breakLease?: boolean;
+  /** "fee_rate_high" once the operator confirmed a rate far above the next
+   *  block's (asked by a 409 fee_rate_high). */
+  confirmed?: SendCheckCode[];
 }
 
 /** POST /peers/connect. */
@@ -686,6 +704,8 @@ export interface ChannelOpenRequest {
   feeRate?: number;
   isPrivate?: boolean;
   spendPromised?: boolean;
+  /** As the close's. */
+  confirmed?: SendCheckCode[];
 }
 
 /** POST /settings: the settings to change. */
@@ -720,6 +740,10 @@ export interface OnchainSendRequest {
   sendAll?: boolean;
   spendPromised?: boolean;
   confirmed?: SendCheckCode[];
+  /** The page's id for this send (8–64 letters, digits, dashes): the same id
+   *  is never sent twice — a repeat is answered 409 send_repeated with what
+   *  the first did. A new form, a new id. */
+  requestId?: string;
   /** Never sent: the preview's `max` goes as its amount (refused, 400). */
   max?: never;
   /** Never sent: the preview's `all` is `sendAll` here (refused, 400). */

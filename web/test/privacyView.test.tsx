@@ -15,6 +15,8 @@ import type { PrivacyInfo } from "../src/types";
 
 const info = (o: Partial<PrivacyInfo> = {}): PrivacyInfo => ({
   torProxy: null,
+  torProxyFault: null,
+  route: "direct",
   lnplusLookups: true,
   nodeLookups: true,
   destinations: [
@@ -26,7 +28,15 @@ const info = (o: Partial<PrivacyInfo> = {}): PrivacyInfo => ({
 });
 
 test("without a Tor proxy the card says the lookups leave from the home IP; with one, that every lookup goes through it", () => {
-  assert.match(privacySummary(info()), /^Your node is Tor-only, but LightningMate's own lookups are not the node's: no Tor proxy is available to this app, so they leave from this server's internet connection — your home IP address\./);
+  assert.match(
+    privacySummary(info()),
+    /^No Tor proxy is given to this app \(TOR_PROXY_IP \/ TOR_PROXY_PORT are not set\), so LightningMate's own lookups leave from this server's internet connection — your home IP address\./,
+  );
+  // SEC-1: a proxy value given and unusable is named — not "no proxy".
+  assert.match(
+    privacySummary(info({ torProxyFault: 'TOR_PROXY_PORT "90 50" is no port number (1–65535)' })),
+    /^The Tor proxy setting is faulty: TOR_PROXY_PORT "90 50" is no port number \(1–65535\)\. Until it is fixed \(TOR_PROXY_IP \/ TOR_PROXY_PORT in the app's environment\), LightningMate's own lookups leave from this server's internet connection/,
+  );
   // 0.8.5: Tor-only — the Amboss calls made with the API key and the
   // service-fee lookup too (up to 0.8.4 they went direct by default).
   assert.equal(
@@ -90,4 +100,32 @@ test("the LN+ panel says why its lookups go direct: the app has no Tor proxy", (
   const panel = readFileSync(new URL("../src/components/LnPlusPanel.tsx", import.meta.url), "utf8");
   assert.match(panel, /\{lnplusDirectNote\(status\)\}/);
   assert.doesNotMatch(panel, /no Tor proxy — see Settings/);
+});
+
+test("SEC-10: an LN+ link goes into an href only as LN+'s own https page — a javascript: URL or another host becomes LN+'s start page", async () => {
+  const { lnplusHref } = await import("../src/format");
+  assert.equal(lnplusHref("https://lightningnetwork.plus/nodes/02ab"), "https://lightningnetwork.plus/nodes/02ab");
+  for (const bad of ["javascript:alert(1)", "JAVASCRIPT:alert(1)", "http://lightningnetwork.plus/nodes/x", "https://lightningnetwork.plus.evil.example/", "https://user@lightningnetwork.plus/", "//evil.example", "", null, 42]) {
+    assert.equal(lnplusHref(bad), "https://lightningnetwork.plus/", JSON.stringify(bad));
+  }
+  // Every LN+ link of the pages goes through it.
+  for (const [file, expr] of [
+    ["../src/components/NodePanel.tsx", "href={lnplusHref(lnp.profileUrl)}"],
+    ["../src/components/LnPlusPanel.tsx", "href={lnplusHref(s.url)}"],
+    ["../src/components/SuggestionsPanel.tsx", "href={lnplusHref(s.lnplus.profileUrl)}"],
+  ] as const) {
+    const src = readFileSync(new URL(file, import.meta.url), "utf8");
+    assert.ok(src.includes(expr), `${file}: ${expr}`);
+    assert.doesNotMatch(src, /href=\{[^}]*(profileUrl|s\.url)\}/, `${file}: no LN+ link unchecked`);
+  }
+});
+
+test("SEC-1/SEC-9 in Settings: a faulty proxy setting is an error banner, the route in force is said, and 'Sign out everywhere' ends every session where a login is required", () => {
+  const src = readFileSync(new URL("../src/components/SettingsPanel.tsx", import.meta.url), "utf8");
+  assert.match(src, /privacy\.torProxyFault \? \(\n\s+<p className="banner error">\{privacySummary\(privacy\)\}<\/p>/);
+  assert.match(src, /Route in force since the app started: \{privacy\.route\}\./);
+  assert.match(src, /\{authRequired \? \(\n\s+<>\n\s+<h3 className="sub">Sessions<\/h3>/);
+  assert.match(src, /await api\.authRevokeAll\(\);\n\s+api\.logout\(\);/, "the server ends them, then this page signs out");
+  const client = readFileSync(new URL("../src/api.ts", import.meta.url), "utf8");
+  assert.match(client, /authRevokeAll: \(\) => post<AuthRevokeResult>\("\/auth\/revoke", \{\}\)/);
 });

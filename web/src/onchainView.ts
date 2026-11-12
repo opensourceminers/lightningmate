@@ -51,6 +51,36 @@ export function sendDoubleCheck(checks: readonly SendCheck[]): string | null {
   return `${checks.map((c) => c.message).join(" ")} Send anyway?`;
 }
 
+/** A fresh id for one send (CHAN-14: the server never sends the same id
+ *  twice). From getRandomValues: randomUUID needs a secure context, and the
+ *  app is served over plain http on a LAN. */
+export function newSendId(): string {
+  const b = new Uint8Array(16);
+  crypto.getRandomValues(b);
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+/** Whether an error is the app's own refusal — a 4xx with the app's reason —
+ *  so nothing was sent; not a 5xx or an answer that isn't the app's (a
+ *  proxy's 502/504), which may hide a send that went out. */
+export function refusedByApp(err: unknown): boolean {
+  if (!(err instanceof ApiError) || err.status < 400 || err.status >= 500) return false;
+  const body = err.body as { error?: unknown } | null;
+  return typeof body?.error === "string";
+}
+
+/** The send refused as one asked before (409 send_repeated): what to say,
+ *  the first one's transaction when it went out, and whether the first one
+ *  has ended (`settled`: sent or failed — not still under way). Null for any
+ *  other error. */
+export function sendRepeated(err: unknown): { message: string; transactionId: string | null; settled: boolean } | null {
+  if (!(err instanceof ApiError) || err.status !== 409) return null;
+  const body = err.body as { error?: unknown; message?: unknown; result?: { ok?: unknown; transactionId?: unknown } } | null;
+  if (body?.error !== "send_repeated") return null;
+  const tx = body.result?.ok === true && typeof body.result.transactionId === "string" && body.result.transactionId ? body.result.transactionId : null;
+  return { message: typeof body.message === "string" && body.message ? body.message : err.message, transactionId: tx, settled: !!body.result && typeof body.result === "object" };
+}
+
 /** The send refused because something needs a second yes the page didn't
  *  ask for (it changed since the preview): its checks. */
 export function sendNeedsConfirm(err: unknown): SendCheck[] | null {

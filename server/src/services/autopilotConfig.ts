@@ -234,6 +234,9 @@ const BOOLEAN_KEYS = [
 
 const PRICING_MODES = ["fast", "balanced", "premium", "auto"] as const;
 
+/** Every field a settings update may carry. */
+const TOP_KEYS: ReadonlySet<string> = new Set([...BOOLEAN_KEYS, ...Object.keys(CONFIG_BOUNDS), "sellPricingMode", "policy", "rebalancePolicy"]);
+
 /** What GET /api/autopilot sends the UI so its inputs carry the same limits
  *  — and the rules that span fields (crossFieldErrors), which the form
  *  checks before it sends anything (D17). */
@@ -295,8 +298,13 @@ function checkSection<T extends object>(
   }
   const out: Record<string, number> = {};
   for (const [k, v] of Object.entries(raw)) {
-    // Unknown keys are dropped, not stored — prototype names included.
-    if (!has(bounds, k)) continue;
+    // An unknown key is refused by name, and never stored — prototype names
+    // included (review 2026-11-10, ENG-12: a misspelt key was dropped without
+    // a word, and the save looked done).
+    if (!has(bounds, k)) {
+      errors.push(`${name}.${k.slice(0, 60)} is no setting`);
+      continue;
+    }
     const b = (bounds as Record<string, NumberBounds>)[k];
     const err = checkNumber(`${name}.${k}`, v, b);
     if (err) errors.push(err);
@@ -426,9 +434,10 @@ export function applyPatch(current: AutopilotConfig, patch: AutopilotConfigPatch
 }
 
 /**
- * Validate a (partial) settings update against `current`. Unknown keys are
- * dropped — a stale UI draft must not be able to break saving — but every
- * known key must carry a valid value. Returns the clean patch, or every error.
+ * Validate a (partial) settings update against `current`. An unknown key is
+ * refused by name, as an invalid value is (review 2026-11-10, ENG-12: it was
+ * dropped without a word — a misspelt setting looked saved). Returns the
+ * clean patch, or every error.
  */
 export function validateAutopilotPatch(
   body: unknown,
@@ -437,6 +446,10 @@ export function validateAutopilotPatch(
   if (!isPlainObject(body)) return { ok: false, errors: ["settings must be a JSON object"] };
   const errors: string[] = [];
   const patch: Record<string, unknown> = {};
+  // A field the settings don't have is refused by name (ENG-12).
+  for (const key of Object.keys(body)) {
+    if (!TOP_KEYS.has(key)) errors.push(`${key.slice(0, 60)} is no setting`);
+  }
 
   for (const key of BOOLEAN_KEYS) {
     if (!has(body, key)) continue;

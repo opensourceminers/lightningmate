@@ -84,22 +84,37 @@ test("rejects every value the old endpoint silently stored", () => {
   }
 });
 
-test("accepts an explicit 'no limit' budget and drops unknown keys", () => {
-  const r = ok({ rebalanceDailyBudgetSats: null, someRemovedSetting: 5, policy: { minPpm: 30, legacy: true } });
+test("accepts an explicit 'no limit' budget, and refuses an unknown key by name — at the top and in a section (ENG-12: dropped without a word before)", () => {
+  const r = ok({ rebalanceDailyBudgetSats: null, policy: { minPpm: 30 } });
   assert.ok(r.ok);
   assert.deepEqual(r.patch, { rebalanceDailyBudgetSats: null, policy: { minPpm: 30 } });
+  assert.deepEqual(errorsOf({ rebalanceDailyBudgetSats: null, someRemovedSetting: 5, policy: { minPpm: 30, legacy: true } }), [
+    "someRemovedSetting is no setting",
+    "policy.legacy is no setting",
+  ]);
+  assert.deepEqual(errorsOf({ enabeld: true }), ["enabeld is no setting"], "a misspelt switch");
+  assert.deepEqual(errorsOf({ ["x".repeat(500)]: 1 }), [`${"x".repeat(60)} is no setting`], "a long name is cut");
 });
 
-test("keys named like Object.prototype members are unknown keys too — dropped, never saved", () => {
+test("keys named like Object.prototype members are unknown keys too — refused, never saved", () => {
   // As express.json() parses them: "__proto__" becomes an OWN key here.
   const body = JSON.parse(
     '{"constructor":1,"toString":2,"policy":{"constructor":5,"toString":7,"__proto__":3,"minPpm":30},' +
       '"rebalancePolicy":{"hasOwnProperty":1,"valueOf":2}}',
   ) as unknown;
-  const r = ok(body);
-  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
   // Before: `bounds[k]` found Object.prototype.constructor etc. as a "bound",
   // so these were accepted, merged into the live policy, and `${policy}` threw.
+  assert.deepEqual(errorsOf(body), [
+    "constructor is no setting",
+    "toString is no setting",
+    "policy.constructor is no setting",
+    "policy.toString is no setting",
+    "policy.__proto__ is no setting",
+    "rebalancePolicy.hasOwnProperty is no setting",
+    "rebalancePolicy.valueOf is no setting",
+  ]);
+  const r = ok(JSON.parse('{"policy":{"minPpm":30},"rebalancePolicy":{}}'));
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
   assert.deepEqual(r.patch, { policy: { minPpm: 30 }, rebalancePolicy: {} });
   const merged = applyPatch(DEFAULT_CONFIG, r.patch);
   assert.deepEqual(Object.keys(merged.policy).sort(), Object.keys(DEFAULT_CONFIG.policy).sort());

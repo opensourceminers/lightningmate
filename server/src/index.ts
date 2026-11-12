@@ -6,7 +6,9 @@ import { createApiRouter } from "./routes/api.js";
 import { createHttpApp } from "./app.js";
 import { assertSafeExposure } from "./exposure.js";
 import { RequestGate, SHUTDOWN_GRACE_MS, SHUTDOWN_WAIT_MS, appShutdownSteps, createShutdown } from "./shutdown.js";
-import { authRequired } from "./services/auth.js";
+import { authRequired, loadTokenSecret } from "./services/auth.js";
+import { tidyDataDir } from "./store.js";
+import { logRouting } from "./services/http.js";
 import { LnPlusStore } from "./services/lnplusStore.js";
 import { Autopilot } from "./services/autopilot.js";
 import { CapitalLedger } from "./services/capital.js";
@@ -71,6 +73,10 @@ function main(): void {
   }
 
   const writeLnd = getWriteLnd(config);
+  // The data directory readable by this app only, its orphans gone; then
+  // the sessions' signing secret, kept there (SEC-9).
+  tidyDataDir(config.dataDir);
+  loadTokenSecret(config.dataDir);
   const rebalanceLog = new RebalanceLog(config.dataDir);
   const settings = new SettingsStore(config.dataDir);
   const overrides = new OverridesStore(config.dataDir);
@@ -150,6 +156,8 @@ function main(): void {
     console.log(`⚡ LightningMate listening on ${config.bindHost}:${config.port}`);
     const mode = config.writeEnabled ? "read + write" : "read-only";
     console.log(`   LND socket: ${config.lnd.socket}  (${mode})`);
+    // The route of the app's own requests, decided once at start (SEC-1).
+    logRouting();
   });
 
   // Stop starting new work → let started work reach a recorded state → flush

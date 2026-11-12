@@ -112,6 +112,7 @@ test("every body a route composes is checked against its contract type where it 
     ["MyOrdersView", "MyOrdersView"],
     ["AuthStatus", "AuthStatus"],
     ["AuthUnlockResult", "AuthUnlockResult"],
+    ["AuthRevokeResult", "AuthRevokeResult"],
     ["AlertAckResult", "AlertAckResult"],
     ["PeerConnectResult", "PeerConnectResult"],
     ["FeeApplyResponse", "FeeApplyResponse"],
@@ -205,8 +206,9 @@ function routeOf(n: ts.Node): string {
 }
 
 // Bodies the routes send that no page of the web reads — no contract type.
+// (The widget's — umbreld's four-stats format, read by umbrelOS — is built
+// outside its route since one read is shared: review 2026-11-10, SEC-3.)
 const NOT_THE_WEBS: Record<string, string> = {
-  "GET /widget/stats": "umbreld's home-screen widget format (four-stats), read by umbrelOS",
   "GET /diagnostics": "a file the operator downloads and passes on; the page saves it as it is",
   "GET /service-fees": "the service-fee ledger for transparency (curl, SECURITY.md); no page reads it",
 };

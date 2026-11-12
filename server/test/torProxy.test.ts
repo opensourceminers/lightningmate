@@ -20,15 +20,17 @@ import { clearNodeLookupCache, lookupPublicNode } from "../src/services/nodeLook
 import { getBtcPrice } from "../src/services/price.js";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import http from "node:http";
 import https from "node:https";
 import net, { type AddressInfo } from "node:net";
-import { join } from "node:path";
-import { HttpTimeoutError, httpRequest, mempoolBase, setOutboundRouting, torVia, viaTor } from "../src/services/http.js";
+import { join, sep } from "node:path";
+import { HttpTimeoutError, httpRequest, logRouting, mempoolBase, routingLine, setOutboundRouting, torVia, viaTor } from "../src/services/http.js";
+import { getNode as lnplusNode } from "../src/services/lnplus.js";
+import { fetchFeeInvoice } from "../src/services/serviceFee.js";
 import { ambossGql } from "../src/services/amboss.js";
 import { __resetEligibilityCache } from "../src/services/magmaEligibility.js";
-import { socksFetch, socksResolve, torProxyFromEnv } from "../src/services/torProxy.js";
+import { readTorProxyEnv, socksFetch, socksResolve, torProxyFromEnv } from "../src/services/torProxy.js";
 import { socksResolver } from "./helpers/socksResolver.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
 import { startApi } from "./helpers/apiHarness.js";
@@ -133,13 +135,111 @@ function testCert(t: TestContext, name: string): { key: Buffer; cert: Buffer } |
   return r.status === 0 ? { key: readFileSync(key), cert: readFileSync(cert) } : null;
 }
 
-const restoreRouting = (t: TestContext) => t.after(() => setOutboundRouting({ proxy: null, tlsCa: undefined }));
+const restoreRouting = (t: TestContext) => t.after(() => setOutboundRouting({ proxy: null, fault: null, tlsCa: undefined }));
 
 test("Umbrel's Tor proxy is read from TOR_PROXY_IP / TOR_PROXY_PORT — nothing else counts", () => {
   assert.deepEqual(torProxyFromEnv({ TOR_PROXY_IP: "10.21.21.11", TOR_PROXY_PORT: "9050" }), { host: "10.21.21.11", port: 9050 });
   assert.equal(torProxyFromEnv({}), null);
   assert.equal(torProxyFromEnv({ TOR_PROXY_IP: "10.21.21.11", TOR_PROXY_PORT: "nope" }), null);
   assert.equal(torProxyFromEnv({ TOR_PROXY_IP: "x; rm -rf", TOR_PROXY_PORT: "9050" }), null);
+});
+
+test("SEC-1: a proxy value given and unusable is named as the fault it is — not passed over as 'no proxy'", () => {
+  assert.deepEqual(readTorProxyEnv({}), { proxy: null, fault: null });
+  assert.deepEqual(readTorProxyEnv({ TOR_PROXY_IP: " ", TOR_PROXY_PORT: "" }), { proxy: null, fault: null });
+  assert.deepEqual(readTorProxyEnv({ TOR_PROXY_IP: "10.21.21.11", TOR_PROXY_PORT: "9050" }), { proxy: { host: "10.21.21.11", port: 9050 }, fault: null });
+  const fault = (env: NodeJS.ProcessEnv) => readTorProxyEnv(env).fault;
+  assert.equal(fault({ TOR_PROXY_IP: "10.21.21.11", TOR_PROXY_PORT: "nope" }), 'TOR_PROXY_PORT "nope" is no port number (1–65535)');
+  for (const port of ["0", "65536", "9050x", "-1", "90.5", "0x2352"]) {
+    assert.equal(fault({ TOR_PROXY_IP: "10.21.21.11", TOR_PROXY_PORT: port }), `TOR_PROXY_PORT "${port}" is no port number (1–65535)`, port);
+  }
+  assert.equal(fault({ TOR_PROXY_IP: "x; rm -rf", TOR_PROXY_PORT: "9050" }), 'TOR_PROXY_IP "x; rm -rf" is no host name or address');
+  assert.equal(fault({ TOR_PROXY_IP: "10.21.21.11" }), 'TOR_PROXY_IP is set ("10.21.21.11") but TOR_PROXY_PORT is not');
+  assert.equal(fault({ TOR_PROXY_PORT: "9050" }), 'TOR_PROXY_PORT is set ("9050") but TOR_PROXY_IP is not');
+  assert.equal(fault({ TOR_PROXY_IP: "a".repeat(60), TOR_PROXY_PORT: "x" }), 'TOR_PROXY_PORT "x" is no port number (1–65535)');
+  assert.equal(fault({ TOR_PROXY_IP: "a;".repeat(30), TOR_PROXY_PORT: "9050" }), `TOR_PROXY_IP "${"a;".repeat(20)}…" is no host name or address`, "a long value is cut");
+});
+
+test("SEC-1: the start's line says the route in force — through Tor by which proxy, direct with no proxy given, direct and the fault with a faulty one (a warning)", () => {
+  const said = (env: NodeJS.ProcessEnv) => {
+    const lines: { level: string; line: string }[] = [];
+    logRouting(readTorProxyEnv(env), { log: (l: string) => lines.push({ level: "log", line: l }), warn: (l: string) => lines.push({ level: "warn", line: l }) });
+    return lines;
+  };
+  assert.deepEqual(said({ TOR_PROXY_IP: "10.21.21.11", TOR_PROXY_PORT: "9050" }), [
+    { level: "log", line: "   Outbound requests: through Tor: every outbound request goes through the SOCKS5 proxy 10.21.21.11:9050 (TOR_PROXY_IP / TOR_PROXY_PORT)" },
+  ]);
+  assert.deepEqual(said({}), [
+    {
+      level: "log",
+      line: "   Outbound requests: direct, from this server's internet connection — no Tor proxy is given (TOR_PROXY_IP / TOR_PROXY_PORT are not set; on Umbrel the app's compose file passes them)",
+    },
+  ]);
+  assert.deepEqual(said({ TOR_PROXY_IP: "10.21.21.11", TOR_PROXY_PORT: "90 50" }), [
+    {
+      level: "warn",
+      line:
+        "   Outbound requests: direct, from this server's internet connection — the Tor proxy setting is faulty: " +
+        'TOR_PROXY_PORT "90 50" is no port number (1–65535). Fix TOR_PROXY_IP / TOR_PROXY_PORT in the app\'s environment for the requests to go through Tor',
+    },
+  ]);
+  // The start says it once, after the listen line.
+  const index = readFileSync(join(import.meta.dirname, "../src/index.ts"), "utf8");
+  assert.match(index, /console\.log\(`   LND socket: [^\n]+\n\s+\/\/[^\n]+\n\s+logRouting\(\);/);
+  // The routing is read from the environment once, when http.ts loads.
+  const httpSrc = readFileSync(join(import.meta.dirname, "../src/services/http.ts"), "utf8");
+  assert.match(httpSrc, /^let routing: OutboundRouting = readTorProxyEnv\(\);$/m);
+});
+
+test("SEC-1: GET /privacy says the route in force — with a valid proxy, with none, with a faulty one", async (t) => {
+  restoreRouting(t);
+  const api = await startApi(t);
+  const at = async (env: NodeJS.ProcessEnv) => {
+    setOutboundRouting({ ...readTorProxyEnv(env) });
+    return (await api.request("GET", "/privacy")).body as { torProxy: string | null; torProxyFault: string | null; route: string; destinations: { viaTor: boolean }[] };
+  };
+  const tor = await at({ TOR_PROXY_IP: "10.21.21.11", TOR_PROXY_PORT: "9050" });
+  assert.deepEqual([tor.torProxy, tor.torProxyFault], ["10.21.21.11:9050", null]);
+  assert.equal(tor.route, routingLine({ proxy: { host: "10.21.21.11", port: 9050 } }));
+  assert.match(tor.route, /^through Tor: every outbound request goes through the SOCKS5 proxy 10\.21\.21\.11:9050/);
+  assert.ok(tor.destinations.every((d) => d.viaTor));
+  const none = await at({});
+  assert.deepEqual([none.torProxy, none.torProxyFault], [null, null]);
+  assert.match(none.route, /^direct, from this server's internet connection — no Tor proxy is given/);
+  assert.ok(none.destinations.every((d) => !d.viaTor));
+  const faulty = await at({ TOR_PROXY_IP: "10.21.21.11", TOR_PROXY_PORT: "nope" });
+  assert.deepEqual([faulty.torProxy, faulty.torProxyFault], [null, 'TOR_PROXY_PORT "nope" is no port number (1–65535)']);
+  assert.match(faulty.route, /the Tor proxy setting is faulty: TOR_PROXY_PORT "nope" is no port number/);
+  assert.ok(faulty.destinations.every((d) => !d.viaTor), "said as direct: it is");
+});
+
+test("SEC-1: LN+ and the service fee's LNURL lookup take the proxy when there is one — through the services' own calls, none goes direct", async (t) => {
+  restoreRouting(t);
+  const web = await webServer(t);
+  const socks = await socksServer(t, () => web.port);
+  const fetchMock = installFetchMock(t);
+  setOutboundRouting({ proxy: socks.proxy });
+  // (Plain http behind the tunnel: the https calls fail at TLS — what counts
+  // is where they went.)
+  await lnplusNode("02" + "ab".repeat(32)).catch(() => undefined);
+  await fetchFeeInvoice("fee@fees.example", 21).catch(() => undefined);
+  assert.deepEqual(socks.asked, [
+    { host: "lightningnetwork.plus", port: 443 },
+    { host: "fees.example", port: 443 },
+  ]);
+  assert.equal(fetchMock.requests.length, 0, "nothing went direct");
+});
+
+test("SEC-1: no request goes around the proxy — only http.ts calls fetch, only torProxy.ts opens sockets, and the one DNS lookup is lsps1's proxy-less fallback", () => {
+  const src = join(import.meta.dirname, "../src");
+  // Every source file, tracked or not (R1-18: git's list missed a new one).
+  const files = (readdirSync(src, { recursive: true }) as string[]).filter((f) => f.endsWith(".ts")).map((f) => f.split(sep).join("/"));
+  assert.ok(files.length > 50, "the sources were listed");
+  const hits = (re: RegExp) => files.filter((f) => re.test(readFileSync(join(src, f), "utf8"))).sort();
+  assert.deepEqual(hits(/(?<![.\w])fetch\(|globalThis\.fetch|\bundici\b/), ["services/http.ts"]);
+  assert.deepEqual(hits(/^import (?!type )[^\n]*from "(node:)?(net|tls|https?|http2|dgram)"/m), ["services/torProxy.ts"]);
+  assert.deepEqual(hits(/from "(node:)?dns/), ["services/lsps1.ts"]);
+  assert.match(readFileSync(join(src, "services/lsps1.ts"), "utf8"), /if \(proxy\) return socksResolve\(proxy, host\);/, "the DNS lookup only without a proxy");
 });
 
 test("through the proxy the destination is sent by NAME (Tor resolves it — no DNS lookup leaves the server) and the request arrives with its own Host", async (t) => {
@@ -387,4 +487,128 @@ test("a name is resolved by the Tor proxy (RESOLVE): the name goes to the proxy,
   assert.equal(await socksResolve(proxy, "home.example.org"), "203.0.113.9");
   await assert.rejects(socksResolve(proxy, "gone.example.org"), /the Tor proxy could not resolve gone\.example\.org: host unreachable/);
   assert.deepEqual(asked, ["home.example.org", "gone.example.org"]);
+});
+
+/** A web service behind the test proxy that answers by path: a body of
+ *  3 MB, or a redirect to where `?to=` says; and counts its open connections. */
+async function trickyServer(t: TestContext) {
+  const server = http.createServer((req, res) => {
+    const u = new URL(req.url ?? "/", "http://x");
+    if (u.pathname === "/big") {
+      res.setHeader("Content-Type", "application/json");
+      res.end(`"${"x".repeat(3 * 1024 * 1024)}"`);
+      return;
+    }
+    if (u.pathname === "/endless") {
+      // An answer that never ends: only the client closing the tunnel stops it.
+      res.setHeader("Content-Type", "application/json");
+      const chunk = "x".repeat(256 * 1024);
+      const timer = setInterval(() => res.write(chunk), 5);
+      res.on("close", () => clearInterval(timer));
+      return;
+    }
+    if (u.pathname === "/redirect") {
+      res.statusCode = 302;
+      res.setHeader("Location", u.searchParams.get("to") ?? "/");
+      res.end();
+      return;
+    }
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ path: req.url, authorization: req.headers.authorization ?? null }));
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+  t.after(async () => {
+    server.closeAllConnections?.();
+    await new Promise<void>((r) => server.close(() => r()));
+  });
+  const open = () => new Promise<number>((r) => server.getConnections((_e, n) => r(n)));
+  return { port: (server.address() as AddressInfo).port, open };
+}
+
+test("SEC-8: through the proxy an answer larger than 2 MB is refused, not read whole — and a redirect is followed to the same host over https only", async (t) => {
+  restoreRouting(t);
+  const web = await trickyServer(t);
+  const socks = await socksServer(t, () => web.port);
+  setOutboundRouting({ proxy: socks.proxy });
+  await assert.rejects(httpRequest("http://lightningnetwork.plus/big", {}, 5_000), /the answer from lightningnetwork\.plus is larger than 2 MB — not read/);
+  const to = (where: string) => `http://lightningnetwork.plus/redirect?to=${encodeURIComponent(where)}`;
+  await assert.rejects(httpRequest(to("http://192.168.1.1:8080/admin"), { headers: { Authorization: "Bearer x" } }, 5_000), /lightningnetwork\.plus redirected to another host \(192\.168\.1\.1:8080\) — not followed/);
+  await assert.rejects(httpRequest(to("http://lightningnetwork.plus/other"), {}, 5_000), /redirected to http:\/\/lightningnetwork\.plus — not followed \(https only\)/);
+  // An onion service may answer over plain http (Tor encrypts to the service).
+  const onion = "mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion";
+  const viaOnion = await httpRequest(`http://${onion}/redirect?to=${encodeURIComponent(`http://${onion}/api/v1/prices`)}`, {}, 5_000);
+  assert.equal((await viaOnion.json<{ path: string }>()).path, "/api/v1/prices");
+  assert.deepEqual(
+    socks.asked.map((a) => a.host),
+    ["lightningnetwork.plus", "lightningnetwork.plus", "lightningnetwork.plus", onion, onion],
+    "the other host was never asked for",
+  );
+});
+
+test("SEC-8: direct, the same — a body over 2 MB is refused, a redirect to another host or to plain http is not followed", async (t) => {
+  restoreRouting(t);
+  setOutboundRouting({ proxy: null });
+  const fetchMock = installFetchMock(t);
+  fetchMock.on("https://mempool.space/api/v1/prices", () => new Response("x".repeat(3 * 1024 * 1024), { status: 200 }));
+  fetchMock.on("https://mempool.space/declared", () => new Response("{}", { status: 200, headers: { "content-length": String(5 * 1024 * 1024) } }));
+  fetchMock.on("https://mempool.space/away", () => new Response(null, { status: 302, headers: { location: "http://192.168.1.1/admin" } }));
+  fetchMock.on("https://mempool.space/down", () => new Response(null, { status: 301, headers: { location: "http://mempool.space/x" } }));
+  fetchMock.on("https://mempool.space/moved", () => new Response(null, { status: 301, headers: { location: "/api/v1/lightning/nodes/x" } }));
+  fetchMock.on("https://mempool.space/api/v1/lightning/nodes/x", () => ({ ok: true }));
+  await assert.rejects((await httpRequest("https://mempool.space/api/v1/prices", {}, 5_000)).text(), /larger than 2 MB/);
+  await assert.rejects((await httpRequest("https://mempool.space/declared", {}, 5_000)).json(), /larger than 2 MB/);
+  await assert.rejects(httpRequest("https://mempool.space/away", {}, 5_000), /redirected to another host \(192\.168\.1\.1\) — not followed/);
+  await assert.rejects(httpRequest("https://mempool.space/down", {}, 5_000), /not followed \(https only\)/);
+  const moved = await httpRequest("https://mempool.space/moved", {}, 5_000);
+  assert.deepEqual(await moved.json(), { ok: true }, "the same host over https: followed");
+  assert.ok(!fetchMock.requests.some((r) => r.url.includes("192.168")), "the other host was never asked");
+});
+
+test("SEC-7: a header http.request refuses (a line break in the key) leaves no tunnel open through the proxy", async (t) => {
+  restoreRouting(t);
+  const web = await trickyServer(t);
+  const socks = await socksServer(t, () => web.port);
+  await assert.rejects(socksFetch("http://lightningnetwork.plus/x", { headers: { Authorization: "Bearer first\nsecond" } }, socks.proxy, new AbortController().signal));
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(await web.open(), 0, "the tunnel was closed");
+  // And the key path: refused before any request, never quoted.
+  setOutboundRouting({ proxy: socks.proxy });
+  await assert.rejects(ambossGql("http://api.amboss.example/graphql", "query { x }", "sk_first\nSECOND-HALF"), (err: Error) => !err.message.includes("SECOND") && /not one line of printable characters/.test(err.message));
+  assert.equal(socks.asked.length, 1, "the malformed key never went out");
+});
+
+test("SEC-1 (R1-13): a compose service name with an underscore is a host — not a fault", () => {
+  assert.deepEqual(readTorProxyEnv({ TOR_PROXY_IP: "umbrel_tor_proxy_1", TOR_PROXY_PORT: "9050" }), { proxy: { host: "umbrel_tor_proxy_1", port: 9050 }, fault: null });
+  assert.match(readTorProxyEnv({ TOR_PROXY_IP: "tor proxy", TOR_PROXY_PORT: "9050" }).fault ?? "", /is no host name or address/);
+});
+
+test("SEC-8 (R1-8, M33): through the proxy a redirect to another port of the same host is not followed, and an answer too large closes the tunnel", async (t) => {
+  restoreRouting(t);
+  const web = await trickyServer(t);
+  const socks = await socksServer(t, () => web.port);
+  setOutboundRouting({ proxy: socks.proxy });
+  await assert.rejects(httpRequest(`http://lightningnetwork.plus/redirect?to=${encodeURIComponent("https://lightningnetwork.plus:8443/admin")}`, {}, 5_000), /redirected to another port \(lightningnetwork\.plus:8443\) — not followed/);
+  await assert.rejects(httpRequest("http://lightningnetwork.plus/endless", {}, 5_000), /larger than 2 MB/);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(await web.open(), 0, "the tunnel of the too-large answer was closed");
+});
+
+test("SEC-8 (M16): direct, a real redirect to another host is never asked for — the app follows redirects itself, by its own rule", async (t) => {
+  restoreRouting(t);
+  setOutboundRouting({ proxy: null });
+  const target = await trickyServer(t);
+  let asked = 0;
+  const other = http.createServer((_q, s) => {
+    asked += 1;
+    s.end("{}");
+  });
+  await new Promise<void>((r) => other.listen(0, "127.0.0.1", () => r()));
+  t.after(() => new Promise<void>((r) => other.close(() => r())));
+  const otherPort = (other.address() as AddressInfo).port;
+  // 127.0.0.1 → localhost: another host for the rule, the same machine for undici.
+  await assert.rejects(
+    httpRequest(`http://127.0.0.1:${target.port}/redirect?to=${encodeURIComponent(`http://localhost:${otherPort}/x`)}`, { headers: { Authorization: "Bearer k" } }, 5_000),
+    /redirected to another host \(localhost:\d+\) — not followed/,
+  );
+  assert.equal(asked, 0, "the other host was never asked");
 });

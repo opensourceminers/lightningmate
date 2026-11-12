@@ -8,7 +8,8 @@ build/
 
 # env / secrets — never commit macaroons or certs
 .env
-.env.local
+.env.*
+!.env.example
 *.macaroon
 tls.cert
 
@@ -19,7 +20,8 @@ tls.cert
 *.log
 npm-debug.log*
 
-# editor / os
+# editor / os / assistants
+.claude/
 .DS_Store
 .vscode/
 .idea/

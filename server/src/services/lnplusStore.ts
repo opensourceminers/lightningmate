@@ -1,5 +1,5 @@
 import { JsonStore } from "../store.js";
-import { getNode, LnPlusNotFound, type LnPlusNode } from "./lnplus.js";
+import { getNode, LnPlusNotFound, lnplusUrl, type LnPlusNode } from "./lnplus.js";
 
 /**
  * Persistent cache for LN+ node profiles.
@@ -70,6 +70,10 @@ export class LnPlusStore {
     this.store = new JsonStore<CacheState>(dataDir, "lnplus-nodes.json");
     this.state = this.store.read({ nodes: {}, calls: [] });
     if (!this.state.nodes) this.state.nodes = {};
+    // A link kept from before it was checked (SEC-10) is checked now.
+    for (const e of Object.values(this.state.nodes)) {
+      if (e && typeof e.node === "object" && e.node) e.node.profileUrl = lnplusUrl(e.node.profileUrl, e.node.pubkey);
+    }
     if (!Array.isArray(this.state.calls)) this.state.calls = [];
   }
 

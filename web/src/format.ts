@@ -40,3 +40,18 @@ export function timeAgo(iso: string): string {
   if (hours < 24) return `${hours}h ago`;
   return `${Math.round(hours / 24)}d ago`;
 }
+
+/** An LN+ link for an `href`: LN+'s own https pages only, else LN+'s start
+ *  page (review 2026-11-10, SEC-10 — the server checks them too; a
+ *  `javascript:` URL in an href runs on a click, React 18 lets it through). */
+export function lnplusHref(url: unknown): string {
+  if (typeof url === "string") {
+    try {
+      const u = new URL(url);
+      if (u.protocol === "https:" && u.hostname === "lightningnetwork.plus" && !u.username && !u.password) return u.toString();
+    } catch {
+      // not a URL
+    }
+  }
+  return "https://lightningnetwork.plus/";
+}

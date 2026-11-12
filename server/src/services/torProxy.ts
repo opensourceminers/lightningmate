@@ -27,10 +27,29 @@ export interface SocksProxy {
 
 /** Umbrel's Tor proxy, when the app's environment passes it (null: none). */
 export function torProxyFromEnv(env: NodeJS.ProcessEnv = process.env): SocksProxy | null {
-  const host = (env.TOR_PROXY_IP ?? "").trim();
-  const port = Number((env.TOR_PROXY_PORT ?? "").trim());
-  if (!host || !/^[a-z0-9.:-]+$/i.test(host) || !Number.isInteger(port) || port < 1 || port > 65_535) return null;
-  return { host, port };
+  return readTorProxyEnv(env).proxy;
+}
+
+/**
+ * What the app's environment says about a Tor proxy: the proxy, or none —
+ * and when a value is given and unusable, what is wrong with it (`fault`).
+ * Before (review 2026-11-10, SEC-1), a malformed TOR_PROXY_PORT passed as
+ * "no proxy" without a word, and every request went direct.
+ */
+export function readTorProxyEnv(env: NodeJS.ProcessEnv = process.env): { proxy: SocksProxy | null; fault: string | null } {
+  const rawHost = env.TOR_PROXY_IP;
+  const rawPort = env.TOR_PROXY_PORT;
+  const host = (rawHost ?? "").trim();
+  const portText = (rawPort ?? "").trim();
+  if (!host && !portText) return { proxy: null, fault: null };
+  const shown = (v: string) => JSON.stringify(v.length > 40 ? `${v.slice(0, 40)}…` : v);
+  if (!host) return { proxy: null, fault: `TOR_PROXY_PORT is set (${shown(portText)}) but TOR_PROXY_IP is not` };
+  if (!portText) return { proxy: null, fault: `TOR_PROXY_IP is set (${shown(host)}) but TOR_PROXY_PORT is not` };
+  // (An underscore too: a compose service name like tor_proxy is one.)
+  if (!/^[a-z0-9._:-]{1,253}$/i.test(host)) return { proxy: null, fault: `TOR_PROXY_IP ${shown(host)} is no host name or address` };
+  const port = /^\d{1,5}$/.test(portText) ? Number(portText) : NaN;
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) return { proxy: null, fault: `TOR_PROXY_PORT ${shown(portText)} is no port number (1–65535)` };
+  return { proxy: { host, port }, fault: null };
 }
 
 /** RFC 1928 reply codes, in words. */
@@ -169,8 +188,31 @@ export interface ProxiedResponse {
   body: string;
 }
 
-/** Redirects a GET follows through the proxy (fetch follows them too). */
-const MAX_REDIRECTS = 3;
+/** Redirects a GET follows (through the proxy and direct alike). */
+export const MAX_REDIRECTS = 3;
+/** The largest answer read (review 2026-11-10, SEC-8: a 64 MB body was read
+ *  whole; every service the app asks answers in kilobytes). */
+export const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
+
+/** The error for an answer larger than MAX_RESPONSE_BYTES. */
+export const tooLargeError = (host: string): Error => new Error(`the answer from ${host} is larger than ${MAX_RESPONSE_BYTES / 1024 / 1024} MB — not read`);
+
+/**
+ * Whether a redirect from `from` to `to` is followed: to the same host only,
+ * over https — or plain http to an onion service, which Tor encrypts end to
+ * end (SEC-8: a 302 to a LAN address made the app ask for it, with the same
+ * headers). Throws, naming the hop, when it is not.
+ */
+export function checkRedirect(from: URL, to: URL): void {
+  const onion = /\.onion$/i.test(to.hostname);
+  // The same host and port (another port is another service: R1-8); a
+  // move from http to https on the host's default ports is followed.
+  const port = (u: URL): string => u.port || (u.protocol === "https:" ? "443" : "80");
+  const samePort = port(to) === port(from) || (from.protocol === "http:" && to.protocol === "https:" && !from.port && !to.port);
+  if (to.hostname.toLowerCase() !== from.hostname.toLowerCase()) throw new Error(`${from.host} redirected to another host (${to.host}) — not followed`);
+  if (to.protocol !== "https:" && !(to.protocol === "http:" && onion)) throw new Error(`${from.host} redirected to ${to.protocol}//${to.host} — not followed (https only)`);
+  if (!samePort) throw new Error(`${from.host} redirected to another port (${to.host}) — not followed`);
+}
 
 /**
  * One HTTP(S) request through the SOCKS5 proxy: TLS with the destination's
@@ -203,30 +245,52 @@ export async function socksFetch(
     headers["Content-Length"] = String(Buffer.byteLength(init.body));
   }
   const res = await new Promise<ProxiedResponse & { location?: string }>((resolve, reject) => {
-    const req = http.request(
-      {
-        method: init.method ?? "GET",
-        host: u.hostname,
-        port,
-        path: `${u.pathname}${u.search}`,
-        headers,
-        createConnection: () => socket,
-        signal,
-      },
-      (r) => {
-        const chunks: Buffer[] = [];
-        r.on("data", (c: Buffer) => chunks.push(c));
-        r.on("error", reject);
-        r.on("end", () => {
-          const headers = new Headers();
-          for (const [k, v] of Object.entries(r.headers)) {
-            if (v === undefined) continue;
-            for (const one of Array.isArray(v) ? v : [v]) headers.append(k, one);
-          }
-          resolve({ status: r.statusCode ?? 0, headers, body: Buffer.concat(chunks).toString("utf8"), location: r.headers.location });
-        });
-      },
-    );
+    let req: http.ClientRequest;
+    try {
+      req = http.request(
+        {
+          method: init.method ?? "GET",
+          host: u.hostname,
+          port,
+          path: `${u.pathname}${u.search}`,
+          headers,
+          createConnection: () => socket,
+          signal,
+        },
+        (r) => {
+          const chunks: Buffer[] = [];
+          let size = 0;
+          r.on("data", (c: Buffer) => {
+            size += c.length;
+            if (size > MAX_RESPONSE_BYTES) {
+              // Read no further: the tunnel goes, the answer is refused.
+              socket.destroy();
+              raw.destroy();
+              reject(tooLargeError(u.host));
+              return;
+            }
+            chunks.push(c);
+          });
+          r.on("error", reject);
+          r.on("end", () => {
+            const headers = new Headers();
+            for (const [k, v] of Object.entries(r.headers)) {
+              if (v === undefined) continue;
+              for (const one of Array.isArray(v) ? v : [v]) headers.append(k, one);
+            }
+            resolve({ status: r.statusCode ?? 0, headers, body: Buffer.concat(chunks).toString("utf8"), location: r.headers.location });
+          });
+        },
+      );
+    } catch (err) {
+      // A header http.request refuses (a line break in a value): it throws
+      // before the request exists — the tunnel was open and must go (SEC-7:
+      // one leaked tunnel per attempt).
+      socket.destroy();
+      raw.destroy();
+      reject(err);
+      return;
+    }
     req.on("error", (err) => {
       socket.destroy();
       reject(err);
@@ -240,7 +304,9 @@ export async function socksFetch(
   });
   const method = (init.method ?? "GET").toUpperCase();
   if (method === "GET" && [301, 302, 303, 307, 308].includes(res.status) && res.location && redirects < MAX_REDIRECTS) {
-    return socksFetch(new URL(res.location, u).toString(), init, proxy, signal, tlsCa, redirects + 1);
+    const next = new URL(res.location, u);
+    checkRedirect(u, next);
+    return socksFetch(next.toString(), init, proxy, signal, tlsCa, redirects + 1);
   }
   return { status: res.status, headers: res.headers, body: res.body };
 }

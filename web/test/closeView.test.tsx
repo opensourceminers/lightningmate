@@ -160,11 +160,14 @@ test("a leased channel: the dialog says what closing breaks, and no close button
   // "Force-close…" only opens the confirmation step; only "Force-close now" there sends it.
   assert.match(src, /disabled=\{!can\.force\} onClick=\{\(\) => setStep\("force"\)\}>\s*Force-close…/);
   // The cooperative close is held by the same rule (closeButtons, below).
-  assert.match(src, /disabled=\{!can\.coop\} onClick=\{\(\) => void doClose\(false\)\}/);
+  assert.match(src, /disabled=\{!can\.coop\} onClick=\{\(\) => void doClose\(false, rateAsked\)\}/);
   assert.match(src, /const can = closeButtons\(\{ busy: busy !== null, rate, lease, breakLease \}\)/);
   assert.equal(src.match(/doClose\(true\)/g)?.length, 1, "one force-close call: the confirmation step's");
   assert.match(src, /onConfirm=\{\(\) => void doClose\(true\)\}/);
-  assert.match(src, /api\.channelClose\(\s*channel\.transactionId,\s*channel\.transactionVout,\s*force,\s*force \? undefined : rate,\s*leaseWarning !== null && breakLease,\s*\)/);
+  assert.match(
+    src,
+    /api\.channelClose\(\s*channel\.transactionId,\s*channel\.transactionVout,\s*force,\s*force \? undefined : rate,\s*leaseWarning !== null && breakLease,\s*!force && rateConfirmed \? \["fee_rate_high"\] : undefined,\s*\)/,
+  );
 });
 
 test("the close buttons with a fee rate set: a running lease holds the cooperative close AND the force-close step until 'close it anyway' is ticked", () => {

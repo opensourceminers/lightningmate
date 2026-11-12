@@ -163,6 +163,8 @@ const INVOICE =
 type Walk = { body?: (ids: { offerOn: string; offerOff: string; sale: string; channelId: string }) => unknown; expect: number };
 const WALK: Record<string, Walk> = {
   "POST /auth/unlock": { body: () => ({ password: "nope" }), expect: 401 },
+  // (Ends the sessions — no login here; nothing of LND or Amboss.)
+  "POST /auth/revoke": { expect: 200 },
   "POST /backup/export": { expect: 200 },
   "POST /overrides": { body: (i) => ({ channelId: i.channelId, mode: "fixed", fixedPpm: 100 }), expect: 200 },
   "POST /alerts/ack": { body: () => ({ id: "nothing-here" }), expect: 404 },

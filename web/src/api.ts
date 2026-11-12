@@ -16,6 +16,7 @@ import type {
   ApplyRecommendedResponse,
   AuthStatus,
   AuthUnlockRequest,
+  AuthRevokeResult,
   AuthUnlockResult,
   AutopilotConfigPatch,
   AutopilotResumeResult,
@@ -84,6 +85,7 @@ import type {
   OfferUpdateRequest,
   OfferUpdateResult,
   OnchainSendRequest,
+  SendCheckCode,
   OnchainSendResult,
   OnchainState,
   OnchainTx,
@@ -253,13 +255,14 @@ export const api = {
   health: () => get<HealthInfo>("/health"),
   /** A channel inside its lease is refused (409 lease_active) unless
    *  `breakLease` — sent only after the operator confirmed breaking it. */
-  channelClose: (transactionId: string, transactionVout: number, isForce: boolean, feeRate?: number, breakLease?: boolean) =>
+  channelClose: (transactionId: string, transactionVout: number, isForce: boolean, feeRate?: number, breakLease?: boolean, confirmed?: SendCheckCode[]) =>
     post<CloseChannelResult, ChannelCloseRequest>("/channels/close", {
       transactionId,
       transactionVout,
       isForce,
       ...(feeRate !== undefined ? { feeRate } : {}),
       ...(breakLease ? { breakLease } : {}),
+      ...(confirmed?.length ? { confirmed } : {}),
     }),
   /** Dial a channel's peer again (the close dialog's first offer for a peer that is away). */
   peerConnect: (pubkey: string, socket?: string) =>
@@ -318,6 +321,8 @@ export const api = {
   onchainPreview: (q: SendPreviewQuery) => get<SendPreview, SendPreviewQuery>("/onchain/send-preview", q),
   onchainSend: (params: OnchainSendRequest) => post<OnchainSendResult, OnchainSendRequest>("/onchain/send", params),
   authStatus: () => get<AuthStatus>("/auth/status"),
+  /** End every session (a new token secret on the server): this one too. */
+  authRevokeAll: () => post<AuthRevokeResult>("/auth/revoke", {}),
   login: async (password: string): Promise<boolean> => {
     const res = await fetch("/api/auth/unlock", {
       method: "POST",

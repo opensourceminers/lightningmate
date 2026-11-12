@@ -101,10 +101,20 @@ const num = (n: unknown): number => (typeof n === "number" && Number.isFinite(n)
 
 /** LN+'s own pages only: a link from the answer that points elsewhere is
  *  replaced by the profile's address (review 2026-11-10, CHAN-12 — the
- *  answer's URL was rendered as the "LN+ profile" link unchecked). */
+ *  answer's URL was rendered as the "LN+ profile" link unchecked; SEC-10 —
+ *  parsed: https, LN+'s own host, no user part). */
 const LNPLUS_WEB = "https://lightningnetwork.plus/";
-export const lnplusUrl = (url: unknown, pubkey: string, page = `nodes/${pubkey}`): string =>
-  typeof url === "string" && url.startsWith(LNPLUS_WEB) && url.length <= 512 ? url : `${LNPLUS_WEB}${page}`;
+export const lnplusUrl = (url: unknown, pubkey: string, page = `nodes/${pubkey}`): string => {
+  if (typeof url === "string" && url.length <= 512 && url.startsWith(LNPLUS_WEB)) {
+    try {
+      const u = new URL(url);
+      if (u.protocol === "https:" && u.hostname === "lightningnetwork.plus" && !u.port && !u.username && !u.password) return u.toString();
+    } catch {
+      // not a URL: the profile's address below
+    }
+  }
+  return `${LNPLUS_WEB}${page}`;
+};
 
 function mapNode(r: RawNode): LnPlusNode {
   return {

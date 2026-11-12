@@ -1,4 +1,4 @@
-import { socksFetch, torProxyFromEnv, type SocksProxy } from "./torProxy.js";
+import { MAX_REDIRECTS, MAX_RESPONSE_BYTES, checkRedirect, readTorProxyEnv, socksFetch, tooLargeError, type SocksProxy } from "./torProxy.js";
 
 /**
  * The one way this app makes outbound HTTP requests (Amboss, LN+, mempool.space,
@@ -61,11 +61,40 @@ export const HTTP_TIMEOUTS = {
 export interface OutboundRouting {
   /** Umbrel's Tor proxy (TOR_PROXY_IP / TOR_PROXY_PORT), or null. */
   proxy: SocksProxy | null;
+  /** A proxy value given and unusable, in words (null: none, or fine).
+   *  Requests then go direct — said at start and in Settings, never
+   *  silently (review 2026-11-10, SEC-1 as E5 was changed on 2026-11-12:
+   *  Tor first, no fail-closed). */
+  fault?: string | null;
   /** Tests only: the CA a proxied TLS connection trusts. */
   tlsCa?: string | Buffer;
 }
 
-let routing: OutboundRouting = { proxy: torProxyFromEnv() };
+/** Decided once, when the app starts: from the environment. */
+let routing: OutboundRouting = readTorProxyEnv();
+
+/**
+ * The route in force, in one line — logged at start and shown in Settings
+ * → Privacy: through Tor by which proxy, or direct and why.
+ */
+export function routingLine(r: Readonly<OutboundRouting> = routing): string {
+  if (r.proxy) return `through Tor: every outbound request goes through the SOCKS5 proxy ${r.proxy.host}:${r.proxy.port} (TOR_PROXY_IP / TOR_PROXY_PORT)`;
+  if (r.fault) {
+    return (
+      `direct, from this server's internet connection — the Tor proxy setting is faulty: ${r.fault}. ` +
+      "Fix TOR_PROXY_IP / TOR_PROXY_PORT in the app's environment for the requests to go through Tor"
+    );
+  }
+  return "direct, from this server's internet connection — no Tor proxy is given (TOR_PROXY_IP / TOR_PROXY_PORT are not set; on Umbrel the app's compose file passes them)";
+}
+
+/** The start's line about the route (index.ts): a faulty proxy setting is a
+ *  warning, the rest is said plainly. */
+export function logRouting(r: Readonly<OutboundRouting> = routing, log: Pick<Console, "log" | "warn"> = console): void {
+  const line = `   Outbound requests: ${routingLine(r)}`;
+  if (r.fault && !r.proxy) log.warn(line);
+  else log.log(line);
+}
 
 /** Change the routing (a test's proxy). */
 export function setOutboundRouting(patch: Partial<OutboundRouting>): void {
@@ -176,12 +205,52 @@ export async function httpRequest(url: string, init: RequestInit, timeoutMs: num
       text: async () => proxied.body,
     };
   }
-  const res = await bounded(fetch(url, { ...init, signal }));
+  // Direct: the same rules as through the proxy (SEC-8) — a redirect only to
+  // the same host over https, an answer read up to MAX_RESPONSE_BYTES.
+  let at = new URL(url);
+  let res = await bounded(fetch(url, { ...init, signal, redirect: "manual" }));
+  for (let hops = 0; [301, 302, 303, 307, 308].includes(res.status) && (init.method ?? "GET").toUpperCase() === "GET"; hops++) {
+    const location = res.headers.get("location");
+    if (!location || hops >= MAX_REDIRECTS) break;
+    const next = new URL(location, at);
+    checkRedirect(at, next);
+    await res.body?.cancel().catch(() => undefined);
+    at = next;
+    res = await bounded(fetch(next.toString(), { ...init, signal, redirect: "manual" }));
+  }
+  const answer = res;
+  const host = at.host;
+  let read: Promise<string> | null = null;
+  const text = (): Promise<string> => (read ??= bounded(readCapped(answer, host)));
   return {
-    status: res.status,
-    ok: res.ok,
-    headers: res.headers,
-    json: <T>() => bounded(res.json() as Promise<T>),
-    text: () => bounded(res.text()),
+    status: answer.status,
+    ok: answer.ok,
+    headers: answer.headers,
+    json: async <T>() => JSON.parse(await text()) as T,
+    text,
   };
+}
+
+/** A response's body as text, refused past MAX_RESPONSE_BYTES (SEC-8). */
+async function readCapped(res: Response, host: string): Promise<string> {
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+    await res.body?.cancel().catch(() => undefined);
+    throw tooLargeError(host);
+  }
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_RESPONSE_BYTES) {
+      await reader.cancel().catch(() => undefined);
+      throw tooLargeError(host);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }

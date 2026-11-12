@@ -8,6 +8,7 @@ import type {
   ApplyRecommendedResponse,
   AuthStatus,
   AuthUnlockRequest,
+  AuthRevokeResult,
   AuthUnlockResult,
   AutopilotConfigPatch,
   AutopilotResumeResult,
@@ -92,7 +93,7 @@ import type {
 } from "../apiTypes.js";
 import { readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { Router, type Request, type Response, type NextFunction } from "express";
+import express, { Router, type Request, type Response, type NextFunction } from "express";
 import { getClosedChannels, getFeeRates, getWalletInfo, signMessage, type AuthenticatedLnd, type GetClosedChannelsResult } from "lightning";
 import { getNodeScore } from "../services/score.js";
 import type { Config } from "../config.js";
@@ -127,6 +128,9 @@ import {
   newAddress,
   planSend,
   previewSend,
+  closeMaxRate,
+  rateFarAboveText,
+  type FeeEstimates,
   sendBudget,
   sendOnchain,
   type SendCheckCode,
@@ -134,22 +138,30 @@ import {
   type SendRequest,
   type SendResult,
 } from "../services/onchain.js";
-import { closeChannelByOutpoint, connectForOpen, fundChannel, MIN_CHANNEL_SATS, type OpenChannelResult } from "../services/channelOps.js";
+import {
+  closeChannelByOutpoint,
+  connectForOpen,
+  fundChannel,
+  manualCloseRefusedText,
+  MIN_CHANNEL_SATS,
+  type CloseChannelResult,
+  type OpenChannelResult,
+} from "../services/channelOps.js";
 import { promisedSpendRefusal, spendableOnchain, type PromisedSpendRefusal } from "../services/capital.js";
 import { CLOSE_TX_VBYTES, OPEN_TX_VBYTES } from "../services/nodeEconomics.js";
 import { MIN_YIELD_EARNED_SAT, MIN_YIELD_FORWARDS, OPEN_PAYBACK_MONTHS } from "../services/openPlan.js";
 import { saleFeeConfig, type ServiceFeeLedger } from "../services/serviceFee.js";
 import { floorWindowStart, getFeeRecommendations } from "../services/feeRecommend.js";
 import { getBtcPrice } from "../services/price.js";
-import { outboundRouting, viaTor } from "../services/http.js";
+import { outboundRouting, routingLine, viaTor } from "../services/http.js";
 import type { FiatCurrency, SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, FeeMode, OverridesStore } from "../services/overrides.js";
 import { DEAD_CAPITAL, deadCapitalAlerts, getAlerts, leasePromiseAlerts, magmaChannelNotShownAlerts, magmaKeptPaymentAlerts, magmaOpenAboveEarningsAlerts, magmaOpenYoursAlerts, magmaOverduePaymentAlerts, magmaPartsAlerts, magmaRefundAlerts, magmaRefusalAlerts, magmaUnpaidChannelAlerts, offerPriceAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
-import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
+import { authRequired, bearer, issueToken, passwordUnguessable, revokeAllTokens, verifyPassword, verifyToken } from "../services/auth.js";
 import { SlidingWindowLimiter } from "../services/rateLimit.js";
 import { acknowledgeStoreIncident } from "../store.js";
 import { DEFAULT_CONFIG, ConfigValidationError } from "../services/autopilotConfig.js";
-import { buyFromOffer, buyLiquidity, cancelPurchase, getMarket, getOffers, getOrder, isAuthError } from "../services/amboss.js";
+import { AMBOSS_KEY_MAX, buyFromOffer, buyLiquidity, cancelPurchase, getMarket, getOffers, getOrder, isAmbossKeyShaped, isAuthError } from "../services/amboss.js";
 import { rankBuyOffers, type BuyerFacts } from "../services/magmaBuy.js";
 import { feeTiers, publicBook } from "../services/magmaEligibility.js";
 import {
@@ -180,10 +192,17 @@ import { buildSellDiagnostics } from "../services/sellDiagnostics.js";
 function numericOverrides<T>(query: Fields<T>, keys: (keyof T)[]): Partial<T> {
   const out: Partial<T> = {};
   for (const key of keys) {
-    const n = Number(query[key]);
-    if (Number.isFinite(n)) out[key] = n as T[keyof T];
+    const n = numQuery(query[key]);
+    if (n !== null) out[key] = n as T[keyof T];
   }
   return out;
+}
+
+/** A number of a query string: plain decimal ("12", "-3", "0.5") and nothing
+ *  else — not "", "0x10" or "1e3", which `Number` reads as 0, 16 and 1000
+ *  (review 2026-11-10, SEC-2). */
+function numQuery(v: unknown): number | null {
+  return typeof v === "string" && /^-?\d{1,15}(\.\d{1,15})?$/.test(v) ? Number(v) : null;
 }
 
 const WRITE_DISABLED_MSG =
@@ -273,10 +292,35 @@ const isChannelId = (s: unknown): s is string =>
 /** A BOLT11 payment request (bech32-ish, starts with "ln"). */
 const isPayRequest = (s: unknown): s is string =>
   typeof s === "string" && s.length >= 20 && s.length <= 2000 && /^ln[a-z0-9]+$/i.test(s.trim());
-/** A mainnet on-chain address (bech32 bc1… or base58 1…/3…). LND validates fully. */
-const isBtcAddress = (s: unknown): s is string =>
-  typeof s === "string" &&
-  (/^bc1[a-z0-9]{8,87}$/i.test(s.trim()) || /^[13][a-km-zA-HJ-NP-Z1-9]{20,40}$/.test(s.trim()));
+/** The chain LND runs on, as an address's prefixes tell it. */
+type ChainNet = "mainnet" | "testnet" | "regtest";
+/** An on-chain address of the node's own chain (bech32 bc1… / tb1… / bcrt1…,
+ *  or base58 1…/3… on mainnet, m…/n…/2… elsewhere). LND validates fully.
+ *  (Review 2026-11-10, CHAN-10: mainnet only, so on regtest and testnet
+ *  every send was refused before LND saw it.) */
+const isBtcAddress = (s: unknown, net: ChainNet = "mainnet"): s is string => {
+  if (typeof s !== "string") return false;
+  const a = s.trim();
+  const hrp = net === "mainnet" ? "bc" : net === "regtest" ? "bcrt" : "tb";
+  if (new RegExp(`^${hrp}1[a-z0-9]{8,87}$`, "i").test(a)) return true;
+  return net === "mainnet" ? /^[13][a-km-zA-HJ-NP-Z1-9]{20,40}$/.test(a) : /^[mn2][a-km-zA-HJ-NP-Z1-9]{20,40}$/.test(a);
+};
+/** The chains' genesis hashes (as block explorers show them). The library's
+ *  getWalletInfo gives them byte-reversed: both orders are looked up. */
+const GENESIS: Record<string, ChainNet> = {
+  "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f": "mainnet",
+  "0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206": "regtest",
+  "00000008819873e925422c1ff0f99f7cc9bbb232af63a077a480a3633bee1ef6": "testnet", // signet
+  "000000000933ea01ad0ee984209779baaec3ced90fa3f408719526f8d77f4943": "testnet",
+  "00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043": "testnet", // testnet4
+};
+const reversedHex = (hex: string): string => Buffer.from(hex, "hex").reverse().toString("hex");
+const CHAIN_NETS: Record<string, ChainNet> = Object.fromEntries(
+  Object.entries(GENESIS).flatMap(([hash, net]) => [
+    [hash, net],
+    [reversedHex(hash), net],
+  ]),
+);
 /** `value` is one of `options` (a string union's allowed values). */
 function isOneOf<T extends string>(value: unknown, options: readonly T[]): value is T {
   return typeof value === "string" && (options as readonly string[]).includes(value);
@@ -284,14 +328,22 @@ function isOneOf<T extends string>(value: unknown, options: readonly T[]): value
 const FIAT_CURRENCIES: readonly FiatCurrency[] = ["off", "USD", "EUR", "GBP", "CHF"];
 const FEE_MODES: readonly FeeMode[] = ["auto", "fixed", "exclude"];
 const isFeeMode = (v: unknown): v is FeeMode => isOneOf(v, FEE_MODES);
-/** Finite integer within [min, max], else null. */
+/** A whole number of a request body, in range — a JSON number and nothing
+ *  else. (Review 2026-11-10, SEC-2: `Number(v)` took null, "", [] and false
+ *  for 0 — a fee of 0 ppm written to LND, a channel pinned at 0 — "0x10" for
+ *  16 and 12.9 for 12.) */
 function intIn(v: unknown, min: number, max: number): number | null {
-  const n = Number(v);
-  return Number.isFinite(n) && n >= min && n <= max ? Math.floor(n) : null;
+  return typeof v === "number" && Number.isInteger(v) && v >= min && v <= max ? v : null;
 }
+/** …any finite JSON number, in range. */
 function numIn(v: unknown, min: number, max: number): number | null {
-  const n = Number(v);
-  return Number.isFinite(n) && n >= min && n <= max ? n : null;
+  return typeof v === "number" && Number.isFinite(v) && v >= min && v <= max ? v : null;
+}
+/** A whole number of a query string (`?days=30`): decimal digits only. A
+ *  default the route gives is a number already. */
+function intQuery(v: unknown, min: number, max: number): number | null {
+  if (typeof v === "number") return intIn(v, min, max);
+  return typeof v === "string" && /^\d{1,12}$/.test(v) ? intIn(Number(v), min, max) : null;
 }
 // Sane bounds.
 const MAX_CHANNEL_SATS = 1_000_000_000; // 10 BTC
@@ -317,10 +369,25 @@ function parsePolicyQuery(query: Fields<FeePreviewQuery>): Partial<FeePolicy> {
     "minChangePpm",
   ];
   for (const key of keys) {
-    const n = Number(query[key]);
-    if (Number.isFinite(n)) out[key] = n;
+    const n = numQuery(query[key]);
+    if (n !== null) out[key] = n;
   }
   return out;
+}
+
+/** A request body body-parser could not read (its error's `type`), as the
+ *  answer says it; null for any other error. */
+function bodyParserFault(err: unknown): { status: number; error: string; message: string } | null {
+  const type = err && typeof err === "object" ? (err as { type?: unknown }).type : undefined;
+  if (type === "entity.parse.failed") return { status: 400, error: "bad_json", message: "The request body is no valid JSON." };
+  if (type === "entity.too.large") return { status: 413, error: "body_too_large", message: "The request body is too large." };
+  if (type === "encoding.unsupported" || type === "charset.unsupported") {
+    return { status: 415, error: "unsupported_body", message: "The request body's encoding or charset is not supported: send it as UTF-8 JSON." };
+  }
+  if (typeof type === "string" && /^request\.(aborted|size\.invalid)$|^stream\.encoding\.set$/.test(type)) {
+    return { status: 400, error: "bad_body", message: "The request body could not be read." };
+  }
+  return null;
 }
 
 // Wrap async handlers so rejected promises reach the error middleware.
@@ -381,6 +448,42 @@ export function stateFileList(dir: string): StateFileInfo[] {
   return out.sort((a, b) => a.file.localeCompare(b.file));
 }
 
+/** How long a manual close or on-chain send waits for LND's answer before
+ *  the page is told the outcome is unknown (review 2026-11-10, CHAN-14: the
+ *  close dialog stayed on "Closing…" with Cancel disabled while LND kept
+ *  waiting on the peer). LND goes on with it; nothing is given up. Below the
+ *  60 s a proxy in front of the app commonly waits (nginx's default): the
+ *  app's own answer arrives first (R1-9). An object, so a test can shorten
+ *  it. */
+export const MANUAL_CHAIN_DEADLINE = { ms: 45_000 };
+/** How long a send's request id is remembered (CHAN-14's idempotency guard). */
+const SEND_ID_KEEP_MS = 24 * 3_600_000;
+
+/** `work`'s result, or `late()` once `ms` have passed without one — `work`
+ *  runs on (`onLate` gets its result should it come after). */
+async function answerWithin<T>(ms: number, work: Promise<T>, late: () => T, onLate?: (v: T) => void): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  let lateAnswered = false;
+  const timeout = new Promise<T>((resolve) => {
+    timer = setTimeout(() => {
+      lateAnswered = true;
+      resolve(late());
+    }, ms);
+    timer.unref?.();
+  });
+  void work.then(
+    (v) => {
+      if (lateAnswered) onLate?.(v);
+    },
+    () => undefined,
+  );
+  try {
+    return await Promise.race([work, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export function createApiRouter(
   lnd: AuthenticatedLnd,
   writeLnd: AuthenticatedLnd | undefined,
@@ -397,6 +500,45 @@ export function createApiRouter(
   serviceFees: ServiceFeeLedger,
 ): Router {
   const router = Router();
+  /** The codes of the checks a request confirmed (`confirmed`): [] when none
+   *  were, null when it is no short list of strings. */
+  const confirmedCodes = (v: unknown): string[] | null =>
+    v === undefined ? [] : Array.isArray(v) && v.length <= 10 && v.every((c) => typeof c === "string") ? (v as string[]) : null;
+  /** A channel open's or close's rate far above LND's next-block estimate
+   *  asks again, as a send's does (review 2026-11-10, CHAN-2: 500 typed for 5
+   *  closed a channel for 75,000 sat with one click): 409 fee_rate_high with
+   *  the fee it would pay, unless `confirmed` holds that code. True when it
+   *  answered. */
+  const askRateAgain = (res: Response, est: FeeEstimates | null, rate: number | undefined, vbytes: number, what: string, confirmed: string[]): boolean => {
+    if (rate === undefined || confirmed.includes("fee_rate_high")) return false;
+    const message = rateFarAboveText(est, rate, vbytes, what);
+    if (!message) return false;
+    res.status(409).json({ error: "fee_rate_high", code: "fee_rate_high", message });
+    return true;
+  };
+  /** The manual closes under way, by channel and kind ("<outpoint>:coop" /
+   *  ":force"): a second click of the same kind, or the same request sent
+   *  again after a lost answer, is refused while LND works on the first
+   *  (CHAN-14) — until the deadline's answer, after which LND decides. A
+   *  force-close is never refused for a cooperative close LND keeps waiting
+   *  on (independent review of P5, R1-1). Each entry is its request's own:
+   *  a late end of the first never frees a second's. */
+  const closing = new Map<string, symbol>();
+  /** On-chain sends by the page's request id: under way, or sent (CHAN-14 —
+   *  an answer lost after LND broadcast left the form filled, and nothing
+   *  stopped the same send going out twice). */
+  const sends = new Map<string, { at: number; result?: OnchainSendResult }>();
+  /** The chain LND runs on, read once (mainnet while it can't be read: the
+   *  strictest rules, and a node that can't answer sends nothing anyway). */
+  let chainNetRead: Promise<ChainNet> | null = null;
+  const chainNet = (): Promise<ChainNet> =>
+    (chainNetRead ??= getWalletInfo({ lnd }).then(
+      (w) => CHAIN_NETS[w.chains?.[0] ?? ""] ?? "mainnet",
+      () => {
+        chainNetRead = null;
+        return "mainnet" as const;
+      },
+    ));
   /** The chain tip as LND sees it (0 when it can't say: leases then read as running). */
   const currentHeight = (): Promise<number> =>
     getWalletInfo({ lnd })
@@ -438,28 +580,53 @@ export function createApiRouter(
     next();
   });
 
+  // The JSON body, parsed behind the login gate (review 2026-11-10, SEC-6:
+  // parsed before it, every broken body without a token was one stack trace
+  // in the log, and its answer Express's own page). A body that is no JSON
+  // or too big is answered by the error handler below. Of the open paths
+  // only the sign-in reads one (independent review of P5, R1-5: /health and
+  // the widget read a tokenless body too).
+  const jsonBody = express.json({ limit: "256kb" });
+  router.use((req, res, next) => (OPEN_PATHS.has(req.path) && req.path !== "/auth/unlock" ? next() : jsonBody(req, res, next)));
+
   // Whether a login is required, and whether this request is already signed in.
   router.get("/auth/status", (req, res) => {
     res.json({ authRequired: authRequired(), unlocked: verifyToken(bearer(req)) } satisfies AuthStatus);
   });
 
   // Exchange the app password for a session token. Brute-force guarded by
-  // counting FAILED attempts per client: guessing from one address can't lock
-  // out the owner, whose correct password always gets through.
+  // counting FAILED attempts per client address: 8 a minute, then every
+  // wrong one is refused (429) until the minute has slid on. Behind
+  // Umbrel's app proxy every browser arrives from the proxy's one address,
+  // so anyone past Umbrel's login could keep the owner out with 8 wrong
+  // passwords a minute (review 2026-11-10, SEC-5). The password is checked
+  // first (in constant time), and the right one gets through the limit when
+  // it is random by construction — Umbrel's derived one, 64 hex characters.
+  // A password a person chose (standalone) keeps the limit for every
+  // attempt: letting a right guess through would let guessing run at full
+  // speed.
   const unlockFailures = new SlidingWindowLimiter({ windowMs: 60_000, max: 8 });
   router.post("/auth/unlock", (req, res) => {
     const key = clientKey(req);
-    if (unlockFailures.limited(key)) {
+    const right = verifyPassword(bodyOf<AuthUnlockRequest>(req).password);
+    if (unlockFailures.limited(key) && !(right && passwordUnguessable())) {
       res.status(429).json({ error: "rate_limited", message: "Too many attempts; wait a minute." });
       return;
     }
-    if (!verifyPassword(bodyOf<AuthUnlockRequest>(req).password)) {
+    if (!right) {
       unlockFailures.hit(key);
       res.status(401).json({ error: "bad_password", message: "Wrong password." });
       return;
     }
     unlockFailures.reset(key);
     res.json({ token: issueToken() } satisfies AuthUnlockResult);
+  });
+
+  // Sign out everywhere: a new token secret — every session, this one too,
+  // must log in again (SEC-9).
+  router.post("/auth/revoke", (_req, res) => {
+    revokeAllTokens();
+    res.json({ ok: true } satisfies AuthRevokeResult);
   });
 
   router.get("/health", (_req, res) => {
@@ -475,12 +642,12 @@ export function createApiRouter(
 
   // Umbrel home-screen widget (four-stats). Polled by umbreld; cached briefly so
   // continuous polling doesn't keep re-scanning forwarding history.
-  let widgetCache: { at: number; body: unknown } | null = null;
-  router.get("/widget/stats", async (_req, res) => {
-    if (widgetCache && Date.now() - widgetCache.at < 30_000) {
-      res.json(widgetCache.body);
-      return;
-    }
+  type WidgetRead = { at: number; body: unknown; failed: boolean };
+  let widgetCache: WidgetRead | null = null;
+  let widgetRead: Promise<WidgetRead> | null = null;
+  const WIDGET_KEEP_MS = 30_000;
+  const WIDGET_FAILED_KEEP_MS = 10_000;
+  const readWidget = async (): Promise<WidgetRead> => {
     const compact = (n: number) =>
       n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1_000 ? `${(n / 1_000).toFixed(1)}k` : String(n);
     try {
@@ -496,12 +663,28 @@ export function createApiRouter(
           { title: "Forwards", text: String(flow.totalForwards), subtext: "30d" },
         ],
       };
-      widgetCache = { at: Date.now(), body };
-      res.json(body);
+      return { at: Date.now(), body, failed: false };
     } catch {
-      res.json({ type: "four-stats", refresh: "60s", link: "", items: [] });
+      return { at: Date.now(), body: { type: "four-stats", refresh: "60s", link: "", items: [] }, failed: true };
     }
-  });
+  };
+  // Open to every container on Umbrel's network (no token): one read of LND
+  // at a time and at most one per 30 s, a failed one kept 10 s — before
+  // (review 2026-11-10, SEC-3) 40 parallel requests made LND walk its
+  // forwarding history 40 times, and each request while LND failed one more.
+  router.get(
+    "/widget/stats",
+    wrap(async (_req, res) => {
+      const now = Date.now();
+      if (!widgetCache || now - widgetCache.at >= (widgetCache.failed ? WIDGET_FAILED_KEEP_MS : WIDGET_KEEP_MS)) {
+        widgetRead ??= readWidget().finally(() => {
+          widgetRead = null;
+        });
+        widgetCache = await widgetRead;
+      }
+      res.json(widgetCache.body);
+    }),
+  );
 
   router.get(
     "/node",
@@ -640,8 +823,7 @@ export function createApiRouter(
   router.get(
     "/flows",
     wrap(async (req, res) => {
-      const days = Number(queryOf<DaysQuery>(req).days ?? config.flowWindowDays);
-      const windowDays = Number.isFinite(days) && days > 0 ? days : config.flowWindowDays;
+      const windowDays = intQuery(queryOf<DaysQuery>(req).days, 1, 36_500) ?? config.flowWindowDays;
       res.json(await getFlowSummary(lnd, windowDays));
     }),
   );
@@ -652,8 +834,8 @@ export function createApiRouter(
     "/forwards/report",
     wrap(async (req, res) => {
       const q = queryOf<ForwardsReportQuery>(req);
-      const days = Number(q.days ?? 30);
-      const windowDays = Math.min(90, Math.max(1, Number.isFinite(days) ? days : 30));
+      const days = intQuery(q.days, 0, 36_500);
+      const windowDays = days === null ? 30 : Math.min(90, Math.max(1, days));
       res.json(await getForwardsReport(lnd, windowDays, { tzOffsetMin: parseTzOffset(q.tz) }));
     }),
   );
@@ -842,10 +1024,19 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { transactionId, transactionVout, isForce, feeRate, breakLease } = bodyOf<ChannelCloseRequest>(req);
+      const { transactionId, transactionVout, isForce, feeRate, breakLease, confirmed } = bodyOf<ChannelCloseRequest>(req);
       const vout = intIn(transactionVout, 0, 1_000_000);
       if (!isTxid(transactionId) || vout === null) {
         res.status(400).json({ error: "bad_request", message: "valid transactionId (64 hex) and transactionVout required." });
+        return;
+      }
+      // As LND and every list here write it: an upper-case txid found no
+      // channel, so no lease was checked (R1-1b).
+      const txid = transactionId.toLowerCase();
+      // Strictly true or false (SEC-2/CHAN-2: "false", "0" or [] was a
+      // force-close).
+      if (typeof isForce !== "boolean") {
+        res.status(400).json({ error: "bad_request", message: "isForce must be true or false." });
         return;
       }
       if (breakLease !== undefined && typeof breakLease !== "boolean") {
@@ -853,9 +1044,22 @@ export function createApiRouter(
         return;
       }
       // Optional sat/vByte for cooperative closes; ignored for force-closes.
-      const rate = feeRate === undefined ? undefined : (intIn(feeRate, 1, 5000) ?? undefined);
+      // One that is given and unusable is refused, as the open refuses it —
+      // dropped, the close went out at LND's own rate while the dialog said
+      // the one typed.
+      const rate = feeRate === undefined ? undefined : intIn(feeRate, 1, 5000);
+      if (rate === null) {
+        res.status(400).json({ error: "bad_request", message: "feeRate must be a whole number of sat/vByte from 1 to 5000." });
+        return;
+      }
+      const codes = confirmedCodes(confirmed);
+      if (codes === null) {
+        res.status(400).json({ error: "bad_request", message: "confirmed must be a list of check codes." });
+        return;
+      }
+      const outpoint = `${txid}:${vout}`;
       const [channels, height, sources] = await Promise.all([getChannelsView(lnd), currentHeight(), autopilot.leaseSourcesFresh()]);
-      const channel = channels.find((c) => c.transactionId === transactionId && c.transactionVout === vout);
+      const channel = channels.find((c) => c.transactionId === txid && c.transactionVout === vout);
       if (channel?.status === "pending_open") {
         res.status(409).json({
           error: "pending",
@@ -874,7 +1078,41 @@ export function createApiRouter(
         });
         return;
       }
-      res.json(await closeChannelByOutpoint(writeLnd, transactionId, vout, Boolean(isForce), rate));
+      // A cooperative close's rate: asked again when far above the next
+      // block's, and the most it may pay (closeMaxRate) — one read of LND's
+      // estimate for both.
+      const coopRate = isForce ? undefined : rate;
+      const est = coopRate === undefined ? null : await getFeeEstimates(lnd).catch(() => null);
+      if (askRateAgain(res, est, coopRate, CLOSE_TX_VBYTES, "this close", codes)) return;
+      const maxRate = coopRate === undefined ? undefined : closeMaxRate(coopRate, est?.fast ?? null);
+      const key = `${outpoint}:${isForce ? "force" : "coop"}`;
+      if (closing.has(key)) {
+        res.status(409).json({ error: "close_in_flight", message: "A close of this channel is already under way — wait for its answer, or look under pending channels." });
+        return;
+      }
+      const mine = Symbol(key);
+      closing.set(key, mine);
+      const release = (): void => {
+        if (closing.get(key) === mine) closing.delete(key);
+      };
+      const work = closeChannelByOutpoint(writeLnd, txid, vout, isForce, coopRate, maxRate)
+        .then((r): CloseChannelResult => (r.stillClosing && maxRate !== undefined ? { ...r, error: manualCloseRefusedText(maxRate) } : r))
+        .finally(release);
+      res.json(
+        await answerWithin<CloseChannelResult>(
+          MANUAL_CHAIN_DEADLINE.ms,
+          work,
+          () => {
+            release();
+            return {
+              ok: false,
+              stillClosing: true,
+              error: `LND has not answered within ${Math.round(MANUAL_CHAIN_DEADLINE.ms / 1000)} s. The close may still go out: look under pending channels before you try again.`,
+            };
+          },
+          (late) => console.log(`[close] ${outpoint}: LND answered after the page was told the outcome was unknown — ${late.ok ? `closing transaction ${late.transactionId}` : late.error}`),
+        ),
+      );
     }),
   );
 
@@ -1238,7 +1476,7 @@ export function createApiRouter(
   router.get(
     "/rebalance/costs",
     wrap(async (req, res) => {
-      const days = intIn(queryOf<DaysQuery>(req).days ?? 30, 1, 36_500);
+      const days = intQuery(queryOf<DaysQuery>(req).days ?? 30, 1, 36_500);
       if (days === null) {
         res.status(400).json({ error: "bad_request", message: "days must be 1–36500." });
         return;
@@ -1285,8 +1523,7 @@ export function createApiRouter(
   router.get(
     "/pnl",
     wrap(async (req, res) => {
-      const days = Number(queryOf<DaysQuery>(req).days ?? config.flowWindowDays);
-      const windowDays = Number.isFinite(days) && days > 0 ? days : config.flowWindowDays;
+      const windowDays = intQuery(queryOf<DaysQuery>(req).days, 1, 36_500) ?? config.flowWindowDays;
       res.json(await getPnl(lnd, { rebalanceLog, earnings, serviceFees, purchases: autopilot.purchases, closeTxs: autopilot.closeTxs }, windowDays));
     }),
   );
@@ -1308,7 +1545,7 @@ export function createApiRouter(
   router.get(
     "/analytics/bought-inbound",
     wrap(async (req, res) => {
-      const windowDays = intIn(queryOf<DaysQuery>(req).days ?? 30, 1, 36_500);
+      const windowDays = intQuery(queryOf<DaysQuery>(req).days ?? 30, 1, 36_500);
       if (windowDays === null) {
         res.status(400).json({ error: "bad_request", message: "days must be 1–36500." });
         return;
@@ -1521,9 +1758,9 @@ export function createApiRouter(
     "/lnplus/pool",
     wrap(async (req, res) => {
       if (lnplusOff(res)) return;
-      const minCredits = Number(queryOf<LnPlusPoolQuery>(req).minCredits);
+      const minCredits = intQuery(queryOf<LnPlusPoolQuery>(req).minCredits, 1, MAX_CHANNEL_SATS * 10);
       const nodes = await getPoolNodes({
-        minCreditsSats: Number.isFinite(minCredits) && minCredits > 0 ? minCredits : undefined,
+        minCreditsSats: minCredits ?? undefined,
         limit: 50,
       });
       // Our node is Tor-only on many installs, so say up front who we can reach.
@@ -1583,7 +1820,7 @@ export function createApiRouter(
   router.get(
     "/channels/open-estimate",
     wrap(async (req, res) => {
-      const size = intIn(queryOf<SizeQuery>(req).size, MIN_CHANNEL_SATS, MAX_CHANNEL_SATS);
+      const size = intQuery(queryOf<SizeQuery>(req).size, MIN_CHANNEL_SATS, MAX_CHANNEL_SATS);
       if (size === null) {
         res.status(400).json({ error: "bad_request", message: `size (${MIN_CHANNEL_SATS}–${MAX_CHANNEL_SATS} sat) required.` });
         return;
@@ -1625,7 +1862,7 @@ export function createApiRouter(
         res.status(403).json({ error: "write_disabled", message: WRITE_DISABLED_MSG });
         return;
       }
-      const { pubkey, socket, localTokens, feeRate, isPrivate, spendPromised } = bodyOf<ChannelOpenRequest>(req);
+      const { pubkey, socket, localTokens, feeRate, isPrivate, spendPromised, confirmed } = bodyOf<ChannelOpenRequest>(req);
       const amount = intIn(localTokens, 20_000, MAX_CHANNEL_SATS);
       if (!isPubkey(pubkey) || amount === null) {
         res.status(400).json({ error: "bad_request", message: "valid pubkey (66 hex) and localTokens (20k–10 BTC) required." });
@@ -1644,6 +1881,17 @@ export function createApiRouter(
         res.status(400).json({ error: "bad_request", message: "spendPromised must be true or false." });
         return;
       }
+      if (isPrivate !== undefined && typeof isPrivate !== "boolean") {
+        res.status(400).json({ error: "bad_request", message: "isPrivate must be true or false." });
+        return;
+      }
+      const codes = confirmedCodes(confirmed);
+      if (codes === null) {
+        res.status(400).json({ error: "bad_request", message: "confirmed must be a list of check codes." });
+        return;
+      }
+      const est = fee === undefined || fee === null || codes.includes("fee_rate_high") ? null : await getFeeEstimates(lnd).catch(() => null);
+      if (askRateAgain(res, est, fee ?? undefined, OPEN_TX_VBYTES, "this open", codes)) return;
       // One open to a node at a time: the dial alone can take a minute and a
       // half, and a second click (another tab, a form opened again) would only
       // wait its turn at the mutex and fund a second channel — and so would
@@ -1663,7 +1911,7 @@ export function createApiRouter(
           socket: socket ? String(socket) : undefined,
           localTokens: amount,
           feeRate: fee ?? undefined,
-          isPrivate: Boolean(isPrivate),
+          isPrivate: isPrivate === true,
           routingFeePpm: routing.feeRatePpm,
           routingBaseFeeMsat: routing.baseFeeMsat,
         };
@@ -1758,9 +2006,12 @@ export function createApiRouter(
   // server's internet connection (review a3-channels:lnplus-clearnet-lookups).
   router.get("/privacy", (_req, res) => {
     const s = settings.get();
-    const proxy = outboundRouting().proxy;
+    const r = outboundRouting();
+    const proxy = r.proxy;
     res.json({
       torProxy: proxy ? `${proxy.host}:${proxy.port}` : null,
+      torProxyFault: proxy ? null : (r.fault ?? null),
+      route: routingLine(r),
       lnplusLookups: s.lnplusLookups,
       nodeLookups: s.nodeLookups,
       destinations: [
@@ -1830,7 +2081,7 @@ export function createApiRouter(
   router.get(
     "/htlc/demand",
     wrap(async (req, res) => {
-      const days = intIn(queryOf<DaysQuery>(req).days, 1, 30) ?? 7;
+      const days = intQuery(queryOf<DaysQuery>(req).days, 1, 30) ?? 7;
       const demand = getUnservedDemand(days);
       // Join peer aliases (and current fees) so the UI can name the channels.
       const [channels, rates] = demand.length
@@ -1892,8 +2143,10 @@ export function createApiRouter(
         return;
       }
       const { tokens, description, expirySec } = bodyOf<LnInvoiceRequest>(req);
-      const amount = intIn(tokens ?? 0, 0, MAX_RECEIVE_SATS);
-      const expiry = intIn(expirySec ?? 3600, 60, 31_536_000);
+      // Left out: an invoice for any amount, valid an hour; null is no
+      // number (SEC-2, independent review of P5, R1-16).
+      const amount = intIn(tokens === undefined ? 0 : tokens, 0, MAX_RECEIVE_SATS);
+      const expiry = intIn(expirySec === undefined ? 3600 : expirySec, 60, 31_536_000);
       if (amount === null || expiry === null) {
         res.status(400).json({ error: "bad_request", message: "tokens (0–1 BTC) / expirySec out of range." });
         return;
@@ -1921,7 +2174,7 @@ export function createApiRouter(
         return;
       }
       const { request, maxFeeSats, tokens } = bodyOf<LnPayRequest>(req);
-      const maxFee = intIn(maxFeeSats ?? 0, 0, MAX_PAY_FEE_SATS);
+      const maxFee = intIn(maxFeeSats === undefined ? 0 : maxFeeSats, 0, MAX_PAY_FEE_SATS);
       const amount = tokens === undefined ? undefined : intIn(tokens, 1, MAX_RECEIVE_SATS);
       if (!isPayRequest(request) || maxFee === null || (tokens !== undefined && amount === null)) {
         res.status(400).json({ error: "bad_request", message: "valid request and maxFeeSats (0–2M) required." });
@@ -1981,14 +2234,18 @@ export function createApiRouter(
   /** An on-chain send as asked: an address, a fee rate, and exactly one of an
    *  amount, `max` or a sweep — `modes` names them as the route does, for the
    *  400. Null after a 400 naming what is wrong. */
-  const parseSend = (input: SendAsk, modes: string, res: Response): SendRequest | null => {
-    const flag = (v: unknown): boolean | null => (v === undefined ? false : v === true || v === "1" || v === "true" ? true : v === false || v === "0" || v === "false" ? false : null);
+  const parseSend = (input: SendAsk, modes: string, from: "query" | "body", net: ChainNet, res: Response): SendRequest | null => {
+    // A query string's words are strings ("1", "true"); a JSON body's are
+    // numbers and booleans, and nothing else (SEC-2).
+    const flag = (v: unknown): boolean | null =>
+      v === undefined ? false : v === true || (from === "query" && (v === "1" || v === "true")) ? true : v === false || (from === "query" && (v === "0" || v === "false")) ? false : null;
+    const whole = from === "query" ? intQuery : intIn;
     const max = flag(input.max);
     const sendAll = flag(input.sendAll);
-    const rate = intIn(input.feeRate, 1, MAX_FEE_RATE);
-    const amount = input.tokens === undefined || input.tokens === "" ? undefined : intIn(input.tokens, MIN_SEND_SATS, MAX_ONCHAIN_SEND_SATS);
+    const rate = whole(input.feeRate, 1, MAX_FEE_RATE);
+    const amount = input.tokens === undefined || (from === "query" && input.tokens === "") ? undefined : whole(input.tokens, MIN_SEND_SATS, MAX_ONCHAIN_SEND_SATS);
     const given = [amount !== undefined, max === true, sendAll === true].filter(Boolean).length;
-    if (!isBtcAddress(input.address) || rate === null || amount === null || max === null || sendAll === null || given !== 1) {
+    if (!isBtcAddress(input.address, net) || rate === null || amount === null || max === null || sendAll === null || given !== 1) {
       res.status(400).json({
         error: "bad_request",
         message: `a valid address, feeRate (1–${MAX_FEE_RATE} sat/vB) and one of ${modes} required.`,
@@ -2012,6 +2269,8 @@ export function createApiRouter(
       const ask = parseSend(
         { address: q.address, feeRate: q.feeRate, tokens: q.tokens, max: q.max, sendAll: q.all },
         `tokens (≥${MIN_SEND_SATS} sat), max or all`,
+        "query",
+        await chainNet(),
         res,
       );
       if (!ask) return;
@@ -2036,10 +2295,14 @@ export function createApiRouter(
       // amount, a sweep is `sendAll`. Refused rather than ignored — an `all`
       // next to an amount would otherwise send the amount without a word.
       const body = bodyOf<OnchainSendRequest>(req);
-      const { spendPromised, confirmed } = body;
-      const codes: unknown[] | null = Array.isArray(confirmed) ? confirmed : confirmed === undefined ? [] : null;
-      if ((spendPromised !== undefined && typeof spendPromised !== "boolean") || codes === null || !codes.every((c) => typeof c === "string")) {
+      const { spendPromised, confirmed, requestId } = body;
+      const codes = confirmedCodes(confirmed);
+      if ((spendPromised !== undefined && typeof spendPromised !== "boolean") || codes === null) {
         res.status(400).json({ error: "bad_request", message: "spendPromised must be true/false and confirmed a list of check codes." });
+        return;
+      }
+      if (requestId !== undefined && (typeof requestId !== "string" || !/^[A-Za-z0-9-]{8,64}$/.test(requestId))) {
+        res.status(400).json({ error: "bad_request", message: "requestId must be 8–64 letters, digits or dashes." });
         return;
       }
       if (body.max !== undefined || body.all !== undefined) {
@@ -2049,30 +2312,108 @@ export function createApiRouter(
       const ask = parseSend(
         { address: body.address, feeRate: body.feeRate, tokens: body.tokens, max: undefined, sendAll: body.sendAll },
         `tokens (≥${MIN_SEND_SATS} sat) or sendAll`,
+        "body",
+        await chainNet(),
         res,
       );
       if (!ask) return;
+      // The same send asked twice (an answer lost after LND broadcast, a
+      // second click): never run again — answered with what the first one
+      // did, or that it is still under way (CHAN-14).
+      const now = Date.now();
+      for (const [id, s] of sends) if (now - s.at > SEND_ID_KEEP_MS) sends.delete(id);
+      const before = requestId === undefined ? undefined : sends.get(requestId);
+      if (before) {
+        res.status(409).json({
+          error: "send_repeated",
+          message: before.result
+            ? before.result.ok
+              ? `This send went out already: transaction ${before.result.transactionId}. Nothing was sent again.`
+              : `This send was tried already and failed (${before.result.error ?? "no transaction"}). Check the amount and send again from a fresh form.`
+            : "This send is still under way — look under the on-chain transactions before sending again.",
+          ...(before.result ? { result: before.result } : {}),
+        });
+        return;
+      }
+      const record: { at: number; result?: OnchainSendResult } = { at: now };
+      if (requestId !== undefined) sends.set(requestId, record);
       // Taken in turn with every channel open (Magma, LSPS1, the autopilot,
       // manual): a send in the middle of an open's check would spend what
       // that check counted on. Coins promised to buyers are refused unless
       // the operator confirmed spending them — judged by the plan itself,
       // with the send's own fee, exactly as its preview's touchesPromised.
-      let done:
+      type Done =
         | { refusal: PromisedSpendRefusal }
         | { invalid: string }
         | { confirm: { checks: SendPreview["checks"]; preview: SendPreview } }
-        | { sent: SendResult };
-      try {
-        done = await autopilot.capital.mutex.run("on-chain send", async () => {
+        | { sent: SendResult }
+        | { failed: OnchainSendResult }
+        | { withdrawn: true };
+      // Whether the send was handed to LND, and whether the deadline took
+      // it back before that (independent review of P5, R1-3: a send still
+      // waiting for the wallet at the deadline was told "may still go out"
+      // and went out later — beside the one the operator sent again).
+      let atLnd = false;
+      let withdrawn = false;
+      const run: Promise<Done> = autopilot.capital.mutex
+        .run("on-chain send", async (): Promise<Done> => {
+          if (withdrawn) return { withdrawn: true };
           const { preview, promised } = await planSend(lnd, autopilot.capital, autopilot.onchainReserveSetting(), ask);
           if (preview.error) return { invalid: preview.error };
           const unconfirmed = preview.checks.filter((c) => !(codes as SendCheckCode[]).includes(c.code));
           if (unconfirmed.length) return { confirm: { checks: unconfirmed, preview } };
           if (promised && !spendPromised) return { refusal: promised };
+          if (withdrawn) return { withdrawn: true };
+          atLnd = true;
           return { sent: await sendOnchain(writeLnd, { address: ask.address, feeRate: ask.feeRate, ...(ask.sendAll ? { sendAll: true } : { tokens: ask.tokens }) }) };
+        })
+        .catch((err: unknown): Done => ({ failed: { ok: false, transactionId: "", error: describeError(err) } }))
+        .then((d) => {
+          // What reached LND stays on record under its id; a send that never
+          // did (a check to confirm, promised coins, a bad send, a plan LND
+          // could not make, withdrawn at the deadline) frees the id: the
+          // same request may go again (R1-4).
+          if ("sent" in d) record.result = d.sent;
+          else if ("failed" in d && atLnd) record.result = d.failed;
+          else if (requestId !== undefined && sends.get(requestId) === record) sends.delete(requestId);
+          return d;
         });
-      } catch (err) {
-        res.json({ ok: false, transactionId: "", error: describeError(err) } satisfies OnchainSendResult);
+      const done = await answerWithin<Done | { late: true } | { busyWith: string | null }>(
+        MANUAL_CHAIN_DEADLINE.ms,
+        run,
+        () => {
+          if (atLnd) return { late: true };
+          // Not handed to LND yet: taken back — nothing goes out.
+          withdrawn = true;
+          if (requestId !== undefined && sends.get(requestId) === record) sends.delete(requestId);
+          return { busyWith: autopilot.capital.mutex.heldBy };
+        },
+        (d) => console.log(`[send] answered after the page was told its outcome was unknown: ${"sent" in d ? `transaction ${d.sent.transactionId}` : "failed" in d ? d.failed.error : "nothing sent"}`),
+      );
+      if ("busyWith" in done) {
+        const busy = done.busyWith && done.busyWith !== "on-chain send" ? ` (${done.busyWith})` : "";
+        res.json({
+          ok: false,
+          transactionId: "",
+          error: `Nothing was sent: the wallet was busy${busy} for ${Math.round(MANUAL_CHAIN_DEADLINE.ms / 1000)} s, so the send was withdrawn. Send it again in a moment.`,
+        } satisfies OnchainSendResult);
+        return;
+      }
+      if ("late" in done) {
+        res.json({
+          ok: false,
+          transactionId: "",
+          unknown: true,
+          error: `LND has not answered within ${Math.round(MANUAL_CHAIN_DEADLINE.ms / 1000)} s. The send may still go out: look under the on-chain transactions before you send again.`,
+        } satisfies OnchainSendResult);
+        return;
+      }
+      if ("withdrawn" in done) {
+        res.json({ ok: false, transactionId: "", error: "Nothing was sent: the send was withdrawn." } satisfies OnchainSendResult);
+        return;
+      }
+      if ("failed" in done) {
+        res.json(done.failed satisfies OnchainSendResult);
         return;
       }
       // Coins spent outside the main run: the offers' capital, within seconds.
@@ -2165,11 +2506,24 @@ export function createApiRouter(
     }),
   );
 
-  router.post("/amboss/key", async (req, res) => {
+  router.post(
+    "/amboss/key",
+    wrap(async (req, res) => {
     const { apiKey: given } = bodyOf<AmbossKeyRequest>(req);
     const apiKey = typeof given === "string" ? given.trim() : "";
     if (!apiKey) {
       res.status(400).json({ error: "missing_key", message: "Missing API key." });
+      return;
+    }
+    // Printable ASCII of a key's length, before any use (SEC-7): a key with
+    // a line break went into the Authorization header, and fetch's refusal
+    // quoted it back — the one path where key material reached an error
+    // text — and through Tor left its tunnel open. Never echoed.
+    if (!isAmbossKeyShaped(apiKey)) {
+      res.status(400).json({
+        error: "invalid_key",
+        message: `That doesn't look like an Amboss API key: it must be one line of letters, digits and symbols (${AMBOSS_KEY_MAX} characters at most), without spaces. Copy it again from Amboss.`,
+      });
       return;
     }
     const { verdict, error } = await checkKey(apiKey);
@@ -2187,7 +2541,8 @@ export function createApiRouter(
     }
     amboss.setKey(apiKey);
     res.json({ ok: true, connected: true } satisfies AmbossKeyResult);
-  });
+    }),
+  );
 
   router.delete("/amboss/key", (_req, res) => {
     amboss.clear();
@@ -2213,7 +2568,7 @@ export function createApiRouter(
   router.get(
     "/amboss/buy-offers",
     wrap(async (req, res) => {
-      const sizeSats = intIn(queryOf<SizeQuery>(req).size, MIN_CHANNEL_SATS, MAX_CHANNEL_SATS) ?? 2_000_000;
+      const sizeSats = intQuery(queryOf<SizeQuery>(req).size, MIN_CHANNEL_SATS, MAX_CHANNEL_SATS) ?? 2_000_000;
       const own = await getOwnPubkey(lnd);
       const [market, me, book] = await Promise.all([getMarket(), buyerFacts(), publicBook(own).catch(() => null)]);
       const tiers = book ? feeTiers(book.offers) : [];
@@ -2243,9 +2598,9 @@ export function createApiRouter(
         return;
       }
       const asked = bodyOf<BuyQuoteRequest>(req);
-      const usdCents = Math.floor(Number(asked.usdCents));
+      const usdCents = intIn(asked.usdCents, 0, 100_000_000);
       const wantsOffer = typeof asked.offerId === "string" && asked.offerId.trim().length > 0;
-      if (!wantsOffer && (!Number.isFinite(usdCents) || usdCents < 500)) {
+      if (!wantsOffer && (usdCents === null || usdCents < 500)) {
         res.status(400).json({ error: "bad_amount", message: "Minimum is $5 (500 cents)." });
         return;
       }
@@ -2265,9 +2620,9 @@ export function createApiRouter(
       // user clicked, someone else could get the order. `market.order.create`
       // takes an offer_id, so the pick decides.
       const offerId = typeof asked.offerId === "string" ? asked.offerId.trim() : "";
-      const sizeSats = Math.floor(Number(asked.sizeSats));
+      const sizeSats = intIn(asked.sizeSats, MIN_CHANNEL_SATS, MAX_CHANNEL_SATS);
       if (offerId) {
-        if (!Number.isFinite(sizeSats) || sizeSats < MIN_CHANNEL_SATS || sizeSats > MAX_CHANNEL_SATS) {
+        if (sizeSats === null) {
           res.status(400).json({ error: "bad_size", message: "Choose a channel size within the offer's range." });
           return;
         }
@@ -2313,6 +2668,11 @@ export function createApiRouter(
           baseFeeCapSats: purchase.baseFeeCapSats,
           ambossFeeSats: targeted.ambossFeeSats ?? null,
         } satisfies BuyQuoteResponse);
+        return;
+      }
+      // (A dollar amount is what this quote is for: refused above when unusable.)
+      if (usdCents === null) {
+        res.status(400).json({ error: "bad_amount", message: "Minimum is $5 (500 cents)." });
         return;
       }
       const quote = await withAmboss(() => buyLiquidity(amboss.getKey(), uri, usdCents, isPrivate));
@@ -2400,8 +2760,8 @@ export function createApiRouter(
       }
       const pay = bodyOf<BuyPayRequest>(req);
       const orderId = typeof pay.orderId === "string" ? pay.orderId : "";
-      const maxSats = Math.floor(Number(pay.maxSats));
-      if (!orderId || !Number.isFinite(maxSats) || maxSats <= 0) {
+      const maxSats = intIn(pay.maxSats, 1, MAX_CHANNEL_SATS);
+      if (!orderId || maxSats === null) {
         res.status(400).json({ error: "bad_request", message: "Missing order or confirmed amount." });
         return;
       }
@@ -2648,18 +3008,23 @@ export function createApiRouter(
     b: Fields<OfferTermsRequest>,
     res: Response,
   ): Omit<OfferTerms, "feeRateCapPpm" | "baseFeeCapSats" | "conditions" | "onchainPriority" | "onchainMultiplier"> | null => {
-    const terms = {
-      totalSizeSats: Math.floor(Number(b.totalSizeSats)),
-      minSizeSats: Math.floor(Number(b.minSizeSats)),
-      maxSizeSats: Math.floor(Number(b.maxSizeSats)),
-      feeRatePpm: Math.floor(Number(b.feeRatePpm)),
-      baseFeeSats: Math.floor(Number(b.baseFeeSats)),
-      minBlockLength: Math.floor(Number(b.minBlockLength)),
+    // Whole numbers, sent as numbers (SEC-2: `Number` read null, "" and
+    // false as 0 — a base fee of 0 nobody typed).
+    const whole = (v: unknown): number | null => intIn(v, 0, Number.MAX_SAFE_INTEGER);
+    const read = {
+      totalSizeSats: whole(b.totalSizeSats),
+      minSizeSats: whole(b.minSizeSats),
+      maxSizeSats: whole(b.maxSizeSats),
+      feeRatePpm: whole(b.feeRatePpm),
+      baseFeeSats: whole(b.baseFeeSats),
+      minBlockLength: whole(b.minBlockLength),
     };
-    if (!Object.values(terms).every((n) => Number.isFinite(n) && n >= 0)) {
-      res.status(400).json({ error: "bad_request", message: "Fill in all fields with valid numbers." });
+    const { totalSizeSats, minSizeSats, maxSizeSats, feeRatePpm, baseFeeSats, minBlockLength } = read;
+    if (totalSizeSats === null || minSizeSats === null || maxSizeSats === null || feeRatePpm === null || baseFeeSats === null || minBlockLength === null) {
+      res.status(400).json({ error: "bad_request", message: "Fill in all fields with whole numbers (0 or more)." });
       return null;
     }
+    const terms = { totalSizeSats, minSizeSats, maxSizeSats, feeRatePpm, baseFeeSats, minBlockLength };
     if (terms.minSizeSats <= 0 || terms.maxSizeSats < terms.minSizeSats || terms.totalSizeSats < terms.maxSizeSats) {
       res.status(400).json({ error: "bad_sizes", message: "Sizes must satisfy 0 < min ≤ max ≤ total." });
       return null;
@@ -2984,8 +3349,24 @@ export function createApiRouter(
     }),
   );
 
+  // Any other path under /api: no such route — not the web app's page
+  // (review 2026-11-10: GET /api/<unknown> answered index.html).
+  router.use((_req, res) => {
+    res.status(404).json({ error: "not_found", message: "No such API route." });
+  });
+
   // Error middleware — surface LND/connection failures as JSON, not a crash.
-  router.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+  // A request body that could not be read is the client's: 400 / 413, one
+  // short line in the log (SEC-6).
+  router.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+    const bodyFault = bodyParserFault(err);
+    if (bodyFault) {
+      // Not for a tokenless request (the sign-in): nobody signed in writes
+      // the log, line by line (R1-5).
+      if (!OPEN_PATHS.has(req.path)) console.warn(`[api] ${req.method} ${req.path.slice(0, 80)}: request body refused (${bodyFault.error})`);
+      res.status(bodyFault.status).json({ error: bodyFault.error, message: bodyFault.message });
+      return;
+    }
     const message = describeError(err);
     console.error("[api error]", message);
     res.status(502).json({ error: "node_request_failed", message });

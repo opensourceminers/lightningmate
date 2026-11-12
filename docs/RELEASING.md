@@ -117,20 +117,21 @@ home-screen widget, which the official one doesn't).
 
 1. `docker-compose.yml` — set `image:` to the pin from the workflow summary
    (`…:v0.8.0@sha256:…`, tag AND digest).
-2. **At the next release (the first after the 2026-10 review fixes) add the Tor
-   proxy lines** to the `web` service's `environment:` — they are in this
-   repo's packaging compose, not yet in the store's:
+2. **Keep the Tor proxy lines** in the `web` service's `environment:` (the
+   community store's compose carries them since 0.8.5, the official store's
+   since 0.9.1, as this repo's packaging compose does) — check they are there:
 
    ```yaml
    TOR_PROXY_IP: "$TOR_PROXY_IP"
    TOR_PROXY_PORT: "$TOR_PROXY_PORT"
    ```
 
-   Without them LightningMate has no Tor proxy on Umbrel: every lookup — LN+
-   reputations (this node's key included), the BTC price, Amboss with and
-   without the API key, the fee lookup — goes out directly from the home
-   connection, and Settings → Privacy says so. With them, every one goes
-   through Tor.
+   Without them LightningMate has no Tor proxy on Umbrel: every request — LN+
+   reputations (this node's key included), the BTC price, node lookups,
+   Amboss with and without the API key, the fee lookup — goes out directly
+   from the home connection; the start's log line and Settings → Privacy say
+   so (and name a faulty value as one). With them, every one goes through
+   Tor.
 3. Keep `LM_SELL_FEE_BPS: "100"` and `LM_SELL_FEE_ADDRESS` (the disclosed 1 %
    service fee on completed sales). Optional: `LM_SELL_FEE_PUBKEY` — the fee
    server's node id; with it, fee invoices to any other node are refused (D13).

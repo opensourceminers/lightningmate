@@ -4,7 +4,7 @@ import http from "node:http";
 import net, { type AddressInfo } from "node:net";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { Router } from "express";
+import express, { Router } from "express";
 import { createHttpApp } from "../src/app.js";
 import { storeIncidents } from "../src/store.js";
 import { RequestGate, SHUTDOWN_WAIT_MS, appShutdownSteps, createShutdown, type ShutdownParts } from "../src/shutdown.js";
@@ -776,6 +776,8 @@ test("the shutdown keeps waiting for a request under way after its client has go
 test("a write request that fails, or never reaches its handler, doesn't hold up the shutdown", async (t) => {
   t.mock.method(console, "error", () => undefined); // express prints the handler's error
   const router = Router();
+  // The body is read by the router, as the API's reads it (behind its login gate).
+  router.use(express.json());
   router.post("/fail", (_req, _res, next) => next(new Error("LND unreachable")));
   const { gate, port, post } = await serveGated(t, router);
 

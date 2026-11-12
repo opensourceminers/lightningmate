@@ -57,9 +57,29 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
   // Where the app's own lookups go (Privacy).
   const [privacy, setPrivacy] = useState<PrivacyInfo | null>(null);
   const loadPrivacy = () => api.privacy().then(setPrivacy).catch(() => setPrivacy(null));
+  // Sessions (only where a login is required): end every sign-in (SEC-9).
+  const [authRequired, setAuthRequired] = useState(false);
+  const signOutEverywhere = async () => {
+    const yes = await ui.confirm({
+      title: "Sign out everywhere",
+      message: "Every device signed in to LightningMate must sign in again with the app password — this one too.",
+      confirmLabel: "Sign out everywhere",
+    });
+    if (!yes) return;
+    try {
+      await api.authRevokeAll();
+      api.logout();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   useEffect(() => {
     void loadPrivacy();
+    api
+      .authStatus()
+      .then((s) => setAuthRequired(s.authRequired))
+      .catch(() => undefined);
     api.getSettings().then(setSettings).catch((e) => setError(e instanceof Error ? e.message : String(e)));
     api
       .ambossStatus()
@@ -286,6 +306,8 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
           {/* Without a proxy every lookup leaves from the home IP: a warning. */}
           {privacy.torProxy ? (
             <p className="muted">{privacySummary(privacy)}</p>
+          ) : privacy.torProxyFault ? (
+            <p className="banner error">{privacySummary(privacy)}</p>
           ) : (
             <div className="dryrun-banner">{privacySummary(privacy)}</div>
           )}
@@ -309,6 +331,7 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
           </div>
           <details className="set-more">
             <summary>Where each lookup goes</summary>
+            <p className="muted small">Route in force since the app started: {privacy.route}.</p>
             <ul className="close-aside">
               {privacy.destinations.map((d) => (
                 <li key={`${d.service}:${d.what}`}>{destinationLine(d)}</li>
@@ -319,6 +342,18 @@ export function SettingsPanel({ onChange, version }: { onChange: () => void; ver
       ) : (
         <p className="muted">Loading…</p>
       )}
+
+      {authRequired ? (
+        <>
+          <h3 className="sub">Sessions</h3>
+          <div className="amboss-row">
+            <span className="muted">A sign-in lasts 12 hours on each device. Sign out everywhere ends every one at once — this one too.</span>
+            <button className="row-btn" disabled={busy} onClick={() => void signOutEverywhere()}>
+              Sign out everywhere
+            </button>
+          </div>
+        </>
+      ) : null}
 
       <h3 className="sub">Amboss Magma</h3>
       {ambossConnected === null ? (

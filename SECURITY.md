@@ -47,6 +47,13 @@ security@opensourceminers.de (please don't open a public issue first).
   - **Without the proxy** (outside Umbrel), every one of them leaves from
     this server's internet connection, which is your home IP address, and
     Settings → Privacy says so.
+  - **With a faulty proxy setting** (one of the two missing, a port that is
+    no number), the same as without one — but named as the fault it is.
+
+  The route is decided once, when the app starts, and said in its log
+  ("Outbound requests: through Tor …" or "direct … and why") and in Settings
+  → Privacy. Redirects are followed only to the same host over https (or an
+  onion service's own plain http), and no answer larger than 2 MB is read.
 
   Settings → Privacy ("Where each lookup goes") lists each destination with
   the route it takes right now. Every outbound request has a hard deadline.
@@ -151,7 +158,17 @@ security@opensourceminers.de (please don't open a public issue first).
   Other containers share the Docker network, so this stops them from using the
   API; it also runs behind Umbrel's `app_proxy`. The container binds `0.0.0.0`
   (so app_proxy can reach it) — set via `LM_BIND`. `$APP_PASSWORD` / `$APP_SEED`
-  are injected by Umbrel and used to verify and sign the session token.
+  are injected by Umbrel. A session lasts 12 hours; its token is signed with
+  a random secret the app makes at its first start and keeps in its data
+  directory (`token-secret`, mode 0600), mixed with `$APP_SEED` — never the
+  password itself. Settings → Sessions → "Sign out everywhere" makes a new
+  secret and so ends every session at once; deleting the file before a
+  restart does the same. Eight wrong passwords a minute from one address are
+  refused for the rest of that minute; behind Umbrel's app proxy (one address
+  for every browser) Umbrel's own password (64 hex characters, random) still
+  gets through. A password you chose yourself (standalone) is refused with
+  the rest until the minute has passed, so guessing it stays at eight a
+  minute.
 - **Standalone/dev:** with no `APP_PASSWORD` set it runs without a login, so it
   **refuses to start unless bound to loopback** (`127.0.0.1`/`::1`, the default).
   To bind anything else (e.g. `LM_BIND=0.0.0.0` inside Docker), set
@@ -159,6 +176,15 @@ security@opensourceminers.de (please don't open a public issue first).
   reverse proxy.
 - **No CORS** is sent, so a malicious web page can't read responses or make
   cross-site JSON requests to the API.
+- **Security headers** on the page and the API: a Content-Security-Policy
+  that allows only the app's own scripts, styles, fonts and API (no inline
+  script, no other origin), `frame-ancestors 'none'` and `X-Frame-Options:
+  DENY` (the app is never shown inside another page), `X-Content-Type-Options:
+  nosniff` and `Referrer-Policy: no-referrer`. A request body is read only
+  behind the login gate — the sign-in's own excepted; one that is no JSON or
+  larger than 256 KB is answered `400` / `413` as JSON. Every write route
+  takes numbers as JSON numbers and switches as `true`/`false` — nothing else
+  is read as one.
 - **Cross-site requests are refused** under `/api`, in every mode: a request a
   browser marks as coming from another site's page (`Sec-Fetch-Site:
   cross-site`) gets `403`, and every POST must be JSON (`Content-Type:
@@ -224,9 +250,11 @@ The state lives in `DATA_DIR`: in the Docker image `/data`, owned by the user
 the app runs as (`node`, uid 1000 — never root; the app's own code under
 `/app` is root's and not writable by it) — on Umbrel the app's own data dir,
 standalone a volume (README: `-v lightningmate-data:/data`); run from a
-checkout, `<repo>/.data`. It holds the settings, the Amboss key and the order
-records whose saved preimages claim buyers' held payments: the files are
-written readable by their owner only (mode 0600) — keep the directory private.
+checkout, `<repo>/.data`. It holds the settings, the Amboss key, the session
+secret and the order records whose saved preimages claim buyers' held
+payments: the files are written readable by their owner only (mode 0600), and
+at every start a file left readable by others (by an older version) is made
+so — keep the directory private.
 
 All state files are written atomically (temp file → fsync → rename; the previous
 version is kept as `.bak`). A damaged file is never silently replaced by

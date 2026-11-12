@@ -457,6 +457,13 @@ export const closeFeeRefusedAtMaxText = (maxFeeRate: number): string =>
   `The peer wants more than the ${Math.round(maxFeeRate)} sat/vB maximum, so this round ended without a closing transaction. ` +
   "The channel is shutting down all the same: LND normally finishes the close with the peer at its own fee estimate — which can be above that maximum.";
 
+/** The same for a close by hand with its maximum (review 2026-11-10, CHAN-2):
+ *  what LND does next, and what to do. */
+export const manualCloseRefusedText = (maxRate: number): string =>
+  `The peer wants more than ${Math.round(maxRate)} sat/vB, the most this close may pay, so this round ended without a closing transaction. ` +
+  "The channel is shutting down all the same: LND normally finishes the close with the peer at its own fee estimate — which can be above that rate — usually within minutes. " +
+  "Wait for it. If it still hasn't closed after a few hours, a force-close remains possible.";
+
 export async function closeChannelByOutpoint(
   writeLnd: AuthenticatedLnd,
   transactionId: string,

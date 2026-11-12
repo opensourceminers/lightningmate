@@ -9,7 +9,7 @@ import type {
   SuggestionPolicy,
   SuggestionsResponse,
 } from "../types";
-import { sats, satsCompact } from "../format";
+import { lnplusHref, sats, satsCompact } from "../format";
 import { WRITE_MODE_HINT } from "../statusNotes";
 import { useNodeChanges } from "../nodeNav";
 import { NodeLink } from "./NodeLink";
@@ -233,7 +233,7 @@ export function SuggestionsPanel() {
                       {s.lnplus ? (
                         <a
                           className={`lnp-chip${s.lnplus.scoreEffectPct < 0 ? " neg" : ""}`}
-                          href={s.lnplus.profileUrl}
+                          href={lnplusHref(s.lnplus.profileUrl)}
                           target="_blank"
                           rel="noreferrer noopener"
                           onClick={(e) => e.stopPropagation()}

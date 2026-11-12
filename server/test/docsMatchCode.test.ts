@@ -125,11 +125,14 @@ test("the README and SECURITY.md say what the server does about where requests c
   assert.match(security, /## Release integrity/);
 });
 
-test("the release process says how the stores' compose changes at the next release — the Tor proxy lines — and that images are immutable", () => {
+test("the release process says the stores' compose keeps the Tor proxy lines — and that images are immutable", () => {
   const releasing = read("docs/RELEASING.md");
   assert.match(releasing, /TOR_PROXY_IP: "\$TOR_PROXY_IP"/);
   assert.match(releasing, /TOR_PROXY_PORT: "\$TOR_PROXY_PORT"/);
-  assert.match(releasing, /next release/);
+  // Both stores carry them since 0.8.5 (review 2026-11-10: the text still
+  // said "add them at the next release").
+  assert.match(releasing, /\*\*Keep the Tor proxy lines\*\*/);
+  assert.doesNotMatch(releasing, /next release/);
   assert.match(releasing, /Images are immutable/);
   assert.match(releasing, /imagetools inspect/);
   // The packaging compose has them already, beside the disclosed service fee.

@@ -12,10 +12,18 @@ import type { PrivacyInfo } from "./types";
 
 /** The card's headline: is there a Tor proxy — then everything goes through it. */
 export function privacySummary(p: PrivacyInfo): string {
+  // A proxy value given and unusable (review 2026-11-10, SEC-1): named, not
+  // passed over as "no proxy".
+  if (!p.torProxy && p.torProxyFault) {
+    return (
+      `The Tor proxy setting is faulty: ${p.torProxyFault}. Until it is fixed (TOR_PROXY_IP / TOR_PROXY_PORT in the app's environment), ` +
+      "LightningMate's own lookups leave from this server's internet connection — your home IP address. Switch off what you don't need."
+    );
+  }
   if (!p.torProxy) {
     return (
-      "Your node is Tor-only, but LightningMate's own lookups are not the node's: no Tor proxy is available to this app, " +
-      "so they leave from this server's internet connection — your home IP address. Switch off what you don't need."
+      "No Tor proxy is given to this app (TOR_PROXY_IP / TOR_PROXY_PORT are not set), so LightningMate's own lookups " +
+      "leave from this server's internet connection — your home IP address. Switch off what you don't need."
     );
   }
   return `Every lookup goes through Umbrel's Tor proxy (${p.torProxy}) — none leaves from this server's IP address.`;

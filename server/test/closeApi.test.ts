@@ -150,8 +150,12 @@ test("POST /channels/close refuses a channel inside its lease unless the request
   assert.equal(forced.status, 409, "a force-close too");
   const opening = await api.request("POST", "/channels/close", { transactionId: TX(4), transactionVout: 0, isForce: true });
   assert.deepEqual([opening.status, opening.body.error], [409, "pending"]);
-  const bad = await api.request("POST", "/channels/close", { transactionId: TX(1), transactionVout: 0, breakLease: "yes" });
+  const bad = await api.request("POST", "/channels/close", { transactionId: TX(1), transactionVout: 0, isForce: false, breakLease: "yes" });
   assert.equal(bad.status, 400);
+  assert.match(bad.body.message, /breakLease must be true or false/);
+  // An upper-case txid is the same channel: its lease is checked (R1-1b).
+  const upper = await api.request("POST", "/channels/close", { transactionId: TX(1).toUpperCase(), transactionVout: 0, isForce: false, feeRate: 2 });
+  assert.deepEqual([upper.status, upper.body.error], [409, "lease_active"]);
   assert.equal(closes(), 0);
 
   // The operator confirmed breaking it: closed.

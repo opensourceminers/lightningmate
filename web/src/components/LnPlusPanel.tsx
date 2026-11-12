@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { NodeLink } from "./NodeLink";
 import { api } from "../api";
 import type { LnPlusPoolNode, LnPlusStatus, LnPlusSwap, LnPlusSwapsResponse } from "../types";
-import { satsCompact } from "../format";
+import { lnplusHref, satsCompact } from "../format";
 import { lnplusDirectNote } from "../privacyView";
 import { InfoTip } from "./InfoTip";
 
@@ -126,7 +126,7 @@ function SwapRow({ swap: s }: { swap: LnPlusSwap }) {
     <tr>
       <td>
         <div className="sug-peer">
-          <a href={s.url} target="_blank" rel="noreferrer noopener">
+          <a href={lnplusHref(s.url)} target="_blank" rel="noreferrer noopener">
             #{s.id}
           </a>
           {s.requiresPrime ? <span className="sug-badge">Prime only</span> : null}

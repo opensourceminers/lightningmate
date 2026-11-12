@@ -41,7 +41,7 @@ export function PaymentsPanel({ price }: { price?: PriceInfo | null }) {
     setCreating(true);
     setInvoice(null);
     try {
-      const inv = await api.lnInvoice({ tokens: Number(amount) || 0, description: memo });
+      const inv = await api.lnInvoice({ tokens: Math.max(0, Math.floor(Number(amount) || 0)), description: memo });
       setInvoice(inv);
     } catch (e) {
       toast(msg(e), "error");
@@ -76,7 +76,7 @@ export function PaymentsPanel({ price }: { price?: PriceInfo | null }) {
   const payNow = async () => {
     if (!decoded) return;
     const amountless = decoded.tokens === 0;
-    const sendSats = amountless ? Number(payAmount) || 0 : decoded.tokens;
+    const sendSats = amountless ? Math.max(0, Math.floor(Number(payAmount) || 0)) : decoded.tokens;
     if (amountless && sendSats <= 0) {
       toast("Enter an amount for this invoice.", "error");
       return;
@@ -209,7 +209,7 @@ export function PaymentsPanel({ price }: { price?: PriceInfo | null }) {
 
               <label className="policy-field">
                 <span>Max routing fee (sat)</span>
-                <input type="number" min={0} value={maxFee} onChange={(e) => setMaxFee(Math.max(0, Number(e.target.value) || 0))} />
+                <input type="number" min={0} value={maxFee} onChange={(e) => setMaxFee(Math.max(0, Math.floor(Number(e.target.value) || 0)))} />
               </label>
 
               <button

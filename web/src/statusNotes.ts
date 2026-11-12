@@ -147,6 +147,20 @@ export function promisedSpend(err: unknown): { message: string; promisedSat: num
   };
 }
 
+/**
+ * A channel open or close the server asks about again because its fee rate
+ * is far above LND's next-block estimate (review 2026-11-10, CHAN-2): the
+ * question, naming the fee it would pay. The caller asks it and sends again
+ * with `confirmed: ["fee_rate_high"]` only after a yes. Null for any other
+ * error.
+ */
+export function rateFarAbove(err: unknown): string | null {
+  if (!(err instanceof ApiError) || err.status !== 409) return null;
+  const body = err.body as { error?: unknown; message?: unknown } | null;
+  if (body?.error !== "fee_rate_high") return null;
+  return typeof body.message === "string" && body.message ? body.message : err.message;
+}
+
 /** The confirmation for spending promised coins anyway. */
 export function spendPromisedQuestion(refusal: { message: string }): string {
   return `${refusal.message} Spend them anyway?`;

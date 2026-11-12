@@ -185,6 +185,12 @@ async function graphqlErrorIn(res: TimedResponse): Promise<GraphqlError | null> 
   }
 }
 
+/** The longest Amboss API key taken (SEC-7). */
+export const AMBOSS_KEY_MAX = 2048;
+/** One line of printable ASCII (no space) of a key's length: what can go
+ *  into an Authorization header as it is. */
+export const isAmbossKeyShaped = (key: string): boolean => key.length > 0 && key.length <= AMBOSS_KEY_MAX && /^[\x21-\x7e]+$/.test(key);
+
 /**
  * One GraphQL request to Amboss. Every call is deadline-bound (http.ts): a
  * stalled Amboss must not hold anything hostage. Mutations get their own
@@ -200,6 +206,9 @@ export async function ambossGql<T>(
   deadlineMs?: number,
 ): Promise<T> {
   const timeoutMs = deadlineMs ?? (/^\s*mutation\b/.test(query) ? HTTP_TIMEOUTS.ambossMutationMs : HTTP_TIMEOUTS.ambossQueryMs);
+  // A key that can't go into a header as it is never goes out — and is
+  // never quoted (SEC-7).
+  if (apiKey && !isAmbossKeyShaped(apiKey)) throw new AmbossError("auth", "the Amboss API key is not one line of printable characters — connect it again");
   let res: TimedResponse;
   try {
     res = await httpRequest(

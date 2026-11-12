@@ -48,12 +48,13 @@ services:
       # before anything is sold. "0" turns it off.
       LM_SELL_FEE_BPS: "100"
       LM_SELL_FEE_ADDRESS: "lightningmate@btcpay.opensourceminers.de"
-      # Umbrel's Tor proxy (SOCKS5). LightningMate's own third-party lookups
-      # (LN+ reputations — this node's pubkey included — the BTC price and
-      # Amboss's public market data) go through it instead of the home
-      # connection; Settings → Privacy can route the Amboss account calls through
-      # it too. Without these lines they go out directly.
-      # NOT YET IN THE STORES' COMPOSE: add both lines there with the next
-      # release (docs/RELEASING.md).
+      # Umbrel's Tor proxy (SOCKS5). Every request LightningMate makes itself
+      # — Amboss (with and without the API key), LN+ reputations (this node's
+      # pubkey included), the BTC price, node lookups and the service fee's
+      # lightning address — goes through it, none from the home connection.
+      # Without these lines (or with a faulty value) they go out directly,
+      # and the app says so at start and in Settings → Privacy. The
+      # community store carries them since 0.8.5, the official one since
+      # 0.9.1 (docs/RELEASING.md).
       TOR_PROXY_IP: "$TOR_PROXY_IP"
       TOR_PROXY_PORT: "$TOR_PROXY_PORT"

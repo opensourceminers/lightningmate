@@ -1,11 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { COPY_FAILED, copyText } from "../clipboard";
 import { QRCodeSVG } from "qrcode.react";
 import { api } from "../api";
 import type { OnchainState, OnchainTx, PriceInfo, SendPreview } from "../types";
 import { fiat, sats, timeAgo } from "../format";
 import { promisedSpend, spendPromisedQuestion } from "../statusNotes";
-import { budgetLine, sendDoubleCheck, sendNeedsConfirm, sendSummary } from "../onchainView";
+import { budgetLine, newSendId, refusedByApp, sendDoubleCheck, sendNeedsConfirm, sendRepeated, sendSummary } from "../onchainView";
 import { useUi } from "./Overlay";
 
 const msg = (e: unknown) => (e instanceof Error ? e.message : String(e));
@@ -28,6 +28,10 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
   const [sendAll, setSendAll] = useState(false);
   const [feeRate, setFeeRate] = useState("");
   const [sending, setSending] = useState(false);
+  /** This form's send id (CHAN-14): the server never sends one id twice.
+   *  Kept while no answer came (a lost answer, LND slow) — a second click is
+   *  then answered with what the first did; a new one for any other send. */
+  const sendId = useRef<{ key: string; id: string } | null>(null);
 
   const load = () => {
     api
@@ -71,7 +75,7 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
   // The most that can go while the reserve and the coins promised to buyers
   // stay, at the chosen fee rate (the server's own preview).
   const fillMax = async () => {
-    const rate = Number(feeRate) || 0;
+    const rate = Math.floor(Number(feeRate) || 0);
     if (!toAddr.trim() || rate <= 0) {
       toast("Enter the address and the fee rate first.", "error");
       return;
@@ -90,8 +94,9 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
   };
 
   const send = async () => {
-    const amt = Number(amount) || 0;
-    const rate = Number(feeRate) || 0;
+    // Whole sat and sat/vB, as the server takes them (it refuses fractions).
+    const amt = Math.floor(Number(amount) || 0);
+    const rate = Math.floor(Number(feeRate) || 0);
     if (!toAddr.trim() || (!sendAll && amt <= 0) || rate <= 0) {
       toast("Enter address, amount and fee rate.", "error");
       return;
@@ -124,14 +129,34 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
     const second = sendDoubleCheck(preview.checks);
     if (second && !(await confirm({ title: "Check before sending", message: second, confirmLabel: "Send anyway", danger: true }))) return;
     const confirmed = preview.checks.map((c) => c.code);
+    const key = JSON.stringify([toAddr.trim(), sendAll ? "all" : amt, rate]);
+    if (sendId.current?.key !== key) sendId.current = { key, id: newSendId() };
+    const requestId = sendId.current.id;
     const sendNow = (spendPromised: boolean) =>
-      api.onchainSend({ address: toAddr.trim(), feeRate: rate, ...what, confirmed, ...(spendPromised ? { spendPromised } : {}) });
+      api.onchainSend({ address: toAddr.trim(), feeRate: rate, ...what, confirmed, requestId, ...(spendPromised ? { spendPromised } : {}) });
+    const sent = (tx: string) => {
+      toast(`Sent — tx ${tx.slice(0, 12)}…`, "success");
+      setToAddr("");
+      setAmount("");
+      setSendAll(false);
+      load();
+    };
     setSending(true);
     try {
       let r: Awaited<ReturnType<typeof sendNow>>;
       try {
         r = await sendNow(false);
       } catch (e) {
+        // Asked before (the first answer was lost, or LND was slow): what
+        // the first one did — never a second send. While the first is still
+        // under way the id stays: the next click must find it again.
+        const repeated = sendRepeated(e);
+        if (repeated) {
+          if (repeated.settled) sendId.current = null;
+          if (repeated.transactionId) sent(repeated.transactionId);
+          toast(repeated.message, repeated.transactionId ? "info" : "error");
+          return;
+        }
         // Something changed since the preview (the balance, LND's rates):
         // nothing was sent — review it again.
         const changed = sendNeedsConfirm(e);
@@ -154,16 +179,17 @@ export function OnchainPanel({ price }: { price?: PriceInfo | null }) {
         }
         r = await sendNow(true);
       }
-      if (r.ok && r.transactionId) {
-        toast(`Sent — tx ${r.transactionId.slice(0, 12)}…`, "success");
-        setToAddr("");
-        setAmount("");
-        setSendAll(false);
-        load();
-      } else {
-        toast(`Send failed: ${r.error ?? "unknown"}`, "error");
-      }
+      // An answer came: the next send is a new one — unless LND's outcome
+      // is unknown, when the same click must find the first send.
+      if (!r.unknown) sendId.current = null;
+      if (r.ok && r.transactionId) sent(r.transactionId);
+      else toast(r.unknown ? (r.error ?? "The send's outcome is unknown — look under the on-chain transactions.") : `Send failed: ${r.error ?? "unknown"}`, "error");
     } catch (e) {
+      // The app refused it (its own 4xx, with its reason): nothing was sent
+      // under this id. No answer at all, or a 5xx — a proxy in front of the
+      // app that gave up waiting (504) — may hide a send: the id stays for
+      // the next click (independent review of P5, R1-9).
+      if (refusedByApp(e)) sendId.current = null;
       toast(msg(e), "error");
     } finally {
       setSending(false);

@@ -1,5 +1,7 @@
 import {
+  chmodSync,
   closeSync,
+  lstatSync,
   copyFileSync,
   existsSync,
   fsyncSync,
@@ -70,6 +72,57 @@ function keepPreviousAsBackup(file: string): void {
       // no backup this time — the atomic rename below still protects the file
     }
   }
+}
+
+/** Files no version reads any more (market telemetry, dropped in 0.6.x):
+ *  removed at start instead of lying in the data directory for good. */
+const ORPHANED_FILES = ["market-telemetry.json", "market-telemetry.json.bak"];
+/** The names the app writes in its data directory: `<name>.json` with its
+ *  `.bak`, temp and `.corrupt-…` copies, and `token-secret`. */
+const APP_FILE = /^(?:[a-z0-9-]+\.json(?:\.bak|\.tmp-[\w-]+|\.corrupt-[\w.-]+)?|token-secret(?:\.tmp)?)$/;
+
+/**
+ * The data directory at start (review 2026-11-10): every file in it readable
+ * by its owner only — the atomic writes make theirs 0600, but files written
+ * before that, and not since (amboss.json with the API key, settings.json,
+ * backup.json, rebalances.json), stayed 0644 — and the orphans gone. What
+ * can't be changed is left as it is (said in the log).
+ */
+export function tidyDataDir(dataDir: string): { tightened: string[]; removed: string[] } {
+  const tightened: string[] = [];
+  const removed: string[] = [];
+  let names: string[];
+  try {
+    names = readdirSync(dataDir);
+  } catch {
+    return { tightened, removed };
+  }
+  for (const name of names) {
+    // The app's own files only (its JSON stores with their backups and
+    // quarantined copies, the session secret) — never another file a
+    // mis-set DATA_DIR holds, and never through a symlink out of it
+    // (independent review of P5, R1-6).
+    if (!APP_FILE.test(name)) continue;
+    const path = join(dataDir, name);
+    try {
+      const st = lstatSync(path);
+      if (!st.isFile()) continue;
+      if (ORPHANED_FILES.includes(name)) {
+        rmSync(path, { force: true });
+        removed.push(name);
+        continue;
+      }
+      if ((st.mode & 0o077) !== 0) {
+        chmodSync(path, st.mode & 0o700);
+        tightened.push(name);
+      }
+    } catch (err) {
+      console.warn(`[store] ${name}: could not be tidied (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
+  if (tightened.length) console.log(`[store] readable by this app only now: ${tightened.join(", ")}`);
+  if (removed.length) console.log(`[store] removed files no version reads any more: ${removed.join(", ")}`);
+  return { tightened, removed };
 }
 
 /**

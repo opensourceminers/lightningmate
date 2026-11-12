@@ -102,7 +102,36 @@ async function nextBlockRate(lnd: AuthenticatedLnd): Promise<{ rate: { tokens_pe
   }
 }
 
-/** How a send's rate check names the rate it compares with. */
+/** The question a channel's open or close at `rate` asks first, like a send's
+ *  fee_rate_high (review 2026-11-10, CHAN-2: any rate up to 5,000 sat/vB went
+ *  out with one click — 500 typed for 5 paid 75,000 sat for a close). Null:
+ *  not far above what LND estimates for the next blocks, or no estimate.
+ *  `vbytes`: the transaction's size, for the fee it names. */
+export function rateFarAboveText(e: FeeEstimates | null, rate: number, vbytes: number, what: string): string | null {
+  if (!e || e.fast === null || !(rate > SEND_RATE_FACTOR * e.fast)) return null;
+  return `${rate} sat/vB is more than ${SEND_RATE_FACTOR}× ${fastRateName(e)}: ${what} (about ${vbytes} vB) pays ~${sat(Math.ceil(rate * vbytes))} sat in fees.`;
+}
+
+/** What LND agrees to with the peer by itself on a cooperative close: up to
+ *  this many times the rate asked for. */
+export const LND_CLOSE_FEE_HEADROOM = 3;
+
+/**
+ * The most a cooperative close by hand may pay (sat/vB). LND alone agrees
+ * to up to three times the rate chosen; the close now stops where the app
+ * would ask before closing (3× the next block's rate) — unless the rate
+ * chosen is itself that high, when the rate the operator confirmed is the
+ * most (review 2026-11-10, CHAN-2). Never below the rate chosen: a peer that
+ * asks a little more than an economy rate still closes (independent review
+ * of P5, R1-12: a maximum equal to the rate ended many first rounds).
+ * Undefined while LND gives no estimate: its own rule.
+ */
+export function closeMaxRate(rate: number, fast: number | null): number | undefined {
+  if (fast === null) return undefined;
+  return Math.max(rate, Math.min(LND_CLOSE_FEE_HEADROOM * rate, SEND_RATE_FACTOR * fast));
+}
+
+/** How a rate check names the rate it compares with. */
 const fastRateName = (e: FeeEstimates): string =>
   e.fastTarget === 2 ? `LND's 2-block rate (${e.fast} sat/vB)` : `what LND estimates for the next block (${e.fast} sat/vB)`;
 

@@ -3,7 +3,7 @@ import { api } from "../api";
 import { useDialogFocus } from "../a11y";
 import { copyText } from "../clipboard";
 import { feeText } from "../feeView";
-import { satsCompact, timeAgo } from "../format";
+import { lnplusHref, satsCompact, timeAgo } from "../format";
 import { leaseTag, offlineLabel } from "../closeView";
 import { notifyNodeChanged, setNodeHandler, useNodeChanges, type NodeTarget } from "../nodeNav";
 import {
@@ -604,7 +604,7 @@ function NodePanel({ target, onClose }: { target: NodeTarget; onClose: () => voi
                   Amboss ↗
                 </a>
                 {lnp ? (
-                  <a href={lnp.profileUrl} target="_blank" rel="noreferrer noopener">
+                  <a href={lnplusHref(lnp.profileUrl)} target="_blank" rel="noreferrer noopener">
                     LN+ ↗
                   </a>
                 ) : null}

@@ -5,7 +5,7 @@ import { satsCompact } from "../format";
 import { notifyNodeChanged } from "../nodeNav";
 import { fastRateHint } from "../onchainView";
 import { openLines, startingFeeText } from "../openView";
-import { promisedSpend, spendPromisedQuestion } from "../statusNotes";
+import { promisedSpend, rateFarAbove, spendPromisedQuestion } from "../statusNotes";
 import { useUi } from "./Overlay";
 
 const MIN_CHANNEL_SATS = 20_000;
@@ -84,28 +84,41 @@ export function OpenChannelForm({
   }, []);
 
   const send = async (): Promise<OpenChannelResult> => {
-    const open = (spendPromised: boolean) =>
-      api.channelOpen({
-        pubkey,
-        socket,
-        localTokens: size,
-        ...(rate > 0 ? { feeRate: rate } : {}),
-        ...(spendPromised ? { spendPromised } : {}),
-      });
-    try {
-      return await open(false);
-    } catch (e) {
-      // Coins promised to buyers: only with an explicit yes that names them.
-      const promised = promisedSpend(e);
-      if (!promised) throw e;
-      const yes = await ui.confirm({
-        title: "Spend coins promised to buyers?",
-        message: spendPromisedQuestion(promised),
-        confirmLabel: "Open anyway",
-        danger: true,
-      });
-      if (!yes) return { ok: false, pubkey, localTokens: size, error: promised.message };
-      return open(true);
+    // Each question the server asks is asked once, and the open sent again
+    // only after its yes: a rate far above the next block's (CHAN-2), then
+    // coins promised to buyers.
+    let rateConfirmed = false;
+    let spendPromised = false;
+    for (;;) {
+      try {
+        return await api.channelOpen({
+          pubkey,
+          socket,
+          localTokens: size,
+          ...(rate > 0 ? { feeRate: rate } : {}),
+          ...(spendPromised ? { spendPromised } : {}),
+          ...(rateConfirmed ? { confirmed: ["fee_rate_high"] } : {}),
+        });
+      } catch (e) {
+        const high = rateConfirmed ? null : rateFarAbove(e);
+        if (high) {
+          const yes = await ui.confirm({ title: "Fee rate far above the next block", message: `${high} Open at this rate anyway?`, confirmLabel: "Open anyway", danger: true });
+          if (!yes) return { ok: false, pubkey, localTokens: size, error: high };
+          rateConfirmed = true;
+          continue;
+        }
+        // Coins promised to buyers: only with an explicit yes that names them.
+        const promised = spendPromised ? null : promisedSpend(e);
+        if (!promised) throw e;
+        const yes = await ui.confirm({
+          title: "Spend coins promised to buyers?",
+          message: spendPromisedQuestion(promised),
+          confirmLabel: "Open anyway",
+          danger: true,
+        });
+        if (!yes) return { ok: false, pubkey, localTokens: size, error: promised.message };
+        spendPromised = true;
+      }
     }
   };
 
@@ -140,7 +153,7 @@ export function OpenChannelForm({
             min={MIN_CHANNEL_SATS}
             step={100_000}
             value={size}
-            onChange={(e) => setSize(Math.max(0, Number(e.target.value) || 0))}
+            onChange={(e) => setSize(Math.max(0, Math.floor(Number(e.target.value) || 0)))}
           />
         </label>
         <span className="field-label">On-chain fee</span>

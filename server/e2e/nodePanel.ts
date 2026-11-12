@@ -105,7 +105,7 @@ check("never-open shows in the details", never.body.neverOpen === true);
 await api.request("POST", "/channels/never-open", { pubkey: buyerKey, never: false });
 
 // ── close ────────────────────────────────────────────────────────────────────
-const closed = await api.request("POST", "/channels/close", { transactionId: c.transactionId, transactionVout: c.transactionVout, force: false, feeRate: 2 });
+const closed = await api.request("POST", "/channels/close", { transactionId: c.transactionId, transactionVout: c.transactionVout, isForce: false, feeRate: 2 });
 // On regtest the peer's fee estimate is far above 2 sat/vB, so LND's first round
 // ends in a refusal; what matters is that the app doesn't call that a failure.
 check(

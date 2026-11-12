@@ -667,15 +667,23 @@ test("the dashboard counts idle channels: open, online, past the window, outside
 test("a close whose fee the peer refuses isn't called failed: LND goes on with it, so nobody is sent to force-close", async (t) => {
   const { node } = setup();
   const api = await startApi(t, { node });
-  const close = { transactionId: TX(1), transactionVout: 0, feeRate: 2 };
+  const close = { transactionId: TX(1), transactionVout: 0, isForce: false, feeRate: 2 };
   // LND's words, as seen on regtest (0.21).
   node.closeFailure = "unable to process close msg: latest fee proposal exceeds max fee: 0.00000933 BTC > 0.00000900 BTC";
   const refused = await api.request("POST", "/channels/close", close);
   assert.equal(refused.status, 200);
   assert.equal(refused.body.ok, false);
   assert.equal(refused.body.stillClosing, true);
+  // No fee estimate from LND: LND's own rule, up to three times the rate.
+  assert.match(refused.body.error, /^The peer wants more than three times the fee you chose/);
   assert.match(refused.body.error, /shutting down all the same/);
   assert.match(refused.body.error, /Wait for it\./);
+  // With one: the close's maximum (three times 2, below 3× the next block's 12).
+  node.override("wallet.estimateFee", (a, cb) => cb(null, { sat_per_kw: String(Number(a.conf_target) <= 1 ? 3000 : 500), min_relay_fee_sat_per_kw: "253" }));
+  const capped = await api.request("POST", "/channels/close", close);
+  assert.equal(capped.body.stillClosing, true);
+  assert.match(capped.body.error, /^The peer wants more than 6 sat\/vB, the most this close may pay, so this round ended/);
+  assert.match(capped.body.error, /Wait for it\./);
   // Any other failure is one.
   node.closeFailure = "peer is offline";
   const other = await api.request("POST", "/channels/close", close);

@@ -23,6 +23,7 @@ export type {
   AreaStatus,
   AuthStatus,
   AuthUnlockRequest,
+  AuthRevokeResult,
   AuthUnlockResult,
   AutomationSwitch,
   AutopilotBounds,
