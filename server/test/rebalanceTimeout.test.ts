@@ -13,7 +13,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import { PAYMENT_CHECK, REBALANCE_MAX_TIMEOUT_BLOCKS, executeRebalance, pathfindingMs } from "../src/services/rebalance.js";
-import { FakeLnd } from "./helpers/fakeLnd.js";
+import { FakeLnd, sentPayment } from "./helpers/fakeLnd.js";
 import { BUYER, autopilotWith, failedRebalance, manualRefillsUnchecked, paidRebalance, plannedRebalance, sellerSetup, type AutopilotSeams } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import { installFetchMock } from "./helpers/fetchMock.js";
@@ -288,7 +288,7 @@ test("an attempt LND gives up on is booked failed, not in flight — its pathfin
   // LND gives up once its pathfinding time is over, 30 ms later.
   node.beforeCall = (method, args) => {
     if (method !== "router.sendPaymentV2") return;
-    const id = Buffer.from(args.payment_hash as Buffer).toString("hex");
+    const id = sentPayment(args).id;
     setTimeout(() => node.resolvePayment(id, "fail"), Number(args.timeout_seconds) * 1_000 + 30);
   };
   const ends: string[] = [];

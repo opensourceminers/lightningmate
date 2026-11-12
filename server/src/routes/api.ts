@@ -103,7 +103,7 @@ import { lookupPublicNode } from "../services/nodeLookup.js";
 import { getFlowSummary, getForwardsReport, parseTzOffset, readForwardEvents } from "../services/forwards.js";
 import { getFeePreview, type FeeApplyItem, type FeePolicy } from "../services/fees.js";
 import { buildGraphCache, type SuggestionPolicy } from "../services/suggestions.js";
-import { assessNode, getChannelSuggestionsV2, getCloseSuggestionsV2, scidAgeDays } from "../services/suggestRecommend.js";
+import { assessNode, getChannelSuggestionsV2, getCloseSuggestionsV2, scidAgeDays, type CloseSuggestion } from "../services/suggestRecommend.js";
 import { channelLeases, leaseProtection, standardChannelId } from "../services/leases.js";
 import { BOUGHT_INBOUND_METHOD, amortizedPurchaseCost, boughtInboundRoi } from "../services/inboundRoi.js";
 import { labelCostChannels, rebalanceCosts } from "../services/rebalanceCosts.js";
@@ -144,7 +144,7 @@ import { getBtcPrice } from "../services/price.js";
 import { outboundRouting, viaTor } from "../services/http.js";
 import type { FiatCurrency, SettingsStore } from "../services/settings.js";
 import type { ChannelOverride, FeeMode, OverridesStore } from "../services/overrides.js";
-import { getAlerts, leasePromiseAlerts, magmaKeptPaymentAlerts, magmaOverduePaymentAlerts, magmaPartsAlerts, magmaRefundAlerts, magmaRefusalAlerts, magmaUnpaidChannelAlerts, offerPriceAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
+import { DEAD_CAPITAL, deadCapitalAlerts, getAlerts, leasePromiseAlerts, magmaKeptPaymentAlerts, magmaOverduePaymentAlerts, magmaPartsAlerts, magmaRefundAlerts, magmaRefusalAlerts, magmaUnpaidChannelAlerts, offerPriceAlerts, serviceFeeAlerts, stateAlerts } from "../services/alerts.js";
 import { authRequired, bearer, issueToken, verifyPassword, verifyToken } from "../services/auth.js";
 import { SlidingWindowLimiter } from "../services/rateLimit.js";
 import { acknowledgeStoreIncident } from "../store.js";
@@ -167,7 +167,7 @@ import {
 } from "../services/magmaApi.js";
 import type { DeskResult } from "../services/magmaDesk.js";
 import type { AmbossStore } from "../services/ambossStore.js";
-import { FeeItemError, RebalanceBudgetError, RefillInFlightError, RefillNotAllowedError, StalePlanError, ambossFields, termsMatch, type Autopilot, type OfferWrite } from "../services/autopilot.js";
+import { FeeItemError, RebalanceBudgetError, RefillInFlightError, RefillNotAllowedError, StalePlanError, ambossFields, termsMatch, withDeadline, type Autopilot, type OfferWrite } from "../services/autopilot.js";
 import type { RebalanceLog } from "../services/rebalanceLog.js";
 import { BackupStore, exportScb, getBackupStatus } from "../services/backup.js";
 import type { EarningsLog } from "../services/earningsLog.js";
@@ -599,8 +599,8 @@ export function createApiRouter(
     wrap(async (req, res) => {
       const pubkey = nodeKey(queryOf<NodeQuery>(req).pubkey, res);
       if (!pubkey) return;
-      const [profile, looked] = await Promise.all([
-        lnplus.lookup(pubkey).catch(() => null),
+      const [ln, looked] = await Promise.all([
+        lnplus.lookupWithState(pubkey).catch(() => ({ profile: null, state: "unavailable" as const })),
         settings.get().nodeLookups
           ? lookupPublicNode(pubkey).then(
               (record) => ({ record, state: record ? ("ok" as const) : ("unknown" as const), error: null }),
@@ -609,8 +609,8 @@ export function createApiRouter(
           : Promise.resolve({ record: null, state: "off" as const, error: null }),
       ]);
       res.json({
-        lnplus: profile,
-        lnplusState: !lnplus.isEnabled() ? "off" : !profile && lnplus.isPaused() ? "unavailable" : "ok",
+        lnplus: ln.profile,
+        lnplusState: ln.state,
         record: looked.record,
         recordState: looked.state,
         recordError: looked.error,
@@ -744,6 +744,38 @@ export function createApiRouter(
     res.json(overrides.set(channelId, override));
   });
 
+  // The close list, as /suggestions/close computes it; the last one is kept
+  // for the dead-capital alert, and computed again in the background when it
+  // is DEAD_CAPITAL.refreshMs old (after a failure not before retryMs, under a deadline) (it reads 60 days of forwards and the
+  // graph: not on every alerts poll).
+  let closeView: { at: number; candidates: CloseSuggestion[] } | null = null;
+  let closeViewRefresh: Promise<unknown> | null = null;
+  let closeViewFailedAt = -Infinity;
+  const closeReport = async () => {
+    const leaseSources = await autopilot.leaseSourcesFresh();
+    const report = await getCloseSuggestionsV2(lnd, rebalanceLog.successes(), autopilot.feeV2Overrides(), overrides.all(), {
+      leaseSources,
+      uptime: autopilot.uptime,
+      // Only opens the channel autopilot would make (its rules, LN+).
+      opportunity: () => autopilot.swapTargets(),
+    });
+    closeView = { at: Date.now(), candidates: report.candidates };
+    return report;
+  };
+  const deadCapital = () => {
+    const now = Date.now();
+    if (closeView && now - closeView.at >= DEAD_CAPITAL.staleMs) closeView = null;
+    const due = !closeView || now - closeView.at >= DEAD_CAPITAL.refreshMs;
+    if (due && !closeViewRefresh && now - closeViewFailedAt >= DEAD_CAPITAL.retryMs) {
+      closeViewRefresh = withDeadline("the close list for the dead-capital alert", DEAD_CAPITAL.deadlineMs, () => closeReport())
+        .catch(() => {
+          closeViewFailedAt = Date.now();
+        })
+        .finally(() => (closeViewRefresh = null));
+    }
+    return deadCapitalAlerts(closeView?.candidates ?? null);
+  };
+
   // Alerts: damaged/unsaveable state files and service-fee problems (these
   // stay until acknowledged), plus derived node alerts (offline channels, …).
   router.get(
@@ -763,6 +795,7 @@ export function createApiRouter(
           ...autopilot.onchainLockAlerts(),
           ...leasePromiseAlerts(autopilot.leasePromiseFailures()),
           ...autopilot.refillLockAlerts(),
+          ...deadCapital(),
         ], (c) => autopilot.uptime.offlineInfo(c)?.hours ?? null),
       );
     }),
@@ -1440,15 +1473,7 @@ export function createApiRouter(
   router.get(
     "/suggestions/close",
     wrap(async (_req, res) => {
-      const leaseSources = await autopilot.leaseSourcesFresh();
-      res.json(
-        await getCloseSuggestionsV2(lnd, rebalanceLog.successes(), autopilot.feeV2Overrides(), overrides.all(), {
-          leaseSources,
-          uptime: autopilot.uptime,
-          // Only opens the channel autopilot would make (its rules, LN+).
-          opportunity: () => autopilot.swapTargets(),
-        }),
-      );
+      res.json(await closeReport());
     }),
   );
 
@@ -1589,9 +1614,6 @@ export function createApiRouter(
     }),
   );
 
-  /** The nodes a click is opening a channel to right now. */
-  const manualOpens = new Set<string>();
-
   // Open a channel to a peer — real on-chain action, requires write access.
   router.post(
     "/channels/open",
@@ -1621,13 +1643,14 @@ export function createApiRouter(
       }
       // One open to a node at a time: the dial alone can take a minute and a
       // half, and a second click (another tab, a form opened again) would only
-      // wait its turn at the mutex and fund a second channel.
-      const opener = pubkey.toLowerCase();
-      if (manualOpens.has(opener)) {
-        res.status(409).json({ error: "open_in_flight", message: "An open to this node is already under way." });
+      // wait its turn at the mutex and fund a second channel — and so would
+      // the autopilot's open to the same node (one record for both, review
+      // 2026-11-10, CHAN-7).
+      if (!autopilot.claimOpen(pubkey, "manual")) {
+        const by = autopilot.openUnderWayBy(pubkey);
+        res.status(409).json({ error: "open_in_flight", message: `An open to this node is already under way${by === "autopilot" ? " (by the autopilot)" : ""}.` });
         return;
       }
-      manualOpens.add(opener);
       try {
         // The routing fee it starts with: the one the fee engine protects a new
         // channel at — not LND's default (stock: 1 sat + 1 ppm).
@@ -1670,7 +1693,7 @@ export function createApiRouter(
         // An open also says the routing fee the channel starts with.
         else res.json((done.opened.ok ? { ...done.opened, startingFee: routing } : done.opened) satisfies ApiOpenChannelResult);
       } finally {
-        manualOpens.delete(opener);
+        autopilot.releaseOpen(pubkey);
       }
     }),
   );

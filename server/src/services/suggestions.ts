@@ -215,7 +215,13 @@ async function readGraph(lnd: AuthenticatedLnd): Promise<GraphCache> {
           s.feeSum += pol.fee_rate;
           s.feeCount += 1;
         }
-        if (pol.is_disabled === false) s.enabledCount += 1;
+        // Live only where neither side has it disabled: a node that went
+        // offline keeps its own last policies, all "enabled", in the graph —
+        // what says it is gone is its peers disabling their side toward it
+        // (review 2026-11-10, CHAN-4: a node dead for up to 21 days was a
+        // candidate with every channel counted live).
+        const other = ch.policies.find((p) => p.public_key !== pk);
+        if (pol.is_disabled === false && other?.is_disabled !== true) s.enabledCount += 1;
         if (pol.updated_at && new Date(pol.updated_at).getTime() >= freshAfter) s.recentUpdates += 1;
       }
       // Adjacency: record the channel's other endpoint(s) as neighbors.

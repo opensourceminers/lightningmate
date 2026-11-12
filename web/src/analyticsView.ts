@@ -433,8 +433,10 @@ export function closeNote(p: Pick<PnlSummary, "channelCloseCount" | "channelClos
 
 // ── Health score ─────────────────────────────────────────────────────────────
 
-/** A category bar: its width, or that it isn't graded (insufficient data). */
+/** A category bar: its width, or that it isn't graded (too little data, or a
+ *  read that failed — the detail line says which; "insufficient data" stood
+ *  beside "LND's balance couldn't be read", the review of P4, P14). */
 export function scoreBar(c: Pick<ScoreCategory, "score">): { graded: true; widthPct: number } | { graded: false; label: string } {
-  if (c.score === null || c.score === undefined) return { graded: false, label: "insufficient data" };
+  if (c.score === null || c.score === undefined) return { graded: false, label: "not graded" };
   return { graded: true, widthPct: Math.round(c.score * 100) };
 }

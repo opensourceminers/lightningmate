@@ -1,16 +1,14 @@
 import {
   cancelHodlInvoice,
   createInvoice,
-  decodePaymentRequest,
   getFeeRates,
   getPayment,
   getRouteToDestination,
   getWalletInfo,
-  payViaPaymentDetails,
+  payViaPaymentRequest,
   type AuthenticatedLnd,
 } from "lightning";
 import { getChannelsView, type ChannelView } from "./channels.js";
-import { getOwnPubkey } from "./node.js";
 
 /**
  * Rebalancing: circular payments that move our own liquidity from an idle
@@ -65,9 +63,17 @@ export async function estimateCost(
   amountSats: number,
   maxPpm: number,
   maxFeeSats?: number,
+  /** This node's other peers (every channel's peer but the source's): no
+   *  first hop to them. LND 0.21 ignores QueryRoutes' outgoing channel (the
+   *  field is deprecated, and the library sends only it): on regtest the
+   *  "route out of the source" went out over the target peer's own sibling
+   *  channel and straight back for 2 sat (review 2026-11-10, P4b regtest).
+   *  Ignoring the first hop to every other peer leaves only the source's. */
+  otherPeers: readonly string[] = [],
 ): Promise<{ costPpm: number | null; feeSats: number | null }> {
   try {
     const maxFee = maxFeeSats !== undefined ? Math.max(0, Math.floor(maxFeeSats)) : Math.ceil((amountSats * maxPpm) / 1_000_000);
+    const ignore = [...new Set(otherPeers)].filter((pk) => pk !== source.peerPubkey).map((pk) => ({ from_public_key: ownKey, to_public_key: pk }));
     const { route } = await getRouteToDestination({
       lnd,
       destination: ownKey,
@@ -75,6 +81,7 @@ export async function estimateCost(
       outgoing_channel: source.id,
       incoming_peer: target.peerPubkey,
       max_fee: maxFee,
+      ...(ignore.length ? { ignore } : {}),
     });
     if (!route) return { costPpm: null, feeSats: null };
     const feeSats = route.safe_fee;
@@ -461,11 +468,13 @@ function paymentFailed(err: unknown): boolean {
 }
 
 /** ln-service throws errors as [code, name, { ... }] arrays — surface the cause. */
-function describePayError(err: unknown, budgetPpm: number): string {
+function describePayError(err: unknown, budgetPpm: number, maxFeeSats?: number): string {
   if (Array.isArray(err)) {
     const name = String(err[1] ?? err[0] ?? "payment_failed");
     if (/Route|Payable|Possible|Pathfinding/i.test(name)) {
-      return `no route within budget (${budgetPpm} ppm) — target may be too costly to refill`;
+      // (The last attempt's own cap in sats: a 2 sat cap read "within budget
+      // (3000 ppm)" — the review of P4, P14 and its second round.)
+      return `no route within budget (${maxFeeSats !== undefined ? `${maxFeeSats} sat at most, ` : ""}${budgetPpm} ppm) — target may be too costly to refill`;
     }
     const extra = err[2] as { err?: { details?: string; message?: string } } | undefined;
     const detail = extra?.err?.details ?? extra?.err?.message ?? "";
@@ -545,7 +554,6 @@ export async function executeRebalance(
   }
   const cap: RefillFeeCap = { maxCostPpm: gatedBudget, maxFeeSats: params.maxFeeSats ?? null, earnings: gate };
 
-  const ownKey = await getOwnPubkey(readLnd);
   // The CLTV ceiling is relative to the tip; without a height, LND's default applies.
   const tip = await getWalletInfo({ lnd: readLnd })
     .then((w) => w.current_block_height)
@@ -567,6 +575,8 @@ export async function executeRebalance(
   };
   const failedSourceIds: string[] = [];
   let lastErr: unknown = null;
+  /** The cap of the attempt whose failure lastErr is (sat). */
+  let lastErrCapSats: number | undefined;
   let tried = false;
   // Source by source; per source the requested amount, then smaller ones,
   // paying the first that routes. A route that pays from no size of one
@@ -628,9 +638,21 @@ export async function executeRebalance(
       let sent: string | null = null;
       const attemptedHere = { ...withTarget, sourceId: source.id, sourceAlias: source.peerAlias, amountSats: amount, failedSourceIds };
       try {
-        const invoice = await createInvoice({ lnd: writeLnd, tokens: amount });
+        // The hard limit covers the making of the invoice too: an AddInvoice
+        // LND never answers held the refill — and the refill lock — for good
+        // (the review of P4, P5). Past the limit nothing is sent; an invoice
+        // that arrives later is cancelled (nothing pays it).
+        const making = createInvoice({ lnd: writeLnd, tokens: amount });
+        const madeInTime = await waitAtMost(making, Math.max(0, deadline - Date.now()));
+        if (madeInTime === TIMED_OUT) {
+          void making.then((late) => dropInvoice(writeLnd, late.id)).catch(() => undefined);
+          triedHere = triedBefore.here;
+          tried = triedBefore.any;
+          lastErr ??= new Error("rebalance time limit reached");
+          break;
+        }
+        const invoice = madeInTime;
         made = invoice.id;
-        const decoded = await decodePaymentRequest({ lnd: readLnd, request: invoice.request });
         // Asked again right before it goes out: the signal may have come
         // while the invoice was made (which is cancelled: nothing pays it).
         const late = opts.shouldStop?.();
@@ -674,21 +696,24 @@ export async function executeRebalance(
           };
         }
         sent = invoice.id;
-        const paying = payViaPaymentDetails({
+        // Paid by its request, with the source as `outgoing_channels`: the
+        // library sends `outgoing_channel` as SendPaymentV2's single
+        // `outgoing_chan_id` — deprecated, and ignored by LND 0.21. On
+        // regtest a refill "out of" the hub's channel went out over the
+        // target peer's own sibling and straight back, refused as "same
+        // incoming and outgoing channel", and LND's mission control then
+        // shunned the peer's last hop for every refill after it (P4b
+        // regtest). payViaPaymentDetails passes only the single field on;
+        // payViaPaymentRequest passes the plural one (`outgoing_chan_ids`).
+        // The request carries the invoice's features: a big refill may split
+        // (LND splits only for a destination that declares multi-path
+        // payments), the cap is for the whole payment.
+        const paying = payViaPaymentRequest({
           lnd: writeLnd,
-          id: invoice.id,
-          destination: ownKey,
-          tokens: amount,
+          request: invoice.request,
           max_fee: maxFeeSats,
-          outgoing_channel: source.id,
+          outgoing_channels: [source.id],
           incoming_peer: target.peerPubkey,
-          payment: decoded.payment,
-          mtokens: decoded.mtokens,
-          // A big refill may split; the cap is for the whole payment. LND
-          // splits only for a destination that declares multi-path payments:
-          // without the invoice's features it has none to go by (DestFeatures
-          // nil — "not splitting") and max_paths changes nothing.
-          features: decoded.features,
           max_paths: amount >= MULTI_PATH_MIN_SATS ? MULTI_PATH_MAX_PATHS : 1,
           pathfinding_timeout: pathfindingMs(left),
           ...(tip ? { max_timeout_height: tip + REBALANCE_MAX_TIMEOUT_BLOCKS } : {}),
@@ -716,6 +741,7 @@ export async function executeRebalance(
         };
       } catch (err) {
         lastErr = err;
+        lastErrCapSats = maxFeeSats;
         // An error LND made no payment of (refused outright — "permission
         // denied", nothing created): failed at once, with LND's reason — not
         // "still in flight" with the budget held until LightningMate restarts
@@ -742,7 +768,7 @@ export async function executeRebalance(
           sentAndFailedHere = true;
         }
         // Over with nothing left that could pay it — LND reported the payment
-        // failed, or it was never sent (the invoice couldn't be decoded).
+        // failed, or it was never sent (LND refused it, or the time ran out).
         if (made !== null) await dropInvoice(writeLnd, made);
       }
     }
@@ -753,7 +779,7 @@ export async function executeRebalance(
   return {
     ...withTarget,
     failedSourceIds,
-    error: tried ? describePayError(lastErr, budgetPpm) : lastErr instanceof Error ? lastErr.message : "nothing to try",
+    error: tried ? describePayError(lastErr, budgetPpm, lastErrCapSats) : lastErr instanceof Error ? lastErr.message : "nothing to try",
   };
 }
 

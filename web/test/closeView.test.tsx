@@ -26,6 +26,7 @@ import {
   type CloseTarget,
 } from "../src/closeView";
 import { CloseChannelDialog, ForceCloseConfirm } from "../src/components/CloseChannelDialog";
+import { CandidateFlow, pnl60Text } from "../src/components/CloseCandidatesPanel";
 import { ChannelTable } from "../src/components/ChannelTable";
 import { OverlayProvider } from "../src/components/Overlay";
 import type { ChannelLease, ChannelView, OfflineInfo } from "../src/types";
@@ -203,4 +204,16 @@ test("a sale only Amboss's listing knows: an old listing says from when it is", 
   const nowMs = Date.parse("2026-10-21T12:00:00.000Z");
   assert.equal(leaseLeft({ blocksLeft: null, reportedByAmboss: true, reportedAt: "2026-10-21T11:00:00.000Z" }, nowMs), "running (per Amboss)");
   assert.equal(leaseLeft({ blocksLeft: null, reportedByAmboss: true, reportedAt: "2026-10-18T09:00:00.000Z" }, nowMs), "running (per Amboss, 2026-10-18)");
+});
+
+test("a close candidate whose 60-day history was not read says so — not '0 forwards / 60d · 0 routed' (the review of P4, P7)", () => {
+  const unread = renderToStaticMarkup(<CandidateFlow c={{ historyRead: false, forwards60d: 0, flow60dSats: 0, pnl30dSats: 0 }} />);
+  assert.match(unread, /60-day forwarding history not read — forwards and P&amp;L unknown/);
+  assert.doesNotMatch(unread, /0 forwards/);
+  // The P&L 60 d column and its phone line: "unknown", not the refill cost alone (R2-1).
+  assert.equal(pnl60Text({ historyRead: false, pnl60dSats: -3_000 }), "unknown");
+  assert.equal(pnl60Text({ pnl60dSats: -3_000 }), "-3000");
+  assert.equal(pnl60Text({ pnl60dSats: 0 }), "—");
+  const read = renderToStaticMarkup(<CandidateFlow c={{ forwards60d: 4, flow60dSats: 200_000, pnl30dSats: -12 }} />);
+  assert.match(read, /4 forwards \/ 60d · 200(\.0)?k routed · P&amp;L 30d -12/);
 });

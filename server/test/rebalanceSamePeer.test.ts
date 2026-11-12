@@ -112,7 +112,8 @@ test("a peer drained over both its channels is refilled — once per plan: the s
 
 test("a refill is no larger than what the peer lacks over its channels together", async () => {
   // A lacks 1.75M to its half; with B's 3.2M the peer lacks 1.05M of 10M.
-  const node = planNode([drainedSpec(1), { n: 2, peer: 1, local: 3_200_000 }, { n: 3, local: 4_000_000 }]);
+  // (B at A's price: what is sized here, not what a cheaper sibling is worth — below.)
+  const node = planNode([drainedSpec(1), { n: 2, peer: 1, local: 3_200_000, feePpm: 400 }, { n: 3, local: 4_000_000 }]);
   const plan = await planOf(node, probeAt(150), { cfg: { targetDeficitThreshold: 0.1 } });
   const a = row(plan, A);
   assert.equal(a.state, "route_found_profitable", a.reasons.join(" | "));
@@ -120,6 +121,32 @@ test("a refill is no larger than what the peer lacks over its channels together"
   assert.ok(a.reasons.includes("sized to the 1.05M its peer lacks over its 2 channels with us (this channel alone would take 1.25M)"), a.reasons.join(" | "));
   // What the row shows as "to target" stays the channel's own.
   assert.equal(a.amountToReachTargetLocalRatio, 1_750_000);
+});
+
+test("a refill toward a peer is valued at the lowest fee of its channels that can take it: the peer may carry it back into its 50 ppm channel, not the 400 ppm one it was planned for (the review of P4, P11)", async () => {
+  const cheap = planNode([drainedSpec(1), { n: 2, peer: 1, local: 3_200_000, feePpm: 50 }, { n: 3, local: 4_000_000 }]);
+  const plan = await planOf(cheap, probeAt(150), { cfg: { targetDeficitThreshold: 0.1 } });
+  const a = row(plan, A);
+  assert.equal(a.expectedRevenuePpm, 50, a.reasons.join(" | "));
+  assert.equal(a.wouldRebalance, false, "a 150 ppm route does not pay for sats sold at 50");
+  assert.ok(a.reasons.some((r) => /^valued at 50 ppm, not 400: the peer may carry a refill back into its other channel /.test(r)), a.reasons.join(" | "));
+  // A sibling whose peer side has less than the smallest refill to give can't
+  // take it (a 100k channel at 90 % ours): the planned fee stands.
+  const small = planNode([drainedSpec(1), { n: 2, peer: 1, capacity: 100_000, local: 90_000, feePpm: 50 }, { n: 3, local: 4_000_000 }]);
+  const kept = row(await planOf(small, probeAt(150), { cfg: { targetDeficitThreshold: 0.1 } }), A);
+  assert.equal(kept.expectedRevenuePpm, 400, kept.reasons.join(" | "));
+  assert.ok(!kept.reasons.some((r) => /^valued at 50 ppm/.test(r)), kept.reasons.join(" | "));
+  // Nor one whose peer side holds less than the refill (60k against 1.05M):
+  // the whole of it can't land there (the review's second round, R2-2).
+  const thin = planNode([drainedSpec(1), { n: 2, peer: 1, capacity: 500_000, local: 440_000, feePpm: 50 }, { n: 3, local: 4_000_000 }]);
+  const notThin = row(await planOf(thin, probeAt(150), { cfg: { targetDeficitThreshold: 0.1 } }), A);
+  assert.equal(notThin.expectedRevenuePpm, 400, notThin.reasons.join(" | "));
+  // Nor one whose fee LND didn't list — it read as 0 ppm (R2-3).
+  const unlisted = planNode([drainedSpec(1), { n: 2, peer: 1, local: 3_200_000, feePpm: 50 }, { n: 3, local: 4_000_000 }]);
+  const sib = unlisted.fees.find((f) => f.channelId === unlisted.channels[1].id)!;
+  Object.assign(sib, { transactionId: null, currentPpm: 0 });
+  const notUnlisted = row(await planOf(unlisted, probeAt(150), { cfg: { targetDeficitThreshold: 0.1 } }), A);
+  assert.equal(notUnlisted.expectedRevenuePpm, 400, notUnlisted.reasons.join(" | "));
 });
 
 test("a peer that lacks less than the smallest refill is left alone", async () => {
@@ -147,7 +174,7 @@ test("a channel of the target's own peer is never the source, however full it is
   assert.match(row(alone, A).reasons.at(-1) ?? "", /^no channel can give liquidity: .* — and its peer's channels together above theirs$/);
   assert.deepEqual(asked, []);
   // With a channel of another peer it is refilled — from that one.
-  const three = planNode([drainedSpec(1, { local: 250_000 }), { n: 2, peer: 1, capacity: 2_000_000, local: 1_600_000 }, { n: 3, local: 4_000_000 }]);
+  const three = planNode([drainedSpec(1, { local: 250_000 }), { n: 2, peer: 1, capacity: 2_000_000, local: 1_600_000, feePpm: 400 }, { n: 3, local: 4_000_000 }]);
   const plan = await planOf(three, probeAt(150));
   assert.equal(row(plan, A).state, "route_found_profitable", row(plan, A).reasons.join(" | "));
   assert.equal(row(plan, A).selectedSourceChannel, C);
@@ -342,7 +369,10 @@ test("a refill that arrived on the peer's other channel is booked there: the log
 
   // The planned channel is still drained, and the next plan lists a refill of
   // it or of its sibling: neither is sent within the cooldown.
-  assert.ok(cooldowns(autopilot)[TARGET], "the cooldown is the planned target's");
+  assert.ok(cooldowns(autopilot)[TARGET], "the planned target's cooldown runs");
+  // …and the channel the sats arrived on has its own (on regtest only the
+  // planned one's was stamped — P4b).
+  assert.ok(cooldowns(autopilot)[SIBLING], "the cooldown is that channel's too");
   for (const next of [refill(SIBLING, [TARGET]), refill(TARGET, [SIBLING])]) {
     seams.rebalanceReport = async () => ({ recommendations: [next] });
     await autopilot.runOnce();
@@ -350,7 +380,8 @@ test("a refill that arrived on the peer's other channel is booked there: the log
   assert.equal(node.callsTo("router.sendPaymentV2").length, 1, "no second refill toward the peer");
   seams.rebalanceReport = async () => ({ recommendations: [refill(SIBLING, [TARGET])] });
   await autopilot.runOnce();
-  assert.match(autopilot.getState().decisions.rebalance?.text ?? "", new RegExp(`peer-${SIBLING}: its peer's other channel was refilled or tried within its cooldown`));
+  // (It was refilled itself: its own cooldown says so.)
+  assert.match(autopilot.getState().decisions.rebalance?.text ?? "", new RegExp(`peer-${SIBLING}: refilled or tried within its cooldown`));
 });
 
 test("a refill that arrived on the channel it was planned for is booked as before", async (t) => {
@@ -409,5 +440,7 @@ test("while a refill toward a peer is in flight none goes into its other channel
   const [rec, ...more] = new RebalanceLog(disk).recent();
   assert.deepEqual(more, []);
   assert.deepEqual([rec?.ok, rec?.targetId, rec?.plannedTargetId, rec?.targetSentBefore, rec?.holdPpm, rec?.paymentId], [true, SIBLING, TARGET, 1_111_111, 300, id]);
+  // The channel it arrived on has its cooldown, as when a refill is booked at once (the review of P4, P12).
+  assert.ok(cooldowns(two.autopilot)[SIBLING], "the sibling's cooldown runs");
   await first;
 });

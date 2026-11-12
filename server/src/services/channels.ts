@@ -56,12 +56,26 @@ function classify(sent: number, received: number): ChannelRole {
   return "router";
 }
 
-export async function getChannelsView(
-  lnd: AuthenticatedLnd,
-): Promise<ChannelView[]> {
+export async function getChannelsView(lnd: AuthenticatedLnd): Promise<ChannelView[]> {
+  return (await getChannelsViewChecked(lnd)).channels;
+}
+
+/**
+ * The channels, and whether LND's pending channels were read: a failed read
+ * of them shows none (the view stays usable), and `pendingKnown` says so —
+ * where a decision needs them (an automatic open must see a channel still
+ * confirming to that peer), "none" is not what LND said (review
+ * 2026-11-10, CHAN-6: a timed-out read let a peer with an open still
+ * confirming be suggested, and opened to, a second time).
+ */
+export async function getChannelsViewChecked(lnd: AuthenticatedLnd): Promise<{ channels: ChannelView[]; pendingKnown: boolean }> {
+  let pendingKnown = true;
   const [{ channels }, pending] = await Promise.all([
     getChannels({ lnd }),
-    getPendingChannels({ lnd }).catch(() => ({ pending_channels: [] })),
+    getPendingChannels({ lnd }).catch(() => {
+      pendingKnown = false;
+      return { pending_channels: [] };
+    }),
   ]);
 
   const views = await Promise.all(
@@ -131,5 +145,5 @@ export async function getChannelsView(
   const all = [...views, ...closing];
   // Biggest channels first — that's usually where the action is.
   all.sort((a, b) => b.capacity - a.capacity);
-  return all;
+  return { channels: all, pendingKnown };
 }

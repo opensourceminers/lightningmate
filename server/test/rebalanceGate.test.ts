@@ -32,7 +32,8 @@ import { REBAL_REC_DEFAULTS, planRebalances, type RebalanceRecommendation, type 
 import { RebalanceLog, type RebalanceRecord } from "../src/services/rebalanceLog.js";
 import type { ChannelView } from "../src/services/channels.js";
 import { chanNumber, feeNode, forwardsOut, withMarket, type FakeForward, type FeeChannel } from "./helpers/feeNode.js";
-import { INVOICE_FEATURE } from "./helpers/fakeLnd.js";
+import { INVOICE_FEATURE, sentPayment } from "./helpers/fakeLnd.js";
+import { parsePaymentRequest } from "./helpers/bolt11.js";
 import { autopilotWith, manualRefillsUnchecked, paidRebalance, plannedRebalance } from "./helpers/autopilot.js";
 import { startApi } from "./helpers/apiHarness.js";
 import type { RebalanceExecParams } from "../src/services/rebalance.js";
@@ -79,10 +80,13 @@ function refillNode(targetPpm = 400) {
 }
 const sentPayments = (node: ReturnType<typeof refillNode>) =>
   node.callsTo("router.sendPaymentV2").map((a) => ({
-    sats: Number(a.amt),
+    sats: sentPayment(a).tokens,
     maxFee: Number(a.fee_limit_sat),
     parts: Number(a.max_parts),
-    out: String(a.outgoing_chan_id),
+    // The source as LND 0.21 reads it: the plural field (the single one is
+    // deprecated and ignored there — P4b regtest).
+    out: sentPayment(a).outgoing.join(","),
+    single: a.outgoing_chan_id,
   }));
 
 test("every attempt of a refill — the halved fallbacks too — carries the gate's own cap as its max fee; a size the gate leaves no fee for is not sent", async () => {
@@ -137,11 +141,27 @@ test("a refill of 500k or more may split over several paths (MPP) — and carrie
   );
   // Before: no features — ln-service sent no dest_features, and LND's payment
   // session doesn't split for a destination without them ("DestFeatures is
-  // nil"): max_parts 3 changed nothing. The self-invoice declares MPP.
+  // nil"): max_parts 3 changed nothing. The self-invoice declares MPP, and
+  // each attempt is paid by that invoice's request — LND reads the features
+  // from it (since the P4b regtest: paying by request is what carries the
+  // outgoing channel in the field LND 0.21 reads).
   for (const call of node.callsTo("router.sendPaymentV2")) {
-    const features = (call.dest_features ?? []) as number[];
-    assert.ok(features.includes(INVOICE_FEATURE.multiPathOptional), `dest_features ${JSON.stringify(call.dest_features)}`);
+    assert.equal(typeof call.payment_request, "string");
+    const features = parsePaymentRequest(call.payment_request as string).features.map((f) => f.bit);
+    assert.ok(features.includes(INVOICE_FEATURE.multiPathOptional), `features ${JSON.stringify(features)}`);
     assert.ok(features.includes(INVOICE_FEATURE.paymentAddrRequired));
+  }
+});
+
+test("a refill names its source in the field LND 0.21 reads — outgoing_chan_ids, by paying its invoice's request — not only the deprecated single outgoing_chan_id it ignores (on regtest a refill went out over the target peer's own channel and back; P4b regtest)", async () => {
+  const node = refillNode();
+  node.payOutcome = "fail";
+  await executeRebalance(node.lnd, node.lnd, { targetId: "850000x1x0", sourceId: "850000x2x0", amountSats: 400_000, econRatio: 0.8, maxFeePpm: 320 });
+  const calls = node.callsTo("router.sendPaymentV2");
+  assert.ok(calls.length >= 1);
+  for (const call of calls) {
+    assert.deepEqual(((call.outgoing_chan_ids ?? []) as unknown[]).map(String), [chanNumber("850000x2x0")]);
+    assert.equal(typeof call.payment_request, "string");
   }
 });
 
@@ -156,7 +176,7 @@ test("a refill records the target's lifetime 'sent' counter from LND — what th
 test("no route from the first source: the next source is tried before giving up — and a move never takes a source below the share it keeps", async () => {
   const node = refillNode();
   const first = chanNumber("850000x2x0");
-  node.payOutcome = (p) => (String(p.params.outgoing_chan_id) === first ? "fail" : "succeed");
+  node.payOutcome = (p) => (sentPayment(p.params).outgoing.join(",") === first ? "fail" : "succeed");
   const res = await executeRebalance(node.lnd, node.lnd, {
     targetId: "850000x1x0",
     sourceId: "850000x2x0",

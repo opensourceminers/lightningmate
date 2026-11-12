@@ -469,6 +469,10 @@ function NodePanel({ target, onClose }: { target: NodeTarget; onClose: () => voi
                   <p className="muted small">Your node's view of the network doesn't have it: it may be private, or never announced itself.</p>
                 )}
                 {!pub && !pubError ? <p className="muted small">Looking up its public record…</p> : null}
+                {pub && !lnp && pub.lnplusState === "not_asked" ? (
+                  <p className="muted small">LN+ wasn&apos;t asked about it today — the day&apos;s LN+ lookups are used up, so whether it has a profile isn&apos;t known.</p>
+                ) : null}
+                {pub && !lnp && pub.lnplusState === "unavailable" ? <p className="muted small">LN+ couldn&apos;t be asked right now.</p> : null}
                 {pubError || pub?.recordState === "unavailable" ? <p className="muted small">The public record couldn't be read right now.</p> : null}
                 {pub?.recordState === "off" ? <p className="muted small">Public record lookups are off (Settings → Privacy).</p> : null}
               </section>

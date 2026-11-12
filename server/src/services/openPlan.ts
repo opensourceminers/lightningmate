@@ -235,7 +235,7 @@ export const briefError = (error: string): string => {
 export function planOpen(
   s: Pick<
     SuggestionV2,
-    "pubkey" | "alias" | "socket" | "sockets" | "recommendedSizeSats" | "usefulness" | "lnplus" | "peerMinChannelSats" | "closedDaysAgo" | "closeHistoryKnown"
+    "pubkey" | "alias" | "socket" | "sockets" | "recommendedSizeSats" | "usefulness" | "lnplus" | "peerMinChannelSats" | "closedDaysAgo" | "closeHistoryKnown" | "pendingKnown"
   >,
   ctx: OpenContext,
 ): OpenPlan {
@@ -255,6 +255,11 @@ export function planOpen(
   // applied).
   if (s.closeHistoryKnown === false) {
     return { skip: `LND didn't say its block height or its closed channels — whether you closed a channel with it within ${RECENT_CLOSE_DAYS} days can't be checked, so it isn't opened to automatically until LND does` };
+  }
+  // LND's pending channels were not read: one still confirming to this node
+  // can't be ruled out (review 2026-11-10, CHAN-6).
+  if (s.pendingKnown === false) {
+    return { skip: "LND didn't list its pending channels — whether a channel to it is still confirming can't be checked, so it isn't opened to automatically until LND does" };
   }
   const rec = ctx.peers[s.pubkey];
   if (rec && Date.parse(rec.retryAt) > ctx.nowMs) {

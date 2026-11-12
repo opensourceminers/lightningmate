@@ -1,5 +1,5 @@
 import { getClosedChannels, getWalletInfo, type AuthenticatedLnd } from "lightning";
-import { getChannelsView, type ChannelView } from "./channels.js";
+import { getChannelsView, getChannelsViewChecked, type ChannelView } from "./channels.js";
 import { getFlowSummary } from "./forwards.js";
 import { getOwnPubkey } from "./node.js";
 import { getFeeRecommendations, type FeeRecConfig, type FeeRecState, type FeeRecommendation } from "./feeRecommend.js";
@@ -172,6 +172,10 @@ export interface SuggestionV2 {
    *  recent close can't be ruled out (closedDaysAgo null says nothing then),
    *  and the channel autopilot doesn't open to it. Absent: known. */
   closeHistoryKnown?: false;
+  /** False when LND's pending channels could not be read: a channel still
+   *  confirming to this node can't be ruled out, and the channel autopilot
+   *  doesn't open to it (review 2026-11-10, CHAN-6). Absent: known. */
+  pendingKnown?: false;
 }
 
 /** A peer this node closed a channel with this recently is not proposed for
@@ -264,6 +268,7 @@ interface SuggestInputs {
   torOnly: boolean;
   closedDays: Map<string, number>;
   closeHistoryKnown: boolean;
+  pendingKnown: boolean;
   now: number;
   staleMs: number;
   peers: Set<string>;
@@ -279,9 +284,9 @@ interface SuggestInputs {
 }
 
 async function readSuggestInputs(lnd: AuthenticatedLnd, policy: SuggestV2Config): Promise<SuggestInputs> {
-  const [graph, channels, ownKey, flow, info, closed] = await Promise.all([
+  const [graph, { channels, pendingKnown }, ownKey, flow, info, closed] = await Promise.all([
     buildGraphCache(lnd),
-    getChannelsView(lnd),
+    getChannelsViewChecked(lnd),
     getOwnPubkey(lnd),
     getFlowSummary(lnd, policy.demandWindowDays).catch(() => null),
     getWalletInfo({ lnd }).catch(() => null),
@@ -365,6 +370,7 @@ async function readSuggestInputs(lnd: AuthenticatedLnd, policy: SuggestV2Config)
     torOnly,
     closedDays,
     closeHistoryKnown,
+    pendingKnown,
     now,
     staleMs,
     peers,
@@ -597,7 +603,7 @@ function scoreCandidates(inp: SuggestInputs, candidates: Candidate[]) {
 /** A scored candidate as the API and the list show it. `rank` and `overlap`:
  *  its place among the picks (0, 0: judged on its own). */
 function toSuggestion(inp: SuggestInputs, policy: SuggestV2Config, s: Scored, overlap: number, rank: number): SuggestionV2 {
-  const { ourMedianChan, hasDemandData, closedDays, closeHistoryKnown, nodeNeed, torOnly, now } = inp;
+  const { ourMedianChan, hasDemandData, closedDays, closeHistoryKnown, pendingKnown, nodeNeed, torOnly, now } = inp;
   const { stat, meta, pk } = { ...s.e, pk: s.e.pk };
   const avgChan = avgChanOf(stat);
 
@@ -650,6 +656,7 @@ function toSuggestion(inp: SuggestInputs, policy: SuggestV2Config, s: Scored, ov
   } else if (!closeHistoryKnown) {
     warnings.push("LND didn't say its block height or its closed channels — whether you closed a channel with it lately is unknown, so the autopilot doesn't open to it until it does.");
   }
+  if (!pendingKnown) warnings.push("LND didn't list its pending channels — whether a channel to this node is still confirming is unknown, so the autopilot doesn't open to it until it does.");
   if (meta.sockets.length === 0) warnings.push("It advertises no address — it can only be opened to while it is connected to you.");
   if (hasDemandData && s.demandScore < 0.15) {
     warnings.push("Low demand evidence: this pick rests mainly on graph topology.");
@@ -731,6 +738,7 @@ function toSuggestion(inp: SuggestInputs, policy: SuggestV2Config, s: Scored, ov
     peerMinChannelSats: lp && lp.minChannelSizeSats > 0 ? lp.minChannelSizeSats : null,
     closedDaysAgo,
     ...(closeHistoryKnown ? {} : { closeHistoryKnown: false as const }),
+    ...(pendingKnown ? {} : { pendingKnown: false as const }),
   };
 }
 
@@ -946,6 +954,11 @@ export interface CloseSuggestion {
   assisted60dSats: number;
   flow60dSats: number;
   forwards60d: number;
+  /** False: the 60-day forwarding history couldn't be read in full — the
+   *  forward and P&L figures are not known, not 0 (the review of P4, P7: the
+   *  panel printed "0 forwards / 60d · 0 routed" for such a channel).
+   *  Absent: read. */
+  historyRead?: false;
   ageDays: number | null;
   reachContribution: number;
   uniqueReachLost: number;
@@ -1194,14 +1207,20 @@ export function rankCloseCandidates(input: CloseInput): CloseV2Report {
       });
       continue;
     }
-    const idle60 = routed60 === 0;
-    const losing = pnl60 < 0;
+    // (Listed on a long offline peer alone with the history unread: what it
+    // routed, lost or earned is not known, and is neither scored nor said —
+    // "No forwards in 60d." stood on a history that could not be read;
+    // review 2026-11-10, CHAN-8.)
+    const flowRead = input.flowKnown !== false;
+    const idle60 = flowRead && routed60 === 0;
+    const losing = flowRead && pnl60 < 0;
+    const lowYieldRead = flowRead && lowYield;
     const weak = feeState === "close_candidate" || m?.peerGate === "weak";
-    if (!longOffline && !idle60 && !losing && !weak && !lowYield) continue;
+    if (!longOffline && !idle60 && !losing && !weak && !lowYieldRead) continue;
 
     // ── Score ──
-    const idleScore = longOffline ? 1 : idle60 ? 0.8 : routed30 === 0 || lowYield ? 0.4 : 0;
-    const negPnlScore = pnl60 < 0 ? clamp01(-pnl60 / 5000) : 0;
+    const idleScore = longOffline ? 1 : idle60 ? 0.8 : flowRead && (routed30 === 0 || lowYield) ? 0.4 : 0;
+    const negPnlScore = losing ? clamp01(-pnl60 / 5000) : 0;
     const weakPeerScore = feeState === "close_candidate" ? 1 : longOffline ? 0.6 : m?.peerGate === "weak" ? 0.5 : 0;
     const lowReachScore = 1 - reachContribution;
     // What closing actually returns on-chain to redeploy = our current local balance
@@ -1236,9 +1255,10 @@ export function rankCloseCandidates(input: CloseInput): CloseV2Report {
         );
       }
     }
-    if (idle60 && lifetime === 0) reasons.push("Never routed.");
+    if (!flowRead) reasons.push("Its 60-day forwarding history couldn't be read in full — what it routed and earned isn't known.");
+    else if (idle60 && lifetime === 0) reasons.push("Never routed.");
     else if (idle60) reasons.push("No forwards in 60d.");
-    else if (lowYield && nodeYield60 !== null)
+    else if (lowYieldRead && nodeYield60 !== null)
       reasons.push(
         `Earned ${Math.round(earnings60).toLocaleString("en-US")} sat in 60d` +
           (assisted60 > 0 ? ` (incl. ${Math.round(assisted60).toLocaleString("en-US")} on forwards it brought in)` : "") +
@@ -1309,6 +1329,7 @@ export function rankCloseCandidates(input: CloseInput): CloseV2Report {
       assisted60dSats: Math.round(assisted60),
       flow60dSats: routed60,
       forwards60d: forwards60,
+      ...(flowRead ? {} : { historyRead: false as const }),
       ageDays,
       reachContribution: Math.round(reachContribution * 100) / 100,
       uniqueReachLost: uniqueReach,

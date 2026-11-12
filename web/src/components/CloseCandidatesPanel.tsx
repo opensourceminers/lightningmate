@@ -83,7 +83,8 @@ export function CloseCandidatesPanel() {
       </div>
 
       <p className="muted lede">
-        Channels that earn too little to keep.
+        Channels that earn too little to keep. Closing one is yours to do: LightningMate never closes a channel by itself
+        (only a sold channel after its lease, when Auto-close is on).
         {canWrite ? null : <> Closing is <strong>disabled</strong> (read-only).</>}
         <InfoTip label="How channels are judged">
           Judged on real flow, P&amp;L, weak-peer signals and how much unique reach they actually add. Honest about what a close{" "}
@@ -132,17 +133,22 @@ export function CloseCandidatesPanel() {
                       </div>
                       <div className="muted reason" title={c.reasons[0]}>{c.reasons[0]?.split(" — ")[0]}</div>
                       <div className="sm-only muted small">
-                        inbound lost {c.inboundLiquidityLostSats > 0 ? satsCompact(c.inboundLiquidityLostSats) : "—"} · P&amp;L 60 d{" "}
-                        {c.pnl60dSats === 0 ? "—" : `${c.pnl60dSats > 0 ? "+" : ""}${c.pnl60dSats}`}
+                        inbound lost {c.inboundLiquidityLostSats > 0 ? satsCompact(c.inboundLiquidityLostSats) : "—"} · P&amp;L 60 d {pnl60Text(c)}
                       </div>
                     </td>
                     <td className="num strong">{satsCompact(c.capitalFreedSats)}</td>
                     <td className="num">{c.inboundLiquidityLostSats > 0 ? satsCompact(c.inboundLiquidityLostSats) : "—"}</td>
                     <td
-                      className={`num ${c.pnl60dSats < 0 ? "cost" : c.pnl60dSats > 0 ? "green" : ""}`}
-                      title={c.assisted60dSats ? `incl. ${c.assisted60dSats} sat in fees of the forwards it brought in` : undefined}
+                      className={`num ${c.historyRead === false ? "" : c.pnl60dSats < 0 ? "cost" : c.pnl60dSats > 0 ? "green" : ""}`}
+                      title={
+                        c.historyRead === false
+                          ? "the 60-day forwarding history couldn't be read"
+                          : c.assisted60dSats
+                            ? `incl. ${c.assisted60dSats} sat in fees of the forwards it brought in`
+                            : undefined
+                      }
                     >
-                      {c.pnl60dSats === 0 ? "—" : `${c.pnl60dSats > 0 ? "+" : ""}${c.pnl60dSats}`}
+                      {pnl60Text(c)}
                     </td>
                     <td>
                       <button
@@ -177,11 +183,7 @@ export function CloseCandidatesPanel() {
                               capacity <b>{satsCompact(c.capacitySats)}</b> · local <b>{satsCompact(c.localSats)}</b> · frees{" "}
                               <b>{satsCompact(c.capitalFreedSats)}</b> · close cost <b>~{c.closeCostSat} sat</b>
                             </span>
-                            <span>
-                              {c.forwards60d} forwards / 60d · {satsCompact(c.flow60dSats)} routed · P&amp;L 30d{" "}
-                              {c.pnl30dSats >= 0 ? "+" : ""}
-                              {c.pnl30dSats}
-                            </span>
+                            <CandidateFlow c={c} />
                             <span>
                               unique reach lost {c.uniqueReachLost} ({Math.round(c.reachContribution * 100)}%) ·{" "}
                               {c.ageDays != null ? `${c.ageDays}d old` : "age unknown"} · {c.feeV2State}
@@ -256,4 +258,26 @@ export function CloseCandidatesPanel() {
       ) : null}
     </section>
   );
+}
+
+/** A candidate's forwards and P&L — or, with the 60-day history unread, that
+ *  they are not known (it read "0 forwards / 60d · 0 routed"; the review of
+ *  P4, P7). */
+export function CandidateFlow({ c }: { c: Pick<CloseCandidate, "historyRead" | "forwards60d" | "flow60dSats" | "pnl30dSats"> }) {
+  if (c.historyRead === false) return <span>60-day forwarding history not read — forwards and P&amp;L unknown</span>;
+  return (
+    <span>
+      {c.forwards60d} forwards / 60d · {satsCompact(c.flow60dSats)} routed · P&amp;L 30d{" "}
+      {c.pnl30dSats >= 0 ? "+" : ""}
+      {c.pnl30dSats}
+    </span>
+  );
+}
+
+/** A candidate's 60-day P&L as the table shows it — "unknown" with the
+ *  history unread: what it earned is not known, so "−3000" (the refill cost
+ *  alone) is no P&L (the review of P4, second round, R2-1). */
+export function pnl60Text(c: Pick<CloseCandidate, "historyRead" | "pnl60dSats">): string {
+  if (c.historyRead === false) return "unknown";
+  return c.pnl60dSats === 0 ? "—" : `${c.pnl60dSats > 0 ? "+" : ""}${c.pnl60dSats}`;
 }

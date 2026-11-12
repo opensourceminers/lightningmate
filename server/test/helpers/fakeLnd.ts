@@ -985,6 +985,22 @@ export class FakeLnd {
   }
 }
 
+/**
+ * What a SendPaymentV2 call asked for: its payment hash, amount and outgoing
+ * channels — by details (payment_hash, amt) or by request (the request
+ * carries hash and amount; a refill is paid by its request since the P4b
+ * regtest, with `outgoing_chan_ids`).
+ */
+export function sentPayment(call: Record<string, unknown>): { id: string; tokens: number; outgoing: string[] } {
+  const outgoing = ((call.outgoing_chan_ids as unknown[] | undefined) ?? (call.outgoing_chan_id ? [call.outgoing_chan_id] : [])).map(String).filter((x) => x !== "0");
+  if (typeof call.payment_request === "string" && call.payment_request) {
+    const p = parsePaymentRequest(call.payment_request);
+    return { id: p.id, tokens: p.tokens > 0 ? p.tokens : Number(call.amt ?? 0), outgoing };
+  }
+  const msat = call.amt_msat !== undefined ? Number(call.amt_msat) : Number(call.amt ?? 0) * 1000;
+  return { id: Buffer.from(call.payment_hash as Buffer).toString("hex"), tokens: Math.floor(msat / 1000), outgoing };
+}
+
 /** sha256 hex — payment hash of a preimage. */
 export const paymentHashOf = (secretHex: string): string =>
   createHash("sha256").update(Buffer.from(secretHex, "hex")).digest("hex");

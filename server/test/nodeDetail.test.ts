@@ -547,6 +547,36 @@ test("one open to a node at a time: a second click while the first is dialing is
   assert.notEqual(again.status, 409, "free again");
 });
 
+test("the autopilot and a click share the one open under way to a node: the autopilot's open waits while a click is dialing it, and a click is refused while the autopilot opens to it (review 2026-11-10, CHAN-7)", async (t) => {
+  const { node } = setup();
+  const peer = PK(73);
+  let release = () => undefined as void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  node.override("default.connectPeer", (a, cb) => {
+    void held.then(() => {
+      const pk = (a.addr as { pubkey: string }).pubkey;
+      if (!node.peers.includes(pk)) node.peers.push(pk);
+      cb(null, {});
+    });
+  });
+  const api = await startApi(t, { node });
+  const body = { pubkey: peer, socket: "peer73.onion:9735", localTokens: 2_000_000, feeRate: 3 };
+  const click = api.request("POST", "/channels/open", body);
+  for (let i = 0; i < 200 && node.callsTo("default.connectPeer").length === 0; i++) await new Promise((r) => setTimeout(r, 5));
+  const openTo = (api.autopilot as unknown as { openTo: (w: unknown, s: object, size: number, fee: number) => Promise<{ kind: string; reason?: string }> }).openTo.bind(api.autopilot);
+  const auto = await openTo(node.lnd, { pubkey: peer, alias: "peer73", sockets: ["peer73.onion:9735"] }, 2_000_000, 3);
+  assert.deepEqual(auto, { kind: "deferred", reason: "deferred: an open to peer73 is already under way (by hand)" });
+  release();
+  await click;
+  assert.equal(node.callsTo("default.openChannel").length, 1, "one channel funded");
+  // The reverse: while the autopilot holds it, a click is refused and says by whom.
+  assert.equal(api.autopilot.claimOpen(PK(74), "autopilot"), true);
+  const refused = await api.request("POST", "/channels/open", { ...body, pubkey: PK(74) });
+  assert.deepEqual([refused.status, refused.body.error, refused.body.message], [409, "open_in_flight", "An open to this node is already under way (by the autopilot)."]);
+  api.autopilot.releaseOpen(PK(74));
+  assert.equal(api.autopilot.openUnderWayBy(PK(74)), null);
+});
+
 test("a refused or failed open doesn't leave the node marked as being opened to", async (t) => {
   const { node } = setup();
   node.override("default.connectPeer", (_a, cb) => cb({ details: "dial tcp: i/o timeout" }));

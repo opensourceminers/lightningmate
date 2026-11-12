@@ -16,7 +16,7 @@ import {
 import { isAuthError } from "./amboss.js";
 import { NO_EXTRA_TERMS, createOffer, getMyOffer, getMyOffers, termsOf, toggleOffer, updateOffer, type MyOffer, type OfferTerms } from "./magmaApi.js";
 import { MagmaDesk, afterLeaseNote, deadlineWords, type MagmaSellAction, type SellActionKind } from "./magmaDesk.js";
-import { CapitalLedger, OnchainMutex, listableSat, spendableOnchain, type Spendable } from "./capital.js";
+import { CapitalLedger, OnchainMutex, channelsWith, listableSat, spendableOnchain, type Spendable } from "./capital.js";
 import {
   BLOCKS_PER_YEAR,
   DEFAULT_LEASE_BLOCKS,
@@ -180,12 +180,17 @@ export class RefillInFlightError extends Error {
   constructor(
     readonly channelId: string,
     readonly payment: RefillInFlight,
+    /** Set when the payment is into another channel of the asked target's
+     *  peer (that channel is `channelId`). */
+    peerOf?: string,
   ) {
     const what =
       channelId === payment.targetId ? `A payment into ${payment.alias || channelId}` : `A payment out of ${payment.sourceAlias || channelId}`;
     super(
       `${what} is still in flight — LightningMate is waiting to learn how it ended (checked every ${INFLIGHT_REBALANCE_CHECK_MS / 60_000} minutes). ` +
-        `Until then no other refill moves through that channel.`,
+        (peerOf
+          ? `It refills the same peer as ${peerOf}: until then no other refill goes toward that peer.`
+          : `Until then no other refill moves through that channel.`),
     );
     this.name = "RefillInFlightError";
   }
@@ -1756,6 +1761,26 @@ export class Autopilot {
   /** This process's own open while LND hasn't answered it (openTo): its
    *  write-ahead record is not one a restart left. */
   private openInFlight: OpeningRecord | null = null;
+  /** The nodes a channel open is under way to — by the autopilot or by a
+   *  click — from the dial to LND's answer (review 2026-11-10, CHAN-7: the
+   *  manual route kept a set of its own, so an automatic open to a node a
+   *  click was dialing, or the reverse, could fund a second channel). */
+  private readonly opensUnderWay = new Map<string, "autopilot" | "manual">();
+
+  /** Take the one open under way to `pubkey`; false when one is (by whom:
+   *  `openUnderWayBy`). Released with releaseOpen. */
+  claimOpen(pubkey: string, by: "autopilot" | "manual"): boolean {
+    const key = pubkey.toLowerCase();
+    if (this.opensUnderWay.has(key)) return false;
+    this.opensUnderWay.set(key, by);
+    return true;
+  }
+  openUnderWayBy(pubkey: string): "autopilot" | "manual" | null {
+    return this.opensUnderWay.get(pubkey.toLowerCase()) ?? null;
+  }
+  releaseOpen(pubkey: string): void {
+    this.opensUnderWay.delete(pubkey.toLowerCase());
+  }
   /** When the current main run took its lock (null when idle) — exposed so a
    *  run that takes unusually long is visible, not just a stale lastRunAt. */
   private runningSince: string | null = null;
@@ -3699,6 +3724,10 @@ export class Autopilot {
           // Its fee belongs to the budget day it was sent on, like a payment
           // that ends after a restart.
           const entry = res.paymentId ? sent.get(res.paymentId) : undefined;
+          // Arrived on the peer's other channel: that channel's cooldown
+          // starts too — the sats are there (the planned one keeps its own).
+          // On regtest the planned target's alone was stamped (P4b).
+          if (res.ok && res.landed) this.state.perTargetLastRebalanced[res.landed.id] = new Date().toISOString();
           this.rebalanceLog.append({
             ...this.rebalanceRecord(res, meta.via, heldAt(meta.holdPpm, res.ok && res.landed ? res.landed.ppm : res.targetPpm)),
             ...(entry ? { startedAt: entry.at } : {}),
@@ -3784,6 +3813,9 @@ export class Autopilot {
       const sentBefore = landed ? landed.sentBefore : p.targetSentBefore;
       const hold = ok ? heldAt(p.holdPpm, landed ? landed.ppm : undefined) : null;
       if (p.sourceId) this.notePairs(p.targetId, { ok, sourceId: p.sourceId, failedSourceIds: ok ? [] : [p.sourceId] });
+      // Arrived on the peer's other channel: its cooldown starts too, as
+      // when the refill is booked at once (the review of P4, P12).
+      if (landed) this.state.perTargetLastRebalanced[landed.id] = new Date().toISOString();
       // Written with the time it was sent: its fee belongs to that day's
       // budget (the maximum fee was charged there meanwhile).
       this.rebalanceLog.append({
@@ -3896,6 +3928,14 @@ export class Autopilot {
         const at = refilledSince(id);
         if (at && planAt !== undefined) throw new StalePlanError(params.targetId, at, planAt, id);
       }
+      // A refill into the peer's other channel still in flight: the peer is
+      // being refilled already, and that payment may still land — a second
+      // one would buy its lack twice. The stage holds the whole peer back;
+      // a run by hand does too (the package's review, P2: the click paid a
+      // second refill toward the peer). (Its stamp is older than the plan,
+      // so the stale-plan check above does not see it.)
+      const intoPeer = this.inFlightThrough(rules.peerChannels);
+      if (intoPeer) throw new RefillInFlightError(intoPeer.channelId, intoPeer.payment, rules.targetAlias || params.targetId);
       if (rules.sources.length === 0) {
         const [first, ...more] = rules.refused;
         throw new RefillNotAllowedError(
@@ -4527,6 +4567,28 @@ export class Autopilot {
     | { kind: "blocked"; reason: string }
     | { kind: "refused"; error: string; preBroadcast: boolean }
   > {
+    if (!this.claimOpen(s.pubkey, "autopilot")) {
+      return { kind: "deferred", reason: `deferred: an open to ${s.alias} is already under way (${this.openUnderWayBy(s.pubkey) === "manual" ? "by hand" : "by the autopilot"})` };
+    }
+    try {
+      return await this.openToClaimed(writeLnd, s, sizeSats, feeRate, heldSat);
+    } finally {
+      this.releaseOpen(s.pubkey);
+    }
+  }
+
+  private async openToClaimed(
+    writeLnd: AuthenticatedLnd,
+    s: Pick<SuggestionV2, "pubkey" | "alias" | "socket" | "sockets">,
+    sizeSats: number,
+    feeRate: number,
+    heldSat: number,
+  ): Promise<
+    | { kind: "opened"; transactionId?: string }
+    | { kind: "deferred"; reason: string }
+    | { kind: "blocked"; reason: string }
+    | { kind: "refused"; error: string; preBroadcast: boolean }
+  > {
     // Every address it advertises, in dialing order (then the graph's).
     const sockets = [...new Set([...(s.sockets ?? []), ...(s.socket ? [s.socket] : [])])];
     const connected = await connectForOpen(writeLnd, { pubkey: s.pubkey, sockets });
@@ -4558,6 +4620,21 @@ export class Autopilot {
       }
       const late = this.stopWhy("channelEnabled");
       if (late) return { kind: "deferred" as const, reason: openStopped(late) };
+      // A channel to this node may have come since the suggestions were
+      // read — a click's open that finished while this stage dialed earlier
+      // picks (the review of P4, P4: the claim covers only opens that
+      // overlap; the stage then funded a second channel). LND is asked here,
+      // under the mutex every open takes: open or pending, it is not opened
+      // to again; a look LND does not answer opens nothing either.
+      let existing: Awaited<ReturnType<typeof channelsWith>>;
+      try {
+        existing = await channelsWith(this.readLnd, s.pubkey);
+      } catch (err) {
+        return { kind: "deferred" as const, reason: `deferred: LND didn't list its channels with ${s.alias} (${errText(err)}) — not opened to until it does` };
+      }
+      if (existing.length > 0) {
+        return { kind: "deferred" as const, reason: `deferred: a channel with ${s.alias} exists already (${existing[0].pending ? "pending" : "open"}) — not opened to again` };
+      }
       const routing = this.initialRoutingFee();
       // Write-ahead: on record before LND has it — a process that goes down
       // while LND funds the open finds it at the next channel stage, as an

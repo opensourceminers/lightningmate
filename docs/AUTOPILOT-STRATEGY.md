@@ -31,7 +31,13 @@ if enabled, it runs four independent sub-autopilots in order:
 
 1. **Fees** — recompute and apply each channel's outbound `fee_rate` + `base_fee`.
 2. **Rebalancing** — run profitable circular rebalances to refill channels.
-3. **Channels** — open a channel to a well-scored peer if on-chain funds allow.
+3. **Channels** — open a channel to a well-scored peer if on-chain funds allow. It never
+   closes one: closing is the operator's (decided 2026-11-10). The close list (Channels →
+   Channels to close) ranks what earns too little, and an alert names the capital in channels
+   that routed nothing in 60 days while their peer was there (the list is computed again in the
+   background at most every 6 h). An open to a node is one at a time, whether the autopilot or
+   a click makes it; with LND's pending channels unread no automatic open is made to a
+   suggestion.
 4. **Magma** — keep our offer fundable and well-formed, reprice/relist it if asked, optionally
    auto-close finished leases (that part runs with selling off too, so a node that stopped
    selling still gets its sold channels closed as their leases end). (Orders themselves are
@@ -771,6 +777,14 @@ later are **not** failed runs: they go into the rebalance decision ("last decisi
 tab), never into the run history. A drained channel the gate turns down says what a refill would need
 (earnings per sat at the demand-sized refill, outflow, net drain — and when that price is above
 the max ppm, that no fee it may charge pays for it).
+
+A refill goes out of its source and nowhere else: the route question shuts the first hop to
+every other peer out (LND 0.21 ignores the single outgoing channel QueryRoutes still takes),
+and the payment is made by the invoice's request with the source as `outgoing_chan_ids` (the
+single field of SendPaymentV2 is ignored too). On regtest, asked the old way, a refill went out
+over the target peer's own other channel and straight back, and LND then shunned that peer's
+last hop for every refill. A refill that arrives on the peer's other channel is booked there,
+cooldown included (`server/e2e/refill.ts`).
 
 **Channels** (`runChannels`, `openPlan.ts`): opens one channel per cooldown to the best
 peer suggestion it can really open, when on-chain funds exceed the reserve. It walks down the

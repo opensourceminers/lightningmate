@@ -16,9 +16,10 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { REBAL_REC_DEFAULTS, type RouteProbe } from "../src/services/rebalanceRecommend.js";
+import { REBAL_REC_DEFAULTS, getRebalanceRecommendations, type RouteProbe } from "../src/services/rebalanceRecommend.js";
 import { estimateCost } from "../src/services/rebalance.js";
 import { drainedSpec, lndPreferring, planNode, planOf, type RouteQuestion } from "./helpers/refillPlan.js";
+import { feeNode, forwardsOut, withMarket, type FeeChannel } from "./helpers/feeNode.js";
 
 /** The probe exactly as getRebalanceRecommendations builds it. */
 const probeOf = (node: ReturnType<typeof lndPreferring>): RouteProbe => (source, target, amount, maxFeeSats) =>
@@ -85,6 +86,26 @@ test("a size whose cap is under one sat is not asked for under it: the one quest
   for (const q of asked) assert.ok(q.limitPpm >= 3000, `asked ${q.amountSats} under ${q.limitPpm} ppm`);
 });
 
+test("the route out of the source is asked for with every other peer shut out as a first hop — LND 0.21 ignores QueryRoutes' outgoing channel, and on regtest the 'route out of the source' went out over the target peer's own other channel and back for 2 sat (P4b regtest)", async () => {
+  const asked: Record<string, unknown>[] = [];
+  const lnd = lndPreferring([200], []);
+  const inner = lnd.callsTo.bind(lnd);
+  const n = drainedAndDonor();
+  const [target, donor] = n.channels;
+  const others = [target.peerPubkey, "02" + "77".repeat(32), donor.peerPubkey];
+  await estimateCost(lnd.lnd, lnd.publicKey, donor, target, 1_000_000, 3000, 320, others);
+  asked.push(...inner("default.queryRoutes"));
+  const pairs = ((asked[0]?.ignored_pairs ?? []) as { from: Buffer; to: Buffer }[]).map((p) => [Buffer.from(p.from).toString("hex"), Buffer.from(p.to).toString("hex")]);
+  assert.deepEqual(
+    pairs.sort(),
+    [
+      [lnd.publicKey, target.peerPubkey],
+      [lnd.publicKey, "02" + "77".repeat(32)],
+    ].sort(),
+    "every peer but the source's, the target's own included",
+  );
+});
+
 test("estimateCost asks LND for a route within the sats given, and within the ppm ceiling when none are given", async () => {
   const asked: RouteQuestion[] = [];
   const lnd = lndPreferring([500, 200], asked);
@@ -94,4 +115,28 @@ test("estimateCost asks LND for a route within the sats given, and within the pp
   assert.deepEqual(await estimateCost(lnd.lnd, lnd.publicKey, donor, target, 1_000_000, 3000), { costPpm: 500, feeSats: 500 });
   assert.deepEqual(await estimateCost(lnd.lnd, lnd.publicKey, donor, target, 1_000_000, 3000, 199), { costPpm: null, feeSats: null });
   assert.deepEqual(asked.map((q) => q.limitSats), [320, 3000, 199]);
+});
+
+test("the plan asks each route with the first hop to every peer but the source's shut out — the target's own peer and every other (the regtest fix, the review of P4, R13b)", async () => {
+  const PEER = (n: number) => "02" + n.toString(16).padStart(2, "0").repeat(32);
+  const TX = (n: number) => n.toString(16).padStart(2, "0").repeat(32);
+  const channels: FeeChannel[] = [
+    { id: "850000x1x0", partnerPublicKey: PEER(1), capacity: 5_000_000, localBalance: 750_000, transactionId: TX(1), transactionVout: 0, feeRatePpm: 400, baseFeeMsat: 0 },
+    { id: "850000x2x0", partnerPublicKey: PEER(2), capacity: 5_000_000, localBalance: 4_000_000, transactionId: TX(2), transactionVout: 0, feeRatePpm: 100, baseFeeMsat: 0 },
+    { id: "850000x3x0", partnerPublicKey: PEER(3), capacity: 5_000_000, localBalance: 2_500_000, transactionId: TX(3), transactionVout: 0, feeRatePpm: 100, baseFeeMsat: 0 },
+  ];
+  const node = feeNode({ blockHeight: 860_000, channels, forwards: forwardsOut("850000x1x0", "850000x2x0", 20, { tokens: 60_000, feeMsat: 24_000, days: 10 }) });
+  withMarket(node, channels, { "850000x1x0": { intoPpm: 100, backPpm: 50 } });
+  // (Every route question is answered "no route"; what it carried is what counts.)
+  node.override("default.queryRoutes", (_a: unknown, cb: (e: unknown) => void) => cb({ details: "unable to find a path to destination" }));
+  const plan = await getRebalanceRecommendations(node.lnd, { rebalanceRecords: [], cooldown: null });
+  const asked = node.callsTo("default.queryRoutes");
+  assert.ok(asked.length > 0, `the plan asked for a route: ${JSON.stringify(plan.recommendations.map((r) => [r.channelId, r.state, r.reasons[0]]))}`);
+  for (const q of asked) {
+    const pairs = ((q.ignored_pairs ?? []) as { from: Buffer; to: Buffer }[]).map((p) => Buffer.from(p.to).toString("hex"));
+    assert.ok(pairs.includes(PEER(1)), "the target's own peer is no first hop");
+    // (One of the other two is the source; its peer is left open.)
+    assert.ok(!(pairs.includes(PEER(2)) && pairs.includes(PEER(3))), "the source's peer is left open");
+    assert.equal(pairs.length, 2, JSON.stringify(pairs));
+  }
 });

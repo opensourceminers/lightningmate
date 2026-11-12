@@ -96,6 +96,43 @@ test("a node too young to judge gets no Earnings grade — 'insufficient data', 
   assert.equal(few.provisional, null);
 });
 
+test("a read LND did not answer is unknown, not zero: the on-chain or channel balance unread leaves Reserve or Liquidity out of the score, and a channel whose fee LND didn't list is not judged a 0 ppm fee (review 2026-11-10, CHAN-9)", () => {
+  const base = computeNodeScore(input());
+  const noChain = computeNodeScore(input({ onchainSats: null }));
+  assert.equal(cat(noChain, "reserve").score, null);
+  assert.match(cat(noChain, "reserve").detail, /^unknown — LND's on-chain balance couldn't be read/);
+  const noBalance = computeNodeScore(input({ outboundSats: null, inboundSats: null }));
+  assert.equal(cat(noBalance, "liquidity").score, null);
+  assert.match(cat(noBalance, "liquidity").detail, /^unknown — LND's channel balance couldn't be read/);
+  // Left out, the rest carry the score — no "0 sat on-chain" pulling it
+  // down (before, the failed read scored the reserve 0).
+  assert.ok(computeNodeScore(input({ onchainSats: 0 })).score < noChain.score);
+  assert.ok(computeNodeScore(input({ outboundSats: 0, inboundSats: 0 })).score < noBalance.score);
+  // A fee LND didn't list: the channel is not counted among the fees judged.
+  const channels = [ch(1), ch(2), ch(3), ch(4)];
+  const someFees = computeNodeScore(input({ channels, feePpmById: new Map(channels.slice(0, 3).map((c) => [c.id, 300])) }));
+  assert.equal(cat(someFees, "hygiene").score, cat(base, "hygiene").score);
+  assert.match(cat(someFees, "hygiene").detail, /^3\/3 sane fees \(1 not listed by LND\)/);
+});
+
+test("GET /score with LND not answering the balance reads: the parts are unknown, and the next look asks again (no five-minute cache of a part that failed)", async (t) => {
+  quiet(t);
+  const node = feeNode({
+    channels: [{ id: "840000x1x0", partnerPublicKey: "02" + "01".repeat(32), capacity: 2_000_000, localBalance: 1_000_000, transactionId: "01".repeat(32), transactionVout: 0, feeRatePpm: 300 }],
+  });
+  installChain(node);
+  node.override("default.describeGraph", (_a, cb) => cb(null, { edges: [], nodes: [] }));
+  node.override("default.walletBalance", (_a, cb) => cb({ details: "rpc error: unavailable" }));
+  const api = await startApi(t, { node });
+  const first = await api.request("GET", "/score");
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  const reserve = (first.body.categories as { key: string; score: number | null }[]).find((c) => c.key === "reserve");
+  assert.equal(reserve?.score, null);
+  const calls = node.callsTo("default.walletBalance").length;
+  await api.request("GET", "/score");
+  assert.ok(node.callsTo("default.walletBalance").length > calls, "asked again");
+});
+
 test("inbound bought counts in the last 30 days for its share of the lease", () => {
   const now = Date.parse("2026-10-20T00:00:00Z");
   const p = (paidDaysAgo: number, leaseBlocks: number) => ({ orderId: "x", at: new Date(now - paidDaysAgo * 86_400_000).toISOString(), feeSats: 30_000, routingFeeSats: 0, sizeSats: 1, leaseBlocks });

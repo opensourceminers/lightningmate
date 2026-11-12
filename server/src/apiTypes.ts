@@ -307,10 +307,11 @@ export interface NodeSearchResponse {
 
 /** GET /nodes/public: what other services say about a node, asked only when
  *  its details are opened. "off": the operator switched it off;
- *  "unavailable": the lookup failed or is backing off. */
+ *  "unavailable": the lookup failed or is backing off; LN+ "not_asked": not
+ *  known here and the day's LN+ calls are spent. */
 export interface NodePublicInfo {
   lnplus: LnPlusNode | null;
-  lnplusState: "ok" | "off" | "unavailable";
+  lnplusState: "ok" | "off" | "unavailable" | "not_asked";
   record: PublicNodeRecord | null;
   /** "unknown": mempool.space answered and doesn't know the node. */
   recordState: "ok" | "off" | "unknown" | "unavailable";

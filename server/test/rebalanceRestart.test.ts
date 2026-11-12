@@ -14,6 +14,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { sentPayment } from "./helpers/fakeLnd.js";
 import { cpSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { JsonStore } from "../src/store.js";
@@ -83,7 +84,7 @@ const refill = (target: string, sources: string[] = [SOURCE]) =>
     minNetProfitSats: 100,
   }) as unknown as RebalanceRecommendation;
 
-const hashOf = (call: Record<string, unknown>) => Buffer.from(call.payment_hash as Buffer).toString("hex");
+const hashOf = (call: Record<string, unknown>) => sentPayment(call).id;
 
 /** Until LND holds `n` of the refill's payments in flight — and their ids.
  *  (The SendPaymentV2 call is recorded a tick before the fake LND registers

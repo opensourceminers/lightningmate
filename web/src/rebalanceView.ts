@@ -183,14 +183,15 @@ export function confirmRefillText(
   );
 }
 
-/** A payment still in flight through a row's channels — its target or its
- *  source — if any: a refill there is refused until LND says how it ended
- *  (a second move could double what was planned). */
+/** A payment still in flight through a row's channels — its target, its
+ *  source, or its peer's other channels — if any: a refill there is refused
+ *  until LND says how it ended (a second move could double what was
+ *  planned; one into the peer's other channel buys the peer's lack twice). */
 export function inFlightThrough(
-  r: Pick<RebalanceRecommendation, "channelId" | "selectedSourceChannel">,
+  r: Pick<RebalanceRecommendation, "channelId" | "selectedSourceChannel" | "peerChannels">,
   inFlight: RefillInFlight[] | null | undefined,
 ): { payment: RefillInFlight; channelId: string } | null {
-  const ids = [r.channelId, ...(r.selectedSourceChannel ? [r.selectedSourceChannel] : [])];
+  const ids = [r.channelId, ...(r.selectedSourceChannel ? [r.selectedSourceChannel] : []), ...(r.peerChannels ?? [])];
   for (const payment of inFlight ?? []) {
     const channelId = ids.find((id) => id === payment.targetId || id === payment.sourceId);
     if (channelId) return { payment, channelId };

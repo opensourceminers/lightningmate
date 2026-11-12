@@ -16,6 +16,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { sentPayment } from "./helpers/fakeLnd.js";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { RefillNotAllowedError, StalePlanError } from "../src/services/autopilot.js";
@@ -113,7 +114,7 @@ test("a source gives no more than it can spare above its share: 2M asked of one 
   assert.equal(res.body.ok, true, res.body.error);
   assert.equal(res.body.amountSats, 850_000, "3.6M less the 2.75M it keeps");
   assert.equal(paid(node).length, 1);
-  assert.equal((paid(node)[0] as { amt?: number }).amt, 850_000);
+  assert.equal(sentPayment(paid(node)[0] as Record<string, unknown>).tokens, 850_000);
 });
 
 test("the executor is handed every source with the share it keeps and the most it gives — whatever the request says of shares; the row's other sources go along in its order, and one the rules no longer allow is left out", async (t) => {

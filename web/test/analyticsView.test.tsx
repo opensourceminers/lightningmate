@@ -310,8 +310,8 @@ test("the Rebalancing figure says how many runs and whose; the ROI figure says h
   assert.equal(rebalanceSummaryLine(summary, "2026-10-12T08:00:00Z", now), "4 done since 2026-10-12 · 1,200 sat fees · avg 300 ppm", "the log began inside the window: said");
 });
 
-test("a category with too little data has no bar — 'insufficient data', never an empty bar that reads as zero", () => {
-  assert.deepEqual(scoreBar({ score: null }), { graded: false, label: "insufficient data" });
+test("a category with too little data, or a read that failed, has no bar — 'not graded', never an empty bar that reads as zero", () => {
+  assert.deepEqual(scoreBar({ score: null }), { graded: false, label: "not graded" });
   assert.deepEqual(scoreBar({ score: 0.426 }), { graded: true, widthPct: 43 });
 });
 

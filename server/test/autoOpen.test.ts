@@ -165,7 +165,7 @@ test("a peer's size limits are read from LND's refusal — btcutil amounts in BT
 
 /** A node with one channel (to P) and a public graph in which C — ten
  *  channels to nodes this node doesn't reach — is a candidate. */
-function graphNode() {
+function graphNode(o: { peersDisabled?: number } = {}) {
   const node = new FakeLnd({ chainBalance: 5_000_000, blockHeight: 860_000 });
   const me = node.publicKey;
   const P = PK(1);
@@ -182,8 +182,13 @@ function graphNode() {
     node1_policy: pol,
     node2_policy: pol,
   });
-  // C: 10 channels to nodes we don't reach — a candidate; P: our peer.
-  const edges = [edge(1, me, P), ...Array.from({ length: 10 }, (_, i) => edge(10 + i, C, PK(100 + i)))];
+  // C: 10 channels to nodes we don't reach — a candidate; P: our peer. With
+  // `peersDisabled`, that many of C's peers have disabled their side toward
+  // it (C's own side still "enabled": its last announcement).
+  const edges = [
+    edge(1, me, P),
+    ...Array.from({ length: 10 }, (_, i) => ({ ...edge(10 + i, C, PK(100 + i)), ...(i < (o.peersDisabled ?? 0) ? { node2_policy: { ...pol, disabled: true } } : {}) })),
+  ];
   const nodeInfo = (pk: string, alias: string, addrs: string[]) => ({
     pub_key: pk,
     alias,
@@ -1018,6 +1023,33 @@ test("LND not listing its closed channels: the same — no automatic open until 
   const c = (await getChannelSuggestionsV2(node.lnd, { minChannels: 8 })).suggestions.find((s) => s.pubkey === C);
   assert.equal(c?.closeHistoryKnown, false);
   assert.ok("skip" in planOpen(c!, ctx()));
+});
+
+test("a node is judged live by its peers' side of its channels too: one whose peers all disabled their side toward it is no candidate, however 'enabled' its own last announcement says it is (review 2026-11-10, CHAN-4)", async () => {
+  const gone = graphNode({ peersDisabled: 10 });
+  const goneReport = await getChannelSuggestionsV2(gone.node.lnd, { minChannels: 8 });
+  assert.equal(goneReport.suggestions.find((s) => s.pubkey === gone.C), undefined, "before: suggested with all ten channels counted live");
+  const half = graphNode({ peersDisabled: 5 });
+  const halfS = (await getChannelSuggestionsV2(half.node.lnd, { minChannels: 8 })).suggestions.find((s) => s.pubkey === half.C);
+  const whole = graphNode();
+  const wholeS = (await getChannelSuggestionsV2(whole.node.lnd, { minChannels: 8 })).suggestions.find((s) => s.pubkey === whole.C);
+  assert.ok(halfS && wholeS, "still a candidate with half its channels live");
+  assert.ok(halfS.score < wholeS.score, `${halfS.score} against ${wholeS.score}: the share its peers keep enabled counts`);
+});
+
+test("LND not listing its pending channels: no suggestion is opened to automatically — a channel still confirming to it can't be ruled out (a timed-out read let the peer of an unconfirmed open be suggested and opened to again) — and the suggestion says why (review 2026-11-10, CHAN-6)", async () => {
+  const { node, C } = graphNode();
+  const known = (await getChannelSuggestionsV2(node.lnd, { minChannels: 8 })).suggestions.find((s) => s.pubkey === C);
+  assert.equal(known?.pendingKnown, undefined, "known");
+  node.override("default.pendingChannels", (_a, cb) => cb({ details: "rpc error: deadline exceeded" }));
+  const blind = (await getChannelSuggestionsV2(node.lnd, { minChannels: 8 })).suggestions.find((s) => s.pubkey === C);
+  assert.ok(blind, "still suggested — by hand it can be opened");
+  assert.equal(blind.pendingKnown, false);
+  assert.ok(blind.warnings.some((w) => /^LND didn't list its pending channels — whether a channel to this node is still confirming is unknown/.test(w)), blind.warnings.join(" | "));
+  assert.deepEqual(planOpen(blind, ctx()), {
+    skip: "LND didn't list its pending channels — whether a channel to it is still confirming can't be checked, so it isn't opened to automatically until LND does",
+  });
+  assert.ok("sizeSats" in planOpen({ ...blind, pendingKnown: undefined }, ctx()), "that alone held it back");
 });
 
 test("the close list's 'redeploy into' names only opens the channel autopilot would make — its peer rules, LN+ and a third of the node's capital — not the top suggestions as ranked", async (t) => {

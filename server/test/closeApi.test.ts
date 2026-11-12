@@ -15,6 +15,7 @@ import { installFetchMock } from "./helpers/fetchMock.js";
 import { FakeMagma } from "./helpers/magma.js";
 import { AMBOSS_API } from "./helpers/amboss.js";
 import { channelLeases } from "../src/services/leases.js";
+import { deadCapitalAlerts } from "../src/services/alerts.js";
 import { Autopilot } from "../src/services/autopilot.js";
 import { RebalanceLog } from "../src/services/rebalanceLog.js";
 import { OverridesStore } from "../src/services/overrides.js";
@@ -90,6 +91,31 @@ test("GET /suggestions/close: a channel sold on Magma or over LSPS1 is protected
   assert.equal(leased[channels[0].id]?.lease?.kind, "magma_sale");
   assert.match(leased[channels[2].id]?.reason ?? "", /^sold to an LSP client \(order lsp-sale…\) — this node promised to keep it open until block 867,200/);
   assert.deepEqual(body.pending.map((p) => [p.channelId, p.status]), [[`${TX(4)}:0`, "pending_open"]]);
+});
+
+test("GET /alerts names the capital in channels that routed nothing in 60 days and says LightningMate doesn't close them — from the close list, computed in the background at most every 6 h (review 2026-11-10, CHAN-3)", async (t) => {
+  t.mock.method(console, "log", () => undefined);
+  const { api } = await setup(t);
+  const dead = (body: { message: string }[]) => body.filter((a) => /routed nothing in 60 days/.test(a.message));
+  // The first look starts the close list; the next one has it.
+  const first = await api.request("GET", "/alerts");
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  for (let i = 0; i < 100 && dead((await api.request("GET", "/alerts")).body).length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+  const [alert] = dead((await api.request("GET", "/alerts")).body);
+  assert.equal(
+    alert?.message,
+    "1 channel has routed nothing in 60 days — 2,000,000 sat of yours earn nothing there. Channels → Channels to close lists them with what a close frees and costs. LightningMate doesn't close channels by itself.",
+  );
+});
+
+test("the dead-capital alert counts only channels whose peer is there and whose 60 days were read whole, and is one line for all of them", () => {
+  const c = (o: Partial<{ flow60dSats: number; capitalFreedSats: number; offline: { long?: boolean } | null; reasons: string[] }> = {}) => ({ flow60dSats: 0, capitalFreedSats: 1_000_000, offline: null, reasons: [], ...o });
+  assert.deepEqual(deadCapitalAlerts(null), []);
+  // (3M routed in, none out — a channel that feeds the node's forwards — is not dead.)
+  assert.deepEqual(deadCapitalAlerts([c({ flow60dSats: 3_000_000 }), c({ offline: { long: true } }), c({ capitalFreedSats: 0 }), c({ reasons: ["Its 60-day forwarding history couldn't be read in full — what it routed and earned isn't known."] })]), []);
+  const [one] = deadCapitalAlerts([c(), c({ capitalFreedSats: 2_500_000 }), c({ flow60dSats: 50_000 })]);
+  assert.match(one.message, /^2 channels have routed nothing in 60 days — 3,500,000 sat of yours earn nothing there\./);
+  assert.equal(one.level, "info");
 });
 
 test("GET /suggestions/close: where a close's capital could go names the opens the channel autopilot would make — not the top suggestions as ranked", async (t) => {

@@ -55,6 +55,10 @@ export class LnPlusStore {
   private readonly store: JsonStore<CacheState>;
   private state: CacheState;
   private pausedUntil = 0;
+  /** One fetch per key at a time: the node panel's two reads of one node
+   *  shared nothing and spent two of the day's calls (review 2026-11-10,
+   *  CHAN-11). "failed": an outage or rate limit (nothing remembered). */
+  private readonly inflight = new Map<string, Promise<LnPlusNode | null | "failed">>();
   private lastError: string | null = null;
 
   constructor(
@@ -129,15 +133,24 @@ export class LnPlusStore {
   async enrich(pubkeys: string[], budget = DEFAULT_BUDGET): Promise<Map<string, LnPlusNode>> {
     const out = new Map<string, LnPlusNode>();
     const missing: string[] = [];
+    const waiting: Promise<void>[] = [];
 
     for (const pk of pubkeys) {
       const e = this.state.nodes[pk];
       if (this.fresh(e)) {
         if (e.node) out.set(pk, e.node);
+      } else if (this.inflight.has(pk)) {
+        // Asked already by another pass: its answer, not a second call.
+        waiting.push(
+          (this.inflight.get(pk) as Promise<LnPlusNode | null | "failed">).then((n) => {
+            if (n && n !== "failed") out.set(pk, n);
+          }),
+        );
       } else {
         missing.push(pk);
       }
     }
+    if (waiting.length) await Promise.all(waiting);
 
     // The rolling day budget bounds everything: a per-pass budget alone would
     // let 48 autopilot runs spend 576 calls against a 100/day allowance.
@@ -156,24 +169,16 @@ export class LnPlusStore {
         if (i >= queue.length) return;
         const pk = queue[i];
         if (this.remainingToday() <= 0) return;
-        this.noteCall();
-        try {
-          const node = await getNode(pk);
-          this.remember(pk, node);
-          out.set(pk, node);
-          dirty = true;
-        } catch (err) {
-          if (err instanceof LnPlusNotFound) {
-            // A definitive "no profile" — cache it so we stop asking.
-            this.remember(pk, null);
-            dirty = true;
-          } else {
-            // Rate limit or outage: stop the whole pass, keep what we have.
-            this.lastError = err instanceof Error ? err.message : String(err);
-            this.pausedUntil = Date.now() + BACKOFF_MS;
-            return;
-          }
+        const already = this.inflight.get(pk);
+        const asked = already ?? this.fetchOne(pk);
+        if (!already) {
+          this.inflight.set(pk, asked);
+          void asked.finally(() => this.inflight.delete(pk));
         }
+        const node = await asked;
+        if (node === "failed") return; // rate limit or outage: the pass stops, keeping what it has
+        if (node) out.set(pk, node);
+        dirty = true;
       }
     };
 
@@ -184,6 +189,45 @@ export class LnPlusStore {
     if (dirty) this.prune();
     this.store.write(this.state);
     return out;
+  }
+
+  /** One call to LN+ for `pk`, remembered: its profile, null for a
+   *  definitive "no profile", "failed" on a rate limit or outage (the store
+   *  then backs off). */
+  private async fetchOne(pk: string): Promise<LnPlusNode | null | "failed"> {
+    this.noteCall();
+    try {
+      const node = await getNode(pk);
+      this.remember(pk, node);
+      return node;
+    } catch (err) {
+      if (err instanceof LnPlusNotFound) {
+        // A definitive "no profile" — cache it so we stop asking.
+        this.remember(pk, null);
+        return null;
+      }
+      this.lastError = err instanceof Error ? err.message : String(err);
+      this.pausedUntil = Date.now() + BACKOFF_MS;
+      return "failed";
+    }
+  }
+
+  /**
+   * One profile and what was asked for it: "ok" — LN+ answered (now or
+   * cached), the profile or none; "off" — switched off; "unavailable" — LN+
+   * failed or is backed off; "not_asked" — not cached and the day's calls
+   * are spent, so whether it has a profile is not known (the panel said
+   * "ok" then, read as "no LN+ profile"; review 2026-11-10, CHAN-11).
+   */
+  async lookupWithState(pubkey: string): Promise<{ profile: LnPlusNode | null; state: "ok" | "off" | "unavailable" | "not_asked" }> {
+    const cached = this.peek(pubkey);
+    if (!this.enabled()) return { profile: cached ?? null, state: "off" };
+    if (cached !== undefined) return { profile: cached, state: "ok" };
+    if (this.isPaused()) return { profile: null, state: "unavailable" };
+    const found = await this.enrich([pubkey], 1);
+    const now = this.peek(pubkey);
+    if (now !== undefined) return { profile: now, state: "ok" };
+    return { profile: found.get(pubkey) ?? null, state: this.isPaused() ? "unavailable" : "not_asked" };
   }
 
   /** One profile, cached. Returns null when the node is not on LN+. */

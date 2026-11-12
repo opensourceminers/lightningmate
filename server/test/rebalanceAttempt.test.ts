@@ -13,7 +13,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { INVOICE_CANCEL, PAYMENT_CHECK, executeRebalance } from "../src/services/rebalance.js";
-import { FakeLnd } from "./helpers/fakeLnd.js";
+import { FakeLnd, sentPayment } from "./helpers/fakeLnd.js";
 import { chanNumber } from "./helpers/feeNode.js";
 
 const TARGET = "800001x1x0";
@@ -95,7 +95,10 @@ test("an attempt LND reports failed leaves no open invoice behind: each size's i
   const res = await executeRebalance(node.lnd, node.lnd, REFILL, { onEnd: (id, outcome) => ends.push(`${outcome} ${id}`) });
   assert.equal(res.ok, false);
   assert.match(res.error ?? "", /^no route within budget/);
-  const tried = sent(node).map((c) => Buffer.from(c.payment_hash as Buffer).toString("hex"));
+  // It names the last attempt's own cap in sats (the review of P4, P14 and its second round).
+  const lastCap = Number(sent(node).at(-1)?.fee_limit_sat);
+  assert.match(res.error ?? "", new RegExp(`^no route within budget \\(${lastCap} sat at most, `), `${res.error} — last cap ${lastCap}`);
+  const tried = sent(node).map((c) => sentPayment(c).id);
   assert.equal(tried.length, 3, "the planned size, its half and its quarter");
   assert.deepEqual(cancelled(node), tried, "one cancel per failed attempt, in their order");
   assert.deepEqual(ends, tried.map((id) => `failed ${id}`), "each on the books as failed");

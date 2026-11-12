@@ -1029,6 +1029,32 @@ export async function planRebalances(input: PlanInput, probeRoute: RouteProbe): 
       );
       continue;
     }
+    // The peer chooses which of its channels with us carries a refill back.
+    // Landed in a cheaper sibling while the planned channel stays drained
+    // (its advertised size small), the sats sell at the sibling's fee: a
+    // refill toward the peer is valued at no more than the lowest fee of a
+    // channel that can take the whole of it — its peer side holds the
+    // refill's size — and whose fee LND listed (the gate took the planned
+    // channel's 400 ppm while the sats could land in its 50 ppm sibling; the
+    // review of P4, P11 and its second round, R2-2 and R2-3).
+    const lacksNow = clamp0(wanted - local);
+    const refillSize = Math.max(cfg.minRebalanceAmount, Math.min(rec.recommendedAmount ?? Infinity, lacksNow));
+    if (rec.expectedRevenuePpm != null) {
+      const cheaper = mates
+        .filter((c) => c.id !== rec.channelId && c.remoteBalance >= refillSize)
+        .map((c) => ({ c, fee: feeById.get(c.id) }))
+        .filter((x) => !!x.fee && x.fee.transactionId !== null && x.fee.currentPpm < (rec.expectedRevenuePpm as number))
+        .map((x) => ({ c: x.c, ppm: (x.fee as FeeRecommendation).currentPpm }))
+        .sort((a, b) => a.ppm - b.ppm)[0];
+      if (cheaper) {
+        rec.reasons.push(
+          `valued at ${cheaper.ppm} ppm, not ${rec.expectedRevenuePpm}: the peer may carry a refill back into its other channel ${cheaper.c.id}, which charges ${cheaper.ppm} ppm`,
+        );
+        rec.expectedRevenuePpm = cheaper.ppm;
+        rec.preRefillPpm = cheaper.ppm;
+        rec.maxCostPpm = Math.round(cheaper.ppm * cfg.profitShare);
+      }
+    }
     const lacks = clamp0(wanted - local);
     if (rec.recommendedAmount == null || lacks >= rec.recommendedAmount) continue;
     if (lacks < cfg.minRebalanceAmount) {
@@ -1276,7 +1302,8 @@ export async function getRebalanceRecommendations(
       boughtLeases: opts.boughtLeases ?? [],
       feeAutomation: opts.feeAutomation !== false,
     },
-    (source, target, amount, maxFeeSats) => estimateCost(lnd, ownKey, source, target, amount, cfg.probeCeilingPpm, maxFeeSats),
+    (source, target, amount, maxFeeSats) =>
+      estimateCost(lnd, ownKey, source, target, amount, cfg.probeCeilingPpm, maxFeeSats, run.channels.map((c) => c.peerPubkey)),
   );
   return { generatedAt, config: cfg, feeAutomation: opts.feeAutomation !== false, ...plan };
 }

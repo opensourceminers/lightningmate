@@ -39,6 +39,8 @@ server/e2e/regtest.sh up        # (fresh chain and nodes for the next one)
 node --import tsx e2e/sale.ts   # a whole sale to the lease's end, then what can go wrong (listed below)
 server/e2e/regtest.sh up
 node --import tsx e2e/nodePanel.ts  # a node's details through the app's routes: open by hand, fee mode, close
+server/e2e/regtest.sh up
+node --import tsx e2e/refill.ts     # refills: a route under its fee limit, invoices of failed tries, one peer over two channels
 server/e2e/regtest.sh down
 ```
 
@@ -76,6 +78,30 @@ it shows, in order:
   to normal no second one is opened; its payment is claimed and the sale booked once.
 
 No service fee is set in that run, so "what the sale earns" is the order's whole fee there.
+
+`refill.ts` (a few minutes; it mines two weeks of blocks so the hub's channel may give
+liquidity) builds the cycle seller → hub → buyer → seller with two channels between seller and
+buyer, one drained and one full on the seller's side, and checks:
+
+- **A route asked for under a fee limit** is within it or none, never a dearer one; and it goes
+  out of the source, through the hub. LND 0.21 ignores the single outgoing channel QueryRoutes
+  and SendPaymentV2 still accept (deprecated `outgoing_chan_id`): asked that way, the route "out
+  of the source" went out over the buyer's own full channel and straight back, and the payment
+  was refused by the buyer ("same incoming and outgoing channel"), after which LND shunned that
+  last hop for every refill. The app shuts the first hops to every other peer out of the route
+  question and pays by the invoice's request with `outgoing_chan_ids`.
+- **A refill no route fits** pays nothing, and each of its tries' self-invoices is cancelled.
+- **One peer over two channels**: the drained one is not refilled while the full one reaches the
+  peer (the peer rule is the reason the plan gives), and the executor refuses the full one as its
+  source before anything is sent; a refill is booked on the channel it arrived on (LND forwards
+  over either channel of the peer: it was planned for the drained one and arrived on the other),
+  with that channel's cooldown. That a peer drained over both channels is refilled once per plan
+  needs demand the regtest network has none of (no forwards); the suite holds it
+  (`rebalanceSamePeer.test.ts`).
+
+A tighter limit returning a cheaper route LND did not prefer needs two paths through different
+nodes (LND prices parallel channels between two nodes at the highest fee and time lock among
+them): the test suite's fake LND holds that case (`rebalanceRouteLimit.test.ts`).
 
 ---
 

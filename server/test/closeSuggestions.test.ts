@@ -647,4 +647,20 @@ test("a forwarding history read cut short lists no channel as dead — only a pe
   const cut = rankCloseCandidates(input([idle, away], { offline, flowKnown: false }));
   assert.deepEqual(cut.candidates.map((c) => c.channelId), [away.id]);
   assert.match(cut.protected.find((p) => p.channelId === idle.id)?.reason ?? "", /^its 60-day forwarding history couldn't be read in full/);
+  // The channel listed for its absent peer says what is not known, and
+  // nothing the unread history would have to show (review 2026-11-10,
+  // CHAN-8: "No forwards in 60d." and "Never routed." stood on it).
+  const listed = cut.candidates[0];
+  assert.ok(listed.reasons.includes("Its 60-day forwarding history couldn't be read in full — what it routed and earned isn't known."), listed.reasons.join(" | "));
+  assert.ok(!listed.reasons.some((r) => /No forwards in 60d|Never routed|Negative P&L|Earned .* in 60d/.test(r)), listed.reasons.join(" | "));
+  // Its score rests on the absence alone: lower than with the history read.
+  const fullAway = full.candidates.find((c) => c.channelId === away.id)!;
+  assert.ok(listed.closeScore <= fullAway.closeScore, `${listed.closeScore} against ${fullAway.closeScore}`);
+  assert.equal(listed.historyRead, false, "the panel says the history is unread (the review of P4, P7)");
+  assert.equal(fullAway.historyRead, undefined);
+  // Refilled within the 60 days: with the earnings unread its P&L is only
+  // the refill's cost — no "Negative P&L" is stated from that (the review of P4, G6).
+  const refill = { at: new Date().toISOString(), via: "autopilot" as const, targetId: away.id, targetAlias: "", sourceId: "", sourceAlias: "", amountSats: 500_000, budgetPpm: 0, feeSats: 3_000, costPpm: 6_000, ok: true };
+  const refilled = rankCloseCandidates(input([idle, away], { offline, flowKnown: false, rebalanceRecords: [refill] })).candidates.find((c) => c.channelId === away.id)!;
+  assert.ok(!refilled.reasons.some((r) => /Negative P&L/.test(r)), refilled.reasons.join(" | "));
 });

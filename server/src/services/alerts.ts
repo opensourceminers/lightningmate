@@ -14,6 +14,19 @@ export interface Alert {
 }
 
 const LOW_ONCHAIN_SATS = 25_000;
+/** How the close list behind the dead-capital alert is kept: computed again
+ *  in the background once it is `refreshMs` old; after a failure not before
+ *  `retryMs`; given up after `deadlineMs` (a read LND never answers must not
+ *  stop the refresh for good); and not used once `staleMs` old (the review
+ *  of P4, P3: a failed list was computed again on every 30-second poll, a hung
+ *  one froze it until a restart, and an old one stayed shown for good). An
+ *  object, so a test can shorten the times. */
+export const DEAD_CAPITAL = {
+  refreshMs: 6 * 3_600_000,
+  retryMs: 15 * 60_000,
+  deadlineMs: 5 * 60_000,
+  staleMs: 24 * 3_600_000,
+};
 
 /** What losing each state file means for the operator, in plain words. */
 const RESET_CONSEQUENCE: Record<string, string> = {
@@ -333,6 +346,33 @@ export function serviceFeeAlerts(ledger: Pick<ServiceFeeLedger, "problems">): Al
  *  behind 55 % of a node's fee income was gone five weeks, with only the
  *  count of offline channels to show for it). */
 export const OFFLINE_ALERT_HOURS = 7 * 24;
+
+/** The close list's channels that routed nothing in 60 days while their peer
+ *  was there (a peer away for days has an alert of its own): the capital
+ *  that earns nothing. One alert for all of them; nothing is closed by
+ *  LightningMate (decision E3, review 2026-11-10 CHAN-3: the autopilot's only
+ *  reaction to ~18.6M sat in nine dead channels was a row in a list nobody
+ *  was told about). */
+export function deadCapitalAlerts(
+  candidates: readonly { flow60dSats: number; capitalFreedSats: number; offline: { long?: boolean } | null; reasons: readonly string[] }[] | null,
+): Alert[] {
+  if (!candidates) return [];
+  // Routed nothing either way: a channel whose peer pushes payments into the
+  // node (forwards in, none out) feeds the node's forwards — it is listed on
+  // its yield, but "routed nothing" is not true of it (the package's review,
+  // P1: one with 3M routed in was named dead).
+  const dead = candidates.filter((c) => c.flow60dSats === 0 && !c.offline?.long && c.capitalFreedSats > 0 && !c.reasons.some((r) => /history couldn't be read/.test(r)));
+  if (dead.length === 0) return [];
+  const sats = dead.reduce((s, c) => s + c.capitalFreedSats, 0);
+  return [
+    {
+      level: "info",
+      message:
+        `${dead.length} channel${dead.length === 1 ? " has" : "s have"} routed nothing in 60 days — ${sats.toLocaleString("en-US")} sat of yours earn nothing there. ` +
+        "Channels → Channels to close lists them with what a close frees and costs. LightningMate doesn't close channels by itself.",
+    },
+  ];
+}
 
 export async function getAlerts(
   lnd: AuthenticatedLnd,

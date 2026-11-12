@@ -61,10 +61,15 @@ export interface ScoreInput {
   feePpmById: ReadonlyMap<string, number>;
   forwards30: number;
   routingRevenue30Sats: number;
-  onchainSats: number;
+  /** null: LND's on-chain balance couldn't be read — the reserve is then
+   *  not judged (review 2026-11-10, CHAN-9: a failed read scored as "0 sat
+   *  on-chain" for five minutes). */
+  onchainSats: number | null;
   /** LND's channel balance (outbound) and inbound — what the header shows. */
-  outboundSats: number;
-  inboundSats: number;
+  /** null: LND's channel balance couldn't be read — liquidity is then not
+   *  judged. */
+  outboundSats: number | null;
+  inboundSats: number | null;
   rank: NetworkRank | null;
   /** Costs, for the net yield: rebalancing over the last 30 days; on-chain
    *  opens and closes over the last 365 days (spread over 12 months); inbound
@@ -145,11 +150,14 @@ export function computeNodeScore(input: ScoreInput): NodeScore {
   // channels are normal and fine; what matters is the node can route both ways.
   // Use LND's channel-balance (outbound) + inbound — the SAME numbers the Overview
   // header shows — so the tile and the header always agree.
-  const sideTotal = input.outboundSats + input.inboundSats;
-  const outShare = sideTotal > 0 ? input.outboundSats / sideTotal : 0;
-  const inShare = sideTotal > 0 ? input.inboundSats / sideTotal : 0;
+  const sidesKnown = input.outboundSats !== null && input.inboundSats !== null;
+  const outSats = input.outboundSats ?? 0;
+  const inSats = input.inboundSats ?? 0;
+  const sideTotal = outSats + inSats;
+  const outShare = sideTotal > 0 ? outSats / sideTotal : 0;
+  const inShare = sideTotal > 0 ? inSats / sideTotal : 0;
   // 50/50 across the node = best routing flexibility; heavily one-sided = limited.
-  const liquidity = clamp01(2 * Math.min(outShare, inShare));
+  const liquidity = sidesKnown ? clamp01(2 * Math.min(outShare, inShare)) : null;
 
   // ── Connectivity ── online + peer diversity (HHI) + network rank — over
   // the open channels only.
@@ -219,18 +227,21 @@ export function computeNodeScore(input: ScoreInput): NodeScore {
       : null) ?? "Lower fees on idle channels or add inbound so they start routing.";
 
   // ── Hygiene ── sane outbound fees + open capacity that's actually online.
-  const sane = active.filter((c) => {
-    const ppm = input.feePpmById.get(c.id) ?? 0;
+  // (A channel whose fee LND didn't list is not judged on it — before, it
+  // counted as a 0 ppm fee.)
+  const priced = active.filter((c) => input.feePpmById.has(c.id));
+  const sane = priced.filter((c) => {
+    const ppm = input.feePpmById.get(c.id) as number;
     return ppm >= 1 && ppm <= 2500;
   }).length;
-  const feeHealth = active.length ? sane / active.length : 0;
+  const feeHealth = priced.length ? sane / priced.length : active.length ? null : 0;
   const activeCapRatio = openCapacity > 0 ? activeCapacity / openCapacity : 0;
-  const hygiene = clamp01(0.6 * feeHealth + 0.4 * activeCapRatio);
+  const hygiene = feeHealth === null ? clamp01(activeCapRatio) : clamp01(0.6 * feeHealth + 0.4 * activeCapRatio);
 
   // ── Reserve ── on-chain sats to fee-bump force-closes and fund new channels.
-  const onchain = input.onchainSats;
+  const onchain = input.onchainSats ?? 0;
   const reserveTarget = Math.max(250_000, active.length * 50_000);
-  const reserveScore = clamp01(onchain / reserveTarget);
+  const reserveScore = input.onchainSats === null ? null : clamp01(onchain / reserveTarget);
   const onchainStr =
     onchain >= 1_000_000 ? `${(onchain / 1_000_000).toFixed(1)}M` : `${Math.round(onchain / 1000)}k`;
 
@@ -241,9 +252,10 @@ export function computeNodeScore(input: ScoreInput): NodeScore {
       label: "Liquidity",
       score: liquidity,
       weight: 0.2,
-      detail: `${Math.round(outShare * 100)}% outbound · ${Math.round(inShare * 100)}% inbound`,
-      hint:
-        outShare < 0.2
+      detail: sidesKnown ? `${Math.round(outShare * 100)}% outbound · ${Math.round(inShare * 100)}% inbound` : "unknown — LND's channel balance couldn't be read",
+      hint: !sidesKnown
+        ? "Not judged this time: LND didn't answer the balance read."
+        : outShare < 0.2
           ? "Low outbound — you can receive but barely forward out. Refill outbound (rebalance or open a channel)."
           : inShare < 0.2
             ? "Low inbound — you can forward out but barely receive. Get inbound (sell on Magma, spend, or loop out)."
@@ -282,7 +294,9 @@ export function computeNodeScore(input: ScoreInput): NodeScore {
       label: "Hygiene",
       score: hygiene,
       weight: 0.13,
-      detail: withPending(`${sane}/${active.length} sane fees · ${Math.round(activeCapRatio * 100)}% capacity online`),
+      detail: withPending(
+        `${sane}/${priced.length} sane fees${priced.length < active.length ? ` (${active.length - priced.length} not listed by LND)` : ""} · ${Math.round(activeCapRatio * 100)}% capacity online`,
+      ),
       hint: `Set sensible outbound fees on the rest and clear out dead channels.`,
     },
     {
@@ -290,7 +304,7 @@ export function computeNodeScore(input: ScoreInput): NodeScore {
       label: "Reserve",
       score: reserveScore,
       weight: 0.12,
-      detail: `${onchainStr} sat on-chain`,
+      detail: input.onchainSats === null ? "unknown — LND's on-chain balance couldn't be read" : `${onchainStr} sat on-chain`,
       hint: `Keep on-chain sats to fee-bump force-closes and fund new channels.`,
     },
   ];
@@ -370,9 +384,9 @@ export async function getNodeScore(lnd: AuthenticatedLnd, src: ScoreSources = {}
     getChannelsView(lnd),
     getFeeRates({ lnd }),
     getFlowSummary(lnd, 30),
-    getChainBalance({ lnd }).catch(() => ({ chain_balance: 0 })),
+    getChainBalance({ lnd }).catch(() => null),
     getOwnPubkey(lnd),
-    getChannelBalance({ lnd }).catch(() => ({ channel_balance: 0, inbound: 0 })),
+    getChannelBalance({ lnd }).catch(() => null),
     getWalletInfo({ lnd })
       .then((w) => w.current_block_height)
       .catch(() => null),
@@ -400,9 +414,9 @@ export async function getNodeScore(lnd: AuthenticatedLnd, src: ScoreSources = {}
     feePpmById: new Map(rates.channels.map((c) => [c.id, c.fee_rate])),
     forwards30: flows.totalForwards,
     routingRevenue30Sats: flows.totalFeesEarnedSats,
-    onchainSats: chain.chain_balance ?? 0,
-    outboundSats: chanBal.channel_balance ?? 0,
-    inboundSats: chanBal.inbound ?? 0,
+    onchainSats: chain ? (chain.chain_balance ?? 0) : null,
+    outboundSats: chanBal ? (chanBal.channel_balance ?? 0) : null,
+    inboundSats: chanBal ? (chanBal.inbound ?? 0) : null,
     rank,
     rebalance30Sats: rebal,
     chainCostsYearSats: chainYear,
@@ -410,6 +424,8 @@ export async function getNodeScore(lnd: AuthenticatedLnd, src: ScoreSources = {}
     leaseIncome30Sats: leaseIncomeInLast30(src, nowMs),
     historyDays,
   });
-  scoreCache.set(lnd, { at: Date.now(), value });
+  // (A score with a part LND didn't answer is not kept for five minutes:
+  // the next look asks again.)
+  if (chain && chanBal) scoreCache.set(lnd, { at: Date.now(), value });
   return value;
 }

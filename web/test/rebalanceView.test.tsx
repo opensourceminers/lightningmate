@@ -243,6 +243,10 @@ test("a row whose channels a payment still in flight goes through shows that pay
   const into = inFlightThrough(recommended(), [payment({ targetId: "850000x1x0", alias: "router", sourceId: "850000x7x0" })]);
   assert.match(inFlightLine(into!), /^A payment into router /);
   assert.equal(inFlightThrough(recommended(), [payment({ sourceId: "850000x7x0" })]), null, "other channels don't block it");
+  // … or into the peer's other channel: the peer is being refilled already
+  // (the review of P4, P2 — the Run button stayed and paid a second refill).
+  const sibling = inFlightThrough({ ...recommended(), peerChannels: ["850000x9x0"] }, [payment({ targetId: "850000x9x0", sourceId: "850000x7x0" })]);
+  assert.equal(sibling?.channelId, "850000x9x0");
   // The run area: the line, no button — and the button when nothing blocks it.
   const blocked = renderToStaticMarkup(<RefillAction r={recommended()} inFlight={[payment()]} running={false} onRun={() => undefined} />);
   assert.match(blocked, /A payment out of src/);

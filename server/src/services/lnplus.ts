@@ -99,6 +99,13 @@ interface RawNode {
 
 const num = (n: unknown): number => (typeof n === "number" && Number.isFinite(n) ? n : 0);
 
+/** LN+'s own pages only: a link from the answer that points elsewhere is
+ *  replaced by the profile's address (review 2026-11-10, CHAN-12 — the
+ *  answer's URL was rendered as the "LN+ profile" link unchecked). */
+const LNPLUS_WEB = "https://lightningnetwork.plus/";
+export const lnplusUrl = (url: unknown, pubkey: string, page = `nodes/${pubkey}`): string =>
+  typeof url === "string" && url.startsWith(LNPLUS_WEB) && url.length <= 512 ? url : `${LNPLUS_WEB}${page}`;
+
 function mapNode(r: RawNode): LnPlusNode {
   return {
     pubkey: r.pubkey,
@@ -116,7 +123,7 @@ function mapNode(r: RawNode): LnPlusNode {
     openChannels: num(r.open_channels),
     capacitySats: num(r.capacity),
     minChannelSizeSats: num(r.min_channel_size),
-    profileUrl: r.profile_urls?.["LN+"] ?? `https://lightningnetwork.plus/nodes/${r.pubkey}`,
+    profileUrl: lnplusUrl(r.profile_urls?.["LN+"], r.pubkey),
   };
 }
 
@@ -131,6 +138,9 @@ export async function getNode(pubkey: string): Promise<LnPlusNode> {
     throw e;
   }
   if (!raw?.pubkey) throw new LnPlusNotFound(pubkey);
+  // An answer about another node is no answer about this one: its rank must
+  // not be attached to this key (CHAN-12). Taken as "no profile".
+  if (String(raw.pubkey).toLowerCase() !== pubkey.toLowerCase()) throw new LnPlusNotFound(pubkey);
   return mapNode(raw);
 }
 
@@ -209,7 +219,7 @@ export async function getPoolNodes(q: PoolQuery = {}): Promise<LnPlusPoolNode[]>
     rankName: r.lnp_rank_name ?? "",
     positiveRatings: num(r.lnp_positive_ratings_received),
     negativeRatings: num(r.lnp_negative_ratings_received),
-    profileUrl: r.web_url ?? `https://lightningnetwork.plus/nodes/${r.pubkey}`,
+    profileUrl: lnplusUrl(r.web_url, r.pubkey),
     reachableOverTor: !!r.tor_address,
   }));
 }
@@ -296,7 +306,8 @@ export async function getSwaps(q: SwapQuery = {}): Promise<LnPlusSwap[]> {
     const applied = num(s.participant_applied_count);
     return {
       id: s.id,
-      url: s.web_url ?? `https://lightningnetwork.plus/swaps/${s.id}`,
+      // (The swap's page, checked like the profile links — the review of P4, P6.)
+      url: lnplusUrl(s.web_url, "", `swaps/${encodeURIComponent(String(s.id))}`),
       status: s.status ?? "",
       statusText: s.humanized_status ?? s.status ?? "",
       capacitySats: num(s.capacity_sats),
