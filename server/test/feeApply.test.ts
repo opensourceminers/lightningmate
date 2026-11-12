@@ -171,7 +171,9 @@ test("manual Apply applies what the engine recommends — the base fee too — a
   assert.equal(node.policyWrites.length, 1, "only the row asked for");
   const state = (await api.request("GET", "/autopilot")).body;
   assert.equal(state.history[0].changes[0].via, "manual");
-  assert.ok(api.autopilot.feeCooldown().lastApplied["850000x1x0"], "the cooldown is stamped");
+  // On record — but the price did not change, so the fee's clocks are not
+  // started (review FEE-12; a change of the rate does stamp: the next test).
+  assert.equal(api.autopilot.feeCooldown().lastApplied["850000x1x0"], undefined);
   assert.equal(api.autopilot.feeChanges()[0].via, "manual");
   const after = (await api.request("GET", "/fees/recommendations")).body;
   assert.equal(after.recommendations.find((r: { channelId: string }) => r.channelId === "850000x1x0").wouldApply, false, "the row is done");
@@ -309,8 +311,9 @@ test("a manual Apply never writes beside another fee write: while the fee lock i
 test("the run history says why each fee moved — the rule that set it: a raise toward the replacement cost reads 'replacement:', a lowering toward a cheaper market 'market:'", async (t) => {
   const DAY = 86_400_000;
   const channels = [
-    // Draining (10 forwards of 50,000 out in 10 days), 55% local.
-    channel(1, { localBalance: 1_100_000, feeRatePpm: 80 }),
+    // Draining (10 forwards of 50,000 out in 10 days), 80% local: at that
+    // rate four weeks from drained — the ordinary raise, not the drain ramp.
+    channel(1, { localBalance: 1_600_000, feeRatePpm: 80 }),
     // Routed this month, nothing in the last 14 days, 50% local.
     channel(2, { localBalance: 1_000_000, feeRatePpm: 80 }),
     // Where those forwards came in.
@@ -398,10 +401,11 @@ test("upgrading: a pin stored outside the policy range (the old pin inputs saved
 });
 
 test("two autopilot runs 31 minutes apart, the second's graph read slower than the fee engine waits: it still prices with the market and writes no fee on a market-priced channel", async (t) => {
-  // Draining (10 forwards of 50,000 out in 10 days), priced at its
+  // Draining (10 forwards of 50,000 out in 20 days — a sale every other day,
+  // not the daily seller a probe would try a higher fee on), priced at its
   // replacement cost already: 200 into the peer + 100 back = 300, × 1.15.
   const channels = [channel(1, { localBalance: 1_000_000, feeRatePpm: 340 }), channel(3, { localBalance: 1_000_000, feeRatePpm: 80 })];
-  const node = feeNode({ blockHeight: HEIGHT, channels, forwards: forwardsOut("850000x1x0", "850000x3x0", 10) });
+  const node = feeNode({ blockHeight: HEIGHT, channels, forwards: forwardsOut("850000x1x0", "850000x3x0", 10, { days: 20 }) });
   withMarket(node, channels, { "850000x1x0": { intoPpm: 200, backPpm: 100 } });
   const keepAlive = setInterval(() => undefined, 1_000);
   t.after(() => clearInterval(keepAlive));
@@ -476,10 +480,11 @@ function inboundDisabled(graph: { edges: Record<string, unknown>[] }, peer: stri
 }
 
 test("a peer back from an outage — its inbound channels still disabled in the graph — no longer lowers a draining channel priced at its refill cost (340 → 310 toward the balance curve, then walked down for good)", async (t) => {
-  // Draining (10 forwards of 50,000 out in 10 days) at 340: 200 into the
-  // peer + 100 back = a refill costs ~300, × 1.15 = 345.
+  // Draining (10 forwards of 50,000 out in 20 days — a sale every other day,
+  // no daily seller for a probe) at 340: 200 into the peer + 100 back = a
+  // refill costs ~300, × 1.15 = 345.
   const channels = [channel(1, { feeRatePpm: 340 }), channel(3, { feeRatePpm: 80 })];
-  const node = feeNode({ blockHeight: HEIGHT, channels, forwards: forwardsOut("850000x1x0", "850000x3x0", 10) });
+  const node = feeNode({ blockHeight: HEIGHT, channels, forwards: forwardsOut("850000x1x0", "850000x3x0", 10, { days: 20 }) });
   const graph = withMarket(node, channels, { "850000x1x0": { intoPpm: 200, backPpm: 100 } });
   const keepAlive = setInterval(() => undefined, 1_000);
   t.after(() => clearInterval(keepAlive));
@@ -496,7 +501,8 @@ test("a peer back from an outage — its inbound channels still disabled in the 
 });
 
 test("through such a gap the autopilot keeps pricing a draining channel toward its refill cost from the reference it last saw — 200 → 220, then 220 → 240 with the reference gone", async (t) => {
-  const channels = [channel(1, { feeRatePpm: 200 }), channel(3, { feeRatePpm: 80 })];
+  // (80% local: four weeks from drained at what it sells — ordinary raises, not the drain ramp.)
+  const channels = [channel(1, { feeRatePpm: 200, localBalance: 1_600_000 }), channel(3, { feeRatePpm: 80 })];
   const forwards = forwardsOut("850000x1x0", "850000x3x0", 10);
   const node = feeNode({ blockHeight: HEIGHT, channels, forwards });
   const graph = withMarket(node, channels, { "850000x1x0": { intoPpm: 200, backPpm: 100 } });
@@ -509,8 +515,9 @@ test("through such a gap the autopilot keeps pricing a draining channel toward i
   // Three days on (past the 72 h raise pause) the peer's inbound channels are disabled in the graph.
   node.override("default.describeGraph", (_a, cb) => cb(null, inboundDisabled(graph, PEER(1), node.publicKey)));
   t.mock.timers.tick(73 * 3_600_000);
-  // It sold at 220 meanwhile: a raise needs a sale at the fee it raises from.
-  forwards.push(...forwardsOut("850000x1x0", "850000x3x0", 3, { days: 1 }));
+  // It sold at 220 meanwhile: a raise needs a sale at the fee it raises from
+  // (two sales — three in a day, and the drain ramp leads the raise).
+  forwards.push(...forwardsOut("850000x1x0", "850000x3x0", 2, { days: 1 }));
   const second = await autopilot.runOnce();
   const ch1 = second.changes.find((c) => c.id === "850000x1x0");
   // Without the memory: no reference — held at 220, short of its refill cost.
@@ -600,3 +607,231 @@ test("a max_htlc update that took is written once — the next pass reads it bac
   assert.equal(lastWrites.size, 0, "settled: forgotten");
 });
 
+
+// ── review 2026-11-10, FEE-5 / FEE-6 / FEE-9 / FEE-10 / FEE-12 ──
+
+const HOUR = 3_600_000;
+const point = (r: Record<string, unknown>) => (r.chan_point as { funding_txid_str: string }).funding_txid_str;
+/** The inbound fee a policy request names (LND's signs: negative is a discount) — null: none. */
+const inboundNamed = (r: Record<string, unknown>) => {
+  const i = r.inbound_fee as { base_fee_msat: number; fee_rate_ppm: number } | undefined;
+  return i ? { base: Number(i.base_fee_msat) + 0, rate: Number(i.fee_rate_ppm) + 0 } : null;
+};
+
+test("an inbound discount set by hand survives the app's writes: a fee write and a max_htlc write both name it again exactly as LND has it, and a channel without one is sent none (review FEE-9: neither named it — an LND that resets what is not named lost the discount with every write)", async () => {
+  const node = feeNode({
+    blockHeight: HEIGHT,
+    channels: [
+      channel(1, { localBalance: 1_500_000, inboundBaseMsat: -500, inboundRatePpm: -50 }),
+      channel(2, { localBalance: 1_500_000 }),
+      // The rate alone: both parts are named, the base as the 0 it is.
+      channel(3, { localBalance: 1_500_000, inboundRatePpm: -20 }),
+    ],
+  });
+  const results = await applyFees(
+    node.lnd,
+    node.lnd,
+    [1, 2, 3].map((n) => ({ id: `850000x${n}x0`, transactionId: TX(n), transactionVout: 0, feeRatePpm: 250, baseFeeMsat: 0 })),
+  );
+  assert.deepEqual(results.map((r) => r.ok), [true, true, true]);
+  const expected = [{ base: -500, rate: -50 }, null, { base: 0, rate: -20 }];
+  assert.deepEqual(node.policyRequests.map(inboundNamed), expected);
+  // The max_htlc pass (a single HTLC of 990,000 sat at most: 1,980,000 → 524,288 on each).
+  const moved = await runMaxHtlcPass(node.lnd, node.lnd, new Map());
+  assert.deepEqual(moved.map((m) => [m.id, m.toSat, m.ok]), [1, 2, 3].map((n) => [`850000x${n}x0`, 524_288, true]));
+  assert.deepEqual(node.policyRequests.slice(3).map(inboundNamed), expected);
+  assert.deepEqual([1, 2, 3].map((n) => node.inboundOf(`850000x${n}x0`)), [{ base: -500, rate: -50 }, { base: 0, rate: 0 }, { base: 0, rate: -20 }]);
+});
+
+test("the max_htlc pass leaves a channel the operator excluded alone — its policy is not rewritten (review FEE-5: 8 updates in 3 days for a channel 'the autopilot never touches'); a pinned channel's size stays managed", async (t) => {
+  const node = feeNode({
+    blockHeight: HEIGHT,
+    channels: [channel(1, { localBalance: 1_500_000 }), channel(2, { localBalance: 1_500_000 }), channel(3, { localBalance: 1_500_000 })],
+  });
+  const { autopilot } = autopilotOn(t, node, { maxHtlcEnabled: true });
+  const { overrides } = autopilot as unknown as { overrides: OverridesStore };
+  overrides.set("850000x1x0", { mode: "exclude" });
+  overrides.set("850000x2x0", { mode: "fixed", fixedPpm: 300 });
+  const run = await autopilot.runOnce();
+  assert.deepEqual((run.maxHtlc ?? []).map((m) => [m.id, m.toSat, m.ok]), [
+    ["850000x2x0", 524_288, true],
+    ["850000x3x0", 524_288, true],
+  ]);
+  assert.deepEqual(node.policyRequests.map(point), [TX(2), TX(3)], "nothing sent for the excluded channel");
+  // Taken back into automation, it is managed again.
+  overrides.set("850000x1x0", { mode: "auto" });
+  const next = await autopilot.runOnce();
+  assert.deepEqual((next.maxHtlc ?? []).map((m) => m.id), ["850000x1x0"]);
+});
+
+test("one channel's max_htlc changes at most once in 6 h — a near-empty channel in use flipped 32,768 ↔ 65,536 with every payment, an update a run (review FEE-6); a change by two buckets or more, down or up, does not wait", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-01T00:00:00Z") });
+  const RESERVE = 10_000;
+  const ch = channel(1, { localBalance: RESERVE + 80_000 });
+  const node = feeNode({ blockHeight: HEIGHT, channels: [ch] });
+  const lastChanged = new Map<string, number>();
+  const pass = async (spendable: number) => {
+    node.channels[0].localBalance = RESERVE + spendable;
+    return (await runMaxHtlcPass(node.lnd, node.lnd, new Map(), { lastChanged })).map((m) => [m.fromSat, m.toSat, m.ok]);
+  };
+  // The first change is made at once (nothing was changed before).
+  assert.deepEqual(await pass(80_000), [[1_980_000, 65_536, true]]);
+  // 50k leaves and comes back, every half hour: one bucket down, back up.
+  for (let i = 0; i < 11; i++) {
+    t.mock.timers.tick(HOUR / 2);
+    assert.deepEqual(await pass(i % 2 === 0 ? 40_000 : 80_000), [], `run ${i + 1}: held`);
+  }
+  assert.equal(node.policyRequests.length, 1, "before: a write on each of these runs");
+  // 6 h after the change the lower bucket is written …
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(40_000), [[65_536, 32_768, true]]);
+  // … and the raise back waits its turn,
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(80_000), []);
+  // but a channel that can forward a quarter of what it advertises says so now.
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(9_000), [[32_768, 8_192, true]]);
+  // (One bucket down again: held, as the change before it was 30 minutes ago.
+  // One bucket up, with its headroom: held as well.)
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(5_000), []);
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(18_100), []);
+  // Three buckets up — it can forward eight times what it advertises: now.
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(80_000), [[8_192, 65_536, true]]);
+  assert.equal(node.policyRequests.length, 4);
+});
+
+test("a channel that was emptied and is filled again advertises its size at once: 524,288 → 8,192 → 524,288 within the hour (review of the fee package, R4 — before: held at 8,192 for six hours with 600,000 sat to sell)", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-01T00:00:00Z") });
+  const RESERVE = 10_000;
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: RESERVE + 600_000 })] });
+  const lastChanged = new Map<string, number>();
+  const pass = async (spendable: number) => {
+    node.channels[0].localBalance = RESERVE + spendable;
+    return (await runMaxHtlcPass(node.lnd, node.lnd, new Map(), { lastChanged })).map((m) => [m.fromSat, m.toSat, m.ok]);
+  };
+  assert.deepEqual(await pass(600_000), [[1_980_000, 524_288, true]]);
+  // A buyer empties it within the half hour …
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(9_000), [[524_288, 8_192, true]]);
+  // … and the next run's refill brings the 600k back.
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(600_000), [[8_192, 524_288, true]]);
+  // From there one bucket down waits its six hours again, counted from the raise.
+  t.mock.timers.tick(5.5 * HOUR);
+  assert.deepEqual(await pass(300_000), []);
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(300_000), [[524_288, 262_144, true]]);
+});
+
+test("a channel whose policy names no max_htlc (LND says 0) is given one, once — the interval holds the next write: a size the channel doesn't say is no 'two buckets off'", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-11-01T00:00:00Z") });
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 610_000 })] });
+  // LND keeps answering with a policy that has no max_htlc.
+  const info = node.lnd.default.getChanInfo;
+  node.override("default.getChanInfo", (a, cb) =>
+    info(a, (err: unknown, res: { node1_policy?: { max_htlc_msat?: string }; node2_policy?: { max_htlc_msat?: string } }) => {
+      for (const p of [res?.node1_policy, res?.node2_policy]) if (p) p.max_htlc_msat = "0";
+      cb(err, res);
+    }),
+  );
+  assert.deepEqual(decideMaxHtlc(600_000, null), { change: true, toSat: 524_288 });
+  const lastChanged = new Map<string, number>();
+  const pass = async () => (await runMaxHtlcPass(node.lnd, node.lnd, new Map(), { lastChanged })).map((m) => [m.fromSat, m.toSat, m.ok]);
+  assert.deepEqual(await pass(), [[0, 524_288, true]]);
+  t.mock.timers.tick(HOUR / 2);
+  assert.deepEqual(await pass(), [], "held for the interval");
+  assert.equal(node.policyRequests.length, 1);
+  t.mock.timers.tick(6 * HOUR);
+  assert.deepEqual(await pass(), [[0, 524_288, true]]);
+});
+
+test("the autopilot keeps the six hours across its runs: the size it wrote in one run is not changed by the next (the stage hands every pass the same record of when each channel was changed)", async (t) => {
+  const RESERVE = 10_000;
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: RESERVE + 80_000 })] });
+  const { autopilot } = autopilotOn(t, node, { maxHtlcEnabled: true });
+  const first = await autopilot.runOnce();
+  assert.deepEqual((first.maxHtlc ?? []).map((m) => [m.fromSat, m.toSat, m.ok]), [[1_980_000, 65_536, true]]);
+  // 40k leave before the next run: one bucket down — held.
+  node.channels[0].localBalance = RESERVE + 40_000;
+  const next = await autopilot.runOnce();
+  assert.deepEqual(next.maxHtlc ?? [], []);
+  assert.equal(node.policyRequests.length, 1);
+});
+
+test("a write that leaves the rate as it was — the base fee alone — does not restamp the fee's 'set at' time: what sold since the fee was set and the raise wait keep counting from the change of price (review FEE-12)", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  // Idle at 40% local: lowered 300 → 270 on the first run, base fee 0.
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 800_000 })] });
+  const api = await startApi(t, { node });
+  api.autopilot.setConfig({ enabled: true });
+  const run = await api.autopilot.runOnce();
+  assert.deepEqual(run.changes.map((c) => [c.fromPpm, c.toPpm, c.ok]), [[300, 270, true]]);
+  const setAt = api.autopilot.feeCooldown().lastApplied["850000x1x0"];
+  assert.ok(setAt);
+  // Three hours on, the base fee alone is written (by hand here).
+  t.mock.timers.tick(3 * HOUR);
+  const res = await api.request("POST", "/fees/apply", {
+    items: [{ id: "850000x1x0", transactionId: TX(1), transactionVout: 0, feeRatePpm: 270, baseFeeMsat: 1000 }],
+  });
+  assert.deepEqual(res.body.results.map((r: { ok: boolean; feeRatePpm: number }) => [r.ok, r.feeRatePpm]), [[true, 270]]);
+  assert.deepEqual(node.feeOf("850000x1x0"), { ppm: 270, base: 1000 });
+  // On record, as every write is …
+  assert.deepEqual(api.autopilot.feeChanges().map((c) => [c.fromPpm, c.toPpm, c.toBaseMsat]), [[270, 270, 1000], [300, 270, 0]]);
+  // … but the fee was set three hours ago, not now.
+  assert.equal(api.autopilot.feeCooldown().lastApplied["850000x1x0"], setAt);
+  // So a day after the price was set the idle channel's next lowering is due.
+  // Before: the base-fee write restarted the day — the rate stood until 27 h.
+  t.mock.timers.tick(21 * HOUR);
+  const next = await api.autopilot.runOnce();
+  assert.deepEqual(next.changes.map((c) => [c.fromPpm, c.toPpm, c.ok]), [[270, 240, true]]);
+  // A change of the rate does restamp it.
+  assert.equal(api.autopilot.feeCooldown().lastApplied["850000x1x0"], new Date().toISOString());
+});
+
+test("a fee LND has that the books don't — a write taken right before the process died, or a fee set with another tool — is put on record at the next run and its clocks start again: the engine does not step it a second time from the old stamp (review FEE-10)", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  // Idle at 40% local: lowered once a day. Channel 2 is excluded.
+  const node = feeNode({ blockHeight: HEIGHT, channels: [channel(1, { localBalance: 800_000 }), channel(2, { localBalance: 800_000 })] });
+  const { autopilot, saved } = autopilotOn(t, node, { enabled: true });
+  const first = await autopilot.runOnce();
+  assert.deepEqual(first.changes.map((c) => [c.id, c.fromPpm, c.toPpm, c.ok]), [
+    ["850000x1x0", 300, 270, true],
+    ["850000x2x0", 300, 270, true],
+  ]);
+  (autopilot as unknown as { overrides: OverridesStore }).overrides.set("850000x2x0", { mode: "exclude" });
+  // A day later LND takes 270 → 240 and the books never hear of it.
+  t.mock.timers.tick(24 * HOUR);
+  const lost = await applyFees(node.lnd, node.lnd, [
+    { id: "850000x1x0", transactionId: TX(1), transactionVout: 0, feeRatePpm: 240, baseFeeMsat: 0 },
+    { id: "850000x2x0", transactionId: TX(2), transactionVout: 0, feeRatePpm: 240, baseFeeMsat: 0 },
+  ]);
+  assert.deepEqual(lost.map((r) => r.ok), [true, true]);
+  t.mock.timers.tick(HOUR / 2);
+  const nowIso = new Date().toISOString();
+  const run = await autopilot.runOnce();
+  // Before: the stamp said "set 24.5 h ago" — 240 → 210 at once.
+  assert.deepEqual(run.changes, [], "no second step");
+  assert.equal(node.feeOf("850000x1x0")?.ppm, 240);
+  assert.equal(saved().perChannelLastApplied["850000x1x0"], nowIso);
+  const logged = autopilot.feeChanges();
+  assert.deepEqual(
+    logged.map((c) => [c.channelId, c.fromPpm, c.toPpm, c.via, c.why]),
+    [
+      ["850000x1x0", 270, 240, "manual", "found at this fee — set outside the app, or by it right before a restart"],
+      ["850000x2x0", 300, 270, "autopilot", logged[1].why],
+      ["850000x1x0", 300, 270, "autopilot", logged[2].why],
+    ],
+    "the excluded channel's fee is whoever manages it's business: no record",
+  );
+  // The next look finds the books in order: nothing more is recorded.
+  t.mock.timers.tick(HOUR / 2);
+  await autopilot.runOnce();
+  assert.equal(autopilot.feeChanges().length, 3);
+  // A day after it was found the channel is priced again, from 240.
+  t.mock.timers.tick(24 * HOUR);
+  const later = await autopilot.runOnce();
+  assert.deepEqual(later.changes.map((c) => [c.id, c.fromPpm, c.ok]), [["850000x1x0", 240, true]]);
+});

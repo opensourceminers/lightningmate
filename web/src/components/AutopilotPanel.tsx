@@ -62,7 +62,8 @@ type Sub = "fees" | "rebalancing" | "channels" | "magma" | "history";
  *  between any two updates). */
 export const FEE_COOLDOWN_HINT =
   "How often a ramp steps a fee — protecting a drained channel, or recovering a refill's cost. Every other move waits at least this " +
-  "long too, and longer by its own rule: a raise 72 h after the last update, the demand ramp 6 h, a lowering 24 h.";
+  "long too, and longer by its own rule: a raise or a price test 72 h after the last update, the demand and drain ramps 6 h, a " +
+  "lowering 24 h (an idle channel at its target, once it is down to Neutral ppm, a week).";
 /** What "Min change" skips — and what it never does. */
 export const MIN_CHANGE_HINT =
   "A fee this close to where the engine is heading — or within 20 % of the fee, whichever is more — is left as it is. Never an idle " +
@@ -144,14 +145,20 @@ export function afterLeaseLine(after: { channels: number; sats: number } | undef
 export const FEE_MOVE_HINT =
   "Each update moves a fee by at most two “Round to” steps up (up to three where a learned elasticity says raising pays; four while " +
   "protecting a drained channel or recovering a refill’s cost; a quarter of the fee, at most every 6 h, for a drained channel that " +
-  "sold three times at its fee — the demand ramp) and at most the idle-ratchet’s steps down. A fee is raised only when the channel " +
-  "drains below its target, its flow says it drains, or a floor or Min ppm needs it — a channel that routes at its price keeps it — " +
-  "and an ordinary raise waits for a sale at the fee it charges now; a raise nothing sold at for 48 h while the channel had sats to " +
-  "sell goes back to the higher of the last price that sold and the fee before it — and isn’t raised back to that level for a week. " +
+  "sold three times at its fee — the demand ramp — and for one that sells itself empty within three weeks — the drain ramp, up to a " +
+  "third of the way to what a refill costs) and at most the idle-ratchet’s steps down. Apart from the price test below, a fee is raised only when the channel " +
+  "drains below its target, its flow says it drains, or a floor or Min ppm needs it, and an ordinary raise waits for a sale at the " +
+  "fee it charges now — protecting a drained channel too (there an HTLC it had to refuse counts as well). A fee that sells is kept: " +
+  "it is not lowered while the channel sells at it, unless the channel holds more than its target and takes in more than it sells " +
+  "or would need over three months to sell the surplus; where a channel sells every day and holds no more than its target, a fee " +
+  "one step (or a tenth) higher is tried, and taken back if it earns less — the price that earned less is then not raised to for a week either, unless the channel drains. A raise nothing sold at for 48 h while the channel had " +
+  "sats to sell goes back to the last fee that sold — and isn’t raised back to that level for a week, two weeks the second time in " +
+  "a row, four the third. " +
   "In one update only: a step back, an idle channel dropping to the price that last won it flow or to the market’s price into its " +
   "peer, a pinned fee, a new channel’s protected fee, a broken lease promise, and a fee outside Min/Max ppm (a fee below Min goes to " +
-  "Min first, then steps). “Min change” only skips fees already that close to where the engine is heading — never an idle channel’s " +
-  "step or jump down, nor a fee brought into Min/Max.";
+  "Min first, then steps). An idle channel steps down to Min ppm only where it holds more than its target: at its target it steps " +
+  "to Neutral ppm and from there one step a week, and under its target it is not stepped down below Neutral ppm (the drop to the price that last won it flow, or to the market’s, is made there too). “Min change” only skips " +
+  "fees already that close to where the engine is heading — never an idle channel’s step or jump down, nor a fee brought into Min/Max.";
 const SELL_NUM_FIELDS: { key: NumKey; label: string; hint?: string }[] = [{ key: "sellMaxChannelSats", label: "Max channel size / order (sat)" }];
 /** Fields on the Limits, labelled there (validation messages name them). */
 const LIMIT_LABELS = { sellMaxDeploySats: "Capital to sell (sat)", sellReserveSats: "Keep on chain (sat)" } as const;

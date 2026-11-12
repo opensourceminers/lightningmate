@@ -83,7 +83,9 @@ import { DEFAULT_POLICY, applyFees, type FeeApplyItem, type FeeApplyResult } fro
 import {
   FEE_REC_DEFAULTS,
   MARKET_RUN_WAIT_MS,
-  STEP_BACK_MEMORY_DAYS,
+  STEP_BACK_KEEP_DAYS,
+  STEP_BACK_MAX_REPEATS,
+  type StepBackRecord,
   floorWindowStart,
   getFeeRecommendations,
   sellableSats,
@@ -248,6 +250,8 @@ type FeeWrite = FeeApplyItem & {
   pinned?: boolean;
   /** A step-back from this fee: remembered once LND took it (feeStepBacks). */
   stepBackFromPpm?: number;
+  /** …that takes back a probe: remembered apart (feeProbeBacks). */
+  probeBack?: boolean;
   /** A no-flow lowering: opens the flow-won episode (flowAnchors). */
   noFlowLowering?: boolean;
   /** It fixes a broken lease promise: retried at every chance, whatever
@@ -272,7 +276,7 @@ function recommendationWrite(r: FeeRecommendation): FeeWrite {
     noFlowLowering: r.noFlowLowering,
     leaseBreach: r.leaseCapBreach === true,
     ...(r.pinned ? { pinned: true } : {}),
-    ...(r.stepBack ? { stepBackFromPpm: r.currentPpm } : {}),
+    ...(r.stepBack ? { stepBackFromPpm: r.currentPpm, ...(r.probeBack ? { probeBack: true } : {}) } : {}),
   };
 }
 
@@ -573,9 +577,15 @@ interface PersistedState {
    *  from it — and when that was. */
   feeSellableSince?: Record<string, string>;
   feeSellableCheckedAt?: string | null;
-  /** Each channel's last step-back — the fee it stepped back from, and when:
-   *  not raised to again for STEP_BACK_MEMORY_DAYS (sanitizeStepBacks). */
-  feeStepBacks?: Record<string, { fromPpm: number; at: string }>;
+  /** Each channel's last step-back — the fee it stepped back from, the fee
+   *  it went back to, when, and how often in a row: the fee engine does not
+   *  raise back to it for a while that grows with the count (sanitizeStepBacks,
+   *  nextStepBack). */
+  feeStepBacks?: Record<string, StepBackRecord>;
+  /** The same for a probe that was taken back (a fee tried on a channel that
+   *  sells daily): it bounds the next probe only — a raise a rule has
+   *  evidence for is not held down by a guess that failed. */
+  feeProbeBacks?: Record<string, StepBackRecord>;
   lastSellRepriceAt: string | null;
   /** Adaptive Magma pricing state (mode "auto"): the current 0..1 price level and
    *  the fill bookkeeping that ratchets it up (sells fast) or down (sits unsold). */
@@ -1155,6 +1165,9 @@ export const LEASE_PROMISE_CHECK_MS = 10 * 60_000;
  *  sent), the autopilot leaves that channel's fee alone this long — a broken
  *  lease promise excepted (writeFees). */
 export const FEE_RETRY_BACKOFF_MS = 6 * 3_600_000;
+/** The reason on record for a fee found changed where the books did not see
+ *  it (noteFeesSetElsewhere). */
+export const FEE_SET_ELSEWHERE = "found at this fee — set outside the app, or by it right before a restart";
 
 /** How long past its time a fee retry entry is kept: only its reason is
  *  left to read then ("the same failure again" is no news). */
@@ -1176,18 +1189,38 @@ export function sanitizeFeeRetry(raw: unknown, nowMs = Date.now()): Record<strin
   return out;
 }
 
-/** The saved step-back memories, made safe: a fee above 0 and a time that
- *  parses, under STEP_BACK_MEMORY_DAYS old (the fee engine reads them). */
-export function sanitizeStepBacks(raw: unknown, nowMs = Date.now()): Record<string, { fromPpm: number; at: string }> {
+/** The saved step-back records, made safe: a fee above 0 and a time that
+ *  parses, under STEP_BACK_KEEP_DAYS old. (The fee engine reads them and
+ *  decides how long each one's memory lasts — stepBackMemoryDays; a record
+ *  outlives its memory so that the next step-back is told a repeat.) */
+export function sanitizeStepBacks(raw: unknown, nowMs = Date.now()): Record<string, StepBackRecord> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
-  const out: Record<string, { fromPpm: number; at: string }> = {};
+  const out: Record<string, StepBackRecord> = {};
+  const fee = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v) && v > 0;
   for (const [id, r] of Object.entries(raw as Record<string, unknown>)) {
-    const e = (r ?? {}) as { fromPpm?: unknown; at?: unknown };
+    const e = (r ?? {}) as { fromPpm?: unknown; toPpm?: unknown; count?: unknown; at?: unknown };
     const at = typeof e.at === "string" ? Date.parse(e.at) : NaN;
-    if (typeof e.fromPpm !== "number" || !Number.isFinite(e.fromPpm) || e.fromPpm <= 0 || !Number.isFinite(at)) continue;
-    if (nowMs - at < STEP_BACK_MEMORY_DAYS * 86_400_000) out[id] = { fromPpm: e.fromPpm, at: e.at as string };
+    if (!fee(e.fromPpm) || !Number.isFinite(at)) continue;
+    if (nowMs - at >= STEP_BACK_KEEP_DAYS * 86_400_000) continue;
+    out[id] = {
+      fromPpm: e.fromPpm,
+      at: e.at as string,
+      ...(fee(e.toPpm) && e.toPpm < e.fromPpm ? { toPpm: e.toPpm } : {}),
+      ...(typeof e.count === "number" && Number.isInteger(e.count) && e.count >= 1 ? { count: Math.min(STEP_BACK_MAX_REPEATS, e.count) } : {}),
+    };
   }
   return out;
+}
+
+/** The record of a step-back LND took, after the one before it (if any): one
+ *  that ended no higher than the last is a repeat — the same price failed
+ *  again — and the memory grows with the count (review FEE-11). */
+export function nextStepBack(was: StepBackRecord | undefined, fromPpm: number, toPpm: number, at: string): StepBackRecord {
+  // (A repeat: the two failed stretches overlap. A test that failed at 110 ppm
+  // after one at 360 ppm weeks before is a first failure there — the
+  // package's own review, R5: it waited 14 days instead of 7.)
+  const repeat = was?.toPpm !== undefined && toPpm <= was.toPpm && fromPpm > was.toPpm;
+  return { fromPpm, toPpm, at, count: repeat ? Math.min(STEP_BACK_MAX_REPEATS, (was?.count ?? 1) + 1) : 1 };
 }
 
 /** Two looks of the fee stage further apart than this (fee automation was
@@ -1619,6 +1652,10 @@ export class Autopilot {
   /** The last max_htlc update applied per channel: one that didn't take is
    *  not resent every run (runMaxHtlcPass). */
   private readonly maxHtlcLastWrites = new Map<string, { fromSat: number | null; toSat: number }>();
+  /** When each channel's max_htlc was last changed: a channel's advertised
+   *  size is changed at most once in MAX_HTLC_MIN_INTERVAL_MS (runMaxHtlcPass).
+   *  In memory: a restart at worst lets one change come early. */
+  private readonly maxHtlcLastChanged = new Map<string, number>();
   /** Every applied fee change (D15) — what fee outcomes and the elasticity
    *  learner measure; never the run history. */
   readonly feeLog: FeeChangeLog;
@@ -1855,6 +1892,7 @@ export class Autopilot {
     this.state.feeSellableSince = sanitizeTimes(this.state.feeSellableSince);
     this.state.feeSellableCheckedAt = validTime(this.state.feeSellableCheckedAt) ? this.state.feeSellableCheckedAt : null;
     this.state.feeStepBacks = sanitizeStepBacks(this.state.feeStepBacks);
+    this.state.feeProbeBacks = sanitizeStepBacks(this.state.feeProbeBacks);
     this.state.perTargetLastRebalanced ??= {};
     // Today's rebalance spend is read from the rebalance log now
     // (rebalanceBudget) — the separate counter is gone.
@@ -1917,6 +1955,7 @@ export class Autopilot {
       retryAfter,
       sellableSince: recent ? { ...(this.state.feeSellableSince ?? {}) } : {},
       stepBacks: sanitizeStepBacks(this.state.feeStepBacks, now),
+      probeBacks: sanitizeStepBacks(this.state.feeProbeBacks, now),
     };
   }
 
@@ -2564,9 +2603,60 @@ export class Autopilot {
     };
   }
 
+  /**
+   * The books against LND (review FEE-10). A channel whose fee is not the
+   * one the fee-change log last recorded for it was changed where the books
+   * did not see it: a write LND took right before the process died (the
+   * record is saved after LND's answer), or a fee set with another tool.
+   * Left alone, the engine read the old stamp — "set three days ago" — and
+   * the sales made at the fee before as sold at this one, and stepped again
+   * at once (100 → 120 taken and lost, then 120 → 140 on the next run).
+   * Recorded once, as a change found now and not made by the autopilot: the
+   * stamp and the log say so, the fee's clocks start again, and the next
+   * look finds the books in order. A channel with no record yet has no
+   * books to check; one the operator excluded is not priced here — whatever
+   * manages it may change its fee as often as it likes without a record
+   * each time.
+   */
+  private async noteFeesSetElsewhere(): Promise<void> {
+    const last = new Map<string, FeeChangeRecord>();
+    for (const r of this.feeLog.all()) if (!last.has(r.channelId)) last.set(r.channelId, r);
+    if (last.size === 0) return;
+    let rates;
+    try {
+      rates = (await getFeeRates({ lnd: this.readLnd })).channels;
+    } catch {
+      return; // LND is not answering: the fee stage says so itself
+    }
+    const overrides = this.overrides.all();
+    const nowIso = new Date().toISOString();
+    const found: FeeChangeRecord[] = [];
+    for (const c of rates) {
+      const was = last.get(c.id);
+      if (!was || was.toPpm === c.fee_rate || overrides[c.id]?.mode === "exclude") continue;
+      const base = Number(c.base_fee_mtokens);
+      found.push({
+        at: nowIso,
+        channelId: c.id,
+        alias: was.alias,
+        fromPpm: was.toPpm,
+        toPpm: c.fee_rate,
+        fromBaseMsat: was.toBaseMsat,
+        toBaseMsat: Number.isFinite(base) ? base : null,
+        via: "manual",
+        why: FEE_SET_ELSEWHERE,
+      });
+      this.state.perChannelLastApplied[c.id] = nowIso;
+    }
+    if (found.length === 0) return;
+    this.feeLog.append(found);
+    this.persist();
+  }
+
   /** Compute and apply eligible fee changes. */
   private async runFees(writeLnd: AuthenticatedLnd): Promise<AutopilotChange[]> {
     this.migrateOutOfRangePins();
+    await this.noteFeesSetElsewhere();
     // v2 engine — wouldApply already folds in the relative/absolute threshold,
     // cooldown, the retry back-off and max-changes-per-run, so we just apply
     // the eligible ones.
@@ -2680,6 +2770,7 @@ export class Autopilot {
     const keep = <T>(m: Record<string, T>): Record<string, T> => Object.fromEntries(Object.entries(m).filter(([id]) => open.has(id)));
     this.state.perChannelFeeRetry = keep(sanitizeFeeRetry(this.state.perChannelFeeRetry, nowMs));
     this.state.feeStepBacks = keep(sanitizeStepBacks(this.state.feeStepBacks, nowMs));
+    this.state.feeProbeBacks = keep(sanitizeStepBacks(this.state.feeProbeBacks, nowMs));
   }
 
   /**
@@ -2754,13 +2845,19 @@ export class Autopilot {
       }
       if (res.ok) {
         delete retry[res.id];
-        this.state.perChannelLastApplied[res.id] = nowIso;
+        // The stamp is the fee's "set at": what sold since is counted from
+        // it, and the raise wait runs from it. A write that left the rate as
+        // it was — the base fee alone, after the setting changed — is no new
+        // price: it reset the sale count to 0 and started the 72 h raise
+        // wait again on every channel it touched (review FEE-12).
+        if (w?.fromPpm == null || res.feeRatePpm !== w.fromPpm) this.state.perChannelLastApplied[res.id] = nowIso;
         // Applied a no-flow lowering → open (or refresh) the flow-won episode.
         if (w?.noFlowLowering) fa[res.id] = { ...fa[res.id], episodeAt: nowIso };
-        // A step-back LND took: the fee it left is not raised to again for
-        // STEP_BACK_MEMORY_DAYS (the fee engine reads it).
+        // A step-back LND took: the fee it left is not raised to again for a
+        // while (the fee engine reads the record).
         if (w?.stepBackFromPpm !== undefined && res.feeRatePpm < w.stepBackFromPpm) {
-          (this.state.feeStepBacks ??= {})[res.id] = { fromPpm: w.stepBackFromPpm, at: nowIso };
+          const backs = w.probeBack ? (this.state.feeProbeBacks ??= {}) : (this.state.feeStepBacks ??= {});
+          backs[res.id] = nextStepBack(backs[res.id], w.stepBackFromPpm, res.feeRatePpm, nowIso);
         }
         this.feeLog.append([
           {
@@ -2936,6 +3033,7 @@ export class Autopilot {
       return await this.feeLock.run("fee apply", () =>
         withDeadline("the fee apply", WORK_DEADLINES_MS.feeWork, async () => {
           this.migrateOutOfRangePins();
+          await this.noteFeesSetElsewhere();
           const report = await this.feeReport(await this.feeElasticityModifiers());
           this.noteFlowReturns(report.recommendations);
           const wanted = channelIds ? new Set(channelIds) : null;
@@ -7363,6 +7461,14 @@ export class Autopilot {
           const moved = await runMaxHtlcPass(this.readLnd, writeLnd, this.maxHtlcBackoff, {
             shouldStop: () => (halted.why = this.stopWhy("maxHtlcEnabled")) !== null,
             lastWrites: this.maxHtlcLastWrites,
+            lastChanged: this.maxHtlcLastChanged,
+            // "Exclude" means the channel is left alone — its advertised size
+            // too, not only its fee (review FEE-5).
+            excluded: new Set(
+              Object.entries(this.overrides.all())
+                .filter(([, ov]) => ov.mode === "exclude")
+                .map(([id]) => id),
+            ),
           });
           this.explain("maxHtlc", () => maxHtlcDecision(moved, halted.why));
           return moved;

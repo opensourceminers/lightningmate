@@ -1,7 +1,7 @@
 import { getChannel, getChannels, updateRoutingFees, type AuthenticatedLnd } from "lightning";
 import { getOwnPubkey } from "./node.js";
 import { getAlias } from "./aliases.js";
-import { channelMaxPendingMsat, updateRefusal } from "./fees.js";
+import { channelMaxPendingMsat, inboundFeeEcho, updateRefusal } from "./fees.js";
 import { errorText } from "./errorText.js";
 
 /**
@@ -20,9 +20,32 @@ import { errorText } from "./errorText.js";
  *    on every routed sat
  *
  * Raising to a bigger bucket needs 10% headroom above the bucket floor so a
- * balance sitting exactly on a boundary doesn't flap; lowering happens
- * immediately — advertising more than we can forward is exactly the failure
- * mode this exists to prevent.
+ * balance sitting exactly on a boundary doesn't flap; lowering needs none —
+ * advertising more than we can forward is exactly the failure mode this
+ * exists to prevent.
+ *
+ * Paced per channel (review FEE-6): a near-empty channel in use crossed a
+ * bucket boundary with every payment in and out — 32,768 ↔ 65,536 four times
+ * in a day in the probe, an update a run where payments come between runs —
+ * and every one is a channel update the whole network relays, on top of the
+ * fee stage's own. Peers limit how many they take from one channel, and a
+ * sender still holding the older, larger value fails its first try anyway.
+ * So one channel's max_htlc changes at most once in MAX_HTLC_MIN_INTERVAL_MS
+ * — except a change of two buckets or more, either way. Down (a quarter of
+ * what is advertised, or less): the channel is far emptier than it says,
+ * which is what this exists to prevent. Up (four times what is advertised,
+ * or more): it was emptied and filled again, and held to the small size it
+ * would advertise 8,192 sat for six hours with 600,000 to sell — senders'
+ * pathfinding skips it for every payment above that (review of the fee
+ * package, R4). Within the interval the advertised size is off by one bucket
+ * at most, either way.
+ *
+ * A channel the operator excluded from fee automation is left alone here too
+ * (review FEE-5): its policy was rewritten — fee, base fee and CLTV echoed,
+ * max_htlc changed — and gossiped, eight times in three days in the probe,
+ * for a channel "the autopilot never touches"; whoever excludes a channel to
+ * manage it with another tool had two writers on it. A pinned channel stays
+ * managed: the pin is about its fee.
  */
 
 export interface MaxHtlcChange {
@@ -42,6 +65,12 @@ const RAISE_HEADROOM = 1.1;
 /** After LND refused a channel's update, leave it alone this long (it was
  *  retried — and recorded as applied — every 30-minute run). */
 export const MAX_HTLC_BACKOFF_MS = 6 * 3_600_000;
+/** The least time between two max_htlc changes on one channel (four a day
+ *  at most), a change by URGENT_CHANGE or more — either way — excepted. */
+export const MAX_HTLC_MIN_INTERVAL_MS = 6 * 3_600_000;
+/** Two buckets: the channel can forward a quarter of what it advertises, or
+ *  four times as much. */
+const URGENT_CHANGE = 4;
 
 /**
  * Largest power of two ≤ spendable. Below the smallest bucket: the
@@ -73,7 +102,8 @@ export function decideMaxHtlc(
 /**
  * One pass over all active channels: read the current policy, compute the
  * bucket from the spendable balance, and update where the bucket moved.
- * Fee rate / base fee / CLTV / min_htlc are always echoed back unchanged.
+ * Fee rate / base fee / CLTV / min_htlc — and an inbound fee set by hand
+ * (inboundFeeEcho) — are always echoed back unchanged.
  *
  * The bucket never exceeds the channel's max pending amount: LND refuses a
  * policy whose max_htlc is above it (review a1) — and LND's refusals come
@@ -84,6 +114,11 @@ export function decideMaxHtlc(
  * `shouldStop`: asked right before each update — once it says yes, the pass
  * ends there and writes nothing more (the switch went off, or all
  * automation was paused, while it ran — review of P7).
+ *
+ * `excluded`: the channels the operator took out of fee automation — not
+ * read, not written. `lastChanged`: when each channel's max_htlc was last
+ * changed by a pass (kept by the caller), for the pacing above; kept in
+ * memory only — after a restart one change may come early.
  */
 export async function runMaxHtlcPass(
   readLnd: AuthenticatedLnd,
@@ -94,14 +129,18 @@ export async function runMaxHtlcPass(
     /** The last update applied per channel (kept by the caller): one that
      *  LND took but the channel doesn't advertise is not sent again. */
     lastWrites?: Map<string, { fromSat: number | null; toSat: number }>;
+    excluded?: ReadonlySet<string>;
+    lastChanged?: Map<string, number>;
   } = {},
 ): Promise<MaxHtlcChange[]> {
   const lastWrites = opts.lastWrites ?? new Map<string, { fromSat: number | null; toSat: number }>();
+  const lastChanged = opts.lastChanged ?? new Map<string, number>();
   const [{ channels }, mine] = await Promise.all([getChannels({ lnd: readLnd }), getOwnPubkey(readLnd)]);
   const out: MaxHtlcChange[] = [];
   const now = Date.now();
+  for (const [id, at] of lastChanged) if (now - at >= MAX_HTLC_MIN_INTERVAL_MS) lastChanged.delete(id);
 
-  for (const c of channels.filter((ch) => ch.is_active)) {
+  for (const c of channels.filter((ch) => ch.is_active && !opts.excluded?.has(ch.id))) {
     const refusedAt = backoff.get(c.id);
     if (refusedAt !== undefined && now - refusedAt < MAX_HTLC_BACKOFF_MS) continue;
     // What this channel could actually forward right now — and never more
@@ -147,6 +186,11 @@ export async function runMaxHtlcPass(
       }
     } else if (last) lastWrites.delete(c.id);
     if (!change) continue;
+    // Changed within the interval: it waits — unless the channel can forward
+    // a quarter or less of what it advertises, or four times as much or more.
+    // (A size the channel doesn't say — none in its policy — is no measure.)
+    const urgent = !!currentMaxSat && (toSat * URGENT_CHANGE <= currentMaxSat || toSat >= currentMaxSat * URGENT_CHANGE);
+    if (lastChanged.has(c.id) && !urgent) continue;
     if (opts.shouldStop?.()) break;
 
     try {
@@ -159,6 +203,7 @@ export async function runMaxHtlcPass(
         cltv_delta: current.cltv_delta,
         max_htlc_mtokens: String(toSat * 1000),
         ...(current.min_htlc_mtokens ? { min_htlc_mtokens: current.min_htlc_mtokens } : {}),
+        ...inboundFeeEcho(current),
       });
       const refused = updateRefusal(res, c.transaction_id, c.transaction_vout);
       if (refused) {
@@ -175,6 +220,7 @@ export async function runMaxHtlcPass(
       }
       backoff.delete(c.id);
       lastWrites.set(c.id, { fromSat: currentMaxSat, toSat });
+      lastChanged.set(c.id, now);
       out.push({
         id: c.id,
         alias: await getAlias(readLnd, c.partner_public_key),

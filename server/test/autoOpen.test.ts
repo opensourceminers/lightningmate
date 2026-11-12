@@ -818,7 +818,8 @@ test("an open by hand starts at the fee engine's new-channel fee — the Open fo
 
 test("the starting routing fee stays inside the operator's fee range: a 50 ppm maximum starts new channels at 50 (not the engine's 80), a 200 ppm minimum at 200 — the autopilot's open, the Open form's estimate and a manual open alike", async (t) => {
   const cases = [
-    { policy: { minPpm: 25, neutralPpm: 40, maxPpm: 50 }, ppm: 50 },
+    // Protect ppm comes down with the maximum: a save that leaves it above Max ppm is refused (review 2026-11-10, FEE-4).
+    { policy: { minPpm: 25, neutralPpm: 40, maxPpm: 50, protectPpm: 50 }, ppm: 50 },
     { policy: { minPpm: 200, neutralPpm: 300, maxPpm: 1000 }, ppm: 200 },
   ];
   for (const [i, c] of cases.entries()) {

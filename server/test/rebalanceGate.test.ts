@@ -526,12 +526,16 @@ test("end to end: an autopilot refill through the real executor is booked with t
 });
 
 /** A routing version of it: the target drained by 1.2M of forwards out in
- *  10 days at 400 ppm, and a market reference into its peer (others charge
- *  100 ppm, the peer 50 back) — so after a big refill the engine's own
- *  rules would take the fee down toward the balance curve. */
+ *  10 days at 400 ppm — the last of them eight days ago — and a market
+ *  reference into its peer (others charge 100 ppm, the peer 50 back) — so
+ *  after a big refill the engine's own rules would take the fee down toward
+ *  the balance curve. (With a sale in the last week they would not: a fee
+ *  that sells is kept, review 2026-11-10 FEE-2 — the floor matters where the
+ *  buyers have paused.) */
 function routingNode() {
   const channels = holdChannels();
-  const node = holdNode(channels, forwardsOut("850000x1x0", "850000x2x0", 20, { tokens: 60_000, feeMsat: 24_000, days: 10 }));
+  const sold = forwardsOut("850000x1x0", "850000x2x0", 20, { tokens: 60_000, feeMsat: 24_000, days: 10 });
+  const node = holdNode(channels, sold.map((f) => ({ ...f, at: Number(f.at) - 8 * 86_400_000 })));
   withMarket(node, channels, { "850000x1x0": { intoPpm: 100, backPpm: 50 } });
   return node;
 }

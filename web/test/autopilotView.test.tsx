@@ -406,11 +406,11 @@ test("the Overview says when its figures couldn't be loaded, and from when the o
 const int = (min: number, max: number): NumberBounds => ({ min, max, integer: true });
 const bounds: AutopilotBounds = {
   config: { intervalMinutes: int(5, 35_791), channelSizeSats: int(0, 1_000_000_000), rebalanceDailyBudgetSats: { ...int(1, 10_000_000), nullable: true } } as AutopilotBounds["config"],
-  policy: { minPpm: int(0, 50_000), maxPpm: int(1, 50_000), neutralPpm: int(0, 50_000) } as AutopilotBounds["policy"],
+  policy: { minPpm: int(0, 50_000), maxPpm: int(1, 50_000), neutralPpm: int(0, 50_000), protectPpm: int(0, 50_000) } as AutopilotBounds["policy"],
   rebalancePolicy: { econRatio: { min: 0.05, max: 1, integer: false } } as AutopilotBounds["rebalancePolicy"],
   rules: { channelSizeMinSats: 20_000 },
 };
-const labels = { intervalMinutes: "Run every (min)", "policy.minPpm": "Min ppm", "policy.maxPpm": "Max ppm", "policy.neutralPpm": "Neutral ppm", channelSizeSats: "Channel size", rebalanceDailyBudgetSats: "Daily fee budget" };
+const labels = { intervalMinutes: "Run every (min)", "policy.minPpm": "Min ppm", "policy.maxPpm": "Max ppm", "policy.neutralPpm": "Neutral ppm", "policy.protectPpm": "Protect ppm", channelSizeSats: "Channel size", rebalanceDailyBudgetSats: "Daily fee budget" };
 const draft = (o: Partial<Draft>): Draft => ({ ...EMPTY_DRAFT, ...o });
 
 test("the settings draft: a blank or out-of-range field is reported at the field and never sent (never as 0); what equals the saved value isn't a change", () => {
@@ -436,6 +436,14 @@ test("the settings draft checks the rules across fields the server checks: min â
   // Raising both together is fine â€” one Save, not one field at a time.
   assert.deepEqual(checkDraft(draft({ nums: { "policy.minPpm": "2000", "policy.maxPpm": "3000", "policy.neutralPpm": "2500" } }), c, bounds, labels).errors, []);
   assert.deepEqual(checkDraft(draft({ nums: { "policy.neutralPpm": "5" } }), c, bounds, labels).errors, ["Neutral ppm (5) must lie between Min ppm (25) and Max ppm (1000)"]);
+  // Protect ppm above Max ppm, from either field (review FEE-4); both lowered in one Save is fine.
+  const over = checkDraft(draft({ nums: { "policy.maxPpm": "200" } }), c, bounds, labels);
+  assert.deepEqual(over.errors, [`Protect ppm (${c.policy.protectPpm}) must not be above Max ppm (200)`]);
+  assert.equal(over.fieldErrors["policy.maxPpm"], over.errors[0]);
+  const high = checkDraft(draft({ nums: { "policy.protectPpm": "1200" } }), c, bounds, labels);
+  assert.deepEqual(high.errors, ["Protect ppm (1200) must not be above Max ppm (1000)"]);
+  assert.equal(high.fieldErrors["policy.protectPpm"], high.errors[0]);
+  assert.deepEqual(checkDraft(draft({ nums: { "policy.maxPpm": "200", "policy.protectPpm": "150" } }), c, bounds, labels).errors, []);
   assert.deepEqual(checkDraft(draft({ nums: { channelSizeSats: "15000" } }), c, bounds, labels).errors, ["Channel size: 0 (auto) or at least 20,000 sat"]);
   assert.deepEqual(checkDraft(draft({ nums: { channelSizeSats: "0" } }), config({ channelSizeSats: 2_000_000 }), bounds, labels).patch, { channelSizeSats: 0 });
 });

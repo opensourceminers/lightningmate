@@ -28,7 +28,11 @@ export const OVERRIDE_HINTS: Record<FeeMode, string> = {
   // next run, or Apply on the Fees tab does (review: "applied exactly as set"
   // read as if saving it changed the fee — with automation off, nothing did).
   fixed: "pin a fee: fee automation (or Apply on the Fees tab) sets it exactly as typed, then holds it",
-  exclude: "the autopilot never touches this channel's fee (except to keep a sold channel's fee promise)",
+  // Excluded means the whole policy: the payment size the channel advertises
+  // (max_htlc) is left as it is too — it was rewritten, and gossiped, several
+  // times a day on a channel "the autopilot never touches" (review FEE-5).
+  exclude:
+    "the autopilot never touches this channel's fee (except to keep a sold channel's fee promise) and leaves the payment size it advertises as it is",
 };
 
 /** The most a pin can be (as the server checks it). */
@@ -78,10 +82,12 @@ export function feeText(ppm: number | null | undefined, baseMsat: number | null 
 /**
  * What "Neutral ppm" does (review 3). A fee goes up only on a drain signal,
  * so raising Neutral ppm no longer lifts a balanced channel by itself — the
- * field label ("balanced") suggested it did.
+ * field label ("balanced") suggested it did. Nor is it a ceiling any more
+ * (review 2026-11-10, FEE-2): a channel that sells above it keeps its fee,
+ * and one that sells every day is tried a little higher.
  */
 export const NEUTRAL_PPM_HINT =
-  "Neutral ppm is a ceiling for balanced channels, not a price they are raised to: raising it doesn't raise a channel that routes at a lower fee (that one is held); it lowers balanced channels priced above it, and the balance curve starts from it for drained and full channels. Only a drain signal or a floor prices a balanced channel above it.";
+  "Neutral ppm is the balance curve's price for a balanced channel, not a price channels are raised to: raising it doesn't raise a channel that routes at a lower fee (that one is held). A balanced channel priced above it is lowered toward it unless it sells at its fee — a fee that sells is kept — and the balance curve starts from it for drained and full channels. Above it, a balanced channel is priced only by a drain signal, a floor, or a small price test where it sells every day.";
 
 /** The market into a channel's peer, as the Fees tab shows it: "~200 ppm
  *  (3 channels)". A remembered reference — the latest graph had none for the

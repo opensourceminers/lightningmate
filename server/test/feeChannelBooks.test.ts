@@ -18,9 +18,11 @@ import {
   FEE_RETRY_KEEP_MS,
   SWAP_SUGGESTIONS_KEEP_MS,
   WORK_DEADLINES_MS,
+  nextStepBack,
   sanitizeFeeRetry,
   sanitizeStepBacks,
 } from "../src/services/autopilot.js";
+import { stepBackMemoryDays } from "../src/services/feeRecommend.js";
 import { LANE_PASS_DEADLINE } from "../src/services/magmaDesk.js";
 import { FeeChangeLog } from "../src/services/feeChangeLog.js";
 import { openFeeRateOf } from "../src/services/openPlan.js";
@@ -38,7 +40,8 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 interface FeeBooks {
   feeSellableSince?: Record<string, string>;
   feeSellableCheckedAt?: string | null;
-  feeStepBacks?: Record<string, { fromPpm: number; at: string }>;
+  feeStepBacks?: Record<string, { fromPpm: number; toPpm?: number; count?: number; at: string }>;
+  feeProbeBacks?: Record<string, { fromPpm: number; toPpm?: number; count?: number; at: string }>;
   perChannelFeeRetry?: Record<string, { until: string; error: string }>;
   channelOpening?: { at: string } | null;
   lastChannelOpenAt: string | null;
@@ -83,7 +86,7 @@ test("A1: the fee stage keeps since when each channel has had sats to sell — d
   assert.deepEqual(Object.keys(sanitizeFeeRetry(retry, now)), ["b"]);
 });
 
-test("A3: a step-back LND took is remembered a week — on disk, read back by a restart, handed to the fee engine; a lowering that is no step-back, or a damaged or week-old memory, is not", async (t) => {
+test("A3: a step-back LND took is remembered — the fee it left and the fee it went back to, on disk, read back by a restart, handed to the fee engine; a lowering that is no step-back, or a damaged or eight-week-old record, is not", async (t) => {
   const { autopilot, seams, dir, node } = autopilotWith(t, { enabled: true });
   const rec = (id: string, from: number, to: number, stepBack: boolean) =>
     ({ ...plannedFeeChange(id, from, to), ...(stepBack ? { stepBack } : {}), capacity: 2_000_000, metrics: { routedOut14d: 0, localRatio: 0.3 } }) as unknown as FeeRecommendation;
@@ -92,8 +95,27 @@ test("A3: a step-back LND took is remembered a week — on disk, read back by a 
   await autopilot.runOnce();
   assert.deepEqual(Object.keys(autopilot.feeCooldown().stepBacks ?? {}), ["800001x1x0"]);
   assert.equal(autopilot.feeCooldown().stepBacks?.["800001x1x0"]?.fromPpm, 820);
+  assert.equal(autopilot.feeCooldown().stepBacks?.["800001x1x0"]?.toPpm, 660);
+  assert.equal(autopilot.feeCooldown().stepBacks?.["800001x1x0"]?.count, 1);
+  // The same price fails again (the fee was raised to 700 and stepped back to
+  // 660 once more): a repeat — the engine's memory grows with the count.
+  seams.feeReport = async () => ({ recommendations: [rec("800001x1x0", 700, 660, true)] });
+  await autopilot.runOnce();
+  assert.deepEqual(
+    [autopilot.feeCooldown().stepBacks?.["800001x1x0"]?.fromPpm, autopilot.feeCooldown().stepBacks?.["800001x1x0"]?.count],
+    [700, 2],
+  );
   const again = autopilotAt(t, dir, node).autopilot;
-  assert.equal(again.feeCooldown().stepBacks?.["800001x1x0"]?.fromPpm, 820, "a restart reads it back");
+  assert.equal(again.feeCooldown().stepBacks?.["800001x1x0"]?.count, 2, "a restart reads the count back");
+  again.stop();
+  // A step-back that ends higher than the last one is a new price, not a repeat.
+  assert.equal(nextStepBack({ fromPpm: 700, toPpm: 660, at: "x", count: 2 }, 760, 700, "y").count, 1);
+  assert.equal(nextStepBack({ fromPpm: 700, toPpm: 660, at: "x", count: 3 }, 690, 650, "y").count, 3, "at most three");
+  assert.equal(nextStepBack({ fromPpm: 700, at: "x" }, 690, 650, "y").count, 1, "a record without its 'to' (written before it was kept) starts the count");
+  assert.equal(nextStepBack({ fromPpm: 360, toPpm: 330, at: "x", count: 1 }, 110, 100, "y").count, 1, "a failure far below the last one is the first there, not the second in a row");
+  assert.deepEqual([1, 2, 3, 9, undefined].map(stepBackMemoryDays), [7, 14, 28, 28, 7]);
+  const reread = autopilotAt(t, dir, node).autopilot;
+  assert.equal(reread.feeCooldown().stepBacks?.["800001x1x0"]?.fromPpm, 700, "a restart reads it back");
   const now = Date.now();
   const recent = new Date(now - HOUR).toISOString();
   assert.deepEqual(
@@ -101,13 +123,49 @@ test("A3: a step-back LND took is remembered a week — on disk, read back by a 
       {
         a: { fromPpm: "820", at: recent },
         b: { fromPpm: 820, at: "never" },
-        c: { fromPpm: 820, at: new Date(now - 7 * 24 * HOUR - 1).toISOString() },
+        c: { fromPpm: 820, at: new Date(now - 56 * 24 * HOUR - 1).toISOString() },
         d: { fromPpm: 820, at: recent },
+        // (Kept past its week: the next step-back is told a repeat by it.)
+        e: { fromPpm: 820, toPpm: 660, count: 2, at: new Date(now - 30 * 24 * HOUR).toISOString() },
+        // A "to" at or above the "from", or a count that is no whole number, is dropped — the record stays.
+        f: { fromPpm: 820, toPpm: 900, count: 1.5, at: recent },
       },
       now,
     ),
-    { d: { fromPpm: 820, at: recent } },
+    {
+      d: { fromPpm: 820, at: recent },
+      e: { fromPpm: 820, toPpm: 660, count: 2, at: new Date(now - 30 * 24 * HOUR).toISOString() },
+      f: { fromPpm: 820, at: recent },
+    },
   );
+});
+
+test("a price test LND took back is remembered apart from a step-back a rule made — it bounds the next test only — and is counted, saved and dropped with its channel like the other (review 2026-11-10, FEE-2)", async (t) => {
+  const { autopilot, seams, dir, node } = autopilotWith(t, { enabled: true });
+  const rec = (id: string, from: number, to: number, probeBack: boolean) =>
+    ({ ...plannedFeeChange(id, from, to), stepBack: true, ...(probeBack ? { probeBack } : {}), capacity: 2_000_000, metrics: { routedOut14d: 0, localRatio: 0.5 } }) as unknown as FeeRecommendation;
+  seams.feeReport = async () => ({ recommendations: [rec("800001x1x0", 330, 300, true), rec("800002x1x0", 500, 470, false)] });
+  seams.feeApply = async (_w, items) => items.map((i) => ({ id: i.id, ok: true, feeRatePpm: i.feeRatePpm }));
+  await autopilot.runOnce();
+  const tests = () => autopilot.feeCooldown().probeBacks ?? {};
+  assert.deepEqual(Object.keys(tests()), ["800001x1x0"]);
+  assert.deepEqual([tests()["800001x1x0"]?.fromPpm, tests()["800001x1x0"]?.toPpm, tests()["800001x1x0"]?.count], [330, 300, 1]);
+  assert.deepEqual(Object.keys(autopilot.feeCooldown().stepBacks ?? {}), ["800002x1x0"], "the rule's step-back is in the other book");
+  // The same test fails again: a repeat, remembered twice as long.
+  seams.feeReport = async () => ({ recommendations: [rec("800001x1x0", 330, 300, true)] });
+  await autopilot.runOnce();
+  assert.equal(tests()["800001x1x0"]?.count, 2);
+  assert.equal(autopilot.feeCooldown().stepBacks?.["800001x1x0"], undefined);
+  // A restart reads it back; a record that is damaged is dropped.
+  const again = autopilotAt(t, dir, node).autopilot;
+  assert.equal(again.feeCooldown().probeBacks?.["800001x1x0"]?.count, 2);
+  books(again).state.feeProbeBacks = { "800001x1x0": { fromPpm: 330, toPpm: 300, count: 2, at: "never" } };
+  assert.deepEqual(again.feeCooldown().probeBacks, {});
+  again.stop();
+  // Its channel closed: the record goes with it.
+  seams.feeReport = async () => ({ recommendations: [rec("800003x1x0", 500, 470, false)] });
+  await autopilot.runOnce();
+  assert.deepEqual(Object.keys(tests()), []);
 });
 
 test("A4: a fee set by hand while LND's fees can't be read is on record with its 'from' unknown — null, never 0 — and the log reads such a record back", async (t) => {

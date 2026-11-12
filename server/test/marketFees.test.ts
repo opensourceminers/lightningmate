@@ -218,13 +218,14 @@ function peerOffline(graph: { edges: Record<string, unknown>[] }, peer: string, 
 }
 
 test("a channel whose peer drops out of the market reference (its inbound channels disabled after an outage) keeps its last one for MARKET_MEMORY_MS — a draining channel is not lowered — and says when it was last seen", async (t) => {
-  // Draining (10 forwards of 50,000 out in 10 days) at 300 ppm; 200 into the
-  // peer + 100 back: a refill costs ~300, × 1.15 = 345.
+  // Draining (10 forwards of 50,000 out in 20 days — a sale every other day,
+  // no daily seller for a probe) at 300 ppm; 200 into the peer + 100 back: a
+  // refill costs ~300, × 1.15 = 345.
   const channels = [
     { id: "850000x1x0", partnerPublicKey: PK(1), capacity: 2_000_000, localBalance: 1_000_000, transactionId: TX(1), transactionVout: 0, feeRatePpm: 300, baseFeeMsat: 0 },
     { id: "850000x3x0", partnerPublicKey: PK(3), capacity: 2_000_000, localBalance: 1_000_000, transactionId: TX(3), transactionVout: 0, feeRatePpm: 80, baseFeeMsat: 0 },
   ];
-  const node = feeNode({ channels, forwards: forwardsOut("850000x1x0", "850000x3x0", 10) });
+  const node = feeNode({ channels, forwards: forwardsOut("850000x1x0", "850000x3x0", 10, { days: 20 }) });
   const graph = withMarket(node, channels, { "850000x1x0": { intoPpm: 200, backPpm: 100 } });
   const keepAlive = setInterval(() => undefined, 1_000);
   t.after(() => clearInterval(keepAlive));

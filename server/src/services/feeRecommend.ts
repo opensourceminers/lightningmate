@@ -128,7 +128,11 @@ export const FEE_REC_DEFAULTS: FeeRecConfig = {
   peerGateWindowDays: 30,
   benchmarkWindowDays: 30,
   deadband: 0.05,
-  newChannelProtectionDays: 3,
+  // (Not a setting. A new channel keeps its protected fee, and is not lowered
+  // as idle, for two weeks or until its third forward — review FEE-7: with
+  // three days a channel that had no time to be found was at Min ppm on day
+  // four.)
+  newChannelProtectionDays: 14,
   maxChangesPerRun: 6,
   sourceTargetLocalRatio: 0.45,
   sinkTargetLocalRatio: 0.55,
@@ -162,6 +166,21 @@ export const DEMAND_RAMP_HOURS = 6;
  *  — a 2-sat inflow switched a drained channel's demand off (review). */
 export const REFILL_INFLOW_TOLERANCE_SHARE = 0.01;
 export const REFILL_INFLOW_TOLERANCE_SATS = 50_000;
+/** The drain ramp (review FEE-3): a channel that still has liquidity but, at
+ *  what it sells net a day AT THE FEE IT CHARGES NOW, is down to the demand
+ *  ramp's "drained" (DEMAND_RAMP_LOCAL) within this many days… */
+export const DRAIN_RAMP_WITHIN_DAYS = 21;
+/** …is priced for the balance it will have this many days from now at that
+ *  rate (the balance curve read that far ahead), and raised toward it like
+ *  the demand ramp: a quarter of the fee per move, every DEMAND_RAMP_HOURS. */
+export const DRAIN_RAMP_AHEAD_DAYS = 7;
+/** A stretch of time counts toward that rate with DRAIN_MIN_FORWARDS sales
+ *  and this share of the channel's capacity net out in it. */
+export const DRAIN_RAMP_NET_SHARE = 0.05;
+/** Toward a KNOWN refill cost one move covers this share of the way, where
+ *  that is more than the quarter of the fee — and never more than the fee
+ *  itself: a move at most doubles it. */
+export const DRAIN_RAMP_GAP_SHARE = 1 / 3;
 /** The step-back: a fee raised to a price nothing sold at for this long —
  *  counted from the raise, or from when the channel last got sats to sell
  *  if that is later — with at least STEP_BACK_MIN_SELLABLE (or 1 % of
@@ -182,8 +201,79 @@ export const sellableSats = (capacity: number, localRatio: number): number => {
  *  STEP_BACK_MIN_SELLABLE, or 1 % of its capacity if more. */
 export const stepBackSellableMin = (capacity: number): number => Math.max(STEP_BACK_MIN_SELLABLE, CHANNEL_RESERVE_SHARE * Math.max(1, capacity));
 /** After a step-back, the fee it stepped back from is not raised to again
- *  for this long. */
+ *  for this long — the first time. */
 export const STEP_BACK_MEMORY_DAYS = 7;
+/** A step-back that ends no higher than the one before it is a repeat: the
+ *  memory doubles with each, up to this many (7, 14, 28 days). Review FEE-11:
+ *  a channel cycled 140 → 160 → 140 every nine days for months — each raise
+ *  two days without a sale — because the memory was the same seven days
+ *  however often the same price had failed. */
+export const STEP_BACK_MAX_REPEATS = 3;
+export const stepBackMemoryDays = (count: number | undefined): number =>
+  STEP_BACK_MEMORY_DAYS * 2 ** (Math.min(STEP_BACK_MAX_REPEATS, Math.max(1, Math.floor(count ?? 1))) - 1);
+/** How long a step-back's record is kept: long enough for the next one to be
+ *  told a repeat after the longest memory has run out. */
+export const STEP_BACK_KEEP_DAYS = 56;
+/** One channel's last step-back: the fee it left, the fee it went back to
+ *  (absent on records written before it was kept), when, and how many times
+ *  in a row a step-back ended at or below the same fee. */
+export interface StepBackRecord {
+  fromPpm: number;
+  at: string;
+  toPpm?: number;
+  count?: number;
+}
+/** The highest fee a step-back's memory lets a raise reach from `currentPpm`
+ *  (review FEE-11): the grid price below the fee that failed — or, while the
+ *  fee stands in the lower half between the price it went back to and that
+ *  one, the middle: each failed try halves the stretch that is tried again. */
+function memoryCapOf(rec: StepBackRecord, currentPpm: number, step: number): number {
+  const below = Math.ceil(rec.fromPpm / step) * step - step;
+  const mid = rec.toPpm !== undefined ? Math.floor((rec.toPpm + rec.fromPpm) / 2 / step) * step : below;
+  return Math.max(currentPpm, currentPpm < mid ? Math.min(mid, below) : below);
+}
+/** A fee that sells is not lowered (review FEE-2): this many sales at it
+ *  since it was set, one of them in the last 7 days — or this many in the
+ *  last 7 days while the fee stood at this one or higher: a write does not
+ *  undo what the channel has shown (the package's own review, R1). */
+export const SELLS_HERE_SALES = DEMAND_RAMP_SALES;
+/** …unless the channel holds more than its target and either takes in more
+ *  than it sells, or at what it sells a day would need longer than this to
+ *  sell what it holds over its target: a lower fee is then worth a try. */
+export const SPARE_SELL_DAYS = 90;
+/** A fee the autopilot raised to is not lowered by the balance curve for this
+ *  long: what sells at it decides (the step-back takes it back). */
+export const RAISE_TRIAL_DAYS = 7;
+/** The upward probe: a channel that sells daily at its fee (this many sales
+ *  in the last week, PROBE_RECENT_SALES of them in the last
+ *  PROBE_JUDGE_AFTER_HOURS, which the fee has stood) and holds no more than
+ *  its target tries a fee this share higher (at least one grid step), at the
+ *  ordinary raise's pace. */
+export const PROBE_WEEK_SALES = 7;
+export const PROBE_RECENT_SALES = 6;
+export const PROBE_SHARE = 0.1;
+/** A probe that still sells is judged once, on two stretches of this many
+ *  hours: what the channel earned in the probe's first hours against the
+ *  same hours before it, at the fee before. Less, and it goes back; as much
+ *  or more, and it stays. Both stretches are fixed when the hours are over —
+ *  a sale an hour later changes nothing (judged on a running average, a
+ *  probe was taken back on "7.5 sat a day against 8.0", five sales where the
+ *  sixth came an hour later, and kept or taken back by the hour it was looked
+ *  at). */
+export const PROBE_JUDGE_AFTER_HOURS = 72;
+/** One step of a tenth cannot be told from chance on a few sales (at twelve
+ *  sales in 72 hours the spread of what they earn is three times the step),
+ *  so kept probes are checked again as a climb: every CLIMB_CHECK_DAYS days
+ *  since its first probe, what the channel earned in the last days — up to
+ *  CLIMB_WINDOW_DAYS — is set against as many days before the climb began.
+ *  Less, and the fee goes back to where the climb began, in one move. A
+ *  week's check is in force for CLIMB_CHECK_HOURS after the week ended (a
+ *  lowering waits a day after the last change) and is made on stretches that
+ *  stay on record whole for as long: what it says does not change with the
+ *  hour it is read in. */
+export const CLIMB_CHECK_DAYS = 7;
+export const CLIMB_WINDOW_DAYS = 14;
+export const CLIMB_CHECK_HOURS = 48;
 /** Elasticity may widen a raise step by at most this factor. */
 const MAX_ELASTIC_STEP = 1.5;
 /** The profit floor comes from the autopilot's own refills of this window. */
@@ -390,6 +480,8 @@ export interface FeeRecommendation {
   /** This move is a step-back (the autopilot remembers the fee it stepped
    *  back from: not raised to again for STEP_BACK_MEMORY_DAYS). */
   stepBack?: boolean;
+  /** …and what it takes back is a probe: remembered apart (`probeBacks`). */
+  probeBack?: boolean;
   /** A channel this node sold (Magma, LSPS1) whose order locked a routing-fee
    *  promise for the lease: the target never exceeds it (leaseCaps.ts). */
   leaseCap: { source: LeaseCap["source"]; orderId: string; feeRateCapPpm: number; baseFeeCapMsat: number; untilHeight: number | null } | null;
@@ -441,6 +533,10 @@ export interface FeeSignals {
  *  (The autopilot loop runs every ~30 min; without pacing an idle channel would
  *  ratchet from any fee to minPpm within hours, before the market can react.) */
 const LOWER_PACING_HOURS = 24;
+/** An idle channel at its target is lowered below the balanced level one
+ *  grid step at a time, this far apart (review FEE-7: at the ratchet's pace
+ *  it reached Min ppm in days and the first buyer took half of it there). */
+export const SLOW_LOWER_PACING_HOURS = 7 * 24;
 const DAY_MS = 86_400_000;
 
 // ── small helpers ─────────────────────────────────────────────────────────────
@@ -600,6 +696,289 @@ export function provenLevel(
   }
   return best;
 }
+
+/** A fee change someone made by hand or a pin applied: never the autopilot's
+ *  own trial of a higher price. */
+const madeByHand = (h: Pick<FeeChangeRecord, "via" | "why" | "pinned">): boolean =>
+  h.via === "manual" || h.pinned === true || /^pinned to /.test(h.why ?? "");
+
+/** The autopilot's climb to the current fee: its consecutive raises, each
+ *  starting where the one before ended. */
+export interface RaiseChain {
+  /** The fee before the first of these raises. */
+  basePpm: number;
+  /** The highest fee of the climb below the current one that sold at least
+   *  once while it stood — null: none of them did. */
+  soldPpm: number | null;
+  /** How many raises the climb has. */
+  steps: number;
+  startedAt: string;
+}
+
+type ChangeRow = Pick<FeeChangeRecord, "at" | "fromPpm" | "toPpm" | "via" | "why" | "pinned">;
+const sortedChanges = (history: readonly ChangeRow[], nowMs: number): (ChangeRow & { t: number })[] =>
+  history
+    .map((h) => ({ ...h, t: Date.parse(h.at) }))
+    .filter((h) => Number.isFinite(h.t) && h.t <= nowMs)
+    .sort((a, b) => a.t - b.t);
+
+/**
+ * The run of raises that ended at the current fee, from the fee-change log,
+ * and what sold on the way (review FEE-1: a ramp climbed 80 → 350 ppm in 42
+ * hours past buyers who paid up to 150; the step-back knew only the last
+ * change, went back one step to 340 and stayed there for months). A raise by
+ * hand, a pin or a lease promise is not part of a climb, nor is one older
+ * than the forwards read (`fromMs`): what sold before it isn't known.
+ */
+export function raiseChainOf(
+  events: readonly ForwardEvent[],
+  channelId: string,
+  history: readonly ChangeRow[],
+  currentPpm: number,
+  fromMs: number,
+  nowMs: number,
+): RaiseChain | null {
+  const changes = sortedChanges(history, nowMs);
+  const chain: (ChangeRow & { t: number })[] = [];
+  for (let i = changes.length - 1; i >= 0; i--) {
+    const h = changes[i];
+    const next = chain[0];
+    const raise = !madeByHand(h) && h.via !== "lease" && h.fromPpm !== null && h.fromPpm > 0 && h.toPpm > h.fromPpm && h.t > fromMs;
+    if (!raise || h.toPpm !== (next ? next.fromPpm : currentPpm)) break;
+    chain.unshift(h);
+  }
+  if (!chain.length) return null;
+  let soldPpm: number | null = null;
+  for (let k = chain.length - 2; k >= 0; k--) {
+    if (salesOf(events, channelId, chain[k].t, chain[k + 1].t).forwards >= 1) {
+      soldPpm = chain[k].toPpm;
+      break;
+    }
+  }
+  return { basePpm: chain[0].fromPpm as number, soldPpm, steps: chain.length, startedAt: chain[0].at };
+}
+
+/** The fees a channel charged in (fromMs, nowMs], from the fee-change log:
+ *  each change's new fee from its time to the next; before the first change
+ *  in the stretch, the fee that change replaced. Null where the log doesn't
+ *  say — a change whose "from" wasn't known, or a last change that did not
+ *  end at the fee the channel charges now (set outside the app since). */
+function feeLevels(history: readonly ChangeRow[], currentPpm: number, fromMs: number, nowMs: number): { ppm: number | null; from: number; to: number }[] {
+  const changes = sortedChanges(history, nowMs);
+  const before = [...changes].reverse().find((h) => h.t <= fromMs);
+  const inside = changes.filter((h) => h.t > fromMs);
+  const levels: { ppm: number | null; from: number; to: number }[] = [];
+  let fee: number | null = before ? before.toPpm : inside.length ? inside[0].fromPpm : currentPpm;
+  let from = fromMs;
+  for (const h of inside) {
+    levels.push({ ppm: fee, from, to: h.t });
+    fee = h.toPpm;
+    from = h.t;
+  }
+  levels.push({ ppm: fee === currentPpm ? fee : null, from, to: nowMs });
+  return levels;
+}
+
+/** A channel's sales and inflow over part of a stretch, and how long that
+ *  part was (ms). */
+export type FlowOver = Flow & { ms: number };
+
+/**
+ * What `channelId` sold and took in after `fromMs` while its fee passed
+ * `keep` — and for how long that was. The hold reads it two ways (the
+ * package's own review, R1 and R3): the sales of the last 7 days at the
+ * present fee or a higher one (a write starts "sold since it was set" at none
+ * again; what buyers paid before it is still known), and what came in against
+ * what went out over the days at the present fee or a lower one (the days of
+ * a higher fee — a price test — say nothing about whether this fee lets the
+ * channel fill up).
+ */
+export function flowAtFees(
+  events: readonly ForwardEvent[],
+  channelId: string,
+  history: readonly ChangeRow[],
+  currentPpm: number,
+  fromMs: number,
+  nowMs: number,
+  keep: (ppm: number) => boolean,
+): FlowOver {
+  const sum: FlowOver = { out: 0, inn: 0, revenue: 0, forwards: 0, ms: 0 };
+  for (const l of feeLevels(history, currentPpm, fromMs, nowMs)) {
+    if (l.ppm === null || !keep(l.ppm)) continue;
+    const f = salesOf(events, channelId, l.from, l.to);
+    sum.out += f.out;
+    sum.inn += f.inn;
+    sum.revenue += f.revenue;
+    sum.forwards += f.forwards;
+    sum.ms += l.to - l.from;
+  }
+  return sum;
+}
+
+/** A raise the autopilot made as a price test, and a step-back it made: the
+ *  two moves a climb of price tests consists of (told by the reason the
+ *  change was logged with). */
+const isPriceTest = (h: ChangeRow): boolean =>
+  !madeByHand(h) && h.via !== "lease" && h.fromPpm !== null && h.fromPpm > 0 && h.toPpm > h.fromPpm && /^price test: /.test(h.why ?? "");
+const isStepBack = (h: ChangeRow): boolean => !madeByHand(h) && h.fromPpm !== null && h.toPpm < h.fromPpm && /^step back: /.test(h.why ?? "");
+
+/** The price test that set the current fee, and the two stretches it is
+ *  judged on: what the channel sold in the PROBE_JUDGE_AFTER_HOURS before it,
+ *  at the fee before, and in its first PROBE_JUDGE_AFTER_HOURS. */
+export interface PriceTest {
+  fromPpm: number;
+  at: string;
+  before: Flow;
+  first: Flow;
+}
+
+/** Null: the last change is no price test, or the stretch before it is not
+ *  on record whole — the fee before stood for less, or the forwards read
+ *  (`fromMs`) starts later. Such a test is not judged on what it earned. */
+export function priceTestOf(
+  events: readonly ForwardEvent[],
+  channelId: string,
+  history: readonly ChangeRow[],
+  currentPpm: number,
+  fromMs: number,
+  nowMs: number,
+): PriceTest | null {
+  const changes = sortedChanges(history, nowMs);
+  const last = changes[changes.length - 1];
+  if (!last || !isPriceTest(last) || last.toPpm !== currentPpm) return null;
+  const span = PROBE_JUDGE_AFTER_HOURS * 3_600_000;
+  const prev = changes[changes.length - 2];
+  if (last.t - Math.max(fromMs, prev ? prev.t : fromMs) < span) return null;
+  return {
+    fromPpm: last.fromPpm as number,
+    at: last.at,
+    before: salesOf(events, channelId, last.t - span, last.t),
+    first: salesOf(events, channelId, last.t, last.t + span),
+  };
+}
+
+/** A climb of price tests: where it began, and its latest weekly check. */
+export interface ClimbAnchor {
+  /** The fee the climb began at. */
+  ppm: number;
+  /** When its first price test raised the fee. */
+  startedAt: string;
+  /** The price tests since, kept or taken back. */
+  tests: number;
+  /** The check at the climb's latest full week: what the channel sold in the
+   *  `hours` it is judged on, of the `window` hours before that week ended
+   *  (from `from`, ms), and in the `hours` before the climb began. Left out
+   *  of the window: a price test that was taken back since, and one not yet
+   *  judged when the week ended — the days nothing sold at a fee above what
+   *  buyers pay are not what the fee below it earns (a climb from 300 to the
+   *  330 ppm buyers paid was taken back whole for the two dead days of the
+   *  try at 360). Null: no full week yet, or less than
+   *  PROBE_JUDGE_AFTER_HOURS of either stretch are on record. */
+  week: { n: number; hours: number; window: number; from: number; now: Flow; before: Flow } | null;
+}
+
+/**
+ * The climb the current fee belongs to (the package's own review, R2): the
+ * changes that ended at it, back in time for as long as they are price tests
+ * and step-backs, each starting where the one before ended — and of those the
+ * earliest price test since which the fee has stayed above the fee it began
+ * at, with PROBE_JUDGE_AFTER_HOURS on record before it at that fee. That fee
+ * is what the climb is checked against, every CLIMB_CHECK_DAYS days, on two
+ * stretches of the same length: the last days before the week ended (as many
+ * as the climb is old, CLIMB_WINDOW_DAYS at most, and no more than are on
+ * record before the climb) against as many days before the climb began. The
+ * check of a week is fixed when the week ends and in force for
+ * CLIMB_CHECK_HOURS: its stretches are cut to what the forwards read still
+ * holds at the end of those hours, so that every run in them reads the same
+ * sales. (With a read of 30 days: 7 days after the first week, 14 after the
+ * second, 7 after the third, and none after that — the climb's next price
+ * test is then what it is checked from.)
+ */
+export function climbAnchorOf(
+  events: readonly ForwardEvent[],
+  channelId: string,
+  history: readonly ChangeRow[],
+  currentPpm: number,
+  fromMs: number,
+  nowMs: number,
+): ClimbAnchor | null {
+  const changes = sortedChanges(history, nowMs);
+  const span = PROBE_JUDGE_AFTER_HOURS * 3_600_000;
+  /** How long the fee before change `i` is on record. */
+  const stoodBefore = (i: number): number => changes[i].t - Math.max(fromMs, i > 0 ? changes[i - 1].t : fromMs);
+  let at = -1;
+  let tests = 0;
+  let walked = 0;
+  // The lowest fee since the change looked at.
+  let low = currentPpm;
+  for (let i = changes.length - 1; i >= 0; i--) {
+    const h = changes[i];
+    const next = changes[i + 1];
+    if ((!isPriceTest(h) && !isStepBack(h)) || h.toPpm !== (next ? next.fromPpm : currentPpm) || h.t <= fromMs) break;
+    low = Math.min(low, h.toPpm);
+    if (!isPriceTest(h)) continue;
+    walked += 1;
+    if (low > (h.fromPpm as number) && stoodBefore(i) >= span) {
+      at = i;
+      tests = walked;
+    }
+  }
+  if (at < 0) return null;
+  const first = changes[at];
+  const week = CLIMB_CHECK_DAYS * DAY_MS;
+  const n = Math.floor((nowMs - first.t) / week);
+  const mark = first.t + n * week;
+  const inForce = CLIMB_CHECK_HOURS * 3_600_000;
+  // What is on record before the climb, at its fee, when the check's hours end.
+  const readFrom = mark + inForce - (nowMs - fromMs);
+  const onRecord = first.t - Math.max(readFrom, at > 0 ? changes[at - 1].t : readFrom);
+  const window = Math.floor(Math.min(CLIMB_WINDOW_DAYS * DAY_MS, n * week, onRecord) / 3_600_000);
+  const from = mark - window * 3_600_000;
+  // The climb's fees in those hours, each from its change to the next —
+  // without a price test taken back since or not yet judged at the week's end.
+  const now: Flow = { out: 0, inn: 0, revenue: 0, forwards: 0 };
+  let revenueMsat = 0;
+  let keptMs = 0;
+  for (let i = at; i < changes.length; i++) {
+    const h = changes[i];
+    const next = changes[i + 1];
+    const a = Math.max(h.t, from);
+    const b = Math.min(next ? next.t : mark, mark);
+    if (b <= a) continue;
+    if (isPriceTest(h) && ((next && isStepBack(next)) || mark - h.t < span)) continue;
+    const f = salesOf(events, channelId, a, b);
+    now.out += f.out;
+    now.inn += f.inn;
+    now.forwards += f.forwards;
+    revenueMsat += Math.round(f.revenue * 1000);
+    keptMs += b - a;
+  }
+  now.revenue = revenueMsat / 1000;
+  const hours = Math.floor(keptMs / 3_600_000);
+  return {
+    ppm: first.fromPpm as number,
+    startedAt: first.at,
+    tests,
+    week:
+      n >= 1 && nowMs - mark <= inForce && hours >= PROBE_JUDGE_AFTER_HOURS
+        ? { n, hours, window, from, now, before: salesOf(events, channelId, first.t - keptMs, first.t) }
+        : null,
+  };
+}
+
+/** What a channel sold in its last 1, 3, 7 and 14 days, whatever fee it had. */
+export interface RecentSales {
+  d1: Flow;
+  d3: Flow;
+  d7: Flow;
+  d14: Flow;
+}
+export const recentSales = (events: readonly ForwardEvent[], channelId: string, nowMs: number): RecentSales => ({
+  d1: salesOf(events, channelId, nowMs - DAY_MS),
+  d3: salesOf(events, channelId, nowMs - 3 * DAY_MS),
+  d7: salesOf(events, channelId, nowMs - 7 * DAY_MS),
+  d14: salesOf(events, channelId, nowMs - 14 * DAY_MS),
+});
 
 function flowMap(perChannel: { channelId: string; routedOutSats: number; routedInSats: number; feesEarnedSats: number; forwardCount: number }[]): Map<string, Flow> {
   const m = new Map<string, Flow>();
@@ -832,7 +1211,12 @@ export interface CooldownInput {
   sellableSince?: Record<string, string>;
   /** Each channel's last step-back: the fee it stepped back from, and when
    *  — not raised to again for STEP_BACK_MEMORY_DAYS. */
-  stepBacks?: Record<string, { fromPpm: number; at: string }>;
+  stepBacks?: Record<string, StepBackRecord>;
+  /** Each channel's last probe that was taken back: no probe to that fee
+   *  again for as long (the same record and growing memory as a step-back).
+   *  Kept apart from `stepBacks`: a probe is a guess, and its failure does
+   *  not bound a raise a rule has evidence for. */
+  probeBacks?: Record<string, StepBackRecord>;
 }
 
 // ── main builder ──────────────────────────────────────────────────────────────
@@ -969,13 +1353,49 @@ export async function runFeeEngine(lnd: AuthenticatedLnd, inputs: FeeEngineInput
   // A read cut short misses the newest forwards (LND pages oldest first):
   // what sold is then unknown — never read as "nothing sold".
   const salesKnown = history.complete;
+  // (A write that left the rate as it was — the base fee alone — is no change
+  // of price: it is not the change that set the fee, nor a step of a raise
+  // chain; the cooldown is not stamped for it either. Review FEE-12.)
   const changesOf = new Map<string, FeeChangeRecord[]>();
-  for (const r of inputs.feeHistory ?? []) changesOf.set(r.channelId, [...(changesOf.get(r.channelId) ?? []), r]);
+  for (const r of inputs.feeHistory ?? []) {
+    if (r.fromPpm !== null && r.fromPpm === r.toPpm) continue;
+    changesOf.set(r.channelId, [...(changesOf.get(r.channelId) ?? []), r]);
+  }
   const lastChangeOf = (id: string): BuildCtx["lastChange"] => {
     const last = [...(changesOf.get(id) ?? [])].sort((a, b) => b.at.localeCompare(a.at))[0];
     return last
       ? { at: last.at, fromPpm: last.fromPpm, toPpm: last.toPpm, via: last.via, ...(last.why ? { why: last.why } : {}), ...(last.pinned ? { pinned: true } : {}) }
       : undefined;
+  };
+  // Each channel's own forwards, in and out (what sold is read a dozen ways
+  // per channel below: over its own events, not the node's every time).
+  const eventsOf = new Map<string, ForwardEvent[]>();
+  for (const e of history.events) {
+    for (const id of e.incomingChannel === e.outgoingChannel ? [e.outgoingChannel] : [e.incomingChannel, e.outgoingChannel]) {
+      const list = eventsOf.get(id);
+      if (list) list.push(e);
+      else eventsOf.set(id, [e]);
+    }
+  }
+  /** What was sold at which fee, from the forwards and the fee-change log. */
+  const salesContext = (id: string): Partial<BuildCtx> => {
+    const events = eventsOf.get(id) ?? [];
+    const changes = changesOf.get(id) ?? [];
+    const fee = rateById.get(id)?.fee_rate ?? 0;
+    const readFrom = nowMs - readDays * DAY_MS;
+    return {
+      soldSinceChange: soldSince(events, id, changedAt(id)),
+      provenLevel: provenLevel(events, id, changes, fee, nowMs),
+      raiseChain: raiseChainOf(events, id, changes, fee, readFrom, nowMs),
+      priceTest: priceTestOf(events, id, changes, fee, readFrom, nowMs),
+      climbAnchor: climbAnchorOf(events, id, changes, fee, readFrom, nowMs),
+      recent: recentSales(events, id, nowMs),
+      soldAtOrAbove7d: flowAtFees(events, id, changes, fee, nowMs - 7 * DAY_MS, nowMs, (ppm) => ppm >= fee),
+      atOrBelow: {
+        d7: flowAtFees(events, id, changes, fee, nowMs - 7 * DAY_MS, nowMs, (ppm) => ppm <= fee),
+        d14: flowAtFees(events, id, changes, fee, nowMs - 14 * DAY_MS, nowMs, (ppm) => ppm <= fee),
+      },
+    };
   };
   const contexts = new Map<string, BuildCtx>(
     channels.map((ch) => [
@@ -986,12 +1406,7 @@ export async function runFeeEngine(lnd: AuthenticatedLnd, inputs: FeeEngineInput
         override: channelOverrides[ch.id],
         f14: flowOf(f14, ch.id),
         f30: flowOf(f30, ch.id),
-        ...(salesKnown
-          ? {
-              soldSinceChange: soldSince(history.events, ch.id, changedAt(ch.id)),
-              provenLevel: provenLevel(history.events, ch.id, changesOf.get(ch.id) ?? [], rateById.get(ch.id)?.fee_rate ?? 0, nowMs),
-            }
-          : {}),
+        ...(salesKnown ? salesContext(ch.id) : {}),
         lastChange: lastChangeOf(ch.id),
         currentBlock,
         records: rebalanceRecords,
@@ -1107,6 +1522,26 @@ export interface BuildCtx {
   soldSinceChange?: Flow;
   /** Its highest proven fee level (provenLevel) — absent: none known. */
   provenLevel?: ProvenLevel | null;
+  /** The run of autopilot raises that ended at the current fee, and the
+   *  highest fee of it that sold (raiseChainOf) — absent: not built (the
+   *  step-back then knows only the last change). */
+  raiseChain?: RaiseChain | null;
+  /** The price test that set the current fee, with the two stretches it is
+   *  judged on (priceTestOf) — null or absent: none, or not to be judged. */
+  priceTest?: PriceTest | null;
+  /** The climb of price tests the current fee belongs to, and its latest
+   *  weekly check (climbAnchorOf). */
+  climbAnchor?: ClimbAnchor | null;
+  /** What the channel sold in the last 1, 3, 7 and 14 days, whatever its fee
+   *  was (recentSales) — absent: not known. */
+  recent?: RecentSales;
+  /** What it sold in the last 7 days while its fee stood at the present one
+   *  or higher (flowAtFees) — absent: not known. */
+  soldAtOrAbove7d?: FlowOver;
+  /** What it sold and took in over the part of the last 7 and 14 days in
+   *  which its fee stood at the present one or lower (flowAtFees) — absent:
+   *  not built, the days count whole. */
+  atOrBelow?: { d7: FlowOver; d14: FlowOver };
   /** Its last fee change LightningMate made (the fee-change log): who made
    *  it (absent: the autopilot), its reason, whether it applied a pin — and
    *  its "from", null when that wasn't known. */
@@ -1132,9 +1567,13 @@ export interface BuildCtx {
 
 /** Which rule set this update's move — it decides the pacing and which
  *  reason leads. "range": the policy's min/max moved it (a fee outside them
- *  is brought into them in one move). "demand": the demand ramp raised it.
+ *  is brought into them in one move). "demand": the demand ramp raised it,
+ *  or the drain ramp.
  *  "step_back": a raise nothing sold at went back. */
-type MoveKind = "free" | "raise_step" | "lower_step" | "ramp" | "ratchet" | "jump" | "floor" | "hold" | "range" | "demand" | "step_back";
+type MoveKind = "free" | "raise_step" | "lower_step" | "ramp" | "ratchet" | "jump" | "floor" | "hold" | "range" | "demand" | "step_back" | "probe";
+
+/** The velocity fact of a channel that routes both ways in balance. */
+const VELOCITY_BALANCED = "velocity: active and balanced";
 
 /** One channel's recommendation — pure (exported for the engine's own
  *  simulation tests). */
@@ -1143,6 +1582,14 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const currentPpm = rate?.fee_rate ?? 0;
   const cap = Math.max(1, ch.capacity);
   const step = Math.max(1, cfg.stepPpm);
+  // The two floors the operator sets as fees — Protect ppm and the new
+  // channel's protected fee — hold inside Min..Max like every other fee
+  // (review FEE-4: with Max 200 and Protect 350 a drained channel was ramped
+  // to 300; with Max 50 a new channel was lifted to 80 and the range rule
+  // then walked it back down, two changes for nothing). Where Min stands
+  // above Max, Max wins, as in the range rule.
+  const protectPpm = clamp(cfg.protectPpm, cfg.minPpm, cfg.maxPpm);
+  const newChannelMinPpm = clamp(cfg.newChannelMinPpm, cfg.minPpm, cfg.maxPpm);
   // The reason that leads is the one shown in the Why column and recorded
   // as the run history's "why" (reasons[0]), so it must be the rule that set
   // the move — review: a raise toward the replacement cost read "market: …
@@ -1210,10 +1657,13 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // "idle".
   const demand = ctx.demand;
   const inDemand = !!demand && demand.attempts >= DEMAND_MIN_ATTEMPTS && demand.days >= DEMAND_MIN_DAYS && demand.sats >= DEMAND_MIN_SATS;
-  // Nobody routed through it in 30 days (and it isn't new, and it isn't
-  // turning payments away): drained, it is held; otherwise lowered by the
-  // no-flow rule.
-  const idle = f30.forwards === 0 && !isNewChan && !inDemand;
+  // Nobody routed through it in 30 days and it isn't turning payments away
+  // (`quiet`): drained, it is never raised, and no profit floor lifts it —
+  // whatever its age. Quiet and no longer new, it is `idle`: lowered by the
+  // no-flow rule. (A new channel has had no time to route; review FEE-7: one
+  // 2.9 days old sat at its protected fee and was at Min ppm a day later.)
+  const quiet = f30.forwards === 0 && !inDemand;
+  const idle = quiet && !isNewChan;
 
   // §6 peer gate — has it routed out (or seen flow) in the gate window?
   // On active routing paths in either direction? A fully-drained channel can't
@@ -1230,6 +1680,67 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const replacementCostPpm = market ? market.intoPeerPpm + (market.peerFeeToUsPpm ?? 0) : null;
   const draining = f30.forwards >= DRAIN_MIN_FORWARDS && netDrain30d >= DRAIN_NET_SHARE;
   const competitivePpm = marketPpm != null ? Math.max(cfg.minPpm, Math.round(marketPpm * MARKET_SHARE)) : null;
+
+  // What sold at the fee it charges now, and the change that set it.
+  const sold = ctx.soldSinceChange;
+  const salesKnown = sold !== undefined;
+  const recent = ctx.recent;
+  const changedMs = Date.parse(ctx.cooldown?.lastApplied?.[ch.id] ?? ctx.lastChange?.at ?? "");
+  const setAgo = Number.isFinite(changedMs) ? ` (set ${since(changedMs, ctx.nowMs)})` : "";
+  // ("12 sales since it was set 3 d ago" — or, with no change in the window
+  // the sales are counted over, "in 30 d".)
+  const soldSpan =
+    Number.isFinite(changedMs) && changedMs > ctx.nowMs - cfg.benchmarkWindowDays * DAY_MS
+      ? `since it was set ${since(changedMs, ctx.nowMs)}`
+      : `in ${cfg.benchmarkWindowDays} d`;
+  const inflowTolerance = Math.max(REFILL_INFLOW_TOLERANCE_SHARE * cap, REFILL_INFLOW_TOLERANCE_SATS);
+
+  // The drain ramp's signal (review FEE-3). The faster raises — protect, the
+  // demand ramp — start under 10 % local, when the liquidity is gone: a
+  // channel at 80 % local whose buyers took 300k a day and paid up to 400 ppm
+  // was raised 20 ppm every 72 h, sold 3.95M at 96 ppm on average and reached
+  // 350 ppm empty. The signal here is the time left: at what the channel
+  // sells net a day at the fee it charges NOW, it is down to 10 % local
+  // within DRAIN_RAMP_WITHIN_DAYS days. That rate is the largest of: the time
+  // since the fee was set (counted as DEMAND_RAMP_HOURS at least), and the
+  // last 1, 3, 7 and 14 days where the fee has stood that long — what sold at
+  // an older, lower fee says nothing about this one (a ramp reading it climbs
+  // past the price that had already slowed the drain). Each stretch counts
+  // with DRAIN_MIN_FORWARDS sales and DRAIN_RAMP_NET_SHARE of the capacity
+  // net out — what came in is taken off — and none counts unless the flow
+  // window (14 days) shows that much net out too: a channel that routes both
+  // ways has days on which it only sells, and gets the sats back the day
+  // after; one such day is not a drain. Not where a measurement says higher
+  // fees cost flow here (as for every drain reflex).
+  const windowDays = cfg.benchmarkWindowDays;
+  const stampMs = Date.parse(ctx.cooldown?.lastApplied?.[ch.id] ?? "");
+  // (What `sold` is counted over: since the fee's stamp, the window at most.)
+  const soldDays = Number.isFinite(stampMs) ? Math.min(windowDays, (ctx.nowMs - stampMs) / DAY_MS) : windowDays;
+  const heldDays = Number.isFinite(changedMs) ? Math.min(windowDays, (ctx.nowMs - changedMs) / DAY_MS) : windowDays;
+  let netOutPerDay = 0;
+  const drainRate = (f: Flow | undefined, days: number): void => {
+    if (!f || f.forwards < DRAIN_MIN_FORWARDS) return;
+    const net = f.out - f.inn;
+    if (net >= DRAIN_RAMP_NET_SHARE * cap) netOutPerDay = Math.max(netOutPerDay, net / days);
+  };
+  drainRate(sold, Math.max(soldDays, DEMAND_RAMP_HOURS / 24));
+  if (recent) {
+    if (heldDays >= 1) drainRate(recent.d1, 1);
+    if (heldDays >= 3) drainRate(recent.d3, 3);
+    if (heldDays >= 7) drainRate(recent.d7, 7);
+    if (heldDays >= 14) drainRate(recent.d14, 14);
+  }
+  const daysToDrained = netOutPerDay > 0 ? ((ch.localRatio - DEMAND_RAMP_LOCAL) * cap) / netOutPerDay : Infinity;
+  const fastDrain =
+    ch.localRatio >= DEMAND_RAMP_LOCAL &&
+    daysToDrained <= DRAIN_RAMP_WITHIN_DAYS &&
+    netDrain14d >= DRAIN_RAMP_NET_SHARE &&
+    ctx.elasticityMod >= 1;
+  /** "it sells ~300k a day net at 50 ppm — at that rate it is down to 10% local in ~11 d" */
+  const drainFact = (): string =>
+    `it sells ~${satsShort(Math.round(netOutPerDay))} a day net at ${currentPpm} ppm — at that rate it is down to ${Math.round(DEMAND_RAMP_LOCAL * 100)}% local in ${
+      daysToDrained < 1.5 ? "about a day" : `~${Math.round(daysToDrained)} d`
+    }`;
 
   // §2 target ratio
   const targetLocalRatio = targetLocalRatioFor(ch.role, cfg);
@@ -1252,7 +1763,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     velocityLine = claim("velocity: steady outbound demand — small nudge up", "velocity: steady outbound demand", 1);
   } else if (grossFlow14d >= 0.2 && Math.abs(netDrain14d) < 0.05) {
     winsFlow = true;
-    velocityLine = "velocity: active and balanced — holding";
+    velocityLine = `${VELOCITY_BALANCED} — holding`;
   } else if (grossFlow14d < 0.01 && ch.localRatio > targetLocalRatio + 0.2 && !inDemand && !isNewChan) {
     // (Never on a brand-new channel: it has had no time to route.)
     velocityMod = cfg.exploreLowerModifier;
@@ -1356,9 +1867,8 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // either: the channel is held — before, its reasons said "not raising
   // toward the replacement cost" while the curve raised it all the same. (The
   // benchmark's draining nudge needs a 14-day net drain over 5 %, which is
-  // drain velocity too.)
-  const noDrainSignal =
-    ch.localRatio >= targetLocalRatio - cfg.deadband && velocityMod <= 1 && (!draining || ctx.elasticityMod < 1);
+  // drain velocity too — and so does a fast drain, above.)
+  const noDrainSignal = ch.localRatio >= targetLocalRatio - cfg.deadband && velocityMod <= 1 && (!draining || ctx.elasticityMod < 1);
   // (A fee below the policy's min is lifted to the min by the range rule.)
   let heldLine: string | null = null;
   const curveAt = (): string => `the balance curve's ~${Math.min(cfg.maxPpm, Math.round(aim / step) * step)} ppm`;
@@ -1393,7 +1903,13 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const belowReplacement = draining && replacementCostPpm != null && currentPpm < replacementCostPpm;
   // Set only when it raised the aim (it then leads the reasons).
   let replacementLine: string | null = null;
-  if (draining && replacementCostPpm != null && market) {
+  // The refill cost the aim was raised to (null: it wasn't) — what the drain
+  // ramp's wider step is measured against.
+  let refillAim: number | null = null;
+  // (A channel on its way to drained within weeks is draining too, before
+  // the 30-day net says so: review FEE-3, S4a — the refill cost was known and
+  // shown for 24 days while 2.95M sold at a seventh of it.)
+  if ((draining || fastDrain) && replacementCostPpm != null && market) {
     const refill = Math.min(cfg.maxPpm, Math.round(replacementCostPpm * cfg.safetyMargin));
     if (refill > aim) {
       const cost =
@@ -1414,6 +1930,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
         );
       } else {
         aim = refill;
+        refillAim = refill;
         // (Priced above it, the channel is lowered toward it — and no
         // further: the curve's level below it is not where it is going.)
         replacementLine =
@@ -1424,6 +1941,161 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
       }
     }
   }
+
+  // Priced for the balance it will have (review FEE-3). The balance curve
+  // prices the balance a channel has: one that sells 6 % of its capacity a
+  // day is over its target today and under 10 % in eleven days, and the
+  // curve's raise comes when it is there. A channel that drains fast is
+  // priced where the curve puts the balance it will have in
+  // DRAIN_RAMP_AHEAD_DAYS days at its present net rate — still a low fee
+  // while it is full, the higher the nearer it comes to empty. Never a lower
+  // aim than the rules above set.
+  let drainAimLine: string | null = null;
+  if (fastDrain) {
+    const ahead = Math.max(0, ch.localRatio - (netOutPerDay * DRAIN_RAMP_AHEAD_DAYS) / cap);
+    const priced = balanceTargetPpm(ahead, targetLocalRatio, { ...cfg, neutralPpm: neutral }) * combinedMod;
+    if (priced > aim) {
+      aim = priced;
+      // (The refill cost is then not where the fee is going — "pricing toward
+      // 460 ppm" stood beside "on the way to 1000 ppm": its fact stays.)
+      if (replacementLine) {
+        const at = reasons.indexOf(replacementLine);
+        const known = claims.get(replacementLine)?.fact;
+        if (at >= 0 && known) reasons[at] = known;
+        replacementLine = null;
+      }
+      const fact = `drain: ${drainFact()}`;
+      const then = ahead < 0.005 ? "the empty channel it would be" : `the ~${Math.round(ahead * 100)}% local it will have`;
+      drainAimLine = claim(
+        `${fact} — priced for ${then} in ${DRAIN_RAMP_AHEAD_DAYS} days: ~${Math.min(cfg.maxPpm, Math.round(priced / step) * step)} ppm`,
+        fact,
+        1,
+      );
+      reasons.push(drainAimLine);
+    }
+  }
+
+  // Its last change, when that is a raise the autopilot made to the fee it
+  // has now: not one set by hand (a manual apply, a pin) or one whose "from"
+  // wasn't known (recorded as 0, it read as a raise from 0), nor while a pin
+  // or an exclusion holds the fee.
+  const lc = ctx.lastChange;
+  const byHand = !!lc && (lc.via === "manual" || lc.pinned === true || /^pinned to /.test(lc.why ?? ""));
+  const manualNow = ctx.override?.mode === "exclude" || (ctx.override?.mode === "fixed" && Number.isFinite(ctx.override.fixedPpm));
+  const raisedFrom = lc && !byHand && lc.fromPpm !== null && lc.fromPpm > 0 && lc.toPpm > lc.fromPpm && lc.toPpm === currentPpm ? lc.fromPpm : null;
+  const raisedMs = lc && raisedFrom !== null ? Date.parse(lc.at) : NaN;
+
+  // A fee that sells is not lowered (review FEE-2). The curve lowered 30 ppm
+  // a day whatever sold: a channel at its target that sold four times a day
+  // at 300 ppm was walked down to 90 in a week and earned a third of what
+  // 300 ppm earns on the same volume — "never below a fee that sold" was true
+  // of the step-back only, and the balanced level, an operator's guess, was
+  // the only price ever tried there. With SELLS_HERE_SALES sales at the fee
+  // since it was set and one in the last 7 days it is held
+  // against every lower aim: the curve's, the market's, a measured
+  // elasticity, a refill cost below it.
+  //
+  // A write does not undo what the channel has shown (the package's own
+  // review, R1: every change of the fee started "sold since it was set" at
+  // none, and with it the hold — a fee that had sold daily for a month was
+  // lowered the day after the autopilot wrote it, back from a climb, or the
+  // operator set it: 19 changes in 90 days on a channel whose buyers paid
+  // 110). So it is held, too, with SELLS_HERE_SALES sales in the last 7 days
+  // while the fee stood at this one or higher (who paid more pays this), and
+  // while it is not yet known whether it sells: it sold here since it was
+  // set, fewer than SELLS_HERE_SALES times, on a channel that sold that often
+  // in the last 7 days at whatever fee — until its own sales hold it, or the
+  // week has run out without them.
+  //
+  // Not where the channel holds more than its target and a lower fee has
+  // something to win: it takes in more than it sells (in 14 days, and still
+  // in the last 7 — over the days the fee stood at this one or lower: on the
+  // days of a higher fee, a price test's, it sold less because of that fee),
+  // or at what it sells a day it would need more than SPARE_SELL_DAYS days to
+  // sell what it holds over its target.
+  //
+  // Nor is a fee the autopilot raised to lowered by the curve in its first
+  // RAISE_TRIAL_DAYS days: what sells at it decides — the step-back takes it
+  // back after two days without a sale, a probe also when it earns less —
+  // where the curve undid a raise a day later, whatever it sold. That week
+  // stands whatever the channel holds: a test takes in more than it sells
+  // while its buyers find the new price, and lowered for that it was never
+  // judged.
+  //
+  // The range, a pin and a lease promise still lower such a fee; so does the
+  // no-flow rule (what sold nothing in 30 days is not selling).
+  const soldHere = sold?.forwards ?? 0;
+  const soldWeek = recent?.d7.forwards ?? 0;
+  const soldWeekAtLeast = ctx.soldAtOrAbove7d?.forwards ?? 0;
+  const sellsAtFee = salesKnown && soldHere >= SELLS_HERE_SALES && soldWeek >= 1;
+  const soldAtLeast = salesKnown && !sellsAtFee && soldWeekAtLeast >= SELLS_HERE_SALES;
+  const notYetKnown = salesKnown && !sellsAtFee && !soldAtLeast && soldHere >= 1 && soldWeek >= SELLS_HERE_SALES;
+  const sellsHere = sellsAtFee || soldAtLeast || notYetKnown;
+  const onTrial = raisedFrom !== null && !manualNow && ctx.nowMs - raisedMs < RAISE_TRIAL_DAYS * DAY_MS;
+  // …nor, for as long, the fee a step-back went back to: it is the fee that
+  // sold before the raise, and its sales "since it was set" start at none
+  // again — the curve took a 300 ppm that had sold 75 times in a month down a
+  // step the day after a test's step-back, before three new sales could hold
+  // it. (Every step-back: the one that ends a climb of several raises says
+  // "raised", not "tried", and was not covered.)
+  const testedFrom =
+    lc && !byHand && lc.fromPpm !== null && lc.toPpm < lc.fromPpm && lc.toPpm === currentPpm && /^step back: /.test(lc.why ?? "") ? lc.fromPpm : null;
+  const testedMs = lc && testedFrom !== null ? Date.parse(lc.at) : NaN;
+  const backOnTrial = testedFrom !== null && !manualNow && ctx.nowMs - testedMs < RAISE_TRIAL_DAYS * DAY_MS;
+  const overTarget = ch.localRatio - targetLocalRatio > cfg.deadband;
+  const spareSats = Math.max(0, (ch.localRatio - targetLocalRatio) * cap);
+  // (A context without the fee levels counts the days whole.)
+  const atFee = ctx.atOrBelow ?? (recent ? { d7: { ...recent.d7, ms: 7 * DAY_MS }, d14: { ...recent.d14, ms: 14 * DAY_MS } } : undefined);
+  const takesInMore = !!atFee && atFee.d14.inn - atFee.d14.out > inflowTolerance && atFee.d7.inn > atFee.d7.out;
+  const soldPerDay = recent ? recent.d14.out / 14 : 0;
+  const slowSeller = !!recent && spareSats > soldPerDay * SPARE_SELL_DAYS;
+  const spareToSell = overTarget && (takesInMore || slowSeller);
+  // Set when this hold kept the fee (a lowering another line claimed is then
+  // taken back to its fact).
+  let heldSelling = false;
+  if (aim < currentPpm && (sellsHere || onTrial || backOnTrial)) {
+    const lowerAim = Math.max(cfg.minPpm, Math.min(cfg.maxPpm, Math.round(aim / step) * step));
+    const sales = (n: number): string => (n === 1 ? "1 sale" : `${n} sales`);
+    if (onTrial || backOnTrial || !spareToSell) {
+      heldLine =
+        sellsAtFee && !spareToSell
+          ? `hold: it sells at ${currentPpm} ppm (${sales(soldHere)} ${soldSpan}) — a fee that sells is not lowered toward ${lowerAim} ppm`
+          : soldAtLeast && !spareToSell
+            ? `hold: it sold ${soldWeekAtLeast} times in the last 7 days at ${currentPpm} ppm or more — a fee that sells is not lowered toward ${lowerAim} ppm`
+            : notYetKnown && !spareToSell
+              ? `hold: ${sales(soldHere)} at ${currentPpm} ppm ${soldSpan}, on a channel that sold ${soldWeek} times in the last 7 days — too early to say it does not sell here: it is not lowered toward ${lowerAim} ppm`
+              : onTrial
+                ? `hold: raised ${raisedFrom}→${currentPpm} ppm ${since(raisedMs, ctx.nowMs)} — what sells at it decides for ${RAISE_TRIAL_DAYS} days, it is not lowered toward ${lowerAim} ppm`
+                : `hold: back at ${currentPpm} ppm ${since(testedMs, ctx.nowMs)}, after ${/^step back: tried /.test(lc?.why ?? "") ? "a test of" : "a raise to"} ${testedFrom} ppm — it sold here before: what sells at it decides for ${RAISE_TRIAL_DAYS} days, it is not lowered toward ${lowerAim} ppm`;
+      aim = currentPpm;
+      heldSelling = true;
+      // (Nor is it "testing a lower fee".)
+      if (exploring) {
+        exploring = false;
+        dropLine(velocityLine);
+      }
+      if (benchMod < 1) dropLine(benchLine);
+      dropLine(marketLine);
+      reasons.push(heldLine);
+    } else if (sellsHere && recent && atFee) {
+      // (Over the days at this fee or a lower one, where some were left out.)
+      const atFeeDays = Math.round((atFee.d14.ms / DAY_MS) * 10) / 10;
+      const over = atFeeDays >= 14 ? "in 14 d" : `in the ${atFeeDays} of the last 14 days at this fee or a lower one`;
+      reasons.push(
+        takesInMore
+          ? `spare: it sells at ${currentPpm} ppm, but holds more than its target and takes in more than it sells (${satsShort(atFee.d14.inn)} in, ${satsShort(atFee.d14.out)} out ${over}) — the fee is not held for those sales`
+          : `spare: it sells at ${currentPpm} ppm, but at ~${satsShort(Math.round(soldPerDay))} a day it would take more than ${SPARE_SELL_DAYS} days to sell the ${satsShort(Math.round(spareSats))} it holds over its target — the fee is not held for those sales`,
+      );
+    }
+  }
+
+  // With the forwarding history incomplete, what the fee sold is unknown and
+  // none of the holds above can speak. The run says so (the package's own
+  // review, R8: a selling fee went down a step with no line why the hold was
+  // off). The fee is still lowered: a node whose history never fits the read
+  // would otherwise only ever raise.
+  if (!salesKnown && aim < currentPpm)
+    reasons.push("sales unknown: the forwarding history could not be read whole — the hold for a fee that sells does not apply on this run");
 
   // ── the move: bounded steps toward the aim ─────────────────────────────
   let target = aim;
@@ -1451,23 +2123,38 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // after a sale at the price before it: where nobody buys at the new price,
   // it stops one step above the last one that sold (the ordinary steps go
   // on). Never past the aim; a channel with liquidity keeps the gentle steps.
-  const sold = ctx.soldSinceChange;
-  const inflowTolerance = Math.max(REFILL_INFLOW_TOLERANCE_SHARE * cap, REFILL_INFLOW_TOLERANCE_SATS);
   const drainedWithBuyers =
     ch.localRatio < DEMAND_RAMP_LOCAL && f30.forwards >= DRAIN_MIN_FORWARDS && f14.inn - f14.out <= inflowTolerance;
   const demandRamp = drainedWithBuyers && (sold?.forwards ?? 0) >= DEMAND_RAMP_SALES && ctx.elasticityMod >= 1;
+  // The drain ramp (review FEE-3): the same moves BEFORE the channel is
+  // drained, on the signal above — at what it sells net a day at this fee it
+  // is down to 10 % local within DRAIN_RAMP_WITHIN_DAYS days — and the same
+  // proof, DEMAND_RAMP_SALES sales at the fee it raises from. Each move
+  // starts the count again: where the higher fee slows the sales enough, the
+  // ramp ends by itself, at the fee that holds the balance; where nothing
+  // sells at it, the step-back takes it back to the last fee that sold.
+  // Toward a refill cost the market shows it covers a third of the way per
+  // move where that is more (never more than doubling the fee): 70 → 140 →
+  // 280 → 520 toward ~1,000 where a quarter needs twelve moves.
+  const drainRamp = fastDrain && (sold?.forwards ?? 0) >= DEMAND_RAMP_SALES;
+  const ramping = demandRamp || drainRamp;
   const ordinaryStep = RAISE_STEPS * step * elasticStep;
   // (Rounded down onto the grid: "up to a quarter" holds — 25 % of 100 is a
   // 20-ppm move on a 10-ppm grid, never 30.)
-  const raiseStep = demandRamp ? Math.max(ordinaryStep, Math.floor((from * DEMAND_RAMP_SHARE) / step) * step) : ordinaryStep;
+  const quarterStep = Math.floor((from * DEMAND_RAMP_SHARE) / step) * step;
+  const gapStep =
+    drainRamp && refillAim !== null && refillAim > from
+      ? Math.min(Math.floor(((refillAim - from) * DRAIN_RAMP_GAP_SHARE) / step) * step, Math.floor(from / step) * step)
+      : 0;
+  const raiseStep = ramping ? Math.max(ordinaryStep, quarterStep, gapStep) : ordinaryStep;
   // The most any channel is lowered in one move: its ratchet's steps (at
   // least one).
   const lowerStep = Math.max(1, cfg.noFlowRatchetSteps) * step;
   if (target > from + raiseStep) {
     target = from + raiseStep;
-    kind = demandRamp ? "demand" : "raise_step";
+    kind = ramping ? "demand" : "raise_step";
     hiLimit = from + raiseStep;
-  } else if (demandRamp && target > from) {
+  } else if (ramping && target > from) {
     // Its last move, onto the aim, keeps the ramp's pacing too (as "free" it
     // would wait the 72 h raise pause behind the ramp's own previous move).
     kind = "demand";
@@ -1478,8 +2165,8 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // 310 → 380 waited 6 h where 310 → 350 takes one).
   let floorAhead = 0;
   if (kind === "demand") {
-    const protectAhead = ch.localRatio < 0.1 && (f30.forwards > 0 || inDemand) ? cfg.protectPpm : 0;
-    const profitAhead = profitFloorPpm != null && refill && !idle ? profitFloorPpm : 0;
+    const protectAhead = ch.localRatio < 0.1 && (f30.forwards > 0 || inDemand) ? protectPpm : 0;
+    const profitAhead = profitFloorPpm != null && refill && !quiet ? profitFloorPpm : 0;
     const ahead = Math.max(protectAhead, profitAhead);
     if (ahead > from && target > ahead) {
       floorAhead = ahead;
@@ -1495,6 +2182,170 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // own limits where they take over.
   if (target > currentPpm) hiLimit = Math.min(hiLimit, from + raiseStep, aim);
   else if (target < currentPpm) loLimit = Math.max(loLimit, currentPpm - lowerStep, aim);
+  // The upward probe (review FEE-2; othervice's decision E1). A fee that
+  // sells is kept — and nothing ever tried whether its buyers pay more: the
+  // curve aims at the balanced level whatever sells, and a channel that isn't
+  // below its target and doesn't drain is never raised. Where it sells daily
+  // (PROBE_WEEK_SALES sales in the last week, SELLS_HERE_SALES of them at this
+  // fee), holds no more than its target, no measurement says higher fees cost
+  // flow here, and no rule raises it (the aim is at the fee, or nearer than
+  // the anti-churn threshold lets a move be), it tries a fee PROBE_SHARE
+  // higher — at least one grid step, at the ordinary raise's pace. The
+  // step-back below takes it back: after STEP_BACK_AFTER_HOURS without a
+  // sale, or when it earned less than the fee before it did. With fewer
+  // sales a week a probe would mostly be taken back by chance (two days
+  // without a sale are then the rule, not a sign), so it isn't made — nor
+  // before the fee has stood PROBE_JUDGE_AFTER_HOURS and sold
+  // PROBE_RECENT_SALES times in them: those hours are what the probe is set
+  // against. (The lines call it a "price test": "probes" are refused
+  // payments elsewhere in the app.)
+  //
+  // What a probe earned is judged once (the package's own review, R2): its
+  // first PROBE_JUDGE_AFTER_HOURS against the PROBE_JUDGE_AFTER_HOURS before
+  // it, at the fee before — two stretches of one length, both over when the
+  // first run looks at them, so that no later sale changes what they say.
+  // Less, and it goes back (while its RAISE_TRIAL_DAYS days run); as much or
+  // more, and it is kept and the next probe may follow. Before, it was a
+  // running average a day over two stretches of unlike length, read at every
+  // run from 72 hours on with one sale's margin: the hour the autopilot ran
+  // in decided whether the same probe stayed, and what chance kept was never
+  // looked at again — buyers who buy a sixth less at each tenth more left a
+  // channel 1,500 to 2,000 sat in 120 days where the fee it began at earned
+  // 2,400.
+  const probed = raisedFrom !== null && /^price test: /.test(lc?.why ?? "");
+  const raisedH = (ctx.nowMs - raisedMs) / 3_600_000;
+  const test = probed && ctx.priceTest && ctx.priceTest.fromPpm === raisedFrom ? ctx.priceTest : null;
+  /** "early": not judged yet. "less": to be taken back. "kept". Null: no
+   *  price test, one that is not judged on what it earned (the stretch before
+   *  it is not on record whole), or one that earned less and could not be
+   *  taken back in its trial days — an ordinary fee by now. */
+  const verdict: "early" | "less" | "kept" | null = !test
+    ? null
+    : raisedH < PROBE_JUDGE_AFTER_HOURS
+      ? "early"
+      : test.first.revenue >= test.before.revenue
+        ? "kept"
+        : raisedH < RAISE_TRIAL_DAYS * 24
+          ? "less"
+          : null;
+  const sat = (n: number): string => (n < 100 ? String(Math.round(n * 10) / 10) : Math.round(n).toLocaleString("en-US"));
+  // One step of a tenth cannot be told from chance on three days' sales
+  // (twelve sales vary by a quarter and more on their own), and a probe kept
+  // by chance is the base of the next. So the climb is checked against the
+  // fee it began at — the fee before the earliest of its price tests since
+  // which the fee never came back to it: at the end of each of its weeks,
+  // what it earned in its last days against as many days before the climb
+  // (climbAnchorOf). Less, and the whole climb goes back (below). Only where
+  // the channel had sats to sell through those days — the time the autopilot
+  // keeps for the step-back.
+  const sellableSince = ctx.cooldown?.sellableSince;
+  const sellableSinceMs = sellableSince === undefined ? -Infinity : Date.parse(sellableSince[ch.id] ?? "");
+  const anchor = ctx.climbAnchor && ctx.climbAnchor.ppm < currentPpm ? ctx.climbAnchor : null;
+  const anchorWeek = anchor?.week ?? null;
+  const anchorJudged = !!anchorWeek && sellableSinceMs <= anchorWeek.from;
+  // Less by more than one sale: two stretches of one length of the same even
+  // flow differ by a sale (a channel selling twice a day sold 9 times in five
+  // days and 10 times in the five before — at a tenth more a sale, that read
+  // "earned less" and took back the fee its buyers paid).
+  const anchorSale = anchorWeek && anchorWeek.now.forwards > 0 ? anchorWeek.now.revenue / anchorWeek.now.forwards : 0;
+  const anchorLess = !!anchorWeek && anchorJudged && anchorWeek.now.revenue + anchorSale < anchorWeek.before.revenue;
+  const spanOf = (hours: number): string => (hours % 24 === 0 ? `${hours / 24} d` : `${hours} h`);
+  /** The hours a week's check is judged on, as its line names them. */
+  const lastSpan = (w: { hours: number; window: number }): string =>
+    w.hours < w.window ? `${spanOf(w.hours)} of its last ${spanOf(w.window)} (without a price test taken back or not yet judged)` : `its last ${spanOf(w.hours)}`;
+  if (anchor && anchorWeek && anchorJudged && !anchorLess)
+    reasons.push(
+      `price test: at ${currentPpm} ppm, up from ${anchor.ppm} ppm ${since(Date.parse(anchor.startedAt), ctx.nowMs)} — it earned ${sat(anchorWeek.now.revenue)} sat in ${lastSpan(anchorWeek)} against ${sat(anchorWeek.before.revenue)} in the ${spanOf(anchorWeek.hours)} before, at ${anchor.ppm} ppm: kept${
+        anchorWeek.now.revenue < anchorWeek.before.revenue ? " (less by no more than one sale)" : ""
+      }`,
+    );
+  // A probe that was taken back is not made again for a while that grows
+  // with each failure (7, 14, 28 days) — the step-back's record, kept apart
+  // for probes: as one memory, a failed probe held a drained channel's
+  // protect ramp down for a week, and a burst of demand sold at the old fee.
+  // No middle of the stretch is tried in between, as after a step-back: a
+  // probe is one small step already, and half of it says nothing new (a
+  // channel went 280 → 300 → 280 → 290 → 280 every two weeks).
+  const probeBack = ctx.cooldown?.probeBacks?.[ch.id];
+  const probeBackAtMs = probeBack ? Date.parse(probeBack.at) : NaN;
+  const probeBackDays = stepBackMemoryDays(probeBack?.count);
+  const probeBackLive =
+    !!probeBack && Number.isFinite(probeBackAtMs) && ctx.nowMs - probeBackAtMs < probeBackDays * DAY_MS && currentPpm < probeBack.fromPpm;
+  let probeMemorySaid = false;
+  const minDelta = Math.max(cfg.minChangePpm, Math.round(currentPpm * cfg.relativeChangeThreshold));
+  const weekSales = recent?.d7.forwards ?? 0;
+  // (recent.d3: the PROBE_JUDGE_AFTER_HOURS before now.)
+  const recentSold = recent?.d3.forwards ?? 0;
+  if (
+    sellsAtFee &&
+    weekSales >= PROBE_WEEK_SALES &&
+    !overTarget &&
+    ctx.elasticityMod >= 1 &&
+    !manualNow &&
+    currentPpm >= cfg.minPpm &&
+    currentPpm < cfg.maxPpm &&
+    // (No rule lowers it — a hold has set the aim to the fee by now — and
+    // none raises it by a move the threshold lets through.)
+    aim >= currentPpm &&
+    aim - currentPpm < minDelta
+  ) {
+    const probeStep = Math.max(step, Math.floor((currentPpm * PROBE_SHARE) / step) * step);
+    const to = Math.min(cfg.maxPpm, currentPpm + probeStep);
+    if (verdict === "early" && test) {
+      reasons.push(
+        `price test: raised ${raisedFrom}→${currentPpm} ppm ${since(raisedMs, ctx.nowMs)} — judged once, ${PROBE_JUDGE_AFTER_HOURS} h after the raise: what it earned in them against the ${PROBE_JUDGE_AFTER_HOURS} h before, at ${raisedFrom} ppm (${sat(test.before.revenue)} sat)`,
+      );
+    } else if (verdict === "less" || anchorLess) {
+      // (Earning less: the step-backs below say so.)
+    } else if (probeBack && probeBackLive) {
+      const until = new Date(probeBackAtMs + probeBackDays * DAY_MS).toISOString().slice(0, 10);
+      probeMemorySaid = true;
+      reasons.push(
+        `price test: ${probeBack.fromPpm} ppm was tried and taken back ${since(probeBackAtMs, ctx.nowMs)}${
+          (probeBack.count ?? 1) > 1 ? ` (the ${probeBack.count === 2 ? "second" : "third"} time in a row)` : ""
+        } — no higher fee is tried before ${until}`,
+      );
+    } else if (heldDays * 24 < PROBE_JUDGE_AFTER_HOURS || recentSold < PROBE_RECENT_SALES) {
+      if (verdict === "kept" && test)
+        reasons.push(
+          `price test: ${currentPpm} ppm earned ${sat(test.first.revenue)} sat in its first ${PROBE_JUDGE_AFTER_HOURS} h against ${sat(test.before.revenue)} in the ${PROBE_JUDGE_AFTER_HOURS} h before, at ${raisedFrom} ppm — kept; a higher fee is tried once it sold ${PROBE_RECENT_SALES} times in ${PROBE_JUDGE_AFTER_HOURS} h (${recentSold} in the last ${PROBE_JUDGE_AFTER_HOURS} h)`,
+        );
+    } else {
+      target = to;
+      aim = target;
+      hiLimit = target;
+      kind = "probe";
+      // (Not "testing a lower fee" beside a raise.)
+      if (exploring) {
+        exploring = false;
+        dropLine(velocityLine);
+      }
+    }
+  }
+  // The price a test failed at is not reached by an ordinary raise either
+  // while the test's memory lasts (the package's own review, R6: three days
+  // after 110 ppm was judged to earn less than 100, "steady outbound demand —
+  // small nudge up" went 100 → 120 in one move, past it). Such a raise stops
+  // on the highest grid price below the one that failed. The demand and drain
+  // ramps, the protect ramp and the floors stay free: a failed test must not
+  // hold a draining channel down (a burst of demand sold at the old fee).
+  if (probeBack && probeBackLive && !ramping && kind !== "probe" && target > currentPpm) {
+    const below = Math.max(currentPpm, Math.ceil(probeBack.fromPpm / step) * step - step);
+    if (target > below) {
+      target = below;
+      hiLimit = Math.min(hiLimit, below);
+      aim = Math.min(aim, below);
+      const until = new Date(probeBackAtMs + probeBackDays * DAY_MS).toISOString().slice(0, 10);
+      const fact = `${probeBack.fromPpm} ppm was tried and taken back ${since(probeBackAtMs, ctx.nowMs)} — it earned less there`;
+      if (below <= currentPpm) {
+        kind = "hold";
+        if (!probeMemorySaid) dominant(`hold: ${fact}; not raised to it before ${until} unless the channel drains`);
+      } else {
+        reasons.push(claim(`guard: ${fact}; raised no higher than ${below} ppm before ${until} unless the channel drains`, null, 1));
+      }
+    }
+  }
+
   // A raise needs a buyer at the fee it raises from (2026-10-25 review):
   // the curve, a drain signal, the replacement cost and the ramp all read 14-
   // and 30-day windows that may hold no sale at all — node8153 was raised
@@ -1504,13 +2355,17 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // it is held (the floors, the policy's min, a pin and a lease promise
   // still move it). Without the forwarding history (a read cut short) what
   // sold is unknown, and the rule doesn't apply.
-  const salesKnown = sold !== undefined;
-  const changedMs = Date.parse(ctx.cooldown?.lastApplied?.[ch.id] ?? ctx.lastChange?.at ?? "");
-  const setAgo = Number.isFinite(changedMs) ? ` (set ${since(changedMs, ctx.nowMs)})` : "";
+  // A payment turned away for lack of outbound since the fee was set is a
+  // buyer at this fee the sales can't show (a drained channel sells nothing).
+  // Where the time of the last one isn't known (a record written before it
+  // was kept), protect takes the demand as current — the step-back does not.
+  const refusedAt = demand?.lastAt;
+  const refusedSinceSet = inDemand && (refusedAt == null || !Number.isFinite(changedMs) || refusedAt > changedMs);
+  const refusedSinceSetForSure = inDemand && refusedAt != null && Number.isFinite(changedMs) && refusedAt > changedMs;
   // A drained channel nobody routes through is never raised (below) — its
   // own hold says so, with its fee as the aim, not "before a sale" (final
   // review: it read "not raised toward 350 ppm before a sale").
-  const drainedIdle = idle && ch.localRatio < 0.1;
+  const drainedIdle = quiet && ch.localRatio < 0.1;
   let unsoldLine: string | null = null;
   if (salesKnown && sold.forwards === 0 && target > currentPpm && !drainedIdle) {
     // (The aim as the policy's max bounds it: the line named aims above it.)
@@ -1527,59 +2382,88 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // nobody had bought at. A raise goes at most to the highest grid price
   // below it; a floor, the policy's min, a pin and a lease promise still
   // move the fee (and a fee a floor took past it is not held back by it).
+  //
+  // The memory grows and narrows (review FEE-11): a step-back that ended no
+  // higher than the one before doubles it (7, 14, 28 days), and while the fee
+  // stands in the lower half between the price it went back to and the one
+  // that failed, a raise goes at most to the middle — each failed try halves
+  // the stretch that is tried again, instead of the whole climb every week.
   const lastBack = ctx.cooldown?.stepBacks?.[ch.id];
   const backAtMs = lastBack ? Date.parse(lastBack.at) : NaN;
+  const backDays = stepBackMemoryDays(lastBack?.count);
+  const backLive = !!lastBack && Number.isFinite(backAtMs) && ctx.nowMs - backAtMs < backDays * DAY_MS && currentPpm < lastBack.fromPpm;
+  /** The highest fee the memory lets a raise reach (Infinity: no memory). */
+  let memoryCap = Infinity;
+  if (lastBack && backLive) memoryCap = memoryCapOf(lastBack, currentPpm, step);
   let backCapLine: string | null = null;
   let backCapAt = Infinity;
-  if (
-    lastBack &&
-    Number.isFinite(backAtMs) &&
-    ctx.nowMs - backAtMs < STEP_BACK_MEMORY_DAYS * DAY_MS &&
-    currentPpm < lastBack.fromPpm &&
-    target >= lastBack.fromPpm
-  ) {
-    backCapAt = Math.max(currentPpm, Math.ceil(lastBack.fromPpm / step) * step - step);
-    const until = new Date(backAtMs + STEP_BACK_MEMORY_DAYS * DAY_MS).toISOString().slice(0, 10);
-    const fact = `stepped back from ${lastBack.fromPpm} ppm ${since(backAtMs, ctx.nowMs)}`;
-    target = backCapAt;
-    hiLimit = Math.min(hiLimit, backCapAt);
-    aim = Math.min(aim, backCapAt);
+  // The aim the memory stopped short (null: it didn't). The anti-churn
+  // threshold judges a raise the memory bounds against it: the middle of the
+  // stretch may be 10 ppm away while what the rules aim at is hundreds —
+  // with the bounded aim as the gap, a fee that sold sat a step under the
+  // middle for the memory's whole length ("change below threshold").
+  let aimPastMemory: number | null = null;
+  /** The memory's bound, said once — by the rule it stopped first: a hold
+   *  where it leaves no room at all, else a guard. */
+  const sayMemory = (): void => {
+    if (!lastBack || backCapLine) return;
+    backCapAt = memoryCap;
+    const until = new Date(backAtMs + backDays * DAY_MS).toISOString().slice(0, 10);
+    const fact = `stepped back from ${lastBack.fromPpm} ppm ${since(backAtMs, ctx.nowMs)}${
+      (lastBack.count ?? 1) > 1 ? ` (the ${lastBack.count === 2 ? "second" : "third"} time in a row)` : ""
+    }`;
     if (backCapAt <= currentPpm) {
       backCapLine = `hold: ${fact} — not raised back to it before ${until}`;
-      kind = "hold";
       dominant(backCapLine);
     } else {
       backCapLine = claim(`guard: ${fact} — raised no higher than ${backCapAt} ppm before ${until}`, null, 1);
       reasons.push(backCapLine);
     }
+  };
+  // (Also where this move stays under the bound and the aim lies past it: "on
+  // the way to 830 ppm" was said of a climb the memory ends at 390.)
+  if (lastBack && backLive && (target > memoryCap || (aim > memoryCap && target > currentPpm))) {
+    target = Math.min(target, memoryCap);
+    hiLimit = Math.min(hiLimit, memoryCap);
+    if (aim > memoryCap) aimPastMemory = aim;
+    aim = Math.min(aim, memoryCap);
+    if (memoryCap <= currentPpm) kind = "hold";
+    sayMemory();
   }
 
   // The step-back (2026-10-25 review): a fee LightningMate raised that sold
   // nothing for STEP_BACK_AFTER_HOURS while the channel had sats to sell goes
-  // back in one move, paced like a lowering, to the higher of the last price
-  // that sold three times (its proven level) and the fee before that raise —
-  // never below a fee that sold (final review: a proven level under the
-  // raise's "from" took it below a fee that had sold); none when a level at
-  // or above this fee sold three times. The ramp stopped one step above what
-  // buyers paid, and a drained channel had no way back down: the no-flow
-  // rule needs 10 % local and 30 idle days. The hours count from the raise —
-  // or, if later, from when the channel last got sats to sell (the
-  // autopilot keeps that time): a channel drained through them could sell
-  // nothing, and was stepped back on the first run its liquidity came back.
-  // Not a raise set by hand (a manual apply, a pin) or one whose "from"
-  // wasn't known (recorded as 0, it read as a raise from 0), nor while a pin
-  // or an exclusion holds the fee.
-  const lc = ctx.lastChange;
-  const byHand = !!lc && (lc.via === "manual" || lc.pinned === true || /^pinned to /.test(lc.why ?? ""));
-  const manualNow = ctx.override?.mode === "exclude" || (ctx.override?.mode === "fixed" && Number.isFinite(ctx.override.fixedPpm));
-  const raisedFrom = lc && !byHand && lc.fromPpm !== null && lc.fromPpm > 0 && lc.toPpm > lc.fromPpm && lc.toPpm === currentPpm ? lc.fromPpm : null;
-  const raisedMs = lc && raisedFrom !== null ? Date.parse(lc.at) : NaN;
+  // back in one move, paced like a lowering (the ramp stopped one step above
+  // what buyers paid, and a drained channel had no way back down: the no-flow
+  // rule needs 10 % local and 30 idle days). It goes to the last fee that
+  // sold: the highest price of the climb that ended here at which something
+  // sold — or, if none of them sold, the fee before the climb's first raise
+  // (review FEE-1: a ramp went 80 → 350 ppm in 42 hours past buyers who paid
+  // up to 150; one step back, to 340, left it above them for months) — and
+  // never below the last price that sold three times (its proven level). A
+  // floor that holds the fee anyway — the profit floor, a new channel's
+  // protected fee, the policy's min — is where it stops, and with none of
+  // that below the fee there is no step-back (review FEE-8: "step back … to
+  // 80 ppm" was said over a fee a floor kept). Not while payments were turned
+  // away since the fee was set: those are buyers at this price. The hours
+  // count from the raise — or, if later, from when the channel last got sats
+  // to sell (the autopilot keeps that time): a channel drained through them
+  // could sell nothing, and was stepped back on the first run its liquidity
+  // came back.
+  // (Only a raise the autopilot made — `raisedFrom`, above.)
   const sellable = sellableSats(cap, ch.localRatio);
   const proven = ctx.provenLevel ?? null;
-  // (At or above this fee, the proven level leaves nothing below it: none.)
-  const backTo = raisedFrom !== null ? Math.max(raisedFrom, proven?.ppm ?? 0) : null;
-  const sinceMap = ctx.cooldown?.sellableSince;
-  const clockMs = Math.max(raisedMs, sinceMap === undefined ? -Infinity : Date.parse(sinceMap[ch.id] ?? ""));
+  // (Without the climb — a context that has only the last change, a raise
+  // older than the forwards read — it is the fee before that raise.)
+  const climb = raisedFrom !== null ? (ctx.raiseChain ?? null) : null;
+  const climbTo = climb ? (climb.soldPpm ?? climb.basePpm) : raisedFrom;
+  const holdNew = ageDays != null && ageDays < cfg.newChannelProtectionDays && f30.forwards < 3 ? newChannelMinPpm : 0;
+  const holdProfit = profitFloorPpm != null && refill && !quiet ? profitFloorPpm : 0;
+  const heldAt = Math.max(cfg.minPpm, holdNew, holdProfit);
+  // (At or above this fee, the proven level or a floor leaves nothing below
+  // it: none.)
+  const backTo = climbTo !== null ? Math.max(climbTo, proven?.ppm ?? 0, heldAt) : null;
+  const clockMs = Math.max(raisedMs, sellableSinceMs);
   let stepBackLine: string | null = null;
   if (
     raisedFrom !== null &&
@@ -1588,19 +2472,32 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     !manualNow &&
     salesKnown &&
     sold.forwards === 0 &&
+    !refusedSinceSetForSure &&
     Number.isFinite(clockMs) &&
     ctx.nowMs - clockMs >= STEP_BACK_AFTER_HOURS * 3_600_000 &&
     sellable >= stepBackSellableMin(cap)
   ) {
-    const fact = `step back: raised ${raisedFrom}→${currentPpm} ppm ${since(raisedMs, ctx.nowMs)} and nothing sold at it since`;
+    const steps = climb?.steps ?? 1;
+    const fact =
+      climb && steps > 1
+        ? `step back: raised ${climb.basePpm}→${currentPpm} ppm in ${steps} moves, the last ${since(raisedMs, ctx.nowMs)}, and nothing sold at it since`
+        : `step back: ${probed ? "tried" : "raised"} ${raisedFrom}→${currentPpm} ppm ${since(raisedMs, ctx.nowMs)} and nothing sold at it since`;
     const selling = clockMs > raisedMs ? ` (with sats to sell for ${since(clockMs, ctx.nowMs).replace(/ ago$/, "")})` : "";
-    stepBackLine = claim(
-      `${fact}${selling}, with ${satsShort(sellable)} to sell — back to ${backTo} ppm, ${
-        proven && backTo === proven.ppm ? `the last price that sold ${proven.sales} times` : "its fee before that raise"
-      }`,
-      fact,
-      -1,
-    );
+    const where =
+      proven && backTo === proven.ppm
+        ? `the last price that sold ${proven.sales} times`
+        : backTo === holdProfit
+          ? "its profit floor, what its refills cost"
+          : backTo === holdNew
+            ? "a new channel's protected fee"
+            : climb && climb.soldPpm !== null && backTo === climb.soldPpm
+              ? "the highest price of this climb that sold"
+              : backTo === climbTo
+                ? steps > 1
+                  ? `its fee before these ${steps} raises`
+                  : "its fee before that raise"
+                : "the policy's min";
+    stepBackLine = claim(`${fact}${selling}, with ${satsShort(sellable)} to sell — back to ${backTo} ppm, ${where}`, fact, -1);
     if (unsoldLine) dropLine(unsoldLine);
     unsoldLine = null;
     if (backCapLine) dropLine(backCapLine);
@@ -1609,6 +2506,98 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     aim = Math.min(aim, backTo);
     loLimit = backTo;
     hiLimit = backTo;
+    kind = "step_back";
+    dominant(stepBackLine);
+  }
+
+  // A climb of price tests that earned less than the fee it began at goes
+  // back to that fee (the check above), all of it: each of its tests was
+  // kept on three days' sales, and together they are what the weeks show.
+  // Not below a floor that holds the fee anyway, and — as the step-back
+  // above — not after payments were turned away since the fee was set. It
+  // goes further down than a step-back for a last test nothing sold at, and
+  // takes its place.
+  const climbBackTo = anchor ? Math.max(anchor.ppm, heldAt) : null;
+  let climbBack = false;
+  if (
+    anchor &&
+    anchorWeek &&
+    anchorLess &&
+    climbBackTo !== null &&
+    climbBackTo < (kind === "step_back" ? target : currentPpm) &&
+    !manualNow &&
+    !refusedSinceSetForSure &&
+    sellable >= stepBackSellableMin(cap)
+  ) {
+    const span = spanOf(anchorWeek.hours);
+    const started = since(Date.parse(anchor.startedAt), ctx.nowMs);
+    const fact = `step back: ${
+      anchor.tests > 1 ? `raised ${anchor.ppm}→${currentPpm} ppm in ${anchor.tests} price tests since ${started}` : `tried ${anchor.ppm}→${currentPpm} ppm ${started}`
+    }, and it earned less there, by more than one sale (${sat(anchorWeek.now.revenue)} sat in ${lastSpan(anchorWeek)} against ${sat(anchorWeek.before.revenue)} in the ${span} before, at ${anchor.ppm} ppm)`;
+    const where =
+      climbBackTo === anchor.ppm
+        ? anchor.tests > 1
+          ? "its fee before these tests"
+          : "its fee before the test"
+        : climbBackTo === holdProfit
+          ? "its profit floor, what its refills cost"
+          : climbBackTo === holdNew
+            ? "a new channel's protected fee"
+            : "the policy's min";
+    if (stepBackLine) dropLine(stepBackLine);
+    stepBackLine = claim(`${fact} — back to ${climbBackTo} ppm, ${where}`, fact, -1);
+    if (unsoldLine) dropLine(unsoldLine);
+    unsoldLine = null;
+    if (backCapLine) dropLine(backCapLine);
+    backCapLine = null;
+    target = climbBackTo;
+    aim = Math.min(aim, climbBackTo);
+    loLimit = climbBackTo;
+    hiLimit = climbBackTo;
+    kind = "step_back";
+    climbBack = true;
+    dominant(stepBackLine);
+  }
+
+  // A probe that still sells and earned less in its first
+  // PROBE_JUDGE_AFTER_HOURS than the fee before it did in as many (above)
+  // goes back to that fee — where the 48 hours above only ask whether
+  // anything sold at all. Only while the channel had sats to sell since the
+  // probe and turned no payment away. Back to the fee before the probe, not
+  // to the last price that sold three times — the probed fee may be that
+  // price by now.
+  const lessBackTo = raisedFrom !== null ? Math.max(raisedFrom, heldAt) : null;
+  if (
+    kind !== "step_back" &&
+    verdict === "less" &&
+    test &&
+    raisedFrom !== null &&
+    lessBackTo !== null &&
+    lessBackTo < currentPpm &&
+    !manualNow &&
+    sold !== undefined &&
+    sold.forwards >= 1 &&
+    !refusedSinceSetForSure &&
+    Number.isFinite(clockMs) &&
+    clockMs <= raisedMs &&
+    sellable >= stepBackSellableMin(cap)
+  ) {
+    const fact = `step back: tried ${raisedFrom}→${currentPpm} ppm ${since(raisedMs, ctx.nowMs)} and it earned less in its first ${PROBE_JUDGE_AFTER_HOURS} h (${sat(test.first.revenue)} sat against ${sat(test.before.revenue)} in the ${PROBE_JUDGE_AFTER_HOURS} h before, at ${raisedFrom} ppm)`;
+    const where =
+      lessBackTo === raisedFrom
+        ? "its fee before the test"
+        : lessBackTo === holdProfit
+          ? "its profit floor, what its refills cost"
+          : lessBackTo === holdNew
+            ? "a new channel's protected fee"
+            : "the policy's min";
+    stepBackLine = claim(`${fact} — back to ${lessBackTo} ppm, ${where}`, fact, -1);
+    if (backCapLine) dropLine(backCapLine);
+    backCapLine = null;
+    target = lessBackTo;
+    aim = Math.min(aim, lessBackTo);
+    loLimit = lessBackTo;
+    hiLimit = lessBackTo;
     kind = "step_back";
     dominant(stepBackLine);
   }
@@ -1639,22 +2628,22 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     // Its protected fee holds whether or not it binds this move: rounding
     // never takes a new channel under it (an aim of exactly 80 rounded to 75
     // on a 25-ppm grid).
-    aimFloor = Math.max(aimFloor, cfg.newChannelMinPpm);
-    hardFloor = Math.max(hardFloor, cfg.newChannelMinPpm);
-    if (cfg.newChannelMinPpm > target) {
-      const fact = `new channel: only ${ageDays}d old with little history — its protected fee is ${cfg.newChannelMinPpm} ppm`;
+    aimFloor = Math.max(aimFloor, newChannelMinPpm);
+    hardFloor = Math.max(hardFloor, newChannelMinPpm);
+    if (newChannelMinPpm > target) {
+      const fact = `new channel: only ${ageDays}d old with little history — its protected fee is ${newChannelMinPpm} ppm`;
       const line = `new channel: only ${ageDays}d old with little history — keeping a protected fee`;
-      target = cfg.newChannelMinPpm;
-      aim = Math.max(aim, cfg.newChannelMinPpm);
-      aimCeiling = Math.max(aimCeiling, cfg.newChannelMinPpm);
-      if (cfg.newChannelMinPpm > currentPpm) {
+      target = newChannelMinPpm;
+      aim = Math.max(aim, newChannelMinPpm);
+      aimCeiling = Math.max(aimCeiling, newChannelMinPpm);
+      if (newChannelMinPpm > currentPpm) {
         // It lifts the fee: at once, and it is why.
         kind = "floor";
         hiLimit = Infinity;
         dominant(claim(line, fact));
       } else {
         // A fee above it is only stopped short of it (lowered by steps).
-        reasons.push(claim(`${line} (not below ${cfg.newChannelMinPpm} ppm)`, fact));
+        reasons.push(claim(`${line} (not below ${newChannelMinPpm} ppm)`, fact));
       }
     }
     exploring = false; // never explore-lower a brand-new channel
@@ -1669,7 +2658,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // operator's, which may be shorter than the demand ramp's 6 h.
   let floorRampTo = 0;
   // (An idle channel's floor would be overridden by the no-flow rule below.)
-  if (profitFloorPpm != null && refill && profitFloorPpm > target && !idle) {
+  if (profitFloorPpm != null && refill && profitFloorPpm > target && !quiet) {
     const ramped = liftTo(profitFloorPpm);
     if (ramped > currentPpm) floorRampTo = Math.max(floorRampTo, profitFloorPpm);
     // It leads when its ramp IS this move. One below the current fee only
@@ -1694,7 +2683,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     if (lifts) dominant(claim(line, fact, line === fact ? 0 : 1));
     else reasons.push(profitFloorPpm <= currentPpm ? claim(`${line} — not lowered below it`, fact) : line);
   }
-  if (floorReleased && refill && !idle) {
+  if (floorReleased && refill && !quiet) {
     reasons.push(
       `profit floor released: ${satsShort(refill.remainingSats)} of refills still here, but under ${LOW_FLOW_FORWARDS} forwards out in ` +
         `${cfg.flowWindowDays} d at ${Math.round(ch.localRatio * 100)}% local — holding their price (${refill.ppm} ppm) isn't moving them`,
@@ -1703,12 +2692,50 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // Protect only a drained channel that is STILL in demand — a modest bump to
   // slow the bleed, never a flat ceiling. In demand: it forwarded in the
   // window, or it keeps turning payments away for lack of outbound.
-  if (ch.localRatio < 0.1 && (f30.forwards > 0 || inDemand)) {
+  const protectFact = `protect: drained (${Math.round(ch.localRatio * 100)}% local) but still in demand`;
+  // (Not over a step-back: nothing sold at this fee and nobody was turned
+  // away at it.)
+  const protects = kind !== "step_back" && ch.localRatio < 0.1 && (f30.forwards > 0 || inDemand);
+  // The ramp toward Protect ppm needs a buyer at the fee it raises from, like
+  // every raise: a sale at it since it was set, or a payment turned away for
+  // lack of outbound since then (review FEE-1: the ramp read 30 days of
+  // forwards, so one burst took a channel to 350 ppm in 42 hours with nothing
+  // sold on the way). Without one the fee is neither lifted nor held; a fee
+  // already at Protect ppm or more is still not lowered under it.
+  const protectEvidence = !salesKnown || sold.forwards >= 1 || refusedSinceSet;
+  // Below Protect ppm the ramp also stops at the step-back's memory: the
+  // price nobody bought at is not ramped back to under another name.
+  const memoryBinds = protects && protectEvidence && currentPpm < protectPpm && memoryCap < protectPpm;
+  if (protects && currentPpm < protectPpm && !protectEvidence) {
+    if (!unsoldLine)
+      reasons.push(
+        `protect: drained (${Math.round(ch.localRatio * 100)}% local), but nothing sold at ${currentPpm} ppm since it was set${setAgo} — not ramped toward ${protectPpm} ppm before a sale`,
+      );
+  } else if (memoryBinds) {
+    const ramped = liftTo(memoryCap);
+    if (ramped > currentPpm) floorRampTo = Math.max(floorRampTo, memoryCap);
+    const lifts = ramped > target && ramped > currentPpm;
+    if (ramped > target) {
+      target = ramped;
+      if (lifts) {
+        kind = "ramp";
+        hiLimit = ramped;
+      }
+    }
+    aimPastMemory = Math.max(aimPastMemory ?? 0, aim, protectPpm);
+    aim = Math.max(Math.min(aim, memoryCap), ramped);
+    aimFloor = Math.max(aimFloor, ramped);
+    hardFloor = Math.max(hardFloor, ramped);
+    floored = "protecting_liquidity";
+    sayMemory();
+    if (lifts) dominant(claim(`${protectFact} — ramping toward ${memoryCap} ppm`, protectFact, 1));
+    else reasons.push(protectFact);
+  } else if (protects) {
     // Ramp, don't slam: step toward protectPpm by at most RAMP_STEPS steps
     // per change (the old one-shot jump to protectPpm was the outage
     // mechanic in miniature).
-    const ramped = liftTo(cfg.protectPpm);
-    if (ramped > currentPpm) floorRampTo = Math.max(floorRampTo, cfg.protectPpm);
+    const ramped = liftTo(protectPpm);
+    if (ramped > currentPpm) floorRampTo = Math.max(floorRampTo, protectPpm);
     // It leads only when it lifts the fee (a fee above protectPpm walking
     // down the curve, or stopped at protectPpm on the way, is not "bumped").
     const lifts = ramped > target && ramped > currentPpm;
@@ -1719,18 +2746,18 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
         hiLimit = ramped;
       }
     }
-    aim = Math.max(aim, cfg.protectPpm);
-    aimFloor = Math.max(aimFloor, cfg.protectPpm);
+    aim = Math.max(aim, protectPpm);
+    aimFloor = Math.max(aimFloor, protectPpm);
     hardFloor = Math.max(hardFloor, ramped);
-    aimCeiling = Math.max(aimCeiling, cfg.protectPpm);
+    aimCeiling = Math.max(aimCeiling, protectPpm);
     floored = "protecting_liquidity";
-    const fact = `protect: drained (${Math.round(ch.localRatio * 100)}% local) but still in demand`;
+    const fact = protectFact;
     // (Short of protectPpm this move, it is "ramping toward" it — also when
     // another floor's lift set the move: "kept at 350 ppm or more" was false
     // there.)
-    const toward = `${fact} — ramping toward ${cfg.protectPpm} ppm`;
-    if (lifts) dominant(claim(ramped < cfg.protectPpm ? toward : `${fact} — modest bump`, fact, 1));
-    else reasons.push(ramped < cfg.protectPpm ? claim(toward, fact, 1) : claim(`${fact} — kept at ${cfg.protectPpm} ppm or more`, fact));
+    const toward = `${fact} — ramping toward ${protectPpm} ppm`;
+    if (lifts) dominant(claim(ramped < protectPpm ? toward : `${fact} — modest bump`, fact, 1));
+    else reasons.push(ramped < protectPpm ? claim(toward, fact, 1) : claim(`${fact} — kept at ${protectPpm} ppm or more`, fact));
   }
 
   // No routing → lower (the core volume-first safety): a channel that hasn't
@@ -1738,10 +2765,55 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // back. Overrides the curve + floors (except new-channel protection) — the
   // opposite of a drain reflex. We never price-kill an idle channel. A channel
   // that keeps turning payments away is not idle (D20): no lowering.
+  //
+  // A drained one that still has sats to sell is lowered too (review FEE-1:
+  // under 10 % local an idle channel was never raised — and never lowered
+  // either: 350k sat stayed at 340 ppm for good beside buyers who paid 150).
+  // Not in the move the step-back makes: that is this move's lowering, the
+  // rule goes on from where it lands.
+  //
+  // How far down, and how fast, follows the balance (review FEE-7): at the
+  // ratchet's pace to Min ppm only where the channel holds more than its
+  // target — sats to spare, which a lower price may move. One at its target
+  // or under it is lowered to the balanced level at that pace: at Min ppm the
+  // first buyer took half a channel for a third of its price (2.45M at 25–40
+  // ppm). Below the balanced level a channel at its target goes on one grid
+  // step a week (buyers who pay less than the balanced level must still be
+  // found — held there for good, a balanced channel whose buyers pay 35 never
+  // sold again; a week a step, the first sale stops it within a step of
+  // their price), and one under its target stays: what little it holds is
+  // not discounted. A price with evidence behind it — the one that last won
+  // routing back, the market's — is still taken at once, whatever the
+  // balance.
   let noFlowLowering = false;
   let noFlowLine: string | null = null;
+  let noFlowHoldLine: string | null = null;
+  // The one-step-a-week lowering below the balanced level (its own pacing).
+  let slowStep = false;
   const exploringBeforeNoFlow = exploring;
-  if (idle && ch.localRatio >= 0.1) {
+  const offTarget = ch.localRatio - targetLocalRatio;
+  const spare = offTarget > cfg.deadband;
+  const scarce = offTarget < -cfg.deadband;
+  const balancedDest = Math.max(cfg.minPpm, Math.round(neutral / step) * step);
+  const idleWithSats = idle && (ch.localRatio >= 0.1 || sellable >= stepBackSellableMin(cap)) && kind !== "step_back";
+  const anchorAbove = ctx.flowAnchor != null && currentPpm > ctx.flowAnchor;
+  const marketAbove = ctx.flowAnchor == null && competitivePpm != null && currentPpm > Math.max(cfg.minPpm, Math.round(competitivePpm / step) * step);
+  if (idleWithSats && scarce && !anchorAbove && !marketAbove && currentPpm <= balancedDest) {
+    // At the balanced level or under it, and under its target: neither
+    // lowered (the curve's price for this balance is no lower) nor raised
+    // (nothing sold here). One line, unless a hold already says why.
+    if (target !== currentPpm) {
+      const pct = Math.round(ch.localRatio * 100);
+      noFlowHoldLine =
+        target < currentPpm
+          ? `hold: nothing routed here recently, and at ${pct}% local it holds less than its target — not lowered below the balanced level (${balancedDest} ppm)`
+          : `hold: nothing routed here recently — an idle channel is not raised`;
+      target = currentPpm;
+      kind = "hold";
+      dominant(noFlowHoldLine);
+    }
+    aim = currentPpm;
+  } else if (idleWithSats) {
     const anchor = ctx.flowAnchor;
     // The market's price on the "Round to" grid: an idle channel already
     // there (40 ppm against 0.9 × 40 = 36) is AT the market — before, the
@@ -1767,7 +2839,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
       dest = marketDest;
       kind = "jump";
       why = `no flow: other nodes charge ~${marketPpm} ppm into this peer${seen} — dropping to ${marketDest} ppm instead of stepping down blind`;
-    } else {
+    } else if (spare) {
       // Below the anchor or the market (or no reference): slow stepping —
       // demand may have moved. (A fee below the min — 0, say — is brought up
       // to the min by the range rule, not to the balanced level.)
@@ -1775,12 +2847,29 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
       dest = cfg.minPpm;
       kind = "ratchet";
       why = "no flow: nothing routed here recently — lowering toward min to win routing back";
+    } else if (currentPpm > balancedDest) {
+      // The same stepping, to the balanced level.
+      lowered = Math.max(balancedDest, currentPpm - lowerStep);
+      dest = balancedDest;
+      kind = "ratchet";
+      why = `no flow: nothing routed here recently — lowering toward the balanced level (${balancedDest} ppm): it holds no more than its target, so not down to min at this pace`;
+    } else {
+      // At its target, at the balanced level or under it: one grid step, a
+      // week apart (the pacing guard below).
+      lowered = Math.max(cfg.minPpm, currentPpm - step);
+      dest = cfg.minPpm;
+      kind = "ratchet";
+      slowStep = true;
+      why = `no flow: nothing routed here recently — it holds no more than its target, so below the balanced level (${balancedDest} ppm) it is lowered one step a week only`;
     }
     // Exactly the evidence's price, or exactly one ratchet step: the curve or
     // an explore price no longer cut an idle channel further in one move
     // (review: 1,500 → 900 ppm at 20% local; and a "dropping to 200 ppm" jump
     // that landed on the curve's 40).
     target = Math.max(cfg.minPpm, lowered);
+    // At the min there is nothing to lower ("lowering toward min" was said
+    // of a fee that stays; one below the min is the range rule's).
+    if (currentPpm === cfg.minPpm) why = `no flow: nothing routed here recently — at your min of ${cfg.minPpm} ppm already, not lowered further`;
     aim = Math.max(cfg.minPpm, Math.min(aim, dest));
     // Rounding must not stretch the one step, nor move a jump off the price
     // it jumps to.
@@ -1859,7 +2948,8 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // min or max is exact). What lands on a price of its own stays exact: a
   // jump to the price that won flow, a floor and its ramp, the range, the
   // step-back to a price that sold.
-  const gridBound = kind === "raise_step" || kind === "free" || kind === "demand" || kind === "lower_step" || kind === "ratchet";
+  const gridBound =
+    kind === "raise_step" || kind === "free" || kind === "demand" || kind === "probe" || kind === "lower_step" || kind === "ratchet";
   const downOnGrid = (p: number) => (p >= cfg.maxPpm ? cfg.maxPpm : p <= cfg.minPpm ? cfg.minPpm : Math.floor(p / step) * step);
   // (A lowering down to a floor lands on the floor: 100 → 80, a new
   // channel's, on a 25-ppm grid — not back up to 100.)
@@ -1889,11 +2979,33 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   const localPct = Math.round(ch.localRatio * 100);
   if (kind === "demand" && targetPpm > currentPpm) {
     const n = sold?.forwards ?? 0;
-    const fact = `demand: drained (${localPct}% local) and sold ${n} time${n === 1 ? "" : "s"} at ${currentPpm} ppm since it was set`;
     const hours = targetPpm <= floorRampTo ? (ctx.cooldown?.cooldownHours ?? 0) : Math.max(DEMAND_RAMP_HOURS, ctx.cooldown?.cooldownHours ?? 0);
     const onFloor = floorAhead > 0 && targetPpm === floorAhead ? ` (onto its ${floorAhead} ppm floor first)` : "";
     const move = targetPpm < aimPpm ? `${currentPpm}→${targetPpm}${onFloor} on the way to ${aimPpm} ppm` : `${currentPpm}→${targetPpm} ppm, its aim`;
-    dominant(claim(`${fact} — raising a quarter of the fee per move (at least two steps), at most every ${hours} h: ${move}`, fact, 1));
+    if (drainRamp) {
+      // (Its own line says what the aim's note said: one of the two.)
+      dropLine(drainAimLine);
+      drainAimLine = null;
+      const fact = `drain: ${drainFact()} (${n} sales ${soldSpan})`;
+      const how =
+        gapStep > Math.max(ordinaryStep, quarterStep)
+          ? "a third of the way to its refill cost per move (never more than doubling the fee)"
+          : "a quarter of the fee per move (at least two steps)";
+      dominant(claim(`${fact} — raising ${how}, at most every ${hours} h: ${move}`, fact, 1));
+    } else {
+      const fact = `demand: drained (${localPct}% local) and sold ${n} time${n === 1 ? "" : "s"} at ${currentPpm} ppm since it was set`;
+      dominant(claim(`${fact} — raising a quarter of the fee per move (at least two steps), at most every ${hours} h: ${move}`, fact, 1));
+    }
+  } else if (kind === "probe" && targetPpm > currentPpm) {
+    const n = sold?.forwards ?? 0;
+    const fact = `price test: it sells at ${currentPpm} ppm (${n} sales ${soldSpan}, ${weekSales} in the last 7 days) and holds no more than its target`;
+    dominant(
+      claim(
+        `${fact} — trying ${targetPpm} ppm: taken back if nothing sells at it in ${STEP_BACK_AFTER_HOURS} h, or if it earns less in its first ${PROBE_JUDGE_AFTER_HOURS} h than the ${PROBE_JUDGE_AFTER_HOURS} h before it earned at ${currentPpm} ppm`,
+        fact,
+        1,
+      ),
+    );
   } else if (drainedWithBuyers && !demandRamp && ctx.elasticityMod >= 1 && targetPpm > currentPpm && aimPpm > currentPpm) {
     // Drained with buyers, but nothing sold at this fee yet: the next ramp
     // move waits for a sale; the ordinary step (or a floor's ramp) goes on.
@@ -1954,6 +3066,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     const lead =
       dir > 0
         ? (replacementLine ??
+          drainAimLine ??
           (velocityMod > 1 ? velocityLine : null) ??
           (benchMod > 1 ? benchLine : null) ??
           drainingLine ??
@@ -2042,11 +3155,17 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     dropLine(heldLine);
     dropLine(drainedIdleLine);
     dropLine(unsoldLine);
+    dropLine(noFlowHoldLine);
   }
   // (The step-back's memory: its hold, when the fee moved after all; its
   // cap, when a floor or the min took the fee past it.)
   if (backCapLine && (backCapAt <= currentPpm ? targetPpm !== currentPpm : targetPpm > backCapAt)) dropLine(backCapLine);
   if (targetPpm > currentPpm) dropLine(noFlowLine);
+  // ("— holding" over a fee that moves: review FEE-8. The fact stays.)
+  if (targetPpm !== currentPpm) {
+    const at = reasons.indexOf(`${VELOCITY_BALANCED} — holding`);
+    if (at >= 0) reasons[at] = VELOCITY_BALANCED;
+  }
   // What the engine's rules claimed for their move no longer holds when a
   // pin, an exclusion or a lease promise set another one — nor a claimed
   // direction the fee doesn't take: only the facts stay.
@@ -2057,7 +3176,9 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     // (Held — for want of a sale, or by a hold of its own — a raise the rules
     // claimed didn't happen: no "small nudge up" beside a hold.)
     const withheld = (unsoldLine !== null || kind === "hold") && moved === 0 && c?.dir === 1;
-    if (!c || !(replaced || withheld || (c.dir !== 0 && moved === -c.dir))) continue;
+    // (Nor a lowering, where a fee that sells was kept.)
+    const kept = heldSelling && moved === 0 && c?.dir === -1;
+    if (!c || !(replaced || withheld || kept || (c.dir !== 0 && moved === -c.dir))) continue;
     if (c.fact === null) reasons.splice(i, 1);
     else reasons[i] = c.fact;
   }
@@ -2082,7 +3203,6 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
 
   // §11 apply guards (decide wouldApply only — never the target)
   const blockedByGuards: string[] = [];
-  const minDelta = Math.max(cfg.minChangePpm, Math.round(currentPpm * cfg.relativeChangeThreshold));
   const baseFeeChanged = recommendedBaseMsat !== currentBaseMsat;
   const isRaise = targetPpm > currentPpm;
   if (override?.mode === "exclude" && !leaseCapBreach) blockedByGuards.push("excluded (manual)");
@@ -2101,9 +3221,15 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
   // range (1,010 ppm against a max of 1,004 sat there, 6 ppm "below
   // threshold").
   const outsideRange = currentPpm < cfg.minPpm || currentPpm > ceiling;
-  // (The step-back too: one move back to a price that sold, on evidence.)
-  const designedMove = noFlowLowering || outsideRange || kind === "step_back";
-  if (Math.abs(aimPpm - currentPpm) < minDelta && !baseFeeChanged && !leaseCapBreach && !pinned && !designedMove) {
+  // (The step-back too: one move back to a price that sold, on evidence —
+  // and the probe, a tenth of the fee by design.)
+  const designedMove = noFlowLowering || outsideRange || kind === "step_back" || kind === "probe";
+  // (A raise the step-back's memory bounds: the gap to the aim behind it.)
+  const gapToAim = Math.max(
+    Math.abs(aimPpm - currentPpm),
+    isRaise && aimPastMemory !== null && targetPpm === engineTargetPpm ? Math.min(ceiling, aimPastMemory) - currentPpm : 0,
+  );
+  if (gapToAim < minDelta && !baseFeeChanged && !leaseCapBreach && !pinned && !designedMove) {
     blockedByGuards.push("change below threshold");
   }
   // An update LND refused (or that failed) waits before it is tried again —
@@ -2142,9 +3268,17 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
               ? ctx.cooldown.cooldownHours
               : Math.max(ctx.cooldown.cooldownHours, DEMAND_RAMP_HOURS)
             : Math.max(ctx.cooldown.cooldownHours, cfg.cooldownHours)
-        : Math.max(LOWER_PACING_HOURS, ctx.cooldown.cooldownHours);
+        : Math.max(slowStep ? SLOW_LOWER_PACING_HOURS : LOWER_PACING_HOURS, ctx.cooldown.cooldownHours);
       if (elapsedH < limitH)
-        blockedByGuards.push(isRaise ? "raise cooldown active" : limitH > LOWER_PACING_HOURS ? `lower pacing (every ${Math.round(limitH)} h)` : "lower pacing (1/day)");
+        blockedByGuards.push(
+          isRaise
+            ? "raise cooldown active"
+            : slowStep && limitH === SLOW_LOWER_PACING_HOURS
+              ? "lower pacing (1/week below the balanced level)"
+              : limitH > LOWER_PACING_HOURS
+                ? `lower pacing (every ${Math.round(limitH)} h)`
+                : "lower pacing (1/day)",
+        );
     }
   }
   // Nothing to write when neither the rate nor the base fee moves.
@@ -2167,7 +3301,7 @@ export function buildRecommendation(ch: FeeChannel, ctx: BuildCtx): FeeRecommend
     // Only a lowering opens the flow-won episode — not a fee a pin took up.
     noFlowLowering: noFlowLowering && targetPpm < currentPpm,
     pinned,
-    ...(kind === "step_back" && targetPpm < currentPpm && targetPpm === engineTargetPpm ? { stepBack: true } : {}),
+    ...(kind === "step_back" && targetPpm < currentPpm && targetPpm === engineTargetPpm ? { stepBack: true, ...(probed || climbBack ? { probeBack: true } : {}) } : {}),
     leaseCap: lease
       ? { source: lease.source, orderId: lease.orderId, feeRateCapPpm: lease.feeRateCapPpm, baseFeeCapMsat: lease.baseFeeCapMsat, untilHeight: lease.untilHeight }
       : null,

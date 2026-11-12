@@ -11,6 +11,9 @@ export interface FeeChannel extends FakeChannel {
   /** Our current routing fee on it. */
   feeRatePpm?: number;
   baseFeeMsat?: number;
+  /** Our inbound fee on it, as LND has it (negative: a discount). */
+  inboundBaseMsat?: number;
+  inboundRatePpm?: number;
 }
 
 /** A forward through the node, for its forwarding history. */
@@ -48,6 +51,10 @@ export function forwardsOut(outId: string, inId: string, n: number, opts: { toke
  * `node.refusals.set(outpoint, "why")` makes LND refuse that channel's next
  * updates the way it does — in `failed_updates`, not as an error — and
  * `node.policyRequests` holds every UpdateChannelPolicy request as sent.
+ *
+ * A channel's inbound fee (`inboundBaseMsat`, `inboundRatePpm`) is in its
+ * policy; an update that names one sets it, one that names none leaves it
+ * (as LND 0.21 does — checked on regtest); `node.inboundOf(id)` reads it.
  */
 export function feeNode(opts: { channels: FeeChannel[]; blockHeight?: number; chainBalance?: number; forwards?: FakeForward[] }) {
   const node = new FakeLnd({ channels: opts.channels, blockHeight: opts.blockHeight ?? 860_000, chainBalance: opts.chainBalance ?? 0 });
@@ -55,6 +62,7 @@ export function feeNode(opts: { channels: FeeChannel[]; blockHeight?: number; ch
   const fees = new Map(opts.channels.map((c) => [c.id, { ppm: c.feeRatePpm ?? 100, base: c.baseFeeMsat ?? 1000 }]));
   /** max_htlc each channel advertises after an update set it (msat). */
   const maxHtlcOf = new Map<string, number>();
+  const inbound = new Map(opts.channels.map((c) => [c.id, { base: c.inboundBaseMsat ?? 0, rate: c.inboundRatePpm ?? 0 }]));
   const byPoint = new Map(opts.channels.map((c) => [`${c.transactionId}:${c.transactionVout}`, c]));
   const writes: { outpoint: string; feeRatePpm: number; baseFeeMsat: number }[] = [];
   const requests: Record<string, unknown>[] = [];
@@ -66,8 +74,8 @@ export function feeNode(opts: { channels: FeeChannel[]; blockHeight?: number; ch
         channel_point: `${c.transactionId}:${c.transactionVout}`,
         base_fee_msat: String(fees.get(c.id)!.base),
         fee_per_mil: String(fees.get(c.id)!.ppm),
-        inbound_base_fee_msat: 0,
-        inbound_fee_per_mil: 0,
+        inbound_base_fee_msat: inbound.get(c.id)!.base,
+        inbound_fee_per_mil: inbound.get(c.id)!.rate,
       })),
     }),
   );
@@ -106,17 +114,19 @@ export function feeNode(opts: { channels: FeeChannel[]; blockHeight?: number; ch
     const ch = typeof a.chan_point === "string" ? byPoint.get(a.chan_point) : opts.channels.find((c) => chanNumber(c.id) === String(a.chan_id));
     if (!ch) return cb({ details: "edge not found" });
     const ours = fees.get(ch.id)!;
-    const policy = (ppm: number, base: number) => ({
+    const policy = (ppm: number, base: number, inb = { base: 0, rate: 0 }) => ({
       disabled: false,
       fee_base_msat: String(base),
       fee_rate_milli_msat: String(ppm),
+      inbound_fee_base_msat: inb.base,
+      inbound_fee_rate_milli_msat: inb.rate,
       last_update: Math.floor(Date.now() / 1000),
       max_htlc_msat: String(maxHtlcOf.get(ch.id) ?? ch.capacity * 990),
       min_htlc: "1000",
       time_lock_delta: 80,
     });
     const [node1, node2] = [node.publicKey, ch.partnerPublicKey].sort();
-    const pol = (pk: string) => (pk === node.publicKey ? policy(ours.ppm, ours.base) : policy(1, 1000));
+    const pol = (pk: string) => (pk === node.publicKey ? policy(ours.ppm, ours.base, inbound.get(ch.id)) : policy(1, 1000));
     cb(null, {
       capacity: String(ch.capacity),
       chan_point: `${ch.transactionId}:${ch.transactionVout}`,
@@ -148,6 +158,8 @@ export function feeNode(opts: { channels: FeeChannel[]; blockHeight?: number; ch
     const baseFeeMsat = Number(a.base_fee_msat);
     writes.push({ outpoint, feeRatePpm, baseFeeMsat });
     if (ch) fees.set(ch.id, { ppm: feeRatePpm, base: baseFeeMsat });
+    const named = a.inbound_fee as { base_fee_msat?: number; fee_rate_ppm?: number } | undefined;
+    if (ch && named) inbound.set(ch.id, { base: Number(named.base_fee_msat ?? 0) + 0, rate: Number(named.fee_rate_ppm ?? 0) + 0 });
     // As LND does: the max_htlc it took is what the channel advertises next.
     if (ch && a.max_htlc_msat !== undefined && Number(a.max_htlc_msat) > 0) maxHtlcOf.set(ch.id, Number(a.max_htlc_msat));
     cb(null, { failed_updates: [] });
@@ -157,6 +169,7 @@ export function feeNode(opts: { channels: FeeChannel[]; blockHeight?: number; ch
     policyRequests: requests,
     refusals,
     feeOf: (id: string) => fees.get(id),
+    inboundOf: (id: string) => inbound.get(id),
   });
 }
 

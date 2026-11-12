@@ -206,9 +206,11 @@ test("Apply's result: a write that did not happen is 'not applied' — a channel
   assert.match(html, /title="[^"]*skipped: skipped: current policy \(cltv\) unreadable[^"]*refused: max htlc size[^"]*"/);
 });
 
-test("the policy hint says what Neutral ppm does now: a ceiling for balanced channels — raising it doesn't raise a channel routing at a lower fee", () => {
-  assert.match(NEUTRAL_PPM_HINT, /^Neutral ppm is a ceiling for balanced channels, not a price they are raised to/);
+test("the policy hint says what Neutral ppm does now: the curve's price for a balanced channel — raising it doesn't raise a channel routing at a lower fee, and a channel that sells above it is not lowered to it (it read 'a ceiling for balanced channels … it lowers balanced channels priced above it')", () => {
+  assert.match(NEUTRAL_PPM_HINT, /^Neutral ppm is the balance curve's price for a balanced channel, not a price channels are raised to/);
   assert.match(NEUTRAL_PPM_HINT, /raising it doesn't raise a channel that routes at a lower fee \(that one is held\)/);
+  assert.match(NEUTRAL_PPM_HINT, /is lowered toward it unless it sells at its fee — a fee that sells is kept/);
+  assert.doesNotMatch(NEUTRAL_PPM_HINT, /a ceiling for balanced channels|it lowers balanced channels priced above it/);
 });
 
 test("a remembered market reference says when it was last seen", () => {

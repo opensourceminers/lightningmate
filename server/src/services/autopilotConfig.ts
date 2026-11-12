@@ -327,6 +327,13 @@ function crossFieldErrors(c: AutopilotConfig, patch: AutopilotConfigPatch): stri
       );
     }
   }
+  // Protect ppm is the fee a drained channel in demand is raised toward. Above
+  // Max ppm it promises a fee the engine never sets: it stops at Max (review
+  // FEE-4 — it did not: with Max 200 and Protect left at 350 a channel went to
+  // 300 ppm). Below Min it is no floor at all, and harmless.
+  if ((patch.policy?.protectPpm !== undefined || patch.policy?.maxPpm !== undefined) && p.minPpm <= p.maxPpm && p.protectPpm > p.maxPpm) {
+    errors.push(`policy.protectPpm (${p.protectPpm}) must not exceed policy.maxPpm (${p.maxPpm})`);
+  }
   if (patch.channelSizeSats !== undefined && c.channelSizeSats !== 0 && c.channelSizeSats < MIN_CHANNEL_SATS) {
     errors.push(`channelSizeSats must be 0 (auto) or at least ${MIN_CHANNEL_SATS} sat (got ${c.channelSizeSats})`);
   }
@@ -371,6 +378,16 @@ export function repairCrossFields(config: AutopilotConfig): string[] {
     const v = Math.min(p.maxPpm, Math.max(p.minPpm, p.neutralPpm));
     repairs.push(`policy.neutralPpm: ${p.neutralPpm} is outside the fee range ${p.minPpm}–${p.maxPpm} — using ${v}`);
     p.neutralPpm = v;
+  }
+  // Protect ppm above the ceiling (every version saved it without complaint;
+  // lowering Max alone left the default 350 above it). The engine stops the
+  // protect fee at Max ppm (review FEE-4), so Max is what the stored value
+  // means — and a later save of the fee range is not refused for it.
+  if (p.protectPpm > p.maxPpm) {
+    repairs.push(
+      `policy.protectPpm: ${p.protectPpm} is above maxPpm ${p.maxPpm} — using ${p.maxPpm} (a drained channel's fee is not raised past the ceiling)`,
+    );
+    p.protectPpm = p.maxPpm;
   }
   return repairs;
 }

@@ -87,7 +87,34 @@ test("the same amount again after the retry window is a new attempt; the days wi
   assert.equal(a.demandCount, 3);
   assert.equal(a.demandDays, 2);
   assert.equal(a.demandMedianSats, 100_000);
-  assert.deepEqual(servableDemand(7).get("A"), { attempts: 3, sats: 600_000, days: 2, medianSats: 100_000 });
+  assert.deepEqual(servableDemand(7).get("A"), { attempts: 3, sats: 600_000, days: 2, medianSats: 100_000, lastAt: Date.parse("2026-10-21T10:11:00.000Z") });
+});
+
+test("when the last payment was turned away is kept, so the fee engine can ask whether that was at the fee the channel charges now; a day counted before the time was kept reads as its start (review 2026-11-10, FEE-1)", (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.parse("2026-10-20T10:00:00.000Z") });
+  const dir = makeTempDir(t);
+  // B's day was counted by a version that kept no time.
+  writeFileSync(
+    join(dir, "htlc-telemetry.json"),
+    JSON.stringify({
+      startedAt: "2026-10-10T00:00:00.000Z",
+      buckets: [{ day: "2026-10-19", outChannel: "B", liquidityCount: 2, liquiditySats: 300_000, otherCount: 0, demandCount: 2, demandSats: 300_000, demandAmounts: [100_000, 200_000] }],
+    }),
+  );
+  initHtlcTelemetry(dir);
+  setChannelCapacities([["A", 2_000_000], ["B", 2_000_000]]);
+  t.after(() => {
+    stopHtlcTelemetry();
+    setChannelCapacities([]);
+  });
+  refuse("A", 100_000);
+  t.mock.timers.tick(3 * 3_600_000);
+  refuse("A", 150_000);
+  const demand = servableDemand(7);
+  assert.equal(demand.get("A")?.lastAt, Date.parse("2026-10-20T13:00:00.000Z"), "the last attempt, not the first");
+  assert.equal(demand.get("B")?.lastAt, Date.parse("2026-10-19T00:00:00.000Z"), "never later than it was");
+  // The API's shape is as it was: the time is the engines' own.
+  assert.equal("demandLastAt" in getUnservedDemand(7)[0], false);
 });
 
 test("the age of the data is reported to a tenth of a day — the first day read 0, and the UI then said '7d'", (t) => {

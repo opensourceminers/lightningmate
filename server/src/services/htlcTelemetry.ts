@@ -51,6 +51,9 @@ export interface HtlcDayBucket {
   demandSats?: number;
   /** Sizes of the demand attempts (bounded), for the median. */
   demandAmounts?: number[];
+  /** When the day's last demand attempt was turned away (ms). Absent on
+   *  buckets written before the time was kept. */
+  demandLastAt?: number;
 }
 
 interface HtlcTelemetryState {
@@ -90,6 +93,12 @@ export interface DemandSignal {
   sats: number;
   days: number;
   medianSats: number | null;
+  /** When the last of them was turned away (ms) — what the fee engine asks
+   *  when it wants to know whether payments were turned away at the fee the
+   *  channel charges NOW (review 2026-11-10, FEE-1). For a day counted before
+   *  the time was kept: that day's start (UTC), so it never reads later than
+   *  it was. Absent: not known. */
+  lastAt?: number | null;
 }
 
 const KEEP_DAYS = 30;
@@ -219,6 +228,7 @@ export function recordForwardEvent(event: {
     if (kind === "demand") {
       const amounts = (bucket.demandAmounts ??= []);
       if (amounts.length < AMOUNTS_KEPT) amounts.push(sats);
+      bucket.demandLastAt = nowMs;
     }
   } else {
     bucket.otherCount += 1;
@@ -280,9 +290,15 @@ const median = (xs: number[]): number | null => {
 /** Aggregated unserved demand per outgoing channel over the window: the raw
  *  refusals and what classification makes of them. */
 export function getUnservedDemand(days = 7): UnservedDemand[] {
+  return aggregateDemand(days).map(({ demandLastAt: _lastAt, ...d }) => d);
+}
+
+/** The same, with the time of each channel's last demand attempt (kept out
+ *  of the API's shape; the engines read it through servableDemand). */
+function aggregateDemand(days: number): (UnservedDemand & { demandLastAt: number | null })[] {
   if (!state) return [];
   const cutoff = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
-  const byChannel = new Map<string, UnservedDemand & { amounts: number[]; dayset: Set<string> }>();
+  const byChannel = new Map<string, UnservedDemand & { demandLastAt: number | null; amounts: number[]; dayset: Set<string> }>();
   for (const b of state.buckets) {
     if (b.day < cutoff) continue;
     let agg = byChannel.get(b.outChannel);
@@ -304,6 +320,7 @@ export function getUnservedDemand(days = 7): UnservedDemand[] {
         demandSats: 0,
         demandDays: 0,
         demandMedianSats: null,
+        demandLastAt: null,
         amounts: [],
         dayset: new Set(),
       };
@@ -320,7 +337,12 @@ export function getUnservedDemand(days = 7): UnservedDemand[] {
     agg.oversizedSats += b.oversizedSats ?? 0;
     agg.demandCount += b.demandCount ?? 0;
     agg.demandSats += b.demandSats ?? 0;
-    if ((b.demandCount ?? 0) > 0) agg.dayset.add(b.day);
+    if ((b.demandCount ?? 0) > 0) {
+      agg.dayset.add(b.day);
+      // (A bucket from before the time was kept: its day's start.)
+      const at = b.demandLastAt ?? Date.parse(`${b.day}T00:00:00Z`);
+      if (Number.isFinite(at) && (agg.demandLastAt === null || at > agg.demandLastAt)) agg.demandLastAt = at;
+    }
     agg.amounts.push(...(b.demandAmounts ?? []));
     // Whatever wasn't classified (unknown size, or an older bucket).
     const classified =
@@ -344,9 +366,9 @@ export function getUnservedDemand(days = 7): UnservedDemand[] {
  */
 export function servableDemand(days: number): Map<string, DemandSignal> {
   const out = new Map<string, DemandSignal>();
-  for (const d of getUnservedDemand(days)) {
+  for (const d of aggregateDemand(days)) {
     if (d.demandCount > 0) {
-      out.set(d.outChannel, { attempts: d.demandCount, sats: d.demandSats, days: d.demandDays, medianSats: d.demandMedianSats });
+      out.set(d.outChannel, { attempts: d.demandCount, sats: d.demandSats, days: d.demandDays, medianSats: d.demandMedianSats, lastAt: d.demandLastAt });
     }
   }
   return out;

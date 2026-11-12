@@ -159,18 +159,21 @@ test("every preset: a draining routing channel (30% local) at 80 ppm rises — i
   }
 });
 
-test("every preset: an idle channel keeps stepping down — at 25% local from 500 ppm, at 40% from 300, after a refill from 590 — instead of freezing after one step", () => {
+test("every preset: an idle channel keeps stepping down — at 25% local from 500 ppm, at 40% from 300, after a refill from 590, at 80% from 500 — instead of freezing after one step; to the min with sats to spare, to the balanced level under its target", () => {
   for (const [name, p] of Object.entries(PRESETS)) {
-    for (const [ratio, from] of [[0.25, 500], [0.4, 300], [0.2, 590]] as const) {
+    for (const [ratio, from] of [[0.25, 500], [0.4, 300], [0.2, 590], [0.8, 500]] as const) {
       const sim = simulate(chan({ localRatio: ratio }), ctx({ cfg: cfgOf(p), ppm: from }), 30);
       const step = (p.noFlowRatchetSteps ?? 3) * STEP;
-      const floor = p.minPpm ?? 25;
+      // Review FEE-7: under its target (router: 50 %) it stops at the
+      // balanced level — the preset's Neutral ppm, nothing known of the
+      // market — where it went on to the min before.
+      const floor = ratio > 0.55 ? p.minPpm! : p.neutralPpm!;
       const end = sim.fees.at(-1)!;
       // Before: one ratchet step (500 → 470), then "change below threshold"
-      // for good — the step was under 20% of the fee. Now it walks down until
-      // it is within the threshold (25 ppm) of the floor, or 20 steps lower.
+      // for good — the step was under 20% of the fee. Now it walks down to
+      // its floor, or 20 steps lower.
       assert.ok(sim.moves.length >= 2, `${name} @${ratio}: ${sim.fees.join("→")}`);
-      assert.ok(end <= Math.max(floor + 25, from - 20 * step), `${name} @${ratio}: ${sim.fees.join("→")}`);
+      assert.ok(end >= floor && end <= Math.max(floor, from - 20 * step), `${name} @${ratio}: ${sim.fees.join("→")}`);
       for (const m of sim.moves) assert.ok(m < 0, `${name} @${ratio}: idle, yet raised by ${m}`);
     }
   }
@@ -234,10 +237,28 @@ test("a raise needs a sale at the fee it raises from: the curve, a drain signal 
   assert.ok(sold.targetPpm > 80, sold.reasons.join(" | "));
   // History unread (a read cut short): unknown, not "nothing sold" — raised as before.
   assert.ok(buildRecommendation(chan({ localRatio: 0.35 }), ctx({ ppm: 80, ...flows })).targetPpm > 80);
-  // The protect ramp still lifts a drained channel in demand without a sale…
-  const protect = buildRecommendation(chan({ localRatio: 0.05 }), ctx({ ppm: 80, f14: flow(150_000, 0, 5, 12), f30: flow(300_000, 0, 10, 24), soldSinceChange: NO_FLOW }));
-  assert.equal(protect.targetPpm, 80 + RAMP_STEPS * STEP, protect.reasons.join(" | "));
-  // …the policy's min lifts a fee below it…
+  // The protect ramp needs evidence too (review 2026-11-10, FEE-1): a drained
+  // channel that sold nothing at its fee since it was set is not lifted toward
+  // Protect ppm on the sales of the fee before (it climbed 20 ppm every 72 h
+  // into prices nobody had bought at)…
+  const drainedFlow = { f14: flow(150_000, 0, 5, 12), f30: flow(300_000, 0, 10, 24) } as const;
+  const protect = buildRecommendation(chan({ localRatio: 0.05 }), ctx({ ppm: 80, ...drainedFlow, soldSinceChange: NO_FLOW }));
+  assert.equal(protect.targetPpm, 80, protect.reasons.join(" | "));
+  assert.ok(!protect.reasons.some((x) => /ramping toward/.test(x)), protect.reasons.join(" | "));
+  // …a payment turned away for lack of outbound since the fee was set is that
+  // evidence (a drained channel has nothing to sell), and it ramps as before…
+  const setAt = new Date(NOW - 3 * DAY).toISOString();
+  const refused = (lastAt: number | null) =>
+    buildRecommendation(
+      chan({ localRatio: 0.05 }),
+      ctx({ ppm: 80, ...drainedFlow, soldSinceChange: NO_FLOW, demand: { ...demand(4, 3), lastAt }, cooldown: { lastApplied: { "850000x1x0": setAt }, cooldownHours: 6 } }),
+    );
+  assert.equal(refused(NOW - DAY).targetPpm, 80 + RAMP_STEPS * STEP, refused(NOW - DAY).reasons.join(" | "));
+  // …one turned away before the fee was set is not…
+  assert.equal(refused(NOW - 5 * DAY).targetPpm, 80, refused(NOW - 5 * DAY).reasons.join(" | "));
+  // …and with the history unread nothing is known, so the ramp is as before.
+  assert.equal(buildRecommendation(chan({ localRatio: 0.05 }), ctx({ ppm: 80, ...drainedFlow })).targetPpm, 80 + RAMP_STEPS * STEP);
+  // The policy's min lifts a fee below it…
   assert.equal(buildRecommendation(chan({ localRatio: 0.35 }), ctx({ ppm: 0, ...flows, soldSinceChange: NO_FLOW })).targetPpm, 25);
   // …and a pin applies.
   assert.equal(buildRecommendation(chan({ localRatio: 0.35 }), ctx({ ppm: 80, ...flows, soldSinceChange: NO_FLOW, override: { mode: "fixed", fixedPpm: 300 } })).targetPpm, 300);
@@ -406,8 +427,13 @@ test("the demand ramp only where it applies: drained (under 10 % local), routed 
   ordinary(at(0.05, { f30: flow(100_000, 0, 2, 40) })); // routed twice in 30 days
   ordinary(at(0.05, { f14: flow(50_000, 200_000, 3, 20) })); // inflows refill it faster than it sells
   ordinary(at(0.05, { elasticityMod: 0.8 })); // higher fees measurably cost flow here
-  // Drained and idle: never raised.
-  assert.equal(buildRecommendation(chan({ localRatio: 0.05 }), ctx({ ppm: 400 })).targetPpm, 400);
+  // Drained and idle: never raised — and, with sats left to sell, lowered
+  // toward the balanced level (review FEE-1: it stayed at 400 for good).
+  const idle = buildRecommendation(chan({ localRatio: 0.05 }), ctx({ ppm: 400 }));
+  assert.equal(idle.targetPpm, 370, idle.reasons.join(" | "));
+  assert.match(idle.reasons[0], /^no flow: nothing routed here recently — lowering toward the balanced level \(80 ppm\)/);
+  // With nothing left to sell (under the reserve) it stays.
+  assert.equal(buildRecommendation(chan({ localRatio: 0.005 }), ctx({ ppm: 400 })).targetPpm, 400);
 });
 
 test("the demand ramp's pacing: 6 h (the operator's cadence if longer, and a shorter one up to a floor whose own ramp lifts the fee) — and its last move onto the aim keeps it", () => {
@@ -454,14 +480,18 @@ test("the demand ramp's pacing: 6 h (the operator's cadence if longer, and a sho
 
 // ── drained and idle: never raised ──────────────────────────────────────────
 
-test("every preset: a drained channel nobody routes through is never raised — it held 80 ppm where it jumped to 900 (1,350 on Max profit) in one update", () => {
+test("every preset: a drained channel nobody routes through is never raised — it held 80 ppm where it jumped to 900 (1,350 on Max profit) in one update — and is lowered no further than the balanced level", () => {
   for (const [name, p] of Object.entries(PRESETS)) {
     const start = Math.max(80, p.minPpm ?? 0);
     const sim = simulate(chan({ localRatio: 0.05 }), ctx({ cfg: cfgOf(p), ppm: start }), 30);
-    assert.deepEqual(sim.fees, [start], `${name}: ${sim.fees.join("→")}`);
-    assert.equal(sim.last.targetPpm, start);
+    // (Max routing's balanced level is 60: one step down to it, with 80k sat
+    // left to sell. Review FEE-1, FEE-7.)
+    const balanced = Math.max(p.minPpm!, p.neutralPpm!);
+    assert.deepEqual(sim.fees, start > balanced ? [start, balanced] : [start], `${name}: ${sim.fees.join("→")}`);
+    const end = sim.fees.at(-1)!;
+    assert.equal(sim.last.targetPpm, end);
     assert.equal(sim.last.wouldApply, false);
-    assert.match(sim.last.reasons[0], /^hold: drained \(5% local\) and idle/);
+    assert.match(sim.last.reasons[0], /^hold: drained \(5% local\) and idle/, `${name}: ${sim.last.reasons.join(" | ")}`);
   }
 });
 
@@ -678,8 +708,12 @@ test("an idle channel with no flow-won price jumps to what the market charges in
   assert.equal(r.metrics.marketComparison, "above");
   // A flow-won price is better evidence than the market.
   assert.equal(buildRecommendation(chan({ localRatio: 0.25 }), ctx({ ppm: 500, market: market(100), flowAnchor: 200 })).targetPpm, 200);
-  // Already below the market: the ratchet steps on.
-  assert.equal(buildRecommendation(chan({ localRatio: 0.4 }), ctx({ ppm: 80, market: market(100) })).targetPpm, 80 - 3 * STEP);
+  // Already below the market: the ratchet steps on — with sats to spare. At
+  // its target it goes on one grid step (a week apart), under it it stays at
+  // the balanced level (review FEE-7).
+  assert.equal(buildRecommendation(chan({ localRatio: 0.7 }), ctx({ ppm: 80, market: market(100) })).targetPpm, 80 - 3 * STEP);
+  assert.equal(buildRecommendation(chan({ localRatio: 0.5 }), ctx({ ppm: 80, market: market(100) })).targetPpm, 80 - STEP);
+  assert.equal(buildRecommendation(chan({ localRatio: 0.4 }), ctx({ ppm: 80, market: market(100) })).targetPpm, 80);
 });
 
 /** Routed this month, but nothing in the last 14 days: not winning flow at its price. */
@@ -853,9 +887,13 @@ test("a drained idle channel is lowered by steps too (the curve × a measured el
   // within one step — onto the grid (2026-10-25: fees land on "Round to").
   assert.equal(buildRecommendation(chan({ localRatio: 0.5 }), ctx({ cfg: cfgOf(PRESETS["Max profit"]), ppm: 333 })).targetPpm, 330);
   const coarse = cfgOf(PRESETS.Balanced, { stepPpm: 25 });
-  // A hold holds: 333 is not "rounded" to 325.
-  const held = buildRecommendation(chan({ localRatio: 0.05 }), ctx({ cfg: coarse, ppm: 333 }));
+  // A hold holds: 333 is not "rounded" to 325 (nothing left to sell: it is
+  // not lowered either).
+  const held = buildRecommendation(chan({ localRatio: 0.005 }), ctx({ cfg: coarse, ppm: 333 }));
   assert.deepEqual([held.targetPpm, held.wouldApply], [333, false]);
+  // With sats left to sell it steps down — one ratchet (75) at most, onto the grid.
+  const stepped = buildRecommendation(chan({ localRatio: 0.05 }), ctx({ cfg: coarse, ppm: 333 }));
+  assert.deepEqual([stepped.targetPpm, stepped.wouldApply], [275, true], stepped.reasons.join(" | "));
   // "Dropping to 90 ppm" from 95 on a 25-ppm grid is not written as 100.
   const drop = buildRecommendation(chan({ localRatio: 0.75 }), ctx({ cfg: coarse, ppm: 95, market: market(100) }));
   assert.ok(drop.targetPpm <= 95, `${drop.targetPpm}: ${drop.reasons.join(" | ")}`);
@@ -868,9 +906,13 @@ test("a drained idle channel is lowered by steps too (the curve × a measured el
 });
 
 test("below its flow-won price an idle channel steps down slowly again — the market is no reason to jump (demand may have moved)", () => {
-  const r = buildRecommendation(chan({ localRatio: 0.4 }), ctx({ ppm: 150, market: market(100), flowAnchor: 200 }));
+  const r = buildRecommendation(chan({ localRatio: 0.7 }), ctx({ ppm: 150, market: market(100), flowAnchor: 200 }));
   assert.equal(r.targetPpm, 150 - 3 * STEP, "not the market's 90");
   assert.match(r.reasons[0], /^no flow: nothing routed here recently — lowering toward min/);
+  // Under its target the same steps lead to the balanced level, not to the min (review FEE-7).
+  const under = buildRecommendation(chan({ localRatio: 0.4 }), ctx({ ppm: 150, market: market(100), flowAnchor: 200 }));
+  assert.equal(under.targetPpm, 150 - 3 * STEP);
+  assert.match(under.reasons[0], /^no flow: nothing routed here recently — lowering toward the balanced level \(80 ppm\)/);
 });
 
 test("a channel with possible demand and no forward in 30 days is lowered only by bounded steps of the curve — never the idle jump or the explore cut — and the curve says why", () => {
@@ -926,9 +968,10 @@ test("K2 (P1b carry-over): a pinned channel above its promise — cap 2,200, at 
 });
 
 test("K2b: a 10 ppm breach on a channel the engine manages is fixed past the anti-churn threshold (the '&& !leaseCapBreach' guard)", () => {
-  // Drained and idle (held at its fee), at 2,210 against a 2,200 promise:
-  // the move is 10 ppm, far under the threshold (max(25, 20% of 2,210)).
-  const r = buildRecommendation(chan({ localRatio: 0.05 }), ctx({ ppm: 2210, leaseCap: leaseCap(), cfg: cfgOf(PRESETS.Balanced, { maxPpm: 6000 }) }));
+  // Drained and idle with nothing left to sell (held at its fee), at 2,210
+  // against a 2,200 promise: the move is 10 ppm, far under the threshold
+  // (max(25, 20% of 2,210)).
+  const r = buildRecommendation(chan({ localRatio: 0.005 }), ctx({ ppm: 2210, leaseCap: leaseCap(), cfg: cfgOf(PRESETS.Balanced, { maxPpm: 6000 }) }));
   assert.equal(r.leaseCapBreach, true);
   assert.equal(r.targetPpm, 2200);
   assert.equal(r.wouldApply, true, r.blockedByGuards.join());
@@ -1000,7 +1043,7 @@ test("the report says how many channels the elasticity learner has evidence for 
 
 // ── a price that wins flow is kept; the engine's own moves are not vetoed (review 2) ──
 
-test("the no-flow rule's own moves are not vetoed by the threshold: idle at 70 with a flow-won price of 50 drops to 50, at 60 with a market of 40 to 40, at 50 with nothing known to the min (25)", () => {
+test("the no-flow rule's own moves are not vetoed by the threshold: idle at 70 with a flow-won price of 50 drops to 50, at 60 with a market of 40 to 40, at 50 with nothing known and sats to spare to the min (25) — at its target one step a week", () => {
   // Before: each was 'change below threshold' (within 25 ppm of where it was
   // heading) while the Why said "dropping to 50 ppm".
   const anchored = buildRecommendation(chan(), ctx({ ppm: 70, flowAnchor: 50 }));
@@ -1008,16 +1051,28 @@ test("the no-flow rule's own moves are not vetoed by the threshold: idle at 70 w
   assert.match(anchored.reasons[0], /^no flow: dropping to 50 ppm — the last price that won routing back here/);
   const market40 = buildRecommendation(chan(), ctx({ ppm: 60, market: market(40) }));
   assert.deepEqual([market40.targetPpm, market40.wouldApply], [40, true], "0.9 × 40 = 36, on the 10-ppm grid");
-  const blind = buildRecommendation(chan(), ctx({ ppm: 50 }));
+  const blind = buildRecommendation(chan({ localRatio: 0.7 }), ctx({ ppm: 50 }));
   assert.deepEqual([blind.targetPpm, blind.wouldApply], [25, true], "one ratchet step, landing on the min itself");
+  // At its target (50 % local) and under the balanced level (80): one grid
+  // step, a week apart (review FEE-7) — not vetoed by the threshold either.
+  const slow = buildRecommendation(chan(), ctx({ ppm: 50 }));
+  assert.deepEqual([slow.targetPpm, slow.wouldApply, slow.blockedByGuards], [40, true, []], slow.reasons.join(" | "));
+  assert.match(slow.reasons[0], /^no flow: nothing routed here recently — it holds no more than its target, so below the balanced level \(80 ppm\) it is lowered one step a week only/);
+  const sixDaysAgo = { lastApplied: { "850000x1x0": new Date(NOW - 6 * 24 * 3_600_000).toISOString() }, cooldownHours: 6 };
+  const waiting = buildRecommendation(chan(), ctx({ ppm: 50, cooldown: sixDaysAgo }));
+  assert.deepEqual([waiting.targetPpm, waiting.wouldApply, waiting.blockedByGuards], [40, false, ["lower pacing (1/week below the balanced level)"]]);
+  const aWeekAgo = { lastApplied: { "850000x1x0": new Date(NOW - 7 * 24 * 3_600_000).toISOString() }, cooldownHours: 6 };
+  assert.equal(buildRecommendation(chan(), ctx({ ppm: 50, cooldown: aWeekAgo })).wouldApply, true);
   // Paced all the same: a lowering at most once a day.
   const justLowered = { lastApplied: { "850000x1x0": new Date(NOW - 3_600_000).toISOString() }, cooldownHours: 6 };
   assert.deepEqual(buildRecommendation(chan(), ctx({ ppm: 70, flowAnchor: 50, cooldown: justLowered })).blockedByGuards, ["lower pacing (1/day)"]);
   // An idle channel already AT the market's price (40 against 0.9 × 40 = 36 →
   // 40 on the grid) steps on below it — before, the jump to 36 rounded back
   // to 40 every day and it never moved again.
-  const atMarket = buildRecommendation(chan(), ctx({ ppm: 40, market: market(40) }));
+  const atMarket = buildRecommendation(chan({ localRatio: 0.7 }), ctx({ ppm: 40, market: market(40) }));
   assert.deepEqual([atMarket.targetPpm, atMarket.wouldApply], [25, true]);
+  const atMarketBalanced = buildRecommendation(chan(), ctx({ ppm: 40, market: market(40) }));
+  assert.deepEqual([atMarketBalanced.targetPpm, atMarketBalanced.wouldApply], [30, true], "at its target: one grid step");
   assert.match(atMarket.reasons[0], /^no flow: nothing routed here recently/);
 });
 
@@ -1372,9 +1427,14 @@ test("(d) a fee below the min lifted by the range rule: the range leads, and nei
   // min, it is not "exploring a lower fee" either.
   const refilled = buildRecommendation(chan({ localRatio: 0.4 }), ctx({ ppm: 0, f14: flow(0, 100_000, 0), f30: flow(0, 100_000, 0) }));
   assert.deepEqual([refilled.targetPpm, refilled.noFlowLowering, refilled.state], [25, false, "normal"], refilled.reasons.join(" | "));
-  // An idle channel just above the min is still lowered as idle (to it).
-  const atMin = buildRecommendation(chan({ localRatio: 0.4 }), ctx({ ppm: 40 }));
+  // An idle channel just above the min is still lowered as idle (to it) —
+  // with sats to spare; under its target it stays (review FEE-7), and that
+  // is no no-flow lowering.
+  const atMin = buildRecommendation(chan({ localRatio: 0.7 }), ctx({ ppm: 40 }));
   assert.deepEqual([atMin.targetPpm, atMin.noFlowLowering, atMin.state], [25, true, "close_candidate"]);
+  const under = buildRecommendation(chan({ localRatio: 0.4 }), ctx({ ppm: 40 }));
+  assert.deepEqual([under.targetPpm, under.noFlowLowering, under.wouldApply], [40, false, false], under.reasons.join(" | "));
+  assertNoContradiction(under, "idle under its target at 40");
 });
 
 test("a pin or a lease promise that sets another move takes back the lines that deny it — the step guard's 'a→b', 'never raised', a no-flow lowering under a fee that goes up", () => {

@@ -154,11 +154,15 @@ export function FeeRecommendations() {
         The fees the autopilot applies when <strong>Fee automation</strong> is on — protect nearly-drained
         channels, price draining channels toward what refilling them costs, keep a price that wins flow, react to
         {" "}{POSSIBLE_DEMAND_BANNER}. Each update moves a fee by a small, bounded step toward its aim (protecting a drained channel
-        ramps faster; a drained channel that keeps selling at its fee rises by a quarter of it per move — the demand ramp). A fee
+        ramps faster; a drained channel that keeps selling at its fee, or one that sells itself empty within three weeks, rises by a
+        quarter of its fee per move — the demand and drain ramps). Apart from the price test below, a fee
         goes up only when something says the channel drains, or a floor or your min needs it — never just back toward your
-        balanced level — and an ordinary raise only after a sale at the fee it charges now; a raise nothing sold at for 48 h
-        while it had sats to sell steps back to the higher of the last price that sold and the fee before it, and isn&apos;t
-        raised back to that level for a week. Only these move in one update: a step back, an idle channel dropping to the
+        balanced level — and an ordinary raise, or protecting a drained channel, only after a sale at the fee it charges now.
+        A fee that sells is kept: it is not lowered while the channel sells at it, unless the channel holds more than its
+        target and takes in more than it sells — and where a channel sells every day, a slightly higher fee is tried and
+        taken back if it earns less. A raise nothing sold at for 48 h
+        while it had sats to sell steps back to the last fee that sold, and isn&apos;t
+        raised back to that level for a week — longer each time it fails again. Only these move in one update: a step back, an idle channel dropping to the
         price that last won it flow or to what the market charges into its peer, a fee you pinned, a new
         channel&apos;s protected fee, a broken lease promise, and a fee outside your min/max (one below your min goes
         to the min, and steps on from there). Apply them now, or let the autopilot manage them.
@@ -319,8 +323,8 @@ export function FeeRecommendations() {
                                 {r.state === "protecting_liquidity" ? (
                                   <span className="muted">
                                     still wanted while drained: an inbound discount on this channel (LND 0.18+, experimental) would make the
-                                    payments that refill it cheaper, paid only when they come — set it by hand if you want it; the autopilot
-                                    doesn&apos;t
+                                    payments that refill it cheaper, paid only when they come — set it by hand if you want it: the autopilot
+                                    sets none, and keeps yours when it changes this channel&apos;s fee
                                   </span>
                                 ) : null}
                                 <span>peer <b className={m.peerGate === "ok" ? "ok" : "warn"}>{m.peerGate}</b> · {m.role} · target {pct(m.targetLocalRatio)}{m.channelAgeDays != null ? ` · ${m.channelAgeDays}d old` : ""}</span>

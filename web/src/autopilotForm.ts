@@ -264,6 +264,12 @@ export function checkDraft(draft: Draft, config: AutopilotConfig, bounds: Autopi
       errors.push(e);
     }
   }
+  // Protect ppm above Max ppm is a fee the autopilot never sets: it stops at Max.
+  if ((patch.policy?.protectPpm !== undefined || patch.policy?.maxPpm !== undefined) && p.minPpm <= p.maxPpm && p.protectPpm > p.maxPpm) {
+    const e = `${label("policy.protectPpm")} (${p.protectPpm}) must not be above ${label("policy.maxPpm")} (${p.maxPpm})`;
+    fieldErrors[patch.policy?.protectPpm !== undefined ? "policy.protectPpm" : "policy.maxPpm"] ??= e;
+    errors.push(e);
+  }
   const minSize = bounds?.rules?.channelSizeMinSats ?? 20_000;
   if (patch.channelSizeSats !== undefined && patch.channelSizeSats !== 0 && patch.channelSizeSats < minSize) {
     const e = `${label("channelSizeSats")}: 0 (auto) or at least ${minSize.toLocaleString("en-US")} sat`;

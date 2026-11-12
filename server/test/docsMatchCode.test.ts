@@ -537,3 +537,31 @@ test("the docs say how long an order Amboss reports confirmed waits for its paym
   assert.match(flat, /in the 6 hours before it the channel is opened whatever the fee, at LND's 3-block estimate/);
   assert.doesNotMatch(flat, /looked at again for an hour/);
 });
+
+test("the docs say when a fee that sells is kept, when a higher one is tried and how the try is judged — in the code's own numbers", async () => {
+  // Review 2026-11-10, package P3 (its own review, R15: the doc test pinned
+  // none of the package's numbers).
+  const fee = await import("../src/services/feeRecommend.js");
+  const { MAX_HTLC_MIN_INTERVAL_MS } = await import("../src/services/maxHtlc.js");
+  const flat = strategy.replace(/\s+/g, " ");
+  assert.equal(fee.SELLS_HERE_SALES, 3, "“sold at least three times at the fee it charges now”");
+  assert.equal(fee.RAISE_TRIAL_DAYS, 7, "“for 7 days and whatever the channel holds, a fee the autopilot raised to”");
+  assert.equal(fee.SPARE_SELL_DAYS, 90, "“more than 90 days at its selling rate”");
+  assert.deepEqual([fee.PROBE_WEEK_SALES, fee.PROBE_RECENT_SALES, fee.PROBE_SHARE], [7, 6, 0.1], "“at least 7 sales in the last 7 days … 6 in the last 72 h … a tenth of its fee”");
+  assert.equal(fee.PROBE_JUDGE_AFTER_HOURS, 72, "“judged once, 72 h after the raise”");
+  assert.deepEqual([fee.CLIMB_CHECK_DAYS, fee.CLIMB_WINDOW_DAYS, fee.CLIMB_CHECK_HOURS], [7, 14, 48], "“at the end of each of the climb's weeks (in force for 48 h) … up to 14”");
+  assert.equal(fee.STEP_BACK_AFTER_HOURS, 48, "“A test nothing sells at for 48 h goes back”");
+  assert.deepEqual([1, 2, 3].map(fee.stepBackMemoryDays), [7, 14, 28], "“not repeated for 7 days — 14, then 28”");
+  assert.equal(MAX_HTLC_MIN_INTERVAL_MS, 6 * 3_600_000, "“at most once in 6 h”");
+  assert.match(flat, /A channel that sold at least three times at the fee it charges now, since that fee was set, and at least once in the last 7 days, is not lowered toward a lower aim/);
+  assert.match(flat, /covers, for 7 days and whatever the channel holds, a fee the autopilot raised to/);
+  assert.match(flat, /would need more than 90 days at its selling rate of the last 14 days/);
+  assert.match(flat, /at least 7 sales in the last 7 days, three of them at the fee it charges now, and 6 in the last 72 h, which the fee has stood/);
+  assert.match(flat, /one step higher, or a tenth of its fee where that is more\*\* \(rounded down onto the grid, at most to the max; never on a pinned or excluded channel\)/);
+  assert.match(flat, /judged once, 72 h after the raise\*\*: what the channel earned in the test's first 72 h against the 72 h before it/);
+  assert.match(flat, /at the end of each of the climb's weeks \(in force for 48 h\), what the channel earned in its last days — up to 14 — is set against as many days before the climb/);
+  assert.match(flat, /A test nothing sells at for 48 h goes back by the step back below/);
+  assert.match(flat, /A test that was taken back is not repeated for 7 days — 14, then 28 when tests fail in a row at the same level/);
+  assert.match(flat, /advertised size changes \*\*at most once in 6 h\*\*/);
+  assert.doesNotMatch(flat, /never on a fee set by hand/);
+});

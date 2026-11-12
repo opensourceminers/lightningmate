@@ -70,6 +70,9 @@ test("rejects every value the old endpoint silently stored", () => {
     [{ channelReserveSats: 0 }, /channelReserveSats/],
     [{ rebalanceCooldownMinutes: 0 }, /rebalanceCooldownMinutes/],
     [{ policy: { minPpm: 900, maxPpm: 100 } }, /minPpm \(900\) must not exceed policy\.maxPpm/],
+    // Protect ppm above Max ppm, from either end (review FEE-4: both were saved).
+    [{ policy: { protectPpm: 1_200 } }, /policy\.protectPpm \(1200\) must not exceed policy\.maxPpm \(1000\)/],
+    [{ policy: { maxPpm: 200 } }, /policy\.protectPpm \(350\) must not exceed policy\.maxPpm \(200\)/],
     [{ channelSizeSats: 5_000 }, /channelSizeSats must be 0 \(auto\) or at least 20000/],
     [{ sellPricingMode: "cheap" }, /sellPricingMode must be one of/],
     [{ rebalancePolicy: { econRatio: 2 } }, /rebalancePolicy\.econRatio/],
@@ -442,6 +445,18 @@ test("upgrading keeps what the engine did with an inverted fee range, a sub-mini
   const p = inverted.config.policy;
   assert.deepEqual([p.minPpm, p.neutralPpm, p.maxPpm], [1_500, 1_500, 1_500]);
   assert.ok(inverted.repairs.some((r) => r.startsWith("policy.minPpm: 2000 is above maxPpm 1500 — using 1500")));
+
+  // Protect ppm above Max ppm (Max lowered to 200, Protect left at its 350 —
+  // saved without complaint; review FEE-4): the engine stops at Max now, so the
+  // stored value becomes Max, and the range can be saved again.
+  const over = sanitizePersistedConfig({ enabled: true, policy: { maxPpm: 200, protectPpm: 350 } });
+  assert.deepEqual([over.config.policy.maxPpm, over.config.policy.protectPpm], [200, 200]);
+  assert.ok(over.repairs.some((r) => r.startsWith("policy.protectPpm: 350 is above maxPpm 200 — using 200")), JSON.stringify(over.repairs));
+  assert.equal(validateAutopilotPatch({ policy: { maxPpm: 250 } }, over.config).ok, true);
+  // Lowering both in one save is fine; Protect below Min is no floor, and no error.
+  assert.equal(validateAutopilotPatch({ policy: { maxPpm: 200, protectPpm: 150 } }, DEFAULT_CONFIG).ok, true);
+  assert.equal(validateAutopilotPatch({ policy: { minPpm: 400, neutralPpm: 500 } }, DEFAULT_CONFIG).ok, true);
+  assert.ok(!sanitizePersistedConfig({ policy: { protectPpm: 350 } }).repairs.some((r) => r.startsWith("policy.protectPpm")));
 
   // A positive size below the minimum never opened anything (the open is
   // refused). 0 would mean "auto" (the full recommended size): the minimum is

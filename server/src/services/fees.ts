@@ -200,6 +200,26 @@ export function updateRefusal(res: UpdateRoutingFeesResult | undefined, transact
   return `LND refused the update: ${f.failure || "no reason given"}${why}`;
 }
 
+/**
+ * A channel's own inbound fee, to be sent along with every policy write
+ * (review FEE-9). An inbound discount is set by hand — the fee tab says where
+ * one would pay — and neither a fee write nor a max_htlc write may take it
+ * away. Whether LND keeps the inbound fee of a write that does not name it
+ * depends on its version: 0.21 keeps it (checked on regtest), 0.18.0–0.18.2
+ * are said to reset it to zero. So one that is there is named again exactly
+ * as it was read, discount or surcharge; where there is none nothing is sent
+ * — which is also what an LND without inbound fees expects.
+ */
+export function inboundFeeEcho(policy: { inbound_base_discount_mtokens?: string; inbound_rate_discount?: number }): {
+  inbound_base_discount_mtokens?: string;
+  inbound_rate_discount?: number;
+} {
+  const base = policy.inbound_base_discount_mtokens;
+  const rate = policy.inbound_rate_discount;
+  const set = (base !== undefined && Number(base) !== 0) || (rate !== undefined && rate !== 0);
+  return set ? { inbound_base_discount_mtokens: base ?? "0", inbound_rate_discount: rate ?? 0 } : {};
+}
+
 /** The most a single HTLC may be on a channel (msat): the smaller of its two
  *  max pending amounts — LND checks a policy's max_htlc against its own, and
  *  a lower bound is always safe. Null when neither is known. */
@@ -230,7 +250,8 @@ export async function maxPendingByOutpoint(lnd: AuthenticatedLnd): Promise<Map<s
 /**
  * Apply fee updates to the node. `readLnd` reads each channel's current policy
  * (to preserve cltv_delta + HTLC limits, which LND would otherwise reset to
- * defaults), `writeLnd` performs the update. Channels whose current policy can't
+ * defaults, and an inbound fee set by hand — inboundFeeEcho), `writeLnd`
+ * performs the update. Channels whose current policy can't
  * be read are skipped rather than risk clobbering their timelock settings.
  *
  * `leaseCaps`: the routing-fee promises of sold channels (D7). Every write —
@@ -314,6 +335,7 @@ export async function applyFees(
         ...(current.min_htlc_mtokens
           ? { min_htlc_mtokens: current.min_htlc_mtokens }
           : {}),
+        ...inboundFeeEcho(current),
       });
       const refused = updateRefusal(res, item.transactionId, item.transactionVout);
       if (refused) {

@@ -103,10 +103,11 @@ compares this block with the code.)
 ```
 minPpm            25     # cheapest a channel can go (lots of outbound)
 neutralPpm        80     # the curve's level for a balanced channel (at its target ratio) — a ceiling there, not a
-                         # target: raising it doesn't raise a channel routing at a lower fee (held, see below)
+                         # target: raising it doesn't raise a channel routing at a lower fee (held, see below),
+                         # and a channel that sells above it keeps its fee
 maxPpm          1000     # priciest (fully drained)
 protectPpm       350     # where a drained-but-still-wanted channel is ramped to
-newChannelMinPpm  80     # floor for brand-new channels (first 3 days)
+newChannelMinPpm  80     # floor for a new channel (its first 14 days, or until its third forward)
 baseFeeMsat        0     # flat base fee to set (0 = volume-first)
 stepPpm           10     # round to this — the policy's "Round to" (the engine's own default is 25)
 minChangePpm      25     # leave a fee alone when it is this close to where the engine is heading
@@ -122,9 +123,12 @@ maxChangesPerRun   5     # at most N fee changes applied per run — the autopil
 up) and a **target** (this update's move toward it). Moves are small, bounded steps: a raise
 moves at most **2 steps** (on every channel, routing or not; a learned elasticity can widen
 the step to ×1.5 — **up to 3 steps** — never remove it) — except the **demand ramp** of a
-drained channel that sold at the fee it charges now (a quarter of the fee a move, see 8
-below); the protect and profit-floor ramps at most **4 steps**; **every lowering** at most the
-**idle-ratchet's steps** — idle, routing, new or drained. Only these move in one update, each for a reason of its own: an idle channel
+drained channel that sold at the fee it charges now and the **drain ramp** of one that sells
+itself empty (a quarter of the fee a move, see 8 below); a **price test** on a channel that
+sells daily is one step, or a tenth of the fee; the protect and profit-floor ramps at most
+**4 steps**; **every lowering** at most the **idle-ratchet's steps** — idle, routing, new or
+drained. Only these move in one update, each for a reason of its own: a **step back** (to the
+last fee that sold, see below), an idle channel
 dropping to its **flow-won price** or to the **market price** into its peer (evidence, not a
 guess — and nothing is at stake on a channel nobody routes through), a **pin** (the
 operator's value), the **new-channel floor**, a broken **lease promise**, and a fee outside
@@ -139,31 +143,120 @@ drained channel (the curve), drain velocity, the benchmark's draining nudge, a d
 channel's replacement cost, a floor or the policy's min raise a fee — and where a measured
 elasticity below 1 has switched the drain reflex off, draining raises nothing either (its
 reasons said "not raising toward the replacement cost" while the curve raised it). Raising **Neutral ppm**
-therefore no longer lifts balanced channels by itself: it lowers balanced channels priced above it, and it is
+therefore no longer lifts balanced channels by itself: it lowers balanced channels priced above it
+that do not sell at their fee (one that sells keeps it, see the next paragraph), and it is
 where the curve starts for drained and full channels (the policy hint says so). Before, a price that had
 just won a channel two-way flow was raised straight back out of it (50 → 70 toward the
 balanced level of 80) and lowered again after two quiet weeks — in a 120-day simulation with
 demand that depends on the fee, such channels sat priced out 80–90 % of the time; now they
 keep the price that routes (a test runs that loop on every preset, with and without a market).
 
+**A fee that sells is kept** (review 2026-11-10, FEE-2). A channel that sold at least three
+times at the fee it charges now, since that fee was set, and at least once in the last 7 days,
+is not lowered toward a lower aim — the balance curve, a lower refill cost, the market, a
+learned elasticity. The Why says so: `hold: it sells at N ppm (S sales …) — a fee that sells
+is not lowered toward L ppm`. Before, a balanced channel that sold 200k sat a day at 300 ppm
+was walked down to 90 ppm in seven moves (in a 60-day simulation it earned 1,202 sat; held at
+its fee and tested upward, over 6,500). A write does not undo what the channel has shown: the
+hold also stands where the channel sold three times in the last 7 days while its fee stood at
+this one or higher (a fee just gone back to after a test above it), and where it sold once at
+this fee and three times in the week. The same hold covers, for 7 days and whatever the
+channel holds, a fee the autopilot raised to — what sells at it decides, and the step back
+takes it back, not the curve — and the fee any step back went back to. It does not cover a
+channel with **spare to sell**: one that holds more than its target (beyond the deadband) and
+either takes in more than it sells (14-day inflow above its outflow by more than max(1 % of
+capacity, 50k sat), and more in than out in the last 7 days — counted over the days the fee
+stood at this one or lower: on the days of a price test it sold less because of the test),
+or would need more than 90 days at its selling rate of the last 14 days to sell what it holds
+above its target. There the fee comes down as before (`spare: it sells at N ppm, but holds
+more than its target and … — the fee is not held for those sales`). The policy's range, a
+pin, a lease promise and the no-flow rule lower a fee as ever. Where the forwarding history
+could not be read whole, what sold is unknown and the hold cannot speak; the run says so
+(`sales unknown: …`) and the fee is lowered as the other rules say.
+
+**Price test** (decided 2026-11-10: a channel that sells keeps its fee, and a higher one is
+tried in small steps). A channel that sells daily — at least 7 sales in the last 7 days,
+three of them at the fee it charges now, and 6 in the last 72 h, which the fee has stood —
+holds no more than its target, has no measured elasticity below 1 and no ordinary raise
+ahead (its aim is at the fee, or nearer than the anti-churn threshold) is tried **one step
+higher, or a tenth of its fee where that is more** (rounded down onto the grid, at most to
+the max; never on a pinned or excluded channel): `price test: it sells at N ppm (S sales …,
+W in the last 7 days) and holds no more than its target`. The 72 h are what the test is set
+against, so the next test follows 72 h after the last at the earliest. Below seven sales a
+week no test is made: two days without a sale are then the rule, not a sign.
+
+A test is **judged once, 72 h after the raise**: what the channel earned in the test's first
+72 h against the 72 h before it, at the fee before. Both stretches are over when they are
+read, so the answer does not depend on the hour the autopilot runs in (judged on a running
+average from 72 h on, the same test was kept or taken back by the hour). Less, and the fee
+goes **back to the fee before the test** in one move (`step back: tried A→B ppm … and it
+earned less in its first 72 h`); as much or more, and it is kept and the next test may
+follow. A test nothing sells at for 48 h goes back by the step back below. It is not taken
+back while the channel had nothing to sell or refused an HTLC for lack of balance since the
+test.
+
+One step of a tenth cannot be told from chance on three days' sales, and a test kept by
+chance is the base of the next. So kept tests are **checked again as a climb**, against the
+fee the climb began at: at the end of each of the climb's weeks (in force for 48 h), what
+the channel earned in its last days — up to 14 — is set against as many days before the
+climb. The hours of a test that was taken back since, or was not yet judged when the week
+ended, are left out of both stretches (a climb from 300 to the 330 ppm buyers paid was taken
+back whole for the two dead days of the try at 360). Less by more than one sale, and the fee
+goes back to where the climb began, in one move (`step back: raised A→B ppm by price tests
+since … and it earned less there, by more than one sale`); otherwise the line says what it
+earned against what (`price test: at B ppm, up from A ppm … : kept`).
+
+A test that was taken back is not repeated for 7 days — 14, then 28 when tests fail in a row
+at the same level (`price test: N ppm was tried and taken back … — no higher fee is tried
+before <date>`). For as long, an ordinary raise stops below the price that failed as well
+(`hold: N ppm was tried and taken back … — it earned less there; not raised to it before
+<date> unless the channel drains`); the demand and drain ramps, the protect ramp and the
+floors are not bound by it — a failed test must not hold a draining channel down.
+
+What a test costs: where buyers pay up to a price and nothing above it, the fee is tried up
+to that price and stays there; each try above it costs the two days without a sale until the
+step back, and is made again after 7, 14 and 28 days. In a 60-day simulation with buyers who
+pay up to 330 ppm, a channel starting at 300 earned about 3,400 sat (a fee fixed at 300:
+3,600; at 330: 3,960); starting at 80 with buyers who pay up to 110, about 840 to 890 sat in
+90 days (fixed at 80: 720; at 110: 990). At one sale a day no test is made.
+There is no test downward: a channel that sells at its fee is not offered cheaper to see
+whether it would sell more (in a simulation with buyers who buy less the more it costs, a
+channel starting above its best price stays there — the price of this decision).
+
 **A raise needs a sale** (review 2026-10-25). An ordinary raise — the curve, drain velocity,
 the benchmark, the replacement cost, the demand ramp — waits until the channel sold at least
 once at the fee it charges now, since that fee was set (by the fee-change log); the Why says
 so ("hold: nothing sold at X ppm since it was set — not raised toward Y ppm before a sale").
-Floors, the min/max range, pins and lease promises are not held by it. A **sale** is a forward
+The profit floor, a new channel's floor, the min/max range, pins and lease promises are not
+held by it. The **protect ramp** is (review 2026-11-10, FEE-1): below Protect ppm a drained
+channel is lifted only when it sold at the fee it charges now, or refused an HTLC for lack of
+balance, since that fee was set — each step of the ramp anew (`protect: drained (N% local),
+but nothing sold at X ppm since it was set — not ramped toward P ppm before a sale`). Before,
+a channel one buyer had emptied at 30 ppm was ramped to 340 ppm in eight moves with nothing
+left to sell, and what flowed back into it later met a price nobody had ever paid. A **sale** is a forward
 out of at least 1,000 sat; forwards out of the channel within 60 s of the one before count
 once — one payment's retries, and its shards even when they enter through different channels
 (until the final review the 60 s were counted per incoming → outgoing pair, so three shards
-through three channels were three sales) — for the demand ramp's three sales and the refill
+through three channels were three sales) — for the demand and drain ramps' three sales and the refill
 gate's proof alike. When the forwards couldn't be read completely, sales are unknown and the
 ordinary raises go on as before. The hold names the aim as your max bounds it.
 
 **Step back.** A fee the autopilot raised and then not sold at for 48 h, while the channel had
-something to sell (local balance minus its 1 % reserve at least max(50k, 1 % of capacity)),
-goes back in one move — paced like a lowering — to the **higher** of its **proven level** (the
-highest fee of the last 14 days it sold at least 3 times at; see Rebalancing) and its fee
-before that raise: never below a fee that sold, and not at all when a level at or above the
-current fee sold three times. The 48 h count from the raise, or from when the channel last got
+something to sell (local balance minus its 1 % reserve at least max(50k, 1 % of capacity))
+and refused no HTLC for lack of balance since the fee was set (those are buyers at this
+price), goes back in one move — paced like a lowering — to **the last fee that sold** (review
+2026-11-10, FEE-1): the engine follows the autopilot's raises that ended at this fee back
+through the fee-change log, to the highest price of that climb at which something sold, or,
+where none of them sold, to the fee before the climb's first raise — and never below its
+**proven level** (the highest fee of the last 14 days it sold at least 3 times at; see
+Rebalancing): not at all when a level at or above the current fee sold three times. Before,
+it went back one raise only: a ramp that went 80 → 350 ppm in 42 hours past buyers who paid
+up to 150 stepped back to 340 and stayed above them for months. A **floor is where it
+stops** (FEE-8): the policy's min, a new channel's protected fee, the profit floor of the
+refills still in the channel — the step back lands on the highest of them, its Why names
+which (“back to P ppm, its profit floor, what its refills cost”), and with no room below the
+fee there is no step back (before, “step back … to 80 ppm” stood over a fee a floor kept).
+The 48 h count from the raise, or from when the channel last got
 sats to sell if that is later: the fee stage notes each run since when every channel has had
 something to sell without a break (a channel drained in between starts again — before, its
 raise was stepped back on the first run its liquidity came back; two looks further apart than
@@ -171,8 +264,15 @@ three run intervals, at least 6 h, start every clock again). A raise set by hand
 apply or a pin) is never stepped back, nor one whose earlier fee wasn't known (a manual apply
 that couldn't read LND's fee is on record with an unknown "from" — it read as a raise from 0).
 For 7 days after a step-back, the fee it stepped back from is not raised to again — a raise
-stops on the grid step below it ("guard: stepped back from …"), floors, the min, pins and lease
-promises excepted. The drained-idle hold doesn't strand it there; a drained channel nobody
+stops on the grid step below it ("guard: stepped back from …"), the profit floor, a new
+channel's floor, the min, pins and lease promises excepted; the protect ramp is bound by it
+(below Protect ppm it goes no higher than that — the price nobody bought at is not ramped
+back to under another name). The memory **grows** (FEE-11):
+a step-back that ends no higher than the one before it is a repeat, and the fee is then not
+raised back for 14 days, after the third in a row for 28 (a channel whose buyers paid up to
+150 ppm went 140 → 160 → 140 every nine days for months). And each failed try **halves the
+stretch** that is tried again: while the fee stands in the lower half between the fee it went
+back to and the one that failed, a raise stops in the middle of the two. The drained-idle hold doesn't strand it there; a drained channel nobody
 routes through shows that hold ("an idle channel is never raised") with its fee as the aim, and
 no raise note ("small nudge up", "raising fee") stands beside a hold or a step-back.
 
@@ -298,6 +398,18 @@ idle).
    held at its current fee — not raised toward it, not sold cheaper either. Without any market
    reference (none this run, none remembered) a draining channel is held where the curve would
    lower it, and raised only by a higher aim.
+   A channel that **sells itself empty** (review 2026-11-10, FEE-3) is priced for the balance
+   it will have: where, at what it sells net a day at the fee it charges now, it is down to
+   10 % local within 21 days, the aim is at least the curve's price for the balance it will
+   have **in 7 days** at that rate (an empty channel's price where it would be empty by then)
+   — `drain: it sells ~X a day net at N ppm — at that rate it is down to 10% local in ~D d —
+   priced for the ~P% local it will have in 7 days: ~Y ppm`. The rate is the largest of: what
+   sold since the fee was set (over 6 h at least) and the last 1, 3, 7 and 14 days where the
+   fee has stood that long — sales at an older, lower fee say nothing about this one; each
+   stretch counts with ≥ 3 forwards and ≥ 5 % of capacity net out (what came in is taken
+   off), and none unless the last 14 days show 5 % net out too: a channel that routes both
+   ways has days on which it only sells. Not where a measured elasticity below 1 says higher
+   fees cost flow here. Such a channel counts as draining for the replacement cost as well.
 
 8. **Bounded moves:** the target moves toward the aim by the steps above. **A drained channel
    nobody routes through is never raised** (it jumped to ~900 ppm in one update before), and
@@ -324,24 +436,65 @@ idle).
      learner to measure; the sales each move needs are the ramp's check instead. A fee another
      tool changed carries no stamp: sales at the old fee then count — the refill gate stays safe,
      since it values at what was paid.)
+   - **Drain ramp** (review 2026-11-10, FEE-3): a channel that still has liquidity and **sells
+     itself empty** (7 above) is not left at two steps every 72 h either. With three sales at
+     the fee it charges now it is raised like the demand ramp — **a quarter of its fee per
+     move**, at most every 6 h, each move after three sales at the price before it, never past
+     its aim, stopping on a protect or profit floor ahead first — and, where what a refill
+     costs is known and above its fee, **a third of the way to that cost** per move where that
+     is more (never more than doubling the fee). Raises were four to five times slower than
+     lowerings: live, one buyer emptied a full 5M channel priced at 30 ppm in two evenings
+     while a refill cost about 700 ppm — 157 sat for 4.3M sat; in a simulation a channel at
+     80 % local whose buyers took 300k sat a day and paid up to 400 ppm sold 3.95M sat at 96
+     ppm on average and reached 350 ppm empty. Its Why leads: `drain: it sells ~X a day net at
+     N ppm — at that rate it is down to 10% local in ~D d (S sales …) — raising a quarter of
+     the fee per move (at least two steps), at most every 6 h: a→b on the way to c ppm`. What
+     no rule can price is one payment burst inside a run interval: a fee changes between runs.
 
 9. **Floors:**
-   - new channel (<3 days, <3 forwards) → at least `newChannelMinPpm`
+   - new channel (<14 days, <3 forwards) → at least `newChannelMinPpm` (three days were less
+     than gossip and other nodes' pathfinding need to try a new channel at all: one was at its
+     protected fee for 2.9 days and at the min a day later — review 2026-11-10, FEE-7)
    - profit floor (the refills still in the channel, see 1) → ramped toward it (4 steps a move)
    - **protect**: drained (<10% local) **but still in demand** (forwards, or refused HTLCs a
      refill could have carried — possible demand) → ramped toward `protectPpm` (4 steps a
-     move, at the operator's cooldown)
+     move, at the operator's cooldown) — each step once something sold at the fee it charges
+     now, or an HTLC was refused for lack of balance since it was set (see “A raise needs a
+     sale”), and below a step-back's memory no higher than that
+   - The floors stay inside the policy's range (FEE-4): `protectPpm` and `newChannelMinPpm`
+     are clamped into min..max — with Max ppm 200 and Protect ppm left at 350 a drained
+     channel was ramped to 300, and a new channel was lifted to 80 over a max of 50 and then
+     “brought down to it at once”. A Protect ppm above Max ppm is refused when the policy is
+     saved, and one already stored is set to the max when the settings load (with a line
+     saying so). Only the profit floor passes the max, with its opt-in.
 
 10. **No-flow rule (core volume lever):** if the channel routed **0 forwards in 30 days**,
-    has ≥10% local, isn't brand-new and isn't refusing possible demand → **lower the fee**
+    has ≥10% local — or, drained, still at least max(50k sat, 1 % of capacity) to sell (review
+    2026-11-10, FEE-1: under 10 % local an idle channel was never raised and never lowered
+    either — 350k sat stayed at 340 ppm for good beside buyers who paid 150) — isn't new
+    (14 days) and isn't refusing possible demand → **lower the fee**
     to win flow back (overrides the curve and floors, except new-channel protection):
     - with a **flow-won anchor** (the ppm at which routing last returned here, remembered
       per channel for 60 days): jump straight to that price — best evidence beats stepping;
     - else, with a **market reference** above which it sits: jump to ~0.9 × what others charge
       into the peer, on the "Round to" grid (a channel already there steps on below it —
       before, the jump to 36 rounded back to 40 every day and the channel never moved again);
-    - otherwise: ratchet down toward `minPpm` (`current − ratchetSteps×stepPpm` per step,
-      paced once a day).
+    - otherwise the balance decides how far down, and how fast (FEE-7; before, every idle
+      channel went to the min whatever it held — and the first buyer took half a channel for a
+      third of its price, 2.45M sat at 25–40 ppm):
+      - holding **more than its target** (beyond the deadband): ratchet down toward `minPpm`
+        (`current − ratchetSteps×stepPpm` per step, paced once a day) — sats to spare, which a
+        lower price may move;
+      - **at its target or under it**, priced above the **balanced level** (Neutral ppm on the
+        grid — the market-lowered one where the market is below it): the same ratchet, to the
+        balanced level only;
+      - **at its target**, at the balanced level or under it: one grid step **a week** toward
+        the min (buyers who pay less than the balanced level must still be found; the first
+        sale stops it within a step of their price);
+      - **under its target**, at the balanced level or under it: held — what little it holds
+        is not discounted (`hold: nothing routed here recently, and at N% local it holds less
+        than its target — not lowered below the balanced level (D ppm)`), and an idle channel
+        is not raised.
     A jump lands exactly on that price, a ratchet exactly one step lower (at most to the min,
     which it reaches exactly — rounding 25 to the 10-ppm grid stopped it at 30) — the balance
     curve or the explore price no longer cut an idle channel further in one move (1,500 → 900
@@ -371,9 +524,11 @@ idle).
       changing, it is a pin, a lease promise is broken, or the move is the no-flow rule's own
       (a ratchet step or a jump) or starts from a fee outside the min/max range
     - **asymmetric pacing**: a **raise** waits `max(user cooldown, 72h)` since the last apply
-      (a ramp — protect or profit floor — steps at the user cooldown; the demand ramp at
-      `max(user cooldown, 6h)`, at the user cooldown while within a floor ramp's reach); a
-      **lowering** steps at most once per `max(24h, user cooldown)`. A channel with no prior change applies
+      (a ramp — protect or profit floor — steps at the user cooldown; the demand ramp and the
+      drain ramp at `max(user cooldown, 6h)`, at the user cooldown while within a floor ramp's
+      reach; a price test like any raise, 72 h); a
+      **lowering** steps at most once per `max(24h, user cooldown)` — the idle channel's step
+      below the balanced level once per 7 days. A channel with no prior change applies
       immediately either way.
     - a channel whose last update failed (LND refused it, or it couldn't be sent) waits
       **6 hours** before it is tried again — a broken lease promise excepted (the wait is saved:
@@ -394,10 +549,30 @@ a restart in the middle of a batch keeps the cooldowns and fee-log records of th
 made. "LND refused" is said only of an update LND refused; one skipped (its policy unreadable)
 or never answered reads "not applied".
 
+Three things about the books (review 2026-11-10). A channel's **inbound fee** — a discount
+set by hand, the Fees tab says where one would pay — is sent along with every fee and max
+HTLC write exactly as it was read (FEE-9): whether LND keeps the inbound fee of a write that
+does not name it depends on its version (0.21 keeps it, checked on regtest; early 0.18
+releases are said to reset it). A fee **found different from the books** — set in another
+tool, or written by the app right before a crash, between LND's answer and the save — is
+booked once, as a change by hand (`found at this fee — set outside the app, or by it right
+before a restart`): the cooldown and the sales “since it was set” count from then (FEE-10;
+before, the engine counted sales made at the old fee and raised again at once). And a write
+that **leaves the rate as it is** — the base fee alone, after the setting changed — is no
+new price: it no longer restarts the raise wait or the count of sales at the fee (FEE-12).
+
 The **Advertise routable size** pass: under 1,024 sat to forward, a channel advertises its
 min HTLC (1,024 it couldn't carry drew failed small payments that read as demand). An update LND
 says it took but the channel doesn't advertise is recorded once and left alone for 6 h (live: the
-same write every 30 minutes for 19 h).
+same write every 30 minutes for 19 h). A channel set to **exclude** is left alone by this pass
+too (review 2026-11-10, FEE-5: with the pass on, an excluded channel got eight policy updates
+in three days; a pinned channel is still managed — the pin is its fee, not its size). And a
+channel's advertised size changes **at most once in 6 h** (FEE-6: a near-empty channel in use
+flipped between two sizes with every run, a channel update each) — except a change of two
+buckets or more, either way, which is made at once: down to a quarter or less, since senders
+would fail on what it advertises, and up to four times as much or more, since a channel just
+refilled would advertise a tiny size for six hours. Within the 6 h the size can be off by one
+bucket.
 
 ---
 
