@@ -13,11 +13,11 @@
   },
   "dependencies": {
     "dotenv": "^16.4.7",
-    "express": "^4.22.3",
+    "express": "^5.3.0",
     "lightning": "^10.25.0"
   },
   "devDependencies": {
-    "@types/express": "^4.17.21",
+    "@types/express": "^5.0.6",
     "@types/node": "^22.10.5",
     "tsx": "^4.23.15",
     "typescript": "^5.7.3"
